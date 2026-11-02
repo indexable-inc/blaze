@@ -1,0 +1,36 @@
+{
+  "id": "00812",
+  "from_lane": "item-hash",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "what": "Add `blaze-item-hash = { path = \"crates/blaze-item-hash\" }` to [workspace.dependencies] in the root Cargo.toml (next to blaze-items), and the crate to Cargo.lock at the next build. New crate of lane item-hash (docs/v2/plan/design/item-hash.md): body identities for the item store; blaze-cargo depends on it to install `hir_ty::body_store`.",
+  "state": "applied",
+  "created": "2026-10-30T08:20:44Z",
+  "updated": "2026-10-30T08:39:54Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:20:44Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:54Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:54Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "root Cargo.toml [workspace.dependencies]: blaze-item-hash = { path = \"crates/blaze-item-hash\" } after blaze-items. Cargo.lock already has its entry (members are crates/*) with every dependency of its Cargo.toml; blaze-cargo gains it in the lock when it depends on it, at the next refresh."
+    }
+  ]
+}

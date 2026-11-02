@@ -1,0 +1,35 @@
+{
+  "id": "01156",
+  "from_lane": "speed",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "Andrew 15:56 bench: harness/bench.py `link_kind` (bench.py:551-560) reads lines `link: <time> (<how>)` where <how> starts with `spliced` or holds `not spliced: <why>`. v2 prints none (rg finds no `link:` print in crates/), so a v2 bench round can't show whether an edit was placed into the kept image or laid out in full. Ask: in `codegen::link` (codegen.rs:725), keep why a fresh image is made: `let why_fresh = match &kept { None => Some(\"no image is kept at this path\"), Some(it) if it.output != output => Some(\"the link's output changed\"), Some(_) => None };` before the `filter`, time the stage (`let started = std::time::Instant::now();` before `stage`), and after `stage` print through the same channel the daemon's other per-build lines reach the client's stderr: `link: {:.1?} (spliced: {} functions, {} statics placed)` when `!staged.full()`, else `link: {:.1?} (not spliced: {why})` with `why_fresh`, or `the image keeps no room (not incremental)`. `blaze_link::Staged::full()` is new (speed added it, lib.rs). Use the counts of `change.added` and `change.statics` taken before `stage` consumes `change`.",
+  "state": "applied",
+  "created": "2026-10-30T23:03:23Z",
+  "updated": "2026-10-30T23:22:31Z",
+  "taken_by": "no-fallback-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:03:23Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:22:31Z",
+      "by": "no-fallback-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:22:31Z",
+      "by": "no-fallback-link",
+      "action": "done",
+      "note": "codegen.rs: link returns LinkMade { how: Linking } (serve/work.rs Linking = First | Spliced | Full(Full::Output(OutputFields) | Full::NotIncremental)), from Staged::full() and a field-by-field Output diff; Compiled.links carries it to the loop; job.rs worked() sets Worked.link Placed iff any link was not spliced (was hardcoded Placed). The printed line `link: <path> (spliced|first link|not spliced: <why>)` needs blaze-api Worked.links + blaze-ui printing: queued 01163 to ci. harness/bench.py link_kind/failed_link/edit_link fail an edit whose link was not spliced."
+    }
+  ]
+}

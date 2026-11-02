@@ -1,0 +1,35 @@
+{
+  "id": "01395",
+  "from_lane": "one-pool",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "Delete `rayon = \"1.12.0\"` from the root Cargo.toml [workspace.dependencies] (and its Cargo.lock entries on the next lock refresh). Why: two thread pools (blaze`s and rayon`s) deadlocked the self-build; lane one-pool moved every member to blaze_graph::par (crates/blaze-graph/src/par.rs) and removed rayon from blaze-codegen, blaze-link, blaze-premap, blaze-doc, syntax and blaze-v2-proof. manifest_lint now says: workspace dependency `rayon` is used by no member.",
+  "state": "applied",
+  "created": "2026-11-01T00:49:34Z",
+  "updated": "2026-11-01T03:54:15Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:49:34Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:51:19Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:54:15Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "rayon deleted from root [workspace.dependencies]; Cargo.lock had no rayon entry. manifest_lint now reports no problems."
+    }
+  ]
+}

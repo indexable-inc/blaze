@@ -1,0 +1,29 @@
+{
+  "id": "00919",
+  "from_lane": "item-hash-facts",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/facts.rs"
+  ],
+  "what": "Implements, Method and the other impl facts' values hash interface_hash (facts.rs:205, 216, 220, 234, 548), with the same cycle as Signature in 00881: lane items' fact values are computed inside the body's own inference, and an interface hash reaches a body that leaks (an async fn, a const fn), possibly the one being inferred. Make them signature_hash, in the same change as 00881. Lane dbsp's new hashes (hir_ty::method_resolution::delta impl_set_hash, impl_row_hash, blanket_hash, candidate_set_hash) are not a replacement: they name each impl by impl_identity, its ImplLoc with its crate's content, so any edit anywhere in the crate changes them, where an Implements value keyed on signature hashes stays. They could give a quick check that a slice is unchanged before the walk, once impl_identity names an impl by item key.",
+  "state": "applied",
+  "created": "2026-10-30T09:46:19Z",
+  "updated": "2026-10-30T10:33:38Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:46:19Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:33:38Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "Implements, Method, Coherence (via implements_value), Specializes, Vtable, DropCheck, Derive and the impl index entries (ImplEntry now holds SignatureHash, index::impl_signature) name items by signature_hash; domains bumped. Field, Captures, AutoTraits and a const's type still fill refs by interface hash (codegen reads Captures). Test: what_an_impls_items_leak_keeps_its_impl_facts."
+    }
+  ]
+}

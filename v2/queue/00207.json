@@ -1,0 +1,36 @@
+{
+  "id": "00207",
+  "from_lane": "codegen-inline",
+  "owner": "codegen",
+  "paths": [
+    "v2/build.rs",
+    "v2/refs.rs"
+  ],
+  "what": "## 4. hir-ty-codegen (codegen, codegen-adapter)\n\n- **Turn it on.** `v2/build.rs` `Build::options` and `mod.rs` `mir_options_of`: `inline: level ==\n  MirOptLevel::Release` (the library's crates are always level 2 and inlined, as shipped).\n  `inline.rs`'s `callee_options` gives a callee of another crate the options the code\n  generator asks of it (same crate: the caller's; a library crate: level 2, no UB checks,\n  inlined; else UB checks as its `cfg(debug_assertions)`): keep the two in step.\n- **Spans.** Where codegen maps a `MirSpan` to a file and line (debug info, `Location`,\n  panics), use `source_span(db, body, span)`; a span of an inlined body is in its owner's file.\n  rustc gives an inlined scope its own `DILocation` with `inlinedAt` the call site:\n  `body.inlined.scopes[..].call_site` is that.\n- **`#[track_caller]`.** `mod.rs:13312` `caller_location`: the location a span reports is\n  `caller_location(db, body, span, track_caller(db, func))`: `At(owner, span)` is a constant\n  location, `Argument` the function's caller-location argument. An inlined\n  `#[track_caller]` callee reports its call site, as rustc's `caller_location_span`.\n- **Overflow checks.** `mod.rs:13035` `body_written_checked(db, body)`: per span, through\n  `written_checked_at(db, body, span)`; an inlined callee's arithmetic is checked as its own\n  crate says (`InlinedCallee::written_checked`).\n- **Promoted constants.** Every reading of `body.promoted_locals` (`mod.rs:10329`, 19513,\n  19542, 19622, 19720, 19730, 19811, 19818, `v2/refs.rs:866`) also covers\n  `body.inlined.promoted`: the constant is `expr` of the expression store of\n  `callees[callee].body` (`owner_of(db, ..)`), evaluated with `callees[callee].args`.\n- **The inlined list** (`CompiledFunction::inlined`, `Described::built_in`). In the refs walk\n  (`v2/refs.rs`), for each of `body.inlined.callees` (already monomorphized with the body):\n  the instance `InstanceDef::Fn(func)` or `InstanceDef::Closure(closure)` with `args` is listed\n  as a ref (`places::call_ref`) and its place pushed to `built_in`, as `instance_call` does\n  for an always-inlinable callee, without `declare_inlined` (its code is in the body already).\n  `frontend.rs` `inlined()` then hashes `code_of` of each, transitively: the caller's code is\n  stale when an inlined callee's source moves (spans, `Location` lines) or changes. A callee\n  listed once already as called (`listed_call` gives `None`) still needs its place in\n  `built_in`: keep the place of each `(def, args)` in `called` so it can be found.\n\n> forwarded to codegen (window `codegen-next1`, told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:22:41Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-inline.md#4. hir-ty-codegen (codegen, codegen-adapter)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-inline.md:129"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In: options inline at Release, source_span for inlined spans, written_checked_at per span (mod.rs:7641), body.inlined.promoted read with the callee's owner and args (mod.rs:3075), refs.rs walks body.inlined.callees into built_in."
+    }
+  ]
+}

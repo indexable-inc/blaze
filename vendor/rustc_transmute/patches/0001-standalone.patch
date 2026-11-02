@@ -1,0 +1,73 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e02337a..887cfe6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,15 +3,16 @@
+ //! The analysis converts compiler layouts into trees of bytes, references, and
+ //! definition markers. It prunes destination paths that may carry safety invariants unless
+ //! safety is assumed, then converts the trees into deterministic finite automata.
+-//! Comparing the automata produces an [`rustc_middle::ty::transmute::Answer`]; reference transitions can leave
+-//! [`rustc_middle::ty::transmute::Condition`]s for the trait solver to discharge.
++//! Comparing the automata produces an [`rustc_type_ir::transmute::Answer`]; reference transitions can leave
++//! [`rustc_type_ir::transmute::Condition`]s for the trait solver to discharge.
+ 
+ // tidy-alphabetical-start
+ #![cfg_attr(test, feature(test))]
+ #![feature(option_into_flat_iter)]
+ // tidy-alphabetical-end
+ 
+-pub(crate) use rustc_data_structures::fx::{FxIndexMap as Map, FxIndexSet as Set};
++pub(crate) type Map<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
++pub(crate) type Set<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
+ 
+ pub mod layout;
+ mod maybe_transmutable;
+diff --git a/src/maybe_transmutable/mod.rs b/src/maybe_transmutable/mod.rs
+index be4b1a8..f75599a 100644
+--- a/src/maybe_transmutable/mod.rs
++++ b/src/maybe_transmutable/mod.rs
+@@ -4,7 +4,7 @@ pub(crate) mod query_context;
+ #[cfg(test)]
+ mod tests;
+ 
+-use rustc_middle::ty::transmute::{Answer, Condition, Reason};
++use rustc_type_ir::transmute::{Answer, Condition, Reason};
+ 
+ use crate::Map;
+ use crate::layout::{self, Def, Dfa, Reference, Tree, dfa, union};
+diff --git a/src/maybe_transmutable/tests.rs b/src/maybe_transmutable/tests.rs
+index 56d31cb..6fe6559 100644
+--- a/src/maybe_transmutable/tests.rs
++++ b/src/maybe_transmutable/tests.rs
+@@ -1,7 +1,7 @@
+ extern crate test;
+ 
+ use itertools::Itertools;
+-use rustc_middle::ty::transmute::{Answer, Condition, Reason};
++use rustc_type_ir::transmute::{Answer, Condition, Reason};
+ 
+ use super::query_context::test::{Def, UltraMinimal};
+ use crate::{Assume, layout};
+@@ -44,11 +44,11 @@ fn is_transmutable<R: Representation + Clone>(src: &R, dst: &R, assume: Assume)
+ }
+ 
+ mod answers {
+-    use rustc_middle::ty::transmute::{Condition, Reason};
++    use rustc_type_ir::transmute::{Condition, Reason};
+ 
+     use crate::maybe_transmutable::Quantifier;
+ 
+-    type Answer = rustc_middle::ty::transmute::Answer<usize, ()>;
++    type Answer = rustc_type_ir::transmute::Answer<usize, ()>;
+ 
+     const OUTLIVES: Condition<usize, ()> = Condition::Outlives { long: 1, short: 0 };
+     const IMMUTABLE: Condition<usize, ()> = Condition::Immutable { ty: () };
+@@ -139,7 +139,7 @@ mod answers {
+ }
+ 
+ mod safety {
+-    use rustc_middle::ty::transmute::{Answer, Reason};
++    use rustc_type_ir::transmute::{Answer, Reason};
+ 
+     use super::*;
+ 

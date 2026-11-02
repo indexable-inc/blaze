@@ -1,0 +1,24 @@
+{
+  "id": "01337",
+  "from_lane": "tests-misc-front1",
+  "owner": "codegen-rq-mir-constcheck",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/const_check.rs",
+    "crates/hir-ty-mir/src/mir/const_check/stability.rs"
+  ],
+  "what": "hir-firewall tests/exceptions.rs an_edit_of_a_const_fn_that_keeps_its_value_reaches_no_user_of_the_value (exceptions.rs:112) fails with 4 leaks, all `const_check(one)` re-executed on an edit of another fn of the file (`uses_one`, `other`), asked by the check of `one` (/tmp/blaze-lanes/hir-firewall-exceptions.log, coord-dup-78 12:22). Cause: crates/hir-ty-mir/src/mir/const_check.rs:579 `not_const_checked` reads `#[rustc_do_not_const_check]` through `func.lookup(db).ast_ptr(db).to_view(file root)`, the whole parse of the file, so `const_check` of every const fn reruns on any edit of its file. Ask: read it without positions, from the item tree attributes (an `AttrFlags` bit for `rustc_do_not_const_check`, as `rustc_nounwind` has, through `AttrFlags::query(db, func.into())`), so it re-executes only when the attributes change. The same pattern is in const_check/stability.rs:126 and :212 (`func.lookup(db).source_view(db)` of the callee, rerun by an edit of the callee's file). const_check.rs:567, calls.rs:199, qualifs.rs:962 and stability.rs:148 ask Body::with_source_map, which an edit before the body moves: right only where a diagnostic is placed. Acceptance: that exceptions test goes clean (its other leaks, if any, are db 01304).",
+  "state": "open",
+  "created": "2026-10-31T19:24:59Z",
+  "updated": "2026-10-31T19:24:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T19:24:59Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

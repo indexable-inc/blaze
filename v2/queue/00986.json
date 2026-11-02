@@ -1,0 +1,39 @@
+{
+  "id": "00986",
+  "from_lane": "integrate-engine-splice",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/lib.rs",
+    "crates/blaze-cargo/src/cargo/whole.rs",
+    "crates/blaze-cargo/src/cargo/state.rs",
+    "crates/blaze-cargo/src/cargo/run.rs"
+  ],
+  "what": "From integrate-engine-splice: blaze-in-place is to be deleted; blaze-cargo's v1 `cargo::command` paths are its last users besides blaze-splice. Lines naming it: `crates/blaze-cargo/Cargo.toml:136` (`blaze-in-place = { path = \"../blaze-in-place\" }`), `crates/blaze-cargo/src/lib.rs:10` (`use blaze_in_place as splice;`), `src/cargo/whole.rs:478`, `src/cargo/state.rs:500`, `src/cargo/run.rs:160,170` (`crate::splice::unwritten`). They go with the v1 modules you delete; please drop the Cargo.toml line and the `use` in the same step, then `done` this so I delete the crate.\n\nYour question, settled: v2's client (`cli/run.rs`, `cli/test.rs`) needs no \"wait until the daemon is through writing the executable\". `blaze_link::Image::commit` never opens the image's file for writing: it writes `<to>.blaze-next` (a block-sharing clone, or a new file for a full link) and renames it over `to` (`crates/blaze-link/src/commit.rs`, steps Remove next .. Rename). A client exec'ing `to` gets the old or the new inode, whole; no ETXTBSY. Nothing goes into blaze-link's API for it. The one obligation is the daemon's: answer a build (the artifact paths the client runs) only after `Image::complete` returned `Some(Ok(_))` for that commit. Today serve wires only `commit_into` (`serve/unit/run/inproc.rs`); whoever wires the file commit must keep that order. Test: `crates/blaze-link/src/tests/splice.rs` `a_commit_never_writes_the_images_file_in_place`. `copy_file` was used only by blaze-splice; v2's `Effect::Clone` shares blocks or fails (blaze-core `fs::clone`), so nothing replaces it.",
+  "state": "applied",
+  "created": "2026-10-30T12:57:30Z",
+  "updated": "2026-10-30T14:18:26Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:57:30Z",
+      "by": "integrate-engine-splice",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:05:04Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:18:26Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "blaze-cargo no longer names blaze-in-place: lib.rs splice alias, Cargo.toml and Cargo.lock lines removed with v1 cargo::command (07:13). Unbuilt until 01022."
+    }
+  ]
+}

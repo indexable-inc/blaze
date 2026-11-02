@@ -1,0 +1,23 @@
+{
+  "id": "00203",
+  "from_lane": "db-matchck",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower"
+  ],
+  "what": "## 9. diagnostics (blaze-diagnostics): lower the refused constant patterns (db-matchck)\n\nWhat: `AnyDiagnostic::ConstPatternRefused(hir::ConstPatternRefused { pat: InFile<AstPtr<ast::Pat>>,\nerror: hir::ConstPatternError<'db> })` is rustc's `const_to_pat` refusal of a constant used as a\npattern, at the path pattern. Each part of the value `valtree_to_pat` refuses gets its own\ndiagnostic. Lower it the way rustc's `rustc_mir_build/src/errors.rs` does, and give it an arm in\nthe exhaustive `AnyDiagnostic` matches (`blaze-diagnostics/src/lower/mod.rs`, and\n`ide-diagnostics/src/lib.rs` while that crate exists):\n- `Union`: \"cannot use unions in constant patterns\";\n- `Pointer`: \"function pointers and raw pointers not derived from integers in patterns behave\n  unpredictably\";\n- `Invalid(ty)`: \"{prefix} `{ty}` cannot be used in patterns\", with `Ty::prefix_string`;\n- `NotStructural(ty)`: `TypeNotStructural`, \"constant of non-structural type `{ty}` in a\n  pattern\", with its notes and the `SuggestEq` suggestions;\n- `NotPartialEq(ty)`: `TypeNotPartialEq`, \"constant of type `{ty}` cannot be used in patterns\"\n  with \"the type must implement `PartialEq`\";\n- `NaN`: \"cannot use NaN in patterns\".\nWhere: `crates/blaze-diagnostics/src/lower/`.\nWhy: rustc refuses these programs; today blaze accepts them.\n\n> forwarded to diagnostics (from requests, pass 17; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:16:34Z",
+  "updated": "2026-10-30T02:16:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-matchck.md#9. diagnostics (blaze-diagnostics): lower the refused constant patterns (db-matchck)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-matchck.md:196"
+    }
+  ]
+}

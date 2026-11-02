@@ -1,0 +1,36 @@
+{
+  "id": "00546",
+  "from_lane": "usercode",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-live",
+    "crates/blaze-usercode/src/test/fork_server.rs"
+  ],
+  "what": "## 8. link (`crates/blaze-live/`, the live runtime): what a test executed, per test process\n\nWhat: two weak C symbols the live runtime defines and the fork server\n(`crates/blaze-usercode/src/test/fork_server.rs`, mine) calls when they resolve:\n- `__blaze_live_fork_child()`, called in the child right after `fork`: it zeroes the per-process\n  execution counters (the child's copy of the parent's, copy-on-write).\n- `__blaze_live_executed(out: *mut [u8; 32], cap: usize) -> usize`, called before the child\n  exits: the code hashes of the functions whose counters moved, written to `out`; the return\n  value is how many there are.\n\nSeparately, the runtime gives the daemon the set the fork server executed before its first\nfork (static initializers, the harness), which counts for every test of that binary.\nWhy: decision 10-29 (compile-time.md, change 3) selects tests by what they *executed*.\nWith lazy compilation over one shared code image, a function resolved once stays resolved\nfor every later process, so stub misses undercount what a test ran; only per-process counters,\nzeroed at fork, are exact. Code that ran before the fork reaches every test. With these hooks,\nusercode adds the executed set to the fork server's `Ended` frame and feeds `Reached` from it.\nUntil then, `Reached` is whatever the daemon gives today, which is sound when it is a superset.\n\n> forwarded to link: `crates/blaze-live/` is lane link's.",
+  "state": "applied",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T09:35:23Z",
+  "taken_by": "speed-sol2-link-live",
+  "why": null,
+  "source": "v2/requests/usercode.md#8. link (`crates/blaze-live/`, the live runtime): what a test executed, per test process",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:531"
+    },
+    {
+      "at": "2026-10-30T09:35:23Z",
+      "by": "speed-sol2-link-live",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:35:23Z",
+      "by": "speed-sol2-link-live",
+      "action": "done",
+      "note": "Answered by the execution log already in crates/blaze-live/src/slots/exec.rs, which the fork server uses: __blaze_exec_slots() before forking and __blaze_exec_arm(region, len) in the child (crates/blaze-usercode/src/test/fork_server/recorded.rs:33-139). The child gets a region of its own, the prelude marks before the fork are carried into it (what ran before the fork counts for every test), and every slot logs its first call again, so what each test process executed is exact per process. Slots map to functions, and so to code hashes, on the daemon side (blaze_testsel::Record::of_region). No __blaze_live_fork_child or __blaze_live_executed is added: they would be a second mechanism for the same set."
+    }
+  ]
+}

@@ -1,12 +1,29 @@
 //! The order cargo sorts units in, which is the order of the graph it prints and of each
 //! unit's dependencies: the order `Ord` derives for cargo's `UnitInner`, `TargetInner` and
-//! `Profile`, field by field, written out here over blaze-manifest's types.
+//! `Profile`, field by field, written out here over blaze-manifest's types. Nothing here
+//! allocates: the graph ranks targets and profiles with these once per build and sorts units by
+//! the ranks.
 
 use std::cmp::Ordering;
 
-use blaze_manifest::profiles::{DebugInfo, Lto, PanicStrategy, Profile, ProfileRoot, Strip};
+use blaze_manifest::profiles::{DebugInfo, Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner};
 use blaze_manifest::targets::{CrateType, Target, TargetKind};
 use cargo_util_schemas::manifest::{TomlDebugInfo, TomlTrimPaths};
+
+/// A string's first eight bytes, big-endian and zero-padded: `prefix(a) < prefix(b)` implies
+/// `a < b`, so a sort compares the strings only when their prefixes are equal.
+pub(crate) fn prefix(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    let mut word = [0u8; 8];
+    let n = bytes.len().min(8);
+    word[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(word)
+}
+
+/// `a` and `b` in string order, their prefixes compared first.
+pub(crate) fn name(a: &str, b: &str) -> Ordering {
+    prefix(a).cmp(&prefix(b)).then_with(|| a.cmp(b))
+}
 
 fn crate_type(it: &CrateType) -> (u8, &str) {
     match it {
@@ -21,28 +38,28 @@ fn crate_type(it: &CrateType) -> (u8, &str) {
     }
 }
 
-fn crate_types(types: &[CrateType]) -> Vec<(u8, &str)> {
-    types.iter().map(crate_type).collect()
+fn target_kind(kind: &TargetKind) -> (u8, &[CrateType]) {
+    match kind {
+        TargetKind::Lib(types) => (0, types),
+        TargetKind::Bin => (1, &[]),
+        TargetKind::Test => (2, &[]),
+        TargetKind::Bench => (3, &[]),
+        TargetKind::ExampleLib(types) => (4, types),
+        TargetKind::ExampleBin => (5, &[]),
+        TargetKind::CustomBuild => (6, &[]),
+    }
 }
 
-fn target_kind(kind: &TargetKind) -> (u8, Vec<(u8, &str)>) {
-    match kind {
-        TargetKind::Lib(types) => (0, crate_types(types)),
-        TargetKind::Bin => (1, Vec::new()),
-        TargetKind::Test => (2, Vec::new()),
-        TargetKind::Bench => (3, Vec::new()),
-        TargetKind::ExampleLib(types) => (4, crate_types(types)),
-        TargetKind::ExampleBin => (5, Vec::new()),
-        TargetKind::CustomBuild => (6, Vec::new()),
-    }
+fn target_kinds(a: &TargetKind, b: &TargetKind) -> Ordering {
+    let ((x, xs), (y, ys)) = (target_kind(a), target_kind(b));
+    x.cmp(&y).then_with(|| xs.iter().map(crate_type).cmp(ys.iter().map(crate_type)))
 }
 
 /// cargo's `TargetInner` order. `doc_scrape_examples`, its last field, is left out: two
 /// targets of one package are told apart well before it.
 pub(crate) fn target(a: &Target, b: &Target) -> Ordering {
-    target_kind(&a.kind)
-        .cmp(&target_kind(&b.kind))
-        .then_with(|| a.name.cmp(&b.name))
+    target_kinds(&a.kind, &b.kind)
+        .then_with(|| name(&a.name, &b.name))
         .then_with(|| a.name_inferred.cmp(&b.name_inferred))
         .then_with(|| a.bin_name.cmp(&b.bin_name))
         .then_with(|| a.src_path.cmp(&b.src_path))
@@ -86,13 +103,17 @@ fn panic(it: PanicStrategy) -> u8 {
 
 fn strip(it: &Strip) -> (u8, &str) {
     match it.into_inner() {
-        blaze_manifest::profiles::StripInner::None => (0, ""),
-        blaze_manifest::profiles::StripInner::Named(name) => (1, name),
+        StripInner::None => (0, ""),
+        StripInner::Named(name) => (1, name),
     }
 }
 
-fn trim_paths(it: &Option<TomlTrimPaths>) -> TomlTrimPaths {
-    it.clone().unwrap_or_else(TomlTrimPaths::none)
+/// What cargo compares a profile that sets no `trim-paths` as.
+// alloc: none, an empty `Vec` in a static.
+static NO_TRIM_PATHS: TomlTrimPaths = TomlTrimPaths::Values(Vec::new());
+
+fn trim_paths(it: &Option<TomlTrimPaths>) -> &TomlTrimPaths {
+    it.as_ref().unwrap_or(&NO_TRIM_PATHS)
 }
 
 /// cargo's derived `Profile` order: the deferred `debuginfo` and `strip` compare as what they
@@ -114,6 +135,6 @@ pub(crate) fn profile(a: &Profile, b: &Profile) -> Ordering {
         .then_with(|| panic(a.panic).cmp(&panic(b.panic)))
         .then_with(|| strip(&a.strip).cmp(&strip(&b.strip)))
         .then_with(|| a.rustflags.cmp(&b.rustflags))
-        .then_with(|| trim_paths(&a.trim_paths).cmp(&trim_paths(&b.trim_paths)))
+        .then_with(|| trim_paths(&a.trim_paths).cmp(trim_paths(&b.trim_paths)))
         .then_with(|| a.hint_mostly_unused.cmp(&b.hint_mostly_unused))
 }

@@ -1,7 +1,0 @@
-{
-  "row": "dependency named only in a file the root includes",
-  "package": "app",
-  "crates": [
-    "app"
-  ]
-}

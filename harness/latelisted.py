@@ -12,7 +12,7 @@ and that edit's patch then compiled every one of them as a function added. Here 
 includes `exports.in` (not a `.rs` file, so nothing loads it but the macro) with EXPORTS
 functions of the C ABI. Once the daemon has built the program, a function is added to the
 library: its patch has to be of a few functions, not of the EXPORTS, and the program has to
-print what cargo's does.
+print what its source says (`PRINTS`).
 
 Python 3, stdlib only.
 """
@@ -40,6 +40,8 @@ FILES = {
                       '[dependencies]\ngen = { path = "../gen" }\n',
     "app/src/main.rs": 'fn main() {\n    println!("{} {}", gen::value(), gen::late_export_3());\n}\n',
 }
+# What the program prints once `value` adds what `added` gives.
+PRINTS = "41 3\n"
 
 
 def patches(home):
@@ -78,7 +80,7 @@ def main():
     env["PATH"] = bin_dir + os.pathsep + env["PATH"]
     for name in ("RUSTC_WRAPPER", "CARGO_INCREMENTAL"):
         env.pop(name, None)
-    side, reference = Side(ws, env, True), Side(ws, env, False)
+    side = Side(ws, env, True)
     program = os.path.join(ws, "target", "debug", "app")
     wrong = []
     try:
@@ -91,15 +93,14 @@ def main():
         said = build(side, "a function added", home)
         made = patches(home)[seen:]
         ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
-        _, theirs = reference.cargo("run", "-q", "-p", "app")
         if "[blaze]" not in said:
             wrong.append("the edit was not built by the daemon")
         elif not made:
             wrong.append("the edit was not patched")
         elif made[-1] >= EXPORTS:
             wrong.append(f"the patch is of {made[-1]} functions: the {EXPORTS} the included file declares were not listed")
-        if ran.stdout != theirs.stdout:
-            wrong.append(f"the program printed {ran.stdout.strip()!r}, cargo's {theirs.stdout.strip()!r}")
+        if ran.stdout != PRINTS:
+            wrong.append(f"the program printed {ran.stdout.strip()!r}, not {PRINTS.strip()!r}")
         print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} patch of {made[-1] if made else '-'} functions")
     finally:
         side.cargo("stop")

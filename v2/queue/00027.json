@@ -1,0 +1,23 @@
+{
+  "id": "00027",
+  "from_lane": "vfs",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs"
+  ],
+  "what": "## 1. core: a directory listing effect (blocks the watcher's scan and rescan)\n\nWhat: in `crates/blaze-core/src/lib.rs`, `Effect::List { dir: FileName, tag: Tag }` completing\nwith `Done::Listed(Vec<(FileName, Meta)>)`: every file and directory under `dir`, recursively,\nwith its `Meta`; in the simulation, threads and io_uring drivers.\n\nWhy: `blaze_vfs::Watcher` needs it (a) to load a directory into a head when a watch starts\nand (b) to rescan after `Done::Changed { lost: true }`. Without it the watcher stops on `lost`\nwith `Watched::Lost`, and the caller must start it on a head that already holds what the\ndirectory does. Once it exists, the vfs lane makes `lost` a rescan (diff of listing and head)\nand adds `Watcher::scan`.\n\nStatus: done. Core added `Effect::List` and `Done::Listed`; the watcher scans with it when a\nwatch starts and rescans on `lost`. Note for core: the simulation's `List` fails for a\ndirectory that holds no file (it has no directory entries), where a real one lists nothing.\n\n> applied: by core and vfs (status above).\n> forwarded to core: the note on the simulation's `List` of a directory with no file.",
+  "state": "open",
+  "created": "2026-10-29T23:57:30Z",
+  "updated": "2026-10-29T23:57:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/vfs.md#1. core: a directory listing effect (blocks the watcher's scan and rescan)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/vfs.md:3"
+    }
+  ]
+}

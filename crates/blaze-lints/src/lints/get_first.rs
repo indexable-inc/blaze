@@ -4,26 +4,28 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
 use hir::AsAssocItem as _;
-use syntax::{AstNode, ast};
+use syntax::view as ast;
+
+use ast::AstNode as _;
 
 use super::utils;
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "get_first";
+const LINT: super::Implemented = super::Implemented::GetFirst;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) {
-        return;
-    }
-    let Some(call) = utils::method_call(cx, expr) else { return };
-    let [ast::Expr::Literal(index)] = &call.args[..] else { return };
-    let ast::LiteralKind::IntNumber(number) = index.kind() else { return };
-    if call.name != "get" || number.value().ok() != Some(0) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT) || utils::method_name(expr) != Some("get") {
         return;
     }
     let ast::Expr::MethodCallExpr(method) = expr else { return };
+    let Some(call) = utils::method_call(cx, expr) else { return };
+    let [ast::Expr::Literal(index)] = call.args() else { return };
+    let ast::LiteralKind::IntNumber(number) = index.kind() else { return };
+    if number.value().ok() != Some(0) {
+        return;
+    }
     let db = cx.db();
-    let Some(function) = cx.sema().resolve_method_call(method) else { return };
+    let Some(function) = cx.method(method) else { return };
     let Some(implementing) = function.as_assoc_item(db).and_then(|it| it.implementing_ty(db))
     else {
         return;

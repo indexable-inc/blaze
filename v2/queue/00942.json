@@ -1,0 +1,24 @@
+{
+  "id": "00942",
+  "from_lane": "speed-core-clones",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-usercode/src/test/queue.rs"
+  ],
+  "what": "Effect::Read allocates a fresh Vec per chunk read (blaze-core uring.rs:2191 Vec::with_capacity(len), uring/files.rs, threads.rs:874 vec![0; len], iocp.rs:854); its one caller, blaze-usercode test/queue.rs:1488, reads the sandbox record in CHUNKs and appends each to server.partial, so every chunk is an allocation and a copy. Exact edit: give Effect::Read an `into: Vec<u8>` field with Recv semantics (bytes appended after what it holds, capacity kept; Done::Read hands `into` back), in blaze-core lib.rs Effect::Read and the four drivers (uring.rs start of Read, threads.rs run Read, iocp.rs Read, sim.rs Read) plus core tests matching `Effect::Read {`; then usercode queue.rs:1488 passes `into: std::mem::take(&mut server.partial)` and at 1495 takes the returned buffer as `server.partial` directly (no extend_from_slice), and usercode test/queue/tests.rs:178 matches `Effect::Read { file, at, len, into, tag }`. Why: a warm chunked read then allocates nothing and copies once (kernel to buffer). It changes a public effect across two lanes, so it lands in one step.",
+  "state": "open",
+  "created": "2026-10-30T10:30:48Z",
+  "updated": "2026-10-30T10:30:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:30:48Z",
+      "by": "speed-core-clones",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

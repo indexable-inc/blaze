@@ -1,0 +1,36 @@
+{
+  "id": "00341",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/builtin/fn_macro.rs",
+    "crates/hir-expand"
+  ],
+  "what": "## E9. `line_starts`: counted, then filled at its exact length\n\nThe result is `Box<[u32]>`, built today in `Vec::with_capacity(text.len() / 32 + 1)`: an estimate,\nso a file with more lines than one per 32 bytes grows it by doubling, and every other file's\n`into_boxed_slice` reallocates to shrink it. After, the newlines are counted first (one pass over\nthe bytes, vectorized by the compiler) and the vector is allocated once at its length:\n\n`crates/hir-expand/src/builtin/fn_macro.rs`, old\n```rust\n    let text = text.text(db).as_bytes();\n    let mut starts = Vec::with_capacity(text.len() / 32 + 1);\n    starts.push(0);\n```\nnew\n```rust\n    let text = text.text(db).as_bytes();\n    let lines = text.iter().filter(|&&byte| byte == b'\\n').count();\n    // alloc: the query's value, once per file, at its exact length\n    let mut starts = Vec::with_capacity(lines + 1);\n    starts.push(0);\n```\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-mem-def (23:10): no longer applies. `line_starts` is gone: `line_and_column` reads `base_db::line_index`, a `span::LineIndex` (span's, not lane db's). The capacity estimate the request replaces isn't in the tree.",
+  "state": "applied",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#E9. `line_starts`: counted, then filled at its exact length",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:498"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-mem-def (23:10): no longer applies. `line_starts` is gone: `line_and_column` reads `base_db::line_index`, a `span::LineIndex` (span's, not lane db's). The capacity estimate the request replaces isn't in the tree."
+    }
+  ]
+}

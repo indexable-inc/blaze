@@ -1,0 +1,47 @@
+{
+  "id": "01199",
+  "from_lane": "tests-misc-front1",
+  "owner": "tests-fuzz",
+  "paths": [
+    "crates/base-db/src/reparse.rs"
+  ],
+  "what": "base-db reparse.rs:269 assert_whole panics 'a reparse whose tree is not the whole parse's' in every blaze-items edit test (round2-test.log ~19577-23290: tests::hashes::a_body_edit_keeps_the_interface_and_callers_code, whitespace_inside_a_literal_is_code, form::a_no_mangle_fn_s_name_is_its_interface, facts::a_capture_edit_changes_captures and ~10 more). The incremental reparse of an edit gives a different tree than a whole parse; the cause may be syntax's reparse (format).",
+  "state": "applied",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T16:50:37Z",
+  "taken_by": "tests-fuzz",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:55:52Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> format: db read base-db's side and it is sound: Reparse::previous (reparse.rs:201) picks a kept parse of the same edition and kind, and syntax Parse::reparse_onto keeps that parse's outline flag, so base-db asks for the right parse. The assert (reparse.rs:269) compares made.root().file() == whole.root().file(), i.e. FlatTree PartialEq (syntax-tree flat.rs:464): words, big, kinds, first mark, lazy data. So either syntax parsing::incremental_reparse_onto builds another tree than a whole parse, or it builds the same tree in another word layout (a splice of the edited node that a whole parse lays out differently). Both are format's (syntax, syntax-tree). Repro: blaze-items tests::hashes::a_body_edit_keeps_the_interface_and_callers_code. If a layout difference is meant to be allowed, FlatTree equality (or a structural compare in assert_whole) is the fix; tell db and db (or base-db's holder, query-unify) changes reparse.rs"
+    },
+    {
+      "at": "2026-10-31T16:49:06Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "format -> tests-fuzz: format has no live window (Andrew 05:08: hand it on within the hour); the cause is syntax incremental_reparse_onto or FlatTree equality (db), and tests-fuzz has the syntax reparsing.rs edits"
+    },
+    {
+      "at": "2026-10-31T16:49:17Z",
+      "by": "tests-fuzz",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:50:37Z",
+      "by": "tests-fuzz",
+      "action": "done",
+      "note": "Round 9 (d38d64b4ea) has no assert_whole panic anywhere (round9-test.log: 0 hits of a reparse whose tree is not the whole parse); blaze-items 127/3 with none in reparse. Fixed by the syntax reparsing.rs edits in round 9 (item refused when its parse enters a node after its last token; reparse_all edits bounded so no unit spans another edit; earlier: items with unpaired curlies near the window edge refused) and the parser recoveries that no longer split a brace pair. assert_whole untouched."
+    }
+  ]
+}

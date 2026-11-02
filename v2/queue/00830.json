@@ -1,0 +1,35 @@
+{
+  "id": "00830",
+  "from_lane": "item-hash-identity",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/key.rs"
+  ],
+  "what": "item-hash: `blaze_items::key::resolve` cannot go back from two kinds of key `def_key` gives, so `blaze_item_hash::keys::def_of` (what hir_ty::body_store reads stored inference/MIR records through) returns None for them: (1) `SolverDefId::Ctor` keys (H(of, \"ctor\") under the struct or variant key): add a `Resolved::Ctor(hir_ty::next_solver::Ctor)` row in `item()` for each struct and enum variant whose fields are a tuple or unit; (2) `anon_const_key`s: add `Resolved::AnonConst { store: ExpressionStoreOwnerId, expr: ExprId }` rows for each expression root of each store `Inner::Store` walks (inner index). def_of then turns an AnonConst row of a signature or variant-fields store into the AnonConstId the owner's lowering made (its type is in its loc). Without (1), every stored record that calls a tuple struct or variant constructor is unreadable.",
+  "state": "applied",
+  "created": "2026-10-30T08:37:31Z",
+  "updated": "2026-10-30T09:21:22Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:37:31Z",
+      "by": "item-hash-identity",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:13:51Z",
+      "by": "item-hash-identity",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:21:22Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "key.rs: Resolved::Ctor rows for tuple and unit structs and variants (ctor_key), Resolved::AnonConst rows for each expression root of each store (anon_const_key_of). def_of maps Ctor; an AnonConst gives None by design (body_store writes anon consts by location and type). Callers index.rs, blaze-item-hash values.rs and keys.rs updated. Tests in tests/hashes.rs."
+    }
+  ]
+}

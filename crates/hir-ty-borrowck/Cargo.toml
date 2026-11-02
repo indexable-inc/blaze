@@ -13,22 +13,30 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
 la-arena.workspace = true
 smallvec.workspace = true
-salsa.workspace = true
+blaze-mem.workspace = true
+blaze-query.workspace = true
 
 ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true
 
 # local deps
 base-db.workspace = true
+blaze-ids.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+hir-ty-matchck.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-wfcheck.workspace = true
 syntax.workspace = true
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+blaze-alloc-count.workspace = true
+blaze-format.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

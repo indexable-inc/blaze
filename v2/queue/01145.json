@@ -1,0 +1,23 @@
+{
+  "id": "01145",
+  "from_lane": "tests-store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "blaze-cas commit retry redoes every pack after any failed step (lib.rs complete/start_commit), so a commit of 7 packs + index (~23 effects) rarely survives a 1-in-9 fault rate: crash-test seeds = 8 mod 12 break the store in 20 of 40 rounds (FAILURES_MOST=8 failed commits in a row). Better design: keep per-pack durable progress (a pack whose WriteAt and Sync both succeeded is durable up to `to`; retry truncates/writes only from there, redoing only the packs whose step failed, which still respects fsyncgate). Not done by tests-store because tests-fuzz has uncommitted edits in crates/blaze-cas/src/lib.rs. Assign to whoever owns blaze-cas.",
+  "state": "open",
+  "created": "2026-10-30T22:34:26Z",
+  "updated": "2026-10-30T22:34:26Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:34:26Z",
+      "by": "tests-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

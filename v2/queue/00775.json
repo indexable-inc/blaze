@@ -1,0 +1,43 @@
+{
+  "id": "00775",
+  "from_lane": "selfbuild",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-codegen/v2/roots/proc_macros.rs",
+    "crates/blaze-units/src/load/plan/env.rs",
+    "crates/blaze-units/src/load/plan.rs",
+    "docs/cargo.md",
+    "crates/proc-macro-srv/proc-macro-test/build.rs",
+    "crates/proc-macro-srv/proc-macro-test",
+    "crates/proc-macro-srv/src/lib.rs",
+    "docs/v2/plan/lanes/usercode/macros.md",
+    "crates/blaze-cargo/src/cargo/directives.rs"
+  ],
+  "what": "## 1. cargo + codegen: `[package.metadata.blaze] proc-macro-libraries` (a blaze extension)\n\nWhat: a package's manifest may list proc-macro dependencies by package name:\n\n```toml\n[package.metadata.blaze]\nproc-macro-libraries = [\"proc-macro-test-impl\"]\n```\n\nFor each name, blaze links that dependency as a native shared library with blaze's list of its\nmacros (`BLAZE_PROC_MACROS`, as `crates/hir-ty-codegen/v2/roots/proc_macros.rs` writes it, the\nlibrary blaze's proc-macro server loads), whatever `native-proc-macros`/`BLAZE_PROC_MACRO_WASM`\nsay, and every crate of the listing package that has it as a dependency (normal or dev) is\ncompiled with `BLAZE_PROC_MACRO_LIBRARY_<NAME>` set to that library's path, `<NAME>` as cargo's\n`envify` makes it (`crates/blaze-units/src/load/plan/env.rs`). The variable is part of the\ncompile's environment, so it keys the unit as `CARGO_BIN_EXE_<name>` does (the library's content\nID, not only its path, as `results.rs` does for programs). A test reading it may read the file\nin the sandboxed-tests experiment.\n\nErrors, each naming the manifest and the entry: a value that is not a list of strings; a name\nthat is not a dependency of the package; a dependency that is not a proc macro; a library that\ncan't be linked. No fallback (no wasm module in its place, no rustc).\n\nWhere: `crates/blaze-units/src/load/plan.rs` (the compile env beside `bin_exes`, and a\ndependency edge on the link) and `plan/env.rs` (`CompileEnv`), the manifest reader for\n`[package.metadata.blaze]`, the native proc-macro link (codegen); `docs/cargo.md` gets a section\nonce it works (it is a current doc, so not before).\n\nWhy: `crates/proc-macro-srv/proc-macro-test/build.rs` ran cargo (and so rustc) inside a build\nscript to make a proc-macro dylib for proc-macro-srv's dylib tests, which broke no-rustc and stopped\nblaze loading its own workspace. That build script is gone: `crates/proc-macro-srv/proc-macro-test`\nis now the proc-macro crate `proc-macro-test-impl`, a path dev-dependency of proc-macro-srv,\nwhose tests read `env!(\"BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL\")`\n(`proc_macro_test_dylib_path` in `crates/proc-macro-srv/src/lib.rs`). Until this lands those\ntests don't compile under `blaze test -p proc-macro-srv`; `blaze check --workspace` (lib\ntargets) is unaffected. Change 20 (macros on blaze's own compiler) would make the server and\nthese tests obsolete, but it hasn't landed and the warm server is what runs native macros\ntoday (`docs/v2/plan/lanes/usercode/macros.md`).\n\n`given_by_cargo` (`crates/blaze-cargo/src/cargo/directives.rs`) refuses a build script setting\n`BLAZE_PROC_MACRO_LIBRARY_*` (selfbuild-env).",
+  "state": "refused",
+  "created": "2026-10-30T07:23:09Z",
+  "updated": "2026-10-30T08:33:17Z",
+  "taken_by": "coord-apply-back",
+  "why": "reassign to cargo (cargo-next2 live), with codegen (codegen-next2 live) for the native link: not started on blaze's side (only proc-macro-srv/-cli manifests and tests use it). Its parts are lane cargo's: the [package.metadata.blaze] reader, the compile env and link edge in crates/blaze-units/src/load/plan.rs and plan/env.rs (CompileEnv, keyed by the library's content ID), given_by_cargo in crates/blaze-cargo/src/cargo/directives.rs; and codegen's: linking the dependency as a native shared library with BLAZE_PROC_MACROS (crates/hir-ty-codegen/v2/roots/proc_macros.rs). An opt-in blaze extension, which superset-of-rust allows, so no policy question; docs/cargo.md once it works.",
+  "source": "v2/requests/selfbuild.md#1. cargo + codegen: `[package.metadata.blaze] proc-macro-libraries` (a blaze extension)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/selfbuild.md:3"
+    },
+    {
+      "at": "2026-10-30T08:33:17Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:17Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "reassign to cargo (cargo-next2 live), with codegen (codegen-next2 live) for the native link: not started on blaze's side (only proc-macro-srv/-cli manifests and tests use it). Its parts are lane cargo's: the [package.metadata.blaze] reader, the compile env and link edge in crates/blaze-units/src/load/plan.rs and plan/env.rs (CompileEnv, keyed by the library's content ID), given_by_cargo in crates/blaze-cargo/src/cargo/directives.rs; and codegen's: linking the dependency as a native shared library with BLAZE_PROC_MACROS (crates/hir-ty-codegen/v2/roots/proc_macros.rs). An opt-in blaze extension, which superset-of-rust allows, so no policy question; docs/cargo.md once it works."
+    }
+  ]
+}

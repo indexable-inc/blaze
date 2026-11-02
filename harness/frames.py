@@ -12,8 +12,7 @@ as 0.
 
 Per build: how many functions, their frames' median, 90th and 99th percentile, the largest
 (and whose), the sum, and how many take 4 KiB or more and 64 KiB or more. Against `--base`
-(say rustc's `release` from runbench.py, whose binaries it keeps as `bin-<label>` beside each
-program): over the functions both have, by name with the hash cut off, the sum of their frames
+(say rustc's `release`, kept as `bin-<label>` beside each program): over the functions both have, by name with the hash cut off, the sum of their frames
 in each and how many are larger, and the `--top` functions whose frames grew the most.
 
 Every objdump runs at once, each bounded; a failure names the binary, the command, its exit

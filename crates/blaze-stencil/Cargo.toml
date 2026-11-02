@@ -1,0 +1,66 @@
+[package]
+name = "blaze-stencil"
+description = "blaze v2's copy-and-patch backend for dev runs: functions compiled by copying stencils LLVM made at blaze's build time and patching their holes, tiered up to Cranelift or LLVM when hot"
+publish = false
+build = "build.rs"
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-codegen.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+cranelift-codegen.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+
+[build-dependencies]
+# The stencils are made by LLVM when blaze is built (docs/v2/plan/lanes/fastcompile/stencil.md,
+# "Why a build script"): the generator in `gen/` drives it through its C API.
+llvm-sys.workspace = true
+object.workspace = true
+# `src/table/format.rs`'s sets and little-endian reads, as the patcher reads them, and the
+# library's id: the BLAKE3 hash of its bytes (`blaze_ids::b3`), which stencil units' settings carry.
+blaze-bytes.workspace = true
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-spin.workspace = true
+cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
+cranelift-frontend.workspace = true
+# The reference each stencil is checked against, and the reader of the CLIF corpus.
+cranelift-interpreter.workspace = true
+cranelift-reader.workspace = true
+# The tests' `.eh_frame`, written with the same gimli cranelift-codegen's `to_fde` gives.
+gimli.workspace = true
+# The tests' global allocator, declared once in `src/tier/tests.rs`: proves hot paths allocate nothing.
+blaze-alloc-count.workspace = true
+# The executable memory the tests link units into (`src/tests/exec.rs`).
+blaze-inproc.workspace = true
+# The coverage survey over real workspaces and std (`tests/coverage.rs`): loaded and lowered
+# as a build does, each function's IR from hir-ty-codegen.
+base-db.workspace = true
+blaze-format.workspace = true
+blaze-lower.workspace = true
+blaze-macro-eval.workspace = true
+blaze-query.workspace = true
+blaze-units.workspace = true
+blaze-vfs.workspace = true
+hir-ty-codegen.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

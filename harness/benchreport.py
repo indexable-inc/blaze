@@ -29,20 +29,21 @@ small table of a few projects on one platform (PICK) between `<!-- benchpick:sta
 `memory`, `resident` and `disk_mb`, docs/benchmarks.md "Memory and disk") between
 `<!-- benchmem:start -->` and `<!-- benchmem:end -->`, and every number between
 `<!-- bench:start -->` and `<!-- bench:end -->`.
-A result of `bench.py --runtime` (harness/runbench.py's numbers) writes docs/benchmarks.md's
+A runtime result (v1's harness/runbench.py's numbers; v2 has no runtime bench yet) writes docs/benchmarks.md's
 runtime table instead, between `<!-- runbench:start -->` and `<!-- runbench:end -->`: how fast each
 benchmark's program runs built by blaze's LLVM against `cargo build --release`, and the
 geometric mean. It is stored in docs/benchmarks/runtime-<platform>.json, and differs when a
 median of any build moved by more than noise, a benchmark is new or gone, or the stored run is
-older than `--max-age`. A build that failed, or whose program did not do what the release build's
-did, has the whole result refused.
+older than `--max-age`. A build that failed, or whose program's run failed, has the whole result
+refused.
 `--name NAME` is a project measured on its own (bun, by the bench-bun workflow, which needs hours):
 its results are stored in docs/benchmarks/NAME-<platform>.json and runtime-NAME-<platform>.json,
 compared with those, and are a project like the others in every table and chart: each platform's
 results are its own result's with those of each project measured on its own folded in
 (`stored_all`), and a footnote under each table names the machine, commit and date of each such
 project. docs/benchmarks.md has every number of each, under its platform.
-A result in which a program said something else than cargo's (`wrong`) is refused: exit 2,
+A result in which a program said something else than blaze's cold build of it, or its run
+failed (`wrong`), is refused: exit 2,
 nothing written. A test suite that ended otherwise under `blaze test` is not refused: the
 tests table says how, and the workflow fails after writing. `--check` writes nothing and exits 1
 when it would have written. `--memory`, from before there were platforms, is the same as no flag:
@@ -607,9 +608,7 @@ def setups_table(result, keys, backend, name=""):
 
 
 def said_otherwise(difference):
-    """How a test suite ended otherwise under blaze, for a table cell."""
-    if found := re.fullmatch(r"(-?\d+) for (-?\d+)", difference or ""):
-        return f"`blaze test` exited {found[1]}, `cargo test` {found[2]}"
+    """What was wrong with a test suite under blaze, for a table cell."""
     return (difference or "").replace("|", "\\|")[:120]
 
 
@@ -621,8 +620,8 @@ def tests_table(result, keys, backend, name=""):
              "`blaze test` and `cargo test` of the same tests, median of three: after the edit of a widely used function "
              "(the file named), and again with nothing changed. Each includes running the tests. First runs: the three untimed "
              "runs of `blaze test` before them (the first is handed to cargo, the daemon builds the test targets at the "
-             "second). Every test has to end the same way under both, every time.", "",
-             "| Project | Command | Tests | Same outcome | Edited | Edit, then test: cargo | blaze | | Built | Nothing changed: cargo | blaze | First runs of blaze |",
+             "second). Every test has to pass under blaze by its own verdict, every time; cargo is only timed.", "",
+             "| Project | Command | Tests | All pass | Edited | Edit, then test: cargo | blaze | | Built | Nothing changed: cargo | blaze | First runs of blaze |",
              "|---|---|---:|---|---|---:|---:|---:|---|---:|---:|---|"]
     for key in keys:
         test = result["results"][key]["phases"]["test"]
@@ -638,14 +637,14 @@ def tests_table(result, keys, backend, name=""):
 
 def runtime_wrong(result):
     """Why a runtime result may not be published: a build that failed or whose program
-    behaved otherwise than cargo's release build."""
+    did not run to the end."""
     wrong = []
     for name, program in (result.get("runbench") or {}).get("programs", {}).items():
         for build, info in program["builds"].items():
             if info.get("error"):
                 wrong.append(f"{name} {build}: the build failed")
-            for bench in info.get("differs", []):
-                wrong.append(f"{bench} {build}: the program did not do what cargo's release build did")
+            for bench in info.get("failed_runs", []):
+                wrong.append(f"{bench} {build}: the program's run failed")
         for bench, timed in program.get("benches", {}).items():
             for build in ("release", "blaze-engine"):
                 if build not in timed:
@@ -937,8 +936,8 @@ def runtime_section(results):
         lines += ["", f"**{p}**", "", *runtime_tables(r)]
     lines += ["", "Release with dev checks: `cargo build --release` with `-C overflow-checks=on -C debug-assertions=on`.", "",
               "</details>", "",
-              "Measured by hand with `harness/bench.py --runtime` (harness/runbench.py), or by the `bench-readme` workflow (a "
-              "project measured on its own, by its own workflow) on each platform's benchmark machine once it is registered. "
+              "Measured by v1's runbench.py on each platform's benchmark machine, the last results before v2, "
+              "which has no runtime bench yet. "
               f"Raw JSON: {raw_links(results, 'runtime')}.", RUN_END]
     return "\n".join(lines)
 
@@ -1015,7 +1014,8 @@ def main():
         wrong = [f"{key}: {line}" for key, measured in result["results"].items() for line in measured.get("wrong", [])]
     tests = [line for line in wrong if not runtime and line.split(": ", 1)[1].startswith("tests (")]
     if programs := [line for line in wrong if line not in tests]:
-        print("refused: a program did not say what cargo's said\n" + "\n".join(programs))
+        print("refused: a program said something else than blaze's cold build, or its run failed\n"
+              + "\n".join(programs))
         sys.exit(2)
     if tests:
         print("written with tests that ended otherwise than under cargo (shown in the table):\n" + "\n".join(tests))

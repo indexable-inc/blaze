@@ -1,0 +1,42 @@
+{
+  "id": "00836",
+  "from_lane": "tree-store",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/editioned_file_id.rs",
+    "crates/base-db/src/reparse.rs",
+    "crates/base-db/src/trees.rs",
+    "crates/base-db/src/trees/tests.rs",
+    "crates/base-db/src/db.rs",
+    "crates/base-db/src/files.rs",
+    "crates/base-db/src/lib.rs",
+    "crates/base-db/Cargo.toml"
+  ],
+  "what": "FYI (already done by lane tree-store, per its brief; please keep): base-db `EditionedFileId::parse` is now a plain method over tracked free fn `parse_` (`self_ty = EditionedFileId`, debug name unchanged, `lru = 0`, `mem_tag = Parse`), reading library trees from `db.trees()` (new module trees.rs, field `parses: Parses` in db.rs, `Db::admit_parses`/`parse_capacity`), `Reparse::parse` takes the stored trees and returns Result, `Files::texts`, `DEFAULT_PARSE_LRU_CAP` removed, dep blaze-bytes. Tests in trees/tests.rs. Mark done if fine.",
+  "state": "applied",
+  "created": "2026-10-30T08:40:42Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:40:42Z",
+      "by": "tree-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: FYI, nothing to apply"
+    }
+  ]
+}

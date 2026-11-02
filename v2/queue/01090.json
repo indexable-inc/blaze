@@ -1,0 +1,25 @@
+{
+  "id": "01090",
+  "from_lane": "coord-1030",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/callee.rs",
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty/src/method_resolution.rs"
+  ],
+  "what": "## Valid v2 code the bootstrap refuses in MIR lowering, root cause not yet pinned\n\nFrom v2's first build by the bootstrap (refusals in /Volumes/Projects/.coord-1030/v2-build/errors/refused-1.txt). Read from code; nothing here was run, and the worker log keeps only the first words of each message, so the exact expression is unknown. Each body reads as valid Rust:\n\n1. `hir_def::deps::signatures::served` (`crates/hir-def/src/deps/signatures.rs:420`): `frontend: mir: TypeError(\"function call on bad type\")`, seen through every `served_*` caller. `hir-ty-mir` `lower.rs` gives it for an `Expr::Call` with no method resolution whose callee is not a fn item, fn pointer, closure or error. The one call in the body that is none of those is `live(krate)`, with `live: impl FnOnce(Crate) -> R<Vec<u8>>` (an APIT beside an explicit `<S: Sig>`, its output a local alias with a default, `type R<T = ()> = Result<T, String>`; the callers name `S` by turbofish). Candidate reproducer:\n```rust\ntype R<T = ()> = Result<T, String>;\ntrait Sig { type Value; }\nfn served<S: Sig>(live: impl FnOnce(u32) -> R<Vec<u8>>) -> Option<S::Value> {\n    let _ = live(1);\n    None\n}\n```\nIf inference finds no `FnOnce` for the call, it pushes `ExpectedFunction`, which `blaze check` did not report either.\n2. `<proc_macro_srv::token_stream::TokenStream<Span>>::write_wire` (`crates/proc-macro-srv/src/wire.rs:52`): `frontend: mir: UnresolvedMethod`. Suspect: `builder.build_in(frame).write_wire(out)` (line 92), a method of `tt::Tree` reached by autoderef through `impl<A: Allocator> Deref for TopSubtree<A>` (`crates/tt/src/storage/owned.rs:122`) with `A = &blaze_mem::Frame`, so `&Frame: Allocator` comes from core's `impl<A: Allocator + ?Sized> Allocator for &A`.\n3. `<blaze_mem::frame::Frame>::commit_span` (`crates/blaze-mem/src/frame.rs:379`): `frontend: layout of {type error}: HasErrorType`. No invalid name or type found in it. It has a `match` on `self.task && more > 0`, `cap::frame_reserve(more).map_err(|why| refused(why, self.tag.get(), more))?` (the closure captures the field `self.tag` by reference), and `header(block).span.as_deref()` on `Option<ManuallyDrop<Region>>`.\n4. One more `frontend: mir: HasErrors` whose function the log does not name.\n\nAsk: the full messages from the next build (expression ids and types), then a reproducer and fix for each in the front end.",
+  "state": "open",
+  "created": "2026-10-30T16:20:42Z",
+  "updated": "2026-10-30T16:20:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:20:42Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

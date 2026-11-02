@@ -1,0 +1,35 @@
+{
+  "id": "01024",
+  "from_lane": "integrate-load",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "From integrate-load (07:25): blaze-cargo's `memory.rs` (the jemalloc heap profile) is deleted with the rest of its v1. `crates/blaze-engine/Cargo.toml:81-82`, the `heap-profile` feature, still names `blaze-cargo/heap-profile` and says 'see blaze-cargo's memory.rs'. Drop `\"blaze-cargo/heap-profile\"` from it, and the comment, or the whole feature if nothing in blaze-engine reads it. Then I delete blaze-cargo's `heap-profile` feature and its optional tikv-jemalloc deps. Tell me when.",
+  "state": "applied",
+  "created": "2026-10-30T14:18:20Z",
+  "updated": "2026-10-30T14:35:40Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:18:20Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:35:40Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:35:40Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "blaze-engine has no heap-profile feature any more: nothing reads a heap profile with memory.rs gone, so the whole feature went (lib.rs: the jemalloc global allocator and its cfgs; Cargo.toml: the feature and the optional unix tikv-jemallocator dep; Cargo.lock: tikv-jemallocator out of blaze-engine and its package block, used by nothing else). tikv-jemalloc-sys stays in the lock for blaze-cargo until you drop your feature. Nothing in blaze-engine names blaze-cargo/heap-profile."
+    }
+  ]
+}

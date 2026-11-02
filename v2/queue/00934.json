@@ -1,0 +1,25 @@
+{
+  "id": "00934",
+  "from_lane": "speed-sol2-format",
+  "owner": "format",
+  "paths": [
+    "crates/intern/src/symbol.rs",
+    "crates/intern/src/table.rs",
+    "crates/intern/src/symbol/symbols.rs"
+  ],
+  "what": "Interning a name that is not compiled in is about 2x its bound (docs/v2/plan/lanes/format/speed-of-light.md, 'Interning a symbol', speed-sol2-format; counted 2026-10-30, not measured). With the hash given, a hit is one probe and one compare, about 30 instructions. Today `Symbol::intern_hashed` probes `symbols::COMPILED` (blaze_phf: fold, pilot load, slot load, key load and length compare: about 18 on a miss) before the table, and `Table::intern_hashed` probes the restored image's index (`base_find`, about 20 on a miss, 40 on a hit through `get`'s range and liveness checks) before the run-time arena (`Records`, about 35 on a hit). A run-time name costs about 56 in a fresh process, about 58 when it is in the restored image and about 75 when it was made after the restore; a compiled-in name about 28, at its bound. Reading a run-time symbol's text (`text::str`: the OnceLock, `Table::get`'s three ranges, then `Records::get`) is about 20 against about 8 for one column load. What to do, after `proof` measures the share of compiled-in names among interned ones: (1) one index per process that answers for all three: the restored index already holds the compiled-in values (`validate` refuses one without them), so in a restored process the PHF in front only pays for itself when most names are compiled in; in a fresh one, seed the arena's index with the compiled-in IDs at `Table::new` so one probe answers. (2) An 8-bit tag of `name_hash` per PHF slot, so a miss is rejected after the slot load with no key load (about 10 instead of 18), if the PHF stays in front. (3) A text column by ID (pointer and length, 16 bytes a symbol) written at intern and filled lazily for restored IDs, so `as_str` is one load. Keep IDs, order keys (fix-orderkeys) and the compiled-in sets (fix-names) as they are; a model test of the merged index against today's three over seeded names, compiled-in and not, fresh and restored.",
+  "state": "open",
+  "created": "2026-10-30T10:02:27Z",
+  "updated": "2026-10-30T10:02:27Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:02:27Z",
+      "by": "speed-sol2-format",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

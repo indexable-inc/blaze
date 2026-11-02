@@ -1,0 +1,21 @@
+{
+  "id": "00155",
+  "from_lane": "diagnostics-items-ast",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-ast: the order of the AST validation errors hir gives\n\nWhat: E0130 (`lower/pattern_arg_in_extern_fn.rs`), the `MissingBody` errors\n(`lower/missing_body.rs`) and E0198 (`lower/trait_impl_incorrect_safety.rs`'\n`unsafe_negative`) are rustc's AST validation's, given as its walk comes to their item, among\n`checks::ast_validation`'s. `check.rs` extends `found` with hir's lowered errors before\n`checks::check`, and sorts by phase only, so all of these come before every error of\n`checks::ast_validation` at `Phase::Resolve`. In `tests/ui/parser/self-param-semantic-fail.rs`\n(in `tests/items/ast_validation.rs`) rustc gives each E0130 right after the `self` error of\nthe same function; blaze would give both E0130s first.\n\nTwo ways, the first preferred:\n\n1. `checks::ast_validation` gives these three itself (`fns::visit_fn` for E0130 in the\n   `Ctxt::Foreign` arm of its `patterns` call; `items.rs` for the free `const`/`static`/`type`\n   and associated `const`/`type` without a body, and E0198 in `impl_`), and the three\n   lowerings return nothing. This child can write it once told to.\n2. `Found` carries the node it was found at, and `check.rs` orders the `Phase::Resolve` finds\n   of hir and of `checks::ast_validation` by `Walk::place`.\n\n> for: diagnostics-items (owners of `lower/` and `check.rs`).\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:52:14Z",
+  "updated": "2026-10-30T01:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-ast.md#diagnostics-items-ast: the order of the AST validation errors hir gives",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-ast.md:38"
+    }
+  ]
+}

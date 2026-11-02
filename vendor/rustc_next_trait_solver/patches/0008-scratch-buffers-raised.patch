@@ -1,0 +1,50 @@
+diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
+--- a/src/solve/scratch.rs
++++ b/src/solve/scratch.rs
+@@ -39,10 +39,16 @@
+             self.$field.pop().unwrap_or_default()
+         }
+ 
+-        /// Takes back a buffer, emptied. One that never grew holds nothing worth keeping.
++        /// Takes back a buffer, emptied and grown to the largest its pool holds: the pool hands
++        /// buffers out last in, first out, so without it a goal may get one smaller than a
++        /// sibling outgrew and grow it again each run. One that never grew holds nothing worth
++        /// keeping.
+         pub(super) fn $give(&mut self, mut buffer: $ty) {
+             if buffer.capacity() != 0 {
+                 buffer.clear();
++                let largest = self.$field.iter().map(|it| it.capacity()).max().unwrap_or(0);
++                // alloc: once per buffer below its pool's largest, while warming.
++                buffer.reserve(largest);
+                 self.$field.push(buffer);
+             }
+         }
+@@ -149,6 +155,28 @@
+                 buffer.extend(0..64);
+                 pool.give(buffer);
+             }
++        });
++    }
++
++    /// Two buffers of different sizes, taken in either order once warm, never grow: each given
++    /// back is raised to the larger.
++    #[test]
++    fn warm_buffers_hold_the_largest_any_needed() {
++        let mut pool = Pool::default();
++        let (mut big, mut small) = (pool.take(), pool.take());
++        big.extend(0..100);
++        small.extend(0..10);
++        pool.give(big);
++        pool.give(small);
++        let (first, second) = (pool.take(), pool.take());
++        pool.give(first);
++        pool.give(second);
++        blaze_alloc_count::assert_at_most(0, "buffers raised to the largest", || {
++            let (mut first, mut second) = (pool.take(), pool.take());
++            first.extend(0..100);
++            second.extend(0..100);
++            pool.give(second);
++            pool.give(first);
+         });
+     }
+ 

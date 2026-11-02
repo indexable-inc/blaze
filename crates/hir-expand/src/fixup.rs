@@ -1,19 +1,20 @@
 //! To make attribute macros work reliably when typing, we need to take care to
 //! fix up syntax errors in the code we're passing to them.
 
+use blaze_hash::FixedState;
+use blaze_mem::Frame;
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::smallvec;
 use span::{
     ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor,
     SyntaxContext,
 };
 use stdx::never;
 use syntax::{
-    SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, AstNode, HasLoopBody},
-    match_ast,
+    SyntaxKind, TextRange, TextSize, match_ast,
+    view::{self, AstNode as _, HasLoopBody as _, NodeId},
 };
-use syntax_bridge::DocCommentDesugarMode;
+use syntax_bridge::{Appended, DocCommentDesugarMode, Removed};
 use thin_vec::ThinVec;
 use tt::{Spacing, TransformTtAction, transform_tt};
 
@@ -25,15 +26,27 @@ use crate::{
 /// The result of calculating fixes for a syntax node -- a bunch of changes
 /// (appending to and replacing nodes), the information that is needed to
 /// reverse those changes afterwards, and a token map.
-#[derive(Debug, Default)]
-pub(crate) struct SyntaxFixups {
-    pub(crate) append: FxHashMap<SyntaxElement, Vec<Leaf>>,
-    pub(crate) remove: FxHashSet<SyntaxElement>,
+///
+/// `K` names an element: a view's [`NodeId`].
+pub(crate) struct SyntaxFixups<'f, K = NodeId> {
+    pub(crate) append: Appended<K, &'f Frame>,
+    pub(crate) remove: Removed<K, &'f Frame>,
     pub(crate) undo_info: SyntaxFixupUndoInfo,
 }
 
+impl<'f, K> SyntaxFixups<'f, K> {
+    /// No fixups, their maps in `frame`.
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        SyntaxFixups {
+            append: Appended::with_hasher_in(FixedState, frame),
+            remove: Removed::with_hasher_in(FixedState, frame),
+            undo_info: SyntaxFixupUndoInfo::NONE,
+        }
+    }
+}
+
 /// This is the information needed to reverse the fixups.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyntaxFixupUndoInfo {
     original: Option<ThinVec<TopSubtree>>,
 }
@@ -49,295 +62,340 @@ const FIXUP_DUMMY_RANGE: TextRange = TextRange::empty(TextSize::new(0));
 // `original` list in `SyntaxFixupUndoInfo`.
 const FIXUP_DUMMY_RANGE_END: TextSize = TextSize::new(!0);
 
-pub(crate) fn fixup_syntax(
-    span_map: SpanMap<'_>,
-    node: &SyntaxNode,
-    call_site: Span,
-    mode: DocCommentDesugarMode,
-) -> SyntaxFixups {
-    let mut append = FxHashMap::<SyntaxElement, _>::default();
-    let mut remove = FxHashSet::<SyntaxElement>::default();
-    let mut preorder = node.preorder();
-    let mut original = ThinVec::new();
-    let dummy_range = FIXUP_DUMMY_RANGE;
-    let fake_span = |range| {
-        let span = span_map.span_for_range(range);
-        Span {
-            range: dummy_range,
-            anchor: SpanAnchor { ast_id: FIXUP_DUMMY_AST_ID, ..span.anchor },
-            ctx: span.ctx,
-        }
-    };
-    while let Some(event) = preorder.next() {
-        let syntax::WalkEvent::Enter(node) = event else { continue };
+/// The fixups of the syntax errors under `node`: [`fixup_syntax`], over a view of the
+/// database's tree.
+macro_rules! fixup_syntax_impl {
+    ($name:ident, $Node:ty, $Owned:ty, $Key:ty, $ast:ident, $key:ident, $to_tt:path) => {
+        #[allow(clippy::clone_on_copy, reason = "the body was written for handles too; a view is `Copy`")]
+        pub(crate) fn $name<'f>(
+            frame: &'f Frame,
+            span_map: SpanMap<'_>,
+            node: $Node,
+            call_site: Span,
+            mode: DocCommentDesugarMode,
+        ) -> SyntaxFixups<'f, $Key> {
+            fn has_error(node: &$Owned) -> bool {
+                node.children().any(|c| c.kind() == SyntaxKind::ERROR)
+            }
 
-        let node_range = node.text_range();
-        if can_handle_error(&node) && has_error_to_handle(&node) {
-            remove.insert(node.clone().into());
-            // the node contains an error node, we have to completely replace it by something valid
-            let original_tree =
-                syntax_bridge::syntax_node_to_token_tree(&node, span_map, call_site, mode);
-            let idx = original.len() as u32;
-            original.push(original_tree);
-            let span = span_map.span_for_range(node_range);
-            let replacement = Leaf::Ident(Ident {
-                sym: sym::__ra_fixup,
-                span: Span {
-                    range: TextRange::new(TextSize::new(idx), FIXUP_DUMMY_RANGE_END),
+            fn can_handle_error(node: &$Owned) -> bool {
+                view::Expr::can_cast(node.kind())
+            }
+
+            fn has_error_to_handle(node: &$Owned) -> bool {
+                has_error(node) || node.children().any(|c| !can_handle_error(&c) && has_error_to_handle(&c))
+            }
+
+            let SyntaxFixups { mut append, mut remove, .. } = SyntaxFixups::<$Key>::new_in(frame);
+            let mut preorder = node.preorder();
+            let mut original: Vec<TopSubtree, &Frame> = Vec::new_in(frame);
+            let dummy_range = FIXUP_DUMMY_RANGE;
+            let fake_span = |range| {
+                let span = span_map.span_for_range(range);
+                Span {
+                    range: dummy_range,
                     anchor: SpanAnchor { ast_id: FIXUP_DUMMY_AST_ID, ..span.anchor },
                     ctx: span.ctx,
-                },
-                is_raw: tt::IdentIsRaw::No,
-            });
-            append.insert(node.clone().into(), vec![replacement]);
-            preorder.skip_subtree();
-            continue;
-        }
-        // In some other situations, we can fix things by just appending some tokens.
-        match_ast! {
-            match node {
-                ast::FieldExpr(it) => {
-                    if it.name_ref().is_none() {
-                        // incomplete field access: some_expr.|
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Ident(Ident {
-                                sym: sym::__ra_fixup,
-                                span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
-                            }),
-                        ]);
-                    }
-                },
-                ast::ExprStmt(it) => {
-                    let needs_semi = it.semicolon_token().is_none() && it.expr().is_some_and(|e| e.syntax().kind() != SyntaxKind::BLOCK_EXPR);
-                    if needs_semi {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: ';',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range),
-                            }),
-                        ]);
-                    }
-                },
-                ast::LetStmt(it) => {
-                    if it.semicolon_token().is_none() {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: ';',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::IfExpr(it) => {
-                    if it.condition().is_none() {
-                        // insert placeholder token after the if token
-                        let if_token = match it.if_token() {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        append.insert(if_token.into(), vec![
-                            Leaf::Ident(Ident {
-                                sym: sym::__ra_fixup,
-                                span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
-                            }),
-                        ]);
-                    }
-                    if it.then_branch().is_none() {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: '{',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                            Leaf::Punct(Punct {
-                                char: '}',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::WhileExpr(it) => {
-                    if it.condition().is_none() {
-                        // insert placeholder token after the while token
-                        let while_token = match it.while_token() {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        append.insert(while_token.into(), vec![
-                            Leaf::Ident(Ident {
-                                sym: sym::__ra_fixup,
-                                span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
-                            }),
-                        ]);
-                    }
-                    if it.loop_body().is_none() {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: '{',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                            Leaf::Punct(Punct {
-                                char: '}',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::LoopExpr(it) => {
-                    if it.loop_body().is_none() {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: '{',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                            Leaf::Punct(Punct {
-                                char: '}',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::MatchExpr(it) => {
-                    if it.expr().is_none() {
-                        let match_token = match it.match_token() {
-                            Some(t) => t,
-                            None => continue
-                        };
-                        append.insert(match_token.into(), vec![
-                            Leaf::Ident(Ident {
-                                sym: sym::__ra_fixup,
-                                span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
-                            }),
-                        ]);
-                    }
-                    if it.match_arm_list().is_none() {
-                        // No match arms
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: '{',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                            Leaf::Punct(Punct {
-                                char: '}',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::ForExpr(it) => {
-                    let for_token = match it.for_token() {
-                        Some(token) => token,
-                        None => continue
-                    };
+                }
+            };
+            while let Some(event) = preorder.next() {
+                let syntax::WalkEvent::Enter(node) = event else { continue };
 
-                    let [pat, in_token, iter] = [
-                         sym::underscore,
-                         sym::in_,
-                         sym::__ra_fixup,
-                    ].map(|sym|
-                        Leaf::Ident(Ident {
-                            sym,
-                            span: fake_span(node_range),
-                            is_raw: tt::IdentIsRaw::No
-                        }),
-                    );
+                let node_range = node.text_range();
+                if can_handle_error(&node) && has_error_to_handle(&node) {
+                    // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                    remove.insert($key!(node.clone()));
+                    // the node contains an error node, we have to completely replace it by something valid
+                    let original_tree =
+                        $to_tt(&node, span_map, call_site, mode);
+                    let idx = original.len() as u32;
+                    original.push(original_tree);
+                    let span = span_map.span_for_range(node_range);
+                    let replacement = Leaf::Ident(Ident {
+                        sym: sym::__ra_fixup,
+                        span: Span {
+                            range: TextRange::new(TextSize::new(idx), FIXUP_DUMMY_RANGE_END),
+                            anchor: SpanAnchor { ast_id: FIXUP_DUMMY_AST_ID, ..span.anchor },
+                            ctx: span.ctx,
+                        },
+                        is_raw: tt::IdentIsRaw::No,
+                    });
+                    // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                    append.insert($key!(node.clone()), smallvec![replacement]);
+                    preorder.skip_subtree();
+                    continue;
+                }
+                // In some other situations, we can fix things by just appending some tokens.
+                match_ast! {
+                    match node {
+                        $ast::FieldExpr(it) => {
+                            if it.name_ref().is_none() {
+                                // incomplete field access: some_expr.|
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Ident(Ident {
+                                        sym: sym::__ra_fixup,
+                                        span: fake_span(node_range),
+                                        is_raw: tt::IdentIsRaw::No
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::ExprStmt(it) => {
+                            let needs_semi = it.semicolon_token().is_none() && it.expr().is_some_and(|e| e.syntax().kind() != SyntaxKind::BLOCK_EXPR);
+                            if needs_semi {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: ';',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range),
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::LetStmt(it) => {
+                            if it.semicolon_token().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: ';',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::IfExpr(it) => {
+                            if it.condition().is_none() {
+                                // insert placeholder token after the if token
+                                let if_token = match it.if_token() {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(if_token), smallvec![
+                                    Leaf::Ident(Ident {
+                                        sym: sym::__ra_fixup,
+                                        span: fake_span(node_range),
+                                        is_raw: tt::IdentIsRaw::No
+                                    }),
+                                ]);
+                            }
+                            if it.then_branch().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: '{',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                    Leaf::Punct(Punct {
+                                        char: '}',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::WhileExpr(it) => {
+                            if it.condition().is_none() {
+                                // insert placeholder token after the while token
+                                let while_token = match it.while_token() {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(while_token), smallvec![
+                                    Leaf::Ident(Ident {
+                                        sym: sym::__ra_fixup,
+                                        span: fake_span(node_range),
+                                        is_raw: tt::IdentIsRaw::No
+                                    }),
+                                ]);
+                            }
+                            if it.loop_body().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: '{',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                    Leaf::Punct(Punct {
+                                        char: '}',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::LoopExpr(it) => {
+                            if it.loop_body().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: '{',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                    Leaf::Punct(Punct {
+                                        char: '}',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::MatchExpr(it) => {
+                            if it.expr().is_none() {
+                                let match_token = match it.match_token() {
+                                    Some(t) => t,
+                                    None => continue
+                                };
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(match_token), smallvec![
+                                    Leaf::Ident(Ident {
+                                        sym: sym::__ra_fixup,
+                                        span: fake_span(node_range),
+                                        is_raw: tt::IdentIsRaw::No
+                                    }),
+                                ]);
+                            }
+                            if it.match_arm_list().is_none() {
+                                // No match arms
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: '{',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                    Leaf::Punct(Punct {
+                                        char: '}',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::ForExpr(it) => {
+                            let for_token = match it.for_token() {
+                                Some(token) => token,
+                                None => continue
+                            };
 
-                    if it.pat().is_none() && it.in_token().is_none() && it.iterable().is_none() {
-                        append.insert(for_token.into(), vec![pat, in_token, iter]);
-                    // does something funky -- see test case for_no_pat
-                    } else if it.pat().is_none() {
-                        append.insert(for_token.into(), vec![pat]);
-                    }
-
-                    if it.loop_body().is_none() {
-                        append.insert(node.clone().into(), vec![
-                            Leaf::Punct(Punct {
-                                char: '{',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                            Leaf::Punct(Punct {
-                                char: '}',
-                                spacing: Spacing::Alone,
-                                span: fake_span(node_range)
-                            }),
-                        ]);
-                    }
-                },
-                ast::RecordExprField(it) => {
-                    if let Some(colon) = it.colon_token()
-                        && it.name_ref().is_some() && it.expr().is_none() {
-                            append.insert(colon.into(), vec![
+                            let [pat, in_token, iter] = [
+                                 sym::underscore,
+                                 sym::in_,
+                                 sym::__ra_fixup,
+                            ].map(|sym|
                                 Leaf::Ident(Ident {
-                                    sym: sym::__ra_fixup,
+                                    sym,
                                     span: fake_span(node_range),
                                     is_raw: tt::IdentIsRaw::No
-                                })
-                            ]);
-                        }
-                },
-                ast::Path(it) => {
-                    if let Some(colon) = it.coloncolon_token()
-                        && it.segment().is_none() {
-                            append.insert(colon.into(), vec![
-                                Leaf::Ident(Ident {
-                                    sym: sym::__ra_fixup,
-                                    span: fake_span(node_range),
-                                    is_raw: tt::IdentIsRaw::No
-                                })
-                            ]);
-                        }
-                },
-                ast::ClosureExpr(it) => {
-                    if it.body().is_none() {
-                        append.insert(node.into(), vec![
-                            Leaf::Ident(Ident {
-                                sym: sym::__ra_fixup,
-                                span: fake_span(node_range),
-                                is_raw: tt::IdentIsRaw::No
-                            })
-                        ]);
+                                }),
+                            );
+
+                            if it.pat().is_none() && it.in_token().is_none() && it.iterable().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(for_token), smallvec![pat, in_token, iter]);
+                            // does something funky -- see test case for_no_pat
+                            } else if it.pat().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(for_token), smallvec![pat]);
+                            }
+
+                            if it.loop_body().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node.clone()), smallvec![
+                                    Leaf::Punct(Punct {
+                                        char: '{',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                    Leaf::Punct(Punct {
+                                        char: '}',
+                                        spacing: Spacing::Alone,
+                                        span: fake_span(node_range)
+                                    }),
+                                ]);
+                            }
+                        },
+                        $ast::RecordExprField(it) => {
+                            if let Some(colon) = it.colon_token()
+                                && it.name_ref().is_some() && it.expr().is_none() {
+                                    // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                    append.insert($key!(colon), smallvec![
+                                        Leaf::Ident(Ident {
+                                            sym: sym::__ra_fixup,
+                                            span: fake_span(node_range),
+                                            is_raw: tt::IdentIsRaw::No
+                                        })
+                                    ]);
+                                }
+                        },
+                        $ast::Path(it) => {
+                            if let Some(colon) = it.coloncolon_token()
+                                && it.segment().is_none() {
+                                    // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                    append.insert($key!(colon), smallvec![
+                                        Leaf::Ident(Ident {
+                                            sym: sym::__ra_fixup,
+                                            span: fake_span(node_range),
+                                            is_raw: tt::IdentIsRaw::No
+                                        })
+                                    ]);
+                                }
+                        },
+                        $ast::ClosureExpr(it) => {
+                            if it.body().is_none() {
+                                // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
+                                append.insert($key!(node), smallvec![
+                                    Leaf::Ident(Ident {
+                                        sym: sym::__ra_fixup,
+                                        span: fake_span(node_range),
+                                        is_raw: tt::IdentIsRaw::No
+                                    })
+                                ]);
+                            }
+                        },
+                        _ => (),
                     }
-                },
-                _ => (),
+                }
             }
+            let needs_fixups = !append.is_empty() || !original.is_empty();
+            let original = needs_fixups.then(|| {
+                let mut owned = ThinVec::with_capacity(original.len());
+                owned.extend(original.drain(..));
+                owned
+            });
+            SyntaxFixups { append, remove, undo_info: SyntaxFixupUndoInfo { original } }
         }
-    }
-    original.shrink_to_fit();
-    let needs_fixups = !append.is_empty() || !original.is_empty();
-    SyntaxFixups {
-        append,
-        remove,
-        undo_info: SyntaxFixupUndoInfo { original: needs_fixups.then_some(original) },
-    }
+    };
 }
 
-fn has_error(node: &SyntaxNode) -> bool {
-    node.children().any(|c| c.kind() == SyntaxKind::ERROR)
+macro_rules! view_key {
+    ($element:expr) => {
+        $element.id()
+    };
 }
 
-fn can_handle_error(node: &SyntaxNode) -> bool {
-    ast::Expr::can_cast(node.kind())
+fn view_tree(
+    node: &view::Node<'_>,
+    map: SpanMap<'_>,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+) -> TopSubtree {
+    syntax_bridge::call_input(*node, map, call_site, mode)
 }
 
-fn has_error_to_handle(node: &SyntaxNode) -> bool {
-    has_error(node) || node.children().any(|c| !can_handle_error(&c) && has_error_to_handle(&c))
-}
+fixup_syntax_impl!(fixup_syntax, view::Node<'_>, view::Node<'_>, NodeId, view, view_key, view_tree);
 
-pub(crate) fn reverse_fixups(tt: &mut TopSubtree, undo_info: &SyntaxFixupUndoInfo) {
+pub(crate) fn reverse_fixups<A: core::alloc::Allocator + Clone>(
+    tt: &mut TopSubtree<A>,
+    undo_info: &SyntaxFixupUndoInfo,
+) {
     let Some(undo_info) = &undo_info.original else { return };
     let undo_info = &**undo_info;
     let top_subtree = tt.top_subtree();
@@ -360,7 +418,10 @@ pub(crate) fn reverse_fixups(tt: &mut TopSubtree, undo_info: &SyntaxFixupUndoInf
     reverse_fixups_(tt, undo_info);
 }
 
-fn reverse_fixups_(tt: &mut TopSubtree, undo_info: &[TopSubtree]) {
+fn reverse_fixups_<A: core::alloc::Allocator + Clone>(
+    tt: &mut TopSubtree<A>,
+    undo_info: &[TopSubtree],
+) {
     transform_tt(tt, |tt| match tt {
         tt::TokenTree::Leaf(leaf) => {
             let span = leaf.span();
@@ -442,20 +503,24 @@ mod tests {
             FileId::from_raw(0),
             Edition::CURRENT,
         )));
+        let call_site = span_map.span_for_range(TextRange::empty(0.into()));
+        let frame = &blaze_mem::Frame::new(blaze_mem::Tag::Expand).expect("a test's frame");
         let fixups = super::fixup_syntax(
+            frame,
             span_map,
-            &parsed.syntax_node(),
-            span_map.span_for_range(TextRange::empty(0.into())),
+            parsed.root(),
+            call_site,
             DocCommentDesugarMode::Mbe,
         );
-        let mut tt = syntax_bridge::syntax_node_to_token_tree_modified(
-            &parsed.syntax_node(),
+        let undo_info = fixups.undo_info;
+        let mut tt = syntax_bridge::call_input_modified(
+            parsed.root(),
             span_map,
             fixups.append,
             fixups.remove,
-            span_map.span_for_range(TextRange::empty(0.into())),
+            call_site,
             DocCommentDesugarMode::Mbe,
-            |_, _| (true, Vec::new()),
+            |_, _| (true, syntax_bridge::Inserted::new()),
         );
 
         let actual = format!("{tt}\n");
@@ -465,14 +530,14 @@ mod tests {
 
         // the fixed-up tree should be syntactically valid
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
-            &tt,
+            tt.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| parser::Edition::CURRENT,
         );
         assert!(
             parse.errors().is_empty(),
             "parse has syntax errors. parse tree:\n{:#?}",
-            parse.syntax_node()
+            parse.root()
         );
 
         // the fixed-up tree should not contain braces as punct
@@ -486,12 +551,12 @@ mod tests {
             }
         }
 
-        reverse_fixups(&mut tt, &fixups.undo_info);
+        reverse_fixups(&mut tt, &undo_info);
 
         // the fixed-up + reversed version should be equivalent to the original input
         // modulo token IDs and `Punct`s' spacing.
-        let original_as_tt = syntax_bridge::syntax_node_to_token_tree(
-            &parsed.syntax_node(),
+        let original_as_tt = syntax_bridge::call_input(
+            parsed.root(),
             span_map,
             span_map.span_for_range(TextRange::empty(0.into())),
             DocCommentDesugarMode::Mbe,
@@ -500,6 +565,29 @@ mod tests {
             check_subtree_eq(&tt, &original_as_tt),
             "different token tree:\n{tt:?}\n\n{original_as_tt:?}"
         );
+    }
+
+    /// Code without syntax errors is still changed by `fixup_syntax` (a statement `if` gets a
+    /// `;`), so a macro's input skips it unless an error touches the item
+    /// (`HirFileId::has_syntax_error_in`): the macro sees the tokens rustc gives it.
+    #[test]
+    fn valid_code_is_changed_by_fixups() {
+        let parsed = syntax::SourceFile::parse("fn foo() { if a {} b(); }", Edition::CURRENT);
+        assert!(parsed.errors().is_empty());
+        let span_map = SpanMap::RealSpanMap(&RealSpanMap::absolute(EditionedFileId::new(
+            FileId::from_raw(0),
+            Edition::CURRENT,
+        )));
+        let call_site = span_map.span_for_range(TextRange::empty(0.into()));
+        let frame = &blaze_mem::Frame::new(blaze_mem::Tag::Expand).expect("a test's frame");
+        let fixups = super::fixup_syntax(
+            frame,
+            span_map,
+            parsed.root(),
+            call_site,
+            DocCommentDesugarMode::ProcMacro,
+        );
+        assert!(!fixups.append.is_empty());
     }
 
     #[test]

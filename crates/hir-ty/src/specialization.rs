@@ -1,41 +1,57 @@
 //! Impl specialization related things
 
-use either::Either;
+use base_db::Db;
 use hir_def::{
     HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
     signatures::ImplSignature, unstable_features::UnstableFeatures,
 };
-use rustc_hash::FxHashSet;
+use blaze_mem::Frame;
 use rustc_type_ir::{
     AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
-    TypeVisitor, inherent::IntoKind as _,
+    TypeVisitor,
+    fast_reject::{DeepRejectCtxt, TreatParams, simplify_type},
+    inherent::IntoKind as _,
 };
+use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
-    Span,
+    FrameSet, Span,
     db::HirDatabase,
+    frame_set,
     lower::GenericPredicates,
-    method_resolution::TraitImpls,
+    method_resolution::{RelevantImplsKey, SelfTyKey, relevant_impls},
     next_solver::{
-        ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
+        AnyImplId, ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
         infer::{DbInternerInferExt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         util::clauses_as_obligations,
     },
 };
 
+/// The key of [`specializes_query`]: whether `specializing` specializes `parent`.
+#[blaze_query::interned(debug)]
+pub struct ImplPair {
+    #[returns(copy)]
+    pub specializing: ImplId,
+    #[returns(copy)]
+    pub parent: ImplId,
+}
+
 // rustc does not have a cycle handling for the `specializes` query, meaning a cycle is a bug,
 // and indeed I was unable to cause cycles even with erroneous code. However, in r-a we can
 // create a cycle if there is an error in the impl's where clauses. I believe well formed code
 // cannot create a cycle, but a cycle handler is required nevertheless.
-fn specializes_query_cycle(
-    _db: &dyn HirDatabase,
-    _: salsa::Id,
-    _specializing_impl_def_id: ImplId,
-    _parent_impl_def_id: ImplId,
-) -> bool {
+fn specializes_query_cycle(_db: &Db, _: blaze_query::db::Id, _pair: ImplPair) -> bool {
     false
+}
+
+/// Whether the crate of `impl_id` enables `specialization` or `min_specialization`: only
+/// then may it specialize another impl.
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
+    let features = UnstableFeatures::query(db, impl_id.krate(db));
+    features.specialization || features.min_specialization
 }
 
 /// Is `specializing_impl_def_id` a specialization of `parent_impl_def_id`?
@@ -49,12 +65,9 @@ fn specializes_query_cycle(
 /// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
-#[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy))]
-fn specializes_query(
-    db: &dyn HirDatabase,
-    specializing_impl_def_id: ImplId,
-    parent_impl_def_id: ImplId,
-) -> bool {
+#[blaze_query::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
+fn specializes_query<'db>(db: &'db Db, pair: ImplPair<'db>) -> bool {
+    let (specializing_impl_def_id, parent_impl_def_id) = (pair.specializing(db), pair.parent(db));
     let trait_env = db.trait_environment(specializing_impl_def_id.into());
     let interner = DbInterner::new_with(db, specializing_impl_def_id.krate(db));
 
@@ -145,12 +158,10 @@ fn specializes_query(
 // This function is used to avoid creating the query for crates that does not define `#![feature(specialization)]`,
 // as the solver is calling this a lot, and creating the query consumes a lot of memory.
 pub(crate) fn specializes(
-    db: &dyn HirDatabase,
+    db: &Db,
     specializing_impl_def_id: ImplId,
     parent_impl_def_id: ImplId,
 ) -> bool {
-    let module = specializing_impl_def_id.loc(db).container;
-
     // We check that the specializing impl comes from a crate that has specialization enabled.
     //
     // We don't really care if the specialized impl (the parent) is in a crate that has
@@ -160,35 +171,55 @@ pub(crate) fn specializes(
     // `#[allow_internal_unstable(specialization)]`, but `#[allow_internal_unstable]`
     // is an internal feature, std is not using it for specialization nor is likely to
     // ever use it, and we don't have the span information necessary to replicate that.
-    let features = UnstableFeatures::query(db, module.krate(db));
-    if !features.specialization && !features.min_specialization {
-        return false;
-    }
-
-    specializes_query(db, specializing_impl_def_id, parent_impl_def_id)
+    may_specialize(db, specializing_impl_def_id)
+        && specializes_query(db, ImplPair::new(db, specializing_impl_def_id, parent_impl_def_id))
 }
 
 /// The impl that `impl_id` takes an item it leaves out from: the closest of the impls it
 /// specializes for which `has_item` holds.
 pub(crate) fn specialized_ancestor(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_id: ImplId,
     has_item: impl Fn(ImplId) -> bool,
 ) -> Option<ImplId> {
-    let features = UnstableFeatures::query(db, impl_id.krate(db));
-    if !features.specialization && !features.min_specialization {
+    if !may_specialize(db, impl_id) {
         return None;
     }
-    let trait_id = db.impl_trait(impl_id)?.skip_binder().def_id.0;
-    let mut ancestors = Vec::new();
-    for impls in TraitImpls::for_crate_and_deps(db, impl_id.krate(db)).iter() {
-        impls.for_trait(trait_id, |impls| {
-            let Either::Left(impls) = impls else { return };
-            ancestors.extend(impls.iter().copied().filter(|&ancestor| {
-                ancestor != impl_id && has_item(ancestor) && specializes(db, impl_id, ancestor)
-            }));
-        });
+    let trait_ref = db.impl_trait(impl_id)?.instantiate_identity().skip_norm_wip();
+    // As rustc's `overlapping_impls` rejects a pair before relating it, with the parameters as
+    // `specializes_query` has them: the specializing impl's rigid, the parent's inference
+    // variables. A pair rejected here is one whose trait refs that query fails to equate.
+    let interner = DbInterner::new_no_crate(db);
+    let reject = DeepRejectCtxt::relate_rigid_infer(interner);
+    let headers_may_unify = |ancestor: ImplId| {
+        db.impl_trait(ancestor).is_some_and(|parent| {
+            let parent = parent.instantiate_identity().skip_norm_wip();
+            reject.args_may_unify(trait_ref.args, parent.args)
+        })
+    };
+    // An impl `impl_id` specializes is at least as general: a blanket impl, or one for the
+    // same simplified self type. The closest is the one that specializes every other, so the
+    // order these come in (blanket impls first) picks the same one.
+    let (krate, trait_id) = (impl_id.krate(db), trait_ref.def_id.0);
+    let self_ty = simplify_type(interner, trait_ref.self_ty(), TreatParams::InstantiateWithInfer);
+    let key = RelevantImplsKey::new(db, krate, trait_id, self_ty.map(SelfTyKey));
+    let relevant = relevant_impls(db, key);
+    fn impls(impls: &[AnyImplId]) -> impl Iterator<Item = ImplId> + '_ {
+        impls.iter().filter_map(|&it| match it {
+            AnyImplId::ImplId(it) => Some(it),
+            AnyImplId::BuiltinDeriveImplId(_) => None,
+        })
     }
+    let ancestors: SmallVec<[ImplId; 4]> = impls(relevant.blanket())
+        .chain(impls(relevant.for_self_ty()))
+        .filter(|&ancestor| {
+            ancestor != impl_id
+                && has_item(ancestor)
+                && headers_may_unify(ancestor)
+                && specializes(db, impl_id, ancestor)
+        })
+        // alloc: inline up to 4 ancestors; an impl specializes one or two.
+        .collect();
     ancestors.iter().copied().find(|&ancestor| {
         ancestors.iter().all(|&other| other == ancestor || specializes(db, ancestor, other))
     })
@@ -206,17 +237,17 @@ enum Parameter {
 fn parameters_for<'db>(
     value: impl TypeVisitable<DbInterner<'db>>,
     include_nonconstraining: bool,
-    out: &mut FxHashSet<Parameter>,
+    out: &mut FrameSet<'_, Parameter>,
 ) {
-    struct Collect<'a> {
+    struct Collect<'a, 'f> {
         include_nonconstraining: bool,
-        out: &'a mut FxHashSet<Parameter>,
+        out: &'a mut FrameSet<'f, Parameter>,
     }
-    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_> {
+    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, '_> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
-                TyKind::Alias(alias)
+                TyKind::Alias(_, alias)
                     if !self.include_nonconstraining
                         && matches!(
                             alias.kind,
@@ -239,7 +270,7 @@ fn parameters_for<'db>(
         }
         fn visit_const(&mut self, konst: Const<'db>) {
             match konst.kind() {
-                ConstKind::Unevaluated(_) if !self.include_nonconstraining => return,
+                ConstKind::Alias(..) if !self.include_nonconstraining => return,
                 ConstKind::Param(param) => {
                     self.out.insert(Parameter::TypeOrConst(param.id.into()));
                 }
@@ -256,35 +287,78 @@ fn parameters_for<'db>(
 /// `enforce_impl_non_lifetime_params_are_constrained`). rustc's `assoc_def` refuses to
 /// project an item such an impl defines, which would leave the parameter an inference
 /// variable nothing constrains, and gives an error instead.
-#[salsa::tracked(returns(copy))]
-pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> bool {
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
+    blaze_mem::frame::current(|frame| {
+        let Some(constrained) = constrained_params(db, frame, impl_id) else { return false };
+        type_or_const_params(db, impl_id)
+            .any(|param| !constrained.contains(&Parameter::TypeOrConst(param)))
+    })
+}
+
+/// The type and const parameters of `impl_id` that are constrained neither by its header nor
+/// by the associated types its where clauses equate with what is, in declaration order: each
+/// is one E0207. None when the header has an error type.
+pub fn impl_unconstrained_params(db: &Db, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        // alloc: an empty `Vec` holds no block
+        let Some(constrained) = constrained_params(db, frame, impl_id) else { return Vec::new() };
+        let mut unconstrained = Vec::new_in(frame);
+        unconstrained.extend(
+            type_or_const_params(db, impl_id)
+                .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param))),
+        );
+        // alloc: the caller's result, one block at its size
+        unconstrained.iter().copied().collect()
+    })
+}
+
+fn type_or_const_params(
+    db: &Db,
+    impl_id: ImplId,
+) -> impl Iterator<Item = TypeOrConstParamId> + '_ {
+    GenericParams::of(db, impl_id.into())
+        .iter_type_or_consts()
+        .map(move |(local_id, _)| TypeOrConstParamId { parent: impl_id.into(), local_id })
+}
+
+/// The parameters of `impl_id` its header and its where clauses' projections constrain, or
+/// `None` when the header has an error type.
+fn constrained_params<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    impl_id: ImplId,
+) -> Option<FrameSet<'f, Parameter>> {
     let interner = DbInterner::new_no_crate(db);
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());
     if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {
-        return false;
+        return None;
     }
-    let mut constrained = FxHashSet::default();
+    let mut constrained = frame_set(frame);
     match trait_ref {
         Some(trait_ref) => parameters_for(trait_ref, false, &mut constrained),
         None => parameters_for(self_ty, false, &mut constrained),
     }
     // rustc's `setup_constraining_predicates`: `<T as Trait>::Assoc == U` constrains `U` once
-    // what the projection names is.
-    let projections: Vec<_> = GenericPredicates::query_own_explicit(db, impl_id.into())
-        .iter_identity()
-        .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
-            ClauseKind::Projection(projection) => Some(projection),
+    // what the projection names is. A projection of the impl's own trait ref never does.
+    let mut projections = Vec::new_in(frame);
+    let predicates = GenericPredicates::query_own_explicit(db, impl_id.into());
+    projections.extend(predicates.iter_identity().filter_map(|it| {
+        match it.skip_norm_wip().kind().skip_binder() {
+            ClauseKind::Projection(projection)
+                if Some(projection.projection_term.trait_ref(interner)) != trait_ref =>
+            {
+                Some(projection)
+            }
             _ => None,
-        })
-        .collect();
+        }
+    }));
+    let mut inputs = frame_set(frame);
     loop {
         let before = constrained.len();
         for projection in &projections {
-            if Some(projection.projection_term.trait_ref(interner)) == trait_ref {
-                continue;
-            }
-            let mut inputs = FxHashSet::default();
+            inputs.clear();
             parameters_for(projection.projection_term, true, &mut inputs);
             if inputs.is_subset(&constrained) {
                 parameters_for(projection.term, false, &mut constrained);
@@ -294,8 +368,5 @@ pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplI
             break;
         }
     }
-    GenericParams::of(db, impl_id.into()).iter_type_or_consts().any(|(local_id, _)| {
-        let param = TypeOrConstParamId { parent: impl_id.into(), local_id };
-        !constrained.contains(&Parameter::TypeOrConst(param))
-    })
+    Some(constrained)
 }

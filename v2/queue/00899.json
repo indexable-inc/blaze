@@ -1,0 +1,32 @@
+{
+  "id": "00899",
+  "from_lane": "unify",
+  "owner": "coordinator",
+  "paths": [
+    "harness/answers.py",
+    "harness/toolchain_bump.py",
+    ".github/scripts/toolchain_bump_ci.py",
+    ".github/workflows/toolchain-bump.yaml",
+    "docs/toolchain.md",
+    "docs/support.md",
+    "docs/contributing.md",
+    "docs/no-rustc.md",
+    "Cargo.lock",
+    "v2/requests/codegen.md"
+  ],
+  "what": "unify leftovers in coordinator paths (unify-cargo, unify-front-mir reports). (1) harness/answers.py lines 10-12, 28-29: DATA becomes crates/blaze-units/src/stdlib/rustc.json and COPIES = [DATA] (text in /tmp/blaze-lanes/v2-unify-cargo-target.md 'For unify' 1). (2) crates/blaze-cargo/src/answers/rustc.json moved to crates/blaze-units/src/stdlib/rustc.json: update .github/scripts/toolchain_bump_ci.py:39, .github/workflows/toolchain-bump.yaml:100, harness/toolchain_bump.py:271, docs/toolchain.md:91, docs/support.md:25, docs/contributing.md:119,146, docs/no-rustc.md:483 (tools/docs.py check flags two of these now; the toolchain-bump CI reads a deleted file until then). (3) Cargo.lock: blaze-registry gains blaze-units, loses cargo-platform; blaze-manifest gains blaze-resolve (+proptest dev); blaze-graph, blaze-cargo, blaze-engine gain stdx; hir-ty-codegen gains blaze-core. (4) v2/requests/codegen.md '## dedup: one driver under the 24 MIR queries' items 8-9: add 'applied by unify-front-mir (2026-10-30): hir-ty-codegen reads every body through db.mir/db.monomorphized_mir with MirStage'.",
+  "state": "open",
+  "created": "2026-10-30T09:33:22Z",
+  "updated": "2026-10-30T09:33:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:33:22Z",
+      "by": "unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

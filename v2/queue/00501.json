@@ -1,0 +1,21 @@
+{
+  "id": "00501",
+  "from_lane": "diagnostics-lints-bodies-calls-methods-asm",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-bodies-calls-methods-asm: `-A unused` for failing UI tests (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)\n\nSame as `diagnostics-lints-bodies-types-casts`' request above: `tests/ui/asm/named-asm-labels.rs`,\n`binary_asm_labels.rs` and `hexagon-register-pairs.rs` fail and have unused closures, functions\nand imports; compiletest gives them `-A unused`, and their `.stderr`s have no `unused` warnings.\nUntil `compiletest` gives it to every test but a `run-pass` one, these three tests also get\n`unused_must_use`, `dead_code` and `unused_imports` warnings.\n\n> forwarded to diagnostics: its own UI harness.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-calls-methods-asm: `-A unused` for failing UI tests (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1926"
+    }
+  ]
+}

@@ -1,22 +1,22 @@
 //! Definition of `SolverDefId`
 
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId, VariantId,
+    HasModule, TraitId, TypeAliasId, UnionId, VariantId,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
         TraitSignature, TypeAliasSignature, UnionSignature,
     },
 };
 use rustc_type_ir::inherent;
-use salsa::SalsaValue;
 use stdx::impl_from;
 
 use crate::{
     InferBodyId,
     db::{
-        AnonConstId, GeneralConstId, InternedClosureId, InternedCoroutineClosureId,
+        AnonConstId, GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
     },
 };
@@ -29,7 +29,7 @@ pub enum Ctor {
     Enum(EnumVariantId),
 }
 
-#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum SolverDefId<'db> {
     AdtId(AdtId),
     ConstId(ConstId),
@@ -50,8 +50,16 @@ pub enum SolverDefId<'db> {
 
 impl std::fmt::Debug for SolverDefId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let interner = DbInterner::conjure();
-        let db = interner.db;
+        crate::next_solver::interner::fmt_with_attached_db(f, "SolverDefId", |db, f| self.fmt_with_names(db, f))
+    }
+}
+
+impl SolverDefId<'_> {
+    fn fmt_with_names(
+        &self,
+        db: &Db,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
         match *self {
             SolverDefId::AdtId(AdtId::StructId(id)) => {
                 f.debug_tuple("AdtId").field(&StructSignature::of(db, id).name.as_str()).finish()
@@ -315,12 +323,46 @@ impl TryFrom<SolverDefId<'_>> for GenericDefId {
     }
 }
 
+impl<'db> SolverDefId<'db> {
+    /// The crate the item is defined in.
+    pub(crate) fn krate(self, db: &'db Db) -> Crate {
+        match self {
+            SolverDefId::AdtId(id) => id.krate(db),
+            SolverDefId::ConstId(id) => id.krate(db),
+            SolverDefId::FunctionId(id) => id.krate(db),
+            SolverDefId::ImplId(id) => id.krate(db),
+            SolverDefId::BuiltinDeriveImplId(id) => id.krate(db),
+            SolverDefId::StaticId(id) => id.krate(db),
+            SolverDefId::AnonConstId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::TraitId(id) => id.krate(db),
+            SolverDefId::TypeAliasId(id) => id.krate(db),
+            SolverDefId::InternedClosureId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedCoroutineId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedCoroutineClosureId(id) => id.loc(db).owner.krate(db),
+            SolverDefId::InternedOpaqueTyId(id) => match id.loc(db) {
+                crate::ImplTraitId::ReturnTypeImplTrait(func, _) => func.krate(db),
+                crate::ImplTraitId::TypeAliasImplTrait(alias, _) => alias.krate(db),
+            },
+            SolverDefId::EnumVariantId(id) => id.krate(db),
+            SolverDefId::Ctor(Ctor::Struct(id)) => id.krate(db),
+            SolverDefId::Ctor(Ctor::Enum(id)) => id.krate(db),
+        }
+    }
+}
+
+/// rustc's `krate == LOCAL_CRATE`, the local crate being the one `cx` solves for. An interner
+/// without a crate has no local crate to answer for, and stops.
+#[inline]
+fn is_local_to<'db>(id: SolverDefId<'db>, cx: DbInterner<'db>) -> bool {
+    id.krate(cx.db) == cx.expect_crate()
+}
+
 impl<'db> inherent::DefId<DbInterner<'db>> for SolverDefId<'db> {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self)
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self, cx)
     }
 }
 
@@ -380,8 +422,8 @@ macro_rules! declare_id_wrapper {
             fn as_local(self) -> Option<$local> {
                 Some(self.into())
             }
-            fn is_local(self) -> bool {
-                true
+            fn is_local(self, cx: DbInterner<'db>) -> bool {
+                is_local_to(self.into(), cx)
             }
         }
     };
@@ -444,8 +486,8 @@ macro_rules! declare_id_wrapper_with_lt {
             fn as_local(self) -> Option<$local> {
                 Some(self.into())
             }
-            fn is_local(self) -> bool {
-                true
+            fn is_local(self, cx: DbInterner<'db>) -> bool {
+                is_local_to(self.into(), cx)
             }
         }
     };
@@ -458,6 +500,7 @@ declare_id_wrapper_with_lt!(CoroutineIdWrapper, InternedCoroutineId);
 declare_id_wrapper_with_lt!(CoroutineClosureIdWrapper, InternedCoroutineClosureId);
 declare_id_wrapper!(AdtIdWrapper, AdtId);
 declare_id_wrapper_with_lt!(OpaqueTyIdWrapper, InternedOpaqueTyId, OpaqueTyIdWrapper<'db>);
+declare_id_wrapper_with_lt!(AnonConstIdWrapper, AnonConstId);
 
 macro_rules! declare_ty_const_pair {
     ( $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident ) => {
@@ -511,12 +554,6 @@ macro_rules! declare_ty_const_pair {
                 }
             }
         }
-
-        impl<'db> From<$const_id_name> for GeneralConstIdWrapper<'db> {
-            fn from(value: $const_id_name) -> Self {
-                GeneralConstIdWrapper(GeneralConstId::ConstId(value.0))
-            }
-        }
     };
 }
 
@@ -538,57 +575,6 @@ impl<'db> From<TermId> for SolverDefId<'db> {
             TermId::TypeAliasId(id) => id.into(),
             TermId::ConstId(id) => id.into(),
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GeneralConstIdWrapper<'db>(pub GeneralConstId<'db>);
-
-impl std::fmt::Debug for GeneralConstIdWrapper<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
-    }
-}
-impl<'db> From<GeneralConstIdWrapper<'db>> for GeneralConstId<'db> {
-    #[inline]
-    fn from(value: GeneralConstIdWrapper<'db>) -> GeneralConstId<'db> {
-        value.0
-    }
-}
-impl<'db> From<GeneralConstId<'db>> for GeneralConstIdWrapper<'db> {
-    #[inline]
-    fn from(value: GeneralConstId<'db>) -> GeneralConstIdWrapper<'db> {
-        Self(value)
-    }
-}
-impl<'db> From<GeneralConstIdWrapper<'db>> for SolverDefId<'db> {
-    #[inline]
-    fn from(value: GeneralConstIdWrapper<'db>) -> SolverDefId<'db> {
-        match value.0 {
-            GeneralConstId::ConstId(id) => SolverDefId::ConstId(id),
-            GeneralConstId::StaticId(id) => SolverDefId::StaticId(id),
-            GeneralConstId::AnonConstId(id) => SolverDefId::AnonConstId(id),
-        }
-    }
-}
-impl<'db> TryFrom<SolverDefId<'db>> for GeneralConstIdWrapper<'db> {
-    type Error = ();
-    #[inline]
-    fn try_from(value: SolverDefId<'db>) -> Result<Self, Self::Error> {
-        match value {
-            SolverDefId::ConstId(it) => Ok(Self(it.into())),
-            SolverDefId::StaticId(it) => Ok(Self(it.into())),
-            SolverDefId::AnonConstId(it) => Ok(Self(it.into())),
-            _ => Err(()),
-        }
-    }
-}
-impl<'db> inherent::DefId<DbInterner<'db>> for GeneralConstIdWrapper<'db> {
-    fn as_local(self) -> Option<SolverDefId<'db>> {
-        Some(self.into())
-    }
-    fn is_local(self) -> bool {
-        true
     }
 }
 
@@ -638,8 +624,8 @@ impl<'db> inherent::DefId<DbInterner<'db>> for CallableIdWrapper {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self.into())
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self.into(), cx)
     }
 }
 
@@ -675,7 +661,7 @@ impl<'db> inherent::DefId<DbInterner<'db>> for AnyImplId {
     fn as_local(self) -> Option<SolverDefId<'db>> {
         Some(self.into())
     }
-    fn is_local(self) -> bool {
-        true
+    fn is_local(self, cx: DbInterner<'db>) -> bool {
+        is_local_to(self.into(), cx)
     }
 }

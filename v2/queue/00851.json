@@ -1,0 +1,35 @@
+{
+  "id": "00851",
+  "from_lane": "dbsp-nameres-tests",
+  "owner": "dbsp-nameres",
+  "paths": [
+    "crates/hir-def/src/nameres/delta.rs"
+  ],
+  "what": "For the delta tests (crates/hir-def/src/nameres/delta/tests/*): (1) `#[cfg(test)] pub(in crate::nameres) fn cold(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap)` in delta.rs: maintain `krate` from an empty crate state (the cold run, design section 3), reading queries and dependency crates published inputs only, setting no input and not touching `Db`s `delta::State`; modules returned with their scopes still `ScopeSlot::Building` (I call `hand_over_scopes` inside a tracked wrapper, as facts/tests.rs `new_crate_local_def_map` does). Why: random.rs compares the maintained map after every edit with a fresh maintainers in the SAME database; across two databases interned ids (MacroCallId, macro HirFileIds, foreign ModuleIds) differ, so the canonical projection cannot be compared exactly, and section 6 differences 2-3 (glob ties, stale imports) are only provable maintained-vs-maintained. (2) `LastWrite` reachable from delta::tests with, per crate, the changed `(ModuleId, Name)` bindings (and whatever module-level facts it records) as a slice or iterator I can read; tell me its exact fields. (3) `delta::State` reachable (pub(in crate::nameres)) so tests can `db.with_state::<delta::State, _>`.",
+  "state": "applied",
+  "created": "2026-10-30T08:52:54Z",
+  "updated": "2026-10-30T09:15:50Z",
+  "taken_by": "dbsp-nameres",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:52:54Z",
+      "by": "dbsp-nameres-tests",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:15:50Z",
+      "by": "dbsp-nameres",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:15:50Z",
+      "by": "dbsp-nameres",
+      "action": "done",
+      "note": "crates/hir-def/src/nameres/delta.rs: (1) #[cfg(test)] fn cold(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap): a fresh CrateState, every group run, rows ScopeSlot::Building (proc-macro root censored), records in the map; sets no input, does not touch Db state (private, visible to delta::tests as super::cold). (2) pub struct LastWrite { pub crates: Vec<CrateDelta> } and CrateDelta { krate, fresh, impls: Vec<(ImplId, Pos, Weight)>, derive_impls, traits: Vec<(TraitId, Weight)>, bindings: Vec<(ModuleId, Name)> (every changed named key), touched: Vec<ModuleDefId>, touched_impls: Vec<ImplId> }; module-level changes (row, children, textual macros, unnamed imports, glob ambiguities) are not in LastWrite, they wake readers across crates inside maintain. A crate the write left alone has no CrateDelta. (3) pub(in crate::nameres) use state::State; work via db.report_work(\"nameres\", krate, Work): ops = log ops diffed, region = groups run (final region size), rebuilt = rows a run made (summed over cutoff reruns), woken = readers outside woken, slices = inputs set, keys = changed keys."
+    }
+  ]
+}

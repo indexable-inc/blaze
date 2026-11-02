@@ -1,0 +1,40 @@
+{
+  "id": "00644",
+  "from_lane": "frontend-tree",
+  "owner": "db",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/tree-move-hir.md",
+    "crates/hir-ty/src/effects.rs",
+    "crates/hir-ty-borrowck/src/names.rs",
+    "crates/hir-ty-borrowck/src/check/tests.rs",
+    "crates/hir-ty",
+    "crates/hir-ty-borrowck"
+  ],
+  "what": "## frontend-tree: hir-ty effects.rs, hir-ty-borrowck names.rs, check/tests.rs: onto views (3) (2026-10-29)\n\nFrom frontend-tree-move-hir (notes `docs/v2/plan/lanes/frontend/tree-move-hir.md`, \"hir-ty and\nthe checkers\"). The last handle syntax in hir-ty and the four checkers: each reads one node\nunder its file's root and needs no handle. `HirFileId::root` and `AstPtr::to_view` /\n`syntax::view::to_node` are in the tree. wfcheck, matchck and unsafeck have none.\n\n3.1 File `crates/hir-ty/src/effects.rs`. Old:\n\n```rust\nuse syntax::ast;\n```\n\nNew:\n\n```rust\nuse syntax::view as ast;\n```\n\n3.2 File `crates/hir-ty/src/effects.rs`. Old:\n\n```rust\n    let Ok(source) = source_map.expr_syntax(expr) else { return false };\n    let root = source.file_id.parse_or_expand(db);\n    match source.value.to_node(&root) {\n        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),\n```\n\nNew:\n\n```rust\n    let Ok(source) = source_map.expr_syntax(expr) else { return false };\n    match source.value.to_view(source.file_id.root(db)) {\n        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),\n```\n\nWhy: a view of the closure under the root the database keeps, with no handle tree built.\n\n3.3 File `crates/hir-ty-borrowck/src/names.rs`. Old:\n\n```rust\nuse syntax::{\n    AstNode,\n    ast::{self, HasName},\n};\n```\n\nNew:\n\n```rust\nuse syntax::view::{self as ast, AstNode as _, HasName as _};\n```\n\n3.4 File `crates/hir-ty-borrowck/src/names.rs`. Old:\n\n```rust\n        let node = source.value.to_node(&source.file_id.parse_or_expand(self.db));\n```\n\nNew:\n\n```rust\n        let node = source.value.to_view(source.file_id.root(self.db));\n```\n\nWhy: as 3.2. The rest of `from_external_macro` reads the same on views (`Either::right`,\n`ast::Pat::IdentPat`, `name()`, `syntax().text_range()`).\n\n3.5 File `crates/hir-ty-borrowck/src/check/tests.rs`. Old:\n\n```rust\n    let root = source.file_id.parse_or_expand(db);\n    let node = source.value.syntax_node_ptr().to_node(&root);\n    match span {\n        MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),\n        _ => node.text().to_string(),\n    }\n```\n\nNew:\n\n```rust\n    let node = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));\n    match span {\n        MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),\n        _ => node.text().to_owned(),\n    }\n```\n\nWhy: as 3.2; a view node's text is one slice of the source.\n\nStatus: open\n\n> applied by db-apply-ty (22:13): 3.1-3.5 as written. `effects.rs` went in after db-mem-infer-b-lower was done with it, and the borrowck files after db-mem-borrowck cleared them. `names.rs` had moved on (B7.14, `&str` names), but not in `from_external_macro` or the imports, so the old texts still matched.\n\n> forwarded to db (`crates/hir-ty`, `crates/hir-ty-borrowck`; db-next3); told by tmux (requests, pass 27).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db.md#frontend-tree: hir-ty effects.rs, hir-ty-borrowck names.rs, check/tests.rs: onto views (3) (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:10172"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: forwarded to db (`crates/hir-ty`, `crates/hir-ty-borrowck`; db-next3); told by tmux (requests, pass 27)."
+    }
+  ]
+}

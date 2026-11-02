@@ -1,0 +1,37 @@
+{
+  "id": "00121",
+  "from_lane": "db-ty-types",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_type_ir/src/interner.rs",
+    "vendor/rustc_type_ir",
+    "v2/requests/solver-sync-inbox.md"
+  ],
+  "what": "## 3. Lane db (optional): flags of `GenericArgs` tested in blocks\n\nWhat: none needed today. `Clauses` keeps its flags and outer binder in columns of its list table\n(`Lists::intern_with`), as `Clauses: Flags` requires. `GenericArgs` is not `Flags` in today's\n`Interner` trait, so `has_type_flags` over arguments visits each one (each a column read). If\nlane db wants arguments tested in one read, the change is `type GenericArgs: .. + Flags` in\n`vendor/rustc_type_ir/src/interner.rs` and a `TypeVisitableExt` fast path; my side would then\nintern `GenericArgs` with `intern_with`, as `Clauses` is.\n\n> forwarded to db: `vendor/rustc_type_ir` is lane db's.\n> not applied by db-audit-dbsub-tysmall (22:33): optional, and it asks no change today (`type GenericArgs: GenericArgs<Self>` at `vendor/rustc_type_ir/src/interner.rs:115`, no `Flags`). `vendor/` is solver-sync's for the nightly-2026-10-27 rebase and lane db has stopped editing it; the ask is filed there (`v2/requests/solver-sync-inbox.md`, \"Open, optional: `GenericArgs: Flags`\"), unanswered, theirs to take into the series or leave.",
+  "state": "refused",
+  "created": "2026-10-30T01:08:34Z",
+  "updated": "2026-10-30T09:56:58Z",
+  "taken_by": "db-next5",
+  "why": "optional, asks no change in behaviour; db-audit-dbsub-tysmall left it in solver-sync-inbox.md for the vendor patch series",
+  "source": "v2/requests/db-ty-types.md#3. Lane db (optional): flags of `GenericArgs` tested in blocks",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-types.md:108"
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "optional, asks no change in behaviour; db-audit-dbsub-tysmall left it in solver-sync-inbox.md for the vendor patch series"
+    }
+  ]
+}

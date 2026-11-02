@@ -1,0 +1,44 @@
+{
+  "id": "00379",
+  "from_lane": "mem-codegen-unit",
+  "owner": "codegen",
+  "paths": [
+    "Cargo.toml",
+    "crates/hir-ty-codegen",
+    "v2/places.rs",
+    "v2/convert.rs",
+    "v2/backend.rs",
+    "v2/shape.rs",
+    "v2/side.rs",
+    "v2/release.rs",
+    "v2/statics.rs",
+    "crates/blaze-codegen"
+  ],
+  "what": "## Contents\n\n0. Prerequisites for other owners (root `Cargo.toml`, `blaze-mem` on wasm32, the hot lint,\n   `blaze-cargo`)\n1. `crates/hir-ty-codegen`\n   - 1.1 `Cargo.toml` and `mod.rs` header\n   - 1.2 new `frame_map.rs`\n   - 1.3 `lent.rs`\n   - 1.4 `mod.rs`: `build()` and `FunctionCx` on a frame\n   - 1.5 per-worker relocation and line buffers (`fragment.rs`, `debuginfo.rs`, `spare.rs`,\n     `mod.rs`)\n   - 1.6 `v2/places.rs`\n   - 1.7 `v2/convert.rs`\n   - 1.8 `v2/backend.rs`\n   - 1.9 `v2/shape.rs`\n   - 1.10 `v2/side.rs`\n   - 1.11 `v2/release.rs`, `v2/statics.rs`\n   - 1.12 Cranelift's context\n   - 1.13 tests\n   - 1.14 what stays, and why\n2. `crates/blaze-codegen`\n   - 2.1 `Cargo.toml` and `lib.rs`\n   - 2.2 `backend.rs`\n   - 2.3 `template.rs`\n   - 2.4 `blob.rs`\n   - 2.5 `driver.rs`\n   - 2.6 tests\n   - 2.7 `// alloc:` notes for the hot lint\n3. Structs that gain a lifetime or an allocator parameter, and their callers\n4. Boundary with `blaze-engine` (agreed with `mem-codegen-engine`)\n   - 4.1 where the frames open\n   - 4.2 `SymbolResolver`\n   - 4.3 its callers in `hir-ty-codegen`\n   - 4.4 `spare::with_copies` and its test\n   - 4.5 the other implementors (`blaze-wasm`)\n\n---\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:39:13Z",
+  "updated": "2026-10-31T20:50:35Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/mem-codegen-unit.md#Contents",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-unit.md:23"
+    },
+    {
+      "at": "2026-10-31T20:50:35Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:35Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In the tree: hir-ty-codegen frame_map.rs and lent.rs, FunctionCx and Layouts on a Frame (mod.rs), blaze-codegen backend.rs Shape(ContentId), Lookup::read borrowed (driver.rs), template.rs and blob.rs views, v2/shape.rs of(.., frame); hot_lint reads crates without src (hot_lint.py:220)."
+    }
+  ]
+}

@@ -10,13 +10,11 @@ the merge gate and the release train, and the train's verdict queues it or says 
     pr                      commit the answers, push, open or update the pull request, start
                             the train on BRANCH and on BASE, the main commit BRANCH is on
     base-run RUN            outputs run, sha: BASE's train that the train run RUN of BRANCH is
-                            compared with, waited for; the std count's base build is its
-    verdict RUN STD.json    the train run RUN of BRANCH and the std count: no job or harness
-                            red that is green on BASE's train (main's own are cancelled by the
-                            next merge more often than not), and the std unit refusing no more
-                            than main's: queue the pull request; red on the first attempt:
-                            run the failed jobs again; else comment and open or update the
-                            issue
+                            compared with, waited for
+    verdict RUN             the train run RUN of BRANCH: no job or harness red that is green on
+                            BASE's train (main's own are cancelled by the next merge more often
+                            than not): queue the pull request; red on the first attempt: run
+                            the failed jobs again; else comment and open or update the issue
     blocked FILE [--date D] open or update the issue with what FILE says failed
 
 git pushes with the checkout's token, BLAZE_BOT_TOKEN, since a push with GITHUB_TOKEN starts no
@@ -35,8 +33,8 @@ BRANCH = "toolchain/bump"
 # The train of the main commit the bump is on: what the bump's train is compared with.
 BASE = "toolchain/base"
 PIN = os.path.join(ROOT, "harness/toolchain")
-PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
-ANSWERS = os.path.join(ROOT, "crates/blaze-cargo/src/answers/rustc.json")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/toolchain/pins.txt")
+ANSWERS = os.path.join(ROOT, "crates/blaze-units/src/stdlib/rustc.json")
 # The issue is one for as long as the bump is blocked, retitled to the nightly it is on.
 TITLE = "Toolchain bump to {date} is blocked"
 TITLED = re.compile(r"^Toolchain bump to (\d{4}-\d{2}-\d{2}) is blocked$")
@@ -230,8 +228,7 @@ def pr():
         "Linux x86-64, Linux AArch64 and macOS arm64",
         "",
         "The merge gate runs on it as on any pull request; the release train runs on this branch, and "
-        f"when no job or harness is red that is green on the train of the main commit it is on ({BASE}), and the standard "
-        "library refuses no more functions than main's (`harness/stdcount.py`), it is queued with "
+        f"when no job or harness is red that is green on the train of the main commit it is on ({BASE}), it is queued with "
         "`gh pr merge --auto`. Otherwise the verdict is a comment here and the issue \"Toolchain bump to "
         "<date> is blocked\". Fixes for what the new nightly breaks go on this branch; the next daily run "
         "merges main into it and moves it to the newest nightly, keeping them (docs/toolchain.md).",
@@ -377,7 +374,7 @@ def after_merge(pr):
 verdict_date = datetime.date.today().isoformat()
 
 
-def verdict(run_id, std_path):
+def verdict(run_id):
     global verdict_date
     train = json.loads(gh("api", f"repos/{REPO}/actions/runs/{run_id}"))
     if train["head_branch"] != BRANCH:
@@ -403,19 +400,8 @@ def verdict(run_id, std_path):
         elif harnesses and theirs[job] is not None and (harnesses - theirs[job]):
             new.append(f"- {job}: {', '.join(sorted(harnesses - theirs[job]))} (main's train has {', '.join(sorted(theirs[job]))} red)")
     already = [f"- {job}" for job in sorted(ours) if job in theirs and not any(l.startswith(f"- {job}") for l in new)]
-    std = None
-    if std_path and os.path.exists(std_path):
-        std = json.load(open(std_path))
-    std_line = "the std count did not run (its job failed: see the run)"
-    std_worse = True
-    if std and "base" in std:
-        n, b = std["new"], std["base"]
-        std_worse = n["refused"] > b["refused"]
-        std_line = (f"the standard library: {name} refuses {n['refused']} of {n['total']} fns, main's "
-                    f"{b['toolchain']} {b['refused']} of {b['total']} ({n['refused'] - b['refused']:+d})")
     lines = [f"Train on {train['head_sha'][:10]}: {train['html_url']}",
-             f"Compared with {which}: {base['html_url'] if base else 'none found'}", "",
-             f"- {std_line}"]
+             f"Compared with {which}: {base['html_url'] if base else 'none found'}"]
     if new:
         lines += ["", "Red here and green on main (what the bump broke):", *new]
     if already:
@@ -429,7 +415,7 @@ def verdict(run_id, std_path):
            f"**Red here and green on main: running the failed jobs again** (attempt {attempt + 1} "
            f"of {ATTEMPTS}), and that attempt decides.\n\n{body}")
         return
-    if new or std_worse:
+    if new:
         gh("pr", "comment", str(pr["number"]), "-R", REPO, "--body", f"**The bump is blocked.**\n\n{body}")
         blocked(date, f"The bump {pr['url']} ({name}) is red.\n\n{body}")
         sys.exit(1)
@@ -448,9 +434,7 @@ def main():
     sub.add_parser("answers").add_argument("files", nargs="+")
     sub.add_parser("pr")
     sub.add_parser("base-run").add_argument("run")
-    v = sub.add_parser("verdict")
-    v.add_argument("run")
-    v.add_argument("std", nargs="?")
+    sub.add_parser("verdict").add_argument("run")
     b = sub.add_parser("blocked")
     b.add_argument("why_file")
     b.add_argument("--date", default=datetime.date.today().isoformat())
@@ -465,7 +449,7 @@ def main():
         elif args.step == "base-run":
             base_run(args.run)
         elif args.step == "verdict":
-            verdict(args.run, args.std)
+            verdict(args.run)
         else:
             why = open(args.why_file).read() if os.path.exists(args.why_file) else "a step failed before it said why"
             blocked(args.date, f"The daily bump stopped before its pull request:\n\n{why}")

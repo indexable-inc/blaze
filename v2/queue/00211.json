@@ -1,0 +1,37 @@
+{
+  "id": "00211",
+  "from_lane": "coordinator",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "python/typed-input",
+    "python/typed-input/src/typed_input/__init__.py"
+  ],
+  "what": "## tools/v2/hot_lint.py crashes when given `crates` (from db-ty-port-infer-relate)\n\n- What: `{\"root\": \".\", \"crates\": [\"hir-ty\"]}` fails with `typed_input: crates has a type it does\n  not read: list[str]`. `python/typed-input` does not read `list[str]` fields, so either it\n  learns lists or `Input.crates` becomes a type it does read (a `tuple[str, ...]`, if supported).\n- Where: `tools/v2/hot_lint.py` (`Input`) or `python/typed-input/src/typed_input/__init__.py`.\n- Why: the brief's command doesn't run. Without `crates` it works (all hot crates).\n\n> forwarded to the coordinator: `tools/` is its, not requests' (listed in requests' report).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:31:23Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/coordinator.md#tools/v2/hot_lint.py crashes when given `crates` (from db-ty-port-infer-relate)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:17"
+    },
+    {
+      "at": "2026-10-30T08:31:23Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:23Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

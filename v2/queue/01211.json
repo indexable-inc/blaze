@@ -1,0 +1,36 @@
+{
+  "id": "01211",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs",
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R14 Contract + engine: `Storage::resume_readers(&mut self)`, clearing the stop flag (clock bit 32) without opening a view. base-db db/shared.rs `Shared::write`/`idle` (and shared/tests.rs) clear a stop after `&mut` when `readers_stopped()`; the fork did it with `trigger_cancellation`. Today only `new_view` clears it, so a `Shared::write` followed by setters that change nothing (base-db writes only what differs) leaves every later read unwinding `PendingWrite`; `synthetic_write` would clear it but re-verifies every row. The port (worktree blaze-v2-qu) calls `db.storage_mut().resume_readers()`.",
+  "state": "applied",
+  "created": "2026-10-31T01:24:41Z",
+  "updated": "2026-10-31T03:09:42Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:24:41Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:51:50Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:09:42Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Storage::resume_readers(&mut self) in crates/blaze-query/src/db/storage.rs (engine 01220), test resume_readers_clears_the_stop_without_a_view; contract in docs/v2/plan/lanes/db/query-unify.md"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[package]
+name = "blaze-format"
+description = "blaze v2's zero-copy format: pointer-free, aligned, position-independent records whose bytes in memory are their bytes on disk, each under a versioned schema hash"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-ids.workspace = true
+serde = { workspace = true, features = ["derive"] }
+zstd.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-v2-proof.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

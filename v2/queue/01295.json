@@ -1,0 +1,37 @@
+{
+  "id": "01295",
+  "from_lane": "tests-misc-front1",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/ingredient.rs",
+    "crates/blaze-query-macros/src/input.rs",
+    "crates/blaze-query-macros/src/tracked_struct.rs"
+  ],
+  "what": "After the port a read of an input or tracked field is named by its struct alone (Crate, CrateResolution) with ReadKind::InputField(n)/TrackedField(n); salsa named each field (data, cfg_options, extra_data, workspace_data, modules). blaze-item-hash reads.rs RULES rules by field (Crate.data and cfg_options are CrateInput, CrateResolution.modules is refused), so round 8 classify::every_read_of_the_steps... refuses (Infer, Crate), (Mir, Crate), (Mir, CrateResolution) unlisted. Please record each field name in the vtable (the macros have the idents) and give Storage a field_name(ingredient, field) -> &'static str, so blaze-item-hash can name a field read `Crate.data` without a hand table of field numbers that would drift.",
+  "state": "applied",
+  "created": "2026-10-31T14:54:30Z",
+  "updated": "2026-10-31T16:51:45Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:54:30Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:51:45Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:51:45Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Vtable.fields + Input::FIELD_NAMES/Tracked::TRACKED_FIELD_NAMES from the macros; Storage::field_name and Storage::read_name (storage.rs); tests in db/tests.rs and blaze-query-macros/tests/structs.rs. The two hir-ty callers are 01323."
+    }
+  ]
+}

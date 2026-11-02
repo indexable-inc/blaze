@@ -1,10 +1,20 @@
 ---
-status: current
-summary: What is supported, cell by cell, each pointing at the report or harness run behind it.
+status: record
+summary: What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
+date: 2026-10-30
 ---
 # What is supported
 
-Every cell here points at a report or a harness run. "CI" is GitHub Actions run
+This is what blaze v1 supported, as of its integration into v2 on 2026-10-30. Much of it
+describes v1's machinery: rustc's copy of a refused function, handing a build to cargo, the
+splice, tiers and live edits through `blaze-live`, rustc linking with blaze's objects. v2 builds
+with no rustc and no cargo, and none of these cells has been measured for it; what v2 must reach
+is [v2/plan/goals/targets.md](v2/plan/goals/targets.md).
+
+Every cell here points at a report or a harness run. The harnesses that compared blaze with
+rustc or cargo (the corpus, the breakers, the build-model cases, the fuzzer's differential
+runs) were deleted on 2026-10-30 ([harness.md](harness.md)); the cells they measured keep the
+figures of their last run, and the bar from here on is real crates' own tests. "CI" is GitHub Actions run
 39057174862 on commit 888e87df74, the last run recorded in the reports that covered all
 four native platforms under both backends ([reports/PLAT-ABI2.md](reports/PLAT-ABI2.md)).
 "Local" is a run of the gate on Linux x86-64 at f191c6e42a, the commit these docs were
@@ -21,8 +31,8 @@ says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a
 23.1.4). blaze links against what rustc built, so it must agree with that rustc on symbol
 mangling (v0), type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes, and
 everything that mirrors rustc is taken from that one commit: `crates/rustc_abi` is its
-`compiler/rustc_abi`, `vendor/proc-macro-srv` its proc-macro server with blaze's changes,
-and the answers to rustc's questions (`crates/blaze-cargo/src/answers/rustc.json`) are what that
+`compiler/rustc_abi`, blaze's proc-macro server (`crates/proc-macro-srv`) follows its
+`proc_macro` bridge, and the answers to rustc's questions (`crates/blaze-units/src/stdlib/rustc.json`) are what that
 rustc says on x86-64 Linux, AArch64 Linux and arm64 macOS. Stable Rust is not supported as a
 toolchain of its own: a stable release's code builds because the nightly builds it. The pin
 moves to a newer nightly with `harness/toolchain_bump.py`
@@ -48,14 +58,14 @@ another blaze ([toolchain.md](toolchain.md)).
 | Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
 | `blaze` | yes (8) | unverified (9) | yes, by hand (9) | yes, by hand (9) | `wasm32-wasip1` and `wasm32-unknown-unknown` cdylibs, by hand (2) |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
-| Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
+| Remote store | no (11) | no | no | no | no |
 | Fuzzed | yes (12) | no | no | no | no |
 
-1. CI: `difftest.py corpus --layouts` compiles every function of the corpus with blaze and
-   matches rustc under both backends: 822 of 822 functions on Linux x86-64, 825 of 825 on
+1. CI, at the commit above: the corpus comparison compiled every function of the corpus
+   with blaze and matched rustc under both backends: 822 of 822 functions on Linux x86-64, 825 of 825 on
    native AArch64, 830 of 830 on Windows, 828 of 828 on macOS, with 0 type layouts
    differing. `programs`, `stress`, `breakers`, `unwinds`, `splices`, `asmedits`,
-   `includes`, `worktrees` and `keys` ran on every leg. Under LLVM, `backends.py` reports no
+   `includes`, `worktrees` and `keys` ran on every leg. Under LLVM, `backends.py` reported no
    corpus function left to Cranelift on any of the four. Local: 822 of 822 under both.
 2. wasm32 uses its own lowering from Cranelift IR, not Cranelift's or LLVM's code
    generation. `wasm32-wasip1` under wasmtime, 2026-10-27, arm64 ix VMs, pinned nightly,
@@ -65,8 +75,8 @@ another blaze ([toolchain.md](toolchain.md)).
    simd128 guests and two Cloudflare Workers (workers-rs, wasm-bindgen) build, link and answer
    as rustc's builds ([platforms.md](platforms.md), wasm32); `blaze build --target
    wasm32-wasip1` built the second by hand, its build scripts and proc macros blaze's too,
-   and `blaze build` the guest and, under worker-build, both workers. The train runs the corpus,
-   stress and `allblaze_wasm.py` on every push to main. No unwinding is emitted; the wasm
+   and `blaze build` the guest and, under worker-build, both workers. The train runs stress and
+   `allblaze_wasm.py` on every push to main. No unwinding is emitted; the wasm
    targets are `panic=abort`. Modules are 8 to 50 times the size of rustc's.
 3. `splices.py` 71 of 71 in CI on both Linux architectures; `farsplices.py` 6 of 6 on
    AArch64, where a branch reaches only 128 MB. Not every edit can be spliced: about 60 of
@@ -98,16 +108,18 @@ another blaze ([toolchain.md](toolchain.md)).
     `storefull.py` on Linux only. The earlier
     [reports/DISKCACHE.md](reports/DISKCACHE.md) says "Linux x86-64 only"; PLAT-ABI2 is
     later and is what this row follows.
-11. `harness/remote.py` against MinIO and SeaweedFS over loopback
-    ([reports/REMOTE.md](reports/REMOTE.md)); MinIO runs in the Linux x86-64 CI job. Real
-    AWS S3 has not been run.
-12. [reports/FUZZ.md](reports/FUZZ.md). Linux x86-64 only; the smoke run is in that CI job.
+11. v1's remote (S3, a directory or the gateway; [reports/REMOTE.md](reports/REMOTE.md)) was
+    deleted on 2026-10-30 with its harness. v2's remote is a read-through tier of the store
+    (`blaze_cas::remote`), tested in blaze-cas but not yet wired into the daemon.
+12. [reports/FUZZ.md](reports/FUZZ.md), the differential fuzzer's runs, Linux x86-64 only. The
+    fuzzers left (`fuzz/edits.py`, `fuzz/store.py`) hold a warm daemon and store to blaze's own
+    cold build; their smoke runs are in that CI job.
 
 Other targets. `x86_64-apple-darwin` is refused: with the triple forced through, the link
 fails on the unwind table ([platforms.md](platforms.md)). Windows targets other than x86-64 MSVC have
 nothing implemented or run. Cross compiling from Linux x86-64 to
 `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` is covered by the build-model
-harness below.
+row below, as last measured.
 
 ## Backends
 
@@ -122,18 +134,17 @@ LLVM bug is worked around by turning off a vectoriser pass (finding 6 in FUZZ.md
 
 ## MIR optimizations
 
-`BLAZE_MIR_OPT=1` runs the passes rustc runs on a debug build's MIR before code is generated
-from it, `BLAZE_MIR_OPT=2` the ones it runs above `-Copt-level=0` that are ported; 0, the
-default, runs none ([mir-passes.md](mir-passes.md#optimizations),
-[research/mir-gap.md](research/mir-gap.md)). Coroutine bodies are never optimized.
+By default each crate's MIR gets the passes rustc runs at that crate's level, those that are
+ported: level 1 (a debug build's) at `-Copt-level=0`, level 2 above it and for the library's
+crates, whose MIR rustc ships optimized. `BLAZE_MIR_OPT` overrides the level for every crate:
+0 runs none, 1 a debug build's passes, 2 those above `-Copt-level=0`
+([mir-passes.md](mir-passes.md#optimizations), [research/mir-gap.md](research/mir-gap.md)).
+Coroutine bodies are never optimized.
 
 | | 0 | 1 | 2 |
 |---|---|---|---|
-| `difftest.py corpus --mixed 8` | yes | yes | yes |
-| `difftest.py mixfutures --mixed 16 --layouts` | yes | yes | yes |
 | `growth.py`, `movedlines.py` | yes | yes | yes |
 | The interpreter's tests give the same result | yes | yes | yes |
-| Identical to rustc's MIR, corpus `cases` | 4.0% (against rustc's level 1) | 21.5% | 14.5% |
 
 ## Tiers
 
@@ -199,8 +210,8 @@ Known refusals:
 | a body in which rust-analyzer's type inference fails or finds errors rustc does not | no MIR, so no code; examples are range patterns over associated constants and an empty array whose element type comes from a single `PartialEq` impl |
 | 15 functions of the `generic-array` crate | a trait-solver gap on `GenericArray<T, N>` |
 
-Known differences from rustc, where blaze does compile the code. These are the cases
-marked open in `harness/breakers.py`:
+Known differences from rustc, where blaze does compile the code. These were the cases open
+when the breakers were deleted (2026-10-30):
 
 | Case | Difference |
 |---|---|
@@ -209,7 +220,7 @@ marked open in `harness/breakers.py`:
 | `raw_write_then_match` | a value written through a raw pointer into a local rustc believes is `None`, then partly moved out, is dropped by blaze and leaked by rustc |
 | `fragment_edition_through_macro` | blaze does what rustc's own test says rustc will do once rust-lang/rust#130484 is fixed |
 
-The differential fuzzer found twenty-one problems in generated programs, most of them
+The differential fuzzer, before it was deleted, found twenty-one problems in generated programs, most of them
 miscompiles in the order temporaries are dropped. Twenty are fixed or worked around and one
 is the first row above. Nearly every full-size run found something, so expect that more
 exist.
@@ -230,7 +241,7 @@ Borrow-check errors are the main case: blaze's borrow checker ([borrowck.md](bor
 finds nothing rustc accepts in rustc's tests or in seven real projects, but it misses about a
 third of the errors rustc gives (67% of rustc's borrow-check tests get rustc's verdict), and
 an edit with one it misses builds and runs. Run `blaze check` or `cargo check` to get
-rustc's verdict. `BLAZE_BORROWCK_REFUSE=0` stops the daemon refusing borrow-check errors.
+rustc's verdict.
 
 ## Nightly features
 
@@ -243,7 +254,6 @@ far:
 - `harness/live-alloc`, a program on `allocator_api` (`Vec<T, A>` and `Box<T, A>` in a bump
   arena) that takes live edits; `live_e2e.py` runs it with `LIVE_PROGRAM=live-alloc`, in the
   gate.
-- The corpus's `nightly` feature, which `toolchain_bump.py checks '{}'` runs with `--layouts`.
 
 The nightly's own removals apply: `box` patterns are gone upstream in this nightly, replaced
 by `deref_patterns`, and blaze's support for deref patterns is being added. `-Z` flags in
@@ -253,9 +263,9 @@ by `deref_patterns`, and blaze's support for deref patterns is being added. `-Z`
 
 There are two layers, and they support different things.
 
-The daemon itself, driven by the harness, follows most of cargo's build model.
-`harness/buildmodel.py` has a small project per feature and compares against cargo under
-both backends. The latest recorded result is 208 of 208 on Linux x86-64 and 204 of 204 on
+The daemon itself, driven by the harness, follows most of cargo's build model. A harness of a
+small project per feature, compared against cargo under both backends, measured it until it
+was deleted on 2026-10-30. Its last recorded result is 208 of 208 on Linux x86-64 and 204 of 204 on
 native AArch64, where four rows that need an x86-64 host are not run (CI on `51339e5`).
 [reports/BUILDMODEL.md](reports/BUILDMODEL.md) has the table at 97 cases per backend, of
 which 92 were supported and 5 refused.
@@ -263,10 +273,10 @@ which 92 were supported and 5 refused.
 `blaze` is narrower. Its column was recorded while it still handed builds to cargo. Since
 2026-10-27 it hands none ([#408](https://github.com/indexable-inc/blaze/pull/408),
 [#571](https://github.com/indexable-inc/blaze/pull/571)): what it does not build fails with the
-reason (`refused` in `crates/blaze-cargo/src/cargo/whole.rs`). A cell that says "cargo" or "handed to
+reason (`refused_error` in `crates/blaze-cargo/src/lib.rs`). A cell that says "cargo" or "handed to
 cargo" now means one of the two, and which is unverified.
 
-| Feature | Daemon (`buildmodel.py`) | `blaze` |
+| Feature | Daemon | `blaze` |
 |---|---|---|
 | dev and test profiles | supported | served |
 | release and custom profiles, `opt-level`, `debug-assertions`, `overflow-checks`, `codegen-units`, `strip`, per-package overrides | supported | handed to cargo for `--release` and `--profile`; unverified for profile settings changed in the manifest |

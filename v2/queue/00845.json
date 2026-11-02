@@ -1,0 +1,41 @@
+{
+  "id": "00845",
+  "from_lane": "firewall",
+  "owner": "query-unify-port-hirdef",
+  "paths": [
+    "crates/hir-def/src/expr_store/body.rs"
+  ],
+  "what": "Leak found by reading, which crates/hir-firewall (lane firewall) will report on its first run: `body_syntax(G)` in crates/hir-def/src/expr_store/body.rs is keyed by each body G and reads its file's parse and AstIdMap (via def_syntax / span_map / ast_id_map), so an edit of any one function body F re-executes body_syntax for EVERY other body of the same file (it backdates, but it is O(bodies in the file) per edit and breaks the guarantee that a body edit re-executes only F's queries; docs/v2/plan/lanes/firewall/notes.md section 3). Fix at the cause: a per-file query that gives each item's position-free syntax (or its hash and relative tree) as a field of a tracked struct per item, so body_syntax(G) reads only G's field and is not re-executed when another item's text changes, as the item tree's per-item keys already do (item_tree/items.rs, docs/v2/plan/lanes/frontend/reparse.md). Test: crates/hir-firewall/tests/exceptions.rs an_edit_of_each_function_reaches_only_it goes clean.",
+  "state": "applied",
+  "created": "2026-10-30T08:49:13Z",
+  "updated": "2026-10-31T15:33:41Z",
+  "taken_by": "query-unify-port-hirdef",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:49:13Z",
+      "by": "firewall",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:23:26Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to query-unify-port-hirdef, which has the same kind of position-free hir-def query work in 01272/01273 (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour). Round 8 firewall leaks: 832/160/192/82/52, as on qu-test2."
+    },
+    {
+      "at": "2026-10-31T15:23:40Z",
+      "by": "query-unify-port-hirdef",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:33:41Z",
+      "by": "query-unify-port-hirdef",
+      "action": "done",
+      "note": "body.rs: body_syntax now reads its own ItemBodySyntax (tracked struct per fn/const/static/variant outside fn bodies, keyed by ast id, field = Option<BodySyntax>), made by file_body_syntax(EditionedFileId) from AstIdMap::entries (no body walk, map holds no positions). In-fn-body and macro bodies: placed_body_syntax (positional, as before). span ast_id.rs: ErasedFileAstId::in_body is pub. Needs: re-bless hir-ty-mir tests/incremental.rs snapshots (body_syntax -> file_body_syntax once per file); try hir-firewall properties.rs:67 with --ignored and drop the ignore if clean. ra clean; cargo not run."
+    }
+  ]
+}

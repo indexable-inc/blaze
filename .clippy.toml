@@ -1,9 +1,58 @@
+# The hot crates (blaze-query, blaze-cas, blaze-ids, blaze-reclaim, intern, blaze-graph,
+# blaze-hashcons, blaze-history, blaze-mem) have a `clippy.toml` of their own, which clippy reads
+# instead of this one: these rules and a ban on locks (docs/v2/plan/design/concurrency.md). A
+# change here is made in theirs too.
 disallowed-types = [
-    { path = "std::collections::HashMap", replacement = "rustc_hash::FxHashMap" },
-    { path = "std::collections::HashSet", replacement = "rustc_hash::FxHashSet" },
-    { path = "std::collections::hash_map::RandomState", replacement = "std::hash::BuildHasherDefault<FxHasher>"}
+    { path = "std::collections::HashMap", replacement = "blaze_hash::HashMap", reason = "SipHash, seeded per map: blaze's maps are on `blaze_hash`'s fixed hasher, or `blaze_hash::ByHash` for keys that are hashes" },
+    { path = "std::collections::HashSet", replacement = "blaze_hash::HashSet", reason = "SipHash, seeded per set: as for `HashMap`" },
+    { path = "std::collections::hash_map::RandomState", replacement = "blaze_hash::FixedState", reason = "SipHash, seeded per map" },
+    { path = "std::hash::RandomState", replacement = "blaze_hash::FixedState", reason = "SipHash, seeded per map" },
+    { path = "rustc_hash::FxHashMap", replacement = "blaze_hash::HashMap", reason = "one hasher for blaze's maps: `blaze_hash`'s, which no key shape makes a worst case", allow-invalid = true },
+    { path = "rustc_hash::FxHashSet", replacement = "blaze_hash::HashSet", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "rustc_hash::FxBuildHasher", replacement = "blaze_hash::FixedState", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "rustc_hash::FxHasher", replacement = "blaze_hash::FixedHasher", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "ahash::AHashMap", replacement = "blaze_hash::HashMap", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "ahash::AHashSet", replacement = "blaze_hash::HashSet", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "ahash::RandomState", replacement = "blaze_hash::FixedState", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "ahash::AHasher", replacement = "blaze_hash::FixedHasher", reason = "one hasher for blaze's maps: `blaze_hash`'s", allow-invalid = true },
+    { path = "std::sync::Mutex", replacement = "parking_lot::Mutex", reason = "no poisoning to handle: a holder that panicked leaves the data as it was" },
+    { path = "std::sync::RwLock", replacement = "parking_lot::RwLock", reason = "no poisoning to handle: a holder that panicked leaves the data as it was" },
+    { path = "std::sync::Condvar", replacement = "parking_lot::Condvar", reason = "waits on the guard in place, with no poisoning to handle" },
+    { path = "std::sync::MutexGuard", replacement = "parking_lot::MutexGuard", reason = "the guard of `parking_lot::Mutex`, which replaces std's" },
+    { path = "std::sync::RwLockReadGuard", replacement = "parking_lot::RwLockReadGuard", reason = "the guard of `parking_lot::RwLock`, which replaces std's" },
+    { path = "std::sync::RwLockWriteGuard", replacement = "parking_lot::RwLockWriteGuard", reason = "the guard of `parking_lot::RwLock`, which replaces std's" },
+    { path = "std::sync::mpsc::Sender", replacement = "crossbeam_channel::Sender", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
+    { path = "std::sync::mpsc::SyncSender", replacement = "crossbeam_channel::Sender", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
+    { path = "std::sync::mpsc::Receiver", replacement = "crossbeam_channel::Receiver", reason = "one channel for every thread handoff: crossbeam's, which also has `select!`, bounded and many-receiver channels" },
+    { path = "std::collections::LinkedList", replacement = "std::collections::VecDeque", reason = "a heap allocation per element and a pointer chase per step" },
+    # AGENTS.md rule 9, standard-structures: one choice per need.
+    { path = "dashmap::DashMap", replacement = "papaya::HashMap", reason = "a shared map is `papaya::HashMap` (AGENTS.md rule 9): each shard of a DashMap is an RwLock", allow-invalid = true },
+    { path = "once_cell::sync::Lazy", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
+    { path = "once_cell::sync::OnceCell", replacement = "std::sync::OnceLock", reason = "std has it", allow-invalid = true },
+    { path = "std::sync::Barrier", reason = "a pool thread waits through the scheduler (AGENTS.md rule 9): join on a counter or a job" },
+    { path = "std::hash::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
+    { path = "std::collections::hash_map::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
+]
+
+disallowed-macros = [
+    { path = "lazy_static::lazy_static", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
 ]
 
 disallowed-methods = [
     { path = "std::process::Command::new", replacement = "toolchain::command", reason = "the latter forces the choice of a working directory" },
+    { path = "std::sync::mpsc::channel", replacement = "crossbeam_channel::unbounded", reason = "one channel for every thread handoff: crossbeam's" },
+    { path = "std::sync::mpsc::sync_channel", replacement = "crossbeam_channel::bounded", reason = "one channel for every thread handoff: crossbeam's" },
+    # AGENTS.md rules 9 and 3: waits go through the scheduler, configuration is typed. Time through the injected clock (rule 11) is `blaze::wall_clock`'s, which knows its paths: clippy refuses a `lint` key here.
+    { path = "std::thread::sleep", reason = "on a pool thread a wait goes through the scheduler, elsewhere through a driver's timer (AGENTS.md rule 9)" },
+    { path = "std::hint::spin_loop", reason = "the one bounded spin-then-park helper of `blaze_graph` spins (AGENTS.md rules 9 and 13)" },
+    { path = "std::thread::spawn", reason = "name the thread, `std::thread::Builder::new().name(..)`: an unnamed thread is unreadable in samples and the profile" },
+    { path = "std::thread::scope", reason = "parallel work runs on blaze's one pool (`blaze_graph::par`), which the scheduler prioritises and the profile sees: a scoped thread is a second, unscheduled pool" },
+    { path = "std::thread::available_parallelism", reason = "the pool owns the worker count (`blaze_graph`'s workers); a second count sizes work for cores another pool is using" },
+    { path = "std::thread::yield_now", reason = "a yield is a spin with no bound: wait through the scheduler, or the bounded spin-then-park helper (AGENTS.md rules 9 and 13)" },
+    { path = "std::thread::park", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 9); a driver parks through its own wait" },
+    { path = "std::thread::park_timeout", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 9); a driver parks through its own wait" },
+    { path = "std::env::var", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
+    { path = "std::env::var_os", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
+    { path = "std::process::exit", reason = "return a typed error from `main`, so destructors and the profile's flush run" },
+    { path = "std::mem::forget", replacement = "std::mem::ManuallyDrop::new", reason = "says what it keeps from being dropped" },
 ]

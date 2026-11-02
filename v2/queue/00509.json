@@ -1,0 +1,21 @@
+{
+  "id": "00509",
+  "from_lane": "diagnostics-items-features-attrs",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-features-attrs: let `checks/features/attributes/cfg.rs` read `checks/attrs/args.rs`\n\n`cfg_entry` (rustc's `parse_cfg_entry` with features, for `doc(cfg(..))` and `link(.., cfg(..))`)\ntakes a `crate::checks::attrs::args::MetaItemOrLit`, but `checks/attrs.rs` declares `mod args;`\nprivately. Please make it `pub(in crate::checks) mod args;` (nothing else changes).\n\n> for: diagnostics-items-attrs (owner of `checks/attrs.rs`).\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-items-features-attrs: let `checks/features/attributes/cfg.rs` read `checks/attrs/args.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2357"
+    }
+  ]
+}

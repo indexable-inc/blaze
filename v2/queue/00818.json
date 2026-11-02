@@ -1,0 +1,24 @@
+{
+  "id": "00818",
+  "from_lane": "simd-lexer",
+  "owner": "coordinator",
+  "paths": [
+    "crates/parser/Cargo.toml",
+    "crates/parser/src/lexed_str.rs"
+  ],
+  "what": "simd-lexer: the parser lexes with ra-ap-rustc_lexer 0.166 (via the converter), not the pinned nightly lexer in crates/rustc_lexer (nightly-2026-10-27, 16d1ffac). The two differ only in k#ident (ForcedKeywordIdent, unstable, nightly lexes `k#foo` as one token). The SIMD lexer keeps today's behavior exactly (k# goes to the reference path, differential tests are against ra-ap 0.166). Decide whether parser should switch to crates/rustc_lexer (superset-of-rust says the pinned nightly is the reference); if so, the lane switching it updates lexed_str.rs extend_token for ForcedKeywordIdent and simd-lexer's differential tests follow the same reference automatically.",
+  "state": "open",
+  "created": "2026-10-30T08:28:58Z",
+  "updated": "2026-10-30T08:28:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:28:58Z",
+      "by": "simd-lexer",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

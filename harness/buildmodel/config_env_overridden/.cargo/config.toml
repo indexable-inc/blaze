@@ -1,3 +1,0 @@
-[env]
-FROM_CONFIG = "config"
-FORCED = { value = "config", force = true }

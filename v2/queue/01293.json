@@ -1,0 +1,41 @@
+{
+  "id": "01293",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify-bench",
+  "paths": [
+    "crates/blaze-bench/benches/query_hit.rs"
+  ],
+  "what": "blaze-v2-qu crates/blaze-bench/benches/query_hit.rs:266: `Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db)` must pass `&mut db` since R18 (singleton inputs take &mut; line 580 already does). Every other singleton caller in blaze-v2-qu is on &mut as of checkpoint 9.",
+  "state": "applied",
+  "created": "2026-10-31T12:17:38Z",
+  "updated": "2026-10-31T14:50:08Z",
+  "taken_by": "query-unify-bench",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:17:38Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:49:36Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Re-filed from the query-unify-port tree, where it was 01250; blaze-v2 has a different 01250, which the merge kept."
+    },
+    {
+      "at": "2026-10-31T14:50:07Z",
+      "by": "query-unify-bench",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:50:08Z",
+      "by": "query-unify-bench",
+      "action": "done",
+      "note": "Already so: the fork module that held line 266 is deleted (7b f65ccd4b2a); the one Graph::builder left, query_hit.rs:270, passes &mut db (in round 7c adc8bbbf04, whose bench ran all nine db/* cases, EXIT 0). blaze-v2-qu has no crates/blaze-bench/benches/query_hit.rs now; when it merges, main's file is the one to keep."
+    }
+  ]
+}

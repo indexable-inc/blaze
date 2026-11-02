@@ -1,0 +1,30 @@
+{
+  "id": "01159",
+  "from_lane": "tests-misc-front1",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-doc/Cargo.toml"
+  ],
+  "what": "The workspace no longer resolves: crates/blaze-doc/Cargo.toml:25 asks pulldown-cmark for features [html, simd], but the root Cargo.toml:244 pins pulldown-cmark 0.9.6, which has no `html` feature (it exists from 0.10). Either bump the workspace pin to a version with `html` or drop the feature. Blocks every cargo run.",
+  "state": "applied",
+  "created": "2026-10-30T23:03:36Z",
+  "updated": "2026-10-31T00:52:42Z",
+  "taken_by": "tests-misc-front1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:03:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T00:52:42Z",
+      "by": "tests-misc-front1",
+      "action": "done",
+      "note": "Stale: the workspace resolves again (pulldown-cmark root pin is 0.13.6), per tests-misc 16:35."
+    }
+  ]
+}

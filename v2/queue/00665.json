@@ -1,0 +1,37 @@
+{
+  "id": "00665",
+  "from_lane": "dedup",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-ids/src/std_hash.rs",
+    "crates/blaze-ids/src/rng.rs",
+    "crates/hir-ty-codegen/v2/fold.rs"
+  ],
+  "what": "## dedup: hir-ty-codegen/v2/fold.rs's hasher forwarders and SplitMix64 onto blaze-ids\n\nFrom `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). `hir-ty-codegen` already\ndepends on `blaze-ids`. New in `blaze-ids`: the macro `blaze_ids::fixed_width_writes!()`\n(`crates/blaze-ids/src/std_hash.rs`: the `write_u8`..`write_isize` methods of a\n`std::hash::Hasher`, each the little-endian bytes through `self.write`, `usize`/`isize` as 64 bits,\nthe same bytes `Le` writes) and `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src/rng.rs`; its\n`below(n)` is `mix(state += GAMMA) % n`, the same stream `Draws::below` draws).\n\n1. `crates/hir-ty-codegen/v2/fold.rs`, `impl std::hash::Hasher for Le<'_>` (about lines 273-327):\n   keep `finish` and `write`; replace `write_u8` through `write_isize` (twelve methods) by the one\n   line `blaze_ids::fixed_width_writes!();`. The doc on `struct Le` stays.\n\n2. Same file, test module, `struct Draws` (about line 1400):\n\n   before:\n\n       struct Draws {\n           state: u64,\n           count: u32,\n           mutate: Option<u32>,\n       }\n\n       impl Draws {\n           fn new(seed: u64, mutate: Option<u32>) -> Draws {\n               Draws { state: seed, count: 0, mutate }\n           }\n\n           fn below(&mut self, n: u32) -> u32 {\n               self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);\n               let mut z = self.state;\n               z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);\n               z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);\n               let value = ((z ^ (z >> 31)) % u64::from(n)) as u32;\n\n   after:\n\n       struct Draws {\n           rng: blaze_ids::rng::SplitMix64,\n           count: u32,\n           mutate: Option<u32>,\n       }\n\n       impl Draws {\n           fn new(seed: u64, mutate: Option<u32>) -> Draws {\n               Draws { rng: blaze_ids::rng::SplitMix64::new(seed), count: 0, mutate }\n           }\n\n           fn below(&mut self, n: u32) -> u32 {\n               let value = self.rng.below(u64::from(n)) as u32;\n\n   (the rest of `below` unchanged; the doc \"SplitMix64. With `mutate`, ...\" stays). Same draws for\n   every seed, so no test's inputs change.\n\n> applied by codegen-v2 (2026-10-29): `Le`'s twelve integer writes are `blaze_ids::fixed_width_writes!()` and the test `Draws` draws from `blaze_ids::rng::SplitMix64`, both as asked.\n\n> forwarded to codegen (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:56:57Z",
+  "taken_by": "unify-front-mir",
+  "why": null,
+  "source": "v2/requests/codegen.md#dedup: hir-ty-codegen/v2/fold.rs's hasher forwarders and SplitMix64 onto blaze-ids",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:1764"
+    },
+    {
+      "at": "2026-10-30T08:55:36Z",
+      "by": "unify-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:57Z",
+      "by": "unify-front-mir",
+      "action": "done",
+      "note": "already in by codegen-v2: crates/hir-ty-codegen/v2/fold.rs:312 blaze_ids::fixed_width_writes!(), Draws on blaze_ids::rng::SplitMix64 (1410-1417)"
+    }
+  ]
+}

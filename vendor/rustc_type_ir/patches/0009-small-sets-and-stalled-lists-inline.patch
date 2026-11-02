@@ -1,0 +1,192 @@
+diff -ruN a/src/data_structures/mod.rs b/src/data_structures/mod.rs
+--- a/src/data_structures/mod.rs
++++ b/src/data_structures/mod.rs
+@@ -13,8 +13,13 @@
+ }
+ 
+ #[cfg(not(feature = "nightly"))]
++mod sso;
++
++#[cfg(not(feature = "nightly"))]
+ mod impl_ {
+-    pub use std::collections::{HashMap as SsoHashMap, HashSet as SsoHashSet};
++    pub use std::collections::HashMap as SsoHashMap;
++
++    pub use super::sso::SsoHashSet;
+ }
+ 
+ pub use delayed_map::{DelayedMap, DelayedSet};
+diff -ruN a/src/data_structures/sso.rs b/src/data_structures/sso.rs
+--- /dev/null
++++ b/src/data_structures/sso.rs
+@@ -0,0 +1,115 @@
++//! A set that keeps its first few elements inline and moves to a hash set past them, as
++//! `rustc_data_structures::sso` does: the visited sets of a type walk or a visitor are
++//! usually small, and a plain hash set allocates on its first insert.
++
++use std::hash::Hash;
++
++use arrayvec::ArrayVec;
++
++use super::HashSet;
++
++/// How many elements stay inline (`rustc_data_structures::sso`'s `SSO_ARRAY_SIZE`).
++const INLINE: usize = 8;
++
++/// A set of at most [`INLINE`] elements in place, searched linearly, and a hash set past that.
++#[derive(Clone)]
++pub enum SsoHashSet<T> {
++    Array(ArrayVec<T, INLINE>),
++    Set(HashSet<T>),
++}
++
++impl<T> SsoHashSet<T> {
++    #[inline]
++    pub const fn new() -> Self {
++        SsoHashSet::Array(ArrayVec::new_const())
++    }
++
++    #[inline]
++    pub fn len(&self) -> usize {
++        match self {
++            SsoHashSet::Array(array) => array.len(),
++            SsoHashSet::Set(set) => set.len(),
++        }
++    }
++
++    #[inline]
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++}
++
++impl<T: Eq + Hash> SsoHashSet<T> {
++    /// Adds `value`, returning whether it was not in the set already.
++    #[inline]
++    pub fn insert(&mut self, value: T) -> bool {
++        match self {
++            SsoHashSet::Array(array) => {
++                if array.contains(&value) {
++                    return false;
++                }
++                if let Err(full) = array.try_push(value) {
++                    let mut set: HashSet<T> = array.drain(..).collect();
++                    set.insert(full.element());
++                    *self = SsoHashSet::Set(set);
++                }
++                true
++            }
++            SsoHashSet::Set(set) => set.insert(value),
++        }
++    }
++
++    #[inline]
++    pub fn contains(&self, value: &T) -> bool {
++        match self {
++            SsoHashSet::Array(array) => array.contains(value),
++            SsoHashSet::Set(set) => set.contains(value),
++        }
++    }
++}
++
++impl<T> Default for SsoHashSet<T> {
++    #[inline]
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<T: std::fmt::Debug> std::fmt::Debug for SsoHashSet<T> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            SsoHashSet::Array(array) => f.debug_set().entries(array.iter()).finish(),
++            SsoHashSet::Set(set) => f.debug_set().entries(set.iter()).finish(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn inserts_answer_as_a_hash_sets_do_on_both_sides_of_the_inline_limit() {
++        let mut ours = SsoHashSet::new();
++        let mut theirs = std::collections::HashSet::new();
++        for value in [3u32, 1, 3, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 6, 2, 6] {
++            assert_eq!(ours.insert(value), theirs.insert(value), "{value}");
++            assert_eq!(ours.len(), theirs.len());
++        }
++        assert!(matches!(ours, SsoHashSet::Set(_)), "past {INLINE} elements it is a hash set");
++        for value in 0..12 {
++            assert_eq!(ours.contains(&value), theirs.contains(&value), "{value}");
++        }
++    }
++
++    #[test]
++    fn up_to_the_inline_limit_nothing_is_allocated() {
++        let mut set = SsoHashSet::new();
++        blaze_alloc_count::assert_at_most(0, "an inline set", || {
++            for value in 0..INLINE as u32 {
++                assert!(set.insert(value));
++                assert!(!set.insert(value));
++            }
++        });
++        assert!(matches!(set, SsoHashSet::Array(_)));
++    }
++}
+diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+--- a/src/solve/mod.rs
++++ b/src/solve/mod.rs
+@@ -10,7 +10,7 @@
+ use rustc_type_ir_macros::{
+     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
+ };
+-use thin_vec::ThinVec;
++use smallvec::SmallVec;
+ use tracing::debug;
+ 
+ use crate::inherent::*;
+@@ -1044,13 +1044,18 @@
+     },
+ }
+ 
++/// The variables a stalled goal waits on: inline for the one or two a goal almost always has,
++/// so stalling allocates nothing (rustc has a `ThinVec`, #160005, which allocates for one).
++pub type StalledVars = SmallVec<[TyOrConstInferVar; 2]>;
++
++/// The sub-unification roots of a stalled goal's type variables, inline as [`StalledVars`].
++pub type SubRoots = SmallVec<[TyVid; 2]>;
++
+ /// The conditions that must change for a goal to warrant
+ #[derive_where(Clone, Debug; I: Interner)]
+ pub struct GoalStalledOn<I: Interner> {
+-    // `ThinVec` is important for performance. See #160005.
+-    pub stalled_vars: ThinVec<TyOrConstInferVar>,
+-    // `ThinVec` is important for performance. See #160005.
+-    pub sub_roots: ThinVec<TyVid>,
++    pub stalled_vars: StalledVars,
++    pub sub_roots: SubRoots,
+     /// The `MaybeInfo` that will be returned on subsequent evaluations if this
+     /// goal remains stalled.
+     pub stalled_maybe_info: MaybeInfo,
+diff -ruN a/src/universe.rs b/src/universe.rs
+--- a/src/universe.rs
++++ b/src/universe.rs
+@@ -1,6 +1,6 @@
+ use tracing::{debug, instrument};
+ 
+-use crate::data_structures::HashSet;
++use crate::data_structures::SsoHashSet;
+ use crate::inherent::*;
+ use crate::visit::TypeVisitableExt;
+ use crate::{
+@@ -71,7 +71,7 @@
+ > {
+     max_universe: UniverseIndex,
+     infcx: &'a Infcx,
+-    cache: HashSet<I::Ty>,
++    cache: SsoHashSet<I::Ty>,
+ }
+ 
+ impl<

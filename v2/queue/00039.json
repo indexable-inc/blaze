@@ -1,0 +1,36 @@
+{
+  "id": "00039",
+  "from_lane": "items-facts",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer.rs",
+    "crates/blaze-items/src/facts.rs"
+  ],
+  "what": "## items-facts: `InferenceResult::defined_anon_consts` (`crates/hir-ty/src/infer.rs`)\n\nWhat: a public accessor for the anonymous consts a body's inference defined (its inline\n`const { .. }` blocks, array lengths and const arguments written in the body):\n\n```rust\nimpl<'db> InferenceResult<'db> {\n    /// The anonymous consts of the body this inferred, including those inside them.\n    pub fn defined_anon_consts(&self) -> &[AnonConstId<'db>] {\n        &self.defined_anon_consts\n    }\n}\n```\n\nWhere: `crates/hir-ty/src/infer.rs`, on `InferenceResult` (the field `defined_anon_consts` is\nprivate, line ~862).\n\nWhy: `Fact::Captures(key)` resolves its key to `Resolved::Closure { store, expr, kind }` and\nhas to rebuild the closure's `InternedClosureId`, whose owner is the `InferBodyId` that\ninferred it: the body, or the anonymous const the closure is inside (`infer_anon_const_query`\ninfers those apart and `merge_anon_consts` merges them). Guessing the body as owner would name\na closure id inference never made, so its captures would be wrong. For signatures and fields\n`AnonConstId::all_from_signature` and `field_types_with_diagnostics(..).defined_anon_consts()`\nalready list them; for bodies only the inference result has the list.\n`crates/blaze-items/src/facts.rs` (`closure_owner`) calls\n`InferenceResult::of(db, body).defined_anon_consts()` as written above; it does not compile\nuntil this lands. Read-only, no behavior change.\n\n> forwarded to db: `crates/hir-ty/src/infer.rs` is db's (db-ty).\n> checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/infer.rs:1914` (`InferenceResult::defined_anon_consts`).",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T09:56:49Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/items.md#items-facts: `InferenceResult::defined_anon_consts` (`crates/hir-ty/src/infer.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/infer.rs:1914` (`InferenceResult::defined_anon_consts`)."
+    }
+  ]
+}

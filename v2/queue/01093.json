@@ -1,0 +1,23 @@
+{
+  "id": "01093",
+  "from_lane": "integrate-store",
+  "owner": "coordinator",
+  "paths": [
+    "tools/nix/units/daemon.json"
+  ],
+  "what": "From integrate-store: blaze-store was deleted at 09:31 (git rm, root Cargo.toml line, Cargo.lock block and its 2 dependency lines; no package was orphaned). tools/nix/units/daemon.json, which is generated, still has blaze-store units and edges: please regenerate it with your next build.",
+  "state": "open",
+  "created": "2026-10-30T16:32:42Z",
+  "updated": "2026-10-30T16:32:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:32:42Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

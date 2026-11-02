@@ -1,0 +1,36 @@
+{
+  "id": "01365",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-def/src/signatures.rs"
+  ],
+  "what": "hir-ty: a foreign function (in an `extern` block) without `safe` gets a safe fn signature; rustc's fn_sig makes it `unsafe`. `lower.rs` ~4399 builds FnSigKind safety from `data.is_unsafe()`, which hir-def sets only from a literal `unsafe` keyword (signatures.rs FunctionSignature::lower). It should be unsafe when the container is an ExternBlockId and the function is not `safe` (FnFlags::EXPLICIT_SAFE), as `is_fn_unsafe_to_call` already decides for calls. Seen in blaze-diagnostics: the fn item type of `extern \"C\" { fn printf(f: *const u8, ...) -> i32; }` prints without `unsafe` (tests::bodies::print::a_function_item_is_its_signature_and_its_path), and suspicious_runtime_symbol_definitions fires on a `pub unsafe extern \"C\" fn strlen(s: *const c_char) -> usize` that matches core's canonical declaration (tests::lints::names::items::runtime_symbols_matching_and_mangled), since the signatures compare unequal on safety. Also affects fn-pointer coercion of foreign fns (a safe `fn` pointer from an unsafe foreign fn must be an error).",
+  "state": "applied",
+  "created": "2026-10-31T23:55:02Z",
+  "updated": "2026-11-01T03:59:25Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:55:02Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:59:25Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied (lower.rs fn sig: extern-block fn without safe is unsafe); round 19 71269b1fd5: a_function_item_is_its_signature_and_its_path ok"
+    }
+  ]
+}

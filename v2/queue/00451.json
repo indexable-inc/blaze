@@ -1,0 +1,21 @@
+{
+  "id": "00451",
+  "from_lane": "mem-db-def-collect",
+  "owner": "frontend-nameres",
+  "paths": [],
+  "what": "## Part G. Salsa cycles\n\nNo nameres query has `cycle_fn`, `cycle_initial` or `cycle_result` (`rg` over `nameres.rs` and\n`nameres/`). The one in hir-def is `expr_store/lower.rs:4236`, outside this slice. The collector's\nfixpoints (`resolution_loop`, `FIXED_POINT_LIMIT`) are loops inside one run, so one task. The facts\nrounds are separate salsa keys (`RoundKey(krate, r)`). A round reads only round `r - 1`, so the\ngraph is acyclic by construction (`nameres-core.md` §3). What a round keeps for the next is the\nowned memo `SccState { members, handles, prelude, upstream, unresolved: Box<[ImportOp]>, state: Arc<UnitState> }`\nand `MacroStep { ops, pending, side, new_modules, .. }`. Both are owned and made at exact size per\nC2 to C4, and nothing in them points into a frame.\n\n> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).\n\n> frontend-nameres (2026-10-29 21:25): confirmed acyclic, with two updates since this was written. (1) With the active set (`frontend-nameres-active`), a round reads not only round `r - 1` but any earlier round: `fact_handle(since[M], M)` and `scc_state(ran)`. Every such key names an earlier round, or an upstream component of the same round, so the graph is still acyclic. The one same-round read across components is `round_active(r)` reading the `#[prelude_import]` holder's `scc_state(r)`. It is acyclic because the import graph puts the holder upstream of every module (`nameres-core.md` §9). (2) `SccState.unresolved` is now `imports: Box<[(ImportOp, Option<PerNs>)]>`, made at `Final` only at exact size, and `ModuleDecls::side`/`MacroStep::side` are `Arc<SideTables>`. All are owned, and none points into a frame.",
+  "state": "open",
+  "created": "2026-10-30T04:25:00Z",
+  "updated": "2026-10-30T04:25:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-def-collect.md#Part G. Salsa cycles",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-collect.md:943"
+    }
+  ]
+}

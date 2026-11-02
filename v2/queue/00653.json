@@ -1,0 +1,38 @@
+{
+  "id": "00653",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/diagnostics.md",
+    "crates/test-utils",
+    "crates/test-utils/src/minicore.rs",
+    "crates/blaze-diagnostics/src/tests/bodies/calls.rs"
+  ],
+  "what": "## coordinator (from db-audit-other): minicore's `Iterator::min` and what the two E0277-free tests need\n\nFrom `v2/requests/diagnostics.md` `## diagnostics-infer2-methods` item 4. `crates/test-utils` is\nthe coordinator's (crates.md, \"every other path\"), not db's.\n\n1. `crates/test-utils/src/minicore.rs`, `trait Iterator`, after `by_ref` (:1942-1947), insert\n   the item's text as it stands:\n\n   ```rust\n                   // region:ord\n                   fn min(self) -> Option<Self::Item>\n                   where\n                       Self: Sized,\n                       Self::Item: crate::cmp::Ord,\n                   {\n                       loop {}\n                   }\n                   // endregion:ord\n   ```\n\n2. What rustc's `tests/ui/suggestions/imm-ref-trait-object.rs` and\n   `tests/ui/illegal-sized-bound/mutability-mismatch-arg.rs` also need, none of which minicore\n   has today:\n   - in `mod cmp`, under `region:ord`: `PartialEq`, `Eq`, `PartialOrd` and `Ord` for the integers\n     (only `()` has `PartialEq` now, :1353), and `impl<A: ?Sized + Ord> Ord for &A`, with its\n     `PartialOrd`, `Eq` and `PartialEq`, as core has them;\n   - in `region:slice`, `impl<T> [T] { pub fn iter(&self) -> Iter<'_, T> }`. The `Iter` at\n     :2028 is in the private `iter::traits::collect` module, so the slice needs a path to it (core\n     has `core::slice::Iter`).\n\nThen diagnostics adds the two tests to `crates/blaze-diagnostics/src/tests/bodies/calls.rs`.\n\n> forwarded to coordinator (requests, pass 37: `crates/test-utils` is the coordinator's \"every other path\", not one of requests' paths; on the report's coordinator list)",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/db.md#coordinator (from db-audit-other): minicore's `Iterator::min` and what the two E0277-free tests need",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12632"
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `Iterator::min` (region ord) after by_ref; in cmp region ord: PartialEq/Eq/PartialOrd/Ord for the integers (builtin_impls) and for `&A`; `[T]::iter` (region iterator) returning `crate::iter::Iter` via a `pub(crate) use self::traits::Iter`. Diagnostics adds the two tests to blaze-diagnostics/src/tests/bodies/calls.rs (told)."
+    }
+  ]
+}

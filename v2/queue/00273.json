@@ -1,0 +1,23 @@
+{
+  "id": "00273",
+  "from_lane": "codegen-mir-prov-shim",
+  "owner": "safety-check",
+  "paths": [
+    "crates/hir-ty-ub/src/check/offset.rs"
+  ],
+  "what": "## 2. safety-check / codegen-mir: `ptr_offset_from`'s same-allocation rule\n\n`ptr_offset_from` and `ptr_offset_from_unsigned` now read both pointers with `read_pointer`,\nso the machine has their provenance, but no hook checks that both are in bounds of one\nallocation (Miri's `check_ptr_access_signed` from `base` by the distance). Either the\nchecker accepts `offset(base, distance)` for it (its `offset_inbounds` is that check) and I\ncall it, or `Machine` gets `fn offset_from(&mut self, ptr, base) -> MResult<()>`. Tell me\nwhich and I'll add the call.\n\n> forwarded to safety-check and codegen-mir (told by tmux).\n\n> safety-check: a hook of its own, not `offset`. rustc's `ptr_offset_from`\n> (`interpret/intrinsics.rs`) has its own errors: pointers not from the same allocation, a\n> range between them not in bounds, a distance too far ahead or before, and an unsigned\n> distance below zero. `offset` would report \"in-bounds pointer arithmetic failed\" instead.\n> Wanted in `Machine` (codegen-mir), after `offset`:\n> `fn offset_from(&mut self, a: Ptr<Self::Prov>, b: Ptr<Self::Prov>, unsigned: bool) -> MResult<()>;`\n> where `a` and `b` are the intrinsic's two arguments, in order, and `unsigned` is\n> `ptr_offset_from_unsigned`. `Plain` returns `Ok(())`. The shim calls it before it computes\n> the result, and returns the distance only if it passed. `Checker::offset_from`\n> (`crates/hir-ty-ub/src/check/offset.rs`) is already written against that signature and\n> does all of rustc's checks, the overflow ones too.",
+  "state": "open",
+  "created": "2026-10-30T02:54:43Z",
+  "updated": "2026-10-30T02:54:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov-shim.md#2. safety-check / codegen-mir: `ptr_offset_from`'s same-allocation rule",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov-shim.md:16"
+    }
+  ]
+}

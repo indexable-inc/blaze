@@ -1,16 +1,7 @@
 //! Module defining all known symbols required by the rest of rust-analyzer.
 #![allow(non_upper_case_globals)]
 
-use std::{
-    hash::{BuildHasher, BuildHasherDefault},
-    ptr::NonNull,
-};
-
-use arrayvec::ArrayString;
-use dashmap::{DashMap, SharedValue};
-use rustc_hash::FxHasher;
-
-use crate::{Symbol, symbol::TaggedArcPtr};
+use crate::{Symbol, symbol::Text};
 
 macro_rules! last {
     ( $($elems:literal,)+ ) => {
@@ -21,14 +12,8 @@ macro_rules! last {
 impl Integer {
     #[inline]
     pub fn as_uint(sym: &Symbol) -> Option<usize> {
-        if !sym.repr.is_arc() {
-            let elem_ref = sym.repr.pointer();
-            // SAFETY: The types have the same layout.
-            let elem_ref = unsafe { std::mem::transmute::<NonNull<*const str>, &&str>(elem_ref) };
-            Self::LIST.element_offset(elem_ref)
-        } else {
-            Self::as_uint_cold(sym)
-        }
+        // A declared integer is one of the list's IDs; one interned at runtime is parsed.
+        Self::index_of(sym).or_else(|| Self::as_uint_cold(sym))
     }
 
     #[cold]
@@ -37,86 +22,111 @@ impl Integer {
     }
 }
 
+/// The sum of the first `lists_before` of `lens`. No binding here may be a symbol's name: each
+/// symbol is a constant of this module, so the binding would be a pattern matching it.
+const fn sum_before(lens: &[usize], lists_before: usize) -> usize {
+    let mut sum = 0;
+    let mut at = 0;
+    while at < lists_before {
+        sum += lens[at];
+        at += 1;
+    }
+    sum
+}
+
 macro_rules! define_symbols {
     (
         @LISTS: $($list_type_name:ident = $list_prefix:literal + [ $($list_idx:literal,)+ ],)*
         @WITH_NAME: $($alias:ident = $value:literal,)*
         @PLAIN: $($name:ident,)*
     ) => {
+        /// The lists, in the order their texts follow the declared ones in [`TEXTS`].
+        #[allow(non_camel_case_types, dead_code)]
+        enum Lists {
+            $( $list_type_name, )*
+        }
+
+        /// How many texts each list has, in the order of [`Lists`].
+        const LIST_LENS: &[usize] = &[ $( last!($($list_idx,)+) + 1, )* ];
+
         $(
             pub enum $list_type_name {}
             impl $list_type_name {
-                // Ensure we covered all numbers.
-                const LIST: &[&str; last!($($list_idx,)+) + 1] = {
-                    static LIST: [&str; last!($($list_idx,)+) + 1] = [ $( concat!($list_prefix, $list_idx), )* ];
-                    &LIST
-                };
+                /// Where the list's first text is in [`TEXTS`].
+                const BASE: usize = DECLARED + sum_before(LIST_LENS, Lists::$list_type_name as usize);
+                const LEN: usize = last!($($list_idx,)+) + 1;
 
                 #[cold]
                 #[inline(never)]
                 fn create(idx: usize) -> Symbol {
-                    use std::fmt::Write;
-                    const MAX_LEN: usize = $list_prefix.len() + u64::MAX.ilog10() as usize + 1;
-                    let mut s = ArrayString::<MAX_LEN>::new();
-                    s.push_str($list_prefix);
-                    _ = write!(s, "{idx}");
-                    Symbol::intern(&s)
+                    // alloc: cold: an index past the list's compiled-in names
+                    Symbol::intern(&format!("{}{idx}", $list_prefix))
                 }
 
                 #[inline]
                 pub fn get(idx: usize) -> Symbol {
-                    match Self::LIST.get(idx) {
-                        Option::Some(s) => Symbol { repr: TaggedArcPtr::non_arc(s) },
-                        Option::None => Self::create(idx),
+                    match idx < Self::LEN {
+                        true => Symbol::from_index(Self::BASE + idx),
+                        false => Self::create(idx),
                     }
+                }
+
+                /// `idx` when `sym` is the compiled-in `get(idx)`.
+                #[inline]
+                #[allow(dead_code)]
+                fn index_of(sym: &Symbol) -> Option<usize> {
+                    let at = sym.static_index()?.checked_sub(Self::BASE)?;
+                    (at < Self::LEN).then_some(at)
                 }
             }
         )*
 
-        // The strings should be in `static`s so that symbol equality holds.
-        $(
-            pub const $name: Symbol = {
-                static SYMBOL_STR: &str = stringify!($name);
-                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
-            };
-        )*
-        $(
-            pub const $alias: Symbol = {
-                static SYMBOL_STR: &str = $value;
-                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
-            };
-        )*
-
-
-        pub(super) fn prefill() -> DashMap<Symbol, (), BuildHasherDefault<FxHasher>> {
-            let mut dashmap_ = <DashMap<Symbol, (), BuildHasherDefault<FxHasher>>>::with_hasher(BuildHasherDefault::default());
-
-            let hasher_ = dashmap_.hasher().clone();
-            let hash_one = |it_: &str| hasher_.hash_one(it_);
-            {
-                $(
-                    for s in $list_type_name::LIST {
-                        let hash_ = hash_one(s);
-                        let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                        let symbol = Symbol { repr: TaggedArcPtr::non_arc(s) };
-                        dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, (symbol, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                    }
-                )*
-                $(
-                    let s = stringify!($name);
-                    let hash_ = hash_one(s);
-                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($name, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                )*
-                $(
-                    let s = $value;
-                    let hash_ = hash_one(s);
-                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($alias, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                )*
-            }
-            dashmap_
+        /// Every plain and named symbol, in declaration order: its index in [`TEXTS`], so a
+        /// declared symbol's index is its ID less one ([`Symbol::declared_index`]) and a fixed
+        /// set of them is a table indexed by it ([`crate::KnownNames`]).
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u16)]
+        pub enum Declared {
+            $( $name, )*
+            $( $alias, )*
         }
+
+        /// How many symbols [`Declared`] has.
+        pub const DECLARED: usize = [$( Declared::$name, )* $( Declared::$alias, )*].len();
+
+        /// How many symbols are compiled in: the declared ones, then each list's.
+        pub const STATIC: usize = DECLARED + sum_before(LIST_LENS, LIST_LENS.len());
+
+        /// Every compiled-in text: symbol ID `n`'s is at `n - 1`. The declared ones in
+        /// declaration order, then each list's, so every compiled-in symbol is a constant ID
+        /// and its text one load.
+        pub(crate) static TEXTS: [Text; STATIC] = [
+            $( Text::new(stringify!($name)), )*
+            $( Text::new($value), )*
+            $( $( Text::new(concat!($list_prefix, $list_idx)), )* )*
+        ];
+
+        /// [`TEXTS`]' texts, in its order: the keys of [`COMPILED`].
+        const NAMES: [&str; STATIC] = [
+            $( stringify!($name), )*
+            $( $value, )*
+            $( $( concat!($list_prefix, $list_idx), )* )*
+        ];
+
+        blaze_phf::name_phf_table! {
+            /// Every compiled-in text's index in [`TEXTS`], keyed by the interner's hash
+            /// ([`blaze_phf::name_hash`]), so interning one is its fixed ID from one lookup
+            /// and one compare, with no probe of the table: what rustc's `sym::` gives a
+            /// predefined symbol. Built when this crate compiles; a text named twice fails it.
+            pub(crate) static COMPILED = &NAMES;
+        }
+        $(
+            pub const $name: Symbol = Symbol::from_index(Declared::$name as usize);
+        )*
+        $(
+            pub const $alias: Symbol = Symbol::from_index(Declared::$alias as usize);
+        )*
     };
 }
 define_symbols! {
@@ -207,6 +217,7 @@ define_symbols! {
     alloc_layout,
     alloc,
     allow,
+    anon,
     any,
     as_str,
     asm,
@@ -350,6 +361,8 @@ define_symbols! {
     From,
     FromStr,
     from_str,
+    from_iter,
+    FromIterator,
     from_output,
     from_residual,
     from_usize,
@@ -470,6 +483,28 @@ define_symbols! {
     panic_2021,
     panic_bounds_check,
     panic_cannot_unwind,
+    panic_const_add_overflow,
+    panic_const_sub_overflow,
+    panic_const_mul_overflow,
+    panic_const_div_overflow,
+    panic_const_rem_overflow,
+    panic_const_neg_overflow,
+    panic_const_shr_overflow,
+    panic_const_shl_overflow,
+    panic_const_div_by_zero,
+    panic_const_rem_by_zero,
+    panic_const_coroutine_resumed,
+    panic_const_async_fn_resumed,
+    panic_const_async_gen_fn_resumed,
+    panic_const_gen_fn_none,
+    panic_const_coroutine_resumed_panic,
+    panic_const_async_fn_resumed_panic,
+    panic_const_async_gen_fn_resumed_panic,
+    panic_const_gen_fn_none_panic,
+    panic_const_coroutine_resumed_drop,
+    panic_const_async_fn_resumed_drop,
+    panic_const_async_gen_fn_resumed_drop,
+    panic_const_gen_fn_none_drop,
     panic_display,
     panic_fmt,
     panic_impl,
@@ -623,6 +658,7 @@ define_symbols! {
     unstable,
     usize,
     v1,
+    Vec,
     va_list,
     vectorcall,
     wasm,
@@ -666,6 +702,7 @@ define_symbols! {
     compiler_builtins,
     custom_mir,
     eii_internals,
+    field_representing_type,
     field_representing_type_raw,
     intrinsics,
     core_intrinsics,
@@ -692,9 +729,173 @@ define_symbols! {
     ref_pat_eat_one_layer_2024,
     ref_pat_eat_one_layer_2024_structural,
     deref_patterns,
+    never_patterns,
+    coroutine_clone,
+    gca_const_items,
+    generic_const_exprs,
+    adt_const_params,
+    min_adt_const_params,
+    const_precise_live_drops,
+    sized_hierarchy,
+    forced_keywords,
     mut_ref,
     type_changing_struct_update,
     RangeMin,
     RangeMax,
     RangeSub,
+    // rustc's intrinsics (`hir_ty::intrinsic::Intrinsic`) that no other name above is:
+    abort_immediate, add_with_overflow, aggregate_raw_ptr, align_of, align_of_val,
+    amdgpu_dispatch_ptr, arith_offset, assert_inhabited, assert_mem_uninitialized_valid,
+    assert_zero_valid, assume, atomic_and, atomic_cxchg, atomic_cxchgweak, atomic_fence,
+    atomic_load, atomic_max, atomic_min, atomic_nand, atomic_or, atomic_singlethreadfence,
+    atomic_store, atomic_umax, atomic_umin, atomic_xadd, atomic_xchg, atomic_xor, atomic_xsub,
+    autodiff, bitreverse, black_box, breakpoint, bswap, caller_location, carrying_mul_add,
+    carryless_mul, catch_unwind, ceil, codeview_annotation, cold_path, compare_bytes,
+    const_allocate, const_deallocate, const_eval_select, const_make_global, contract_check_ensures,
+    contract_check_requires, copy_nonoverlapping, copysignf128, copysignf16, copysignf32,
+    copysignf64, cos, ctlz, ctlz_nonzero, ctpop, cttz, cttz_nonzero, discriminant_value,
+    disjoint_bitor, exact_div, exp, exp2, fabs, fadd_algebraic, fadd_fast, fdiv_algebraic,
+    fdiv_fast, field_offset, field_representing_type_actual_type_id, field_representing_type_name,
+    field_representing_type_offset, float_to_int_unchecked, floor, fma, fmul_algebraic, fmul_fast,
+    fmuladd, forget, frem_algebraic, frem_fast, fsub_algebraic, fsub_fast,
+    gpu_launch_sized_workgroup_mem, integer_max, integer_min, is_val_statically_known, log, log10,
+    log2, maximum_number_nsz_f128, maximum_number_nsz_f16, maximum_number_nsz_f32,
+    maximum_number_nsz_f64, maximumf128, maximumf16, maximumf32, maximumf64,
+    minimum_number_nsz_f128, minimum_number_nsz_f16, minimum_number_nsz_f32, minimum_number_nsz_f64,
+    minimumf128, minimumf16, minimumf32, minimumf64, mul_with_overflow, needs_drop,
+    nontemporal_store, offload, offload_get_num_devices, offset, offset_of, powf, powi,
+    prefetch_read_data, prefetch_read_instruction, prefetch_write_data, prefetch_write_instruction,
+    ptr_guaranteed_cmp, ptr_mask, ptr_metadata, ptr_offset_from, ptr_offset_from_unsigned, raw_eq,
+    read_via_copy, return_address, rotate_left, rotate_right, round, round_ties_even, rustc_peek,
+    saturating_add, saturating_sub, select_unpredictable, simd_add, simd_and, simd_arith_offset,
+    simd_as, simd_bitmask, simd_bitreverse, simd_bswap, simd_carryless_mul, simd_cast,
+    simd_cast_ptr, simd_ceil, simd_ctlz, simd_ctpop, simd_cttz, simd_div, simd_eq,
+    simd_expose_provenance, simd_extract, simd_extract_dyn, simd_fabs, simd_fcos, simd_fexp,
+    simd_fexp2, simd_flog, simd_flog10, simd_flog2, simd_floor, simd_fma, simd_fsin, simd_fsqrt,
+    simd_funnel_shl, simd_funnel_shr, simd_gather, simd_ge, simd_gt, simd_insert, simd_insert_dyn,
+    simd_le, simd_lt, simd_masked_load, simd_masked_store, simd_maximum_number_nsz,
+    simd_minimum_number_nsz, simd_mul, simd_ne, simd_neg, simd_or, simd_reduce_add_ordered,
+    simd_reduce_add_unordered, simd_reduce_all, simd_reduce_and, simd_reduce_any, simd_reduce_max,
+    simd_reduce_min, simd_reduce_mul_ordered, simd_reduce_mul_unordered, simd_reduce_or,
+    simd_reduce_xor, simd_relaxed_fma, simd_rem, simd_round, simd_round_ties_even,
+    simd_saturating_add, simd_saturating_sub, simd_scatter, simd_select, simd_select_bitmask,
+    simd_shl, simd_shr, simd_shuffle, simd_splat, simd_sub, simd_trunc,
+    simd_with_exposed_provenance, simd_xor, sin, size_of, size_of_val, slice_get_unchecked, sqrt,
+    sub_with_overflow, sve_tuple_create2, sve_tuple_create3, sve_tuple_create4, sve_tuple_get,
+    sve_tuple_set, three_way_compare, transmute, transmute_unchecked, trunc, type_id_array_len,
+    type_id_element_ty, type_id_eq, type_id_field_representing_type, type_id_fields,
+    type_id_function_ptr, type_id_generics, type_id_is_signed, type_id_non_exhaustive,
+    type_id_points_mutably, type_id_points_to, type_id_size_of, type_id_type_of,
+    type_id_variant_name, type_id_variant_non_exhaustive, type_id_variants, type_id_vtable,
+    type_name, typed_swap_nonoverlapping, ub_checks, unaligned_volatile_load,
+    unaligned_volatile_store, unchecked_add, unchecked_div, unchecked_funnel_shl,
+    unchecked_funnel_shr, unchecked_mul, unchecked_rem, unchecked_shl, unchecked_shr, unchecked_sub,
+    va_arg, va_copy, va_end, variant_count, volatile_copy_memory,
+    volatile_copy_nonoverlapping_memory, volatile_load, volatile_set_memory, volatile_store,
+    vtable_align, vtable_size, wrapping_add, wrapping_mul, wrapping_sub, write_box_via_move,
+    write_bytes, write_via_move,
+    // `core::ub_checks` functions codegen answers as constants.
+    check_language_ub, check_library_ub,
+    // Names older nightlies gave intrinsics, which `Intrinsic` keeps (see its docs):
+    atomic_and_acqrel, atomic_and_acquire, atomic_and_relaxed, atomic_and_release,
+    atomic_and_seqcst, atomic_cxchg_acqrel_acquire, atomic_cxchg_acqrel_relaxed,
+    atomic_cxchg_acqrel_seqcst, atomic_cxchg_acquire_acquire, atomic_cxchg_acquire_relaxed,
+    atomic_cxchg_acquire_seqcst, atomic_cxchg_relaxed_acquire, atomic_cxchg_relaxed_relaxed,
+    atomic_cxchg_relaxed_seqcst, atomic_cxchg_release_acquire, atomic_cxchg_release_relaxed,
+    atomic_cxchg_release_seqcst, atomic_cxchg_seqcst_acquire, atomic_cxchg_seqcst_relaxed,
+    atomic_cxchg_seqcst_seqcst, atomic_cxchgweak_acqrel_acquire, atomic_cxchgweak_acqrel_relaxed,
+    atomic_cxchgweak_acqrel_seqcst, atomic_cxchgweak_acquire_acquire,
+    atomic_cxchgweak_acquire_relaxed, atomic_cxchgweak_acquire_seqcst,
+    atomic_cxchgweak_relaxed_acquire, atomic_cxchgweak_relaxed_relaxed,
+    atomic_cxchgweak_relaxed_seqcst, atomic_cxchgweak_release_acquire,
+    atomic_cxchgweak_release_relaxed, atomic_cxchgweak_release_seqcst,
+    atomic_cxchgweak_seqcst_acquire, atomic_cxchgweak_seqcst_relaxed,
+    atomic_cxchgweak_seqcst_seqcst, atomic_fence_acqrel, atomic_fence_acquire, atomic_fence_release,
+    atomic_fence_seqcst, atomic_load_acquire, atomic_load_relaxed, atomic_load_seqcst,
+    atomic_max_acqrel, atomic_max_acquire, atomic_max_relaxed, atomic_max_release,
+    atomic_max_seqcst, atomic_min_acqrel, atomic_min_acquire, atomic_min_relaxed,
+    atomic_min_release, atomic_min_seqcst, atomic_nand_acqrel, atomic_nand_acquire,
+    atomic_nand_relaxed, atomic_nand_release, atomic_nand_seqcst, atomic_or_acqrel,
+    atomic_or_acquire, atomic_or_relaxed, atomic_or_release, atomic_or_seqcst,
+    atomic_singlethreadfence_acqrel, atomic_singlethreadfence_acquire,
+    atomic_singlethreadfence_release, atomic_singlethreadfence_seqcst, atomic_store_relaxed,
+    atomic_store_release, atomic_store_seqcst, atomic_umax_acqrel, atomic_umax_acquire,
+    atomic_umax_relaxed, atomic_umax_release, atomic_umax_seqcst, atomic_umin_acqrel,
+    atomic_umin_acquire, atomic_umin_relaxed, atomic_umin_release, atomic_umin_seqcst,
+    atomic_xadd_acqrel, atomic_xadd_acquire, atomic_xadd_relaxed, atomic_xadd_release,
+    atomic_xadd_seqcst, atomic_xchg_acqrel, atomic_xchg_acquire, atomic_xchg_relaxed,
+    atomic_xchg_release, atomic_xchg_seqcst, atomic_xor_acqrel, atomic_xor_acquire,
+    atomic_xor_relaxed, atomic_xor_release, atomic_xor_seqcst, atomic_xsub_acqrel,
+    atomic_xsub_acquire, atomic_xsub_relaxed, atomic_xsub_release, atomic_xsub_seqcst, box_new,
+    // Builtin attributes (`hir_expand::inert_attr_macro::INERT_ATTRIBUTES`) not named above,
+    // so that each is a declared symbol `find_builtin_attr_idx` finds by its index.
+    should_panic, automatically_derived, macro_escape, warn, expect, forbid, deny,
+    must_not_suspend, crate_name, crate_id, link, link_name, no_link, link_section, used,
+    link_ordinal, type_length_limit, move_size_limit, no_start, no_main, no_implicit_prelude,
+    windows_subsystem, panic_handler, no_builtins, track_caller, instruction_set, sanitize,
+    coverage, debugger_visualizer, naked, test_runner, reexport_test_harness_main, thread_local,
+    optimize, ffi_pure, ffi_const, cmse_nonsecure_entry, const_trait, deprecated_safe,
+    collapse_debuginfo, do_not_recommend, cfi_encoding, stable, rustc_const_unstable,
+    rustc_const_stable, rustc_default_body_unstable, rustc_allow_const_fn_unstable,
+    rustc_allowed_through_unstable_modules, rustc_nounwind, default_lib_allocator,
+    needs_allocator, linkage, rustc_std_internal_symbol, rustc_proc_macro_decls,
+    rustc_on_unimplemented, rustc_confusables, rustc_conversion_suggestion,
+    rustc_trivial_field_reads, rustc_lint_query_instability,
+    rustc_lint_untracked_query_information, rustc_lint_opt_ty, rustc_lint_opt_deny_field_access,
+    rustc_promotable, rustc_do_not_const_check, rustc_nonnull_optimization_guaranteed,
+    rustc_pass_by_value, rustc_never_returns_null_ptr, rustc_deny_explicit_impl, rustc_box,
+    rustc_inherit_overflow_checks, rustc_test_marker, rustc_unsafe_specialization_marker,
+    rustc_specialization_trait, rustc_main, rustc_must_implement_one_of, rustc_doc_primitive,
+    rustc_no_mir_inline, rustc_effective_visibility, rustc_outlives, rustc_capture_analysis,
+    rustc_insignificant_dtor, rustc_strict_coherence, rustc_variance, rustc_variance_of_opaques,
+    rustc_hidden_type_of_opaques, rustc_layout, rustc_abi, rustc_regions, rustc_dump_user_args,
+    rustc_evaluate_where_clauses, rustc_if_this_changed, rustc_then_this_would_need, rustc_clean,
+    rustc_partition_reused, rustc_partition_codegened, rustc_expected_cgu_reuse,
+    rustc_symbol_name, rustc_def_path, rustc_mir, rustc_dump_program_clauses,
+    rustc_dump_env_program_clauses, rustc_object_lifetime_default, rustc_dyn_incompatible_trait,
+    rustc_dump_vtable, rustc_dummy, omit_gdb_pretty_printer_section,
+    // fix-names: names code asked for by `Symbol::intern` of a literal.
+    abort,
+    // Builtin attributes and lang items named nowhere above.
+    inline, cold, unsafe_unpin, global_alloc_ty, maybe_dangling,
+    panic_null_reference_constructed, panic_invalid_enum_construction, mem_size_const,
+    mem_align_const, rustc_diagnostic_item, try_as_dyn,
+    // The most frequent identifiers of `library/` and `harness/` (comments and literals left
+    // out, keywords and the names above skipped), most frequent first, so that each is a
+    // fixed ID found by `COMPILED` with no probe of the table. Not here, though common: the
+    // names this module binds (`at`, `sum`, `lens`, `idx`, `sym`) and those the derives on
+    // `Declared` bind (`f`, `other`, `state`), which a constant of the same name would turn
+    // into patterns.
+    a, b, c_int, r, u, target_arch, i, since, issue, assert_instr, T, assert_eq, e, c_long, x, c,
+    simd_test, v, pg, unwrap, o, k, op1, op2, src, ptr, R, mem, bytes, F, N, data, n, s, A, m, io,
+    buf, svbool_t, HvxVector, target_os, name, c_char, h, MAX, map, value, cast, __m128i, base,
+    __mmask8, t, vec, p, val, mix, inner, __m256i, size, take, IMM8, __m512i, ld, op, LANE, as_ptr,
+    c_ulong, get, total, out, K, Error, rustfmt, I, svint32_t, it, d, section,
+    static_assert_uimm_bits, push, y, tcflag_t, svint64_t, V, step, ty, ErrorCode, slice, mask,
+    write, c_uint, println, constants, svint16_t, ident, target_endian, read, as_signed, ZERO,
+    ret_val, size_t, endian, MIN, input, libc, always, w, is_x86_feature_detected, bases, B,
+    __m128, Sized, Value, storage, E, offsets, defined, svuint64_t, assert_eq_m128i, svint8_t, S,
+    U, loaded, svuint32_t, ROUNDING, __m128d, __m128h, _rt, rt, as_mut_ptr, i64x2, addr, vu, op3,
+    fd, collect, MaybeUninit, Endian, Duration, handle, id, __m512d, expected, Float, speed_t, S1,
+    int32x4_t, m256i, __m512, assert_eq_m256i, f0, symbol, U32, uint32x4_t, __mmask16, m128i,
+    entry, key, check, elf, kind, assert_eq_m512i, i64x4, nop, Formatter, Padding, int16x8_t, ptr0,
+    i32x4, rhs, z, as_inner, Allocator, expr, hf64, svuint16_t, insert, svfloat32_t, Path,
+    target_env, vv, svfloat64_t, int16x4_t, ret, MASKS, F32, dst, v128, NAN, int32x2_t, FnMut, P,
+    rs, F64, float32x4_t, sve_into, Arc, float32x2_t, HvxVectorPair, svuint8_t, float16x8_t, i16x8,
+    header, float16x4_t, int8x8_t, set, assert_eq_const_safe, uint8x16_t, i8x16, Type, INT,
+    uint8x8_t, SelfT, items, arg, min, join, S2, this, SAE, as_unsigned, Offset, int8x16_t,
+    NonZero, res, target_pointer_width, unit, Noisy, haystack, encoding, ctx, size_hint, s32, sys,
+    indices, raw, run, as_ref, status, uint16x8_t, fs, __m256, j, mem_addr, to_bits, Int, LE,
+    splat, xs, ffi, thread, tt, D, NonNull, Status, max, length, lock, pos, clippy, ok, __m512h,
+    unwrap_or, null_mut, time_t, uint16x4_t, layout, address, Rc, svsetffr, ErrorKind, svrdffr,
+    finish, uint32x2_t, int64x2_t, bits, Relaxed, _MM_FROUND_NO_EXC, load, INFINITY, s16, Send,
+    enumerate, PhantomData, float64x2_t, rss, OsStr, rng, rx, init, Bencher, Operation, s64, err,
+    f32x4, H, capacity, k1, c_ushort, c_short, version, buffer, v2, cases, EndianSlice, rest,
+    LittleEndian, sections, nl_item, AttributeValue, uint64x2_t, target, mode_t, arch, Acc, writer,
+    __m256d, reg, next_back, contains, pid_t, needle, _mm_setr_ph, cmd, Simd, table, PathBuf, IMM5,
+    borrow, from_bits, text, Layout, item, Elf, File, feed, Loud, object, _mm_set_ps, note,
+    debug_assert, output, static_assert, os, __mmask32, l, NEG_INFINITY, IMM2, matches, left,
+    u32x4, f1, first, written, reader, error, windows, Section, IMM_INDEX, tests, options,
+    vector_unsigned_int, _mm_set_pd, Sync, macho, HvxVectorPred, tx, Op, fold, ix, assert_eq_m128,
+    f64x2,
 }

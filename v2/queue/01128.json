@@ -1,0 +1,35 @@
+{
+  "id": "01128",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R10 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): add `Storage::keep_every_value(&mut self, bool)`: while set, no lru eviction at view boundaries. hir-firewall lib.rs:178 (fork's Zalsa::keep_every_value) keeps every memo so its harness inspects them.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: Storage::keep_every_value."
+    }
+  ]
+}

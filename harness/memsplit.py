@@ -95,7 +95,7 @@ def main():
     home = os.path.join(work, "home")
     env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **prepared, **extra_env)
     env["PATH"] = os.path.dirname(bench.blaze_of("cranelift")) + os.pathsep + env["PATH"]
-    env.update(bench.BACKENDS["cranelift"], BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, "store"))
+    env.update(BLAZE_STATS="1")
     env.pop("RUSTC_WRAPPER", None)
     ours = Side(ws, env, True)
     build = spec.get("build", [])

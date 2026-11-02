@@ -1,0 +1,23 @@
+{
+  "id": "01467",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-global/src/public.rs"
+  ],
+  "what": "The release template key changed (codegen, oid-registry 'a template made against 6 references is given 7'): the driver now keeps a release compile under keys::release(imports.blob_key(blaze_codegen::backend::laid_out(stored(instance, built_in), places))), where places is the second value of blaze_codegen::backend::release_refs(own refs, each import's refs): the first place of each reference of the function and then of each import, which says which of them are one target and so how many places the template has and where each relocation points. No key held it before, so a template was reused against another count.\n\nWhere: crates/blaze-global/src/public.rs, FunctionMade's doc (line ~190) and Rule::function (line ~467), which still compute keys::release(imports.blob_key(stored)). Nothing in production builds a FunctionMade yet, so nothing breaks today, but the key it proves public no longer names the driver's.\n\nWhat: FunctionMade gains the places (or the references they come from) and Rule::function keys with laid_out(stored, places), as the driver does; the doc says so. Test: public.rs's test computing the key expects laid_out's.",
+  "state": "open",
+  "created": "2026-11-01T06:07:02Z",
+  "updated": "2026-11-01T06:07:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T06:07:02Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

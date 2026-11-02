@@ -1,0 +1,31 @@
+{
+  "id": "01339",
+  "from_lane": "tests-misc-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/macro_expansion_tests/mbe.rs",
+    "crates/mbe/src",
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "Fixture for a suspected macro-expansion regression from an uncommitted hir-def/mbe edit (01303/01309?): new test hir-def macro_expansion_tests::mbe::ty_repetition_with_a_trailing_comma (crates/hir-def/src/macro_expansion_tests/mbe.rs:1069), uncommitted, not yet run. It mirrors minicore impl_fmt_traits!: `( $($ty:ty),* $(,)? ) => { $( impl Tr for $ty {} )* }` called with a trailing comma over lines, and once without. Symptom (coord-dup-78, /tmp/blaze-lanes/lints-ubif.log): blaze-lints tests::useless_borrows_in_formatting lost every finding needing Display of an integer (minicore impl_fmt_traits!(i8, ..., char,) at test-utils minicore.rs:1561) while impl_fmt_traits!(str) (no trailing comma) still works. The expect text is hand-written; if the expansion is right and only formatting differs, update the expect and look elsewhere (multi-line call).",
+  "state": "applied",
+  "created": "2026-10-31T20:01:19Z",
+  "updated": "2026-10-31T20:07:39Z",
+  "taken_by": "tests-misc-lints",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:01:19Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:07:39Z",
+      "by": "tests-misc-lints",
+      "action": "done",
+      "note": "withdrawn by the requester: coord-dup-78 ran ty_repetition_with_a_trailing_comma, it passes (/tmp/blaze-lanes/mbe-trailing.log); the 1-of-6 run was a mid-edit tree. Test stays as a guard."
+    }
+  ]
+}

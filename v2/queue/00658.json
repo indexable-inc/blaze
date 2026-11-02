@@ -1,0 +1,23 @@
+{
+  "id": "00658",
+  "from_lane": "codegen",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/position.rs"
+  ],
+  "what": "## 8. link: who builds the span tables `Target::Position` names\n\nWhere: lane link (`crates/blaze-link/src/position.rs` decodes a `SpanTable`; nothing in v2\nproduces one yet).\n\nWhat: a `Target::Position(SpanRef { anchor, index })` from codegen names entry `index` of the\ntable `anchor`. `hir_ty_codegen::v2::ItemHashes::span_tables(db, owner)` lists every table of a\nbody by anchor, with the `MirSpan` at each index, and `ItemHashes::declaration_table(db, func)`\nthe one-entry table of a function's declaration. The position of each entry is\n`hir_ty_mir::mir::location::source_location_in_file`; an entry it finds no syntax for (a\nbinding, the self parameter, `MirSpan::Unknown`) is its owner's position. Whoever feeds the\nlinker its span tables (the daemon's link step, lane cargo or link) should build them from\nthese, keyed by anchor, so a reformat rebuilds tables and compiles nothing.\n\nWhy: without them every panic location and `#[track_caller]` `Location` points at nothing.\n\n> forwarded to link: lane link's call.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#8. link: who builds the span tables `Target::Position` names",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:675"
+    }
+  ]
+}

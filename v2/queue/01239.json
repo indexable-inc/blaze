@@ -1,0 +1,29 @@
+{
+  "id": "01239",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs"
+  ],
+  "what": "Pattern type range ends (#![feature(pattern_types)]): rustc ast lowering (lower_ty_pat_mut) turns an exclusive end a..b into an anon const RangeSub::sub_one(b) (lower_excluded_range_end) and fills an open end with an anon const <_ as RangeMin>::MIN / RangeMax::MAX (lower_ty_pat_range_end). hir-def expr_store lowering of TypeRef::PatternType should synthesize those anon const bodies (lang items RangeSub, RangeMin, RangeMax). Until then hir-ty lower.rs reports TyLoweringDiagnostic::PatternTypeNotLowered { reason: ExclusiveEnd | OpenEnd } (no silent wrong type). Once hir-def makes them, hir-ty drops those two reasons.",
+  "state": "applied",
+  "created": "2026-10-31T02:55:12Z",
+  "updated": "2026-10-31T14:24:57Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:55:12Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:24:57Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "already true: hir-def collect_ty_pat lowers a..b through lower_excluded_range_end (RangeSub) and an open end through lower_ty_pat_range_end (RangeMin/RangeMax), always Inclusive; hir-ty dropped ExclusiveEnd/OpenEnd (lower.rs, lower/diagnostics.rs, ColdBatch schema 6); emitter arms queued to no-fallback-tools"
+    }
+  ]
+}

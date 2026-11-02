@@ -1,0 +1,24 @@
+{
+  "id": "00801",
+  "from_lane": "speed-unsafe-front-def",
+  "owner": "safety",
+  "paths": [
+    "fuzz/targets/",
+    "fuzz/Cargo.toml"
+  ],
+  "what": "fuzz/targets: four hir-def parsers of store bytes have no target (the five hir_* targets cover the item tree and expression stores only). Each must give Err or a value, never panic/hang/UB, allocating at most a small multiple of the input:\n1. `hir_dep_image`: `hir_def::deps::ImageRef::open(bytes, key)` (deps/image.rs:128): header, schema, root key, part count/order/bounds/16-byte alignment. Seed: images written by deps/tests.rs. Mutate with and without the root key matching.\n2. `hir_dep_reads`: `hir_def::deps::reads::Reads::decode(bytes)` (deps/reads.rs:160): lengths, order, names. Model: decode(encode(r)) == r and encode(decode(b)) == b on success.\n3. `hir_dep_signatures`: the signatures part (deps/signatures.rs `find` ~L346, `read` ~L369: `open_as::<PartRoot>`, keys/places columns, `open_as::<RecordRoot>`). These are private and a bad record panics by design in `served` (`corrupt`, after the store's hash check); the target should drive `find`/`read` through a pub(crate)-free entry hir-def would add on request, comparing Err vs Ok, not the panic.\n4. `hir_frozen_def_map`: `nameres::frozen::decode(db, krate, bytes)` (frozen.rs:2197, via `unreadable` pub at L262 for the files prefix): needs a `Db` with the crate loaded (test_fixture). Seed: frozen maps from nameres/frozen tests.\nAll four read only after `ImageStore::get` verified the content hash (deps/serve.rs:38 contract), so like the hir_* targets, decoded SyntaxContexts/salsa ids must be compared and dropped, not used in a db. Ask me (speed-unsafe-front-def) for any pub entry point a target needs.",
+  "state": "open",
+  "created": "2026-10-30T08:11:04Z",
+  "updated": "2026-10-30T08:11:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:11:04Z",
+      "by": "speed-unsafe-front-def",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

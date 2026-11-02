@@ -8,6 +8,8 @@
 //! The sections are those of GNU's extension of DWARF 4, which rustc writes too: an entry
 //! kept apart names no address, only the place of one in `.debug_addr`.
 
+use blaze_format::cursor::Reader;
+use blaze_hash::HashMap;
 use cranelift_codegen::gimli::{
     self, DW_AT_GNU_addr_base, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_GNU_ranges_base,
     DW_AT_comp_dir, DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, DW_CHILDREN_no,
@@ -21,9 +23,8 @@ use cranelift_object::object::{
     self, BinaryFormat, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
 };
-use rustc_hash::FxHashMap;
 
-use super::{Reloc, Section, SectionWriter, Sidecar, Target};
+use super::{Section, SectionWriter, Sidecar, Target};
 
 /// A list entry of `.debug_loc.dwo` that names its two ends by their places in
 /// `.debug_addr`, and the one that ends a list.
@@ -32,18 +33,26 @@ const DW_LLE_GNU_END_OF_LIST_ENTRY: u8 = 0;
 
 /// The name of the file of the unit that is `nth` of those `object` has kept apart.
 pub(super) fn file(object: &str, nth: usize) -> String {
+    // alloc: the file's name, kept; once per unit of up to 256 functions
     format!("{object}.{nth}.dwo")
+}
+
+/// The message of an error of writing a section or an object.
+fn message(error: impl std::fmt::Display) -> String {
+    // alloc: the error's message
+    error.to_string()
 }
 
 /// The shapes of a unit's entries, with the start of an entry's code, which was written as
 /// a plain number, said to be the place of an address among those the object keeps. Both
 /// are written the same way, so the entries stay as they are.
 fn by_index(abbrev: &SectionWriter) -> Result<SectionWriter, String> {
+    // alloc: the error's message
     let short = |_| "the shapes of a unit's entries end short".to_owned();
     let mut read = gimli::EndianSlice::new(abbrev.bytes.slice(), gimli::LittleEndian);
     let mut next = || gimli::leb128::read::unsigned(&mut read).map_err(short);
     let mut renamed = SectionWriter::default();
-    let mut put = |value| renamed.write_uleb128(value).map_err(|e| e.to_string());
+    let mut put = |value| renamed.write_uleb128(value).map_err(message);
     loop {
         let code = next()?;
         put(code)?;
@@ -59,6 +68,7 @@ fn by_index(abbrev: &SectionWriter) -> Result<SectionWriter, String> {
             put(name)?;
             put(if index { DW_FORM_GNU_addr_index.0.into() } else { form })?;
             if form == u64::from(DW_FORM_implicit_const.0) {
+                // alloc: the error's message
                 return Err("a shape with a value of its own".to_owned());
             }
             if name == 0 && form == 0 {
@@ -96,6 +106,12 @@ pub(super) struct Split {
     addr: SectionWriter,
     /// The location lists of the unit being added.
     loc_apart: SectionWriter,
+    /// Of the unit being added, as [`Split::locations`] finds them: the place among the
+    /// relocations of its location lists of the one at each offset, the place in
+    /// `.debug_addr` of each address they name, and where each list is now by where it was.
+    loc_relocs: HashMap<u64, usize>,
+    indices: HashMap<(u32, i64), u64>,
+    lists: HashMap<i64, usize>,
     files: Vec<Sidecar>,
 }
 
@@ -117,6 +133,10 @@ impl Split {
             ranges: SectionWriter::default(),
             addr: SectionWriter::default(),
             loc_apart: SectionWriter::default(),
+            loc_relocs: HashMap::default(),
+            indices: HashMap::default(),
+            lists: HashMap::default(),
+            // alloc: once per object, one file pushed for each unit of up to 256 functions
             files: Vec::new(),
         }
     }
@@ -124,14 +144,15 @@ impl Split {
     /// Writes one unit: its entries apart, and its lines, addresses and skeleton to link.
     pub(super) fn add(&mut self, apart: Apart) -> Result<(), String> {
         if self.abbrev.len() == 0 {
-            self.skeleton_abbrev().map_err(|e| e.to_string())?;
+            self.skeleton_abbrev().map_err(message)?;
         }
         let Apart { unit, lines, ranges, addresses, id } = apart;
         let mut dwarf = gimli::write::Dwarf::new();
         dwarf.units.add(unit);
         let mut written = Sections::new(SectionWriter::default());
-        dwarf.write(&mut written).map_err(|e| e.to_string())?;
+        dwarf.write(&mut written).map_err(message)?;
         if written.debug_str.len() != 0 || written.debug_line.len() != 0 {
+            // alloc: the error's message
             return Err("a unit kept apart has strings or lines of its own".to_owned());
         }
 
@@ -139,47 +160,50 @@ impl Split {
         let (mut line_strings, mut strings) = (LineStringTable::default(), StringTable::default());
         let lines = lines
             .write(&mut self.line, self.encoding, &mut line_strings, &mut strings)
-            .map_err(|e| e.to_string())?;
+            .map_err(message)?;
 
         let size = self.encoding.address_size;
         let of_unit = self.ranges.len();
         for range in ranges {
             let Range::StartLength { begin, length } = range else {
+                // alloc: the error's message
                 return Err("a function of no one stretch of code".to_owned());
             };
             let end = super::past(begin, length as u32);
-            self.ranges.write_address(begin, size).map_err(|e| e.to_string())?;
-            self.ranges.write_address(end, size).map_err(|e| e.to_string())?;
+            self.ranges.write_address(begin, size).map_err(message)?;
+            self.ranges.write_address(end, size).map_err(message)?;
         }
-        self.ranges.write_udata(0, size).map_err(|e| e.to_string())?;
-        self.ranges.write_udata(0, size).map_err(|e| e.to_string())?;
+        self.ranges.write_udata(0, size).map_err(message)?;
+        self.ranges.write_udata(0, size).map_err(message)?;
         let ranges_base = self.ranges.len();
         self.ranges.append(&written.debug_ranges.0);
 
         let addr_base = self.addr.len();
         for address in addresses {
-            self.addr.write_address(address, size).map_err(|e| e.to_string())?;
+            self.addr.write_address(address, size).map_err(message)?;
         }
-        let lists = self.locations(&written.debug_loc.0, addr_base)?;
+        self.locations(&written.debug_loc.0, addr_base)?;
 
         let mut info = written.debug_info.0;
         for reloc in std::mem::take(&mut info.relocs) {
             let value = match reloc.target {
                 Target::Section(SectionId::DebugAbbrev) => reloc.addend,
                 Target::Section(SectionId::DebugRanges) => reloc.addend,
-                Target::Section(SectionId::DebugLoc) => match lists.get(&reloc.addend) {
+                Target::Section(SectionId::DebugLoc) => match self.lists.get(&reloc.addend) {
                     Some(&at) => at as i64,
+                    // alloc: the error's message
                     None => return Err("a unit kept apart reads a list it has not".to_owned()),
                 },
                 Target::Section(section) => {
+                    // alloc: the error's message
                     return Err(format!("a unit kept apart reads {}", section.name()));
                 }
                 Target::Function(_) => {
+                    // alloc: the error's message
                     return Err("a unit kept apart names an address".to_owned());
                 }
             };
-            info.write_udata_at(reloc.offset as usize, value as u64, reloc.size)
-                .map_err(|e| e.to_string())?;
+            info.write_udata_at(reloc.offset as usize, value as u64, reloc.size).map_err(message)?;
         }
         let name = file(&self.name, self.files.len());
         let lists = std::mem::take(&mut self.loc_apart);
@@ -189,7 +213,7 @@ impl Split {
             (SectionId::DebugLoc, &lists),
         ])?;
         self.skeleton(name.as_bytes(), lines.0, id, of_unit, ranges_base, addr_base)
-            .map_err(|e| e.to_string())?;
+            .map_err(message)?;
         self.files.push(Sidecar { name, bytes });
         Ok(())
     }
@@ -202,77 +226,82 @@ impl Split {
         for (id, written) in sections {
             let bytes = written.bytes.slice();
             let Some(name) = id.dwo_name().filter(|_| !bytes.is_empty()) else { continue };
+            // alloc: `object` takes the names owned, of three sections a unit of 256 functions
             let segment = object.segment_name(StandardSegment::Debug).to_vec();
+            // alloc: `object` takes the section's name owned
             let at = object.add_section(segment, name.as_bytes().to_vec(), SectionKind::Debug);
             let section = object.section_mut(at);
-            section.set_data(bytes.to_vec(), 1);
+            section.set_data(bytes, 1);
             section.flags =
                 SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_EXCLUDE.into() };
         }
-        object.write().map_err(|e| e.to_string())
+        object.write().map_err(message)
     }
 
     /// The location lists of a unit as `.debug_loc.dwo` has them, with the addresses they
-    /// name put in `.debug_addr`. Answers where each list is now, by where it was.
-    fn locations(
-        &mut self,
-        loc: &SectionWriter,
-        addr_base: usize,
-    ) -> Result<FxHashMap<i64, usize>, String> {
+    /// name put in `.debug_addr`. Leaves where each list is now, by where it was, in
+    /// [`Split::lists`].
+    fn locations(&mut self, loc: &SectionWriter, addr_base: usize) -> Result<(), String> {
         let size = usize::from(self.encoding.address_size);
         let bytes = loc.bytes.slice();
-        let relocs: FxHashMap<u64, &Reloc> = loc.relocs.iter().map(|it| (it.offset, it)).collect();
+        self.loc_relocs.clear();
+        self.loc_relocs.extend(loc.relocs.iter().enumerate().map(|(nth, it)| (it.offset, nth)));
+        self.indices.clear();
+        self.lists.clear();
+        let relocs = &self.loc_relocs;
+        let reloc = |offset: usize| relocs.get(&(offset as u64)).map(|&nth| &loc.relocs[nth]);
+        // alloc: the error's message
         let short = || "a location list ends short".to_owned();
-        let mut indices: FxHashMap<(u32, i64), u64> = FxHashMap::default();
-        let mut lists = FxHashMap::default();
         let mut entries = 0;
-        let mut at = 0;
+        let mut read = Reader::new(bytes);
         let mut begins = true;
-        while at < bytes.len() {
+        while !read.is_done() {
+            let at = read.at();
             if begins {
-                lists.insert(at as i64, self.loc_apart.len());
+                self.lists.insert(at as i64, self.loc_apart.len());
                 begins = false;
             }
-            let ends = bytes.get(at..at + 2 * size).ok_or_else(short)?;
-            let (begin, end) = (relocs.get(&(at as u64)), relocs.get(&((at + size) as u64)));
-            at += 2 * size;
+            let ends = read.take(2 * size).map_err(|_| short())?;
+            let (begin, end) = (reloc(at), reloc(at + size));
             let (Some(begin), Some(end)) = (begin, end) else {
                 if begin.is_some() || end.is_some() || ends.iter().any(|&it| it != 0) {
+                    // alloc: the error's message
                     return Err("a location list of no function's addresses".to_owned());
                 }
-                self.loc_apart.write_u8(DW_LLE_GNU_END_OF_LIST_ENTRY).map_err(|e| e.to_string())?;
+                self.loc_apart.write_u8(DW_LLE_GNU_END_OF_LIST_ENTRY).map_err(message)?;
                 begins = true;
                 continue;
             };
-            self.loc_apart.write_u8(DW_LLE_GNU_START_END_ENTRY).map_err(|e| e.to_string())?;
+            self.loc_apart.write_u8(DW_LLE_GNU_START_END_ENTRY).map_err(message)?;
             for end in [begin, end] {
                 let Target::Function(func) = end.target else {
+                    // alloc: the error's message
                     return Err("a location list of no function's addresses".to_owned());
                 };
-                let index = match indices.get(&(func.as_u32(), end.addend)) {
+                let index = match self.indices.get(&(func.as_u32(), end.addend)) {
                     Some(&index) => index,
                     None => {
                         let index = ((self.addr.len() - addr_base) / size) as u64;
                         let address =
                             Address::Symbol { symbol: func.as_u32() as usize, addend: end.addend };
-                        self.addr.write_address(address, size as u8).map_err(|e| e.to_string())?;
-                        indices.insert((func.as_u32(), end.addend), index);
+                        self.addr.write_address(address, size as u8).map_err(message)?;
+                        self.indices.insert((func.as_u32(), end.addend), index);
                         index
                     }
                 };
-                self.loc_apart.write_uleb128(index).map_err(|e| e.to_string())?;
+                self.loc_apart.write_uleb128(index).map_err(message)?;
             }
-            let len = bytes.get(at..at + 2).ok_or_else(short)?;
-            let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
-            let expression = bytes.get(at..at + 2 + len).ok_or_else(short)?;
-            self.loc_apart.write(expression).map_err(|e| e.to_string())?;
-            at += 2 + len;
+            let start = read.at();
+            let len = read.u16().map_err(|_| short())?;
+            read.skip(usize::from(len)).map_err(|_| short())?;
+            self.loc_apart.write(&bytes[start..read.at()]).map_err(message)?;
             entries += 1;
         }
         if loc.relocs.len() != 2 * entries {
+            // alloc: the error's message
             return Err("a location kept apart names an address".to_owned());
         }
-        Ok(lists)
+        Ok(())
     }
 
     /// The one shape every skeleton has.
@@ -341,6 +370,7 @@ impl Split {
             (SectionId::DebugAddr, self.addr),
         ];
         let linked = linked.into_iter().map(|(id, written)| Section { id, group: None, written });
+        // alloc: once per object, the five sections it links
         (linked.collect(), self.files)
     }
 }

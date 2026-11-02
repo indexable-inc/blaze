@@ -1,0 +1,35 @@
+{
+  "id": "00944",
+  "from_lane": "speed-vfs-names",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/files.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/unit/files.rs Mounted::walk (lines 63-83): read the whole walk under one pin instead of an owned listing and a pin per file. At the top of walk, after locate: `let pinned = self.reader.pin();`. Replace `self.reader.list(root, &full)` (line 69) with `pinned.list(root, &full)` (lends (&str, bool), so the loop is `for (name, is_dir) in names` with `join(&at, name)`), and `self.reader.file(root, &join(&inner, &rel))?` (line 75) with `pinned.held(root, &join(&inner, &rel))?` (new in blaze-vfs reader.rs: Pinned::held, same return type as Reader::file). Why: Reader::list allocates a Vec and a String per name for every directory walked, and Reader::file enters the reclaimer once per file; under one pin both go (Pinned is not Send; walk is synchronous). Same output: Pinned::list gives Reader::list's names in the same order (blaze-vfs tests.rs every_directory_lists_the_same_lent_owned_and_through_the_vfs). Once applied, Reader::list has no caller; tell lane vfs so it can be removed.",
+  "state": "applied",
+  "created": "2026-10-30T10:45:50Z",
+  "updated": "2026-10-31T20:34:26Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:45:50Z",
+      "by": "speed-vfs-names",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:26Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:26Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "serve/unit/files.rs Mounted::walk reads under one pin: Pinned::list and Pinned::held. ra: 0 errors."
+    }
+  ]
+}

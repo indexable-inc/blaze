@@ -2,23 +2,23 @@
 //! its outer attributes (its visibility, when it has one) to its last, and the inner attributes
 //! of its body join its own.
 
-use syntax::ast::{
+use syntax::view::{
     self as ra, AstNode, HasGenericParams, HasModuleItem as _, HasName as _, HasTypeBounds as _,
     HasVisibility as _,
 };
-use syntax::{SyntaxNode, T};
+use syntax::{NodeOrToken, T};
 
-use super::{Lower, child_token, first_token, last_token, prev_real_token};
+use super::{Lower, first_token, last_token, prev_real_token};
 use crate::ast::{self, DUMMY_NODE_ID, ThinVec};
 use crate::span::{Ident, Span, kw, sym};
 
 impl Lower<'_> {
     /// The crate root: rustc's `parse_mod(Eof)`, whose inner span runs from the file's first
     /// token to its last.
-    pub(crate) fn krate(&self, file: &ra::SourceFile) -> ast::Crate {
+    pub(crate) fn krate(&self, file: ra::SourceFile<'_>) -> ast::Crate {
         let node = file.syntax();
         let attrs = self.inner_attrs(node);
-        let items = file.items().filter_map(|i| self.item(&i)).collect();
+        let items = file.items().filter_map(|i| self.item(i)).collect();
         let spans = self.mod_spans(node, None);
         ast::Crate {
             id: DUMMY_NODE_ID,
@@ -31,16 +31,22 @@ impl Lower<'_> {
 
     /// `inner_span` from the first token after `{` (or of the file) to `}` (or the last token);
     /// `inject_use_span` empty at the first token after the inner attributes.
-    fn mod_spans(&self, list: &SyntaxNode, open: Option<syntax::SyntaxToken>) -> ast::ModSpans {
-        let tokens: Vec<syntax::SyntaxToken> = list
-            .descendants_with_tokens()
-            .filter_map(syntax::SyntaxElement::into_token)
-            .filter(|t| !super::is_trivia(t.kind()))
-            .collect();
+    fn mod_spans(&self, list: ra::Node<'_>, open: Option<ra::Token<'_>>) -> ast::ModSpans {
         let skip = usize::from(open.is_some());
+        let (mut lo, mut hi) = (None, None);
+        let tokens = list
+            .descendants_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+            .filter(|t| !super::is_trivia(t.kind()));
+        for (n, t) in tokens.enumerate() {
+            if n == skip {
+                lo = Some(t);
+            }
+            hi = Some(t);
+        }
         let empty = self.sp(syntax::TextRange::empty(list.text_range().end()));
-        let lo = tokens.get(skip).map(|t| self.tsp(t)).unwrap_or(empty);
-        let hi = tokens.last().map(|t| self.tsp(t)).unwrap_or(empty);
+        let lo = lo.map(|t| self.tsp(t)).unwrap_or(empty);
+        let hi = hi.map(|t| self.tsp(t)).unwrap_or(empty);
         let inner_span = lo.to(hi);
         let mut post_attr = None;
         for child in list.children_with_tokens() {
@@ -48,17 +54,17 @@ impl Lower<'_> {
             if super::is_trivia(kind) || (skip == 1 && kind == T!['{']) {
                 continue;
             }
-            if let syntax::NodeOrToken::Node(n) = &child
-                && ra::AnyAttr::cast(n.clone()).is_some_and(|a| {
-                    self.attr(&a)
+            if let NodeOrToken::Node(n) = child
+                && ra::AnyAttr::cast(n).is_some_and(|a| {
+                    self.attr(a)
                         .is_some_and(|a| a.style == ast::AttrStyle::Inner)
                 })
             {
                 continue;
             }
             post_attr = match child {
-                syntax::NodeOrToken::Token(t) => Some(self.tsp(&t)),
-                syntax::NodeOrToken::Node(n) => first_token(&n).map(|t| self.tsp(&t)),
+                NodeOrToken::Token(t) => Some(self.tsp(t)),
+                NodeOrToken::Node(n) => first_token(n).map(|t| self.tsp(t)),
             };
             break;
         }
@@ -71,8 +77,8 @@ impl Lower<'_> {
 
     fn mk_item<K>(
         &self,
-        node: &SyntaxNode,
-        vis: Option<ra::Visibility>,
+        node: ra::Node<'_>,
+        vis: Option<ra::Visibility<'_>>,
         mut attrs: ast::AttrVec,
         kind: K,
     ) -> Box<ast::Item<K>> {
@@ -88,7 +94,7 @@ impl Lower<'_> {
         })
     }
 
-    pub(crate) fn item(&self, item: &ra::Item) -> Option<Box<ast::Item>> {
+    pub(crate) fn item(&self, item: ra::Item<'_>) -> Option<Box<ast::Item>> {
         let node = item.syntax();
         let span = self.nsp(node);
         let vis = match item {
@@ -116,7 +122,7 @@ impl Lower<'_> {
                 let generics = self.adt_generics(e, ident.span, None);
                 let variants = e
                     .variant_list()
-                    .map(|l| l.variants().map(|v| self.variant(&v)).collect())
+                    .map(|l| l.variants().map(|v| self.variant(v)).collect())
                     .unwrap_or_default();
                 ast::ItemKind::Enum(ident, generics, ast::EnumDef { variants })
             }
@@ -124,18 +130,17 @@ impl Lower<'_> {
                 let safety = self.safety(b.unsafe_token(), None);
                 let abi_node = b.abi();
                 let extern_span = abi_node
-                    .as_ref()
                     .and_then(|a| a.extern_token())
-                    .map(|t| self.tsp(&t))
+                    .map(|t| self.tsp(t))
                     .unwrap_or(span);
                 let abi = abi_node
                     .and_then(|a| a.string_token())
-                    .and_then(|s| self.str_lit(&s));
+                    .and_then(|s| self.str_lit(s));
                 let mut items = ThinVec::new();
                 if let Some(list) = b.extern_item_list() {
                     inner = self.inner_attrs(list.syntax());
                     for it in list.extern_items() {
-                        if let Some(it) = self.foreign_item(&it) {
+                        if let Some(it) = self.foreign_item(it) {
                             items.push(it);
                         }
                     }
@@ -149,14 +154,14 @@ impl Lower<'_> {
             }
             ra::Item::ExternCrate(e) => {
                 let name = match e.name_ref() {
-                    Some(n) => self.name_ref(&n),
+                    Some(n) => self.name_ref(n),
                     None => return self.item_err(span),
                 };
                 match e.rename() {
                     Some(r) => {
                         let ident = match (r.name(), r.underscore_token()) {
-                            (Some(n), _) => self.name(&n),
-                            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(&u)),
+                            (Some(n), _) => self.name(n),
+                            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(u)),
                             _ => return self.item_err(span),
                         };
                         ast::ItemKind::ExternCrate(Some(name.name), ident)
@@ -178,7 +183,7 @@ impl Lower<'_> {
             ra::Item::MacroRules(m) => {
                 let ident = self.item_name(m.name(), span);
                 let body = match m.token_tree() {
-                    Some(tt) => Box::new(self.delim_args(&tt)),
+                    Some(tt) => Box::new(self.delim_args(tt)),
                     None => return self.item_err(span),
                 };
                 ast::ItemKind::MacroDef(
@@ -196,7 +201,7 @@ impl Lower<'_> {
                     self.unsupported(span, "a `macro` with a parameter list");
                 }
                 let body = match m.body() {
-                    Some(tt) => Box::new(self.delim_args(&tt)),
+                    Some(tt) => Box::new(self.delim_args(tt)),
                     None => return self.item_err(span),
                 };
                 ast::ItemKind::MacroDef(
@@ -210,11 +215,11 @@ impl Lower<'_> {
             }
             ra::Item::Module(m) => {
                 let ident = self.item_name(m.name(), span);
-                let safety = self.safety(child_token(m.syntax(), T![unsafe]), None);
+                let safety = self.safety(m.syntax().child_token(T![unsafe]), None);
                 let kind = match m.item_list() {
                     Some(list) => {
                         inner = self.inner_attrs(list.syntax());
-                        let items = list.items().filter_map(|i| self.item(&i)).collect();
+                        let items = list.items().filter_map(|i| self.item(i)).collect();
                         let spans = self.mod_spans(list.syntax(), list.l_curly_token());
                         ast::ModKind::Loaded(items, ast::Inline::Yes, spans)
                     }
@@ -243,7 +248,7 @@ impl Lower<'_> {
                 ast::ItemKind::Union(ident, generics, data)
             }
             ra::Item::Use(u) => match u.use_tree() {
-                Some(tree) => ast::ItemKind::Use(self.use_tree(&tree)),
+                Some(tree) => ast::ItemKind::Use(self.use_tree(tree)),
                 None => return self.item_err(span),
             },
             ra::Item::AsmExpr(_) => {
@@ -259,9 +264,9 @@ impl Lower<'_> {
         None
     }
 
-    fn item_name(&self, name: Option<ra::Name>, span: Span) -> Ident {
+    fn item_name(&self, name: Option<ra::Name<'_>>, span: Span) -> Ident {
         match name {
-            Some(n) => self.name(&n),
+            Some(n) => self.name(n),
             None => {
                 self.unsupported(span, "an item without a name");
                 Ident::new(sym::empty, span)
@@ -271,28 +276,28 @@ impl Lower<'_> {
 
     fn safety(
         &self,
-        unsafe_: Option<syntax::SyntaxToken>,
-        safe: Option<syntax::SyntaxToken>,
+        unsafe_: Option<ra::Token<'_>>,
+        safe: Option<ra::Token<'_>>,
     ) -> ast::Safety {
         match (unsafe_, safe) {
-            (Some(u), _) => ast::Safety::Unsafe(self.tsp(&u)),
-            (None, Some(s)) => ast::Safety::Safe(self.tsp(&s)),
+            (Some(u), _) => ast::Safety::Unsafe(self.tsp(u)),
+            (None, Some(s)) => ast::Safety::Safe(self.tsp(s)),
             (None, None) => ast::Safety::Default,
         }
     }
 
-    fn defaultness(&self, default: Option<syntax::SyntaxToken>) -> ast::Defaultness {
+    fn defaultness(&self, default: Option<ra::Token<'_>>) -> ast::Defaultness {
         match default {
-            Some(d) => ast::Defaultness::Default(self.tsp(&d)),
+            Some(d) => ast::Defaultness::Default(self.tsp(d)),
             None => ast::Defaultness::Implicit,
         }
     }
 
     /// Generics of a struct, enum or union: without a `where`, rustc's clause is empty right
     /// after the generics (or, for a tuple struct, after its fields).
-    fn adt_generics(
+    fn adt_generics<'t>(
         &self,
-        node: &impl HasGenericParams,
+        node: impl HasGenericParams<'t>,
         ident: Span,
         tuple_end: Option<Span>,
     ) -> ast::Generics {
@@ -307,13 +312,12 @@ impl Lower<'_> {
 
     /// A function and the inner attributes of its body (rustc's `parse_fn`): the signature runs
     /// from the item's start to the token before the body, or through the `;`.
-    fn func(&self, f: &ra::Fn) -> (Box<ast::Fn>, ast::AttrVec) {
+    fn func(&self, f: ra::Fn<'_>) -> (Box<ast::Fn>, ast::AttrVec) {
         let node = f.syntax();
         let span = self.nsp(node);
         let ident = self.item_name(f.name(), span);
         let params = f.param_list();
         let params_span = params
-            .as_ref()
             .map(|p| self.nsp(p.syntax()))
             .unwrap_or(ident.span);
         let decl = self.fn_decl(params, f.ret_type(), span);
@@ -324,15 +328,15 @@ impl Lower<'_> {
         let generics = self.item_generics(f, ident.span, decl_end);
         let header = ast::FnHeader {
             constness: match f.const_token() {
-                Some(c) => ast::Const::Yes(self.tsp(&c)),
+                Some(c) => ast::Const::Yes(self.tsp(c)),
                 None => ast::Const::No,
             },
             coroutine_marker: match (f.async_token(), f.gen_token()) {
                 (Some(a), Some(g)) => {
-                    Some((ast::CoroutineKind::AsyncGen, self.tsp(&a).to(self.tsp(&g))))
+                    Some((ast::CoroutineKind::AsyncGen, self.tsp(a).to(self.tsp(g))))
                 }
-                (Some(a), None) => Some((ast::CoroutineKind::Async, self.tsp(&a))),
-                (None, Some(g)) => Some((ast::CoroutineKind::Gen, self.tsp(&g))),
+                (Some(a), None) => Some((ast::CoroutineKind::Async, self.tsp(a))),
+                (None, Some(g)) => Some((ast::CoroutineKind::Gen, self.tsp(g))),
                 (None, None) => None,
             }
             .map(|(kind, span)| ast::CoroutineMarker {
@@ -345,23 +349,23 @@ impl Lower<'_> {
             ext: self.abi(f.abi()),
         };
         let lo = super::first_token_after_attrs(node)
-            .map(|t| self.tsp(&t))
+            .map(|t| self.tsp(t))
             .unwrap_or(span);
         let (body, inner, sig_hi) = match f.body() {
             Some(b) => {
                 let first = b.syntax().first_token();
                 let hi = first
-                    .and_then(|t| prev_real_token(&t))
-                    .map(|t| self.tsp(&t))
+                    .and_then(prev_real_token)
+                    .map(|t| self.tsp(t))
                     .unwrap_or(span);
                 (
-                    Some(self.block_expr_inner(&b)),
-                    self.block_inner_attrs(&b),
+                    Some(self.block_expr_inner(b)),
+                    self.block_inner_attrs(b),
                     hi,
                 )
             }
             None => {
-                let hi = f.semicolon_token().map(|t| self.tsp(&t)).unwrap_or(span);
+                let hi = f.semicolon_token().map(|t| self.tsp(t)).unwrap_or(span);
                 (None, ThinVec::new(), hi)
             }
         };
@@ -385,25 +389,25 @@ impl Lower<'_> {
 
     // ---- impls and traits ----
 
-    fn impl_item(&self, i: &ra::Impl, span: Span) -> (ast::Impl, ast::AttrVec) {
-        let impl_kw = i.impl_token().map(|t| self.tsp(&t)).unwrap_or(span);
+    fn impl_item(&self, i: ra::Impl<'_>, span: Span) -> (ast::Impl, ast::AttrVec) {
+        let impl_kw = i.impl_token().map(|t| self.tsp(t)).unwrap_or(span);
         let self_ty = match i.self_ty() {
-            Some(t) => self.ty(&t),
+            Some(t) => self.ty(t),
             None => self.ty_err(span),
         };
         let generics = self.item_generics(i, impl_kw, self_ty.span);
         let constness = match i.const_token() {
-            Some(c) => ast::Const::Yes(self.tsp(&c)),
+            Some(c) => ast::Const::Yes(self.tsp(c)),
             None => ast::Const::No,
         };
         let of_trait = i.trait_().map(|t| {
-            let path = match &t {
-                ra::Type::PathType(p) => p.path().map(|p| self.path(&p).1),
+            let path = match t {
+                ra::Type::PathType(p) => p.path().map(|p| self.path(p).1),
                 _ => None,
             }
             .unwrap_or_else(|| self.err_path(self.nsp(t.syntax())));
             let polarity = match i.excl_token() {
-                Some(b) => ast::ImplPolarity::Negative(self.tsp(&b)),
+                Some(b) => ast::ImplPolarity::Negative(self.tsp(b)),
                 None => ast::ImplPolarity::Positive,
             };
             Box::new(ast::TraitImplHeader {
@@ -422,7 +426,7 @@ impl Lower<'_> {
         let (items, attrs) = match i.assoc_item_list() {
             Some(list) => (
                 list.assoc_items()
-                    .filter_map(|a| self.assoc_item(&a))
+                    .filter_map(|a| self.assoc_item(a))
                     .collect(),
                 self.inner_attrs(list.syntax()),
             ),
@@ -440,7 +444,7 @@ impl Lower<'_> {
         )
     }
 
-    fn trait_item(&self, t: &ra::Trait, span: Span) -> (ast::ItemKind, ast::AttrVec) {
+    fn trait_item(&self, t: ra::Trait<'_>, span: Span) -> (ast::ItemKind, ast::AttrVec) {
         let ident = self.item_name(t.name(), span);
         let bounds = self.opt_bounds(t);
         let gen_end = t
@@ -451,12 +455,12 @@ impl Lower<'_> {
             .type_bound_list()
             .and_then(|b| last_token(b.syntax()))
             .or_else(|| t.colon_token())
-            .map(|tok| self.tsp(&tok))
+            .map(|tok| self.tsp(tok))
             .unwrap_or(gen_end);
         if t.eq_token().is_some() {
             let generics = self.item_generics(t, ident.span, before_where);
-            let constness = match child_token(t.syntax(), T![const]) {
-                Some(c) => ast::Const::Yes(self.tsp(&c)),
+            let constness = match t.syntax().child_token(T![const]) {
+                Some(c) => ast::Const::Yes(self.tsp(c)),
                 None => ast::Const::No,
             };
             return (
@@ -473,7 +477,7 @@ impl Lower<'_> {
         let (items, attrs) = match t.assoc_item_list() {
             Some(list) => (
                 list.assoc_items()
-                    .filter_map(|a| self.assoc_item(&a))
+                    .filter_map(|a| self.assoc_item(a))
                     .collect(),
                 self.inner_attrs(list.syntax()),
             ),
@@ -494,17 +498,17 @@ impl Lower<'_> {
                         let mut tok = tok;
                         if t.visibility().is_some() {
                             let vis_last = t.visibility().and_then(|v| last_token(v.syntax()))?;
-                            tok = super::next_real_token(&vis_last)?;
+                            tok = super::next_real_token(vis_last)?;
                         }
-                        Some(self.tsp(&tok).shrink_to_lo())
+                        Some(self.tsp(tok).shrink_to_lo())
                     })
                     .unwrap_or(span),
             },
         };
         let tr = ast::Trait {
             impl_restriction,
-            constness: match child_token(t.syntax(), T![const]) {
-                Some(c) => ast::Const::Yes(self.tsp(&c)),
+            constness: match t.syntax().child_token(T![const]) {
+                Some(c) => ast::Const::Yes(self.tsp(c)),
                 None => ast::Const::No,
             },
             safety: self.safety(t.unsafe_token(), None),
@@ -521,7 +525,7 @@ impl Lower<'_> {
         (ast::ItemKind::Trait(Box::new(tr)), attrs)
     }
 
-    fn assoc_item(&self, a: &ra::AssocItem) -> Option<Box<ast::AssocItem>> {
+    fn assoc_item(&self, a: ra::AssocItem<'_>) -> Option<Box<ast::AssocItem>> {
         let node = a.syntax();
         let span = self.nsp(node);
         let (vis, inner, kind) = match a {
@@ -548,7 +552,7 @@ impl Lower<'_> {
         Some(self.mk_item(node, vis, inner, kind))
     }
 
-    fn foreign_item(&self, a: &ra::ExternItem) -> Option<Box<ast::ForeignItem>> {
+    fn foreign_item(&self, a: ra::ExternItem<'_>) -> Option<Box<ast::ForeignItem>> {
         let node = a.syntax();
         let span = self.nsp(node);
         let (vis, inner, kind) = match a {
@@ -577,15 +581,15 @@ impl Lower<'_> {
 
     // ---- consts, statics, type aliases ----
 
-    fn const_item(&self, c: &ra::Const) -> Box<ast::ConstItem> {
+    fn const_item(&self, c: ra::Const<'_>) -> Box<ast::ConstItem> {
         let span = self.nsp(c.syntax());
         let ident = match (c.name(), c.underscore_token()) {
-            (Some(n), _) => self.name(&n),
-            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(&u)),
+            (Some(n), _) => self.name(n),
+            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(u)),
             _ => self.item_name(None, span),
         };
         let ty = self.opt_ty(c.ty(), span);
-        let body = c.body().map(|e| self.expr(&e));
+        let body = c.body().map(|e| self.expr(e));
         let before_where = body.as_ref().map_or(ty.span, |b| b.span);
         let generics = self.item_generics(c, ident.span, before_where);
         if c.type_token().is_some() {
@@ -601,7 +605,7 @@ impl Lower<'_> {
         })
     }
 
-    fn static_item(&self, s: &ra::Static, span: Span) -> Box<ast::StaticItem> {
+    fn static_item(&self, s: ra::Static<'_>, span: Span) -> Box<ast::StaticItem> {
         let ident = self.item_name(s.name(), span);
         let ty = self.opt_ty(s.ty(), span);
         Box::new(ast::StaticItem {
@@ -613,14 +617,14 @@ impl Lower<'_> {
             } else {
                 ast::Mutability::Not
             },
-            expr: s.body().map(|e| self.expr(&e)),
+            expr: s.body().map(|e| self.expr(e)),
             define_opaque: None,
             eii_impl: None,
         })
     }
 
     /// rustc's `parse_type_alias`: a `where` before `=` and one after the type.
-    fn ty_alias(&self, t: &ra::TypeAlias, span: Span) -> Box<ast::TyAlias> {
+    fn ty_alias(&self, t: ra::TypeAlias<'_>, span: Span) -> Box<ast::TyAlias> {
         let ident = self.item_name(t.name(), span);
         let bounds = self.opt_bounds(t);
         let gen_end = t
@@ -631,9 +635,9 @@ impl Lower<'_> {
             .type_bound_list()
             .and_then(|b| last_token(b.syntax()))
             .or_else(|| t.colon_token())
-            .map(|tok| self.tsp(&tok))
+            .map(|tok| self.tsp(tok))
             .unwrap_or(gen_end);
-        let ty = t.ty().map(|ty| self.ty(&ty));
+        let ty = t.ty().map(|ty| self.ty(ty));
         // Which side of `=` a `where` clause was written on decides which of rustc's two it is.
         let eq = t.eq_token().map(|eq| eq.text_range().start());
         let (mut before, mut after) = (None, None);
@@ -660,18 +664,18 @@ impl Lower<'_> {
 
     /// The fields of a struct, union or variant, and for a tuple struct the span its `where`
     /// clause follows.
-    fn variant_data(&self, fields: Option<ra::FieldList>) -> (ast::VariantData, Option<Span>) {
+    fn variant_data(&self, fields: Option<ra::FieldList<'_>>) -> (ast::VariantData, Option<Span>) {
         match fields {
             Some(ra::FieldList::RecordFieldList(list)) => (
                 ast::VariantData::Struct {
-                    fields: list.fields().map(|f| self.record_field(&f)).collect(),
+                    fields: list.fields().map(|f| self.record_field(f)).collect(),
                     recovered: ast::Recovered::No,
                 },
                 None,
             ),
             Some(ra::FieldList::TupleFieldList(list)) => (
                 ast::VariantData::Tuple(
-                    list.fields().map(|f| self.tuple_field(&f)).collect(),
+                    list.fields().map(|f| self.tuple_field(f)).collect(),
                     DUMMY_NODE_ID,
                 ),
                 Some(self.nsp(list.syntax())),
@@ -682,14 +686,14 @@ impl Lower<'_> {
 
     /// rustc's `parse_name_and_ty`: from the visibility (after attributes) through the type or
     /// default value.
-    fn record_field(&self, f: &ra::RecordField) -> ast::FieldDef {
+    fn record_field(&self, f: ra::RecordField<'_>) -> ast::FieldDef {
         let span = self.nsp(f.syntax());
         let ident = self.item_name(f.name(), span);
         let ty = self.opt_ty(f.ty(), span);
         let default = f
             .default_val()
             .and_then(|c| c.expr())
-            .map(|e| self.anon_const(&e));
+            .map(|e| self.anon_const(e));
         let safety = self.safety(f.unsafe_token(), None);
         if f.mut_restriction().is_some() {
             self.unsupported(span, "a `mut` restriction");
@@ -707,7 +711,7 @@ impl Lower<'_> {
     }
 
     /// rustc's `parse_tuple_struct_body`: from the visibility through the type.
-    fn tuple_field(&self, f: &ra::TupleField) -> ast::FieldDef {
+    fn tuple_field(&self, f: ra::TupleField<'_>) -> ast::FieldDef {
         let all = self.nsp(f.syntax());
         let ty = self.opt_ty(f.ty(), all);
         if f.mut_restriction().is_some() {
@@ -729,12 +733,12 @@ impl Lower<'_> {
         &self,
         safety: ast::Safety,
         default: Option<ast::AnonConst>,
-        node: &SyntaxNode,
+        node: ra::Node<'_>,
     ) -> Option<Box<ast::FieldDefExtras>> {
         if matches!(safety, ast::Safety::Default) && default.is_none() {
             return None;
         }
-        let at = super::first_token_after_attrs(node).map(|t| self.tsp(&t).shrink_to_lo());
+        let at = super::first_token_after_attrs(node).map(|t| self.tsp(t).shrink_to_lo());
         Some(Box::new(ast::FieldDefExtras {
             safety,
             mut_restriction: ast::MutRestriction {
@@ -747,11 +751,11 @@ impl Lower<'_> {
 
     /// rustc's `parse_enum_variant`: from the visibility or name (after attributes) through the
     /// discriminant.
-    fn variant(&self, v: &ra::Variant) -> ast::Variant {
+    fn variant(&self, v: ra::Variant<'_>) -> ast::Variant {
         let span = self.nsp(v.syntax());
         let ident = match (v.name(), v.underscore_token()) {
-            (Some(n), _) => self.name(&n),
-            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(&u)),
+            (Some(n), _) => self.name(n),
+            (None, Some(u)) => Ident::new(kw::Underscore, self.tsp(u)),
             _ => self.item_name(None, span),
         };
         let (data, _) = self.variant_data(v.field_list());
@@ -765,7 +769,7 @@ impl Lower<'_> {
             disr_expr: v
                 .const_arg()
                 .and_then(|c| c.expr())
-                .map(|e| self.anon_const(&e)),
+                .map(|e| self.anon_const(e)),
             is_placeholder: false,
         }
     }
@@ -774,10 +778,10 @@ impl Lower<'_> {
 
     /// rustc's `parse_use_tree`: the prefix spans the path before any `::{..}` or `::*` (empty
     /// for a bare `{..}`), a nested list spans its braces and a glob its `*`.
-    fn use_tree(&self, tree: &ra::UseTree) -> ast::UseTree {
+    fn use_tree(&self, tree: ra::UseTree<'_>) -> ast::UseTree {
         let span = self.nsp(tree.syntax());
         let mut prefix = match tree.path() {
-            Some(p) => self.path(&p).1,
+            Some(p) => self.path(p).1,
             None => ast::Path {
                 span: span.shrink_to_lo(),
                 segments: ThinVec::new(),
@@ -788,16 +792,16 @@ impl Lower<'_> {
         {
             prefix
                 .segments
-                .push(ast::PathSegment::path_root(self.tsp(&cc).shrink_to_lo()));
+                .push(ast::PathSegment::path_root(self.tsp(cc).shrink_to_lo()));
         }
         let kind = if let Some(star) = tree.star_token() {
-            ast::UseTreeKind::Glob(self.tsp(&star))
+            ast::UseTreeKind::Glob(self.tsp(star))
         } else if let Some(list) = tree.use_tree_list() {
             ast::UseTreeKind::Nested {
                 items: list
                     .use_trees()
                     .map(|t| ast::UseTreeAndId {
-                        inner: self.use_tree(&t),
+                        inner: self.use_tree(t),
                         id: DUMMY_NODE_ID,
                     })
                     .collect(),
@@ -807,8 +811,8 @@ impl Lower<'_> {
             let rename = tree
                 .rename()
                 .and_then(|r| match (r.name(), r.underscore_token()) {
-                    (Some(n), _) => Some(self.name(&n)),
-                    (None, Some(u)) => Some(Ident::new(kw::Underscore, self.tsp(&u))),
+                    (Some(n), _) => Some(self.name(n)),
+                    (None, Some(u)) => Some(Ident::new(kw::Underscore, self.tsp(u))),
                     _ => None,
                 });
             ast::UseTreeKind::Simple(rename)

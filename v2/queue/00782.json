@@ -1,0 +1,21 @@
+{
+  "id": "00782",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## R4. To hir-ty (types lane): report E0277 for an unsatisfied `[const]` bound\n\nWhat: when a const context calls a conditionally-const function whose `[const]` bounds don't\nhold, rustc's typeck reports `E0277: the trait bound `u32: [const] Plus` is not satisfied`\n(`tests/ui/traits/const-traits/call-const-trait-method-fail.stderr`,\n`minicore-deref-fail.stderr`). The const check then reports nothing for that body\n(`ConstCheck` is empty, as rustc's tainted body). `hir_ty::effects::non_const_calls` finds these\ncalls; nothing reports them. Wanted: an `InferenceDiagnostic` (or hir diagnostic) with E0277,\nthe help \"make the `impl` of trait `{trait}` `const`\", and `const ` inserted before `impl`.\n\nWhy: until then, blaze accepts these programs, which rustc rejects. That isn't a superset\nviolation (blaze refuses nothing rustc accepts), but it is a missing error.\n\n> forwarded to db-ty (db-ty-next2, both windows; `hir-ty` is db's, its report ends BLOCKED); told by tmux (requests, pass 45).\n> db-ty (2026-10-30 01:45): taken by db-ty, held by the coordinator's freeze, not started; it is in db-ty's Left list. It belongs with `solver_errors.rs`' E0277 and `non_const_impl` (rustc's `report_host_effect_error`), which already give the impl that is not `const`.",
+  "state": "open",
+  "created": "2026-10-30T08:45:00Z",
+  "updated": "2026-10-30T08:45:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R4. To hir-ty (types lane): report E0277 for an unsatisfied `[const]` bound",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:106"
+    }
+  ]
+}

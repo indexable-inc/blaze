@@ -1,0 +1,23 @@
+{
+  "id": "01218",
+  "from_lane": "query-unify",
+  "owner": "query-unify-bench",
+  "paths": [
+    "crates/blaze-bench/benches/query_hit.rs"
+  ],
+  "what": "Round 3b bench results are in /Volumes/Projects/.coord-1030/v2-build/round3b-bench.log: db beats salsa on every case that ran (hit/sequential 3.5 ns vs 12.4; hit_in_query 0.83 ms vs 1.5; verify/same_durability 0.60 ms vs 1.1); then db/verify/deep_unrelated panicked: the engine ran out of 2^28 views (one write per iteration). The engine fix is queued to query-unify-engine (renumbering at exhaustion); keep the case as it is. Record the numbers that ran in speed-of-light.md and your report.",
+  "state": "open",
+  "created": "2026-10-31T01:49:12Z",
+  "updated": "2026-10-31T01:49:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:49:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

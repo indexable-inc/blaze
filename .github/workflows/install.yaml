@@ -118,7 +118,7 @@ jobs:
           grep -F "blaze has no channel nightly." out.txt
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
-  # the glibc a release asks for, with blaze's proc-macro server beside blaze, and with no PGO,
+  # the glibc a release asks for, and with no PGO,
   # as release.yaml builds it: with a profile older than the crates the build sat silent past
   # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
   # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
@@ -131,7 +131,7 @@ jobs:
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
       # dist profile), and the recipe is what it checks.
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo --server
+      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo
         timeout-minutes: 40
       - name: archive
         run: |
@@ -204,26 +204,25 @@ jobs:
             if command -v "$tool"; then echo "::error::$tool is on PATH after installing"; exit 1; fi
           done
           blaze stop
-      # A derive from crates.io: the daemon's load links it with blaze and expands it with the
-      # server beside blaze, on this system's glibc; an edit after is the daemon's.
-      - name: proc macros, by blaze's server
+      # A derive from crates.io: blaze builds it and expands it in process on its own evaluator
+      # (blaze-macro-eval), on this system's glibc; an edit after is the daemon's.
+      - name: proc macros, by blaze's evaluator
         shell: sh
         run: |
           set -eu
           export PATH="$HOME/.cargo/bin:$PATH"
-          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 blaze-proc-macro-srv --version
           mkdir -p "$RUNNER_TEMP/derive/src"
           cd "$RUNNER_TEMP/derive"
           printf '[package]\nname = "derive"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\n' > Cargo.toml
           printf '#[derive(serde::Serialize)]\nstruct Point {\n    x: i32,\n}\n\nfn serializable<T: serde::Serialize>(_: &T) -> &str {\n    "derived"\n}\n\nfn main() {\n    println!("{} {}", serializable(&Point { x: 1 }), 1);\n}\n' > src/main.rs
-          BLAZE_PROC_MACRO_SERVER=1 blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
+          blaze run > out.txt 2> err.txt || { cat err.txt; exit 1; }
           cat err.txt out.txt
           grep -Fx "derived 1" out.txt
           sed -i 's/serializable(&Point { x: 1 }), 1)/serializable(\&Point { x: 2 }), 2)/' src/main.rs
-          BLAZE_PROC_MACRO_SERVER=1 blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
+          blaze run > out.txt 2>> err.txt || { cat err.txt; exit 1; }
           cat err.txt out.txt
           grep -Fx "derived 2" out.txt
-          if grep -e "blaze: bug:" -e "the daemon has no part" -e "did not make the proc macro" -e "no proc-macro server" err.txt; then
+          if grep -e "blaze: bug:" -e "the daemon has no part" -e "did not make the proc macro" err.txt; then
             echo "::error::the proc macros were not blaze's"; exit 1
           fi
           blaze stop

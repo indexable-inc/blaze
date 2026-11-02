@@ -8,7 +8,7 @@
 
 use std::fmt::{self, Write};
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 
 use crate::{CfgAtom, CfgDiff, CfgExpr, CfgOptions, InactiveReason};
 
@@ -81,8 +81,8 @@ impl DnfExpr {
         // A cfg is enabled if any of `self.conjunctions` evaluate to `true`.
 
         self.conjunctions.iter().filter_map(move |conj| {
-            let mut enable = FxHashSet::default();
-            let mut disable = FxHashSet::default();
+            let mut enable = HashSet::default();
+            let mut disable = HashSet::default();
             for lit in &conj.literals {
                 let atom = lit.var.as_ref()?;
                 let enabled = opts.enabled.contains(atom);
@@ -113,7 +113,7 @@ impl DnfExpr {
                 disable: disable.into_iter().collect(),
             };
 
-            // Undo the FxHashMap randomization for consistent output.
+            // Undo the HashMap randomization for consistent output.
             diff.enable.sort_unstable();
             diff.disable.sort_unstable();
 

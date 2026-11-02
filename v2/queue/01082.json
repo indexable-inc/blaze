@@ -1,0 +1,24 @@
+{
+  "id": "01082",
+  "from_lane": "integrate-tooling",
+  "owner": "link",
+  "paths": [
+    "harness/",
+    "docs/harness.md"
+  ],
+  "what": "A v2 harness, once the v2 API has a live-patch request, for each live-patch property the deleted v1 harnesses held (from integrate: the rebuild properties are ported onto `blaze build` in harness/rebuild.py; these are the patch's alone). Each: a patch applied to a running program gives what a fresh build of the edited source prints, and is a patch, not a full link. (1) splices.py: edits of thread-locals, statics of every kind, vtables, tables of function pointers, closures, generics, recursion, panics and foreign calls, the binary also run with everything bound at once (LD_BIND_NOW / DYLD_BIND_AT_LAUNCH), read by readelf or dyld_info and its signature verified, and some steps first strip, touch or run the binary. (2) farsplices.py: a patch whose code is further from the program's than an AArch64 b/bl reaches (128 MB). (3) asmedits.py: edits of asm! blocks and the code around them, also with BLAZE_ASSEMBLER=cc (the release's build without LLVM). (4) patch: a patch after an edit whose text was refused (#31), and the editor's edit request arriving while a build runs (#32). (5) farfile.py and bigbinary.py: a patch into an ELF file gigabytes longer than what it loads, and into a program larger than any one place of the splice is sized for (220 MB code, 16 MB eh_frame, 4.2 GB debug_abbrev; #79). (6) debuginfo.py's patched-code checks: a debugger and a backtrace see a patched function's new lines, and a Windows PDB is not left stale. (7) stress.py's check that an edit mending a broken one is a patch. v1's copies: `git show <base>:harness/<name>.py` on a commit before the tooling pass.",
+  "state": "open",
+  "created": "2026-10-30T16:04:46Z",
+  "updated": "2026-10-30T16:04:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:04:46Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

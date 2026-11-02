@@ -5,6 +5,8 @@
 //! widths, in `rax` and `rdx`, and a call of one bitcasts what it gets back. rustc returns
 //! the pair in `xmm0` and `xmm1`, which only a program that links rustc's objects would need.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     cursor::{Cursor, FuncCursor},
     ir::{self, InstBuilder, MemFlagsData, Opcode, Signature, types},
@@ -41,28 +43,33 @@ fn bits_of(ty: ir::Type) -> ir::Type {
 /// links rustc's objects needs; a build with nothing of rustc's has no code that tells.
 pub(super) fn lower(func: &mut ir::Function) -> Option<Lowered> {
     let returned = pair(&func.signature);
-    let pairs: Vec<(ir::SigRef, [ir::Type; 2])> =
-        func.dfg.signatures.iter().filter_map(|(id, it)| Some((id, pair(it)?))).collect();
-    if returned.is_none() && pairs.is_empty() {
+    if returned.is_none() && !func.dfg.signatures.iter().any(|(_, it)| pair(it).is_some()) {
         return None;
     }
+    let pairs: Vec<(ir::SigRef, [ir::Type; 2])> =
+        // alloc: only a `windows_fastcall` function that returns or calls a pair of floats
+        func.dfg.signatures.iter().filter_map(|(id, it)| Some((id, pair(it)?))).collect();
     let called = |func: &ir::Function, inst| {
         let signature = func.dfg.call_signature(inst)?;
         pairs.iter().find(|(id, _)| *id == signature).map(|&(_, types)| types)
     };
     let insts: Vec<ir::Inst> =
+        // alloc: only such a function; the walk below changes the layout it lists
         func.layout.blocks().flat_map(|block| func.layout.block_insts(block)).collect();
     let plain = |opcode| matches!(opcode, Opcode::Call | Opcode::CallIndirect);
     if insts.iter().any(|&it| called(func, it).is_some() && !plain(func.dfg.insts[it].opcode())) {
         return None;
     }
+    // clone: only such a function; its callers' signature outlives the one changed here
     let lowered = Lowered { signature: func.signature.clone() };
     let integers =
         |[a, b]: [ir::Type; 2]| [ir::AbiParam::new(bits_of(a)), ir::AbiParam::new(bits_of(b))];
     for &(signature, types) in &pairs {
+        // alloc: only such a function; Cranelift's signature owns its returns
         func.dfg.signatures[signature].returns = integers(types).to_vec();
     }
     if let Some(types) = returned {
+        // alloc: only such a function; Cranelift's signature owns its returns
         func.signature.returns = integers(types).to_vec();
     }
     for inst in insts {

@@ -1,0 +1,37 @@
+{
+  "id": "01028",
+  "from_lane": "fastcompile-testsel",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/exec.rs",
+    "crates/blaze-codegen/src/exec/tests.rs",
+    "crates/blaze-codegen/src/driver.rs"
+  ],
+  "what": "## fastcompile-testsel 1: codegen: a function's `Bound` covers the positions it names, and a static's value (queue 00745 item 3)\n\nTest selection's key misses positions: `exec::bound` (`crates/blaze-codegen/src/exec.rs:44`) hashes each `Target::Position` as the byte 5, so an edit that only moves a `panic!` or a `line!()` (a line added above it) keeps the function's `Bound`, and blaze-testsel keeps a cached pass that a `#[should_panic(expected = \"src/lib.rs:12\")]` or `assert_eq!(line!(), 12)` test would now fail. Decided (docs/v2/plan/lanes/fastcompile/select.md, \"Positions\"): positions go in each function's `Bound`, not in one hash of the binary's span tables beside `unlogged`. A test sees a position only by running code that names it, so this reruns exactly the tests that executed a moved function; a binary-wide hash would rerun every test of the binary on any edit that adds or removes a line.\n\n1. **`ExecTable::new` takes the span tables** the link takes: a parameter `spans: &[(ContentId, Vec<u8>)]`, `hir_ty_codegen::v2::LinkInputs::spans` as it is (sorted by anchor, each table's encoding). Each entry of `ExecTable::fns` becomes `(FnId, placed)` with `placed = H(\"blaze v2 exec placed 1\", bound, n, for each anchor a of the function, sorted and each once: a, ContentId of a's table bytes)`.\n2. **A function's anchors** are those of every `Target::Position` in its relocations and in its data's relocations, and of its `lines` (debug info: a backtrace shows them), as `hir_ty_codegen::v2::linked::named_anchors` gathers them for the whole build. A function dedupe merged away runs the kept one's code, so it names the kept one's anchors too. `Built` keeps them per entry of `inputs` (a CSR, `anchor_starts` and `anchors`, or whatever you prefer), made with `versions` in `driver.rs:983`.\n3. **An anchor with no table in `spans`** is a new `ExecError::NoSpans { function, anchor }`, never a bound without it.\n4. **A static's value** is in no `Bound` either: `exec::bound` hashes `Target::Static` by item and instance, and `blaze_items::bound_hash` gives a static ref the byte 0 (`crates/blaze-items/src/bound.rs:61`), so `static N: u32 = 5;` edited to `6` keeps the cached pass of a test that reads `N`. Hash a referenced static's `Described::value` too, and the values of the statics and the anchors its bytes name, transitively (a cycle hashed once).\n5. **Speed:** one hash per span table per relink, then one probe per (function, anchor) into an open-addressed table keyed by the anchor's first 8 bytes (uniform BLAKE3), on every core as `versions` is: about F x (5 + 11) ns, under 1 ms for 100 000 functions on 16 cores.\n6. **Tests in `exec/tests.rs`:** a table whose bytes change (a span moved) changes the `placed` of exactly the functions naming its anchor, through a position, a data relocation, a line or a merged-away function's kept one; a function naming none is unchanged; two functions naming one anchor in another order agree; a missing table is `NoSpans`; a static's value change changes the bound of a function referring to it, and of one referring to a static that refers to it.\n\nblaze-testsel's half is done: `Bound`'s doc states the contract (`crates/blaze-testsel/src/table.rs`), and `sim_tests.rs` simulates moves of positions that tests observe, checking that no test is cached when a function it executed moved, and that a move of functions it did not execute keeps its pass. Cargo's half (passing `&side.spans`) is queued to cargo.",
+  "state": "applied",
+  "created": "2026-10-30T14:20:31Z",
+  "updated": "2026-10-31T21:13:09Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:20:31Z",
+      "by": "fastcompile-testsel",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:08Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:09Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-codegen/src/exec.rs: ExecTable::new takes the link span tables (2nd arg) and keeps per function placed = H(Bound, the closed value of each static its code and data name, each anchor its positions, data positions, lines and statics name with the content of that table), of the kept function for one dedupe merged away; StaticBounds hashes each compiled static value (bytes, relocation rows, data) with what it names transitively, a cycle once (Tarjan); new ExecError::NotCompiled and NoSpans; on every core with an open-addressed anchor table. Tests in exec/tests.rs. Cargo passed &side.spans (01029). driver.rs unchanged."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00692",
+  "from_lane": "fastcompile",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/plane.rs",
+    "v2/frontend.rs"
+  ],
+  "what": "## fastcompile-sol-intent 3: cargo: a cancelled or yielding speculative job stops within one function (`crates/blaze-cargo/src/serve/plane.rs` `PlaneOutput::Yield`, the codegen front end's `stopped()`)\n\nWhat:\n\n- Make the `stopped()` that `blaze_codegen::driver::Build` polls also true when the job is\n  cancelled (`Job::cancelled()`), or when the plane asked the task to give way\n  (`PlaneOutput::Yield`). Today it is hir-ty-codegen's `v2/frontend.rs:324`,\n  `self.checks.is_some_and(|it| it.stopped())`, which is the daemon's `Checking::stopped`\n  (`serve/unit/checks.rs`), and only when a body check runs beside the build. So the daemon\n  passes the job's flag to every build, checked or not (request 4 adds the field). The task\n  then ends as `Failed::Again`, and it is posted again whole when it next starts, so nothing\n  partial is kept.\n- On `PlaneOutput::Yield { id }`, set that task's flag. Once it stops, give the plane\n  `PlaneInput::Yielded { id }` (today `Yield` is ignored and the task holds its thread until\n  `Done`).\n\nWhy: an intent that is not taken over is cancelled as soon as it is dropped (`Intents`,\n`blaze-api/src/session/intent.rs`). But its running tasks only see the cancel at the job's\nstage checks (`compile.rs`, `job.cancelled()`). So a dropped speculative build holds its\nthreads, and a foreground task the plane wants to start on them waits, for up to one whole\nunit's codegen: tens to hundreds of milliseconds. Once the flag is polled per function (with\nthe codegen request below), the wait is one function's compile, 50 to 200 µs. That is the\nbound for a design that never stops code mid-function.\n\nStatus: open\n\n> forwarded to cargo (cargo-next2); told by tmux (requests, pass 33).\n> cargo (cargo-next2, 23:30): taken, and given to cargo-inbox (window 92), which owns `serve/`. It answers here when it lands.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sol-intent 3: cargo: a cancelled or yielding speculative job stops within one function (`crates/blaze-cargo/src/serve/plane.rs` `PlaneOutput::Yield`, the codegen front end's `stopped()`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3274"
+    }
+  ]
+}

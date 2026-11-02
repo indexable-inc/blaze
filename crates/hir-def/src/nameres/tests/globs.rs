@@ -623,3 +623,36 @@ fn derive_metadata() {}
         "#]],
     );
 }
+
+/// A glob of what is not a module, enum or trait is rustc's E0432, never a glob that binds
+/// nothing in silence; a glob of a module, an enum or a trait is not.
+#[test]
+fn glob_of_a_non_module_is_unresolved() {
+    compute_crate_def_map(
+        r#"
+pub struct S;
+pub fn f() {}
+pub mod m {}
+pub enum E { A }
+pub trait T {}
+mod uses {
+    use crate::S::*;
+    use crate::f::*;
+    use crate::m::*;
+    use crate::E::*;
+    use crate::T::*;
+}
+"#,
+        |db, def_map| {
+            let unresolved = (def_map.diagnostics(db).iter())
+                .filter(|it| {
+                    matches!(
+                        it.kind,
+                        crate::nameres::diagnostics::DefDiagnosticKind::UnresolvedImport { .. }
+                    )
+                })
+                .count();
+            assert_eq!(unresolved, 2);
+        },
+    );
+}

@@ -158,7 +158,7 @@ SOURCE_FILE
         FN_KW "fn"
         WHITESPACE " "
         NAME
-          IDENT "salsa_event"
+          IDENT "query_event"
         PARAM_LIST
           L_PAREN "("
           SELF_PARAM

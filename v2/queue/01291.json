@@ -1,0 +1,42 @@
+{
+  "id": "01291",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify-port-hirty",
+  "paths": [
+    "crates/hir-ty/src/providers.rs",
+    "crates/hir-ty-mir/src/mir.rs"
+  ],
+  "what": "qu-check6 hir errors (crates/hir/src/evict.rs:39-66, 15 E0599: no evict_values): the contract makes a function evictable on demand only with `lru = N` (0 included). The fork generated evict_values for every Hash output. Add `lru = 0` to the #[blaze_query::tracked] attribute of each query evict.rs drops that lacks one. These are promoted_mir_body, runtime_promoted_mir_body, optimized_mir_body{,_for_closure,_for_coroutine,_for_coroutine_by_move}, monomorphized_mir_body{,_for_closure,_for_coroutine,_for_coroutine_by_move}, monomorphized_promoted_mir_body and monomorphized_optimized_mir_body{,_for_closure,_for_coroutine,_for_coroutine_by_move}, in hir-ty/src/providers.rs and hir-ty-mir/src/mir.rs. The mir_body and runtime_* ones already have it. Cost: the engine now hashes a value only when it is evicted, not on each run (db/function.rs, both trees), so lru = 0 adds no per-run hashing. Then append to /Volumes/Projects/.coord-1030/qu-build/ready.txt. The blaze-items index.rs:291 assert already reads == 8 in the worktree.",
+  "state": "applied",
+  "created": "2026-10-31T12:08:42Z",
+  "updated": "2026-10-31T14:49:36Z",
+  "taken_by": "query-unify-port-hirty",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:08:42Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:09:21Z",
+      "by": "query-unify-port-hirty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:09:21Z",
+      "by": "query-unify-port-hirty",
+      "action": "done",
+      "note": "lru = 0 on the 12 MIR queries in crates/hir-ty/src/providers.rs (mir_loop2/3/4 attributes); hir-ty-mir 3 done by query-unify-port-hir; hir-ty.json re-recorded on 9023f3e6d7 (38 files, 152 edits)"
+    },
+    {
+      "at": "2026-10-31T14:49:36Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Re-filed from the query-unify-port tree, where it was 01248; blaze-v2 has a different 01248, which the merge kept."
+    }
+  ]
+}

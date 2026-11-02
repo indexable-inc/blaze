@@ -1,0 +1,36 @@
+{
+  "id": "00083",
+  "from_lane": "db-ty-unify",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-wfcheck/src/outlives.rs",
+    "crates/hir-ty-wfcheck"
+  ],
+  "what": "## 2. db-ty-hir (sibling), `crates/hir-ty-wfcheck/src/outlives.rs`, `Wfcx::needs_since`\n\nReplace\n\n```rust\n        let constraints = inner.unwrap_region_constraints().region_constraint_data().constraints\n            [mark.1..]\n            .to_vec();\n```\n\nwith\n\n```rust\n        let constraints: Vec<Constraint<'db>> = inner\n            .unwrap_region_constraints()\n            .region_constraint_data()\n            .constraints\n            .iter_from(mark.1)\n            .collect();\n```\n\n`mark()`'s `.constraints.len()` compiles unchanged.\n\n> forwarded to db: `crates/hir-ty-wfcheck/` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/src/outlives.rs:489-492`: `.constraints.iter_from(mark.1)`, collected into the task's frame (`mem::collect`) rather than a heap `Vec`.",
+  "state": "applied",
+  "created": "2026-10-30T00:48:18Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-unify.md#2. db-ty-hir (sibling), `crates/hir-ty-wfcheck/src/outlives.rs`, `Wfcx::needs_since`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-unify.md:25"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/src/outlives.rs:489-492`: `.constraints.iter_from(mark.1)`, collected into the task's frame (`mem::collect`) rather than a heap `Vec`."
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "id": "00789",
+  "from_lane": "frontend-tree-go-tokens",
+  "owner": "frontend-tree-go-expand",
+  "paths": [
+    "crates/hir-expand/Cargo.toml",
+    "crates/hir-expand/src/lib.rs",
+    "crates/hir-expand/src/cfg_process.rs",
+    "crates/hir-expand/src/fixup.rs"
+  ],
+  "what": "frontend-tree-go-tokens: syntax_bridge::syntax_node_to_token_tree{,_modified} moved to syntax_bridge::reference (feature `reference`), per frontend-tree 12:51. hir-expand does not compile until: (1) crates/hir-expand/Cargo.toml [dev-dependencies] gets `syntax-bridge = { workspace = true, features = [\"reference\"] }` (dev-deps only; derive_macro/{reference,editor,tests}.rs and fixup.rs tests now call syntax_bridge::reference::*, done by me); (2) the speculative chain is deleted: lib.rs MacroCallId::expand_speculative (calls at :1006 :1019 :1071 :1091) and the `syntax_node_to_token_tree` in the `use syntax_bridge::{..}` at lib.rs:61; cfg_process.rs attr_macro_input_to_token_tree_handle (:413); fixup.rs fixup_syntax_handle / handle_tree (:411) / handle_key, or kept #[cfg(test)] calling syntax_bridge::reference::syntax_node_to_token_tree if the fixup tests keep their handle comparison.",
+  "state": "applied",
+  "created": "2026-10-30T07:58:43Z",
+  "updated": "2026-10-30T08:04:01Z",
+  "taken_by": "frontend-tree-go-expand",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:58:43Z",
+      "by": "frontend-tree-go-tokens",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:59:41Z",
+      "by": "frontend-tree-go-expand",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:04:01Z",
+      "by": "frontend-tree-go-expand",
+      "action": "done",
+      "note": "hir-expand no longer calls syntax_node_to_token_tree{,_modified} outside syntax_bridge::reference: expand_speculative, fixup_syntax_handle/handle_tree/handle_key, attr_macro_input_to_token_tree_handle, macro_input_callback_handle, reverse_fixups_expansion, find_attr_range_with_source_opt and expand_unhygienic are deleted; the fixup tests keep their expect! stored expectations and build their original tree with call_input. hir-expand dev-depends on syntax-bridge with features=[reference]."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "01381",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs",
+    "crates/hir-ty/src/infer/pat.rs"
+  ],
+  "what": "`SOME_CONST = 14;` (a path to a const as a destructuring assignment left-hand side) gets no error: hir-def lowers it as a path pattern and hir-ty accepts it as a const pattern. rustc (extract_unit_struct_path / extract_tuple_struct_path in rustc_ast_lowering/src/expr.rs) keeps a path or call that resolves to something that is no constructor as an expression, so it is E0070 invalid left-hand side. Report it as hir::NotAStructPath with StructPathFound::Def(Const) on the PathExpr (blaze-diagnostics now lowers a Def found on a CallExpr/PathExpr to E0070), or as InvalidLhsOfAssignment. Test: tests::bodies::calls::an_assignment_to_a_constant_a_literal_and_a_call (tests/ui/error-codes/E0070.rs, line 6).",
+  "state": "open",
+  "created": "2026-11-01T00:16:11Z",
+  "updated": "2026-11-01T00:16:11Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:16:11Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

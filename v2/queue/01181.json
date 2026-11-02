@@ -1,0 +1,35 @@
+{
+  "id": "01181",
+  "from_lane": "query-unify",
+  "owner": "query-unify-bench",
+  "paths": [
+    "crates/blaze-bench/benches/query_hit.rs"
+  ],
+  "what": "Andrew 15:56: add a bench case to query_hit: a memo at depth 64 of a dependency graph of 1M edges, one input outside its closure changed, then the memo asked (fork: its walk; engine: verified by the transitive-input summary, docs/v2/plan/lanes/db/query-unify.md section \"Transitive-input summaries\"). No cargo from now (Andrew 15:21): write the case; the coordinator runs benches.",
+  "state": "applied",
+  "created": "2026-10-30T23:31:12Z",
+  "updated": "2026-10-30T23:33:33Z",
+  "taken_by": "query-unify-bench",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:31:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:33:32Z",
+      "by": "query-unify-bench",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:33:33Z",
+      "by": "query-unify-bench",
+      "action": "done",
+      "note": "crates/blaze-bench/benches/query_hit.rs: salsa/verify/deep_unrelated and db/verify/deep_unrelated. The memo on top of 64 layers of 1024 queries of 16 edges (1M edges) over 4 leaf inputs (few, so a 128-bit summary stays sparse), all MEDIUM; each iteration writes an unrelated MEDIUM input, then asks the top memo. Not run (no cargo); the coordinator runs the bench."
+    }
+  ]
+}

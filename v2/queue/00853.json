@@ -1,0 +1,23 @@
+{
+  "id": "00853",
+  "from_lane": "pure-scripts",
+  "owner": "proof",
+  "paths": [
+    "harness/v2/pure_scripts.py"
+  ],
+  "what": "Lane pure-scripts asks to own the new file harness/v2/pure_scripts.py (as item-hash owns harness/v2/frontend/item_store.py by request): it builds the harness apps and a corpus of top crates.io build scripts cold with and without the pure path, reports per script pure or its first impurity and the cold-build time saved, and with BLAZE_PURE=verify checks every pure hit equals the sandboxed run (docs/v2/plan/lanes/pure-scripts/design.md section 8). Reply done to grant, or refuse with why.",
+  "state": "open",
+  "created": "2026-10-30T08:53:50Z",
+  "updated": "2026-10-30T08:53:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:53:50Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

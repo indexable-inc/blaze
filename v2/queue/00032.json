@@ -1,0 +1,23 @@
+{
+  "id": "00032",
+  "from_lane": "store",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core"
+  ],
+  "what": "## 3. For core: one daemon a store directory\n\n- What: an exclusive lock on a file, as an effect (e.g. `Effect::Lock { file, tag }`\n  completing `Done::Locked` or `Done::Failed` naming who holds it, released when the driver\n  ends), or the daemon taking such a lock on its state directory before it opens a `Store`.\n- Where: `crates/blaze-core` (core), or the daemon (coordinator) at integration.\n- Why: a store has exactly one writer (#686: only the daemon holds the store). Its commit cuts\n  each pack back to the length the head names before appending; a second writer on the same\n  directory would cut the first one's appends. `blaze-cas` cannot take a lock through the\n  effects it has, so today nothing stops a second daemon; it must stop with an error instead.\n\n> forwarded to core: `crates/blaze-core` has no lock effect yet.",
+  "state": "open",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T00:02:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/store.md#3. For core: one daemon a store directory",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:43"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "01171",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/unplaced_diagnostic.rs"
+  ],
+  "what": "hir now has `AnyDiagnostic::UnplacedDiagnostic(Box<hir::UnplacedDiagnostic>)` (crates/hir/src/diagnostics.rs): a diagnostic in desugared code that hir used to drop (inference, missing unsafe, borrowck, const check). `lower` in crates/blaze-diagnostics/src/lower/mod.rs matches AnyDiagnostic exhaustively, so it needs the arm now or the crate stops compiling: `AnyDiagnostic::UnplacedDiagnostic(d) => unplaced_diagnostic::lower(cx, &d),` plus `pub(crate) mod unplaced_diagnostic;` with: `pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic<'_>) -> Vec<Found> { let node = cx.syntax_view(d.owner); let span = cx.span(node.map(|it| it.text_range())); let what = match &d.what { hir::Unplaced::Inference(it) => format!(\"type checking's {it:?}\"), hir::Unplaced::MissingUnsafe { reason, lint } => format!(\"{reason:?} ({lint:?}) needs `unsafe`\"), hir::Unplaced::Borrowck { code, message } | hir::Unplaced::ConstCheck { code, message } => format!(\"{code}: {message}\") }; vec![Found::new(Diag::error(None, format!(\"blaze: {what}, in code with no syntax of its own, which blaze cannot place\"), span), Phase::Bodies)] }` (an error always: no-fallback; it is blaze's own, never rustc's). Imports as in lower/val_tree_error.rs.",
+  "state": "applied",
+  "created": "2026-10-30T23:21:35Z",
+  "updated": "2026-10-30T23:28:01Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:21:35Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:27:08Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:28:01Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "lower/unplaced_diagnostic.rs and its arm in lower/mod.rs, as asked (uncompiled)"
+    }
+  ]
+}

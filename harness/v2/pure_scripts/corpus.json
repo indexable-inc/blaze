@@ -1,0 +1,705 @@
+{
+ "about": "Build scripts for harness/v2/pure_scripts.py (docs/v2/plan/lanes/pure-scripts/measure.md): 100 of the most downloaded crates.io packages with a build script, each pinned, each built as its own workspace from its .crate with default features. `expect` is pure, or why not: cc (spawns the C compiler), rustc (reads RUSTC and runs it, autocfg and version_check too), pkg-config, env (a variable that is not cargo's, or one named at run time), listing, process (another program), thread, random (std's RandomState), other. Read at the pinned version in the crates.io source on 2026-10-30 (`seen: registry`) unless `seen` says memory.",
+ "crates": [
+  {
+   "name": "libc",
+   "version": "0.2.191",
+   "expect": "rustc",
+   "why": "reads RUSTC and runs `rustc --version`; reads RUST_LIBC_UNSTABLE_* too",
+   "seen": "registry"
+  },
+  {
+   "name": "proc-macro2",
+   "version": "1.0.107",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles a probe of nightly features",
+   "seen": "registry"
+  },
+  {
+   "name": "quote",
+   "version": "1.0.47",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "serde",
+   "version": "1.0.229",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs; writes private.rs in OUT_DIR first",
+   "seen": "registry"
+  },
+  {
+   "name": "serde_core",
+   "version": "1.0.229",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs; writes private.rs in OUT_DIR first",
+   "seen": "registry"
+  },
+  {
+   "name": "syn",
+   "version": "1.0.109",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "serde_json",
+   "version": "1.0.154",
+   "expect": "pure",
+   "why": "reads CARGO_CFG_TARGET_ARCH and _POINTER_WIDTH, prints a cfg",
+   "seen": "registry"
+  },
+  {
+   "name": "rustix",
+   "version": "1.1.6",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles probes",
+   "seen": "registry"
+  },
+  {
+   "name": "anyhow",
+   "version": "1.0.104",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles a probe of the backtrace feature",
+   "seen": "registry"
+  },
+  {
+   "name": "thiserror",
+   "version": "2.0.21",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles a probe of error_generic_member_access",
+   "seen": "registry"
+  },
+  {
+   "name": "thiserror",
+   "version": "1.0.69",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles a probe of error_generic_member_access",
+   "seen": "registry"
+  },
+  {
+   "name": "getrandom",
+   "version": "0.3.4",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "getrandom",
+   "version": "0.4.3",
+   "expect": "pure",
+   "why": "reads CARGO_CFG_SANITIZE, prints a cfg",
+   "seen": "registry"
+  },
+  {
+   "name": "num-traits",
+   "version": "0.2.19",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "crossbeam-utils",
+   "version": "0.8.23",
+   "expect": "pure",
+   "why": "reads TARGET and CARGO_CFG_SANITIZE against a constant table, prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "crossbeam-epoch",
+   "version": "0.9.21",
+   "expect": "pure",
+   "why": "reads TARGET and CARGO_CFG_SANITIZE, prints a cfg",
+   "seen": "registry"
+  },
+  {
+   "name": "crossbeam-deque",
+   "version": "0.8.8",
+   "expect": "pure",
+   "why": "prints rerun-if-changed only",
+   "seen": "registry"
+  },
+  {
+   "name": "memoffset",
+   "version": "0.9.1",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "lock_api",
+   "version": "0.4.13",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "parking_lot_core",
+   "version": "0.9.12",
+   "expect": "pure",
+   "why": "reads CARGO_CFG_SANITIZE, prints a cfg",
+   "seen": "registry"
+  },
+  {
+   "name": "generic-array",
+   "version": "0.14.9",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "typenum",
+   "version": "1.19.0",
+   "expect": "pure",
+   "why": "generates tests.rs into OUT_DIR from constants",
+   "seen": "registry"
+  },
+  {
+   "name": "ahash",
+   "version": "0.8.12",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "indexmap",
+   "version": "1.9.3",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "httparse",
+   "version": "1.10.1",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "crc32fast",
+   "version": "1.5.3",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "semver",
+   "version": "1.0.26",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "paste",
+   "version": "1.0.15",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "ref-cast",
+   "version": "1.0.27",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "rayon-core",
+   "version": "1.13.0",
+   "expect": "pure",
+   "why": "prints rerun-if-changed only",
+   "seen": "registry"
+  },
+  {
+   "name": "slab",
+   "version": "0.4.9",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "libm",
+   "version": "0.2.16",
+   "expect": "env",
+   "why": "reads ENSURE_NO_PANIC and the whole environment (env::vars) for CARGO_FEATURE_*",
+   "seen": "registry"
+  },
+  {
+   "name": "portable-atomic",
+   "version": "1.15.0",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs; reads PORTABLE_ATOMIC_DENY_WARNINGS",
+   "seen": "registry"
+  },
+  {
+   "name": "zerocopy",
+   "version": "0.8.63",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "encoding_rs",
+   "version": "0.8.42",
+   "expect": "pure",
+   "why": "rustversion::cfg! is expanded when the script compiles; prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "rustls",
+   "version": "0.23.46",
+   "expect": "pure",
+   "why": "main is empty unless read_buf on nightly (rustversion at compile time)",
+   "seen": "registry"
+  },
+  {
+   "name": "unicase",
+   "version": "2.7.0",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "mime_guess",
+   "version": "2.0.5",
+   "expect": "pure",
+   "why": "generates mime_types_generated.rs into OUT_DIR from an included table",
+   "seen": "registry"
+  },
+  {
+   "name": "winapi",
+   "version": "0.3.9",
+   "expect": "env",
+   "why": "reads WINAPI_NO_BUNDLED_LIBRARIES and WINAPI_STATIC_NOBUNDLE (on the Windows branch, which the walk reaches)",
+   "seen": "registry"
+  },
+  {
+   "name": "winapi-x86_64-pc-windows-gnu",
+   "version": "0.4.0",
+   "expect": "env",
+   "why": "reads WINAPI_NO_BUNDLED_LIBRARIES",
+   "seen": "registry"
+  },
+  {
+   "name": "windows_x86_64_gnu",
+   "version": "0.53.1",
+   "expect": "pure",
+   "why": "prints a link search path made from CARGO_MANIFEST_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "windows_x86_64_msvc",
+   "version": "0.53.1",
+   "expect": "pure",
+   "why": "prints a link search path made from CARGO_MANIFEST_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "wasm-bindgen",
+   "version": "0.2.129",
+   "expect": "pure",
+   "why": "rustversion (as rustversion-compat) at compile time; reads CARGO_CFG_*, prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "wasm-bindgen-shared",
+   "version": "0.2.129",
+   "expect": "process",
+   "why": "runs `git rev-parse`; reads schema files in its package",
+   "seen": "registry"
+  },
+  {
+   "name": "prettyplease",
+   "version": "0.2.37",
+   "expect": "pure",
+   "why": "reads CARGO_PKG_VERSION, prints; process::exit on its absence",
+   "seen": "registry"
+  },
+  {
+   "name": "bindgen",
+   "version": "0.73.2",
+   "expect": "pure",
+   "why": "writes host-target.txt (TARGET) into OUT_DIR, prints rerun-if-env-changed",
+   "seen": "registry"
+  },
+  {
+   "name": "blake3",
+   "version": "1.8.7",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler; reads CC, CFLAGS",
+   "seen": "registry"
+  },
+  {
+   "name": "backtrace",
+   "version": "0.3.73",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler (Android branch, reached by the walk)",
+   "seen": "registry"
+  },
+  {
+   "name": "psm",
+   "version": "0.1.32",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler (stack switching assembly)",
+   "seen": "registry"
+  },
+  {
+   "name": "stacker",
+   "version": "0.1.25",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler",
+   "seen": "registry"
+  },
+  {
+   "name": "ring",
+   "version": "0.17.14",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler (crypto C and assembly)",
+   "seen": "registry"
+  },
+  {
+   "name": "zstd-sys",
+   "version": "2.1.2+zstd.1.5.7",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler (bundled zstd)",
+   "seen": "registry"
+  },
+  {
+   "name": "zstd-safe",
+   "version": "7.2.4",
+   "expect": "pure",
+   "why": "reads CARGO_CFG_TARGET_ARCH and _OS, prints a cfg",
+   "seen": "registry"
+  },
+  {
+   "name": "libz-sys",
+   "version": "1.1.30",
+   "expect": "pkg-config",
+   "why": "probes the system zlib with pkg-config, then builds it with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "lzma-sys",
+   "version": "0.1.20",
+   "expect": "pkg-config",
+   "why": "probes liblzma with pkg-config, then builds it with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "libsqlite3-sys",
+   "version": "0.38.2",
+   "expect": "pkg-config",
+   "why": "finds the system sqlite with pkg-config or vcpkg; bundled builds with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "libgit2-sys",
+   "version": "0.18.8+1.9.7",
+   "expect": "pkg-config",
+   "why": "probes libgit2 with pkg-config, then builds it with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "curl-sys",
+   "version": "0.4.90+curl-8.21.0",
+   "expect": "pkg-config",
+   "why": "probes libcurl with pkg-config, then builds it with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "libssh2-sys",
+   "version": "0.3.2",
+   "expect": "pkg-config",
+   "why": "probes libssh2 with pkg-config, then builds it with cc",
+   "seen": "registry"
+  },
+  {
+   "name": "openssl-sys",
+   "version": "0.9.117",
+   "expect": "pkg-config",
+   "why": "finds OpenSSL through OPENSSL_* variables, pkg-config and vcpkg; runs the C preprocessor on a probe",
+   "seen": "registry"
+  },
+  {
+   "name": "openssl",
+   "version": "0.10.81",
+   "expect": "env",
+   "why": "reads DEP_OPENSSL_VERSION_NUMBER and the other DEP_OPENSSL_* of openssl-sys's run",
+   "seen": "registry"
+  },
+  {
+   "name": "native-tls",
+   "version": "0.2.18",
+   "expect": "env",
+   "why": "reads DEP_OPENSSL_VERSION_NUMBER and DEP_OPENSSL_LIBRESSL_VERSION_NUMBER",
+   "seen": "registry"
+  },
+  {
+   "name": "tikv-jemalloc-sys",
+   "version": "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler via jemalloc's configure and make",
+   "seen": "registry"
+  },
+  {
+   "name": "libmimalloc-sys",
+   "version": "0.1.49",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler",
+   "seen": "registry"
+  },
+  {
+   "name": "io-uring",
+   "version": "0.7.15",
+   "expect": "pure",
+   "why": "default features: prints check-cfgs only (bindgen behind a feature)",
+   "seen": "registry"
+  },
+  {
+   "name": "nix",
+   "version": "0.31.3",
+   "expect": "env",
+   "why": "cfg_aliases reads CARGO_CFG_<name> with the name made at run time (format!)",
+   "seen": "registry"
+  },
+  {
+   "name": "signal-hook",
+   "version": "0.3.18",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler",
+   "seen": "registry"
+  },
+  {
+   "name": "target-lexicon",
+   "version": "0.13.5",
+   "expect": "rustc",
+   "why": "reads RUSTC and runs `rustc --version`; writes host.rs into OUT_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "crunchy",
+   "version": "0.2.4",
+   "expect": "pure",
+   "why": "generates lib.rs into OUT_DIR from constants",
+   "seen": "registry"
+  },
+  {
+   "name": "heapless",
+   "version": "0.9.3",
+   "expect": "rustc",
+   "why": "reads RUSTC (and RUSTC_WRAPPER) and compiles probes",
+   "seen": "registry"
+  },
+  {
+   "name": "erased-serde",
+   "version": "0.4.11",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "typeid",
+   "version": "1.0.3",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "eyre",
+   "version": "0.6.14",
+   "expect": "rustc",
+   "why": "reads RUSTC and compiles a probe of the backtrace feature",
+   "seen": "registry"
+  },
+  {
+   "name": "valuable",
+   "version": "0.1.1",
+   "expect": "pure",
+   "why": "reads TARGET against constant tables, prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "rust_decimal",
+   "version": "1.43.0",
+   "expect": "pure",
+   "why": "reads README.md in its package, writes README-lib.md into OUT_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "chrono-tz",
+   "version": "0.10.4",
+   "expect": "pure",
+   "why": "default features: main does nothing (chrono-tz-build behind filter-by-regex, case-insensitive)",
+   "seen": "registry"
+  },
+  {
+   "name": "html5ever",
+   "version": "0.27.0",
+   "expect": "thread",
+   "why": "expands rules.rs on a spawned thread with a large stack",
+   "seen": "registry"
+  },
+  {
+   "name": "markup5ever",
+   "version": "0.12.1",
+   "expect": "random",
+   "why": "std HashMap's RandomState (and phf_codegen's HashSet) reach the OS",
+   "seen": "registry"
+  },
+  {
+   "name": "selectors",
+   "version": "0.38.0",
+   "expect": "random",
+   "why": "phf_codegen's HashSet: RandomState reaches the OS",
+   "seen": "registry"
+  },
+  {
+   "name": "pulldown-cmark",
+   "version": "0.13.4",
+   "expect": "pure",
+   "why": "default features: main does nothing (spec test generation behind gen-tests)",
+   "seen": "registry"
+  },
+  {
+   "name": "nom",
+   "version": "5.1.3",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "proc-macro-error",
+   "version": "1.0.4",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "proc-macro-error-attr",
+   "version": "1.0.4",
+   "expect": "rustc",
+   "why": "version_check runs `rustc --version`",
+   "seen": "registry"
+  },
+  {
+   "name": "doc-comment",
+   "version": "0.3.4",
+   "expect": "rustc",
+   "why": "runs `rustc --version` from PATH",
+   "seen": "registry"
+  },
+  {
+   "name": "num-bigint",
+   "version": "0.2.6",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "rand",
+   "version": "0.6.5",
+   "expect": "rustc",
+   "why": "autocfg probes the compiler: reads RUSTC and runs it",
+   "seen": "registry"
+  },
+  {
+   "name": "rustversion",
+   "version": "1.0.23",
+   "expect": "rustc",
+   "why": "reads RUSTC and runs `rustc --version`, writes version.expr into OUT_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "object",
+   "version": "0.36.7",
+   "expect": "rustc",
+   "why": "runs `$RUSTC --version` (or a probe compile) to pick cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "rkyv",
+   "version": "0.7.46",
+   "expect": "pure",
+   "why": "reads TARGET, prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "aws-lc-rs",
+   "version": "1.18.2",
+   "expect": "env",
+   "why": "reads AWS_LC_RS_* and the whole environment (env::vars) for DEP_AWS_LC_*",
+   "seen": "registry"
+  },
+  {
+   "name": "aws-lc-sys",
+   "version": "0.46.0",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler with cmake; reads many CFLAGS-like variables",
+   "seen": "registry"
+  },
+  {
+   "name": "icu_properties_data",
+   "version": "2.4.0",
+   "expect": "env",
+   "why": "reads ICU4X_DATA_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "icu_normalizer_data",
+   "version": "2.4.0",
+   "expect": "env",
+   "why": "reads ICU4X_DATA_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "quinn-udp",
+   "version": "0.5.16",
+   "expect": "env",
+   "why": "cfg_aliases reads CARGO_CFG_<name> with the name made at run time (format!)",
+   "seen": "registry"
+  },
+  {
+   "name": "protobuf",
+   "version": "3.7.2",
+   "expect": "pure",
+   "why": "reads CARGO_FEATURE_WITH_SERDE and CARGO_PKG_VERSION, writes version.rs into OUT_DIR",
+   "seen": "registry"
+  },
+  {
+   "name": "tree-sitter",
+   "version": "0.26.13",
+   "expect": "cc",
+   "why": "cc builds C: spawns the C compiler (the runtime's C)",
+   "seen": "registry"
+  },
+  {
+   "name": "objc2",
+   "version": "0.6.5",
+   "expect": "pure",
+   "why": "reads TARGET and CARGO_CFG_TARGET_ABI, prints cfgs",
+   "seen": "registry"
+  },
+  {
+   "name": "wayland-sys",
+   "version": "0.31.11",
+   "expect": "pkg-config",
+   "why": "pkg_config probes behind CARGO_FEATURE_* checks the walk reaches",
+   "seen": "registry"
+  },
+  {
+   "name": "libudev-sys",
+   "version": "0.1.4",
+   "expect": "pkg-config",
+   "why": "pkg_config::find_library, then runs rustc on a probe",
+   "seen": "registry"
+  },
+  {
+   "name": "cranelift-codegen",
+   "version": "0.137.0",
+   "expect": "env",
+   "why": "reads ISLE_SOURCE_DIR, SKIP_ISLE, CRANELIFT_VERBOSE; times its generation (clock)",
+   "seen": "registry"
+  }
+ ]
+}

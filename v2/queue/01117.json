@@ -1,0 +1,41 @@
+{
+  "id": "01117",
+  "from_lane": "dedup",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "dedup, Andrew 14:27 (every dependency in the root, members say `workspace = true`): add these 65 lines to the root Cargo.toml [workspace.dependencies], as one block at the end of the table (after the last entry, before the next [section]), headed `# Dependencies of one member, moved to the root (dedup, 2026-10-30).` Each pins the version Cargo.lock already resolves (or the member's `=` pin), so Cargo.lock does not change. Added alone they break nothing: no member names them yet. Once applied, reply done here; dedup then rewrites the 139 member lines to `workspace = true` (script /tmp/dedup-ws.py, kept until done) and lands the manifest_lint rules. Notes: `syn` is 2.0.117, not 3 (01106): crates/macros needs syn 2 through synstructure, and both majors stay in the lock anyway (syn 2: serde_derive, thiserror-impl, tracing-attributes, zerocopy-derive; syn 3: clap_derive, async-trait, rkyv_derive), so blaze-query-macros should use this one `syn` (told query-unify). `rustfmt-unicode-width` is unicode-width =0.1.14 under its own key: blaze-fmt keeps the pinned nightly rustfmt's widths. Crates being deleted (01107, 01108, 01115) are left out.\n\nar_archive_writer = \"0.5.3\"\naws-config = { version = \"1.12.0\", default-features = false }\naws-sdk-s3 = { version = \"1.152.0\", default-features = false }\naws-smithy-http-client = \"1.5.0\"\nblaze-cache-macros = { version = \"0.1.0\", path = \"crates/blaze-cache-macros\" }\nblaze-cargo = { path = \"crates/blaze-cargo\" }\nblaze-registry = { path = \"crates/blaze-registry\" }\ncargo-platform = \"0.3.3\"\ncargo-util-schemas = \"=0.14.3\"\ncov-mark = \"2.2.0\"\ncranelift-module = \"0.136.2\"\ncranelift-object = \"0.136.2\"\ndiff = \"=0.1.13\"\ndissimilar = \"1.0.11\"\ndrop_bomb = \"0.1.5\"\ndunce = \"1.0.5\"\ned25519-dalek = \"2.2.0\"\nfiletime = \"0.2.29\"\nfind-msvc-tools = \"0.1.11\"\nflate2 = { version = \"1.1.9\", default-features = false }\nfst = { version = \"0.4.7\", default-features = false }\nfutures-util = { version = \"0.3.32\", default-features = false }\nglob = \"0.3.4\"\nhttp-body-util = \"0.1.5\"\nhyper = { version = \"1.12.0\", default-features = false }\nhyper-rustls = { version = \"0.27.10\", default-features = false }\nhyper-util = { version = \"0.1.21\", default-features = false }\nim-rc = \"15.1.0\"\ninkwell = { version = \"0.11.0\", default-features = false }\njobserver = \"0.1.35\"\nlzma-rust2 = { version = \"0.23.0\", default-features = false }\noorandom = \"11.1.5\"\npathdiff = \"0.2.3\"\npercent-encoding = \"2.3.2\"\nproc-macro2 = \"1.0.106\"\nquote = \"1.0.45\"\nrustc-demangle = \"0.1.28\"\nrustc-stable-hash = \"0.1.2\"\nrustc_hashes = { version = \"0.166.0\", package = \"ra-ap-rustc_hashes\" }\nrustc_index = { version = \"0.166.0\", package = \"ra-ap-rustc_index\", default-features = false }\nrustfmt-unicode-width = { version = \"=0.1.14\", package = \"unicode-width\" }\nsame-file = \"1.0.6\"\nserde-untagged = \"0.1.9\"\nsha1 = \"0.10.7\"\nshell-escape = \"=0.1.5\"\nshlex = \"2.0.1\"\nstacker = \"0.1.25\"\nsyn = \"2.0.117\"\nsynstructure = \"0.13.2\"\ntango-bench = \"0.9.0\"\ntar = { version = \"0.4.46\", default-features = false }\ntarget-lexicon = \"0.13.5\"\ntempfile = \"3.27.0\"\nthiserror = \"2.0.18\"\nthorin-dwp = \"0.10.0\"\ntikv-jemalloc-ctl = \"0.5.4\"\ntikv-jemalloc-sys = \"0.5.4\"\ntokio = \"1.53.3\"\ntoml_edit = { version = \"=0.25.12\", default-features = false }\ntyped-arena = \"2.0.2\"\nuds_windows = \"1.2.1\"\nunicode-segmentation = \"=1.12.0\"\nwasm-encoder = { version = \"0.244.0\", default-features = false }\nwinnow = { version = \"0.7.15\", default-features = false }\nzip = { version = \"9.1.2\", default-features = false }\n",
+  "state": "applied",
+  "created": "2026-10-30T21:58:35Z",
+  "updated": "2026-10-30T22:27:44Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:58:35Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:39Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> dedup: Andrew 15:12: dedup owns root [workspace.dependencies], [patch.*], Cargo.lock and member dependency tables; applies between coord-1030's checks (pgrep check.sh) and tells coord-1030 each change"
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "65 lines added at the end of [workspace.dependencies]; every member dep in crates/* and fuzz rewritten to workspace = true (blaze-fmt: rustfmt_unicode_width in utils.rs)."
+    }
+  ]
+}

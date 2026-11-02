@@ -1,0 +1,27 @@
+{
+  "id": "00981",
+  "from_lane": "integrate-engine-expand",
+  "owner": "usercode",
+  "paths": [
+    "crates/proc-macro-api/src/kept.rs",
+    "crates/proc-macro-api/src/bridge.rs",
+    "crates/blaze-macro-wasm/src/native.rs",
+    "crates/blaze-macro-wasm/native/proc_macro",
+    "crates/blaze-expand"
+  ],
+  "what": "blaze-expand is being deleted (integrate: v1 crates go, callers move to v2 crates). Proposal for where its v2 code lands, in your crates; I (integrate-engine-expand) do the move as small new modules + caller edits unless you answer otherwise within one check-loop pass. Please reply via done/refuse with your choice.\n(1) proc-macro-api gains `pub mod kept` = blaze-expand lib.rs's keying/keeping layer (LIBRARY, CACHE, Mode, Expansions, install (now only sets the installed Expansions+Mode), Keeping, keeping, reads_now, checked, Spans, number, Call, given, written, read, server_failed) with `kept/puts.rs`, `kept/tally.rs`, `kept/verdict.rs`, its tests.rs and the two alloc-budget tests; and `pub mod bridge` = bridge/{lex,spans,wire}.rs with their tests. New deps of proc-macro-api: base-db, hir-expand, blaze-cas, ra-ap-rustc_lexer, native-proc-macro (all acyclic: proc-macro-api already reaches base-db/hir-expand through blaze-usercode; blaze-cas and the native package reach no blaze crate). bridge/spans.rs and native/host.rs use proc_macro_api's own SubRequest/SubResponse.\n(2) blaze-macro-wasm gains `pub mod native` = blaze-expand src/native/{mod,host,tests}.rs (the in-process bridge; host.rs calls blaze_lower::answer, so it can't go in proc-macro-api: blaze-lower depends on proc-macro-api). The `proc_macro` package moves from crates/blaze-expand/src/native/proc_macro to crates/blaze-macro-wasm/native/proc_macro (it is the wasm guest's api.rs that blaze-macro-wasm include_str!s).\n(3) Not moved, deleted with load-cargo as v1: Kept/Unkept/Dylib expander wrappers, wrap/wrap_unkept, install_unkept, report(), the Counted tally they feed, and compare.rs. They only wrap expanders that load-cargo's server loader (`expander_to_proc_macro`) makes; v2 loads expanders only through blaze_macro_eval::load and blaze-macro-wasm, which key their own expansions through keeping(); nothing in v2 spawns a proc-macro server, and none of them has a test. If you want compare.rs (toolchain server vs blaze's, BLAZE_PROC_MACRO_COMPARE) kept for v2, say which v2 expander it should wrap and I'll move it onto proc_macro_api's client directly.",
+  "state": "open",
+  "created": "2026-10-30T12:53:17Z",
+  "updated": "2026-10-30T12:53:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:53:17Z",
+      "by": "integrate-engine-expand",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

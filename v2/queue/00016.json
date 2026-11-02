@@ -1,0 +1,41 @@
+{
+  "id": "00016",
+  "from_lane": "format",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/item_tree/attrs.rs",
+    "crates/syntax/src/ast/traits.rs",
+    "crates/blaze-engine/src/lib.rs",
+    "crates/syntax-tree/src/flat.rs",
+    "crates/syntax/src/parsing.rs",
+    "crates/syntax-tree",
+    "crates/syntax/src/parsing/reparsing.rs"
+  ],
+  "what": "## format-parse\n\n1. **`OutlineFn` can go** — `crates/hir-def/src/item_tree/attrs.rs` (format-hir): format-hir's\n   request 2 is done. `HasAttrs::inner_attributes_node` (`crates/syntax/src/ast/traits.rs`)\n   now returns `None` for a `fn` whose body is lazy and not yet parsed when the body's text\n   surely starts with no inner attribute (`block_may_start_with_inner_attr`, the same rule,\n   with its tests). Remove `OutlineFn`, its `may_start_with_inner_attr` and\n   `block_comment_len` and their tests, and call `ast::Fn`'s `HasAttrs` directly. Why: one\n   copy of the rule, for every caller (#1294).\n\n> forwarded to format: `OutlineFn` is still in `crates/hir-def/src/item_tree/attrs.rs:271` (format-hir's).\n2. **No edit, already applied**: the lead's request 3 (drop `syntax::set_green_trees` from\n   `crates/blaze-engine/src/lib.rs`) is done in the tree (`rg set_green_trees crates` finds\n   nothing); `syntax::set_green_trees` no longer exists, so nothing may call it again.\n\n> applied: note only.\n3. **An expander returns its errors** — `crates/syntax-tree/src/flat.rs` (format-tree). Make\n   `pub type Expand = fn(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`,\n   the ranges relative to `text`. Keep them with the part, moved to the file like its tree,\n   and add `FlatTree::part_errors(&self, at: u32) -> &[(TextRange, Box<str>)]`: lazy node\n   `at`'s errors, absolute, parsing the part if it isn't parsed yet. Why (performance): today\n   `Expand` returns only the tree, so `Parse::errors_with_bodies` (and `errors()` for the\n   bodies parsed so far) finds each body's parser errors by parsing the body a second time\n   (`crates/syntax/src/parsing.rs`, `body_parser_errors`). With this each body is parsed once.\n   When it lands, tell format-parse: `expand_lazy` returns its parser errors and\n   `body_parser_errors` reads `part_errors`. Keep a part's errors in its `heap_size`.\n\n> forwarded to format: format-tree's `crates/syntax-tree/`, inside lane format.\n4. **Replace a token in place** — `crates/syntax-tree/src/flat.rs` (format-tree). Add\n   `FlatTree::replace_token(&self, at: u32, text: &str, source: Arc<str>) -> FlatTree`: token\n   `at` with the new `text` (same kind), over `source`, the new whole text, with every lazy\n   node kept lazy and every part already parsed kept (those after `at` moved). Why\n   (performance): the token reparse (`crates/syntax/src/parsing/reparsing.rs`, `Edit::token`)\n   has to rebuild the token's parent from the arrays to call `replace_subtree`. For whitespace\n   or a comment at a file's top level that parent is the root, so a one-character edit rebuilds\n   the whole tree and drops every body parsed so far. When it lands, tell format-parse, which\n   switches `Edit::token` to it.\n\n> forwarded to format: format-tree's `crates/syntax-tree/`, inside lane format.",
+  "state": "refused",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T08:25:24Z",
+  "taken_by": "coord-apply-front",
+  "why": "already done in the tree: OutlineFn is gone from hir-def (no match for OutlineFn/may_start_with_inner_attr in item_tree/attrs.rs); syntax-tree Expand returns (FlatTree, Vec<(TextRange, Box<str>)>) and FlatTree::part_errors exists (flat.rs:191, :1918); FlatTree::replace_token exists (flat.rs:1881) and reparsing.rs splices tokens via splice_all(Splice::Token); set_green_trees is gone.",
+  "source": "v2/requests/format.md#format-parse",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:368"
+    },
+    {
+      "at": "2026-10-30T08:25:23Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:24Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done in the tree: OutlineFn is gone from hir-def (no match for OutlineFn/may_start_with_inner_attr in item_tree/attrs.rs); syntax-tree Expand returns (FlatTree, Vec<(TextRange, Box<str>)>) and FlatTree::part_errors exists (flat.rs:191, :1918); FlatTree::replace_token exists (flat.rs:1881) and reparsing.rs splices tokens via splice_all(Splice::Token); set_green_trees is gone."
+    }
+  ]
+}

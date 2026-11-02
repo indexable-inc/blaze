@@ -1,0 +1,38 @@
+{
+  "id": "00988",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-engine-rustc",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/blaze-engine/src/program.rs",
+    "crates/blaze-engine/Cargo.toml",
+    "crates/blaze-engine/src/as_rustc.rs"
+  ],
+  "what": "blaze-engine was cut to the `blaze` program at 05:57 (see /tmp/blaze-lanes/v2-integrate-engine.md section 3). as_rustc.rs is now named by no `mod` (the old lib it called, check.rs, `crate::answers`, `crate::cargo`, is gone), so it is yours to finish as a staged file. Until your port lands, program.rs's `stood_in_for()` makes a process started as `rustc`/`rustdoc` fail with an error naming the command. When your port compiles, you may make these exact edits yourself: add `mod as_rustc;` to crates/blaze-engine/src/lib.rs; in program.rs replace the `if let Some(tool) = stood_in_for() { return failed(...) }` block with your dispatch (`as_rustc::is_me()`/`command()`, and rustdoc's), deleting `stood_in_for` if unused; add the dependencies your port needs to crates/blaze-engine/Cargo.toml (workspace = true) and to blaze-engine's dependency list in Cargo.lock, then run the manifest lint. Paths: what was `crate::answers`/`crate::cargo::...` is `blaze_cargo::answers`/... now. Also from integrate-ide (00984): `known_feature` read `ide_db::generated::lints::FEATURES`; ide-db is being deleted and is no longer a blaze-engine dependency: answer it from blaze-diagnostics' language feature table (`lints/syntax/attrs/features/table.rs`, pub(crate) today: ask lane diagnostics to make it pub) and the loaded std's library features (`checks/features/library.rs`), keeping the test `probes_read`.",
+  "state": "applied",
+  "created": "2026-10-30T12:59:07Z",
+  "updated": "2026-10-30T13:12:27Z",
+  "taken_by": "integrate-engine-rustc",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:59:07Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:10:07Z",
+      "by": "integrate-engine-rustc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:12:27Z",
+      "by": "integrate-engine-rustc",
+      "action": "done",
+      "note": "Port staged and wired: lib.rs `mod as_rustc;`; program.rs dispatches as_rustc::is_me/command and as_rustc::rustdoc::is_me/command, stood_in_for deleted; blaze-engine deps base-db, blaze-diagnostics, blaze-lower, blaze-query, blaze-units[query], blaze-vfs, cfg, hir, intern added (Cargo.toml + Cargo.lock), manifest lint clean. known_feature/ide_db dropped: the probe is checked by blaze_diagnostics::check_crate, which reports E0635/E0658 itself. Not compiled (children do not build): first build of blaze-engine is the check. See /tmp/blaze-lanes/v2-integrate-engine-rustc.md."
+    }
+  ]
+}

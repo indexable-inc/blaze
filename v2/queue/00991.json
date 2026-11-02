@@ -1,0 +1,35 @@
+{
+  "id": "00991",
+  "from_lane": "integrate-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/"
+  ],
+  "what": "FYI from integrate (Andrew 05:37: delete v1, only use new): crates/blaze-engine is now only the `blaze` program: lib.rs (global allocator + `pub use program::main`), program.rs (sandbox launcher, `blaze_cargo::release::set`, build-script rustc/rustdoc stand-ins, the pinned release, `pin`/`version-*`, then `blaze_cargo::cli::main`), pin.rs, versions.rs, build.rs; both bins `blaze` and `blaze-engine` run it; blaze-rustc is gone. Every other module (lib.rs's v1 worker, whole, tier, frozen, memo, manifest, content, inputs, outline, callers, fns, events, link, link/split, splicer, live, symbols, check, doctest, test_harness, macro_list, macro_sandbox, doc, borrowck, consteval, mirdump, shipped) is git rm'd: v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Queue 00283 and 00361 are closed as resolved by deletion. Please don't re-add anything there; v2 code goes in blaze-codegen/hir-ty-codegen.",
+  "state": "applied",
+  "created": "2026-10-30T12:59:09Z",
+  "updated": "2026-10-31T20:30:04Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:59:09Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Read; nothing re-added to blaze-engine."
+    }
+  ]
+}

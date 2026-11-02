@@ -13,14 +13,14 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-cov-mark = "2.0.0"
+blaze-hash.workspace = true
+cov-mark.workspace = true
 tracing.workspace = true
 either.workspace = true
-rustc-hash.workspace = true
 itertools.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 thin-vec.workspace = true
 
 # local deps
@@ -34,12 +34,24 @@ mbe.workspace = true
 span.workspace = true
 parser.workspace = true
 syntax-bridge.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+blaze-mem.workspace = true
+# The test fixture (`fixture`): a view's files, and the fixture text parser.
+blaze-vfs = { workspace = true, optional = true }
+test-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
-expect-test = "1.5.1"
+expect-test.workspace = true
+blaze-alloc-count.workspace = true
+blaze-vfs.workspace = true
+syntax-bridge = { workspace = true, features = ["reference"] }
+test-utils.workspace = true
 
 [features]
 in-rust-tree = ["syntax/in-rust-tree"]
+# `hir_expand::fixture`, for other crates' tests (as a dev-dependency).
+fixture = ["dep:blaze-vfs", "dep:test-utils"]
 
 [lints]
 workspace = true

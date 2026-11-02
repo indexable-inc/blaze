@@ -1,0 +1,23 @@
+{
+  "id": "00461",
+  "from_lane": "db-ty",
+  "owner": "link",
+  "paths": [
+    "docs/v2/plan/process/decisions.md"
+  ],
+  "what": "## 5. Link (live patch)\n\nBefore committing a speculative patch, run `hir_ty_borrowck::Pending::finish(db)` as a plane\ntask beside the patch, sharing the database by reference (docs/v2/plan/process/decisions.md: no per-thread\nhandles), and roll the patch back on `Err(Refused)`; the\n`Refused` names the body and the errors to report.\n\n> forwarded to link",
+  "state": "open",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T04:31:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#5. Link (live patch)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:58"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00415",
+  "from_lane": "codegen-mir",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "## 5. Codegen must lower (speed-backend-lower, `crates/hir-ty-codegen/mod.rs`)\n\n- `Assert` with the new messages calls, when the condition fails, with `cleanup` absent\n  (rustc's `UnwindAction::Unreachable`: these panics are `#[rustc_nounwind]`), all\n  `#[track_caller]` so the caller location goes last as for `panic_bounds_check`:\n  - `MisalignedPointerDereference { required, found }` → `panic_misaligned_pointer_dereference(required: usize, found: usize)`\n  - `NullPointerDereference` → `panic_null_pointer_dereference()`\n  - `NullReferenceConstructed` → `panic_null_reference_constructed()`\n  - `InvalidEnumConstruction(source)` → `panic_invalid_enum_construction(source: u128)`\n- `CastKind::Transmute`: a bit-for-bit reinterpretation of equal sizes. The checks emit:\n  a `Box`'s field 0 (`Unique`/`NonNull` newtype) to `*const T`; a thin `*const ()` to `usize`;\n  a value to `[MaybeUninit<u8>; N]`; a value to an unsigned integer of its size.\n- The MIR level of a body (mod.rs 3485, 3495, 5353): ask\n  `MirOptions { level: mir_opt_level_of(db, krate), ub_checks: debug_assertions(db, krate), lifetime_markers: true }`\n  where `krate` is the crate whose MIR it is (rustc's `sess.ub_checks()` of that crate, not\n  `ub_checks_of`, which is the `ub_checks()` intrinsic of the calling crate). The runtime body\n  stays for `level == Off && !ub_checks` only.\n- Coroutine bodies (mod.rs ~3527–3546, the runtime coroutine queries): when `ub_checks`, use\n  the new optimized coroutine queries (they insert only the checks; coroutines are not\n  optimized further, as today).\n\n> forwarded to codegen.",
+  "state": "applied",
+  "created": "2026-10-30T04:06:19Z",
+  "updated": "2026-10-31T20:38:18Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir.md#5. Codegen must lower (speed-backend-lower, `crates/hir-ty-codegen/mod.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir.md:91"
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In: mod.rs lowers the UB-check Asserts (ub_check_panic_if, :8084-8089, panic_invalid_enum_construction's u128) and CastKind::Transmute (:7097); v2::build::Build gives MirOptions { level, ub_checks of the crate whose MIR it is, lifetime_markers: true, inline }."
+    }
+  ]
+}

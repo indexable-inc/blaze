@@ -1,0 +1,32 @@
+{
+  "id": "01308",
+  "from_lane": "tests-misc-stencil",
+  "owner": "tests-fuzz",
+  "paths": [
+    "crates/parser/src/grammar.rs",
+    "crates/parser/src/grammar/expressions.rs",
+    "crates/syntax/src/parsing/reparsing.rs",
+    "crates/syntax-bridge/src/lib.rs"
+  ],
+  "what": "Round 8 hir-def parse regressions, after ffbd95f75c (parser attribute recovery and reparsing.rs +22): (1) A statements macro expansion parses its first `let` as a LET_EXPR (validation: `let` expressions are not supported here, at 0..len of the first statement only), and an empty one reports expected expression. Tests: mbe::metavar_expr::concat_{invalid_ident,repetition,invalid_fragment,less_than_two_elements}, tt_conversion::{round_trips_literals,broken_parenthesis_sequence}, mbe::test_type_path_is_transcribed_as_expr_path. ExpandTo::of_call_site_view is right (a_blocks_last_call_expands_to_an_expression passes), so check whether entry MacroStmts / stmt() sees T![let] at token 0. (2) base-db reparse.rs:269 assert_whole: a reparse whose tree is not the whole parse (signatures::relative_tests moved_source_maps_are_the_files, an_edit_of_another_item_lowers_none_of_this_one). (3) file_outline copies (subtree_without on the root) drop the leading newline, so the root SOURCE_FILE range starts at 1 (relative_tests the_outline_*). Panics are in /Volumes/Projects/.coord-1030/v2-build/round8-test.log.",
+  "state": "taken",
+  "created": "2026-10-31T15:24:11Z",
+  "updated": "2026-10-31T16:35:01Z",
+  "taken_by": "tests-fuzz",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:24:11Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:35:01Z",
+      "by": "tests-fuzz",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

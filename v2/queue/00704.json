@@ -1,0 +1,29 @@
+{
+  "id": "00704",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-unsafeck/src/lib.rs"
+  ],
+  "what": "## db (hir-ty-unsafeck; from diagnostics window 85, 2026-10-29 23:25): remove `UnsafetyReason::InitializingTypeWith`\n\nThe pinned rustc (16d1ffac) has no `InitializingTypeWith` kind in `UnsafeOpKind`. In\n`rustc_mir_build/src/check_unsafety.rs`, `ExprKind::Adt` requires unsafe only for\n`has_unsafe_fields()` (`InitializingTypeWithUnsafeField`). A struct expression of a type with\n`#[rustc_layout_scalar_valid_range_*]` outside `unsafe` builds under rustc, but hir-ty-unsafeck\nreports it (`crates/hir-ty-unsafeck/src/lib.rs:76`, the `requires_unsafe` at ~883, expected by\n`tests.rs:694`). Remove the variant, its check, and that test line; mutation and borrow of such\nfields stay (rustc has both). Then tell diagnostics: `blaze-diagnostics/src/lower/missing_unsafe.rs`\ndrops `Op::InitializingTypeWith` and `initializing_type_with`, which until then stop the build with a\nblaze error naming this, and `ide-diagnostics/src/handlers/missing_unsafe.rs:43` drops its arm.\n\nWhy: superset-of-rust; a program the pinned nightly builds must build under blaze.\n\nStatus: open\n\n> forwarded to db-next8 (requests, pass 37; `hir-ty-unsafeck` is db's and lane db is running; diagnostics and the coordinator's `ide-diagnostics` arm follow once db removes the variant; told by tmux)",
+  "state": "refused",
+  "created": "2026-10-30T06:25:00Z",
+  "updated": "2026-10-30T08:40:16Z",
+  "taken_by": null,
+  "why": "owned by lane db (db-next8, live): already forwarded to it; db applies it in its own files.",
+  "source": "v2/requests/db.md#db (hir-ty-unsafeck; from diagnostics window 85, 2026-10-29 23:25): remove `UnsafetyReason::InitializingTypeWith`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12687"
+    },
+    {
+      "at": "2026-10-30T08:40:16Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "owned by lane db (db-next8, live): already forwarded to it; db applies it in its own files."
+    }
+  ]
+}

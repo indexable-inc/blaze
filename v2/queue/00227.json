@@ -1,0 +1,24 @@
+{
+  "id": "00227",
+  "from_lane": "format-lexer",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/parse.rs",
+    "crates/parser/src/grammar/expressions/atom.rs"
+  ],
+  "what": "## format-lexer: lower `LabeledLoopInBreak` and the lexer's new messages as rustc gives them (diagnostics, `crates/blaze-diagnostics/src/lower/parse.rs`)\n\nWhat, in `File::parser_error` and `File::lexer_error`:\n\n1. The parser error \"parentheses are required around this expression to avoid confusion with a\n   labeled break expression\" (`crates/parser/src/grammar/expressions/atom.rs` `break_expr`) is at\n   the end of the labeled value of an unlabeled `BREAK_EXPR`. rustc's `LabeledLoopInBreak`: span\n   the value expression (the `BREAK_EXPR`'s expression child, which ends at the error's offset),\n   the machine-applicable multipart suggestion \"wrap the expression in parentheses\" (`(` before,\n   `)` after), and recovered (`true`): rustc goes on parsing. Today it falls into the `_` arm,\n   which spans the next token and gives up. Needed by\n   `tests/lints/syntax/early/validation.rs::a_labeled_break_of_an_unlabeled_loop_is_linted_after_the_parse_errors`.\n2. The lexer now gives rustc's text: \"prefix `z` is unknown\" (from 2021 only; `'foo` for a\n   lifetime), \"`x` cannot be a raw identifier\", \"`x` cannot be a raw lifetime\" and \"character\n   literal may only contain one codepoint\" (after a raw lifetime from 2021). They reach the\n   pass-through arm already; what's missing is rustc's note \"prefixed identifiers and literals\n   are reserved since Rust 2021\", the label \"unknown prefix\" and `UnknownPrefixSugg` (`rb` → `br`,\n   `rc` → `cr`, the string-with-single-quotes and whitespace suggestions,\n   `report_unknown_prefix`), and the `'r#a'` error's span, which in rustc runs through the\n   following `'`.\n\nWhy: so blaze prints what rustc prints for these programs (the lexer and the grammar give the\ntokens and the tree; the diagnostic shape is the lowering's).\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:26:54Z",
+  "updated": "2026-10-30T02:26:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/format-lexer.md#format-lexer: lower `LabeledLoopInBreak` and the lexer's new messages as rustc gives them (diagnostics, `crates/blaze-diagnostics/src/lower/parse.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format-lexer.md:3"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00813",
+  "from_lane": "item-hash",
+  "owner": "proof",
+  "paths": [
+    "harness/v2/frontend/item_store.py"
+  ],
+  "what": "Lane item-hash will add harness/v2/frontend/item_store.py: the differential test of docs/v2/plan/design/item-hash.md section 9 (random edit sequences over harness/apps with BLAZE_ITEM_STORE=verify; every stored hit equals a fresh run, outputs equal rustc). Please accept item-hash owning that one new file, or refuse naming where it should go.",
+  "state": "open",
+  "created": "2026-10-30T08:20:46Z",
+  "updated": "2026-10-30T08:20:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:20:46Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

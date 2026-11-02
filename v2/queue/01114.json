@@ -1,0 +1,29 @@
+{
+  "id": "01114",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "flake.nix"
+  ],
+  "what": "flake.nix line 61, `scripts.packages`: add `pkgs.b3sum` -> `packages = [ pkgs.uv pkgs.python313 pkgs.nodejs pkgs.b3sum ];` (reaches devShells default, wasm and scripts). Why: Andrew 14:36, blaze hashes its own data with BLAKE3 only; library/DIGEST is now BLAKE3 (crates/blaze-cargo/src/toolchain/library.rs digest_of) and harness/library.py computes it with b3sum (Python hashlib has no BLAKE3), stopping with an error naming b3sum when it is missing. The release workflow installs b3sum itself (apt) for B3SUMS.",
+  "state": "applied",
+  "created": "2026-10-30T21:56:24Z",
+  "updated": "2026-10-30T22:21:51Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:56:24Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:51Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "applied: flake.nix line 61, pushed on blaze-v2"
+    }
+  ]
+}

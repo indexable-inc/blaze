@@ -1,0 +1,17 @@
+[package]
+name = "blaze-alloc-count"
+description = "A counting global allocator for allocation-budget tests: how many allocations and bytes a closure made on this thread"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

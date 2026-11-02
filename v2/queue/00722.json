@@ -1,0 +1,36 @@
+{
+  "id": "00722",
+  "from_lane": "cargo-inbox",
+  "owner": "coordinator",
+  "paths": [
+    "harness/library.py",
+    "v2/requests/usercode.md"
+  ],
+  "what": "## cargo-inbox: to the coordinator (harness/), `library.py` keeps library/UPSTREAM's notes (from cargo-inbox, 2026-10-29)\n\nWhat: `harness/library.py`'s `Upstream.text()` rewrites `library/UPSTREAM` whole on `import` and\non a bump (lines 235, 324, 343), so the `#` block \"blaze's changes to library/\" at its end is\nlost. Keep every line from that heading on when rewriting (read it in `Upstream.read`, append it\nin `text`). Why: blaze's changes to `library/` must be listed in UPSTREAM's notes; the first is\nstd's `__blaze_environ_walked` hook (v2/requests/usercode.md item 6).\n\n> forwarded to the coordinator (`harness/`) (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:36:27Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/cargo.md#cargo-inbox: to the coordinator (harness/), `library.py` keeps library/UPSTREAM's notes (from cargo-inbox, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2822"
+    },
+    {
+      "at": "2026-10-30T08:36:27Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:36:27Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "harness/library.py: write_upstream(upstream) writes Upstream.text() plus the file it replaces from the `# blaze's changes to library/` heading on (with its `#` separator); the three rewrites (import, merge on the same commit, merge) use it. Checked on the current library/UPSTREAM: rewrite is byte-identical and idempotent."
+    }
+  ]
+}

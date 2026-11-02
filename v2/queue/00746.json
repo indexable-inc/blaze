@@ -1,0 +1,25 @@
+{
+  "id": "00746",
+  "from_lane": "requests-backend-axis",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/plan.rs",
+    "crates/blaze-codegen",
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "## requests-backend-axis 1: codegen: the dev tier's backend in the policy (`crates/blaze-codegen/src/plan.rs`)\n\nWhat:\n\n1. `pub enum DevBackend { Cranelift, Stencil }` (serde, `Copy`, `Hash`), and\n   `Profile::codegen_backend: Option<DevBackend>` and `Override::codegen_backend:\n   Option<DevBackend>`, layered by `Policy::layers` as `opt_level` is (profile, then `\"*\"`,\n   then the package, then `build-override` for build-time code; `Origin::Std` keeps\n   `SHIPPED_STD`, which leaves it `None`).\n2. In `Policy::choose`, with `Some(dev)` for the origin:\n   - a function whose level is 0 or 1 is compiled with `dev` (`Backend::Cranelift` or\n     `Backend::Stencil`, from `fastcompile-stencil 1`), in `Mode::Output` and `Mode::Live`\n     alike;\n   - in `Mode::Live`, a function at LLVM's level starts at `dev` (`Choice::first`) and tiers to\n     its LLVM spec (`then`) as today;\n   - no function tiers from one dev backend to the other: a stencil function's tier-up to\n     Cranelift (`blaze_stencil::tier`) is off for every function the setting covers, so each\n     dev-tier function of the build runs `dev`'s code and nothing else's.\n   - `fold` stays as today: on only when the backend is `Backend::Cranelift`.\n   `None` keeps today's choice (and stencil tier 0 of live runs once fastcompile lands it).\n3. A test beside `plan.rs`'s: `Some(Stencil)` and `Some(Cranelift)` give that backend for a\n   member, a dependency and build-time code at level 0, leave std at LLVM `-O3`, give `first`\n   `dev` and `then` LLVM for a live function at level 3, and two policies that differ only\n   in it have different `Policy::id`s.\n\nOwner: codegen (`crates/blaze-codegen/`, docs/v2/plan/reference/crates.md).\n\n> forwarded to codegen (window `codegen-next1`, told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-backend-axis.md#requests-backend-axis 1: codegen: the dev tier's backend in the policy (`crates/blaze-codegen/src/plan.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-backend-axis.md:19"
+    }
+  ]
+}

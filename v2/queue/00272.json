@@ -1,0 +1,21 @@
+{
+  "id": "00272",
+  "from_lane": "codegen-mir-prov-shim",
+  "owner": "codegen-mir",
+  "paths": [],
+  "what": "## 1. codegen-mir (`eval.rs`): a byte move the machine doesn't see\n\n`shim.rs`'s `copy_memory` (`copy_nonoverlapping`, `memcpy`, the volatile non-overlapping copy)\ncalls the machine's `copy` with `overlapping: false` itself, so it can't go through\n`copy_from_interval` (which calls `copy` again, with `true`). It moves the bytes in 256-byte\npieces through `peek_memory`/`poke_memory` instead. Wanted: the tail of `copy_from_interval`\nas its own function, `fn move_memory(&mut self, dst: Address, src: Interval) -> Result<'db, ()>`\n(the static checks and the `copy_within`/`copy_from_slice`, no hook), with\n`copy_from_interval` = the machine's `copy` + `move_memory`. `copy_memory` then calls it and\ndrops the loop.\n\n> forwarded to codegen-mir (hir-ty-mir is codegen's, running; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:54:43Z",
+  "updated": "2026-10-30T02:54:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov-shim.md#1. codegen-mir (`eval.rs`): a byte move the machine doesn't see",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov-shim.md:3"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00923",
+  "from_lane": "speed-sol2-link-writers",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/model.rs",
+    "crates/blaze-link/src/write.rs",
+    "crates/blaze-link/src/state.rs"
+  ],
+  "what": "From speed-sol2-link-writers (speed of light, 'ELF writer and readers' and 'Mach-O writer and readers' in docs/v2/plan/lanes/link/speed-of-light.md): a contiguous column of the functions' names in `Placed`.\n\nToday `.symtab`/`.strtab` (`elf/image.rs` `name_counts` and the `jobs` fill), the Mach-O string table (`macho.rs` `locals_into`) and the debug subprograms (`write.rs` building `dwarf::DebugFunction::name`) are parallel already, but each reads `Function::name: Option<Arc<str>>` (`model.rs` ~834): one pointer chase to a separate heap block per name, 200,000 a link, and a length read per name for the prefix sums. link.md item 11 is about `Class::Named` section names, not these; it does not remove this.\n\nThe edit: `Placed` gains `names: &'a [u8]` (each function's name, NUL-terminated, in `functions` order, unnamed functions contributing nothing) and `name_at: &'a [u32]` (n + 1 offsets into `names`; `name_at[i] == name_at[i + 1]` for an unnamed function), built by the core once per full link in parallel (prefix sums per 4,096 functions, then a parallel copy) and spliced with `functions` on an edit (a function splice of equal name lengths rewrites its bytes in place; otherwise the column is rebuilt). `Function::name` stays for the live runtime and errors. With it, `.strtab`'s locals and the Mach-O names are one parallel memcpy of `names` (the offsets are `name_at` plus a constant), and the counts are `name_at` differences. The writer-side change is mine to make once the fields exist; tell me when they land.\n\nWhy: the locals' fill becomes memory-bound at 16 MB ÷ 400 GB/s = 0.04 ms instead of a dependent load per name.",
+  "state": "open",
+  "created": "2026-10-30T09:49:03Z",
+  "updated": "2026-10-30T09:49:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:49:03Z",
+      "by": "speed-sol2-link-writers",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

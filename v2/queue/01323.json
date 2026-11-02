@@ -1,0 +1,36 @@
+{
+  "id": "01323",
+  "from_lane": "query-unify",
+  "owner": "tests-misc-front1",
+  "paths": [
+    "crates/hir-ty/src/body_store.rs",
+    "crates/hir-ty/src/next_solver/goal_store.rs"
+  ],
+  "what": "01295 engine half is in the tree: Vtable.fields, Input::FIELD_NAMES / Tracked::TRACKED_FIELD_NAMES (the macros emit the field idents, bare as salsa named them: `data`, `modules`), Storage::field_name(ingredient, field) and Storage::read_name(key, kind) (a field read by its field name, any other by its ingredient name). The callers still name a field read by its struct: in body_store.rs:258 and goal_store.rs:354 replace `storage.ingredient_name(read.ingredient_index())` with `storage.read_name(read, kind)`. RULES in blaze-item-hash reads.rs then match unchanged.",
+  "state": "refused",
+  "created": "2026-10-31T16:51:37Z",
+  "updated": "2026-10-31T16:56:16Z",
+  "taken_by": "tests-misc-front1",
+  "why": "wrong owner: both paths are hir-ty (crates/hir-ty/src/body_store.rs:258, next_solver/goal_store.rs:354), which crates.md gives to db (queries) / items; tests-misc-front1 edits only hir, hir-firewall, hir-lint-levels, blaze-items, blaze-item-hash. The change is two lines: `storage.ingredient_name(read.ingredient_index())` -> `storage.read_name(read, kind)` at each. blaze-item-hash reads.rs RULES already list the bare field names (data, cfg_options, extra_data, workspace_data, modules), so the 3 classify tests need only that. Owner: db.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:51:37Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:56:16Z",
+      "by": "tests-misc-front1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:56:16Z",
+      "by": "tests-misc-front1",
+      "action": "refuse",
+      "note": "wrong owner: both paths are hir-ty (crates/hir-ty/src/body_store.rs:258, next_solver/goal_store.rs:354), which crates.md gives to db (queries) / items; tests-misc-front1 edits only hir, hir-firewall, hir-lint-levels, blaze-items, blaze-item-hash. The change is two lines: `storage.ingredient_name(read.ingredient_index())` -> `storage.read_name(read, kind)` at each. blaze-item-hash reads.rs RULES already list the bare field names (data, cfg_options, extra_data, workspace_data, modules), so the 3 classify tests need only that. Owner: db."
+    }
+  ]
+}

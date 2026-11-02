@@ -1,0 +1,23 @@
+{
+  "id": "00165",
+  "from_lane": "solver-sync-kinds",
+  "owner": "solver-sync",
+  "paths": [
+    "crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs"
+  ],
+  "what": "## 1. `crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs:441`: opaque types take `IsRigid`\n\n- old: `.eq(Ty::new_opaque(self.interner, a.def_id.0, a.args), b)?`\n- new: `.eq(Ty::new_opaque(self.interner, IsRigid::No, a.def_id.0, a.args), b)?`\n\nLowering and every place that builds an alias from source makes `IsRigid::No`; only the\nsolver, having failed to normalize an alias, makes `IsRigid::Yes`. The same holds for every\n`Ty::new_alias` / `Ty::new_projection(_from_args)` / `Const::new_alias` call: they now take\n`is_rigid` as their second argument.\n\n> forwarded to solver-sync: `next_solver/` is its wholly (db decision 10).\n> forwarded to solver-sync: `next_solver/` is its (granted at 20:00, db.md 10).",
+  "state": "open",
+  "created": "2026-10-30T02:09:05Z",
+  "updated": "2026-10-30T02:09:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#1. `crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs:441`: opaque types take `IsRigid`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:29"
+    }
+  ]
+}

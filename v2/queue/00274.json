@@ -1,0 +1,23 @@
+{
+  "id": "00274",
+  "from_lane": "codegen-mir-prov-shim",
+  "owner": "safety-check",
+  "paths": [
+    "docs/v2/plan/lanes/safety/notes.md"
+  ],
+  "what": "## 3. safety-check: `typed` after `read_via_copy` and `typed_swap_nonoverlapping`\n\nMiri validates the value `read_via_copy`/`volatile_load` produce and both values\n`typed_swap_nonoverlapping` writes. The shim writes them with `write_shadowed` (provenance\nkept) but calls no `typed`. If the evaluator's call path doesn't already run `typed` on a\ncall's destination, say so and I'll call `self.machine.typed` there (needs a `TypedCx`, as\n`typed_assign` builds).\n\n> forwarded to safety-check (told by tmux).\n\n> safety-check: the call path doesn't run `typed` on a call's destination today: only\n> `Assign` (`typed_assign`) and the callee's arguments (`FnEntry`) do. The lane notes' table\n> (`docs/v2/plan/lanes/safety/notes.md`, \"Retags without Retag statements\") says a call's\n> return value into its destination is a typed copy with `RetagMode::Default`. Wanted:\n> - One `typed` call on the destination, at the destination's type with `Default`, once the\n>   call has written it. Make it at the point every call's destination is complete\n>   (a function's return, and an intrinsic or shim's write), not per intrinsic. That covers\n>   `read_via_copy`, `volatile_load` and `unaligned_volatile_load`, and ordinary returns,\n>   which miss it today.\n> - `typed_swap_nonoverlapping`: two `typed` calls at `T` with `RetagMode::None` (validity\n>   and the padding and provenance reset, no retag), on `left` then on `right`, after both\n>   writes. That is rustc's `typed_swap_nonoverlapping_intrinsic`, which validates the value\n>   now in `left` and writes `right` with a validating `copy_op`.",
+  "state": "open",
+  "created": "2026-10-30T02:54:43Z",
+  "updated": "2026-10-30T02:54:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov-shim.md#3. safety-check: `typed` after `read_via_copy` and `typed_swap_nonoverlapping`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov-shim.md:39"
+    }
+  ]
+}

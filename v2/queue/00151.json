@@ -1,0 +1,38 @@
+{
+  "id": "00151",
+  "from_lane": "fix-names-features",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/target_feature.rs",
+    "crates/target-features",
+    "crates/cfg",
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "## 2. (design, for fix-names or the coordinator) Move the target feature table below `cfg`\n- What: move `TargetFeature`, `TargetFeatureSet`, `NAMES`, `BY_NAME`, `IMPLIED` and rustc's\n  per-arch tables out of `crates/hir-ty/src/target_feature.rs` into a crate below `cfg` (say\n  `crates/target-features`, depending only on `blaze-phf`), re-exported from `hir-ty`. That part\n  of the file uses nothing of `hir-ty`; only `TargetFeatures`, `Declared` and the two tracked\n  queries need the database.\n- Why: two remaining per-check sets of feature names live below `hir-ty` and cannot name the\n  enum today:\n  - `crates/cfg` (`CfgOptions { enabled: FxHashSet<CfgAtom> }`): every `cfg(target_feature =\n    \"…\")` is an `FxHashSet<CfgAtom>` probe; with the enum it can keep the crate's target\n    features as a `TargetFeatureSet` and answer those atoms by a bit test (and\n    `hir_ty::crate_target_features` becomes a field read).\n  - `crates/hir-def/src/attrs.rs` (`AttrFlags::target_features -> &FxHashSet<Symbol>`): could\n    return the bitset plus unknown names directly, and `hir_ty::target_feature`'s\n    `declared_target_features` query would go away.\n- Owners: `cfg` is not in `crates.md`'s lane table; `hir-def/src/attrs.rs` is db's.\n\n> forwarded to coordinator: a design choice across lanes (fix-names is told too).",
+  "state": "applied",
+  "created": "2026-10-30T01:51:54Z",
+  "updated": "2026-10-30T08:29:32Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/fix-names-features.md#2. (design, for fix-names or the coordinator) Move the target feature table below `cfg`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fix-names-features.md:10"
+    },
+    {
+      "at": "2026-10-30T08:29:32Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:32Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "New crate crates/target-features (deps blaze-ids, blaze-phf only; forbid(unsafe_code)) holds TargetFeature, TargetArch, TargetFeatureSet, NAMES, BY_NAME, IMPLIED and rustc per-arch tables, moved verbatim from crates/hir-ty/src/target_feature.rs, plus TargetFeature::all() and TargetArch::rustc_table() (for tests against rustc). hir-ty re-exports them (`pub use target_features::{..}`), keeping crate_target_arch, TargetFeatures, Declared and the queries; tests split between target-features/src/tests.rs (tables) and hir-ty target_feature/tests.rs (enables, call safety). Root Cargo.toml gains the workspace dep; hir-ty/Cargo.toml depends on it. Not done here (separate design steps): cfg keeping a TargetFeatureSet and hir-def AttrFlags::target_features returning bits."
+    }
+  ]
+}

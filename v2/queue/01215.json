@@ -1,0 +1,24 @@
+{
+  "id": "01215",
+  "from_lane": "query-unify-bench",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs",
+    "crates/blaze-query/src/db/row.rs"
+  ],
+  "what": "blaze_query::db panics after 2^28 writes: Storage::next_view asserts view < VIEW_MASK (row.rs:46, 28 bits), storage.rs:351 \"the query database ran out of views (268435455)\". round3b-bench.log: db/verify/deep_unrelated (one write + one fetch an iteration, ~30 ns) spent all 2^28 views inside tango 8 s budget. A daemon lives for days and every input set opens a view, so this is a real limit, not a bench artifact: renumber views when the counter nears the top (with &mut, no readers: map every row verified word and color to a compacted view, or reset to view 1 with every row marked verified-before-1 so it verifies by summary/walk) or widen the field, and add a test that crosses the limit. The bench now rebuilds its database every 2^24 writes (query_hit.rs REBUILD) so it can measure; drop that once this is fixed.",
+  "state": "open",
+  "created": "2026-10-31T01:48:34Z",
+  "updated": "2026-10-31T01:48:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:48:34Z",
+      "by": "query-unify-bench",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

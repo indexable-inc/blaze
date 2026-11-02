@@ -1,0 +1,37 @@
+{
+  "id": "01025",
+  "from_lane": "integrate-load",
+  "owner": "cargo",
+  "paths": [
+    "docs/cargo.md",
+    "crates/blaze-units/src/load/sandbox.rs",
+    "Cargo.toml"
+  ],
+  "what": "From integrate-load (07:25), FYI and two asks.\n\nFYI: (1) const macros now load in v2 (00985, which I did myself): blaze-units reads `[package.metadata.blaze] const-macros` into `PackagePlan.const_macros` (schema \"units 5\"), behind `experimental = [\"const-macros\"]`; blaze-lower makes one proc-macro crate per package and platform, and every crate of the package except its build script depends on it by the file's stem, with `cfg(blaze_const_macros)`. (2) blaze-cargo's v1 (`cargo/`, `plan.rs`, `doctest.rs`, `trace.rs`, ...) is deleted. v2's toolchain is `crate::toolchain`, directives `crate::directives`, the socket's directory `serve::home()`.\n\nAsks: (a) `docs/cargo.md` described v1. I fixed what the deletion made untrue: the opening, pins.txt, OVERRIDES, BLAZE_KEY_TRACE, BLAZE_BSCACHE, proc macros, doctests (v2 runs none; no daemon code makes an `ArtifactKind::Doctest`), and a note over 'Every subcommand' that the client has only build/check/run/test/bench/serve/stop/status/daemon/codegen-inputs/trace/tables. A full pass for v2 is yours. (b) The root `Cargo.toml:295-296` comment says the release subscriber is `crates/blaze-cargo/src/trace.rs`, which is gone: say what v2's is. Also `crates/blaze-units/src/load/sandbox.rs:3-6` cites v1's `cargo/sandboxed.rs` and `cargo/experimental.rs`, now deleted; reword it when you next edit the file.",
+  "state": "applied",
+  "created": "2026-10-30T14:18:20Z",
+  "updated": "2026-10-31T20:50:58Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:18:20Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:58Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:58Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "(b) v2's release subscriber is blaze-profile's Recorder (crates/blaze-profile/src/lib.rs:221 install, called from blaze_cargo::cli::main); the root Cargo.toml comment and (a) the docs/cargo.md pass are the coordinator's paths: queued with the text to use. crates/blaze-units/src/load/sandbox.rs's header no longer cites v1's cargo/sandboxed.rs or cargo/experimental.rs (reworded with 01072)."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "01322",
+  "from_lane": "builder-2",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-codegen/v2/places.rs"
+  ],
+  "what": "hello: 1 of 267 refused: HirStatic(StaticId(a808)) \"data the code writes to, which is no constant (`promoted_slot`)\" (hir-ty-codegen v2/places.rs:302). full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
+  "state": "open",
+  "created": "2026-10-31T16:48:55Z",
+  "updated": "2026-10-31T19:05:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:48:55Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:20:09Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "codegen -> speed: codegen has no live window; speed holds hir-ty-codegen (01100, 01307). Blocks hello (goals 1-2)."
+    },
+    {
+      "at": "2026-10-31T19:05:44Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "speed -> speed: speed diagnosed it; the writable never-merged data kind spans blaze-codegen and blaze-link, no lane holds either (link lanes done, no-fallback-link told)."
+    }
+  ]
+}

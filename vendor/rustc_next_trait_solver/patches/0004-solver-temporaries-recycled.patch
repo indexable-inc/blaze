@@ -1,0 +1,1095 @@
+diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+--- a/src/canonical/canonicalizer.rs
++++ b/src/canonical/canonicalizer.rs
+@@ -1,5 +1,4 @@
+ use std::collections::hash_map::Entry;
+-use std::mem;
+ 
+ use rustc_type_ir::inherent::*;
+ use rustc_type_ir::solve::{Goal, QueryInput};
+@@ -8,7 +7,6 @@
+     Const, Flags, InferCtxtLike, Interner, PlaceholderConst, PlaceholderType, PredicateProxy,
+     Region, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+ };
+-use thin_vec::ThinVec;
+ 
+ use crate::delegate::SolverDelegate;
+ 
+@@ -95,7 +93,7 @@
+         };
+         debug_assert!(!value.has_infer(), "unexpected infer in {value:?}");
+         debug_assert!(!value.has_placeholders(), "unexpected placeholders in {value:?}");
+-        let (max_universe, _variables, var_kinds) = canonicalizer.finalize();
++        let (max_universe, var_kinds) = canonicalizer.finalize();
+ 
+         Canonical { max_universe, var_kinds, value }
+     }
+@@ -201,10 +199,14 @@
+     ///
+     /// We want to keep the option of canonicalizing `'static` to an existential
+     /// variable in the future by changing the way we detect global where-bounds.
++    ///
++    /// The original values are appended to `orig_values`, so the canonicalizer state keeps
++    /// its own buffer for the next canonicalization.
+     pub(super) fn canonicalize_input<P: TypeFoldable<I>>(
+         delegate: &'a D,
+         input: QueryInput<I, P>,
+-    ) -> (ThinVec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
++        mut orig_values: Vec<I::GenericArg>,
++    ) -> (Vec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
+         // First canonicalize the `param_env` while keeping `'static`. This produces a
+         // canonicalizer that can canonicalize the rest of the input without keeping `'static`.
+         let (param_env, mut rest_canonicalizer) =
+@@ -226,8 +228,9 @@
+ 
+         debug_assert!(!value.has_infer(), "unexpected infer in {value:?}");
+         debug_assert!(!value.has_placeholders(), "unexpected placeholders in {value:?}");
+-        let (max_universe, variables, var_kinds) = rest_canonicalizer.finalize();
+-        (variables, Canonical { max_universe, var_kinds, value })
++        orig_values.extend_from_slice(&rest_canonicalizer.state.variables);
++        let (max_universe, var_kinds) = rest_canonicalizer.finalize();
++        (orig_values, Canonical { max_universe, var_kinds, value })
+     }
+ 
+     fn get_or_insert_bound_var(
+@@ -274,7 +277,8 @@
+         ty::BoundVar::from(idx)
+     }
+ 
+-    fn finalize(mut self) -> (ty::UniverseIndex, ThinVec<I::GenericArg>, I::CanonicalVarKinds) {
++    /// Ends the canonicalization: its state, `variables` included, goes back to the delegate.
++    fn finalize(mut self) -> (ty::UniverseIndex, I::CanonicalVarKinds) {
+         // See the rustc-dev-guide section about how we deal with universes
+         // during canonicalization in the new solver.
+         let max_universe = match self.canonicalize_mode {
+@@ -310,14 +314,13 @@
+                     .unwrap_or(ty::UniverseIndex::ROOT)
+             }
+         };
+-        let variables = mem::take(&mut self.state.variables);
+         let var_kinds = self.delegate.cx().mk_canonical_var_kinds(&self.state.var_kinds);
+ 
+         // We have finished with this canonicalizer and can return its state to the delegate for
+         // later reuse.
+         self.delegate.release_canonicalizer_state(self.state);
+ 
+-        (max_universe, variables, var_kinds)
++        (max_universe, var_kinds)
+     }
+ 
+     fn inner_fold_ty(&mut self, t: I::Ty) -> I::Ty {
+diff -ruN a/src/canonical/mod.rs b/src/canonical/mod.rs
+--- a/src/canonical/mod.rs
++++ b/src/canonical/mod.rs
+@@ -12,7 +12,7 @@
+ use std::iter;
+ 
+ use canonicalizer::Canonicalizer;
+-use rustc_index::IndexVec;
++use rustc_index::IndexSlice;
+ use rustc_type_ir::inherent::*;
+ use rustc_type_ir::relate::{
+     self, Relate, RelateResult, TypeRelation, VarianceDiagInfo, relate_args_invariantly,
+@@ -49,7 +49,7 @@
+ }
+ 
+ /// Canonicalizes the goal remembering the original values
+-/// for each bound variable.
++/// for each bound variable, appended to `orig_values` (empty, room to reuse).
+ ///
+ /// This expects `goal` and `opaque_types` to be eager resolved.
+ pub(super) fn canonicalize_goal<D, I>(
+@@ -57,7 +57,8 @@
+     goal: Goal<I, I::Predicate>,
+     opaque_types: &[(ty::OpaqueTypeKey<I>, I::Ty)],
+     typing_mode: TypingMode<I>,
+-) -> (ThinVec<I::GenericArg>, I::CanonicalInput)
++    orig_values: Vec<I::GenericArg>,
++) -> (Vec<I::GenericArg>, I::CanonicalInput)
+ where
+     D: SolverDelegate<Interner = I>,
+     I: Interner,
+@@ -68,6 +69,7 @@
+             goal,
+             predefined_opaques_in_body: delegate.cx().mk_predefined_opaques_in_body(opaque_types),
+         },
++        orig_values,
+     );
+ 
+     let query_input = delegate.cx().mk_canonical_input(ty::CanonicalQueryInput {
+@@ -98,18 +100,26 @@
+ /// - we unify the `var_values` of the response with the `original_values`
+ /// - we apply the `external_constraints` returned by the query, returning
+ ///   the `normalization_nested_goals`
++///
++/// `opt_values` is room the instantiation reuses; it is left in an unspecified state.
+ pub(super) fn instantiate_and_apply_query_response<D, I>(
+     delegate: &D,
+     original_values: &[I::GenericArg],
+     response: CanonicalResponse<I>,
+     span: I::Span,
++    opt_values: &mut Vec<Option<I::GenericArg>>,
+ ) -> (NestedNormalizationGoals<I>, Certainty)
+ where
+     D: SolverDelegate<Interner = I>,
+     I: Interner,
+ {
+-    let instantiation =
+-        compute_query_response_instantiation_values(delegate, &original_values, &response, span);
++    let instantiation = compute_query_response_instantiation_values(
++        delegate,
++        &original_values,
++        &response,
++        span,
++        opt_values,
++    );
+ 
+     let Response { var_values, external_constraints, certainty } =
+         delegate.instantiate_canonical(response, instantiation);
+@@ -150,6 +160,7 @@
+     original_values: &[I::GenericArg],
+     response: &Canonical<I, T>,
+     span: I::Span,
++    opt_values: &mut Vec<Option<I::GenericArg>>,
+ ) -> CanonicalVarValues<I>
+ where
+     D: SolverDelegate<Interner = I>,
+@@ -184,6 +195,7 @@
+         response,
+         span,
+         prev_universe,
++        opt_values,
+     )
+ }
+ 
+@@ -193,6 +205,7 @@
+     response: &Canonical<I, T>,
+     span: I::Span,
+     prev_universe: ty::UniverseIndex,
++    opt_values: &mut Vec<Option<I::GenericArg>>,
+ ) -> CanonicalVarValues<I>
+ where
+     D: SolverDelegate<Interner = I>,
+@@ -209,7 +222,9 @@
+     //
+     // We therefore instantiate the existential variable in the canonical response with the
+     // inference variable of the input right away, which is more performant.
+-    let mut opt_values = IndexVec::from_elem_n(None, response.var_kinds.len());
++    opt_values.clear();
++    opt_values.resize(response.var_kinds.len(), None);
++    let opt_values = IndexSlice::<ty::BoundVar, _>::from_raw_mut(opt_values);
+     for (original_value, result_value) in iter::zip(original_values, var_values.iter()) {
+         match result_value.kind() {
+             ty::GenericArgKind::Type(t) => {
+@@ -606,6 +621,7 @@
+         &state,
+         span,
+         prev_universe,
++        &mut Vec::new(),
+     );
+ 
+     let inspect::State { var_values, data } = delegate.instantiate_canonical(state, instantiation);
+diff -ruN a/src/delegate.rs b/src/delegate.rs
+--- a/src/delegate.rs
++++ b/src/delegate.rs
+@@ -10,6 +10,8 @@
+     self as ty, CanonicalizerState, Const, InferCtxtLike, Interner, Region, TypeFoldable,
+ };
+ 
++use crate::solve::SearchStorage;
++
+ /// `SolverDelegate` is one of the two traits in the `rustc_type_ir` shared abstraction layer
+ /// between rustc and rust-analyzer abstracting over the [InferCtxt][inferctxt-doc], which had to be
+ /// split due to coherence reasons:
+@@ -79,6 +81,15 @@
+         &self,
+     ) -> Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>;
+ 
++    /// [`Self::make_deduplicated_region_constraints`], appended to `into`: an implementation
++    /// that writes them there directly allocates nothing once `into` has room.
++    fn make_deduplicated_region_constraints_into(
++        &self,
++        into: &mut Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>,
++    ) {
++        into.extend(self.make_deduplicated_region_constraints());
++    }
++
+     fn instantiate_canonical<V>(
+         &self,
+         canonical: ty::Canonical<Self::Interner, V>,
+@@ -127,6 +138,15 @@
+     /// Release canonicalizer state, either by deallocating it (the default) or by clearing it and
+     /// stashing it for later reuse.
+     fn release_canonicalizer_state(&self, _: CanonicalizerState<Self::Interner>) {}
++
++    /// The search graph's storage for a root goal. The delegate may keep it between root goals
++    /// (on its worker); the default makes a fresh one.
++    fn obtain_search_storage(&self) -> SearchStorage<Self::Interner> {
++        Default::default()
++    }
++
++    /// Takes back what [`Self::obtain_search_storage`] gave, emptied.
++    fn release_search_storage(&self, _storage: SearchStorage<Self::Interner>) {}
+ 
+     fn emit_next_solver_overflow_fcw(
+         &self,
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,6 +14,10 @@
+ // `unsafe impl GenericTypeVisitable`, which a `forbid` would refuse.
+ #![deny(unsafe_code)]
+ 
++#[cfg(test)]
++#[global_allocator]
++static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
++
+ pub mod canonical;
+ pub mod coherence;
+ pub mod delegate;
+diff -ruN a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
+--- a/src/solve/assembly/mod.rs
++++ b/src/solve/assembly/mod.rs
+@@ -480,7 +480,8 @@
+         goal: Goal<I, G>,
+         assemble_from: AssembleCandidatesFrom,
+     ) -> Result<(Vec<Candidate<I>>, FailedCandidateInfo), RerunNonErased> {
+-        let mut candidates = vec![];
++        // The callers give the list back to the scratch once they have merged it.
++        let mut candidates = self.search_graph.scratch().take_candidates();
+         let mut failed_candidate_info =
+             FailedCandidateInfo { param_env_head_usages: CandidateHeadUsages::default() };
+         let Ok(normalized_self_ty) =
+@@ -1321,29 +1322,37 @@
+                     .assemble_and_evaluate_candidates(goal, AssembleCandidatesFrom::EnvAndBounds)?;
+                 debug!(?candidates);
+ 
+-                // If the trait goal has been proven by using the environment, we want to treat
+-                // aliases as rigid if there are no applicable projection bounds in the environment.
+-                if candidates.is_empty() {
+-                    return inject_normalize_to_rigid_candidate(self);
+-                }
++                let result = 'merge: {
++                    // If the trait goal has been proven by using the environment, we want to
++                    // treat aliases as rigid if there are no applicable projection bounds in the
++                    // environment.
++                    if candidates.is_empty() {
++                        break 'merge inject_normalize_to_rigid_candidate(self);
++                    }
+ 
+-                // If we're normalizing an GAT, we bail if using a where-bound would constrain
+-                // its generic arguments.
+-                if let Some(result) = inject_forced_ambiguity_candidate(self) {
+-                    return result;
+-                }
++                    // If we're normalizing an GAT, we bail if using a where-bound would
++                    // constrain its generic arguments.
++                    if let Some(result) = inject_forced_ambiguity_candidate(self) {
++                        break 'merge result;
++                    }
+ 
+-                // We still need to prefer where-bounds over alias-bounds however.
+-                // See `tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs`.
+-                if candidates.iter().any(|c| matches!(c.source, CandidateSource::ParamEnv(_))) {
+-                    candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_)));
+-                }
++                    // We still need to prefer where-bounds over alias-bounds however.
++                    // See `tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs`.
++                    if candidates
++                        .iter()
++                        .any(|c| matches!(c.source, CandidateSource::ParamEnv(_)))
++                    {
++                        candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_)));
++                    }
+ 
+-                if let Some((response, _)) = self.try_merge_candidates(&candidates) {
+-                    Ok(response)
+-                } else {
+-                    self.flounder(&candidates).map_err(Into::into)
+-                }
++                    if let Some((response, _)) = self.try_merge_candidates(&candidates) {
++                        Ok(response)
++                    } else {
++                        self.flounder(&candidates).map_err(Into::into)
++                    }
++                };
++                self.search_graph.scratch().give_candidates(candidates);
++                result
+             }
+             TraitGoalProvenVia::Misc => {
+                 let (mut candidates, _) =
+@@ -1361,11 +1370,13 @@
+                 // means we can just ignore inference constraints and don't have to special-case
+                 // constraining the normalized-to `term`.
+                 self.filter_specialized_impls(AllowInferenceConstraints::Yes, &mut candidates);
+-                if let Some((response, _)) = self.try_merge_candidates(&candidates) {
++                let result = if let Some((response, _)) = self.try_merge_candidates(&candidates) {
+                     Ok(response)
+                 } else {
+                     self.flounder(&candidates).map_err(Into::into)
+-                }
++                };
++                self.search_graph.scratch().give_candidates(candidates);
++                result
+             }
+         }
+     }
+@@ -1394,12 +1405,16 @@
+             return Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), Certainty::Yes));
+         }
+ 
+-        match assumption.visit_with(&mut FindParamInClause {
++        let mut visitor = FindParamInClause {
++            universes: self.search_graph.scratch().take_universes(),
+             ecx: self,
+             param_env,
+-            universes: vec![],
+             recursion_depth: 0,
+-        }) {
++        };
++        let found = assumption.visit_with(&mut visitor);
++        let FindParamInClause { ecx, universes, .. } = visitor;
++        ecx.search_graph.scratch().give_universes(universes);
++        match found {
+             ControlFlow::Break(Err(NoSolution)) => Err(NoSolution),
+             ControlFlow::Break(Ok(certainty)) => {
+                 Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), certainty))
+diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+--- a/src/solve/eval_ctxt/mod.rs
++++ b/src/solve/eval_ctxt/mod.rs
+@@ -467,12 +467,13 @@
+         origin_span: I::Span,
+         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> R,
+     ) -> R {
+-        let mut search_graph = SearchGraph::new(root_depth);
++        let mut search_graph = SearchGraph::new_in(root_depth, delegate.obtain_search_storage());
++        let nested_goals = search_graph.scratch().take_nested_goals();
+ 
+         let mut ecx = EvalCtxt {
+             delegate,
+             search_graph: &mut search_graph,
+-            nested_goals: Default::default(),
++            nested_goals,
+             inspect: inspect::EvaluationStepBuilder::new_noop(),
+ 
+             // Only relevant when canonicalizing the response,
+@@ -492,7 +493,9 @@
+             "root `EvalCtxt` should not have any goals added to it"
+         );
+         assert!(!ecx.opaque_accesses.might_rerun());
++        ecx.search_graph.scratch().give_nested_goals(mem::take(&mut ecx.nested_goals));
+         assert!(search_graph.is_empty());
++        delegate.release_search_storage(search_graph.into_storage());
+         result
+     }
+ 
+@@ -538,6 +541,7 @@
+             assert!(delegate.clone_opaque_types_lookup_table().is_empty());
+         }
+ 
++        let nested_goals = search_graph.scratch().take_nested_goals();
+         let mut ecx = EvalCtxt {
+             delegate,
+             var_kinds: canonical_input.canonical.var_kinds,
+@@ -546,7 +550,7 @@
+             max_input_universe: canonical_input.canonical.max_universe,
+             initial_opaque_types_storage_num_entries,
+             search_graph,
+-            nested_goals: Default::default(),
++            nested_goals,
+             origin_span: I::Span::dummy(),
+             tainted: Ok(()),
+             inspect: proof_tree_builder.new_evaluation_step(var_values),
+@@ -556,6 +560,7 @@
+         let result = f(&mut ecx, input.goal);
+         ecx.inspect.probe_final_state(ecx.delegate, ecx.max_input_universe);
+         proof_tree_builder.finish_evaluation_step(ecx.inspect);
++        ecx.search_graph.scratch().give_nested_goals(mem::take(&mut ecx.nested_goals));
+ 
+         if canonical_input.typing_mode.0.is_erased_not_coherence() {
+             debug_assert!(delegate.clone_opaque_types_lookup_table().is_empty());
+@@ -815,6 +820,7 @@
+                     goal,
+                     &[],
+                     TypingMode::ErasedNotCoherence(MayBeErased),
++                    self.search_graph.scratch().take_args(),
+                 );
+ 
+                 let (canonical_result, accessed_opaques) =
+@@ -826,7 +832,10 @@
+                     &opaque_types,
+                 );
+                 match should_rerun {
+-                    RerunDecision::Yes => debug!("rerunning in original typing mode"),
++                    RerunDecision::Yes => {
++                        debug!("rerunning in original typing mode");
++                        self.search_graph.scratch().give_args(orig_values);
++                    }
+                     RerunDecision::No => {
+                         break 'retry_canonicalize (
+                             canonical_result,
+@@ -836,7 +845,10 @@
+                         );
+                     }
+                     RerunDecision::EagerlyPropagateToParent => {
+-                        self.opaque_accesses.update(accessed_opaques)?;
++                        if let Err(e) = self.opaque_accesses.update(accessed_opaques) {
++                            self.search_graph.scratch().give_args(orig_values);
++                            return Err(e.into());
++                        }
+                         break 'retry_canonicalize (
+                             canonical_result,
+                             orig_values,
+@@ -849,8 +861,13 @@
+                 }
+             }
+ 
+-            let (orig_values, canonical_goal) =
+-                canonicalize_goal(self.delegate, goal, &opaque_types, typing_mode);
++            let (orig_values, canonical_goal) = canonicalize_goal(
++                self.delegate,
++                goal,
++                &opaque_types,
++                typing_mode,
++                self.search_graph.scratch().take_args(),
++            );
+ 
+             let (canonical_result, accessed_opaques) =
+                 self.evaluate_in_search_graph(canonical_goal, step_kind);
+@@ -870,6 +887,7 @@
+             }
+             Err(NoSolution) => {
+                 debug!("normal failure");
++                self.search_graph.scratch().give_args(orig_values);
+                 return Err(NoSolution.into());
+             }
+         };
+@@ -879,12 +897,15 @@
+         let has_changed =
+             if !has_only_region_constraints(response) { HasChanged::Yes } else { HasChanged::No };
+ 
++        let mut opt_values = self.search_graph.scratch().take_opt_args();
+         let (normalization_nested_goals, certainty) = instantiate_and_apply_query_response(
+             self.delegate,
+             &orig_values,
+             response,
+             self.origin_span,
++            &mut opt_values,
+         );
++        self.search_graph.scratch().give_opt_args(opt_values);
+ 
+         // FIXME: We previously had an assert here that checked that recomputing
+         // a goal after applying its constraints did not change its response.
+@@ -907,11 +928,12 @@
+                 HasChanged::No => Some(self.build_stalled_on(
+                     canonical_goal,
+                     maybe_info,
+-                    orig_values,
++                    &orig_values,
+                     succeeded_in_erased,
+                 )),
+             },
+         };
++        self.search_graph.scratch().give_args(orig_values);
+ 
+         Ok((
+             normalization_nested_goals,
+@@ -923,13 +945,14 @@
+         &self,
+         canonical_goal: I::CanonicalInput,
+         maybe_info: MaybeInfo,
+-        stalled_vars: ThinVec<I::GenericArg>,
++        stalled_vars: &[I::GenericArg],
+         previously_succeeded_in_erased: SucceededInErased<I>,
+     ) -> GoalStalledOn<I> {
+         // Remove the canonicalized universal vars, since we only care about stalled existentials.
+         let mut sub_roots = ThinVec::new();
+         let stalled_vars = stalled_vars
+-            .into_iter()
++            .iter()
++            .copied()
+             .filter_map(|arg| match arg.kind() {
+                 // Lifetimes can never stall goals.
+                 ty::GenericArgKind::Lifetime(_) => None,
+@@ -1052,12 +1075,22 @@
+     fn evaluate_added_goals_step(
+         &mut self,
+     ) -> Result<Option<Certainty>, NoSolutionOrRerunNonErased> {
++        // The goals of this step are taken out and an emptied list from the scratch takes
++        // their place, so goals still pending push into warm room and neither list is freed.
++        let spare = self.search_graph.scratch().take_nested_goals();
++        let mut goals = mem::replace(&mut self.nested_goals, spare);
++        let result = self.evaluate_goals_of_step(&mut goals);
++        self.search_graph.scratch().give_nested_goals(goals);
++        result
++    }
++
++    fn evaluate_goals_of_step(
++        &mut self,
++        goals: &mut Vec<(GoalSource, Goal<I, I::Predicate>, Option<GoalStalledOn<I>>)>,
++    ) -> Result<Option<Certainty>, NoSolutionOrRerunNonErased> {
+         // If this loop did not result in any progress, what's our final certainty.
+         let mut unchanged_certainty = Some(Certainty::Yes);
+-        // This mem::take seems super inefficient, given that we push to it again later.
+-        // Despite that, replacing it has no effect on performance. We tried.
+-        // (https://github.com/rust-lang/rust/pull/158126)
+-        for (source, goal, stalled_on) in mem::take(&mut self.nested_goals) {
++        for (source, goal, stalled_on) in goals.drain(..) {
+             // We never handle `NormalizesTo` as a nested goal
+             debug_assert!(!matches!(
+                 goal.predicate.kind().skip_binder(),
+@@ -1656,18 +1689,17 @@
+                 // uplifting its nested goals. This is the case if the `shallow_certainty` is
+                 // `Certainty::Yes`.
+                 (CurrentGoalKind::ProjectionComputeAssocTermCandidate, Certainty::Yes) => {
+-                    let goals = std::mem::take(&mut self.nested_goals);
++                    let mut goals = std::mem::take(&mut self.nested_goals);
+                     // As we return all ambiguous nested goals, we can ignore the certainty
+                     // returned by `self.try_evaluate_added_goals()`.
+                     if goals.is_empty() {
+                         assert!(matches!(goals_certainty, Certainty::Yes));
+                     }
+-                    (
+-                        Certainty::Yes,
+-                        NestedNormalizationGoals(
+-                            goals.into_iter().map(|(s, g, _)| (s, g)).collect(),
+-                        ),
+-                    )
++                    let scratch = self.search_graph.scratch();
++                    let mut normalization_goals = scratch.take_normalization_goals();
++                    normalization_goals.extend(goals.drain(..).map(|(s, g, _)| (s, g)));
++                    scratch.give_nested_goals(goals);
++                    (Certainty::Yes, NestedNormalizationGoals(normalization_goals))
+                 }
+                 _ => {
+                     let certainty = shallow_certainty.and(goals_certainty);
+@@ -1694,6 +1726,7 @@
+             //
+             // Changing this to retain some constraints in the future
+             // won't be a breaking change, so this is good enough for now.
++            self.search_graph.scratch().give_normalization_goals(normalization_nested_goals.0);
+             return Ok(self.make_ambiguous_response_no_constraints(maybe_info));
+         }
+ 
+@@ -1704,21 +1737,37 @@
+             .deeply_resolve_via_unification_table((self.var_values, external_constraints));
+ 
+         // Remove any trivial or duplicated region constraints once we've resolved regions
+-        let mut unique = HashSet::default();
++        let mut unique = self.search_graph.scratch().take_seen_outlives();
+         if let ExternalRegionConstraints::Old(r) = &mut external_constraints.region_constraints {
+             r.retain(|(outlives, _)| !outlives.is_trivial() && unique.insert(*outlives));
+         }
++        self.search_graph.scratch().give_seen_outlives(unique);
+ 
+-        filter_irrelevant_region_constraints(self.delegate, var_values, &mut external_constraints);
++        let mut region_vars = self.search_graph.scratch().take_region_vars();
++        filter_irrelevant_region_constraints(
++            self.delegate,
++            var_values,
++            &mut external_constraints,
++            &mut region_vars,
++        );
++        self.search_graph.scratch().give_region_vars(region_vars);
+ 
++        // Interned from the borrow, so a response the interner has already costs no copy, and
++        // the lists go back to the scratch.
++        let interned = self.cx().mk_external_constraints_ref(&external_constraints);
++        let ExternalConstraintsData { region_constraints, opaque_types, normalization_nested_goals } =
++            external_constraints;
++        let scratch = self.search_graph.scratch();
++        if let ExternalRegionConstraints::Old(region_constraints) = region_constraints {
++            scratch.give_region_constraints(region_constraints);
++        }
++        scratch.give_opaque_types(opaque_types);
++        scratch.give_normalization_goals(normalization_nested_goals.0);
++
+         let canonical = canonicalize_response(
+             self.delegate,
+             self.max_input_universe,
+-            Response {
+-                var_values,
+-                certainty,
+-                external_constraints: self.cx().mk_external_constraints(external_constraints),
+-            },
++            Response { var_values, certainty, external_constraints: interned },
+         );
+ 
+         Ok(canonical)
+@@ -1749,7 +1798,7 @@
+     /// values.
+     #[instrument(level = "trace", skip(self), ret)]
+     fn compute_external_query_constraints(
+-        &self,
++        &mut self,
+         certainty: Certainty,
+         normalization_nested_goals: NestedNormalizationGoals<I>,
+     ) -> ExternalConstraintsData<I> {
+@@ -1770,7 +1819,9 @@
+             })
+         } else {
+             ExternalRegionConstraints::Old(if let Certainty::Yes = certainty {
+-                self.delegate.make_deduplicated_region_constraints()
++                let mut region_constraints = self.search_graph.scratch().take_region_constraints();
++                self.delegate.make_deduplicated_region_constraints_into(&mut region_constraints);
++                region_constraints
+             } else {
+                 vec![]
+             })
+@@ -1780,9 +1831,11 @@
+         //
+         // Constraints for any existing opaque types are already tracked by changes
+         // to the `var_values`.
+-        let opaque_types = self
+-            .delegate
+-            .clone_opaque_types_added_since(self.initial_opaque_types_storage_num_entries);
++        let mut opaque_types = self.search_graph.scratch().take_opaque_types();
++        self.delegate.clone_opaque_types_added_since_into(
++            self.initial_opaque_types_storage_num_entries,
++            &mut opaque_types,
++        );
+ 
+         if self.typing_mode().is_erased_not_coherence() {
+             assert!(opaque_types.is_empty());
+@@ -1830,15 +1883,15 @@
+     delegate: &D,
+     var_values: I::GenericArgs,
+     external_constraints: &mut ExternalConstraintsData<I>,
++    vars: &mut HashSet<RegionVid>,
+ ) where
+     D: SolverDelegate<Interner = I>,
+     I: Interner,
+ {
+-    #[derive(Default)]
+-    struct NonTrivialVars {
+-        vars: HashSet<RegionVid>,
++    struct NonTrivialVars<'a> {
++        vars: &'a mut HashSet<RegionVid>,
+     }
+-    impl<I> TypeVisitor<I> for NonTrivialVars
++    impl<I> TypeVisitor<I> for NonTrivialVars<'_>
+     where
+         I: Interner,
+     {
+@@ -1875,7 +1928,7 @@
+     if let ExternalRegionConstraints::Old(r) = region_constraints
+         && !r.is_empty()
+     {
+-        let mut vis = NonTrivialVars::default();
++        let mut vis = NonTrivialVars { vars };
+         var_values.visit_with(&mut vis);
+         // We have to visit each component of `external_constraints` individually here
+         // because we skip the RHS of outlives constraints, and `TypeVisitor` doesn't
+@@ -2040,14 +2093,14 @@
+     let typing_mode = delegate.typing_mode_raw().assert_not_erased();
+ 
+     let (orig_values, canonical_goal) =
+-        canonicalize_goal(delegate, goal, &opaque_types, typing_mode.into());
++        canonicalize_goal(delegate, goal, &opaque_types, typing_mode.into(), Vec::new());
+ 
+     let (canonical_result, final_revision, required_depth) =
+         delegate.cx().evaluate_root_goal_for_proof_tree_raw(canonical_goal, root_depth);
+ 
+     let proof_tree = inspect::GoalEvaluation {
+         uncanonicalized_goal: goal,
+-        orig_values,
++        orig_values: orig_values.into(),
+         final_revision,
+         result: canonical_result,
+         required_depth,
+@@ -2063,6 +2116,7 @@
+         &proof_tree.orig_values,
+         response,
+         origin_span,
++        &mut Vec::new(),
+     );
+ 
+     (Ok(normalization_nested_goals), proof_tree)
+diff -ruN a/src/solve/eval_ctxt/probe.rs b/src/solve/eval_ctxt/probe.rs
+--- a/src/solve/eval_ctxt/probe.rs
++++ b/src/solve/eval_ctxt/probe.rs
+@@ -1,4 +1,5 @@
+ use std::marker::PhantomData;
++use std::mem;
+ 
+ use rustc_type_ir::search_graph::CandidateHeadUsages;
+ use rustc_type_ir::solve::{
+@@ -53,7 +54,9 @@
+         self,
+         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
+     ) -> Result<T, NoSolutionOrRerunNonErased> {
+-        let nested_goals = self.ecx.nested_goals.clone();
++        let mut nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
++        // clone: a probe starts from its parent's goals; `GoalStalledOn` clones its lists.
++        nested_goals.extend(self.ecx.nested_goals.iter().cloned());
+         self.enter_inner(f, nested_goals)
+     }
+ 
+@@ -61,7 +64,8 @@
+         self,
+         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
+     ) -> Result<T, NoSolutionOrRerunNonErased> {
+-        self.enter_inner(f, Default::default())
++        let nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
++        self.enter_inner(f, nested_goals)
+     }
+ 
+     pub(in crate::solve) fn enter_inner(
+@@ -95,6 +99,7 @@
+             nested.inspect.probe_final_state(delegate, max_input_universe);
+             r
+         });
++        nested.search_graph.scratch().give_nested_goals(mem::take(&mut nested.nested_goals));
+ 
+         outer.opaque_accesses.update(nested.opaque_accesses)?;
+ 
+diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+--- a/src/solve/mod.rs
++++ b/src/solve/mod.rs
+@@ -17,6 +17,7 @@
+ pub mod inspect;
+ mod normalizes_to;
+ mod project_goals;
++mod scratch;
+ mod search_graph;
+ mod trait_goals;
+ 
+@@ -33,6 +34,7 @@
+     EvalCtxt, GenerateProofTree, SolverDelegateEvalExt,
+     evaluate_root_goal_for_proof_tree_raw_provider, fast_path,
+ };
++pub use self::scratch::{SearchStorage, SolverScratch};
+ use crate::delegate::SolverDelegate;
+ use crate::solve::assembly::Candidate;
+ 
+diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
+--- /dev/null
++++ b/src/solve/scratch.rs
+@@ -0,0 +1,165 @@
++//! Buffers the solver uses inside one goal, kept in the search graph between goals and by the
++//! delegate between root goals ([`SolverDelegate::obtain_search_storage`]): each is taken
++//! empty and given back emptied, so a warm worker allocates none of them.
++//!
++//! [`SolverDelegate::obtain_search_storage`]: crate::delegate::SolverDelegate::obtain_search_storage
++
++use derive_where::derive_where;
++use rustc_type_ir::data_structures::HashSet;
++use rustc_type_ir::search_graph::SearchGraphStorage;
++use rustc_type_ir::{self as ty, Interner};
++
++use crate::solve::assembly::Candidate;
++use crate::solve::{Goal, GoalSource, GoalStalledOn, VisibleForLeakCheck};
++
++type NestedGoal<I> =
++    (GoalSource, Goal<I, <I as Interner>::Predicate>, Option<GoalStalledOn<I>>);
++type RegionConstraint<I> = (ty::RegionConstraint<I>, VisibleForLeakCheck);
++type OpaqueType<I> = (ty::OpaqueTypeKey<I>, <I as Interner>::Ty);
++type NormalizationGoal<I> = (GoalSource, Goal<I, <I as Interner>::Predicate>);
++
++/// A pool of emptied buffers per kind, as deep as goals nest (at most the recursion limit).
++#[derive_where(Default; I: Interner)]
++pub struct SolverScratch<I: Interner> {
++    nested_goals: Vec<Vec<NestedGoal<I>>>,
++    candidates: Vec<Vec<Candidate<I>>>,
++    args: Vec<Vec<I::GenericArg>>,
++    opt_args: Vec<Vec<Option<I::GenericArg>>>,
++    universes: Vec<Vec<Option<ty::UniverseIndex>>>,
++    seen_outlives: Vec<HashSet<ty::RegionConstraint<I>>>,
++    region_vars: Vec<HashSet<ty::RegionVid>>,
++    region_constraints: Vec<Vec<RegionConstraint<I>>>,
++    opaque_types: Vec<Vec<OpaqueType<I>>>,
++    normalization_goals: Vec<Vec<NormalizationGoal<I>>>,
++}
++
++macro_rules! pool {
++    ($take:ident, $give:ident, $field:ident: $ty:ty) => {
++        pub(super) fn $take(&mut self) -> $ty {
++            self.$field.pop().unwrap_or_default()
++        }
++
++        /// Takes back a buffer, emptied. One that never grew holds nothing worth keeping.
++        pub(super) fn $give(&mut self, mut buffer: $ty) {
++            if buffer.capacity() != 0 {
++                buffer.clear();
++                self.$field.push(buffer);
++            }
++        }
++    };
++}
++
++/// Bytes a pool of buffers holds room for, the pool's own slots included.
++fn held_in<B>(pool: &Vec<B>, capacity: impl Fn(&B) -> usize, element: usize) -> usize {
++    pool.capacity() * size_of::<B>() + pool.iter().map(capacity).sum::<usize>() * element
++}
++
++impl<I: Interner> SolverScratch<I> {
++    pool!(take_nested_goals, give_nested_goals, nested_goals: Vec<NestedGoal<I>>);
++    pool!(take_candidates, give_candidates, candidates: Vec<Candidate<I>>);
++    pool!(take_args, give_args, args: Vec<I::GenericArg>);
++    pool!(take_opt_args, give_opt_args, opt_args: Vec<Option<I::GenericArg>>);
++    pool!(take_universes, give_universes, universes: Vec<Option<ty::UniverseIndex>>);
++    pool!(take_seen_outlives, give_seen_outlives, seen_outlives: HashSet<ty::RegionConstraint<I>>);
++    pool!(take_region_vars, give_region_vars, region_vars: HashSet<ty::RegionVid>);
++    pool!(
++        take_region_constraints,
++        give_region_constraints,
++        region_constraints: Vec<RegionConstraint<I>>
++    );
++    pool!(take_opaque_types, give_opaque_types, opaque_types: Vec<OpaqueType<I>>);
++    pool!(
++        take_normalization_goals,
++        give_normalization_goals,
++        normalization_goals: Vec<NormalizationGoal<I>>
++    );
++
++    /// Bytes it holds room for: what a shelf keeps the largest of. A set's slot also has its
++    /// control byte.
++    pub fn held(&self) -> usize {
++        held_in(&self.nested_goals, Vec::capacity, size_of::<NestedGoal<I>>())
++            + held_in(&self.candidates, Vec::capacity, size_of::<Candidate<I>>())
++            + held_in(&self.args, Vec::capacity, size_of::<I::GenericArg>())
++            + held_in(&self.opt_args, Vec::capacity, size_of::<Option<I::GenericArg>>())
++            + held_in(&self.universes, Vec::capacity, size_of::<Option<ty::UniverseIndex>>())
++            + held_in(
++                &self.seen_outlives,
++                HashSet::capacity,
++                size_of::<ty::RegionConstraint<I>>() + 1,
++            )
++            + held_in(&self.region_vars, HashSet::capacity, size_of::<ty::RegionVid>() + 1)
++            + held_in(&self.region_constraints, Vec::capacity, size_of::<RegionConstraint<I>>())
++            + held_in(&self.opaque_types, Vec::capacity, size_of::<OpaqueType<I>>())
++            + held_in(
++                &self.normalization_goals,
++                Vec::capacity,
++                size_of::<NormalizationGoal<I>>(),
++            )
++    }
++}
++
++/// The search graph's storage for one root goal and the goals nested in it.
++pub type SearchStorage<I> = SearchGraphStorage<I, SolverScratch<I>>;
++
++#[cfg(test)]
++mod tests {
++    use super::held_in;
++
++    /// The pools' discipline over a plain buffer type: `SolverScratch` needs an `Interner`,
++    /// which this crate has no test double of, and each of its pools is this macro.
++    #[derive(Default)]
++    struct Pool {
++        buffers: Vec<Vec<u64>>,
++    }
++
++    impl Pool {
++        pool!(take, give, buffers: Vec<u64>);
++    }
++
++    #[test]
++    fn a_given_buffer_comes_back_with_its_capacity() {
++        let mut pool = Pool::default();
++        let mut buffer = pool.take();
++        buffer.extend(0..100);
++        let capacity = buffer.capacity();
++        pool.give(buffer);
++        let buffer = pool.take();
++        assert!(buffer.is_empty());
++        assert_eq!(buffer.capacity(), capacity);
++        assert!(pool.buffers.is_empty());
++    }
++
++    #[test]
++    fn a_buffer_that_never_grew_is_not_kept() {
++        let mut pool = Pool::default();
++        let buffer = pool.take();
++        pool.give(buffer);
++        assert!(pool.buffers.is_empty());
++    }
++
++    #[test]
++    fn a_warm_take_push_give_allocates_nothing() {
++        let mut pool = Pool::default();
++        let mut buffer = pool.take();
++        buffer.extend(0..64);
++        pool.give(buffer);
++        blaze_alloc_count::assert_at_most(0, "a warm scratch buffer", || {
++            for _ in 0..10 {
++                let mut buffer = pool.take();
++                buffer.extend(0..64);
++                pool.give(buffer);
++            }
++        });
++    }
++
++    #[test]
++    fn held_counts_slots_and_room() {
++        let pool = vec![Vec::<u64>::with_capacity(10), Vec::with_capacity(6)];
++        let room: usize = pool.iter().map(Vec::capacity).sum();
++        assert!(room >= 16);
++        assert_eq!(
++            held_in(&pool, Vec::capacity, size_of::<u64>()),
++            pool.capacity() * size_of::<Vec<u64>>() + room * size_of::<u64>()
++        );
++    }
++}
+diff -ruN a/src/solve/search_graph.rs b/src/solve/search_graph.rs
+--- a/src/solve/search_graph.rs
++++ b/src/solve/search_graph.rs
+@@ -8,7 +8,8 @@
+ use crate::canonical::response_no_constraints_raw;
+ use crate::delegate::SolverDelegate;
+ use crate::solve::{
+-    EvalCtxt, FIXPOINT_STEP_LIMIT, has_no_inference_or_external_constraints, inspect,
++    EvalCtxt, FIXPOINT_STEP_LIMIT, SolverScratch, has_no_inference_or_external_constraints,
++    inspect,
+ };
+ 
+ /// This type is never constructed. We only use it to implement `search_graph::Delegate`
+@@ -23,6 +24,7 @@
+     I: Interner,
+ {
+     type Cx = D::Interner;
++    type Scratch = SolverScratch<I>;
+ 
+     const ENABLE_PROVISIONAL_CACHE: bool = true;
+     type ValidationScope = Infallible;
+diff -ruN a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
+--- a/src/solve/trait_goals.rs
++++ b/src/solve/trait_goals.rs
+@@ -1639,7 +1639,7 @@
+     pub(super) fn merge_trait_candidates(
+         &mut self,
+         trait_def_id: I::TraitId,
+-        mut candidates: Vec<Candidate<I>>,
++        candidates: &mut Vec<Candidate<I>>,
+         failed_candidate_info: FailedCandidateInfo,
+     ) -> Result<(CanonicalResponse<I>, Option<TraitGoalProvenVia>), NoSolution> {
+         if candidates.is_empty() {
+@@ -1648,9 +1648,9 @@
+ 
+         let candidate_preference_mode = CandidatePreferenceMode::compute(self.cx(), trait_def_id);
+         if self.typing_mode().is_coherence() {
+-            return Ok(match self.try_merge_impl_candidates(trait_def_id, &candidates) {
++            return Ok(match self.try_merge_impl_candidates(trait_def_id, candidates) {
+                 Some(response) => (response, Some(TraitGoalProvenVia::Misc)),
+-                None => (self.bail_with_ambiguity(&candidates), None),
++                None => (self.bail_with_ambiguity(candidates), None),
+             });
+         }
+ 
+@@ -1675,13 +1675,16 @@
+                 matches!(c.source, CandidateSource::AliasBound(AliasBoundKind::SelfBounds))
+             })
+         {
+-            let alias_bounds: Vec<_> = candidates
+-                .extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(..)))
+-                .collect();
+-            return Ok(self.merge_candidates_or_bail_with_ambiguity(
++            let mut alias_bounds = self.search_graph.scratch().take_candidates();
++            alias_bounds.extend(
++                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(..))),
++            );
++            let merged = self.merge_candidates_or_bail_with_ambiguity(
+                 &alias_bounds,
+                 TraitGoalProvenVia::AliasBound,
+-            ));
++            );
++            self.search_graph.scratch().give_candidates(alias_bounds);
++            return Ok(merged);
+         }
+ 
+         // If there are non-global where-bounds, prefer where-bounds
+@@ -1690,11 +1693,14 @@
+             .iter()
+             .any(|c| matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::NonGlobal)));
+         if has_non_global_where_bounds {
+-            let where_bounds: Vec<_> = candidates
+-                .extract_if(.., |c| matches!(c.source, CandidateSource::ParamEnv(_)))
+-                .collect();
++            let mut where_bounds = self.search_graph.scratch().take_candidates();
++            where_bounds.extend(
++                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::ParamEnv(_))),
++            );
+             let Some((response, info)) = self.try_merge_candidates(&where_bounds) else {
+-                return Ok((self.bail_with_ambiguity(&where_bounds), None));
++                let response = self.bail_with_ambiguity(&where_bounds);
++                self.search_graph.scratch().give_candidates(where_bounds);
++                return Ok((response, None));
+             };
+             match info {
+                 // If there's an always applicable candidate, the result of all
+@@ -1713,7 +1719,7 @@
+                 // Supporting this makes the code more involved, so I am just going to
+                 // ignore this for now.
+                 MergeCandidateInfo::AlwaysApplicable(i) => {
+-                    for (j, c) in where_bounds.into_iter().enumerate() {
++                    for (j, c) in where_bounds.drain(..).enumerate() {
+                         if i != j {
+                             self.ignore_candidate_head_usages(c.head_usages)
+                         }
+@@ -1725,22 +1731,26 @@
+                 }
+                 MergeCandidateInfo::EqualResponse => {}
+             }
++            self.search_graph.scratch().give_candidates(where_bounds);
+             return Ok((response, Some(TraitGoalProvenVia::ParamEnv)));
+         }
+ 
+         // Next, prefer any alias bound (nested or otherwise).
+         if candidates.iter().any(|c| matches!(c.source, CandidateSource::AliasBound(_))) {
+-            let alias_bounds: Vec<_> = candidates
+-                .extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(_)))
+-                .collect();
+-            return Ok(self.merge_candidates_or_bail_with_ambiguity(
++            let mut alias_bounds = self.search_graph.scratch().take_candidates();
++            alias_bounds.extend(
++                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(_))),
++            );
++            let merged = self.merge_candidates_or_bail_with_ambiguity(
+                 &alias_bounds,
+                 TraitGoalProvenVia::AliasBound,
+-            ));
++            );
++            self.search_graph.scratch().give_candidates(alias_bounds);
++            return Ok(merged);
+         }
+ 
+-        self.filter_specialized_impls(AllowInferenceConstraints::No, &mut candidates);
+-        self.unsound_prefer_builtin_dyn_impl(&mut candidates);
++        self.filter_specialized_impls(AllowInferenceConstraints::No, candidates);
++        self.unsound_prefer_builtin_dyn_impl(candidates);
+ 
+         // If there are *only* global where bounds, then make sure to return that this
+         // is still reported as being proven-via the param-env so that rigid projections
+@@ -1751,11 +1761,11 @@
+             .all(|c| matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::Global)));
+         if only_global_where_bounds {
+             Ok(self
+-                .merge_candidates_or_bail_with_ambiguity(&candidates, TraitGoalProvenVia::ParamEnv))
++                .merge_candidates_or_bail_with_ambiguity(candidates, TraitGoalProvenVia::ParamEnv))
+         } else {
+             candidates
+                 .retain(|c| !matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::Global)));
+-            Ok(self.merge_impl_candidates_or_bail_with_ambiguity(trait_def_id, &candidates))
++            Ok(self.merge_impl_candidates_or_bail_with_ambiguity(trait_def_id, candidates))
+         }
+     }
+ 
+@@ -1765,10 +1775,15 @@
+         goal: Goal<I, TraitClause<I>>,
+     ) -> Result<(CanonicalResponse<I>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased>
+     {
+-        let (candidates, failed_candidate_info) =
++        let (mut candidates, failed_candidate_info) =
+             self.assemble_and_evaluate_candidates(goal, AssembleCandidatesFrom::All)?;
+-        self.merge_trait_candidates(goal.predicate.def_id(), candidates, failed_candidate_info)
+-            .map_err(Into::into)
++        let merged = self.merge_trait_candidates(
++            goal.predicate.def_id(),
++            &mut candidates,
++            failed_candidate_info,
++        );
++        self.search_graph.scratch().give_candidates(candidates);
++        merged.map_err(Into::into)
+     }
+ 
+     fn try_stall_coroutine(

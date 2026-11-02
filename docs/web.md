@@ -1,8 +1,16 @@
 ---
-status: current
-summary: The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
+status: record
+date: 2026-10-30
+summary: The build page v1's blaze ui served, every function of the build drawn live on the GPU from a Flecs world of the program. v2 has no blaze ui and its daemon does not start the page.
 ---
 # The build page
+
+This is the build page as blaze v1 served it, as of its integration into v2 on 2026-10-30.
+`crates/blaze-web` is still in the tree, but v2's blaze has no `ui` command and its daemon
+never starts the page's server or sends it records. In v2 the page is to be a client of the
+agent API, `crates/blaze-api` (the ci lane:
+[v2/plan/reference/crates.md](v2/plan/reference/crates.md),
+[v2/plan/lanes/ci.md](v2/plan/lanes/ci.md)).
 
 `blaze ui` prints the address of a page the daemon serves on 127.0.0.1 and opens it: the build
 as it goes, down to every function. Nothing of it runs until it is asked for: the first
@@ -50,7 +58,9 @@ The daemon keeps the program of each of the 16 workspaces built last in a
 [Flecs](https://www.flecs.dev) world, on a thread of its own that the first `blaze ui` starts
 (`crates/blaze-web/src/world.rs`; Flecs's C is `vendor/flecs-c`). Until then the daemon keeps
 no world, only the records it would be made from: of each workspace, those since the build
-that said its functions whole, and all of its last build's.
+that said its functions whole, and all of its last build's. They are kept on the page's thread
+as runs of a build's records, each run's `Began` and `Functions` records in one deflate stream
+(`crates/blaze-web/src/kept.rs`), so a record costs the daemon one send on a channel.
 
 | entity    | what                                                                       |
 |-----------|----------------------------------------------------------------------------|
@@ -63,7 +73,7 @@ that said its functions whole, and all of its last build's.
 module would be a table of their own, and anim has 5 000 modules.
 
 A function is in the path its name is in, as the page groups it (`moduleOf` in
-`assets/names.js`, `module_path` in `world.rs`): its path without its last segment, generic
+`assets/names.js`, `each_module` in `world.rs`): its path without its last segment, generic
 arguments or closures, and for a method of `<T as Trait>` or `<T>`, `T`'s path, so
 `<alloc::vec::Vec<u8>>::push` is in `alloc::vec::Vec`. A type's path is a module here. Each
 segment after its crate's is a module in the one before; a function with none is in its crate.
@@ -92,9 +102,10 @@ messages from the server are binary:
    below, gzipped (the page reads it with `DecompressionStream("gzip")`): anim's 80 000
    functions are 37 MB of it, nearly all names, and 4.3 MB gzipped.
 2. Then the records of that workspace's last build (without its `Functions`, which the snapshot
-   has), and each record of every build from then on as it comes: one CBOR item of
-   [`Record`](../crates/blaze-protocol/src/events.rs) per message, in the deterministic
-   encoding of the socket, without the socket's length prefix.
+   has), and each record of every build from then on as it comes, in frames: a message is a
+   CBOR sequence (RFC 8742) of one or more [`Record`](../crates/blaze-protocol/src/events.rs)s,
+   each in the deterministic encoding of the socket without its length prefix, as many as the
+   daemon had at once. Each is encoded once, whatever the number of pages.
 3. A build of another workspace sends a new snapshot before its `Began`, and the first record
    of a whole object one in place of the record (its functions are in the snapshot): the page
    starts over from it. A message is

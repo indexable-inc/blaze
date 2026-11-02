@@ -1,0 +1,35 @@
+{
+  "id": "00794",
+  "from_lane": "speed-unsafe-front",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/Cargo.toml"
+  ],
+  "what": "crates/hir-ty/Cargo.toml: add `[target.'cfg(blaze_check)'.dependencies]` with `blaze-check.workspace = true` (as crates/blaze-reclaim/Cargo.toml:16-17). Why: crates/hir-ty/src/method_resolution/pick_cache/table.rs (the lock-free pick and steps cache) now takes its atomics and Mutex from blaze_check::sync under cfg(blaze_check), and its model test pick_cache/table/model.rs (docs/v2/plan/design/unsafe.md, model checking of every lock-free structure) runs there. Without it hir-ty fails to build only under --cfg blaze_check; normal builds are unaffected.",
+  "state": "applied",
+  "created": "2026-10-30T08:03:22Z",
+  "updated": "2026-10-30T10:00:06Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:03:22Z",
+      "by": "speed-unsafe-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: crates/hir-ty/Cargo.toml has [target.'cfg(blaze_check)'.dependencies] blaze-check.workspace = true; manifest lint clean"
+    }
+  ]
+}

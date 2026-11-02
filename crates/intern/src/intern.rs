@@ -1,205 +1,81 @@
 //! Interning of single values.
 //!
-//! Interning supports two modes: GC and non-GC.
+//! A value is interned once, into its type's [`InternStorage`], and lives there unmoved for the
+//! life of the process (see [`crate::arena`]): an [`Interned`] is a pointer to it, `Copy`, with
+//! no reference count, and two are equal when they point at the same value. An [`InternedRef`]
+//! is the same pointer with a lifetime, which only marks where a handle is meant to be used
+//! (the query engine refuses to store one, as it is no `blaze_query::db::Value`); [`InternedRef::to_owned`] and
+//! [`InternedRef::change_lifetime`] move between the two freely.
 //!
-//! In non-GC mode, you create [`Interned`]s, and can create `Copy` handles to them
-//! that can still be upgraded back to [`Interned`] ([`InternedRef`]) via [`Interned::as_ref`].
-//! Generally, letting the [`InternedRef`] to outlive the [`Interned`] is a soundness bug and can
-//! lead to UB. When all [`Interned`]s of some value are dropped, the value is freed (newer interns
-//! may re-create it, not necessarily in the same place).
+//! Interned values are never freed: memory is bounded by the database's reachability GC
+//! rebuilding what it keeps (docs/v2/plan/lanes/db.md).
 //!
-//! In GC mode, you generally operate on [`InternedRef`]s. They are `Copy` and comfortable. To intern
-//! a value you call [`Interned::new_gc`], which returns an [`InternedRef`]. Having all [`Interned`]s
-//! of some value be dropped will *not* immediately free the value. Instead, a mark-and-sweep GC can
-//! be initiated, which will free all values which have no live [`Interned`]s.
-//!
-//! Generally, in GC mode, you operate on [`InternedRef`], but when you need to store some long-term
-//! value (e.g. a Salsa query output), you convert it to an [`Interned`]. This ensures that an eventual
-//! GC will not free it as long as it is alive.
-//!
-//! Making mistakes is hard due to GC [`InternedRef`] wrappers not implementing `salsa::Update`, meaning
-//! Salsa will ensure you do not store them in queries or Salsa-interneds. However it's still *possible*
-//! without unsafe code (for example, by storing them in a `static`), which is why triggering GC is unsafe.
-//!
-//! For more information about GC see [`crate::gc`].
+//! Safe code: the typed store and the handle's pointer are [`crate::typed`]'s.
 
 use std::{
     fmt::{self, Debug, Display},
     hash::{BuildHasher, Hash, Hasher},
+    marker::PhantomData,
     ops::Deref,
     ptr,
-    sync::OnceLock,
 };
 
-use dashmap::{DashMap, SharedValue};
-use hashbrown::raw::RawTable;
-use rustc_hash::FxBuildHasher;
-use triomphe::{Arc, ArcBorrow};
+use blaze_hash::FixedState;
 
-type InternMap<T> = DashMap<Arc<T>, (), FxBuildHasher>;
-type Guard<T> = dashmap::RwLockWriteGuard<'static, RawTable<(Arc<T>, SharedValue<()>)>>;
-type Bucket<T> = hashbrown::raw::Bucket<(Arc<T>, SharedValue<()>)>;
+use crate::{
+    sync::OnceLock,
+    typed::{Ptr, Values},
+};
 
 pub struct Interned<T: Internable> {
-    arc: Arc<T>,
+    /// Points into `T::storage()`, which never moves or frees a value.
+    ptr: &'static T,
 }
 
 impl<T: Internable> Interned<T> {
     #[inline]
     pub fn new(obj: T) -> Self {
-        const { assert!(!T::USE_GC) };
-
-        let storage = T::storage().get();
-        let hash = Self::hash(storage, &obj);
-        // SAFETY: The bucket is read while its shard is locked.
-        if let Some(arc) = Self::found(storage, hash, &obj, |it| unsafe { it.as_ref().0.clone() }) {
-            return Self { arc };
-        }
-        let mut shard = Self::select(storage, hash);
-        // Atomically,
-        // - check if `obj` is already in the map
-        //   - if so, clone its `Arc` and return it
-        //   - if not, box it up, insert it, and return a clone
-        // This needs to be atomic (locking the shard) to avoid races with other thread, which could
-        // insert the same object between us looking it up and inserting it.
-        let bucket = match shard.find_or_find_insert_slot(
-            hash,
-            |(other, _)| **other == obj,
-            |(x, _)| Self::hash(storage, x),
-        ) {
-            Ok(bucket) => bucket,
-            // SAFETY: The slot came from `find_or_find_insert_slot()`, and the table wasn't modified since then.
-            Err(insert_slot) => unsafe {
-                shard.insert_in_slot(hash, insert_slot, (Arc::new(obj), SharedValue::new(())))
-            },
-        };
-        // SAFETY: We just retrieved/inserted this bucket.
-        unsafe { Self { arc: bucket.as_ref().0.clone() } }
+        Self { ptr: intern(obj) }
     }
 
+    /// Interns `obj`, as [`Interned::new`] does, handing out the handle with a lifetime.
     #[inline]
     pub fn new_gc<'a>(obj: T) -> InternedRef<'a, T> {
-        const { assert!(T::USE_GC) };
-
-        let storage = T::storage().get();
-        let hash = Self::hash(storage, &obj);
-        let id = ptr::from_ref(storage).addr();
-        // SAFETY: What this thread interned in this epoch is not freed yet.
-        let mine = crate::local::find(id, hash, |it| unsafe { *it.cast::<T>() == obj });
-        if let Some(mine) = mine {
-            // SAFETY: The pointer is an `InternedRef`'s.
-            return unsafe { InternedRef::from_raw(mine.cast()) };
-        }
-        // SAFETY: The bucket is read while its shard is locked; a collection, which frees it,
-        // runs only when no `InternedRef` is alive.
-        let found = |it: Bucket<T>| unsafe { InternedRef { arc: Arc::borrow_arc(&it.as_ref().0) } };
-        if let Some(found) = Self::found(storage, hash, &obj, found) {
-            crate::local::remember(id, hash, found.as_raw().cast());
-            return found;
-        }
-        let mut shard = Self::select(storage, hash);
-        // Atomically,
-        // - check if `obj` is already in the map
-        //   - if so, clone its `Arc` and return it
-        //   - if not, box it up, insert it, and return a clone
-        // This needs to be atomic (locking the shard) to avoid races with other thread, which could
-        // insert the same object between us looking it up and inserting it.
-        let bucket = match shard.find_or_find_insert_slot(
-            hash,
-            |(other, _)| **other == obj,
-            |(x, _)| Self::hash(storage, x),
-        ) {
-            Ok(bucket) => bucket,
-            // SAFETY: The slot came from `find_or_find_insert_slot()`, and the table wasn't modified since then.
-            Err(insert_slot) => unsafe {
-                shard.insert_in_slot(hash, insert_slot, (Arc::new(obj), SharedValue::new(())))
-            },
-        };
-        // SAFETY: We just retrieved/inserted this bucket.
-        let interned = unsafe { InternedRef { arc: Arc::borrow_arc(&bucket.as_ref().0) } };
-        crate::local::remember(id, hash, interned.as_raw().cast());
-        interned
-    }
-
-    /// What `then` makes of the bucket `obj` is in, looked for under a lock that other readers
-    /// share: nearly every value interned already is, and is asked for from many threads at once.
-    #[inline]
-    fn found<R>(
-        storage: &'static InternMap<T>,
-        hash: u64,
-        obj: &T,
-        then: impl FnOnce(Bucket<T>) -> R,
-    ) -> Option<R> {
-        let shard = storage.shards()[storage.determine_shard(hash as usize)].read();
-        shard.find(hash, |(other, _)| **other == *obj).map(then)
-    }
-
-    #[inline]
-    fn select(storage: &'static InternMap<T>, hash: u64) -> Guard<T> {
-        storage.shards()[storage.determine_shard(hash as usize)].write()
-    }
-
-    #[inline]
-    fn hash(storage: &'static InternMap<T>, obj: &T) -> u64 {
-        storage.hasher().hash_one(obj)
-    }
-
-    /// # Safety
-    ///
-    /// The pointer should originate from an `Interned` or an `InternedRef`.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // SAFETY: Our precondition.
-        Self { arc: unsafe { Arc::from_raw(ptr) } }
+        Self::new(obj).as_ref_static()
     }
 
     #[inline]
     pub fn as_ref(&self) -> InternedRef<'_, T> {
-        InternedRef { arc: self.arc.borrow_arc() }
+        self.as_ref_static()
     }
-}
 
-impl<T: Internable> Drop for Interned<T> {
     #[inline]
-    fn drop(&mut self) {
-        // When the last `Ref` is dropped, remove the object from the global map.
-        if !T::USE_GC && Arc::count(&self.arc) == 2 {
-            // Only `self` and the global map point to the object.
-
-            self.drop_slow();
-        }
+    fn as_ref_static<'a>(self) -> InternedRef<'a, T> {
+        InternedRef { ptr: Ptr::new(self.ptr), _marker: PhantomData }
     }
 }
 
-impl<T: Internable> Interned<T> {
-    #[cold]
-    fn drop_slow(&mut self) {
-        let storage = T::storage().get();
-        let hash = Self::hash(storage, &self.arc);
-        let mut shard = Self::select(storage, hash);
+/// The one copy of `obj` in `T::storage()`, interning it if it is not there.
+#[inline]
+fn intern<T: Internable>(obj: T) -> &'static T {
+    let hash = FixedState.hash_one(&obj);
+    T::storage().get().intern(hash, obj)
+}
 
-        if Arc::count(&self.arc) != 2 {
-            // Another thread has interned another copy
-            return;
-        }
-
-        shard.remove_entry(hash, |(other, _)| **other == **self);
-
-        // Shrink the backing storage if the shard is less than 50% occupied.
-        if shard.len() * 2 < shard.capacity() {
-            let len = shard.len();
-            shard.shrink_to(len, |(x, _)| Self::hash(storage, x));
-        }
+impl<T: Internable> Clone for Interned<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
     }
 }
+
+impl<T: Internable> Copy for Interned<T> {}
 
 /// Compares interned `Ref`s using pointer equality.
 impl<T: Internable> PartialEq for Interned<T> {
-    // NOTE: No `?Sized` because `ptr_eq` doesn't work right with trait objects.
-
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.arc, &other.arc)
+        ptr::eq(self.ptr, other.ptr)
     }
 }
 
@@ -208,14 +84,14 @@ impl<T: Internable> Eq for Interned<T> {}
 impl<T: Internable> Hash for Interned<T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.arc.as_ptr().addr())
+        state.write_usize(ptr::from_ref(self.ptr).addr())
     }
 }
 
 impl<T: Internable> AsRef<T> for Interned<T> {
     #[inline]
     fn as_ref(&self) -> &T {
-        self
+        self.ptr
     }
 }
 
@@ -224,84 +100,51 @@ impl<T: Internable> Deref for Interned<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.arc
-    }
-}
-
-impl<T: Internable> Clone for Interned<T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self { arc: self.arc.clone() }
+        self.ptr
     }
 }
 
 impl<T: Debug + Internable> Debug for Interned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        <T as Debug>::fmt(&**self, f)
+        <T as Debug>::fmt(self.ptr, f)
     }
 }
 
 impl<T: Display + Internable> Display for Interned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        <T as Display>::fmt(&**self, f)
+        <T as Display>::fmt(self.ptr, f)
     }
 }
 
+/// `Send` and `Sync` where `T: Sync`, as `&T` is.
 #[repr(transparent)]
 pub struct InternedRef<'a, T> {
-    arc: ArcBorrow<'a, T>,
+    /// A value of an [`InternStorage`], never moved or freed.
+    ptr: Ptr<T>,
+    _marker: PhantomData<&'a T>,
 }
 
 impl<'a, T: Internable> InternedRef<'a, T> {
     #[inline]
     pub fn as_raw(self) -> *const T {
-        // Not `ptr::from_ref(&*self.arc)`, because we need to keep the provenance.
-        self.arc.with_arc(|arc| Arc::as_ptr(arc))
-    }
-
-    /// # Safety
-    ///
-    /// The pointer needs to originate from `Interned` or `InternedRef`.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // SAFETY: Our precondition.
-        Self { arc: unsafe { ArcBorrow::from_ptr(ptr) } }
+        self.ptr.as_ptr()
     }
 
     #[inline]
     pub fn to_owned(self) -> Interned<T> {
-        Interned { arc: self.arc.clone_arc() }
+        Interned { ptr: self.ptr.get() }
     }
 
     #[inline]
     pub fn get(self) -> &'a T {
-        self.arc.get()
+        self.ptr.get()
     }
 
-    /// # Safety
-    ///
-    /// You have to make sure the data is not referenced after the refcount reaches zero; beware the interning
-    /// map also keeps a reference to the value.
-    #[inline]
-    pub unsafe fn decrement_refcount(self) {
-        // SAFETY: Our precondition.
-        unsafe { drop(Arc::from_raw(self.as_raw())) }
-    }
-
-    #[inline]
-    pub(crate) fn strong_count(self) -> usize {
-        ArcBorrow::strong_count(&self.arc)
-    }
-
-    /// **Available only on GC mode**.
-    ///
-    /// Changes the attached lifetime, as in GC mode, the lifetime is more kind of a lint to prevent misuse
-    /// than actual soundness check.
+    /// Changes the attached lifetime: interned values live for the process, so the lifetime is
+    /// only a lint against misuse, not a soundness check.
     #[inline]
     pub fn change_lifetime<'b>(self) -> InternedRef<'b, T> {
-        const { assert!(T::USE_GC) };
-        // SAFETY: The lifetime on `InternedRef` is essentially advisory only for GCed types.
-        unsafe { std::mem::transmute::<InternedRef<'a, T>, InternedRef<'b, T>>(self) }
+        InternedRef { ptr: self.ptr, _marker: PhantomData }
     }
 }
 
@@ -317,15 +160,14 @@ impl<T> Copy for InternedRef<'_, T> {}
 impl<T: Hash> Hash for InternedRef<'_, T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ptr = ptr::from_ref::<T>(&*self.arc);
-        state.write_usize(ptr.addr());
+        state.write_usize(self.ptr.as_ptr().addr());
     }
 }
 
 impl<T: PartialEq> PartialEq for InternedRef<'_, T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ArcBorrow::ptr_eq(&self.arc, &other.arc)
+        ptr::eq(self.ptr.as_ptr(), other.ptr.as_ptr())
     }
 }
 
@@ -336,24 +178,24 @@ impl<T> Deref for InternedRef<'_, T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.arc
+        self.ptr.get()
     }
 }
 
 impl<T: Debug> Debug for InternedRef<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (*self.arc).fmt(f)
+        (**self).fmt(f)
     }
 }
 
 impl<T: Display> Display for InternedRef<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (*self.arc).fmt(f)
+        (**self).fmt(f)
     }
 }
 
 pub struct InternStorage<T: ?Sized> {
-    map: OnceLock<InternMap<T>>,
+    store: OnceLock<Values<T>>,
 }
 
 #[allow(
@@ -362,40 +204,30 @@ pub struct InternStorage<T: ?Sized> {
 )]
 impl<T: ?Sized> InternStorage<T> {
     pub const fn new() -> Self {
-        Self { map: OnceLock::new() }
+        Self { store: OnceLock::new() }
     }
 }
 
 impl<T: Internable + ?Sized> InternStorage<T> {
-    pub(crate) fn get(&self) -> &InternMap<T> {
-        self.map.get_or_init(|| DashMap::with_capacity_and_hasher(1024, Default::default()))
+    pub(crate) fn get(&self) -> &Values<T> {
+        self.store.get_or_init(Values::new)
     }
 }
 
 pub trait Internable: Hash + Eq + Send + Sync + 'static {
-    const USE_GC: bool;
-
     fn storage() -> &'static InternStorage<Self>;
 }
 
 /// Implements `Internable` for a given list of types, making them usable with `Interned`.
+/// `gc;` is accepted and means the same: every interned value lives for the process.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _impl_internable {
-    ( gc; $($t:ty),+ $(,)? ) => { $(
-        impl $crate::Internable for $t {
-            const USE_GC: bool = true;
-
-            fn storage() -> &'static $crate::InternStorage<Self> {
-                static STORAGE: $crate::InternStorage<$t> = $crate::InternStorage::new();
-                &STORAGE
-            }
-        }
-    )+ };
+    ( gc; $($t:ty),+ $(,)? ) => {
+        $crate::_impl_internable!($($t),+);
+    };
     ( $($t:ty),+ $(,)? ) => { $(
         impl $crate::Internable for $t {
-            const USE_GC: bool = false;
-
             fn storage() -> &'static $crate::InternStorage<Self> {
                 static STORAGE: $crate::InternStorage<$t> = $crate::InternStorage::new();
                 &STORAGE
@@ -410,11 +242,16 @@ mod tests {
     use super::*;
 
     #[derive(PartialEq, Eq, Hash, Debug)]
+    #[cfg_attr(blaze_check, allow(dead_code, reason = "made only by a normal build's threaded test"))]
     struct Name(u32);
     impl_internable!(Name);
 
-    /// A value found under the shard's read lock is the one object of it while threads intern
-    /// and drop it at once: a drop that races the lookup does not take it out of the map.
+    const _: () = assert!(size_of::<Interned<Name>>() == size_of::<usize>());
+    const _: () = assert!(size_of::<InternedRef<'static, Name>>() == size_of::<usize>());
+
+    /// A value interned from many threads at once is one value: every thread gets the handle
+    /// interned before them, and values first interned by racing threads are one per value.
+    #[cfg(not(blaze_check))]
     #[test]
     fn interned_from_many_threads() {
         let held: Vec<_> = (0..64).map(|i| Interned::new(Name(i))).collect();
@@ -433,5 +270,267 @@ mod tests {
         });
         let after: Vec<_> = (0..64).map(|i| Interned::new(Name(i))).collect();
         assert!(after == held);
+    }
+
+    #[cfg(not(blaze_check))]
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Racing(u64);
+    #[cfg(not(blaze_check))]
+    impl_internable!(Racing);
+
+    /// Threads interning overlapping new values in different orders get pointer-equal handles.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn new_values_race_to_one_handle() {
+        const THREADS: u64 = 16;
+        const VALUES: u64 = 20_000;
+        let seen: Vec<Vec<Interned<Racing>>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        (0..VALUES)
+                            .map(|n| Interned::new(Racing((n + worker * 1_237) % VALUES)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert_eq!(<Racing as Internable>::storage().get().len(), VALUES as usize);
+        for (worker, handles) in seen.iter().enumerate() {
+            for (i, handle) in handles.iter().enumerate() {
+                let n = (i as u64 + worker as u64 * 1_237) % VALUES;
+                assert!(ptr::eq(&**handle, &*Interned::new(Racing(n))));
+                assert_eq!(handle.0, n);
+            }
+        }
+    }
+
+    #[cfg(not(blaze_check))]
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Text(String);
+    #[cfg(not(blaze_check))]
+    impl_internable!(Text);
+
+    /// Enough values to fill many chunks of every shard: the first handles still read their
+    /// values and are still what interning them again gives.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn handles_stay_valid() {
+        let early: Vec<_> = (0..256).map(|n| Interned::new(Text(format!("early {n}")))).collect();
+        let addresses: Vec<_> = early.iter().map(|it| ptr::from_ref(&**it)).collect();
+        for n in 0..200_000 {
+            Interned::new(Text(format!("later {n}")));
+        }
+        for (n, (handle, &at)) in early.iter().zip(&addresses).enumerate() {
+            assert_eq!(handle.0, format!("early {n}"));
+            assert!(ptr::eq(&**handle, at));
+            assert_eq!(Interned::new(Text(format!("early {n}"))), *handle);
+        }
+    }
+
+    crate::impl_internable!(String);
+
+    #[test]
+    fn simple_interned() {
+        let a = Interned::new("abc".to_owned());
+        let b = Interned::new("abc".to_owned());
+        assert_eq!(a, b);
+        assert_eq!(a.as_ref(), b.as_ref());
+        assert_eq!(a.as_ref(), a.as_ref());
+        #[allow(clippy::clone_on_copy)]
+        let cloned = a.clone();
+        assert_eq!(a, cloned);
+        assert_eq!(*a, "abc");
+        assert_eq!(*b, "abc");
+        assert_eq!(b.as_ref().to_owned(), a);
+        let c = Interned::new("def".to_owned());
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_ne!(b.as_ref(), c.as_ref());
+        assert_eq!(*c.as_ref(), "def");
+        assert_eq!(format!("{a} {c:?}"), "abc \"def\"");
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct GcString(String);
+    crate::impl_internable!(gc; GcString);
+
+    #[test]
+    fn new_gc_is_new() {
+        let r = Interned::new_gc(GcString("abc".to_owned()));
+        let owned = Interned::new(GcString("abc".to_owned()));
+        assert_eq!(r.to_owned(), owned);
+        assert_eq!(r, owned.as_ref());
+        assert_eq!(r.get().0, "abc");
+        assert!(ptr::eq(r.as_raw(), &*owned));
+        let longer: InternedRef<'static, GcString> = r.change_lifetime();
+        assert_eq!(longer, r);
+    }
+
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Keyed(Vec<u8>);
+    impl_internable!(Keyed);
+
+    /// Interning against an `HashMap` from value to the address of its first handle, over
+    /// seeded values that collide often: a value seen before gets that handle, a new one a
+    /// handle of its own, and every handle reads its value.
+    #[test]
+    fn interning_agrees_with_a_map_model() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
+        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed> = blaze_hash::HashMap::default();
+        for _ in 0..20_000 {
+            let len = rng.index(24);
+            let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();
+            let handle = Interned::new(Keyed(bytes.clone()));
+            assert_eq!(handle.0, bytes);
+            let first = *model.entry(bytes).or_insert(ptr::from_ref(&*handle));
+            assert!(ptr::eq(first, &*handle), "one handle a value");
+        }
+        let mut addresses: Vec<_> = model.values().map(|&at| at.addr()).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), model.len(), "a handle of its own for each value");
+    }
+
+    #[cfg(not(blaze_check))]
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Counted(u64);
+    #[cfg(not(blaze_check))]
+    impl_internable!(Counted);
+
+    /// A hit, a read and, once the type's store exists, a miss all allocate nothing: values,
+    /// chunks and tables come from `crate::space`'s region.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn interning_allocates_nothing() {
+        let held = Interned::new(Counted(u64::MAX));
+        blaze_alloc_count::assert_at_most(0, "an interned hit and a read", || {
+            assert!(Interned::new(Counted(u64::MAX)) == held);
+            assert_eq!(held.0, u64::MAX);
+        });
+        blaze_alloc_count::assert_at_most(0, "interning new values, tables growing", || {
+            for n in 0..100_000 {
+                assert_eq!(Interned::new(Counted(n)).0, n);
+            }
+        });
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
+/// model_`): a type's first interns racing to make its store, against a set: the copy kept is
+/// the first intern's of each value, every other copy is dropped once, and equal values get one
+/// handle.
+#[cfg(all(test, blaze_check))]
+#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
+mod model {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+    };
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
+    use super::*;
+
+    /// A value that says when it is dropped. An interned value never is, so a copy dropped by
+    /// the time `Interned::new` returns was found there already.
+    struct Counted {
+        value: u64,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Counted {
+        fn new(value: u64) -> (Counted, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (Counted { value, dropped: dropped.clone() }, dropped)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            assert!(!self.dropped.swap(true, Relaxed), "a copy dropped twice");
+        }
+    }
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Counted) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl Hash for Counted {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
+        }
+    }
+
+    /// This execution's storage. A `static` one would keep the store the first execution made,
+    /// whose atomics each later execution starts again from null while its values stay.
+    static CURRENT: AtomicPtr<InternStorage<Counted>> = AtomicPtr::new(ptr::null_mut());
+
+    impl Internable for Counted {
+        fn storage() -> &'static InternStorage<Counted> {
+            // SAFETY: `model_first_interns_race` points `CURRENT` at a storage it frees only after
+            // joining every thread that interns, and clears it first. The model's threads are
+            // coroutines on its one OS thread, so this `Relaxed` load sees that store.
+            unsafe { CURRENT.load(Relaxed).as_ref() }.expect("a model's storage")
+        }
+    }
+
+    /// The sequential interner: bit `v` is set when value `v` is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u8);
+
+    impl Spec for Set {
+        /// The value interned.
+        type Op = u64;
+        /// Whether this call's copy is the one kept: the value was not there.
+        type Ret = bool;
+
+        fn apply(&mut self, &value: &u64) -> bool {
+            let new = self.0 & (1 << value) == 0;
+            self.0 |= 1 << value;
+            new
+        }
+    }
+
+    fn intern(history: &History<Set>, value: u64) -> Interned<Counted> {
+        let mut handle = None;
+        history.record(value, |&value| {
+            let (copy, dropped) = Counted::new(value);
+            let interned = Interned::new(copy);
+            assert_eq!(interned.value, value, "a handle reads its value whole");
+            handle = Some(interned);
+            !dropped.load(Relaxed)
+        });
+        handle.expect("a recorded intern")
+    }
+
+    #[test]
+    fn model_first_interns_race() {
+        blaze_check::model(|| {
+            let storage = Box::new(InternStorage::<Counted>::new());
+            CURRENT.store(ptr::from_ref(&*storage).cast_mut(), Relaxed);
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let history = history.clone();
+                thread::spawn(move || [1, 2].map(|value| intern(&history, value)))
+            };
+            let two = intern(&history, 2);
+            let one = intern(&history, 1);
+            let [one_there, two_there] = other.join().unwrap();
+            history.check(Set::default());
+            assert!(one == one_there && two == two_there, "equal values, one handle");
+            assert!(one != two, "two values, two handles");
+            assert_eq!(storage.get().len(), 2, "one store, made once");
+            CURRENT.store(ptr::null_mut(), Relaxed);
+            drop(storage);
+        });
     }
 }

@@ -1,0 +1,37 @@
+{
+  "id": "00611",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "crates/intern/src/arena.rs",
+    "crates/intern/src/symbol.rs",
+    "crates/intern/src/lib.rs"
+  ],
+  "what": "## 12. db-salsa (through lane db): interned values may hash their address\n\n`/tmp/blaze-lanes/v2-db-salsa.md` says `intern::Symbol` and `Interned<T>` hashes are unsound for\nvalue fingerprints because they hash the address. Both are now never freed\n(`crates/intern/src/arena.rs`, `symbol.rs`: \"never moves or is freed\"), so an address names one\nvalue for the whole process, and fingerprints are not persisted (salsa recomputes them on load).\n`InferenceResult` and `MirBody` rely on this. Say so if there is a case I miss.\n\n> forwarded to db\n> checked by db-audit-dbsub (2026-10-29 22:40): holds in the tree, more strongly: a `Symbol` is now a `u32` ID in the symbol table, stable across processes that restore one image, and never freed while the process runs (`crates/intern/src/symbol.rs:1-9`); interned values never move or are freed (`crates/intern/src/lib.rs:2`, `arena.rs:3`). The image's GC keeps each surviving symbol at its own ID. No case missed.",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#12. db-salsa (through lane db): interned values may hash their address",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:226"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): holds in the tree, more strongly: a `Symbol` is now a `u32` ID in the symbol table, stable across processes that restore one image, and never freed while the process runs (`crates/intern/src/symbol.rs:1-9`); interned values never move or are freed (`crates/intern/src/lib.rs:2`, `arena.rs:3`). The image's GC keeps each surviving symbol at its own ID. No"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "00036",
+  "from_lane": "store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cas/src/cold.rs"
+  ],
+  "what": "## Vendor zstd-safe and mark its dictionaries `Send` and `Sync` (everything is ours)\n\n- Who: whoever owns `vendor/` (coordinator).\n- What: vendor `zstd-safe` 7.3 (and `zstd` 0.13 with it) into the workspace, and add\n  `unsafe impl Send` and `unsafe impl Sync` for `CDict` and `DDict`, which zstd.h documents as\n  shareable read-only between threads. `crates/blaze-cas/src/cold.rs` (`Prepared`) asserts this\n  today with its own `unsafe impl`. Once the vendored crate says it, that impl goes.\n- Why: the store digests each kind's dictionary once, not once per put and per read. Loading\n  64 KiB of dictionary into a zstd context cost more than decompressing a small cold value.\n  The digested dictionaries are shared by every reader thread.\n\n> forwarded to coordinator: a new `vendor/` crate (and its root `[patch]`) is the coordinator's, not among the paths `requests` applies; `zstd-safe` 7.x and `zstd` 0.13 are in the lock and the local registry.",
+  "state": "taken",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T08:24:56Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/store.md#Vendor zstd-safe and mark its dictionaries `Send` and `Sync` (everything is ours)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:151"
+    },
+    {
+      "at": "2026-10-30T08:24:56Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

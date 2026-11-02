@@ -1,0 +1,38 @@
+{
+  "id": "00755",
+  "from_lane": "fastcompile-macros-corpus",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-macro-eval/Cargo.toml",
+    "v2/requests/fastcompile.md",
+    "harness/macroeval_corpus.py",
+    "crates/blaze-macro-eval/tests/corpus/ws"
+  ],
+  "what": "- (done: all in `[dev-dependencies]`) To the parent, fastcompile-macros, \"fastcompile-macros-corpus 1\": `crates/blaze-macro-eval/Cargo.toml`\n  `[dev-dependencies]`, each `workspace = true`: `native-proc-macro`, `blaze-macro-wasm`,\n  `proc-macro-api`, `blaze-units`, `blaze-query`, `blaze-vfs`, `serde` (with\n  `features = [\"derive\"]`), `serde_json`. `tests/corpus.rs` and `tests/kept.rs` use them (the\n  in-test reference, the wasm and toolchain references, planning and lowering the fixture\n  workspace, the typed `BLAZE_MACRO_CORPUS` config). Everything else they use is a dependency\n  already.\n- (filed as \"fastcompile-macros 6\" to lane proof in `v2/requests/fastcompile.md`) To the parent, \"fastcompile-macros-corpus 2\": a harness script (`harness/macroeval_corpus.py`,\n  one JSON value in, as rule 17 says) that, in an ix VM: copies\n  `crates/blaze-macro-eval/tests/corpus/ws` twice (`workspace`, `scratch`); fetches its\n  registry packages with `cargo fetch --locked` into a `CARGO_HOME` of its own; builds each copy\n  with `blaze build -p corpus-calls` (std's and every build script's runs left beside their\n  `OUT_DIR`); builds rustc's library of each proc-macro crate (`serde_derive`,\n  `thiserror_impl`, `tokio_macros`, `corpus_macros`, `corpus_state`) with the pinned nightly as\n  the reference, and the toolchain's `proc-macro-srv`; optionally blaze's wasm module of each;\n  writes the `BLAZE_MACRO_CORPUS` config (`tests/corpus/config.rs`) and runs\n  `blaze test -p blaze-macro-eval --test corpus --test kept -- --ignored`, with `BLAZE_CACHE`\n  and `BLAZE_PROC_MACRO_CACHE` unset.",
+  "state": "refused",
+  "created": "2026-10-30T06:52:38Z",
+  "updated": "2026-10-30T08:39:06Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "already done: item 1 is in crates/blaze-macro-eval/Cargo.toml [dev-dependencies] (the request says so), and item 2 is harness/v2/macroeval_corpus.py (copy, cargo fetch --locked into its own CARGO_HOME, blaze build -p corpus-calls, rustc reference libraries, the toolchain proc-macro-srv, BLAZE_MACRO_CORPUS config, blaze test --test corpus --test kept -- --ignored with BLAZE_CACHE and BLAZE_PROC_MACRO_CACHE unset). Its docstring now names crates/proc-macro-srv-cli, not the deleted vendor/proc-macro-srv.",
+  "source": "v2/requests/fastcompile-macros-corpus.md#",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-macros-corpus.md:2"
+    },
+    {
+      "at": "2026-10-30T08:39:06Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:06Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "already done: item 1 is in crates/blaze-macro-eval/Cargo.toml [dev-dependencies] (the request says so), and item 2 is harness/v2/macroeval_corpus.py (copy, cargo fetch --locked into its own CARGO_HOME, blaze build -p corpus-calls, rustc reference libraries, the toolchain proc-macro-srv, BLAZE_MACRO_CORPUS config, blaze test --test corpus --test kept -- --ignored with BLAZE_CACHE and BLAZE_PROC_MACRO_CACHE unset). Its docstring now names crates/proc-macro-srv-cli, not the deleted vendor/proc-macro-srv."
+    }
+  ]
+}

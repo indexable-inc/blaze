@@ -1,0 +1,38 @@
+{
+  "id": "00712",
+  "from_lane": "cargo-std",
+  "owner": "cargo",
+  "paths": [
+    "harness/answers.py",
+    "crates/blaze-units/src/stdlib/rustc.json",
+    "crates/blaze-units/src/stdlib/table.rs",
+    "crates/blaze-units/src/query.rs"
+  ],
+  "what": "## 9. From cargo-std: two steps to the speed bar that are outside cargo-std's paths\n\n- **coordinator, `harness/answers.py --write`:** besides `crates/blaze-units/src/stdlib/rustc.json`,\n  also write `crates/blaze-units/src/stdlib/table.rs`: the per-target columns `stdlib/target.rs`\n  compiles at its first call, as `static` data. Then no JSON is parsed at run time (today about\n  1 ms once per process). cargo-std will switch `target.rs` to that file once its format is agreed.\n- **lane cargo, `crates/blaze-units/src/query.rs`:** a `Persist` for already-encoded CBOR, with\n  the same schema and layout as `Cbor<T>` (`CborBytes<'a, T>(&'a [u8])`), so `StdUnits` can\n  return `Foreign`'s bytes after checking them instead of decoding and encoding them again.\n\n> forwarded to coordinator: `harness/answers.py` writing `stdlib/table.rs` is the coordinator's, not among the paths `requests` applies.\n> forwarded to cargo: `CborBytes<'a, T>` in `crates/blaze-units/src/query.rs` is lane cargo's own path; lane cargo is still running.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#9. From cargo-std: two steps to the speed bar that are outside cargo-std's paths",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:452"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "CborBytes<T> is in crates/blaze-units/src/query.rs:99 (the table.rs half is the coordinator's)"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00334",
+  "from_lane": "mem-db-infer-ctx",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## Tracked functions, tags and entry points (R1, R6)\n\n- `infer_body_query` and `infer_anon_const_body_query`: `#[salsa::tracked(.., mem_tag =\n  crate::db::INFER_TAG)]`, bodies in `blaze_mem::frame::current` (A2).\n- `infer_query_with_inspect` (`pub`, the inspector's entry, outside a query):\n  `blaze_mem::frame::task(crate::db::INFER_TAG, ..)` around `infer_body_in` (A2).\n- `InferenceTable::could_unify`, `could_unify_deeply` (called from `crates/hir`): no task, since\n  they allocate nothing of their own in a frame (U8).\n- `InferenceResult::to_record`: no frame, scratch only (P3, P4). `InferenceRecordRef::to_result`\n  and `decode`: `frame::task(crate::db::INFER_TAG, ..)` (P5).\n- Test-only `from_entries` builders: their own `frame::task` (C4 to C11).\n\n> forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).\n> checked by db-audit-mem (22:44): in the tree at `crates/hir-ty/src/infer.rs:1719` and `:1737` (`mem_tag = Infer`), `infer.rs:149` (`infer_query_with_inspect`'s task), `infer/persist.rs:1064` (decode's task), `infer/columns.rs:261`, `:367`, `:547`, `:1136` (`from_entries`' tasks).",
+  "state": "applied",
+  "created": "2026-10-30T03:32:35Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-ctx.md#Tracked functions, tags and entry points (R1, R6)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-ctx.md:3641"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:44): in the tree at `crates/hir-ty/src/infer.rs:1719` and `:1737` (`mem_tag = Infer`), `infer.rs:149` (`infer_query_with_inspect`'s task), `infer/persist.rs:1064` (decode's task), `infer/columns.rs:261`, `:367`, `:547`, `:1136` (`from_entries`' tasks)."
+    }
+  ]
+}

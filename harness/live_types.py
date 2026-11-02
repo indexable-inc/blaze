@@ -19,8 +19,8 @@ one after another, each of which has to be applied as a patch with no restart:
   4  changes a field of `V2`, which the program has values of: the program is told to restart,
      and why, naming `V2`
 
-Each stage's answer is compared with the first answer of the same text built by cargo and rustc
-and started afresh; every edit's time from the build's start to the program having applied it
+Each stage's answer is compared with the first answer of the same text built by blaze from
+nothing (a home, a store and a target directory of its own) and started afresh; every edit's time from the build's start to the program having applied it
 is printed. Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
 """
 
@@ -28,6 +28,7 @@ import asyncio
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -39,7 +40,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 PROGRAM = HERE / "live-types"
 STAGE_MARK = "// The stage.\n"
-REFERENCE_TIMEOUT = 600
 
 
 def text_of(stage: int) -> str:
@@ -59,27 +59,25 @@ def answer_of(line: str) -> str:
     return re.sub(r" at_us=\d+$", "", line.removeprefix("answer "))
 
 
-async def reference(stage: int, work: Path) -> str:
-    """The first answer of the stage's text built by cargo and started afresh."""
-    step = f"reference {stage}"
-    project = work / "reference" / "harness" / "live-types"
+async def from_nothing(stage: int, work: Path, bin_dir: Path) -> str:
+    """The first answer of the stage's text built by blaze from nothing and started afresh."""
+    step = f"from nothing {stage}"
+    project = work / "scratch" / "harness" / "live-types"
     (project / "src" / "main.rs").write_text(text_of(stage))
-    env = dict(os.environ, CARGO_TARGET_DIR=str(work / "target-reference"))
-    cmd = ["cargo", "build", "--locked"]
+    # Short, under /tmp: the daemon's socket is in it, and macOS allows 104 bytes.
+    home = tempfile.mkdtemp(prefix="rj-scratch-", dir=None if os.name == "nt" else "/tmp")
+    target = work / f"target-scratch-{stage}"
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
+               CARGO_TARGET_DIR=str(target))
+    env.pop("CARGO_INCREMENTAL", None)
     try:
-        async with asyncio.timeout(REFERENCE_TIMEOUT):
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=project, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            out, err = await proc.communicate()
-    except TimeoutError:
-        raise StepError(f"{step}: timed out after {REFERENCE_TIMEOUT}s\n  command: {' '.join(cmd)}") from None
-    if proc.returncode != 0:
-        tail = "\n".join((out + err).decode(errors="replace").strip().splitlines()[-30:])
-        raise StepError(f"{step}: exit code {proc.returncode}\n  command: {' '.join(cmd)}\n  output tail:\n{tail}")
+        await build(step, project, env)
+    finally:
+        subprocess.run(["blaze", "stop"], cwd=project, env=env, capture_output=True, timeout=120)
+        shutil.rmtree(home, ignore_errors=True)
     running = Running(
         await asyncio.create_subprocess_exec(
-            str(work / "target-reference" / "debug" / "livetypes"),
+            str(target / "debug" / "livetypes"),
             cwd=project,
             env=env,
             stdout=asyncio.subprocess.PIPE,
@@ -114,14 +112,14 @@ async def main() -> None:
     work = Path(tempfile.mkdtemp(prefix="blaze-live-types-"))
     started: list[Running] = []
     try:
-        for copy in [work, work / "reference"]:
+        for copy in [work, work / "scratch"]:
             shutil.copytree(ROOT / "crates" / "blaze-live", copy / "crates" / "blaze-live")
             shutil.copytree(PROGRAM, copy / "harness" / "live-types", ignore=shutil.ignore_patterns("target"))
         stages = [0, 1, 2, 3]
         expected = {}
         for stage in stages:
-            expected[stage] = await reference(stage, work)
-            print(f"reference {stage}: {expected[stage]}")
+            expected[stage] = await from_nothing(stage, work, bin_dir)
+            print(f"from nothing {stage}: {expected[stage]}")
 
         project = work / "harness" / "live-types"
         source = project / "src" / "main.rs"
@@ -149,7 +147,7 @@ async def main() -> None:
         await program.wait_for("start", "ready")
         got = answer_of(await program.wait_for("start", "answer "))
         if got != expected[0]:
-            raise StepError(f"start: the program says `{got}`, rustc's build `{expected[0]}`")
+            raise StepError(f"start: the program says `{got}`, the build from nothing `{expected[0]}`")
         print(f"started: {got}")
 
         names = {1: "add V2", 2: "move to V2", 3: "delete V1"}
@@ -160,7 +158,7 @@ async def main() -> None:
             if not applied(outcome):
                 raise StepError(f"{step}: the edit was not applied as a patch: {outcome}")
             if got != expected[stage]:
-                raise StepError(f"{step}: the program says `{got}`, rustc's build `{expected[stage]}`")
+                raise StepError(f"{step}: the program says `{got}`, the build from nothing `{expected[stage]}`")
             print(f"  {got}")
 
         # A type the program has values of, changed in place, is the one edit that restarts.

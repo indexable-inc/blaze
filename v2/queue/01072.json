@@ -1,0 +1,36 @@
+{
+  "id": "01072",
+  "from_lane": "integrate-docs",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/stub.rs",
+    "crates/blaze-units/src/load/sandbox.rs"
+  ],
+  "what": "From integrate-docs-cargo (read from code): (1) crates/blaze-cargo/src/stub.rs is an orphan file (no mod stub) that runs rustc: delete (no-rustc). (2) manifest opt-outs unsandboxed-proc-macros, build-script-env, wasi-build-scripts are accepted and only checked to be lists, then ignored (blaze-units load/sandbox.rs): a silent no-op, make them errors or honour them (no-fallback; with usercode). (3) no doctests (blaze test --doc makes none), no daemon idle exit, no command reports the Rust version, no blaze cache list/clear (blaze_cache::store::clear_stale uncalled). docs/cargo.md and docs/usage.md now say these as v2 gaps.",
+  "state": "applied",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-31T20:36:01Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:01Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:01Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "(1) stub.rs is deleted (no-fallback-link-cargo-cli). (2) crates/blaze-units/src/load/sandbox.rs: unsandboxed-proc-macros and wasi-build-scripts are load errors saying why and to remove the key; build-script-env is honoured (scripts get the whole environment), test in a_table_said_otherwise_is_an_error; harness/selects.py and docs/cargo.md queued to coordinator. (3) doctests: 00969; idle exit, rust version, cache list/clear: open as gaps, tracked under 01064/01002 for the version, not done this pass."
+    }
+  ]
+}

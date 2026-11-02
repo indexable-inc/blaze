@@ -114,14 +114,6 @@ jobs:
             ripgrep fd bat hyperfine just axum nushell helix bevy biome --runs 5 --cold-runs 5 "${full[@]}" \
             --work "$work" --reference "$BENCH_HOME/reference" --out "$RUNNER_TEMP/results/bench.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
-      # How fast the built programs run: harness/runbench.py, blaze's LLVM against
-      # `cargo build --release`, into the runtime table.
-      - name: Runtime bench
-        continue-on-error: true
-        run: |
-          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/blaze-engine" APPS_DIR="$BENCH_HOME/apps"
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime \
-            --runs 5 --out "$RUNNER_TEMP/results/runtime.json"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -157,7 +149,7 @@ jobs:
       - name: README and docs/benchmarks.md
         run: |
           # A result refused (a program that said something else) leaves its platform's numbers as they were.
-          for result in "$RUNNER_TEMP"/results/bench-*/bench.json "$RUNNER_TEMP"/results/bench-*/runtime.json; do
+          for result in "$RUNNER_TEMP"/results/bench-*/bench.json; do
             [ -f "$result" ] || continue
             echo "::group::$result"
             python3 harness/benchreport.py "$result" ${{ inputs.force && '--force' || '' }} || echo "::warning::$result was not published"

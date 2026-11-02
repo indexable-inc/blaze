@@ -1,0 +1,35 @@
+{
+  "id": "01125",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R7 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): add `Storage::ingredient_file(u32) -> &'static str` (`file!()` of the definition, from the generated code). blaze-item-hash reads.rs:298 tells same-named queries of different crates apart by file (`zalsa().lookup_ingredient(i).location().file`), keyed in its RULES table.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: Storage::ingredient_file, Vtable carries file!()."
+    }
+  ]
+}

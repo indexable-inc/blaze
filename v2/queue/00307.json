@@ -1,0 +1,27 @@
+{
+  "id": "00307",
+  "from_lane": "speed-hir-store-apply-hir",
+  "owner": "mem-format",
+  "paths": [
+    "crates/hir-def/src/hir.rs",
+    "crates/hir-def/src/expr_store/path.rs",
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty/src/infer/expr.rs",
+    "crates/blaze-diagnostics/src/lints/names/dead/mark/body.rs"
+  ],
+  "what": "## `hir::AsmOperand::Sym` now holds a `PathIdx` (2026-10-29)\n\n`crates/hir-def/src/hir.rs`: `AsmOperand::Sym(Path)` became `Sym(PathIdx)`, a row of the store's\n`PathColumns` (contract: `~/restart-2026-10-28/briefs/v2/speed-hir-store-paths-contract.md`).\nA reader gets the path with `store.path_at(idx)` (a `Path<'_>` view; `ExpressionStore::path_at`\nin `crates/hir-def/src/expr_store/path.rs`). These HIR readers outside hir-def take the path and\nmust change, each in its owner's lane:\n\n- `crates/hir-ty-mir/src/mir/lower.rs:660`: `AsmOperand::Sym(path)` passed to\n  `resolve_path_in_value_ns_fully` -> resolve `self.store.path_at(path)` (the body's store).\n- `crates/hir-ty/src/infer/expr.rs:929`: `AsmOperand::Sym(ref path)` into `self.infer_path(path, ..)`\n  -> `AsmOperand::Sym(path)` and `self.infer_path(self.store.path_at(path), ..)` (whatever\n  `infer_path` takes after the `Path<'a>` migration).\n- `crates/blaze-diagnostics/src/lints/names/dead/mark/body.rs:161`: `if let AsmOperand::Sym(path)`\n  into `self.resolve(None, path, ..)` -> resolve `store.path_at(*path)`.\n\nThe MIR-level `AsmOperand::Sym` matches (hir-ty-mir pretty/optimize/monomorphization, hir-ty-share\nwalk, hir-ty-borrowck, hir-ty-codegen, blaze-items form.rs) are a different type and unaffected,\nas are the `Sym(_)` arms in hir-ide, hir-ty-unsafeck, blaze-diagnostics unsafety.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> mem-format-fwd: information, nothing to apply in `hir*` (`hir.rs` has `Sym(PathIdx)`). Already in at all three readers: `hir-ty-mir/src/mir/lower.rs` ~L881 (`self.store.path_at(*path)`), `hir-ty/src/infer/expr.rs` ~L935 (`self.infer_path(self.store.path_at(path), ..)`), `blaze-diagnostics/.../dead/mark/body.rs` L162 (`store.path_at(*path)`).",
+  "state": "open",
+  "created": "2026-10-30T03:18:36Z",
+  "updated": "2026-10-30T03:18:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir-store-apply-hir.md#`hir::AsmOperand::Sym` now holds a `PathIdx` (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir-store-apply-hir.md:3"
+    }
+  ]
+}

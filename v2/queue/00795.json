@@ -1,0 +1,36 @@
+{
+  "id": "00795",
+  "from_lane": "sol-all-ty",
+  "owner": "sol-all-hirdef",
+  "paths": [
+    "crates/hir-def/src/expr_store.rs",
+    "crates/hir-def/src/hir/columns.rs"
+  ],
+  "what": "Two kind-only reads on ExpressionStore (crates/hir-def/src/expr_store.rs), for match checking's 'body with nothing to check' row (docs/v2/plan/lanes/db/speed-of-light.md, hir-ty-matchck summary): (1) `pub fn expr_kind(&self, id: ExprId) -> hir::ExprKind`, one byte read of `columns.expr_kind`, no row decode; (2) `pub fn let_statements(&self) -> impl Iterator<Item = (PatId, bool /* has else */)>` over the statement column's Let rows, decoding only those. Please say in its doc whether every statement row belongs to some Block expression (no orphan rows left by lowering's statement stack / truncate_statements); matchck needs that to replace its decode of every Block with a scan of Let rows exactly. With both, hir-ty-matchck's needs_analysis goes from ~3K cycles (decoding every expression row) to ~400. I'll switch crates/hir-ty-matchck/src/visit.rs to them once they land.",
+  "state": "applied",
+  "created": "2026-10-30T08:03:43Z",
+  "updated": "2026-10-30T08:13:57Z",
+  "taken_by": "sol-all-hirdef",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:03:43Z",
+      "by": "sol-all-ty",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:12:00Z",
+      "by": "sol-all-hirdef",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:13:57Z",
+      "by": "sol-all-hirdef",
+      "action": "done",
+      "note": "crates/hir-def/src/expr_store.rs: ExpressionStore::expr_kind(id) -> hir::ExprKind (one expr_kind byte, no decode; panics as bad_store on an id past the arena) and ExpressionStore::let_statements() -> impl Iterator<Item = (PatId, bool has_else)> (only Let rows, their head word); backed by HirColumns::expr_kind_of / let_statements in hir/columns.rs. Its doc states the invariant: every statement row is a row of exactly one Expr::Block of the store (lowering collects statements on its own Lists stack and writes a block rows only when it writes that block; truncate_statements acts on that stack, not the store), including blocks lowering made and left unreferenced; only ExpressionStoreBuilder::set_expr replacing a block (no caller in lowering, only columns.rs tests) could leave rows of no block. Test: expr_store/tests/body.rs kind_reads_are_the_decoded_rows (kinds == ExprKind::of(decoded), let rows == lets of every Block, budget 0)."
+    }
+  ]
+}

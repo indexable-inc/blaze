@@ -3,8 +3,8 @@
 A case of gen.py gets a few of them (#862). For each one the case has a constant that calls
 it, which the compiler evaluates (blaze: its MIR interpreter), and `run` calls it again on the
 same arguments through `black_box`, which is compiled code. Both results go into the
-checksum, so blaze's build prints what rustc's does only when the interpreter and the code
-generator agree with each other and with rustc.
+checksum, so a build whose interpreter or code generator an edit or the store reached wrong
+prints another than the build it is held to.
 
 What a body may do is what a `const fn` may on the pinned nightly without a feature: integer
 and float arithmetic, `as`, `while` and `loop` with a counter, `if`, `match`, arrays indexed

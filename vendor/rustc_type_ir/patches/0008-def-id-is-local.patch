@@ -1,0 +1,13 @@
+diff -ruN a/src/inherent.rs b/src/inherent.rs
+--- a/src/inherent.rs
++++ b/src/inherent.rs
+@@ -604,7 +604,8 @@
+ pub trait DefId<I: Interner, Local = <I as Interner>::LocalDefId>:
+     Copy + Debug + Hash + Eq + TypeFoldable<I>
+ {
+-    fn is_local(self) -> bool;
++    /// Whether this is an id of the crate `cx` checks (rustc's `krate == LOCAL_CRATE`).
++    fn is_local(self, cx: I) -> bool;
+ 
+     fn as_local(self) -> Option<Local>;
+ }

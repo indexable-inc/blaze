@@ -1,13 +1,13 @@
 //! Trait solving using next trait solver.
 
-use std::{cell::OnceCell, hash::Hash};
+use std::{cell::OnceCell, fmt, hash::Hash};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
     expr_store::ExpressionStore,
     hir::generics::WherePredicate,
-    lang_item::LangItems,
+    lang_item::{LangItemEnum, LangItems},
     nameres::DefMap,
     resolver::Resolver,
     signatures::{
@@ -19,7 +19,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_type_ir::{
-    TypeVisitableExt, TypingMode,
+    AliasTy, AliasTyKind, TypeVisitableExt, TypingMode,
     inherent::{BoundExistentialPredicates, IntoKind, Ty as _},
 };
 
@@ -53,7 +53,7 @@ impl<'db> ParamEnvAndCrate<'db> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredParamEnvAndCrate {
     param_env: StoredClauses,
     pub krate: Crate,
@@ -61,12 +61,12 @@ pub struct StoredParamEnvAndCrate {
 
 impl StoredParamEnvAndCrate {
     #[inline]
-    pub fn param_env<'db>(&self, _db: &'db dyn HirDatabase) -> ParamEnv<'db> {
+    pub fn param_env<'db>(&self, _db: &'db Db) -> ParamEnv<'db> {
         ParamEnv { clauses: self.param_env.as_ref() }
     }
 
     #[inline]
-    pub fn as_ref<'db>(&self, db: &'db dyn HirDatabase) -> ParamEnvAndCrate<'db> {
+    pub fn as_ref<'db>(&self, db: &'db Db) -> ParamEnvAndCrate<'db> {
         ParamEnvAndCrate { param_env: self.param_env(db), krate: self.krate }
     }
 }
@@ -83,7 +83,7 @@ pub fn structurally_normalize_ty<'db>(
     ty.replace_infer_with_error(infcx.interner)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_query::Value)]
 pub enum FnTrait {
     // Warning: Order is important. If something implements `x` it should also implement
     // `y` if `y <= x`.
@@ -118,41 +118,102 @@ impl FnTrait {
             FnTrait::AsyncFn => lang_items.AsyncFn,
         }
     }
+
+    pub fn lang_item(self) -> LangItemEnum {
+        match self {
+            FnTrait::FnOnce => LangItemEnum::FnOnce,
+            FnTrait::FnMut => LangItemEnum::FnMut,
+            FnTrait::Fn => LangItemEnum::Fn,
+            FnTrait::AsyncFnOnce => LangItemEnum::AsyncFnOnce,
+            FnTrait::AsyncFnMut => LangItemEnum::AsyncFnMut,
+            FnTrait::AsyncFn => LangItemEnum::AsyncFn,
+        }
+    }
+
+    /// The trait's name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FnTrait::FnOnce => "FnOnce",
+            FnTrait::FnMut => "FnMut",
+            FnTrait::Fn => "Fn",
+            FnTrait::AsyncFnOnce => "AsyncFnOnce",
+            FnTrait::AsyncFnMut => "AsyncFnMut",
+            FnTrait::AsyncFn => "AsyncFn",
+        }
+    }
+}
+
+impl fmt::Display for FnTrait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// This should not be used in `hir-ty`, only in `hir`.
 pub fn implements_trait_unique<'db>(
     ty: Ty<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
 ) -> bool {
-    implements_trait_unique_with_infcx(db, env, trait_, &mut |infcx| {
+    implements_trait_unique_with_infcx(db, env, trait_, |infcx| {
         infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()])
     })
 }
 
 /// This should not be used in `hir-ty`, only in `hir`.
 pub fn implements_trait_unique_with_args<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
     args: GenericArgs<'db>,
 ) -> bool {
-    implements_trait_unique_with_infcx(db, env, trait_, &mut |_| args)
+    implements_trait_unique_with_infcx(db, env, trait_, |_| args)
 }
 
 pub fn implements_trait_unique_with_infcx<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
-    create_args: &mut dyn FnMut(&InferCtxt<'db>) -> GenericArgs<'db>,
+    create_args: impl FnOnce(&InferCtxt<'db>) -> GenericArgs<'db>,
 ) -> bool {
     let interner = DbInterner::new_with(db, env.krate);
     // FIXME(next-solver): I believe this should be `PostAnalysis`.
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
 
     let args = create_args(&infcx);
+    trait_ref_holds(&infcx, env, trait_, args)
+}
+
+/// For each of `traits` in order, `each` of it and what [`implements_trait_unique`] answers
+/// for `ty`, from one interner and one inference context in the same typing mode. Each check
+/// runs in its own probe, which rolls back the universe, every variable table, region
+/// constraints and obligations and opaque types, so no check sees what another left.
+pub fn implements_traits_unique<'db>(
+    ty: Ty<'db>,
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    traits: &[TraitId],
+    mut each: impl FnMut(TraitId, bool),
+) {
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    for &trait_ in traits {
+        let holds = infcx.probe(|_| {
+            let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
+            trait_ref_holds(&infcx, env, trait_, args)
+        });
+        each(trait_, holds);
+    }
+}
+
+fn trait_ref_holds<'db>(
+    infcx: &InferCtxt<'db>,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    args: GenericArgs<'db>,
+) -> bool {
+    let interner = infcx.interner;
     let trait_ref = rustc_type_ir::TraitRef::new_from_args(interner, trait_.into(), args);
     if trait_ref.self_ty().is_ty_error() {
         return false;
@@ -165,9 +226,9 @@ pub fn implements_trait_unique_with_infcx<'db>(
 /// Whether two types unify once `create_tys` has replaced their generic parameters with
 /// inference variables: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
 pub fn could_unify_with_infcx<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
-    create_tys: &mut dyn FnMut(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
+    create_tys: impl FnOnce(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
 ) -> bool {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -179,10 +240,10 @@ pub fn could_unify_with_infcx<'db>(
 /// `synthesize_blanket_impls` asks: the impl's parameters are inference variables, its self
 /// type is equated with the type, and its where-clauses and trait ref may each hold.
 pub fn impl_may_apply<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     impl_: ImplId,
-    create_ty: &mut dyn FnMut(&InferCtxt<'db>) -> Ty<'db>,
+    create_ty: impl FnOnce(&InferCtxt<'db>) -> Ty<'db>,
 ) -> bool {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -218,7 +279,7 @@ pub fn impl_may_apply<'db>(
 /// the impl leaves as the trait provides it. `krate` is the crate asking, rustc's local crate:
 /// a clause it could not know the answer to holds as far as it can tell.
 pub fn is_impossible_associated_item(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     impl_: ImplId,
     item: GenericDefId,
@@ -254,7 +315,10 @@ pub fn is_impossible_associated_item(
     }
 
     let Some(trait_ref) = db.impl_trait(impl_) else { return false };
-    let interner = DbInterner::new_with(db, impl_.krate(db));
+    // Solved for `krate`, rustc's local crate: coherence answers a trait goal only a crate
+    // upstream of it could implement (`io::Error: Ord`) as ambiguous, since that crate may add
+    // the impl.
+    let interner = DbInterner::new_with(db, krate);
     // As coherence asks: the impl's parameters are inference variables, so a clause that holds
     // for some of their values (`T: Ord` of an `IntoIter<T>`) is ambiguous, not an error.
     let infcx = interner.infer_ctxt().build(TypingMode::Coherence);
@@ -266,85 +330,12 @@ pub fn is_impossible_associated_item(
         .skip_binder()
         .filter(|clause| clause.visit_with(&mut OwnParam(parent)).is_continue())
     {
-        let clause = EarlyBinder::bind(clause).instantiate(interner, args).skip_norm_wip();
-        // Coherence answers a trait goal only a crate upstream of `krate` could implement
-        // (`io::Error: Ord`) as ambiguous, since that crate may add the impl; rust-analyzer's
-        // solver takes every crate as local, so the goal is left out here instead.
-        // A projection is normalized as the solver constrains it, though the impl's own bounds
-        // on its inference variables leave the goal ambiguous (`Self::Item` of a
-        // `FindIter<'a, 'h, A: Automaton>` is `Match`); one under a binder (`for<'a>`) is
-        // judged as written, the normalizer taking no bound vars. Each projection has a
-        // fulfillment context of its own, so the clauses already registered are answered once,
-        // at the end, and not with it.
-        if let rustc_type_ir::ClauseKind::Trait(pred) = clause.kind().skip_binder() {
-            let known = knowable(db, krate, pred.trait_ref, |ty| {
-                if !matches!(ty.kind(), TyKind::Alias(..)) || ty.has_escaping_bound_vars() {
-                    return ty;
-                }
-                let mut own = crate::next_solver::fulfill::FulfillmentCtxt::new(&infcx);
-                infcx
-                    .at(&ObligationCause::dummy(), ParamEnv::empty())
-                    .structurally_normalize_ty(ty, &mut own)
-                    .ok()
-                    .filter(|it| !matches!(it.kind(), TyKind::Infer(_)))
-                    .unwrap_or(ty)
-            });
-            if !known {
-                continue;
-            }
-        }
-        ocx.register_obligation(Obligation::new(
-            interner,
-            ObligationCause::dummy(),
-            ParamEnv::empty(),
-            clause,
-        ));
+        let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
+        let obligation =
+            Obligation::new(interner, ObligationCause::dummy(), ParamEnv::empty(), clause);
+        ocx.register_obligation(obligation);
     }
     !ocx.try_evaluate_obligations().is_empty()
-}
-
-/// Whether `krate` can know every impl of `trait_ref`: the trait is its own or `#[fundamental]`,
-/// or one of the types is its own, under references and `#[fundamental]` types. rustc's
-/// `trait_ref_is_knowable` and `orphan_check_trait_ref`, leaving out where parameters may appear.
-/// Each type looked at goes through `normalize` first.
-fn knowable<'db>(
-    db: &'db dyn HirDatabase,
-    krate: Crate,
-    trait_ref: crate::next_solver::TraitRef<'db>,
-    mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,
-) -> bool {
-    let trait_id = trait_ref.def_id.0;
-    if trait_id.module(db).krate(db) == krate
-        || TraitSignature::of(db, trait_id).flags.contains(TraitFlags::FUNDAMENTAL)
-    {
-        return true;
-    }
-    trait_ref.args.types().any(|mut ty| {
-        loop {
-            ty = normalize(ty);
-            match ty.kind() {
-                TyKind::Ref(_, inner, _) => ty = inner,
-                TyKind::Adt(adt_def, args) => {
-                    let fundamental = match adt_def.def_id() {
-                        AdtId::StructId(id) => {
-                            StructSignature::of(db, id).flags.contains(StructFlags::FUNDAMENTAL)
-                        }
-                        _ => false,
-                    };
-                    match args.types().next() {
-                        Some(inner) if fundamental => ty = inner,
-                        _ => break adt_def.def_id().module(db).krate(db) == krate,
-                    }
-                }
-                TyKind::Dynamic(bounds, _) => {
-                    break bounds
-                        .principal_def_id()
-                        .is_some_and(|it| it.0.module(db).krate(db) == krate);
-                }
-                _ => break false,
-            }
-        }
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,86 +349,108 @@ pub enum WherePredicateEvaluation {
 /// This should not be used in `hir-ty`, only in `hir`.
 /// This is exposed to allow the IDE to evaluate arbitrary predicates.
 pub fn where_predicate_must_hold<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     resolver: &Resolver<'db>,
-    store: &'db ExpressionStore,
+    store: &ExpressionStore,
     def: ExpressionStoreOwnerId,
     generic_def: GenericDefId,
     env: ParamEnvAndCrate<'db>,
     predicate: &WherePredicate,
 ) -> WherePredicateEvaluation {
-    let interner = DbInterner::new_with(db, env.krate);
-    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-    let generics = OnceCell::<Generics<'db>>::new();
-    let mut ctx = TyLoweringContext::new(
-        db,
-        resolver,
-        store,
-        def,
-        generic_def,
-        &generics,
-        LifetimeElisionKind::Infer,
-        LifetimeLoweringMode::Bound,
-    )
-    .with_interning_mode(LoweringMode::Ide);
-    let clauses =
-        ctx.lower_where_predicate(predicate, false).map(|(clause, _)| clause).collect::<Vec<_>>();
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        let interner = DbInterner::new_with(db, env.krate);
+        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let generics = OnceCell::<Generics<'db>>::new();
+        let mut ctx = TyLoweringContext::new(
+            db,
+            resolver,
+            store,
+            def,
+            generic_def,
+            &generics,
+            LifetimeElisionKind::Infer,
+            LifetimeLoweringMode::Bound,
+            frame,
+        )
+        .with_interning_mode(LoweringMode::Ide);
+        let mut clauses = Vec::new_in(frame);
+        clauses.extend(ctx.lower_where_predicate(predicate, false).map(|(clause, _)| clause));
 
-    if !ctx.diagnostics.is_empty()
-        || clauses.iter().any(|clause| clause.as_predicate().references_error())
-    {
-        return WherePredicateEvaluation::HasErrors;
-    }
-
-    if clauses.is_empty() {
-        return if ctx.unsized_types.is_empty() {
-            WherePredicateEvaluation::HasErrors
-        } else {
-            WherePredicateEvaluation::NoObligations
-        };
-    }
-
-    let result = infcx.probe(|snapshot| {
-        let mut ocx = ObligationCtxt::new(&infcx);
-        for clause in clauses {
-            let obligation = Obligation::new(
-                interner,
-                ObligationCause::dummy(),
-                env.param_env,
-                clause.as_predicate(),
-            );
-            ocx.register_obligation(obligation);
+        if !ctx.diagnostics.is_empty()
+            || clauses.iter().any(|clause| clause.as_predicate().references_error())
+        {
+            return WherePredicateEvaluation::HasErrors;
         }
 
-        let mut result = EvaluationResult::EvaluatedToOk;
-        for error in ocx.evaluate_obligations_error_on_ambiguity() {
-            if error.is_true_error() {
-                return EvaluationResult::EvaluatedToErr;
+        if clauses.is_empty() {
+            return if ctx.unsized_types.is_empty() {
+                WherePredicateEvaluation::HasErrors
+            } else {
+                WherePredicateEvaluation::NoObligations
+            };
+        }
+
+        let result = infcx.probe(|snapshot| {
+            let mut ocx = ObligationCtxt::new(&infcx);
+            for clause in clauses {
+                let obligation = Obligation::new(
+                    interner,
+                    ObligationCause::dummy(),
+                    env.param_env,
+                    clause.as_predicate(),
+                );
+                ocx.register_obligation(obligation);
             }
-            result = result.max(EvaluationResult::EvaluatedToAmbig);
-        }
-        if infcx.opaque_types_added_in_snapshot(snapshot) {
-            result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
-        } else if infcx.region_constraints_added_in_snapshot(snapshot) {
-            result.max(EvaluationResult::EvaluatedToOkModuloRegions)
-        } else {
-            result
-        }
-    });
 
-    if result.must_apply_modulo_regions() {
-        WherePredicateEvaluation::Holds
-    } else {
-        WherePredicateEvaluation::NotProven
-    }
+            let mut result = EvaluationResult::EvaluatedToOk;
+            for error in ocx.evaluate_obligations_error_on_ambiguity() {
+                if error.is_true_error() {
+                    return EvaluationResult::EvaluatedToErr;
+                }
+                result = result.max(EvaluationResult::EvaluatedToAmbig);
+            }
+            if infcx.opaque_types_added_in_snapshot(snapshot) {
+                result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
+            } else if infcx.region_constraints_added_in_snapshot(snapshot) {
+                result.max(EvaluationResult::EvaluatedToOkModuloRegions)
+            } else {
+                result
+            }
+        });
+
+        if result.must_apply_modulo_regions() {
+            WherePredicateEvaluation::Holds
+        } else {
+            WherePredicateEvaluation::NotProven
+        }
+    })
 }
 
-pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id: ImplId) -> bool {
-    let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+/// Whether the inherent impl `impl_id` may be written in the crate of `def_map`. The answer
+/// depends on the impl, that crate and whether it is `#![rustc_coherence_is_core]`, and is
+/// kept per impl.
+pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> bool {
+    inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
+}
+
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+fn inherent_impl_coherent(
+    db: &Db,
+    impl_id: ImplId,
+    krate: Crate,
+    rustc_coherence_is_core: bool,
+) -> bool {
+    let mut self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    // rustc's `InherentCollect::check_item`: a pattern type is taken as its base.
+    while let TyKind::Pat(base, _) = self_ty.kind() {
+        self_ty = base;
+    }
     let self_ty = self_ty.kind();
     let impl_allowed = match self_ty {
         TyKind::Tuple(_)
         | TyKind::FnDef(_, _)
+        | TyKind::FnPtr(..)
+        | TyKind::UnsafeBinder(_)
         | TyKind::Array(_, _)
         | TyKind::Never
         | TyKind::RawPtr(_, _)
@@ -448,12 +461,24 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
         | TyKind::Char
         | TyKind::Int(_)
         | TyKind::Uint(_)
-        | TyKind::Float(_) => def_map.is_rustc_coherence_is_core(),
+        | TyKind::Float(_) => rustc_coherence_is_core,
 
-        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == def_map.krate(),
-        TyKind::Dynamic(it, _) => it
-            .principal_def_id()
-            .is_some_and(|trait_id| trait_id.0.module(db).krate(db) == def_map.krate()),
+        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == krate,
+        TyKind::Dynamic(it, _) => {
+            it.principal_def_id().is_some_and(|trait_id| trait_id.0.module(db).krate(db) == krate)
+        }
+        // rustc's `InherentNominal` (E0118): no type to hang the impl on, in any crate.
+        TyKind::Param(_)
+        | TyKind::Alias(
+            _,
+            AliasTy {
+                kind:
+                    AliasTyKind::Projection { .. }
+                    | AliasTyKind::Inherent { .. }
+                    | AliasTyKind::Opaque { .. },
+                ..
+            },
+        ) => false,
 
         _ => true,
     };
@@ -461,6 +486,8 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
         let rustc_has_incoherent_inherent_impls = match self_ty {
             TyKind::Tuple(_)
             | TyKind::FnDef(_, _)
+            | TyKind::FnPtr(..)
+            | TyKind::UnsafeBinder(_)
             | TyKind::Array(_, _)
             | TyKind::Never
             | TyKind::RawPtr(_, _)
@@ -516,7 +543,16 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
 /// - All of
 ///   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
 ///   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
-pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
+    orphan_rules_hold(db, impl_)
+}
+
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
+    check_orphan_rules_uncached(db, impl_)
+}
+
+fn check_orphan_rules_uncached<'db>(db: &'db Db, impl_: ImplId) -> bool {
     let Some(impl_trait) = db.impl_trait(impl_) else {
         // not a trait impl
         return true;
@@ -532,13 +568,18 @@ pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool 
         return true;
     }
 
-    let interner = DbInterner::new_with(db, local_crate);
-    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    let param_env = db.trait_environment(impl_.into());
-    let trait_ref = infcx
-        .at(&ObligationCause::dummy(), param_env)
-        .deeply_normalize(trait_ref)
-        .unwrap_or(trait_ref);
+    // Normalizing folds only aliases, so a header without one is its own normal form.
+    let trait_ref = if trait_ref.has_aliases() {
+        let interner = DbInterner::new_with(db, local_crate);
+        let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        let param_env = db.trait_environment(impl_.into());
+        infcx
+            .at(&ObligationCause::dummy(), param_env)
+            .deeply_normalize(trait_ref)
+            .unwrap_or(trait_ref)
+    } else {
+        trait_ref
+    };
 
     let unwrap_fundamental = |mut ty: Ty<'db>| {
         // Unwrap all layers of fundamental types with a loop.
@@ -578,4 +619,40 @@ pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool 
     });
     #[allow(clippy::let_and_return, reason = "the name clarifies the meaning of the boolean")]
     is_not_orphan
+}
+
+#[cfg(test)]
+mod fn_trait_tests {
+    use hir_def::lang_item::LangItemEnum;
+
+    use super::FnTrait;
+
+    /// `hir`'s own `FnTrait`, before it became this one: its `Display` and `lang_item`.
+    fn hir_copy(it: FnTrait) -> (&'static str, LangItemEnum) {
+        match it {
+            FnTrait::FnOnce => ("FnOnce", LangItemEnum::FnOnce),
+            FnTrait::FnMut => ("FnMut", LangItemEnum::FnMut),
+            FnTrait::Fn => ("Fn", LangItemEnum::Fn),
+            FnTrait::AsyncFnOnce => ("AsyncFnOnce", LangItemEnum::AsyncFnOnce),
+            FnTrait::AsyncFnMut => ("AsyncFnMut", LangItemEnum::AsyncFnMut),
+            FnTrait::AsyncFn => ("AsyncFn", LangItemEnum::AsyncFn),
+        }
+    }
+
+    #[test]
+    fn names_and_lang_items_are_hirs() {
+        for it in [
+            FnTrait::FnOnce,
+            FnTrait::FnMut,
+            FnTrait::Fn,
+            FnTrait::AsyncFnOnce,
+            FnTrait::AsyncFnMut,
+            FnTrait::AsyncFn,
+        ] {
+            let (name, lang) = hir_copy(it);
+            assert_eq!(it.to_string(), name);
+            assert_eq!(it.as_str(), name);
+            assert_eq!(it.lang_item(), lang);
+        }
+    }
 }

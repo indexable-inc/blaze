@@ -1,18 +1,18 @@
 //! Types, with rustc's `parse_ty_common` span: the type's first token to its last.
 
-use syntax::ast::{self as ra, AstNode};
+use syntax::view::{self as ra, AstNode};
 
 use super::Lower;
 use crate::ast::{self, DUMMY_NODE_ID, ThinVec};
 
 impl Lower<'_> {
-    pub(crate) fn ty(&self, ty: &ra::Type) -> Box<ast::Ty> {
+    pub(crate) fn ty(&self, ty: ra::Type<'_>) -> Box<ast::Ty> {
         let span = self.nsp(ty.syntax());
         let kind = match ty {
             ra::Type::ArrayType(t) => {
                 let elem = self.opt_ty(t.ty(), span);
                 match t.const_arg().and_then(|c| c.expr()) {
-                    Some(len) => ast::TyKind::Array(elem, self.anon_const(&len)),
+                    Some(len) => ast::TyKind::Array(elem, self.anon_const(len)),
                     None => ast::TyKind::Slice(elem),
                 }
             }
@@ -20,7 +20,7 @@ impl Lower<'_> {
             ra::Type::DynTraitType(t) => {
                 let bounds = t
                     .type_bound_list()
-                    .map(|b| self.bounds(&b))
+                    .map(|b| self.bounds(b))
                     .unwrap_or_default();
                 let syntax = if t.dyn_token().is_some() {
                     ast::TraitObjectSyntax::Dyn
@@ -32,7 +32,7 @@ impl Lower<'_> {
             ra::Type::ImplTraitType(t) => {
                 let bounds = t
                     .type_bound_list()
-                    .map(|b| self.bounds(&b))
+                    .map(|b| self.bounds(b))
                     .unwrap_or_default();
                 ast::TyKind::ImplTrait(DUMMY_NODE_ID, bounds)
             }
@@ -41,26 +41,36 @@ impl Lower<'_> {
                 let params: ThinVec<ast::GenericParam> = t
                     .for_binder()
                     .and_then(|b| b.generic_param_list())
-                    .map(|l| l.generic_params().map(|g| self.generic_param(&g)).collect())
+                    .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
                     .unwrap_or_default();
                 match t.ty() {
-                    Some(ra::Type::FnPtrType(f)) => ast::TyKind::FnPtr(self.fn_ptr(&f, params)),
+                    Some(ra::Type::FnPtrType(f)) => ast::TyKind::FnPtr(self.fn_ptr(f, params)),
                     _ => {
                         self.unsupported(span, "a `for<..>` type that is not a function pointer");
                         ast::TyKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed())
                     }
                 }
             }
+            ra::Type::UnsafeBinderType(t) => {
+                let generic_params: ThinVec<ast::GenericParam> = t
+                    .generic_param_list()
+                    .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
+                    .unwrap_or_default();
+                ast::TyKind::UnsafeBinder(Box::new(ast::UnsafeBinderTy {
+                    generic_params,
+                    inner_ty: self.opt_ty(t.ty(), span),
+                }))
+            }
             ra::Type::InferType(_) => ast::TyKind::Infer,
             ra::Type::MacroType(t) => match t.macro_call() {
-                Some(mc) => ast::TyKind::MacCall(self.mac_call(&mc)),
+                Some(mc) => ast::TyKind::MacCall(self.mac_call(mc)),
                 None => self.ty_kind_err(span),
             },
             ra::Type::NeverType(_) => ast::TyKind::Never,
             ra::Type::ParenType(t) => ast::TyKind::Paren(self.opt_ty(t.ty(), span)),
             ra::Type::PathType(t) => match t.path() {
                 Some(p) => {
-                    let (qself, path) = self.path(&p);
+                    let (qself, path) = self.path(p);
                     ast::TyKind::Path(qself, path)
                 }
                 None => self.ty_kind_err(span),
@@ -79,10 +89,10 @@ impl Lower<'_> {
                 } else {
                     ast::Mutability::Not
                 };
-                let lt = t.lifetime().map(|l| self.lifetime(&l));
+                let lt = t.lifetime().map(|l| self.lifetime(l));
                 ast::TyKind::Ref(lt, self.opt_ty(t.ty(), span), mutbl)
             }
-            ra::Type::TupleType(t) => ast::TyKind::Tup(t.fields().map(|f| self.ty(&f)).collect()),
+            ra::Type::TupleType(t) => ast::TyKind::Tup(t.fields().map(|f| self.ty(f)).collect()),
             ra::Type::PatternType(_) => {
                 self.unsupported(span, "a pattern type");
                 ast::TyKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed())
@@ -95,9 +105,9 @@ impl Lower<'_> {
         })
     }
 
-    pub(crate) fn opt_ty(&self, ty: Option<ra::Type>, span: crate::span::Span) -> Box<ast::Ty> {
+    pub(crate) fn opt_ty(&self, ty: Option<ra::Type<'_>>, span: crate::span::Span) -> Box<ast::Ty> {
         match ty {
-            Some(ty) => self.ty(&ty),
+            Some(ty) => self.ty(ty),
             None => {
                 self.unsupported(span, "a type rust-analyzer did not parse");
                 self.ty_err(span)
@@ -114,18 +124,18 @@ impl Lower<'_> {
     /// through the return type.
     fn fn_ptr(
         &self,
-        t: &ra::FnPtrType,
+        t: ra::FnPtrType<'_>,
         generic_params: ThinVec<ast::GenericParam>,
     ) -> Box<ast::FnPtrTy> {
         let decl_span = self.nsp(t.syntax());
         let safety = match t.unsafe_token() {
-            Some(u) => ast::Safety::Unsafe(self.tsp(&u)),
+            Some(u) => ast::Safety::Unsafe(self.tsp(u)),
             None => ast::Safety::Default,
         };
         let ext = self.abi(t.abi());
         let decl = Box::new(self.fn_decl(t.param_list(), t.ret_type(), decl_span));
         if let Some(c) = t.const_token().or(t.async_token()) {
-            self.unsupported(self.tsp(&c), "a `const` or `async` function pointer");
+            self.unsupported(self.tsp(c), "a `const` or `async` function pointer");
         }
         Box::new(ast::FnPtrTy {
             safety,
@@ -137,17 +147,17 @@ impl Lower<'_> {
     }
 
     /// `extern` or `extern "abi"` (rustc's `parse_extern`).
-    pub(crate) fn abi(&self, abi: Option<ra::Abi>) -> ast::Extern {
+    pub(crate) fn abi(&self, abi: Option<ra::Abi<'_>>) -> ast::Extern {
         let Some(abi) = abi else {
             return ast::Extern::None;
         };
         let Some(kw) = abi.extern_token() else {
             return ast::Extern::None;
         };
-        let kw_span = self.tsp(&kw);
+        let kw_span = self.tsp(kw);
         match abi.string_token() {
             None => ast::Extern::Implicit(kw_span),
-            Some(s) => match self.str_lit(&s) {
+            Some(s) => match self.str_lit(s) {
                 Some(lit) => ast::Extern::Explicit(lit, kw_span),
                 None => ast::Extern::Implicit(kw_span),
             },
@@ -155,7 +165,7 @@ impl Lower<'_> {
     }
 
     /// A string literal as `ast::StrLit`, as rustc's `parse_str_lit` builds it for ABIs.
-    pub(crate) fn str_lit(&self, token: &syntax::SyntaxToken) -> Option<ast::StrLit> {
+    pub(crate) fn str_lit(&self, token: ra::Token<'_>) -> Option<ast::StrLit> {
         let span = self.tsp(token);
         let lit = self.token_lit(token);
         match ast::LitKind::from_token_lit(lit) {
@@ -174,9 +184,9 @@ impl Lower<'_> {
     }
 
     /// Generics of an item that has them, with rustc's empty spans when written without.
-    pub(crate) fn item_generics(
+    pub(crate) fn item_generics<'t>(
         &self,
-        node: &impl syntax::ast::HasGenericParams,
+        node: impl ra::HasGenericParams<'t>,
         after: crate::span::Span,
         where_after: crate::span::Span,
     ) -> ast::Generics {
@@ -188,9 +198,9 @@ impl Lower<'_> {
         )
     }
 
-    pub(crate) fn opt_bounds(&self, node: &impl syntax::ast::HasTypeBounds) -> ast::GenericBounds {
+    pub(crate) fn opt_bounds<'t>(&self, node: impl ra::HasTypeBounds<'t>) -> ast::GenericBounds {
         node.type_bound_list()
-            .map(|b| self.bounds(&b))
+            .map(|b| self.bounds(b))
             .unwrap_or_default()
     }
 }

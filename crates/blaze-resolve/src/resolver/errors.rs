@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Error;
+use blaze_ids::radix;
 
 use crate::edit_distance::{closest, edit_distance};
 use crate::interning::InternedString;
@@ -36,6 +37,7 @@ impl ResolveError {
 }
 
 impl std::error::Error for ResolveError {
+    // dyn: `std::error::Error::source`'s own signature, on the error path.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.cause.source()
     }
@@ -467,7 +469,7 @@ fn rejected_versions(
             Ok(candidates) => candidates,
             Err(e) => return Some(Err(e)),
         };
-    version_candidates.sort_unstable_by_key(|a| a.package_id().version().clone());
+    version_candidates.sort_unstable_by(|a, b| a.package_id().version().cmp(b.package_id().version()));
     if version_candidates.is_empty() { None } else { Some(Ok(version_candidates)) }
 }
 
@@ -501,7 +503,7 @@ fn alt_names(
         .into_iter()
         .filter_map(|n| Some((edit_distance(&wild_dep.package_name(), &n.name(), 3)?, n)))
         .collect();
-    name_candidates.sort_by_key(|o| o.0);
+    radix::sort_by_key(&mut name_candidates, |o| o.0);
 
     if name_candidates.is_empty() { None } else { Some(Ok(name_candidates)) }
 }

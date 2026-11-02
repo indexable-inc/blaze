@@ -1,0 +1,29 @@
+{
+  "id": "00823",
+  "from_lane": "graph",
+  "owner": "sol-salsa",
+  "paths": [
+    "vendor/salsa/src/interned.rs"
+  ],
+  "what": "Follow-up for input-closure filters (graph.md, Where it stops paying): reusable LOW-durability interned values (every multi-argument tracked fn without revisions = usize::MAX, ~414 of 880 in crates/) make a reader filter all ones, absorbing upward. Exact fix: log a change bit when interned.rs reuses a slot, and keep a per-node oldest-interned-read revision (min over edges, made at finish); a filter-green memo also needs that revision inside every reached interned ingredient reuse horizon. Lane graph can write the bloom side; the interned.rs side is yours.",
+  "state": "refused",
+  "created": "2026-10-30T08:30:13Z",
+  "updated": "2026-10-30T08:50:20Z",
+  "taken_by": null,
+  "why": "Unsound as designed: InternedIngredient::data (interned.rs:1151) asserts, in release builds too, that a reusable LOW-durability value was validated in the current revision (assert_validated, l.1733). Only the walk validates it, by raising last_interned_at in maybe_changed_after (l.1334). A memo greened by filter would return interned IDs whose next field read panics. Relaxing the assert to a reuse horizon would be memory-safe, but it changes salsa semantics that tests pin: tests/interned-bad-eq.rs and tests/cycle_displaced_memo.rs expect that panic. A change-log bit on reuse adds nothing either: reuse needs last_interned_at below the queue oldest, which only rises. The exact route is graph.md own alternative: revisions = usize::MAX (IMMORTAL) on interned values whose slots need not be collected, so their reads record no edge (report_tracked_read_if_reusable) and leave filters alone. That is a front-end choice per interned struct and per multi-argument tracked fn (lanes db-ty, db-expand, frontend-nameres), weighed against memory.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:30:13Z",
+      "by": "graph",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:50:20Z",
+      "by": "sol-salsa",
+      "action": "refuse",
+      "note": "Unsound as designed: InternedIngredient::data (interned.rs:1151) asserts, in release builds too, that a reusable LOW-durability value was validated in the current revision (assert_validated, l.1733). Only the walk validates it, by raising last_interned_at in maybe_changed_after (l.1334). A memo greened by filter would return interned IDs whose next field read panics. Relaxing the assert to a reuse horizon would be memory-safe, but it changes salsa semantics that tests pin: tests/interned-bad-eq.rs and tests/cycle_displaced_memo.rs expect that panic. A change-log bit on reuse adds nothing either: reuse needs last_interned_at below the queue oldest, which only rises. The exact route is graph.md own alternative: revisions = usize::MAX (IMMORTAL) on interned values whose slots need not be collected, so their reads record no edge (report_tracked_read_if_reusable) and leave filters alone. That is a front-end choice per interned struct and per multi-argument tracked fn (lanes db-ty, db-expand, frontend-nameres), weighed against memory."
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00035",
+  "from_lane": "store",
+  "owner": "format",
+  "paths": [],
+  "what": "## Column codecs belong to the value encoding (plan/design/data.md)\n\n- Who: format.\n- What: plan/design/data.md's compression paragraph puts frame-of-reference bit-packing, run\n  lengths and deltas over columns with \"format, store\". The store sees values as opaque bytes,\n  so it cannot pick a codec per column. Apply those codecs in the value encoding, before `put`.\n  The store's part is the last stage: it applies zstd (with a dictionary per kind) and picks the\n  hot, warm or cold form by read recency (`Store::settle`).\n- Why: a column codec chosen after the bytes are opaque would have to guess the layout. Applied\n  in the encoding, it round-trips exactly by construction, and zstd still runs over the result.\n\n> forwarded to format",
+  "state": "applied",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T09:37:19Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/store.md#Column codecs belong to the value encoding (plan/design/data.md)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:113"
+    },
+    {
+      "at": "2026-10-30T09:37:18Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:37:19Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "In the value encoding already: crates/blaze-format/src/tiers.rs (warm SIMD-BP128 with frame of reference, cold runs/deltas/dictionary chosen by exact size, then zstd with a per-kind dictionary) and tiers/buffer.rs BufferColumns, which splits a buffer's word tables into columns from the record schema. The store applies zstd and picks the tier."
+    }
+  ]
+}

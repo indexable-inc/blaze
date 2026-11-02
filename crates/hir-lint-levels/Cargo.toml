@@ -1,0 +1,38 @@
+[package]
+name = "hir-lint-levels"
+version = "0.0.0"
+repository.workspace = true
+description = "The level of each lint where it is, rustc's rule, as queries."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+hashbrown.workspace = true
+blaze-query.workspace = true
+smallvec.workspace = true
+
+# local deps
+base-db.workspace = true
+blaze-lint-defs.workspace = true
+blaze-phf.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+intern.workspace = true
+span.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

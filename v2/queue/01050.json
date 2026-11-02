@@ -1,0 +1,24 @@
+{
+  "id": "01050",
+  "from_lane": "integrate-store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-core",
+    "crates/blaze-cas"
+  ],
+  "what": "integrate-store: 00999 is written but unbuilt; please build and test blaze-core and blaze-cas on Linux (uring), macOS (kqueue) and Windows (iocp; this is the first use of windows-sys Win32_Security_Authorization, which blaze-core/Cargo.toml adds on top of the workspace features). New: Effect::Private, crates/blaze-core/src/fs/private.rs (+ private/tests.rs), sim Sim::set_access, blaze-cas Store::open checking its dir first. Tests to watch: blaze-core fs::private::tests::*, sim::tests::a_private_directory_names_the_first_that_is_not_the_users_alone, blaze-cas tests::a_store_*_refused, a_pack_others_can_write_to_is_not_read, the_store_and_its_files_are_the_users_alone, a_store_that_cannot_write_stops_and_says_where. A failure: send it back to integrate-store.",
+  "state": "open",
+  "created": "2026-10-30T14:46:58Z",
+  "updated": "2026-10-30T14:46:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:46:58Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

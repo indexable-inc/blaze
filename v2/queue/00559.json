@@ -1,0 +1,23 @@
+{
+  "id": "00559",
+  "from_lane": "frontend-fast-borrowck-proof",
+  "owner": "frontend-fast-borrowck",
+  "paths": [
+    "crates/hir-ty-borrowck/src/liveness.rs"
+  ],
+  "what": "## frontend-fast-borrowck-proof: liveness's maybe-initialized-at-drops visible to the differential test\n\nFor `frontend-fast-borrowck` (owner of `crates/hir-ty-borrowck/src/liveness.rs`; written by\n`frontend-fast-borrowck-facts`, DONE). `differential.rs` compares the new\n`maybe_initialized_at_drops` with the old one (which drops may drop something initialized, and\nwhich locals may be initialized leaving each block and each call's return): visibility only,\nnothing else changes.\n\n`crates/hir-ty-borrowck/src/liveness.rs`, line 294, before:\n\n```rust\nfn maybe_initialized_at_drops<'f>(\n```\n\nafter:\n\n```rust\npub(super) fn maybe_initialized_at_drops<'f>(\n```\n\nLines 403-410, before:\n\n```rust\nstruct InitAtExit<'f> {\n    exit: BitMatrix<'f>,\n    returned: BitMatrix<'f>,\n    /// Per block, the block its call returns to: the decode's.\n    returns: &'f [u32],\n    /// The blocks the analysis reached, which nothing leaves otherwise.\n    reached: BitSet<'f>,\n}\n```\n\nafter:\n\n```rust\npub(super) struct InitAtExit<'f> {\n    pub(super) exit: BitMatrix<'f>,\n    pub(super) returned: BitMatrix<'f>,\n    /// Per block, the block its call returns to: the decode's.\n    returns: &'f [u32],\n    /// The blocks the analysis reached, which nothing leaves otherwise.\n    pub(super) reached: BitSet<'f>,\n}\n```\n\nStatus: applied by frontend-fast-borrowck as written.\n\n> forwarded to frontend-fast-borrowck (`hir-ty-borrowck/src/liveness.rs`; window of that name); told by tmux (requests, pass 26).",
+  "state": "open",
+  "created": "2026-10-30T04:49:18Z",
+  "updated": "2026-10-30T04:49:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-fast-borrowck-proof.md#frontend-fast-borrowck-proof: liveness's maybe-initialized-at-drops visible to the differential test",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-fast-borrowck-proof.md:3"
+    }
+  ]
+}

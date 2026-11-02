@@ -1,0 +1,35 @@
+{
+  "id": "01531",
+  "from_lane": "coord-1030",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs"
+  ],
+  "what": "Rule 15: UnitWriter::keep drops Arc<Lowered> on the daemon's main thread inside Daemon::turn, so a panic in a Storage drop (01530) kills the daemon instead of failing one unit. Run that drop inside the unit's catch or on the unit's pool thread, so a panic fails the unit with a typed error naming it. db offered; serve/unit.rs is cargo's file, coordinate with cargo-next1 and tests-misc-lints (checks_only is in the same file).",
+  "state": "applied",
+  "created": "2026-11-01T20:11:31Z",
+  "updated": "2026-11-01T20:16:39Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T20:11:31Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": "diagnosis by db"
+    },
+    {
+      "at": "2026-11-01T20:16:35Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:16:39Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied, not yet run: blaze-cargo serve/unit.rs Held<T> wraps the loop-held front end (UnitWriter.front, KeptLowered.lowered); its drop runs in catch_unwind and logs the panic naming what was let go, the daemon goes on; keep()s two refusals go through UnitWriter::refused, which lets go of the front end and puts its panic in the job error. Test unit/tests.rs a_front_end_whose_drop_panics_fails_its_holder_not_the_loop. Unchecked: live check is stopped at blaze-mem frame.rs:1701 (one-pool, 01529)."
+    }
+  ]
+}

@@ -13,21 +13,22 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-cov-mark = "2.0.0"
+blaze-hash.workspace = true
+cov-mark.workspace = true
+crossbeam-queue.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
+parking_lot.workspace = true
 smallvec.workspace = true
-ena = "0.14.3"
 serde.workspace = true
 serde_derive.workspace = true
 either.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
-rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 indexmap.workspace = true
-rustc_apfloat = "0.2.3"
-salsa.workspace = true
+inventory.workspace = true
+rustc_apfloat.workspace = true
 bitflags.workspace = true
 
 rustc_abi.workspace = true
@@ -42,6 +43,15 @@ tracing-subscriber.workspace = true
 tracing-tree.workspace = true
 
 # local deps
+blaze-dbsp.workspace = true
+blaze-format.workspace = true
+blaze-hashcons.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+blaze-query.workspace = true
+blaze-reclaim.workspace = true
+blaze-mem.workspace = true
+hashbrown.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true
@@ -51,10 +61,27 @@ hir-expand.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
-thin-vec = "0.2.16"
+target-features.workspace = true
+thin-vec.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
+crossbeam-channel.workspace = true
+expect-test.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]
+
+# The impls of a trait for a type in a crate of many dependencies, read from the crates that
+# can name both against the walk over every crate; prints both and whether it gains.
+[[bench]]
+name = "impls"
+harness = false
 
 [lints]
 workspace = true

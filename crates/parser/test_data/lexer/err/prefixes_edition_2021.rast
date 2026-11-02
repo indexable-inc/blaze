@@ -1,0 +1,29 @@
+COMMENT "//@ edition: 2021"
+WHITESPACE "\n"
+IDENT "z" error: prefix `z` is unknown
+STRING "\"hey\""
+WHITESPACE " "
+IDENT "hey" error: prefix `hey` is unknown
+POUND "#"
+INT_NUMBER "123"
+WHITESPACE " "
+LIFETIME_IDENT "'foo" error: prefix `'foo` is unknown
+POUND "#"
+IDENT "x"
+WHITESPACE " "
+IF_KW "if" error: prefix `if` is unknown
+STRING "\"x\""
+WHITESPACE " "
+IDENT "rb" error: prefix `rb` is unknown
+STRING "\"x\""
+WHITESPACE "\n"
+LIFETIME_IDENT "'r#a"
+WHITESPACE " "
+LIFETIME_IDENT "'r#_" error: `_` cannot be a raw lifetime
+WHITESPACE " "
+IDENT "r#self" error: `self` cannot be a raw identifier
+WHITESPACE " "
+IDENT "r#crate" error: `crate` cannot be a raw identifier
+WHITESPACE " "
+IDENT "r#a"
+WHITESPACE "\n"

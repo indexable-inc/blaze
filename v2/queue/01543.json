@@ -1,0 +1,25 @@
+{
+  "id": "01543",
+  "from_lane": "db",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/driver.rs",
+    "crates/blaze-codegen/src/query.rs",
+    "crates/hir-ty-codegen/v2/hashes.rs"
+  ],
+  "what": "Rule 16/20, self-build 16:17 on tree a674d33407dd2143 (/tmp/blaze-lanes/self-1717-a674d334.log:2776): the store refuses a Code value, Mismatch { key: Key(b5aaad7146ad), kept: af8cc46587a2, given: b7d7a1dc951b }, a template put by unit 274 (build-script-build of libc 0.2.191), failing llvm-sys build script. The key is keys::template(placed(stored(instance.key(), built_in), refs)) (blaze-codegen driver.rs FnNode::stored, query.rs keys::template), and the instance key takes Settings, whose Toolchain.id holds the blaze executable hash (hir-ty-codegen v2/toolchain.rs build/id_of), so another blaze binary cannot have put the kept value: the 16:09 run on the same tree built the same binary in the same home (b2-home-rel). One blaze build made two templates under one key: either the instance key misses an input the template depends on (fix the key), or the template bytes depend on order, addresses or timing (rule 20). First make the refusal name the function: the Code put knows its instance (path, args) and the message gives only the unit. Then compare the two blobs (store keeps af8cc46587a2; the new one is b7d7a1dc951b) to see which bytes differ.",
+  "state": "open",
+  "created": "2026-11-02T01:13:03Z",
+  "updated": "2026-11-02T01:13:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:13:03Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

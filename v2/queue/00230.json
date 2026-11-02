@@ -1,0 +1,37 @@
+{
+  "id": "00230",
+  "from_lane": "requests-link-fuzz",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-link/src/macho/tbd.rs",
+    "crates/blaze-link/src/macho/tbd/reference.rs"
+  ],
+  "what": "## 2. `tools/v2/hot_lint.py`: code compiled only for tests or fuzzing counts as hot\n\nWhat: treat an item under `#[cfg(any(test, feature = \"fuzz\"))]` or `#[cfg(feature = \"fuzz\")]`\nas test code, the way `#[cfg(test)]` is treated. Also treat a file as test code when the\n`mod` that declares it carries one of those cfgs, as in `crates/blaze-link/src/macho/tbd.rs`'s\n`#[cfg(any(test, feature = \"fuzz\"))] mod reference;`.\n\nWhere: `in_test_module` and `lint_file` in `tools/v2/hot_lint.py`.\n\nWhy: the reference models the fuzz targets compare against (link.md item 13) are no normal\nbuild's code. They are the old, allocating readers on purpose. Today they make 77 findings in\n`crates/blaze-link/src/macho/tbd/reference.rs` and about 20 in the fuzz-only parts of\n`macho/dylib.rs` and `macho/tbd.rs`. Marking each line `// alloc:` would mean about 100 comments\nthat all say \"a test model\".\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "applied",
+  "created": "2026-10-30T02:28:48Z",
+  "updated": "2026-10-30T08:31:25Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/requests-link-fuzz.md#2. `tools/v2/hot_lint.py`: code compiled only for tests or fuzzing counts as hot",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-link-fuzz.md:17"
+    },
+    {
+      "at": "2026-10-30T08:31:25Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:25Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

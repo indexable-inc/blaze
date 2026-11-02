@@ -1,0 +1,29 @@
+{
+  "id": "01366",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/demand.rs"
+  ],
+  "what": "hir-def nameres/demand.rs `every_body` (and `walk_bodies` under it) allocates with the number of bodies: `bodies` is a Vec::new() grown by push, `seen` an FxHashSet collected from the roots and grown by insert, the queue extended per body. It is no query, so each call redoes it. blaze-diagnostics test lints::bodies::tests::late_passes_per_crate (the late lint passes over a crate allocate the same at 4 bodies as at 64) fails on it in round 15: 10 allocations at 4 bodies, 19 at 64, the growth all from `every_body` called by lints/bodies.rs `body_owners`. Wanted: size `bodies`, `seen` and the queue once from `crate_body_owners(db, krate).len()` (bodies declared in bodies are few), or make `every_body` a tracked query whose result callers borrow.",
+  "state": "taken",
+  "created": "2026-10-31T23:57:21Z",
+  "updated": "2026-11-01T01:27:01Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:57:21Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

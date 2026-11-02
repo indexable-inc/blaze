@@ -1,0 +1,35 @@
+{
+  "id": "01070",
+  "from_lane": "integrate-docs-cargo",
+  "owner": "integrate-docs",
+  "paths": [
+    "docs/ci-runner.md"
+  ],
+  "what": "docs/ci-runner.md:437 links cargo.md#running-only-the-tests-that-have-not-passed, a v1 section (BLAZE_TESTS test cache) that integrate-docs-cargo replaced with cargo.md#which-tests-run (v2: blaze test --reached, passes kept by executed functions and reads). Repoint the link to cargo.md#which-tests-run and check the surrounding ci-runner.md text, which describes the v1 two-step test key; tools/docs.py check fails on this link until then.",
+  "state": "applied",
+  "created": "2026-10-30T15:13:44Z",
+  "updated": "2026-10-30T15:14:44Z",
+  "taken_by": "integrate-docs",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:13:44Z",
+      "by": "integrate-docs-cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:14:44Z",
+      "by": "integrate-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:14:44Z",
+      "by": "integrate-docs",
+      "action": "done",
+      "note": "ci-runner.md:437 links cargo.md#which-tests-run, saying v2 has what of it is there"
+    }
+  ]
+}

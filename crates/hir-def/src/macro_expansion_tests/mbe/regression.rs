@@ -68,7 +68,7 @@ macro_rules! __rust_force_expr {
 fn main() {
     $crate::__rust_force_expr!($crate:: vec:: Vec:: new());
     $crate::__rust_force_expr!(<[_]>:: into_vec(#[rustc_box]$crate:: boxed:: Box:: new([1u32, 2])));
-    /* error: expected Expr */$crate::__rust_force_expr!($crate:: vec:: from_elem((a.), $n));
+    /* error: expected field name or number */$crate::__rust_force_expr!($crate:: vec:: from_elem((a.), $n));
 }
 "#]],
     );
@@ -97,7 +97,7 @@ macro_rules! __rust_force_expr {
 fn main() {
     (crate ::vec::Vec::new());
     (<[_]>::into_vec(#[rustc_box] crate ::boxed::Box::new([1u32, 2])));
-    /* error: expected Expr *//* parse error: expected field name or number */
+    /* error: expected field name or number *//* parse error: expected field name or number */
 /* parse error: expected expression */
 /* parse error: expected R_PAREN */
 /* parse error: expected COMMA */
@@ -1080,7 +1080,7 @@ macro_rules! concat {}
 macro_rules! line {}
 
 fn main() {
-    "event 0";
+    "event 10";
 }
 
 "##]],
@@ -1106,7 +1106,7 @@ fn main() {
 macro_rules! concat_bytes {}
 
 fn main() {
-    let x = /* error: unexpected token */b"";
+    let x = /* error: cannot concatenate numeric literals */b"";
 }
 
 "#]],
@@ -1159,7 +1159,7 @@ mod any {
     }
     pub use nameable;
 
-    /* error: unexpected token in input */$crate::any::nameable! {
+    /* error: no rules expected `Name` */$crate::any::nameable! {
         struct $name[$a]a
     }
 }

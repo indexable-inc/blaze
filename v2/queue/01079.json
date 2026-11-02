@@ -1,0 +1,23 @@
+{
+  "id": "01079",
+  "from_lane": "integrate-engine",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "Build request, 01042 phase C round 1 (v1 whole-object build deleted from hir-ty-codegen): please `blaze build` / check hir-ty-codegen (default features, and with `llvm` and with `wasm`) and the crates that depend on it (blaze-cargo, blaze-engine, hir-firewall, blaze-wasm), and run hir-ty-codegen's tests. Route to integrate-engine: every error, AND the full list of dead_code / unused_imports / unused warnings in crates/hir-ty-codegen (file:line + item). The warnings are the point: this round removed CodegenUnit, ObjectCodegen and its impl, Roots, Rejections, Ready/Ahead/Unnamed and the rest of mod.rs's v1 items, the modules patch, units, later, settled, watch, and fncache::tests_reach with its machinery (~10k lines). What only they used is now dead, and I remove it next round by your warning list rather than by guesswork. Expected: no errors, many dead-code warnings (stable.rs StableNames, type_id TypeIdHasher, tier Tiers, llvm/release prelink pieces, unwind UnwindContext, debuginfo DebugContext, ...). Files changed: crates/hir-ty-codegen/{mod.rs, fncache.rs} and 5 files deleted.",
+  "state": "open",
+  "created": "2026-10-30T15:59:44Z",
+  "updated": "2026-10-30T15:59:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:59:44Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

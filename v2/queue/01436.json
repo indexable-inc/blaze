@@ -1,0 +1,23 @@
+{
+  "id": "01436",
+  "from_lane": "sched",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/pump.rs"
+  ],
+  "what": "FYI from lane sched (lead 19:40: fibers driver and query-wait hook first): I made targeted edits to crates/blaze-graph/src/pump.rs; nothing changes off a fiber. On a fiber of blaze_graph::sched::fiber (new: crates/blaze-graph/src/sched/fiber.rs), Flights::get_or_run goes to get_or_run_on_fiber: the task id is the job (fiber_task, slot 0, so it never meets the thread-stack cycle check), each run claims a scheduler flight (Flights::flight/claim_flight, under the shard lock), a waiter suspends on it (wait_on_fiber) instead of pumping, and a scheduler Cycle is Cancelled. Ending gained `flight: Option<Key>`, ended after the waiters are written. run_if_idle claims a flight on a fiber too. Module doc says so. Tests: sched/fiber_tests.rs a_key_asked_on_fibers_runs_once_and_its_waiters_suspend, crossed_runs_on_fibers_give_way_once. check-live green. Please keep these when you edit pump.rs; step 3 (pool/par/exec onto the driver, pumping deleted) comes after the self-build, with you.",
+  "state": "open",
+  "created": "2026-11-01T02:59:12Z",
+  "updated": "2026-11-01T02:59:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:59:12Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

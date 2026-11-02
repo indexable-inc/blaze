@@ -1,21 +1,17 @@
 //! Snapshotting in the infer ctxt of the next-trait-solver.
 
-use ena::undo_log::UndoLogs;
 use rustc_type_ir::UniverseIndex;
-use tracing::{debug, instrument};
 
 use super::InferCtxt;
-use super::region_constraints::RegionSnapshot;
 
 mod fudge;
 pub(crate) mod undo_log;
 
-use undo_log::{Snapshot, UndoLog};
+use undo_log::Snapshot;
 
 #[must_use = "once you start a snapshot, you should always consume it"]
 pub struct CombinedSnapshot {
     pub(super) undo_snapshot: Snapshot,
-    region_constraints_snapshot: RegionSnapshot,
     universe: UniverseIndex,
 }
 
@@ -40,53 +36,40 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn in_snapshot(&self) -> bool {
-        UndoLogs::<UndoLog<'db>>::in_snapshot(&self.inner.borrow_mut().undo_log)
+        self.inner.borrow().undo_log.in_snapshot()
     }
 
     pub fn num_open_snapshots(&self) -> usize {
-        UndoLogs::<UndoLog<'db>>::num_open_snapshots(&self.inner.borrow_mut().undo_log)
+        self.inner.borrow().undo_log.num_open_snapshots()
     }
 
     pub fn start_snapshot(&self) -> CombinedSnapshot {
-        debug!("start_snapshot()");
-
         let mut inner = self.inner.borrow_mut();
 
-        CombinedSnapshot {
-            undo_snapshot: inner.undo_log.start_snapshot(),
-            region_constraints_snapshot: inner.unwrap_region_constraints().start_snapshot(),
-            universe: self.universe(),
-        }
+        CombinedSnapshot { undo_snapshot: inner.start_snapshot(), universe: self.universe() }
     }
 
-    #[instrument(skip(self, snapshot), level = "debug")]
     pub fn rollback_to(&self, snapshot: CombinedSnapshot) {
-        let CombinedSnapshot { undo_snapshot, region_constraints_snapshot, universe } = snapshot;
+        let CombinedSnapshot { undo_snapshot, universe } = snapshot;
 
         self.universe.set(universe);
 
-        let mut inner = self.inner.borrow_mut();
-        inner.rollback_to(undo_snapshot);
-        inner.unwrap_region_constraints().rollback_to(region_constraints_snapshot);
+        self.inner.borrow_mut().rollback_to(undo_snapshot);
     }
 
-    #[instrument(skip(self, snapshot), level = "debug")]
     pub fn commit_from(&self, snapshot: CombinedSnapshot) {
-        let CombinedSnapshot { undo_snapshot, region_constraints_snapshot: _, universe: _ } =
-            snapshot;
+        let CombinedSnapshot { undo_snapshot, universe: _ } = snapshot;
 
         self.inner.borrow_mut().commit(undo_snapshot);
     }
 
     /// Execute `f` and commit the bindings if closure `f` returns `Ok(_)`.
-    #[instrument(skip(self, f), level = "debug")]
     pub fn commit_if_ok<T, E, F>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce(&CombinedSnapshot) -> Result<T, E>,
     {
         let snapshot = self.start_snapshot();
         let r = f(&snapshot);
-        debug!("commit_if_ok() -- r.is_ok() = {}", r.is_ok());
         match r {
             Ok(_) => {
                 self.commit_from(snapshot);
@@ -99,7 +82,6 @@ impl<'db> InferCtxt<'db> {
     }
 
     /// Execute `f` then unroll any bindings it creates.
-    #[instrument(skip(self, f), level = "debug")]
     pub fn probe<R, F>(&self, f: F) -> R
     where
         F: FnOnce(&CombinedSnapshot) -> R,
@@ -116,10 +98,13 @@ impl<'db> InferCtxt<'db> {
         self.inner
             .borrow_mut()
             .unwrap_region_constraints()
-            .region_constraints_added_in_snapshot(&snapshot.undo_snapshot)
+            .region_constraints_added_in_snapshot(&snapshot.undo_snapshot.region_constraints)
     }
 
     pub fn opaque_types_added_in_snapshot(&self, snapshot: &CombinedSnapshot) -> bool {
-        self.inner.borrow().undo_log.opaque_types_in_snapshot(&snapshot.undo_snapshot)
+        self.inner
+            .borrow()
+            .opaque_type_storage
+            .registered_since(&snapshot.undo_snapshot.opaque_types)
     }
 }

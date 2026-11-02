@@ -1,0 +1,37 @@
+{
+  "id": "01054",
+  "from_lane": "integrate-store-harness",
+  "owner": "integrate-store",
+  "paths": [
+    "docs/support.md",
+    "docs/cache.md",
+    "docs/fuzzing.md"
+  ],
+  "what": "Current docs naming harnesses I deleted (git rm) or settings no code reads: docs/support.md:104 names harness/remote.py (tools/docs.py check fails on it); docs/cache.md:55 named harness/storebuilds.py; docs/cache.md names BLAZE_REMOTE_JOBS, BLAZE_REMOTE_PUSH_EVERY, BLAZE_REMOTE_TIMEOUT. Also check docs/fuzzing.md usage of harness/fuzz/store.py (now typed input: {\"blaze\": ..., \"profiles\": [...]}) and any mention of storeshared/storefirst/packs/s3fake.",
+  "state": "applied",
+  "created": "2026-10-30T14:50:23Z",
+  "updated": "2026-10-30T16:33:53Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:50:23Z",
+      "by": "integrate-store-harness",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:53Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:53Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "support.md row and note 11 rewritten (v1 remote deleted, v2 tier not wired); cache.md marked superseded by v2/plan/lanes/store.md, so its v1 variables stand as history; fuzzing.md already shows the typed input."
+    }
+  ]
+}

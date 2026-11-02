@@ -8,6 +8,11 @@
 //! of each other they call by the names of requests, as they call anything else; constants
 //! more than one of them uses are a data object of their own.
 
+#![forbid(unsafe_code)]
+
+use std::borrow::Borrow;
+
+use blaze_hash::{HashMap, HashSet};
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{
@@ -21,13 +26,16 @@ use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
-use super::{Symbol, Unhandled};
+use super::{
+    Symbol, Unhandled, pgo,
+    sanitize::{self, Covered},
+};
 use crate::{
     ConstBlob,
     debuginfo::{LineRow, SlotPlaces, VariablePlace},
-    fragment::{Code, Wants},
+    fragment::{Code, Relocs, Wants},
     unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
 
@@ -36,13 +44,13 @@ pub(super) struct Emitted<'data, 'file> {
     /// The section of the function.
     text: SectionIndex,
     /// The sections of every function of the object that is read.
-    texts: &'file FxHashSet<SectionIndex>,
+    texts: &'file HashSet<SectionIndex>,
     /// Sections the code of more than one of them refers to.
-    shared: &'file FxHashSet<SectionIndex>,
+    shared: &'file HashSet<SectionIndex>,
     /// The name of the function, which is that of the file its lines are of.
     name: &'file str,
     /// What became of each section the code leads to.
-    placed: FxHashMap<SectionIndex, Placement>,
+    placed: HashMap<SectionIndex, Placement>,
     /// The sections that are part of the code, in the order they are in `bytes`.
     inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
@@ -50,8 +58,12 @@ pub(super) struct Emitted<'data, 'file> {
     code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
-    /// See [`Code::elf_types`].
+    /// See [`Reloc::elf_type`](crate::fragment::Reloc::elf_type).
     elf_types: Vec<(u32, u32)>,
+    /// Whether the code may count itself in SanitizerCoverage's arrays ([`read_covered`]).
+    covered: bool,
+    /// Whether the code may count itself in its PGO counters ([`read_profiled`]).
+    profiled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,17 +72,69 @@ enum Placement {
     Inline(u64),
     /// A data object of its own: constants that hold addresses, which code cannot.
     Blob(DataId),
+    /// The function's SanitizerCoverage array of this index ([`sanitize::SECTIONS`]).
+    Coverage(u32),
+    /// The function's PGO counters ([`pgo::COUNTERS`]).
+    Counters,
+}
+
+/// What an object is read with, besides its code.
+#[derive(Clone, Copy, Default)]
+struct Instrumented {
+    covered: bool,
+    profiled: bool,
 }
 
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
 /// with the code of one is that function's; what is wrong with the object is every one's.
-pub(super) fn read(
+pub(super) fn read<S: Borrow<Signature>>(
     object: &[u8],
-    functions: &[(&str, Signature)],
+    functions: &[(&str, S)],
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
+    let read = read_all(object, functions, recorder, Instrumented::default())?;
+    // alloc: the result, one per function
+    Ok(read.into_iter().map(|it| it.map(|(code, ..)| code)).collect())
+}
+
+/// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
+/// its arrays and PC table: what it refers to of the arrays are relocations in
+/// [`sanitize::COVERAGE`].
+pub(super) fn read_covered<S: Borrow<Signature>>(
+    object: &[u8],
+    function: (&str, S),
+    recorder: &mut Wants,
+) -> Result<(Code, Covered), Unhandled> {
+    let instrumented = Instrumented { covered: true, profiled: false };
+    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    let (code, covered, _) = read.pop().ok_or(Unhandled::Shape("an object without the function"))??;
+    Ok((code, covered))
+}
+
+/// The code of the one function of an object LLVM instrumented for PGO (and with
+/// SanitizerCoverage, if `covered`, as [`read_covered`] reads it), and how many bytes its
+/// counters take, which start zeroed: what it refers to of them are relocations at index 0
+/// of [`pgo::COUNTER_RELOCS`].
+pub(super) fn read_profiled<S: Borrow<Signature>>(
+    object: &[u8],
+    function: (&str, S),
+    recorder: &mut Wants,
+    covered: bool,
+) -> Result<(Code, Covered, u32), Unhandled> {
+    let instrumented = Instrumented { covered, profiled: true };
+    let mut read = read_all(object, std::slice::from_ref(&function), recorder, instrumented)?;
+    read.pop().ok_or(Unhandled::Shape("an object without the function"))?
+}
+
+fn read_all<S: Borrow<Signature>>(
+    object: &[u8],
+    functions: &[(&str, S)],
+    recorder: &mut Wants,
+    instrumented: Instrumented,
+) -> Result<Vec<Result<(Code, Covered, u32), Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
-    let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
+    let mut found: SmallVec<[Option<(SectionIndex, u64)>; 1]> =
+        SmallVec::from_elem(None, functions.len());
     for symbol in file.symbols() {
         let (Ok(name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
             continue;
@@ -79,11 +143,12 @@ pub(super) fn read(
             found[at] = Some((section, symbol.address()));
         }
     }
-    let texts: FxHashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
-    let mut referrers: FxHashMap<SectionIndex, usize> = FxHashMap::default();
+    // alloc: once per object, the sections of its functions, which `Emitted` looks up per relocation
+    let texts: HashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
+    let mut referrers: HashMap<SectionIndex, usize> = HashMap::default();
     if texts.len() > 1 {
         for &text in &texts {
-            let mut targets = FxHashSet::default();
+            let mut targets = HashSet::default();
             for (_, relocation) in file.section_by_index(text)?.relocations() {
                 if let Destination::Section(target) = Emitted::destination(&file, &relocation)?
                     && !texts.contains(&target)
@@ -96,6 +161,7 @@ pub(super) fn read(
             }
         }
     }
+    // alloc: once per object, as `texts`; empty, allocating nothing, for a function alone
     let shared = referrers.into_iter().filter(|it| it.1 > 1).map(|it| it.0).collect();
     let mut codes = Vec::with_capacity(functions.len());
     for (at, (_, signature)) in functions.iter().enumerate() {
@@ -109,7 +175,9 @@ pub(super) fn read(
             }
             Some((text, _)) => {
                 let name = functions[at].0;
-                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder)
+                // clone: the one copy, which the `Code` owns
+                let signature = signature.borrow().clone();
+                Emitted::code(&file, text, &texts, &shared, name, signature, recorder, instrumented)
             }
         };
         codes.push(code);
@@ -129,25 +197,39 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn code(
         file: &'file object::File<'data>,
         text: SectionIndex,
-        texts: &'file FxHashSet<SectionIndex>,
-        shared: &'file FxHashSet<SectionIndex>,
+        texts: &'file HashSet<SectionIndex>,
+        shared: &'file HashSet<SectionIndex>,
         name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
-    ) -> Result<Code, Unhandled> {
+        instrumented: Instrumented,
+    ) -> Result<(Code, Covered, u32), Unhandled> {
+        let Instrumented { covered, profiled } = instrumented;
+        if !covered && Self::has_coverage(file) {
+            return Err(Unhandled::Shape("SanitizerCoverage in an object read without it"));
+        }
+        if !profiled && Self::has_counters(file) {
+            return Err(Unhandled::Shape("PGO counters in an object read without them"));
+        }
         let mut emitted = Emitted {
             file,
             text,
             texts,
             shared,
             name,
-            placed: FxHashMap::default(),
+            placed: HashMap::default(),
+            // alloc: once per function read, the sections of its code
             inline: Vec::new(),
+            // alloc: the code, which the `Code` keeps
             bytes: Vec::new(),
             code: 0,
             align: 1,
+            // alloc: once per function read, as `inline`
             relocs: Vec::new(),
+            // alloc: empty, allocating nothing but for AArch64 ELF's loads and stores
             elf_types: Vec::new(),
+            covered,
+            profiled,
         };
         let unwind = match (emitted.file.format(), emitted.file.architecture()) {
             (BinaryFormat::MachO, _) => {
@@ -173,8 +255,152 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let lines = emitted.lines()?;
         let slots = emitted.slots().unwrap_or_default();
+        let coverage = match covered {
+            true => emitted.coverage()?,
+            false => Covered::default(),
+        };
+        let counters = match profiled {
+            true => emitted.counters()?,
+            false => 0,
+        };
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots })
+        // alloc: the error's message
+        let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
+        Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage, counters))
+    }
+
+    /// Whether `file` has a section of PGO's counters.
+    fn has_counters(file: &object::File<'_>) -> bool {
+        file.sections().any(|section| section.name().is_ok_and(|name| pgo::COUNTERS.contains(&name)))
+    }
+
+    /// Whether `section` is the function's PGO counters, if the object is read with them.
+    fn is_counters(&self, section: &object::Section<'data, '_>) -> Result<bool, Unhandled> {
+        Ok(self.profiled && pgo::COUNTERS.contains(&section.name()?))
+    }
+
+    /// How many bytes the function's PGO counters take, which start zeroed.
+    fn counters(&self) -> Result<u32, Unhandled> {
+        let mut sections = self.file.sections().filter(|it| it.name().is_ok_and(|it| pgo::COUNTERS.contains(&it)));
+        let Some(section) = sections.next() else {
+            return Err(Unhandled::Shape("an object instrumented for PGO without its counters"));
+        };
+        if sections.next().is_some() {
+            return Err(Unhandled::Shape("two sections of PGO counters"));
+        }
+        if section.relocations().next().is_some() || section.data()?.iter().any(|it| *it != 0) {
+            return Err(Unhandled::Shape("PGO counters that do not start zeroed"));
+        }
+        u32::try_from(section.size()).map_err(|_| Unhandled::Shape("PGO counters of 4 GiB"))
+    }
+
+    /// Whether `file` has a section of SanitizerCoverage's.
+    fn has_coverage(file: &object::File<'_>) -> bool {
+        file.sections().any(|section| {
+            section.name().is_ok_and(|name| {
+                sanitize::SECTIONS.contains(&name)
+                    || name == sanitize::PCS
+                    || name == sanitize::CONTROL_FLOW
+            })
+        })
+    }
+
+    /// Which of the function's SanitizerCoverage arrays `section` is, if it is one of them
+    /// and the object is read with them.
+    fn array(&self, section: &object::Section<'data, '_>) -> Result<Option<u32>, Unhandled> {
+        if !self.covered {
+            return Ok(None);
+        }
+        let name = section.name()?;
+        Ok(sanitize::SECTIONS.iter().position(|it| *it == name).map(|it| it as u32))
+    }
+
+    /// The one section named `name`, if there is one.
+    fn only(&self, name: &str) -> Result<Option<object::Section<'data, 'file>>, Unhandled> {
+        let mut named = self.file.sections().filter(|it| it.name().is_ok_and(|it| it == name));
+        let first = named.next();
+        if named.next().is_some() {
+            return Err(Unhandled::Shape("two SanitizerCoverage sections of one kind"));
+        }
+        Ok(first)
+    }
+
+    /// How long each of the function's SanitizerCoverage arrays is, which start zeroed, and
+    /// where each block they count is in the code, from the PC table.
+    fn coverage(&self) -> Result<Covered, Unhandled> {
+        if self.only(sanitize::CONTROL_FLOW)?.is_some() {
+            return Err(Unhandled::Shape("SanitizerCoverage's control flow, which is not read"));
+        }
+        let mut covered = Covered::default();
+        for (at, name) in sanitize::SECTIONS.iter().enumerate() {
+            let Some(section) = self.only(name)? else { continue };
+            if section.relocations().next().is_some() || section.data()?.iter().any(|it| *it != 0) {
+                return Err(Unhandled::Shape("a SanitizerCoverage array that does not start zeroed"));
+            }
+            covered.arrays[at] = u32::try_from(section.size())
+                .map_err(|_| Unhandled::Shape("a SanitizerCoverage array of 4 GiB"))?;
+        }
+        if let Some(section) = self.only(sanitize::PCS)? {
+            covered.pcs = self.pcs(&section)?;
+            let [counters, flags, guards] = covered.arrays;
+            let blocks = covered.pcs.len();
+            if [counters, flags, guards / 4].into_iter().any(|it| it != 0 && it as usize != blocks) {
+                return Err(Unhandled::Shape("a PC table of other blocks than are counted"));
+            }
+        }
+        Ok(covered)
+    }
+
+    /// The PC table of SanitizerCoverage: a pair of words for each block, the address of the
+    /// block in the code and its flags (1 for the function's entry, as LLVM's
+    /// `SanitizerCoveragePass` writes them).
+    fn pcs(&self, section: &object::Section<'data, '_>) -> Result<Vec<(u32, u64)>, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("a SanitizerCoverage PC table that is not read");
+        let word = if self.file.is_64() { 8 } else { 4 };
+        let data = section.data()?;
+        if data.len() % (2 * word) != 0 {
+            return Err(MALFORMED);
+        }
+        let read = |at: usize| -> Result<u64, Unhandled> {
+            let bytes = data.get(at..at + word).ok_or(MALFORMED)?;
+            let mut wide = [0u8; 8];
+            wide[..word].copy_from_slice(bytes);
+            Ok(u64::from_le_bytes(wide))
+        };
+        let text = self.file.section_by_index(self.text)?;
+        // alloc: SanitizerCoverage's PC table, read only for an instrumented build
+        let mut pcs: Vec<Option<u32>> = vec![None; data.len() / (2 * word)];
+        for (offset, relocation) in section.relocations() {
+            let offset = offset as usize;
+            if offset % (2 * word) != 0 || relocation.kind() != object::RelocationKind::Absolute {
+                return Err(MALFORMED);
+            }
+            let base = match relocation.target() {
+                RelocationTarget::Symbol(symbol) => {
+                    let symbol = self.file.symbol_by_index(symbol)?;
+                    if symbol.section() != SymbolSection::Section(self.text) {
+                        return Err(Unhandled::Shape("a PC table entry outside the function"));
+                    }
+                    symbol.address()
+                }
+                RelocationTarget::Section(index) if index == self.text => 0,
+                _ => return Err(Unhandled::Shape("a PC table entry outside the function")),
+            };
+            // Mach-O and ELF's REL keep what is added in the word itself.
+            let held = if relocation.has_implicit_addend() { read(offset)? } else { 0 };
+            let address = base
+                .wrapping_add(held)
+                .wrapping_add_signed(relocation.addend())
+                .wrapping_sub(text.address());
+            let at = u32::try_from(address).ok().filter(|it| *it < self.code).ok_or(MALFORMED)?;
+            pcs[offset / (2 * word)] = Some(at);
+        }
+        let mut table = Vec::with_capacity(pcs.len());
+        for (entry, at) in pcs.into_iter().enumerate() {
+            let at = at.ok_or(MALFORMED)?;
+            table.push((at, read(entry * 2 * word + word)?));
+        }
+        Ok(table)
     }
 
     /// Where LLVM kept the stack slots `lower` told it of as variables, which are named by
@@ -211,6 +437,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     if let Some(base) = entry.attr_value(gimli::DW_AT_frame_base)
                         && let Some(base) = base.exprloc_value()
                     {
+                        // alloc: the frame's base, which the `Code` keeps
                         places.frame_base = base.0.slice().to_vec();
                     }
                 }
@@ -224,12 +451,17 @@ impl<'data, 'file> Emitted<'data, 'file> {
                         _ => entry.attr_value(gimli::DW_AT_name)?,
                     };
                     let name = dwarf.attr_string(&unit, name).ok()?;
-                    let slot = name.to_string().ok()?.parse().ok()?;
+                    let slot = std::str::from_utf8(name.slice()).ok()?.parse().ok()?;
+                    // alloc: the variable's places, which the `Code` keeps
                     let mut ranges = Vec::new();
+                    let encoding = unit.encoding();
                     match entry.attr_value(gimli::DW_AT_location) {
                         None => {}
                         Some(gimli::AttributeValue::Exprloc(place)) => {
-                            ranges.push((0, self.code, place));
+                            if Self::is_of_frame(place, encoding) {
+                                // alloc: the place, which the `Code` keeps
+                                ranges.push((0, self.code, place.0.slice().to_vec()));
+                            }
                         }
                         Some(list) => {
                             let mut list = dwarf.attr_locations(&unit, list).ok()??;
@@ -240,21 +472,19 @@ impl<'data, 'file> Emitted<'data, 'file> {
                                 else {
                                     continue;
                                 };
-                                ranges.push((begin, end, place.data));
+                                if Self::is_of_frame(place.data, encoding) {
+                                    // alloc: the place, which the `Code` keeps
+                                    ranges.push((begin, end, place.data.0.slice().to_vec()));
+                                }
                             }
                         }
                     }
-                    let ranges = ranges
-                        .into_iter()
-                        .filter(|it| Self::is_of_frame(it.2, unit.encoding()))
-                        .map(|(from, to, place)| (from, to, place.0.slice().to_vec()))
-                        .collect();
                     places.slots.push((slot, VariablePlace::Ranges(ranges)));
                 }
                 _ => {}
             }
         }
-        (!places.frame_base.is_empty()).then_some(places)
+        (!places.frame_base.is_empty()).then(|| SlotPlaces::new(places.frame_base, places.slots))
     }
 
     /// Whether `place` says where a value is by registers, the frame and numbers alone, so
@@ -297,7 +527,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// that is known before linking: each function starts its section, which is at
     /// [`Self::base`], and every other section is on its own.
     fn relocated(&self, name: &str) -> Option<Vec<u8>> {
+        // alloc: empty, allocates nothing
         let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
+        // alloc: once per debug section read, the copy its relocations are filled into
         let mut bytes = section.data().ok()?.to_vec();
         for (offset, relocation) in section.relocations() {
             if relocation.kind() != object::RelocationKind::Absolute {
@@ -333,6 +565,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn lines(&self) -> Result<Vec<LineRow>, Unhandled> {
         const MALFORMED: Unhandled = Unhandled::Shape("a line table that does not parse");
         if self.file.section_by_name(".debug_line").is_none() {
+            // alloc: empty, allocates nothing
             return Ok(Vec::new());
         }
         let bytes = self.relocated(".debug_line").ok_or(MALFORMED)?;
@@ -349,6 +582,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let named = header.file_names().iter().any(ours);
         // Each run of code is of one section: the function's are those that start in it.
+        // alloc: once per function, its rows, which `LineRow::of_ranges` makes the line table of
         let mut ranges = Vec::new();
         for sequence in sequences.iter().filter(|it| self.local(it.start).is_some()) {
             let mut rows = program.resume_from(sequence);
@@ -383,7 +617,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     /// Lays out `first` and every section its relocations lead to.
     fn place(&mut self, first: SectionIndex, recorder: &mut Wants) -> Result<(), Unhandled> {
-        let mut pending = vec![first];
+        let mut pending: SmallVec<[SectionIndex; 8]> = SmallVec::new();
+        pending.push(first);
         while let Some(index) = pending.pop() {
             if self.placed.contains_key(&index) {
                 continue;
@@ -392,6 +627,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("code that refers into another function"));
             }
             let section = self.file.section_by_index(index)?;
+            if let Some(array) = self.array(&section)? {
+                self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
+            if self.is_counters(&section)? {
+                self.placed.insert(index, Placement::Counters);
+                continue;
+            }
             let addresses =
                 section.relocations().any(|(_, relocation)| Self::is_address(&relocation));
             // What more than one function uses is had once, as a data object.
@@ -445,11 +688,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             return Err(Unhandled::Shape("code that refers to a writable section"));
         }
         let mut blob = ConstBlob {
+            // alloc: the data object's bytes, which `Wants` keeps
             bytes: section.data()?.to_vec(),
-            relocs: Vec::new(),
-            fn_relocs: Vec::new(),
             align: section.align().max(1),
-            type_ids: Vec::new(),
+            ..ConstBlob::default()
         };
         for (offset, relocation) in section.relocations() {
             let target = match Self::destination(self.file, &relocation)? {
@@ -551,6 +793,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     (Some(Placement::Blob(id)), _) => {
                         (ModuleRelocTarget::user(1, id.as_u32()), addend + symbol.address() as i64)
                     }
+                    (Some(Placement::Coverage(array)), _) => (
+                        ModuleRelocTarget::user(sanitize::COVERAGE, array),
+                        addend + symbol.address() as i64,
+                    ),
+                    (Some(Placement::Counters), _) => (
+                        ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0),
+                        addend + symbol.address() as i64,
+                    ),
                     (_, Destination::Named(name)) => (Self::target(name, recorder)?, addend),
                     (_, Destination::Section(_)) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
@@ -579,7 +829,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     Field::Got
                 }
                 elf::R_X86_64_TLSGD => Field::TlsGd,
-                other => return Err(Unhandled::Relocation(other)),
+                other => return Err(Unhandled::Relocation(other.0)),
             },
             RelocationFlags::Coff { typ } => match typ {
                 // The numbered forms say how many bytes of the instruction follow the
@@ -591,7 +841,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 | pe::IMAGE_REL_AMD64_REL32_4
                 | pe::IMAGE_REL_AMD64_REL32_5 => Field::Near,
                 pe::IMAGE_REL_AMD64_SECREL => Field::SectionOffset,
-                other => return Err(Unhandled::Relocation(other.into())),
+                other => return Err(Unhandled::Relocation(other.0.into())),
             },
             _ => return Err(Unhandled::Shape("an object of a format that is not read")),
         };
@@ -632,6 +882,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("code that refers into another function"));
             }
             let section = self.file.section_by_index(index)?;
+            if let Some(array) = self.array(&section)? {
+                self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
+            if self.is_counters(&section)? {
+                self.placed.insert(index, Placement::Counters);
+                continue;
+            }
             let blob = match self.file.format() {
                 BinaryFormat::MachO => self.blob_macho(&section)?,
                 _ => self.blob_elf(&section)?,
@@ -651,11 +909,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         match section.kind() {
             SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => Ok(ConstBlob {
+                // alloc: the data object's bytes, which `Wants` keeps
                 bytes: section.data()?.to_vec(),
-                relocs: Vec::new(),
-                fn_relocs: Vec::new(),
                 align: section.align().max(1),
-                type_ids: Vec::new(),
+                ..ConstBlob::default()
             }),
             _ => Err(Unhandled::Shape("code that refers to a writable section")),
         }
@@ -672,11 +929,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             _ => return Err(Unhandled::Shape("code that refers to a writable section")),
         }
         let mut blob = ConstBlob {
+            // alloc: the data object's bytes, which `Wants` keeps
             bytes: section.data()?.to_vec(),
-            relocs: Vec::new(),
-            fn_relocs: Vec::new(),
             align: section.align().max(1),
-            type_ids: Vec::new(),
+            ..ConstBlob::default()
         };
         const HELD: Unhandled = Unhandled::Shape("constants that hold an address of the code");
         for (offset, relocation) in section.relocations() {
@@ -721,7 +977,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
                     macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Reloc::MachOAarch64TlsAdrPage21,
                     macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
-                    other => return Err(Unhandled::Relocation(other.into())),
+                    other => return Err(Unhandled::Relocation(other.0.into())),
                 },
                 RelocationFlags::Elf { r_type } => match r_type {
                     // A jump out of the function is a call that does not come back.
@@ -735,7 +991,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
                         // The low bits go in in units of what the load or store moves,
                         // which Cranelift has no kind for: it stands in as an `add`.
-                        self.elf_types.push((offset as u32, r_type));
+                        self.elf_types.push((offset as u32, r_type.0));
                         Reloc::Aarch64AddAbsLo12Nc
                     }
                     elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
@@ -744,7 +1000,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     elf::R_AARCH64_TLSDESC_LD64_LO12 => Reloc::Aarch64TlsDescLd64Lo12,
                     elf::R_AARCH64_TLSDESC_ADD_LO12 => Reloc::Aarch64TlsDescAddLo12,
                     elf::R_AARCH64_TLSDESC_CALL => Reloc::Aarch64TlsDescCall,
-                    other => return Err(Unhandled::Relocation(other)),
+                    other => return Err(Unhandled::Relocation(other.0)),
                 },
                 _ => return Err(Unhandled::Shape("an object of a format that is not read")),
             };
@@ -758,6 +1014,19 @@ impl<'data, 'file> Emitted<'data, 'file> {
                             ModuleRelocTarget::user(1, id.as_u32()),
                             relocation.addend() + within as i64,
                         )
+                    }
+                    Placement::Coverage(array) => {
+                        let within =
+                            symbol.address() - self.file.section_by_index(target)?.address();
+                        (
+                            ModuleRelocTarget::user(sanitize::COVERAGE, array),
+                            relocation.addend() + within as i64,
+                        )
+                    }
+                    Placement::Counters => {
+                        let within =
+                            symbol.address() - self.file.section_by_index(target)?.address();
+                        (ModuleRelocTarget::user(pgo::COUNTER_RELOCS, 0), relocation.addend() + within as i64)
                     }
                     Placement::Inline(_) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
@@ -804,11 +1073,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
         // Of an object of more than one function, the entries of this one: those whose
         // start, eight bytes in, is relocated against its section.
-        let ours: Option<FxHashSet<u64>> = (self.texts.len() > 1).then(|| {
+        let ours: Option<HashSet<u64>> = (self.texts.len() > 1).then(|| {
             let starts = section.relocations().filter(|(_, relocation)| {
                 Self::symbol(self.file, relocation)
                     .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))
             });
+            // alloc: once per function of a unit, none for a function alone
             starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
         });
         let mut entries = eh_frame.entries(&bases);
@@ -830,7 +1100,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("more than one unwind table entry"));
             }
             let cie = fde.cie();
-            let entry_rules = Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
+            let entry_rules: SmallVec<[(u32, FrameRule); 4]> =
+                Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
             let arch = match self.file.architecture() {
                 Architecture::Aarch64 => crate::Arch::Aarch64,
                 _ => crate::Arch::X86_64,
@@ -838,7 +1109,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             if !entry_rules
                 .iter()
                 .copied()
-                .eq(FrameRule::on_entry(arch).iter().map(|&rule| (0, rule)))
+                .eq(crate::unwind::on_entry(arch).iter().map(|&rule| (0, rule)))
             {
                 return Err(Unhandled::Shape("an unwind table that starts from other rules"));
             }
@@ -891,6 +1162,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         // found it, which the unwinder takes a function without one for. It gets the entry
         // that says as much: whoever looks for where a function ends looks in `.pdata`.
         let Some(pdata) = self.file.section_by_name(".pdata") else {
+            // alloc: the unwind info, which the `Code` keeps
             let leaf = vec![VERSION, 0, 0, 0];
             return Ok(Some(FunctionUnwind::from_unwind_info(code, leaf, seh::Pads::default())));
         };
@@ -920,6 +1192,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             // What is left is an entry that goes on from another.
             _ => return Err(Unhandled::Shape("an unwind table in more than one piece")),
         };
+        // alloc: the unwind info, which the `Code` keeps
         let mut frame = frame.to_vec();
         frame[0] = VERSION;
         Ok(Some(FunctionUnwind::from_unwind_info(code, frame, pads)))
@@ -967,6 +1240,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         if table.relocations().next().is_some() {
             return Err(Unhandled::Shape("landing pads that name a type"));
         }
+        // alloc: the landing pads, which the `Code` keeps
         Ok(table.data()?.to_vec())
     }
 
@@ -1004,6 +1278,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         let (len, encoding) =
             (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
+        // alloc: the unwind rules, which the `Code` keeps
         let mut rows = Vec::new();
         // How far below the frame the saved pairs start.
         let mut at = match encoding & MODE {
@@ -1037,16 +1312,16 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");
 
-    fn rules<R: gimli::Reader>(
+    fn rules<R: gimli::Reader, C: Default + Extend<(u32, FrameRule)>>(
         mut instructions: gimli::CallFrameInstructionIter<'_, R>,
         cie: &gimli::CommonInformationEntry<R>,
-    ) -> Result<Vec<(u32, FrameRule)>, Unhandled> {
+    ) -> Result<C, Unhandled> {
         use gimli::CallFrameInstruction as Cfi;
         let scale = cie.data_alignment_factor();
         let factored =
             |offset: i64| offset.checked_mul(scale).and_then(|it| i32::try_from(it).ok());
         let mut at = 0u32;
-        let mut rules = Vec::new();
+        let mut rules = C::default();
         while let Some(instruction) = instructions.next().map_err(|_| Self::UNKNOWN_RULE)? {
             let rule = match instruction {
                 Cfi::AdvanceLoc { delta } => {
@@ -1079,7 +1354,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 Cfi::ArgsSize { size } => FrameRule::ArgsSize(size as u32),
                 _ => return Err(Self::UNKNOWN_RULE),
             };
-            rules.push((at, rule));
+            rules.extend(std::iter::once((at, rule)));
         }
         Ok(rules)
     }
@@ -1110,6 +1385,7 @@ fn plain<'n>(file: &object::File<'_>, name: &'n str) -> &'n str {
 
 impl From<object::Error> for Unhandled {
     fn from(e: object::Error) -> Self {
+        // alloc: the error's message
         Unhandled::Llvm(format!("object: {e}"))
     }
 }

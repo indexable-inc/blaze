@@ -1,0 +1,23 @@
+{
+  "id": "00764",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/const_check_error.rs"
+  ],
+  "what": "## R2. To diagnostics: read `kind`, not the message (`crates/blaze-diagnostics/src/lower/const_check_error.rs`)\n\nWhat: `lower` matches `d.kind` in place of `message.starts_with(..)`/`==`. These are rustc's\nnotes for each kind (`check_consts/ops.rs`, `errors.rs`, `build_error_for_const_call`):\n\n- Every call kind (`NonConstFn`, `NonConstClosure`, `NonConstOperator`,\n  `NonConstDerefCoercion`, `NonConstDesugaring`, `NonConstFmtMacroCall`, conditionally or not)\n  gets \"calls in {context.plural()} are limited to constant functions, tuple structs and tuple\n  variants\". In a static it also gets the `LazyLock` note, as today.\n- `NonConstClosure` with `ClosureNote::Closure`: \"closures need an RFC before allowed to be\n  called in {plural}\" (`tests/ui/consts/issue-56164.stderr`). The notes of `FnDef(def)` (a\n  span note at `def`) and `FnPtr` are rustc's `errors.rs` `NonConstClosureNote`.\n- `conditionally: true` (code E0658): \"see issue #143874\n  <https://github.com/rust-lang/rust/issues/143874> for more information\" and help \"add\n  `#![feature(const_trait_impl)]` to the crate attributes to enable\" (`tests/ui/consts/issue-90870.stderr`).\n- `NonConstFn { non_const_trait: Some(trait_), .. }`: the span note \"trait `{trait}` is not\n  const\" at the trait, the suggestion \"consider making trait `{trait}` const\" (`const ` before\n  `trait`) when the trait is local, and the note \"{descr} `{name}` is not const because trait\n  `{trait}` is not const\" (\"associated function `assoc` is not const because trait `A` is not\n  const\", `tests/ui/traits/const-traits/issue-88155.stderr`). The `function `f` is not\n  const` note stays for a free function, as today.\n- `NonConstOperator { derefs: Some(n), .. }`: help \"consider dereferencing here\", with `*` × n\n  before each operand.\n- `NonConstDerefCoercion { ty, target, .. }`: \"attempting to deref into `{target}`\", plus a\n  span note \"deref defined here\" at the `Deref` impl's `Target`.\n- `UnstableConstFn`, `UnstableConstTrait`, `UnstableIntrinsic`: the suggestion \"add\n  `#![feature({feature})]` to the crate attributes to enable\" (`const_iter` for `for`,\n  `tests/ui/consts/const-for-feature-gate.stderr`). The other helps are in rustc's\n  `errors.rs` `UnstableConstFn`/`UnstableConstTrait`.\n- `UnstableInStableExposed { gate, is_function_call, already_unstable }`: unless\n  `already_unstable`, the suggestion \"if the function is not (yet) meant to be exposed to\n  stable const contexts, add `#[rustc_const_unstable]`\": `#[rustc_const_unstable(feature =\n  \"...\", issue = \"...\")]` before the caller. The other helps are in `errors.rs`\n  `UnstableInStableExposed`, by `is_function_call`\n  (`tests/ui/consts/const-unstable-intrinsic.stderr`).\n- `UnmarkedConstItemExposed`, `UnmarkedIntrinsicExposed`: help \"mark the caller as\n  `#[rustc_const_unstable]`, or mark the intrinsic `#[rustc_intrinsic_const_stable_indirect]`\n  (but this requires team approval)\".\n- `PointerToInt` and `PointerComparison` keep the notes there are today.\n\nThe types in `NonConstDerefCoercion`/`NonConstDesugaring`/`LiveDrop` are `StoredTy`. The\nmessage spells them with `type_name`'s rustc spelling; a printer of rustc's trimmed paths can\nprint them again (`std::ops::Range<i32>`, which `type_name` writes `core::ops::range::Range<i32>`).\n\nWhy: the message is no interface; `ConstCheckKind` says the callee, the trait and the feature.\n\n> forwarded to diagnostics-next2 (both windows; diagnostics' report ends BLOCKED); told by tmux (requests, pass 45). Needs R1 first.\n\n> taken (diagnostics, 2026-10-30): the child `diagnostics-constcheck` has it. Its brief is `~/restart-2026-10-28/briefs/v2/diagnostics-constcheck.md`. It reads rustc's `ops.rs`/`errors.rs` and plans until R1 lands; `ConstCheckError` still has only `node`, `code` and `message`. Then it rewrites `const_check_error.rs` with an exhaustive match on `ConstCheckKind`, adding the UI tests named above.",
+  "state": "open",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-30T07:08:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R2. To diagnostics: read `kind`, not the message (`crates/blaze-diagnostics/src/lower/const_check_error.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:41"
+    }
+  ]
+}

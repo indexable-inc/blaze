@@ -1,13 +1,13 @@
 //! A package at a version in a source: `src/workspace/package_id.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use rustc_hash::FxHashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
+use blaze_ids::{Domain, Interner, Sharded};
 
 use crate::interning::InternedString;
 use crate::package_id_spec::PackageIdSpec;
@@ -46,7 +46,11 @@ impl Hash for PackageIdInner {
     }
 }
 
-static PACKAGE_ID_CACHE: OnceLock<Mutex<FxHashSet<&'static PackageIdInner>>> = OnceLock::new();
+/// Every package id, by the content ID of what [`PackageIdInner`]'s `Eq` compares (its `Hash`
+/// covers exactly that, the source by address): a hit is lock-free probes and no allocation.
+/// The ID is only compared within this process, so an address in it is sound.
+static PACKAGE_IDS: OnceLock<Sharded<PackageIdInner>> = OnceLock::new();
+static PACKAGE_ID: Domain = Domain::new("blaze-resolve package id 1");
 
 impl PartialEq for PackageId {
     fn eq(&self, other: &PackageId) -> bool {
@@ -79,16 +83,11 @@ impl PackageId {
 
     pub fn new(name: InternedString, version: semver::Version, source_id: SourceId) -> PackageId {
         let inner = PackageIdInner { name, version, source_id };
-        let mut cache = PACKAGE_ID_CACHE.get_or_init(Default::default).lock().unwrap();
-        let inner = match cache.get(&inner) {
-            Some(&inner) => inner,
-            None => {
-                let inner: &'static PackageIdInner = Box::leak(Box::new(inner));
-                cache.insert(inner);
-                inner
-            }
-        };
-        PackageId { inner }
+        let ids = PACKAGE_IDS.get_or_init(Sharded::new);
+        let mut hasher = blaze_ids::Hasher::of(&PACKAGE_ID);
+        hasher.std(&inner);
+        let at = ids.intern(hasher.finish(), || inner);
+        PackageId { inner: ids.get(at) }
     }
 
     pub fn name(self) -> InternedString {

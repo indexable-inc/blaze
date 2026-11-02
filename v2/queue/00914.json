@@ -1,0 +1,24 @@
+{
+  "id": "00914",
+  "from_lane": "speed-sol2-usercode-macros",
+  "owner": "usercode",
+  "paths": [
+    "crates/proc-macro-api/src/transport/postcard.rs",
+    "crates/proc-macro-srv-cli/src/main_loop.rs"
+  ],
+  "what": "Length-prefixed frames on WIRE_TREES connections. Every byte of a warm expansion request and answer is COBS-stuffed (postcard Cobs flavor in proc-macro-api transport/postcard.rs encode_into) and unstuffed (unstuff), one block at a time; tt column bytes are dense in zeros, so blocks are 2 or 3 bytes: about 45 KB x 7 cycles = 90 us per miss for a 300-token derive with a 1,500-token output, against a 28 us bound for the whole fixed cost (docs/v2/plan/lanes/usercode/speed-of-light-macros.md, A miss to a warm server). Change: once the handshake agreed on version::WIRE_TREES, frame each message as a u32 length then its postcard bytes (or keep COBS for the message and send the tree bytes as a raw section of the length the message gives), both in proc-macro-api transport and in the server loop crates/proc-macro-srv-cli/src/main_loop.rs (no lane owns proc-macro-srv-cli in crates.md; selfbuild-srv made it). Keep COBS for older peers and the toolchain server compare runs. Test: a round trip of a tree with many zero bytes through both framings gives the same message.",
+  "state": "open",
+  "created": "2026-10-30T09:45:03Z",
+  "updated": "2026-10-30T09:45:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:45:03Z",
+      "by": "speed-sol2-usercode-macros",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

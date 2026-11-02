@@ -1,0 +1,36 @@
+{
+  "id": "00852",
+  "from_lane": "pure-scripts",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "what": "Add the workspace dependency `hir-ty-pure = { path = \"crates/hir-ty-pure\" }` to the root Cargo.toml (new front-end crate of lane pure-scripts: the purity walk over a build script MIR, docs/v2/plan/lanes/pure-scripts/design.md), and its Cargo.lock entry at the next build. blaze-cargo will depend on it (separate request to cargo).",
+  "state": "applied",
+  "created": "2026-10-30T08:53:49Z",
+  "updated": "2026-10-30T11:27:15Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:53:49Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:14Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:15Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "root Cargo.toml [workspace.dependencies]: hir-ty-pure = { path = \"crates/hir-ty-pure\", version = \"0.0.0\" } after hir-ty-mir. Cargo.lock picks it up at the next build."
+    }
+  ]
+}

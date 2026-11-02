@@ -1,0 +1,37 @@
+{
+  "id": "00053",
+  "from_lane": "usercode-tests",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml",
+    "crates/blaze-engine/src/test_harness.rs",
+    "crates/blaze-engine"
+  ],
+  "what": "## To codegen: start the fork server from the test harness's `main`\n\n`blaze_usercode::test::FORK_SERVER` is the Rust text of a module `fork_server` (the wire format\nof `blaze_usercode::test::wire` and the server over it). It is written for the harness module:\nit names libtest as `super::test` and nothing of the crate, and every edition reads it. When\nthe variable `fork_server::SOCKET` (`__BLAZE_FORK_SERVER`) is set, the binary connects to that\nUnix socket and runs tests in forked children as blaze asks, never returning; otherwise libtest\nruns as before.\n\n1. `crates/blaze-engine/Cargo.toml`, under `[dependencies]`:\n\n   ```toml\n   blaze-usercode.workspace = true\n   ```\n\n2. `crates/blaze-engine/src/test_harness.rs`, in `text()`, replace\n\n   ```rust\n       text.push_str(\"];\\n        test::test_main_env_args(TESTS)\\n    }\\n\");\n       text.push_str(MARKED);\n   ```\n\n   with\n\n   ```rust\n       text.push_str(\n           \"];\\n        \\\n            if let ::core::option::Option::Some(socket) = ::std::env::var_os(fork_server::SOCKET) {\\n            \\\n            fork_server::serve(TESTS, socket)\\n        \\\n            }\\n        \\\n            test::test_main_env_args(TESTS)\\n    }\\n\",\n       );\n       text.push_str(MARKED);\n       text.push_str(blaze_usercode::test::FORK_SERVER);\n   ```\n\n   so the module's `main` reads:\n\n   ```rust\n   pub fn main() -> test::ExitCode {\n       const TESTS: &[&test::TestDescAndFn] = &[&T0, &T1, ];\n       if let ::core::option::Option::Some(socket) = ::std::env::var_os(fork_server::SOCKET) {\n           fork_server::serve(TESTS, socket)\n       }\n       test::test_main_env_args(TESTS)\n   }\n   ```\n\n   `serve` returns `!`, so the `if` is `()` in every edition. A crate with no tests still gets\n   the module (its `TESTS` is empty and the server answers `Hello` with no names).\n\n3. Any test of `text()` that compares the whole module needs the new `main` and the module\n   at its end; the text after `MARKED` is exactly `FORK_SERVER`.\n\n> forwarded to codegen: `crates/blaze-engine/` is codegen's.",
+  "state": "applied",
+  "created": "2026-10-30T00:20:32Z",
+  "updated": "2026-10-31T20:28:50Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/usercode-tests.md#To codegen: start the fork server from the test harness's `main`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-tests.md:3"
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Already so: the harness moved to crates/hir-ty-codegen/v2/roots/harness.rs, whose main serves fork_server::serve(TESTS, socket) when fork_server::SOCKET is set (harness.rs text())."
+    }
+  ]
+}

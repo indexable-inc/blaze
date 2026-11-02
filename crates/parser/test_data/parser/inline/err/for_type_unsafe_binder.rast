@@ -1,0 +1,44 @@
+SOURCE_FILE
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "A"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    FOR_TYPE
+      FOR_BINDER
+        FOR_KW "for"
+        GENERIC_PARAM_LIST
+          L_ANGLE "<"
+          LIFETIME_PARAM
+            LIFETIME
+              LIFETIME_IDENT "'a"
+          R_ANGLE ">"
+      WHITESPACE " "
+      UNSAFE_BINDER_TYPE
+        UNSAFE_KW "unsafe"
+        GENERIC_PARAM_LIST
+          L_ANGLE "<"
+          LIFETIME_PARAM
+            LIFETIME
+              LIFETIME_IDENT "'b"
+          R_ANGLE ">"
+        WHITESPACE " "
+        REF_TYPE
+          AMP "&"
+          LIFETIME
+            LIFETIME_IDENT "'a"
+          WHITESPACE " "
+          REF_TYPE
+            AMP "&"
+            LIFETIME
+              LIFETIME_IDENT "'b"
+            WHITESPACE " "
+            TUPLE_TYPE
+              L_PAREN "("
+              R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"
+error 16: expected a function pointer or path

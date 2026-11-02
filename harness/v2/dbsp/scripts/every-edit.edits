@@ -1,0 +1,39 @@
+//@ dbsp-edits 1
+// Every op, keeping the program and breaking it on purpose in turn, each break mended by the
+// next edit, so both of rustc's paths are compared after every kind of edit.
+add_mod(dbsp_m1, inline);
+add_mod(dbsp_m2, file);
+add_trait(top, DbspT1);
+add_method(DbspT1, dbsp_f1);
+add_struct(dbsp_m1, DbspS1);
+add_struct(dbsp_m2, DbspS2);
+add_impl(top, DbspT1, DbspS1); // keep
+add_probe(top, dbsp_p1, DbspS1, dbsp_f1); // keep
+add_alias(top, DbspA1, DbspS1); // keep
+// break: a second impl of DbspT1 for DbspS1, through the alias (E0119)
+add_impl(dbsp_m2, DbspT1, DbspA1);
+retarget_alias(DbspA1, DbspS2); // keep
+add_use(dbsp_m1, DbspU1, DbspT1); // keep
+add_trait(top, DbspT2);
+repoint_use(DbspU1, DbspT2); // keep
+add_glob(top, dbsp_m2); // keep
+remove_glob(top, dbsp_m2); // keep
+add_macro(dbsp_m1, dbsp_mac1, DbspS3); // keep
+// break: Copy without Clone (E0277)
+add_derive(DbspS1, Copy);
+add_derive(DbspS1, Clone); // keep
+add_probe(dbsp_m1, dbsp_p2, DbspS1, clone); // keep
+remove_derive(DbspS1, Copy); // keep
+add_method(DbspT1, dbsp_f2); // keep
+// break: dbsp_p1 still calls it (E0599)
+remove_method(DbspT1, dbsp_f1);
+add_method(DbspT1, dbsp_f1); // keep
+rename(DbspS2, DbspS4); // keep
+// break: DbspU1 still names DbspT2 (E0432)
+rename_def(DbspT2, DbspT3);
+rename_def(DbspT3, DbspT2); // keep
+remove(dbsp_p1); // keep
+// break: the alias still names it (E0412)
+remove(DbspS4);
+add_struct(top, DbspS4); // keep
+remove_mod(dbsp_m2); // keep

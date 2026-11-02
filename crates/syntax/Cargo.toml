@@ -13,11 +13,15 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-bytes.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+crossbeam-channel.workspace = true
 either.workspace = true
 itertools.workspace = true
-ra-ap-rustc_lexer.workspace = true
+rustc_lexer.workspace = true
 syntax-tree.workspace = true
-rustc-hash.workspace = true
 rustc-literal-escaper.workspace = true
 smol_str.workspace = true
 triomphe.workspace = true
@@ -28,9 +32,10 @@ parser.workspace = true
 stdx.workspace = true
 
 [dev-dependencies]
-rayon.workspace = true
-expect-test = "1.5.1"
-rustc_apfloat = "0.2.3"
+blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
+expect-test.workspace = true
+rustc_apfloat.workspace = true
 
 test-utils.workspace = true
 

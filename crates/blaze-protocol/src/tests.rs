@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
+use blaze_ids::rng::SplitMix64;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -129,11 +130,11 @@ fn map_keys_go_in_the_order_of_their_bytes() {
     encodes(map, "a261620262616101");
     // A hash map's order is its iteration's, which the encoding does not keep: unsigned
     // before negative, each by its head.
-    let hashed: FxHashMap<i64, ()> = (-30..30).map(|it| (it, ())).collect();
+    let hashed: HashMap<i64, ()> = (-30..30).map(|it| (it, ())).collect();
     let bytes = to_vec(&hashed).unwrap();
     check(&bytes).unwrap();
     assert_eq!(&hex(&bytes)[..12], "b83c00f601f6");
-    assert_eq!(from_slice::<FxHashMap<i64, ()>>(&bytes).unwrap(), hashed);
+    assert_eq!(from_slice::<HashMap<i64, ()>>(&bytes).unwrap(), hashed);
     // A struct's fields come out sorted too, whatever their order in the type.
     #[derive(Serialize)]
     struct Fields {
@@ -328,15 +329,12 @@ fn what_is_not_deterministic_is_refused() {
     assert!(to_vec(&u128::MAX).is_err());
 }
 
-/// A small generator: the same values in every run.
-struct Random(u64);
+/// Values of the protocol from a seed, the same in every run.
+struct Random(SplitMix64);
 
 impl Random {
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.0.next_u64()
     }
 
     fn text(&mut self) -> String {
@@ -366,7 +364,7 @@ impl Random {
 /// same bytes again.
 #[test]
 fn random_values_round_trip_byte_for_byte() {
-    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let mut random = Random(SplitMix64::new(0x2545_f491_4f6c_dd1d));
     for _ in 0..2000 {
         let message = Message::new(
             random.next(),
@@ -452,6 +450,43 @@ fn frames_carry_one_item_each() {
     assert!(refused.to_string().contains("more bytes than it needs"), "{refused}");
 }
 
+/// `send` and `receive` keep their frame and encoder on the thread: warm, they allocate
+/// nothing for a value that owns nothing, and give the bytes a fresh buffer would. A frame past
+/// what is kept is sent and read whole.
+#[test]
+fn a_warm_send_and_receive_allocate_nothing() {
+    let message = Message::new(9, 1_250_000_000u64);
+    let mut stream = Vec::with_capacity(4096);
+    send(&mut stream, &message).unwrap();
+    let mut fresh = Vec::new();
+    crate::append_frame(&mut crate::cbor::Writer::new(), &mut fresh, &message).unwrap();
+    assert_eq!(stream, fresh);
+    blaze_alloc_count::assert_at_most(0, "a warm send", || {
+        for _ in 0..15 {
+            send(&mut stream, &message).unwrap();
+        }
+    });
+    assert_eq!(stream, fresh.repeat(16));
+    let mut from = stream.as_slice();
+    assert_eq!(receive::<Message<u64>>(&mut from).unwrap(), Some(message.clone()));
+    let read = blaze_alloc_count::assert_at_most(0, "a warm receive", || {
+        let mut read = 0;
+        while let Some(back) = receive::<Message<u64>>(&mut from).unwrap() {
+            assert_eq!(back, message);
+            read += 1;
+        }
+        read
+    });
+    assert_eq!(read, 15);
+    let big = vec![7u8; 2 << 20];
+    let mut sent = Vec::new();
+    send(&mut sent, &serde_bytes(&big)).unwrap();
+    send(&mut sent, &message).unwrap();
+    let mut from = sent.as_slice();
+    assert_eq!(receive::<crate::bytes::Buf>(&mut from).unwrap().map(|it| it.0), Some(big));
+    assert_eq!(receive::<Message<u64>>(&mut from).unwrap(), Some(message));
+}
+
 /// A record of the functions a build put in its program takes their names and some 100 bytes
 /// more for each (the names of the fields among them): a cold build of anim says some 80 000.
 #[test]
@@ -474,4 +509,424 @@ fn a_record_of_functions_is_small() {
     check(&bytes).unwrap();
     assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
     assert!(bytes.len() < names + 1000 * 128, "{} bytes for {names} of names", bytes.len());
+}
+
+/// A writer that takes one byte per write, and counts its writes.
+struct Trickle {
+    bytes: Vec<u8>,
+    writes: usize,
+}
+
+impl std::io::Write for Trickle {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        match bytes.first() {
+            Some(&byte) => {
+                self.bytes.push(byte);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A frame is its length and its item however few bytes each write takes; into a `Vec` it is
+/// one write; one encoded in place is the frame `send` writes; a kept buffer reads them all.
+#[test]
+fn frames_are_written_in_place_and_read_into_one_buffer() {
+    let item = to_vec(&record()).unwrap();
+    let mut framed = (item.len() as u32).to_be_bytes().to_vec();
+    framed.extend_from_slice(&item);
+    let mut trickle = Trickle { bytes: Vec::new(), writes: 0 };
+    write_frame(&mut trickle, &item).unwrap();
+    assert_eq!(trickle.bytes, framed);
+    assert_eq!(trickle.writes, framed.len());
+    let mut whole = Vec::new();
+    write_frame(&mut whole, &item).unwrap();
+    assert_eq!(whole, framed);
+    let mut sent = Vec::new();
+    send(&mut sent, &record()).unwrap();
+    assert_eq!(sent, framed);
+    let mut writer = crate::cbor::Writer::new();
+    let mut appended = vec![9];
+    crate::append_frame(&mut writer, &mut appended, &record()).unwrap();
+    assert_eq!(appended[1..], framed);
+    // An item with no encoding leaves the buffer as it was.
+    assert!(crate::append_frame(&mut writer, &mut appended, &u128::MAX).is_err());
+    assert_eq!(appended[1..], framed);
+    let mut stream = framed.clone();
+    stream.extend_from_slice(&framed);
+    let mut from = stream.as_slice();
+    let mut buffer = Vec::new();
+    for _ in 0..2 {
+        assert!(crate::read_frame_into(&mut from, &mut buffer).unwrap());
+        assert_eq!(buffer, item);
+    }
+    assert!(!crate::read_frame_into(&mut from, &mut buffer).unwrap());
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn a_cancelled_node_is_settled_and_encodes_as_its_name() {
+    use crate::events::NodeState;
+    encodes(NodeState::Cancelled, "6943616e63656c6c6564");
+    assert!(NodeState::Cancelled.settled());
+    assert!(!NodeState::Ready.settled());
+}
+
+/// Columns of an [`crate::events::Event::Nodes`] built from nodes given as an `Event::Node`
+/// says each, the ids from `first` on.
+fn nodes_record(
+    first: u32,
+    nodes: &[(crate::events::NodeKind, &str, &[u32])],
+) -> crate::events::Event {
+    let mut kinds = Vec::new();
+    let (mut names, mut name_at) = (String::new(), vec![0]);
+    let (mut deps, mut deps_at) = (Vec::new(), vec![0]);
+    for &(kind, name, on) in nodes {
+        kinds.push(kind);
+        names.push_str(name);
+        name_at.push(names.len() as u32);
+        deps.extend_from_slice(on);
+        deps_at.push(deps.len() as u32);
+    }
+    crate::events::Event::Nodes { first, kinds, names, name_at, deps, deps_at }
+}
+
+/// A record of nodes is pinned like the others, and goes through the codec unchanged.
+#[test]
+fn a_record_of_nodes_is_these_bytes() {
+    use crate::events::{NodeKind, Record};
+    let event = nodes_record(1, &[(NodeKind::Std, "std", &[0]), (NodeKind::Names, "ab", &[1])]);
+    let record = Record { at_ns: 0, event };
+    let expected = [
+        "a2 6561745f6e73 00 656576656e74 a1 654e6f646573 a6", // {"at_ns": 0, "event": {"Nodes":
+        "64 64657073 82 00 01",                                //   "deps": [0, 1]
+        "65 6669727374 01",                                    //   "first": 1
+        "65 6b696e6473 82 63537464 654e616d6573",              //   "kinds": ["Std", "Names"]
+        "65 6e616d6573 65 7374646162",                         //   "names": "stdab"
+        "67 646570735f6174 83 00 01 02",                       //   "deps_at": [0, 1, 2]
+        "67 6e616d655f6174 83 00 03 05",                       //   "name_at": [0, 3, 5]}}
+    ];
+    let bytes = to_vec(&record).unwrap();
+    assert_eq!(hex(&bytes), expected.concat().replace(' ', ""));
+    check(&bytes).unwrap();
+    assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
+}
+
+/// A record of nodes reads as the `Event::Node` of each, ids from `first` on, in the order
+/// given; its order puts each after those of it that it waits for, the first given first
+/// among those that can go, at no cost when each already comes after them.
+#[test]
+fn a_record_of_nodes_reads_as_its_nodes() {
+    use crate::events::{Event, NodeKind, Order};
+    let mut order = Order::default();
+    let event = nodes_record(
+        10,
+        &[
+            (NodeKind::Codegen, "a\u{e9}", &[3, 12]),
+            (NodeKind::Link, "", &[]),
+            (NodeKind::Test, "c", &[11, 3, 11]),
+        ],
+    );
+    let batch = event.nodes(&mut order).unwrap().unwrap();
+    let each: Vec<Event> = batch.iter().map(|it| it.event()).collect();
+    let node = |id, kind, name: &str, deps: &[u32]| Event::Node {
+        id,
+        kind,
+        name: name.to_owned(),
+        deps: deps.to_vec(),
+    };
+    assert_eq!(
+        each,
+        [
+            node(10, NodeKind::Codegen, "a\u{e9}", &[3, 12]),
+            node(11, NodeKind::Link, "", &[]),
+            node(12, NodeKind::Test, "c", &[11, 3, 11]),
+        ]
+    );
+    // 10 waits for 12, which waits for 11.
+    assert_eq!(order.places(), [1, 2, 0]);
+    assert_eq!((batch.first(), batch.len(), batch.is_empty()), (10, 3, false));
+    let in_order = nodes_record(0, &[(NodeKind::Std, "std", &[]), (NodeKind::Names, "x", &[0])]);
+    in_order.nodes(&mut order).unwrap().unwrap();
+    assert_eq!(order.places(), [0, 1]);
+    let empty = nodes_record(u32::MAX, &[]);
+    assert!(empty.nodes(&mut order).unwrap().unwrap().is_empty());
+    assert!(order.places().is_empty());
+    assert!(Event::Unlisted { count: 1 }.nodes(&mut order).is_none());
+}
+
+/// The columns of an `Event::Nodes`, to edit in place.
+struct Columns<'a> {
+    first: &'a mut u32,
+    name_at: &'a mut Vec<u32>,
+    deps: &'a mut Vec<u32>,
+    deps_at: &'a mut Vec<u32>,
+}
+
+/// Columns that disagree, or nodes that wait for each other, are refused with why, never a
+/// panic, and leave no order.
+#[test]
+fn a_malformed_record_of_nodes_is_refused() {
+    use crate::events::{Event, NodeKind, Order};
+    // Ids 5 and 6: "std" waiting for 1, said before, and "é" waiting for 5.
+    let good = || {
+        nodes_record(5, &[(NodeKind::Std, "std", &[1]), (NodeKind::Names, "\u{e9}", &[5])])
+    };
+    let mut order = Order::default();
+    assert!(good().nodes(&mut order).unwrap().is_ok());
+    assert_eq!(order.places(), [0, 1]);
+    let cases: [(fn(Columns<'_>), &str); 11] = [
+        (|it| it.name_at.clear(), "name_at of 0 offsets for 2 nodes and 5 entries"),
+        (|it| _ = it.name_at.pop(), "name_at of 2 offsets for 2 nodes"),
+        (|it| it.name_at[0] = 1, "name_at of 3 offsets for 2 nodes"),
+        (|it| it.name_at[2] = 4, "name_at of 3 offsets for 2 nodes and 5 entries"),
+        (|it| it.name_at[1] = 6, "name_at goes back at node 1"),
+        (|it| it.name_at[1] = 4, "name_at cuts a character at node 1"),
+        (|it| it.deps_at[2] = 1, "deps_at of 3 offsets for 2 nodes and 2 entries"),
+        (|it| it.deps_at[1] = 3, "deps_at goes back at node 1"),
+        (|it| *it.first = u32::MAX - 1, "2 ids from 4294967294 past u32"),
+        (|it| it.deps[0] = 6, "nodes 5, 6 wait for each other"),
+        (|it| it.deps[1] = 6, "nodes 6 wait for each other"),
+    ];
+    for (edit, what) in cases {
+        let mut event = good();
+        let Event::Nodes { first, name_at, deps, deps_at, .. } = &mut event else {
+            unreachable!("an Event::Nodes")
+        };
+        edit(Columns { first, name_at, deps, deps_at });
+        good().nodes(&mut order).unwrap().unwrap();
+        let why = event.nodes(&mut order).unwrap().unwrap_err().to_string();
+        assert!(why.contains(what), "{why}, not {what}");
+        assert!(why.starts_with("a record of nodes is malformed: "), "{why}");
+        assert!(order.places().is_empty(), "{why}");
+    }
+}
+
+/// A cycle of more nodes than are shown names the first eight and counts the rest, as the
+/// message built from a list of the stuck ones did.
+#[test]
+fn a_long_cycle_names_eight_nodes() {
+    use crate::events::{NodeKind, Order};
+    let deps: Vec<[u32; 1]> = (0..11).map(|at| [(at + 1) % 11]).collect();
+    let nodes: Vec<(NodeKind, &str, &[u32])> =
+        deps.iter().map(|dep| (NodeKind::Codegen, "n", &dep[..])).collect();
+    let why = nodes_record(0, &nodes).nodes(&mut Order::default()).unwrap().unwrap_err().0;
+    assert_eq!(why, "nodes 0, 1, 2, 3, 4, 5, 6, 7 and 3 more wait for each other");
+}
+
+/// `Cause::shown` writes what `Cause::short` says, each the words they said before.
+#[test]
+fn a_cause_is_said_in_a_few_words() {
+    use crate::events::Cause;
+    let name = || "serde".to_owned();
+    let cases = [
+        (Cause::Cold, "not kept"),
+        (Cause::Edited { file: "src/lib.rs".into() }, "src/lib.rs edited"),
+        (Cause::Body, "body edited"),
+        (Cause::Signature, "signature changed"),
+        (Cause::Callee { name: name() }, "calls serde"),
+        (Cause::Uses, "uses what changed"),
+        (Cause::Dependency { name: name() }, "serde changed"),
+        (Cause::Flags { what: "RUSTFLAGS".to_owned() }, "RUSTFLAGS changed"),
+    ];
+    for (cause, said) in cases {
+        assert_eq!(cause.short(), said);
+        assert_eq!(format!("({})", cause.shown()), format!("({said})"));
+    }
+}
+
+/// Random columns, many of them malformed, are read or refused but never panic the reader;
+/// of those read, the order is the one a plain search for the first node that can go gives.
+#[test]
+fn random_records_of_nodes_are_read_or_refused() {
+    use crate::events::{Event, NodeKind, Order};
+    let mut random = Random(SplitMix64::new(0x9e37_79b9_7f4a_7c15));
+    let mut order = Order::default();
+    let (mut read, mut refused, mut out_of_order) = (0, 0, 0);
+    for _ in 0..4000 {
+        let len = (random.next() % 7) as usize;
+        let first = match random.next() % 50 {
+            0 => u32::MAX - 3,
+            _ => (random.next() % 20) as u32,
+        };
+        let names: String = (0..len).map(|_| random.text()).collect();
+        let below = |random: &mut Random, end: usize| (random.next() % (end as u64 + 1)) as u32;
+        let mut name_at: Vec<u32> = (0..=len).map(|_| below(&mut random, names.len())).collect();
+        // Deps from two before `first` to six after it: said before, of the batch, or past it.
+        let mut deps: Vec<u32> = (0..random.next() % 10)
+            .map(|_| first.wrapping_add((random.next() % 9) as u32).wrapping_sub(2))
+            .collect();
+        if random.next() % 3 == 0 {
+            deps.retain(|&it| it.wrapping_sub(first) >= len as u32);
+        }
+        let mut deps_at: Vec<u32> = (0..=len).map(|_| below(&mut random, deps.len())).collect();
+        // Mostly offsets that agree, so that cycles and orders are reached.
+        if random.next() % 4 != 0 {
+            for (at, end) in [(&mut name_at, names.len()), (&mut deps_at, deps.len())] {
+                at.sort_unstable();
+                at[0] = 0;
+                at[len] = end as u32;
+            }
+        }
+        let kinds = vec![NodeKind::Codegen; len];
+        let event = Event::Nodes { first, kinds, names, name_at, deps, deps_at };
+        match event.nodes(&mut order).unwrap() {
+            Err(_) => refused += 1,
+            Ok(batch) => {
+                read += 1;
+                let nodes: Vec<(u32, Vec<u32>)> =
+                    batch.iter().map(|it| (it.id, it.deps.to_vec())).collect();
+                let want = plain_order(&nodes);
+                assert_eq!(order.places(), want, "{event:?}");
+                let moved = want.iter().enumerate().any(|(at, &it)| it as usize != at);
+                out_of_order += usize::from(moved);
+            }
+        }
+    }
+    assert!(
+        read > 500 && refused > 500 && out_of_order > 20,
+        "{read} read, {refused} refused, {out_of_order} out of order"
+    );
+}
+
+/// The places of `nodes` (each its id and deps), each after those of them it waits for, by
+/// looking each time for the first that can go.
+fn plain_order(nodes: &[(u32, Vec<u32>)]) -> Vec<u32> {
+    let mut placed = vec![false; nodes.len()];
+    let mut order = Vec::new();
+    while order.len() < nodes.len() {
+        let can = (0..nodes.len()).find(|&at| {
+            !placed[at]
+                && nodes[at].1.iter().all(|dep| {
+                    nodes.iter().position(|it| it.0 == *dep).is_none_or(|it| placed[it])
+                })
+        });
+        let at = can.expect("a batch that was read has no cycle");
+        placed[at] = true;
+        order.push(at as u32);
+    }
+    order
+}
+
+/// One record of every event, each field set.
+fn every_event() -> Vec<crate::events::Record> {
+    use crate::events::{
+        Cache, Cause, CrateState, Event, Fns, Function, How, Level, NodeKind, NodeState, Record,
+        Slow, Step, Summary, Took,
+    };
+    let fns = Fns { total: 5353, done: 12, kept: 2 };
+    let slow = || vec![Slow { krate: "rg".into(), name: "rg::main".into(), ns: 300_000_000 }];
+    let cache = Cache { found: 7, fetched: 2, compiled: 1, cold: Some("no store".into()) };
+    let summary = Summary {
+        took_ns: 9_000_000_000,
+        crates: 31,
+        fns,
+        rebuilt: vec![("render".into(), Cause::Callee { name: "draw".into() })],
+        more: 4,
+        error: Some("anim failed".into()),
+        cache: Some(cache.clone()),
+        slowest: vec![Took { step: Step::Codegen, of: Some("anim".into()), took_ns: 5 }],
+    };
+    let function = |id: u32, how: How| Function {
+        id,
+        key: u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        krate: "anim".into(),
+        name: format!("anim::scene::render_{id}"),
+        calls: vec![id + 1, id / 2],
+        how,
+    };
+    let events = [
+        Event::Began { build: 3, command: "build".into(), root: "/w".into() },
+        Event::Started { step: Step::FrontEnd, of: Some("anim".into()) },
+        Event::Ended { step: Step::Link, of: None },
+        Event::Progress { step: Step::Check, done: 3, total: 14, longest: Some("a.rs".into()) },
+        Event::Crate { name: "anim".into(), state: CrateState::Running, fns },
+        Event::Rebuilt { name: "render".into(), krate: "anim".into(), cause: Cause::Body },
+        Event::Unlisted { count: 9 },
+        Event::Cache { cache },
+        Event::Refused { name: "asm".into(), why: "global_asm! of x86".into() },
+        Event::Said { level: Level::Warning, text: "unused".into() },
+        Event::Finished { ok: false, summary },
+        Event::Node { id: 1, kind: NodeKind::Std, name: "std".into(), deps: vec![0] },
+        Event::Nodes {
+            first: 2,
+            kinds: vec![NodeKind::Names, NodeKind::Bodies],
+            names: "animanim".into(),
+            name_at: vec![0, 4, 8],
+            deps: vec![1, 2],
+            deps_at: vec![0, 1, 2],
+        },
+        Event::Moved { id: 2, state: NodeState::Failed { why: "E0308".into() } },
+        Event::Critical { path: vec![0, 1, 3] },
+        Event::Cores { busy: 790, of: 8 },
+        Event::Compiling { functions: slow() },
+        Event::Slowest { functions: slow() },
+        Event::Functions {
+            object: 2,
+            whole: true,
+            functions: vec![
+                function(0, How::Compiled { ns: 125_000 }),
+                function(1, How::Unit),
+                function(2, How::Unchanged),
+                function(3, How::Stored),
+            ],
+        },
+    ];
+    events.into_iter().enumerate().map(|(at, event)| Record { at_ns: at as u64, event }).collect()
+}
+
+/// Every record is written as it comes, no map of it put in order, to the bytes the encoding
+/// gives any order of its fields; the same entries as JSON has.
+#[test]
+fn every_record_is_written_in_its_keys_order() {
+    let mut writer = crate::cbor::Writer::new();
+    let mut out = Vec::new();
+    for record in every_event() {
+        let message = Message::new(3, &record);
+        out.clear();
+        writer.append(&mut out, &message).unwrap();
+        assert_eq!(writer.permuted(), 0, "{record:?}");
+        assert_eq!(out, crate::cbor::reference::to_vec(&message).unwrap(), "{record:?}");
+        check(&out).unwrap();
+        let read: Message<crate::events::Record> = from_slice(&out).unwrap();
+        assert_eq!(read.body, record);
+        let entries: serde_json::Value = from_slice(&out).unwrap();
+        assert_eq!(entries, serde_json::to_value(&message).unwrap(), "{record:?}");
+    }
+}
+
+/// JSON shows the fields in the order the types declare them, as serde's derive wrote them.
+#[test]
+fn json_keeps_the_declared_order() {
+    use crate::events::{Event, Function, How, Summary};
+    let function = Function {
+        id: 1,
+        key: 2,
+        krate: "anim".into(),
+        name: "render".into(),
+        calls: vec![0],
+        how: How::Compiled { ns: 5 },
+    };
+    assert_eq!(
+        serde_json::to_string(&function).unwrap(),
+        r#"{"id":1,"key":2,"krate":"anim","name":"render","calls":[0],"how":{"Compiled":{"ns":5}}}"#
+    );
+    let began = Event::Began { build: 1, command: "build".into(), root: "/w".into() };
+    assert_eq!(
+        serde_json::to_string(&Message::new(4, &began)).unwrap(),
+        r#"{"schema":2,"id":4,"body":{"Began":{"build":1,"command":"build","root":"/w"}}}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&Summary::default()).unwrap(),
+        concat!(
+            r#"{"took_ns":0,"crates":0,"fns":{"total":0,"done":0,"kept":0},"rebuilt":[],"#,
+            r#""more":0,"error":null,"cache":null,"slowest":[]}"#
+        )
+    );
 }

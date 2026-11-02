@@ -1,0 +1,25 @@
+{
+  "id": "01329",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/delta/publish.rs",
+    "crates/hir-def/src/nameres/delta/assemble.rs",
+    "crates/hir-def/src/nameres/delta/state.rs"
+  ],
+  "what": "With 01309 (f). Round 10 tree, nameres::tests::incremental 13/4, three real reruns after a body-only edit: (1) typing_inside_a_function_should_not_invalidate_item_expansions (incremental.rs:443): an extra CrateResolution::module executes. That tracked method (delta/publish.rs) reads only the modules field, and blaze-query records input reads per field, so the maintainer set CrateResolution.modules on an edit inside fn quux, i.e. set_resolution found the assembled ModulesMap != published. Suspect: the edited module group is recollected and its row gets a new ScopeSlot id (a new ScopeInput, or a Building/Collected slot) or origin instead of the published ScopeSlot::Input it had; assemble::modules / state.ordered_rows. (2) crate_metadata_changes_should_not_invalidate_unrelated_def_maps: crate_local_def_map 3 runs, expected 2. (3) typing_inside_macro_heavy_file_should_not_invalidate_def_map: crate_local_def_map 1 run, expected 0. crate_local_def_map reads delta::published (root, prelude, macro_use_prelude, session_macros, data, local and Resolutions.crates), so one of those fields is set on a body edit or metadata change: compare which set_resolution arm fires (it returns the count of fields set). Not blessed: these are reruns, not renames.",
+  "state": "open",
+  "created": "2026-10-31T17:55:26Z",
+  "updated": "2026-10-31T17:55:26Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T17:55:26Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

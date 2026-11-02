@@ -1,0 +1,36 @@
+{
+  "id": "00217",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-fmt/src/span/symbol.rs",
+    "crates/blaze-fmt/Cargo.toml"
+  ],
+  "what": "## dedup: blaze-fmt's `Symbol::intern` onto `intern::Symbol`\n\nFrom `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/blaze-fmt/src/span/symbol.rs`\nkeeps a second process-global text interner: one `parking_lot::Mutex<Option<HashSet<&'static str>>>`\nevery `Symbol::intern` locks (38 call sites), leaking a `Box<str>` per new text. `intern::Symbol`\nis the shared one (sharded, lock-free when found) and hands back the same `&'static str` for\nequal text, so blaze-fmt's `Symbol(&'static str)` keeps its type, its text equality and order.\n\n1. `crates/blaze-fmt/Cargo.toml` `[dependencies]`: add `intern.workspace = true`; remove\n   `parking_lot = \"0.12.5\"` (its one use is this interner).\n2. `crates/blaze-fmt/src/span/symbol.rs`: delete `use std::collections::HashSet;`,\n   `use parking_lot::Mutex;` and `static INTERNER: ...;`, and `Symbol::intern` becomes:\n```rust\n    pub fn intern(s: &str) -> Symbol {\n        Symbol(intern::Symbol::intern(s).as_str())\n    }\n```\n\n> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:32:49Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: blaze-fmt's `Symbol::intern` onto `intern::Symbol`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:887"
+    },
+    {
+      "at": "2026-10-30T08:32:49Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:49Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/blaze-fmt/src/span/symbol.rs: the Mutex<HashSet> interner is gone; `Symbol::intern(s)` is `Symbol(intern::Symbol::intern(s).as_str())` (as_str is &static str). crates/blaze-fmt/Cargo.toml: intern.workspace added, parking_lot removed (its only use)."
+    }
+  ]
+}

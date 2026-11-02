@@ -1,0 +1,33 @@
+{
+  "id": "00422",
+  "from_lane": "mem-db-checks-regions",
+  "owner": "db",
+  "paths": [],
+  "what": "## R1. `Regions<'db>` becomes `Regions<'f, 'db>` (lines 169-243)\n\nOnce per body. Every field a frame value of the body's frame; the struct is what the body's\nanalyses read (`liveness`, `inference`, `loans`, `polonius`, `check`), all in the same task.\n\nLines 169-217, before (fields only):\n\n```rust\npub(super) struct Regions<'db> {\n    pub(super) universals: Vec<(Rv, UniversalKind)>,\n    universal_index: FxHashMap<Rv, usize>,\n    pub(super) static_rv: Rv,\n    pub(super) early: FxHashMap<u32, Rv>,\n    known: BitMatrix,\n    pub(super) type_bounds: Vec<(Ty<'db>, Rv)>,\n    pub(super) local_tys: Vec<Ty<'db>>,\n    pub(super) loan_regions: FxHashMap<Location, Rv>,\n    pub(super) outlives: Constraints,\n    pub(super) type_tests: Vec<TypeTest<'db>>,\n    pub(super) check_universals: bool,\n    pub(super) related_placeholders: FxHashSet<usize>,\n    pub(super) normalized_placeholders: FxHashSet<usize>,\n    pub(super) is_impl_item: bool,\n    pub(super) unsuggested: FxHashSet<usize>,\n    pub(super) closure_env: Option<usize>,\n    pub(super) creator_positions: FxHashMap<usize, usize>,\n    pub(super) members: Vec<Rv>,\n    pub(super) choices: Vec<Rv>,\n    pub(super) returns_static_opaque: bool,\n    pub(super) callee_reads: Vec<(LocalId, Location)>,\n}\n```\n\nafter (doc comments unchanged; `universal_index` gets one):\n\n```rust\npub(super) struct Regions<'f, 'db> {\n    pub(super) universals: FVec<'f, (Rv, UniversalKind)>,\n    /// The position in `universals` of each region variable that is universal, by the\n    /// variable, `u32::MAX` for one that is not; as long as the largest universal variable.\n    universal_index: FVec<'f, u32>,\n    pub(super) static_rv: Rv,\n    pub(super) early: FMap<'f, u32, Rv>,\n    known: BitMatrix<'f>,\n    pub(super) type_bounds: FVec<'f, (Ty<'db>, Rv)>,\n    pub(super) local_tys: FVec<'f, Ty<'db>>,\n    pub(super) loan_regions: FMap<'f, Location, Rv>,\n    pub(super) outlives: Constraints<'f>,\n    pub(super) type_tests: FVec<'f, TypeTest<'db>>,\n    pub(super) check_universals: bool,\n    pub(super) related_placeholders: FSet<'f, usize>,\n    pub(super) normalized_placeholders: FSet<'f, usize>,\n    pub(super) is_impl_item: bool,\n    pub(super) unsuggested: FSet<'f, usize>,\n    pub(super) closure_env: Option<usize>,\n    pub(super) creator_positions: FMap<'f, usize, usize>,\n    pub(super) members: FVec<'f, Rv>,\n    pub(super) choices: FVec<'f, Rv>,\n    pub(super) returns_static_opaque: bool,\n    pub(super) callee_reads: FVec<'f, (LocalId, Location)>,\n}\n```\n\nWhy each:\n- `universal_index`: looked up by every `universal(rv)` (per constraint in `known_relations`\n  and check.rs's universal-region errors, per region in `clauses`). A region variable is a\n  dense `usize` below the body's region count, so a direct index replaces a hash and probe;\n  4 bytes per region up to the largest universal one (the universals come first, the\n  placeholders made later are the only ones past them).\n- `early`, `loan_regions`, `creator_positions`: looked up (`liveness.rs` 895, `loans.rs` 555,\n  check.rs 1914/1999/2003); `creator_positions.values()` at check.rs 284 is counted, and\n  `.len()` at 1677 is a count: order free. hashbrown with the frame.\n- `related_placeholders`, `normalized_placeholders`, `unsuggested`: universal indices, looked\n  up (check.rs 1827, 1828, 1849); grown while universals are still made, so a frame set, not a\n  fixed-size `BitSet`.\n- `known`: the parent's `BitMatrix<'f>`, made once in `known_relations` (R5).\n- `outlives`: the parent's `Constraints<'f>` (B5.6).\n\nLines 219-243 (`impl`), before:\n\n```rust\nimpl<'db> Regions<'db> {\n    pub(super) fn universal(&self, rv: Rv) -> Option<usize> {\n        self.universal_index.get(&rv).copied()\n    }\n    ...\n    pub(super) fn type_bounds_of(&self, ty: Ty<'db>) -> Vec<Rv> {\n        self.type_bounds\n            .iter()\n            .filter(|&&(bounded, _)| bounded == ty)\n            .map(|&(_, region)| region)\n            .collect()\n    }\n```\n\nafter:\n\n```rust\nimpl<'f, 'db> Regions<'f, 'db> {\n    pub(super) fn universal(&self, rv: Rv) -> Option<usize> {\n        match self.universal_index.get(rv) {\n            Some(&at) if at != u32::MAX => Some(at as usize),\n            _ => None,\n        }\n    }\n    ...\n    pub(super) fn type_bounds_of(&self, ty: Ty<'db>) -> impl Iterator<Item = Rv> + '_ {\n        self.type_bounds.iter().filter(move |&&(bounded, _)| bounded == ty).map(|&(_, region)| region)\n    }\n```\n\n(`knows`, `type_outlives_known` unchanged.) `type_bounds_of`'s one caller, check.rs 2087\n`self.regions.type_bounds_of(ty).into_iter().chain([fn_body]).any(..)`, becomes\n`self.regions.type_bounds_of(ty).chain([fn_body]).any(..)`: one vector per type test gone.\nSettled with `mem-db-checks-check` (2026-10-29 21:09): their B7.7 chains\n`type_bounds_of(ty)` without `.into_iter()` at check.rs ~2087, so the iterator above is the\nchange (their 20:53 note that check.rs reads `type_bounds` directly is withdrawn).\n\nEvery other file that names `Regions<'db>` / `&Regions<'_>` names `Regions<'_, 'db>` /\n`&Regions<'_, '_>` (the parent's B5 already writes `liveness`, `loans`, `polonius`,\n`inference` so; check.rs is B7's).\n\n> applied by db-mem-borrowck-regions (2026-10-29 21:45): fields, `universal` and `type_bounds_of` as written. `outlives: Constraints<'f>` and `Constraints::new` are the parent's B5.6, not yet in `constraints.rs`.\n\n---\n\n> forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:09:00Z",
+  "updated": "2026-10-30T10:06:32Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks-regions.md#R1. `Regions<'db>` becomes `Regions<'f, 'db>` (lines 169-243)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks-regions.md:93"
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "last part in: Constraints<'f> and Constraints::new(frame) are in hir-ty-borrowck constraints.rs:24,38, and Regions holds outlives: Constraints<'f> (regions.rs:171,507)"
+    }
+  ]
+}

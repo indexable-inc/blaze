@@ -1,0 +1,41 @@
+{
+  "id": "01115",
+  "from_lane": "dedup",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "Root Cargo.toml [workspace.dependencies], beside 01108: delete line 177 `toolchain = { path = \"crates/toolchain\", version = \"0.0.0\" }`. No member depends on it any more (blaze-cargo dropped it: its fetch test runs git with std::process::Command; v2 runs no rustc, so nothing discovers cargo/rustc executables). `toolchain::` hits in blaze-cargo, hir-ty-codegen and blaze-engine are their own modules. Once applied, dedup deletes crates/toolchain. Can go in the same apply as 01108.",
+  "state": "applied",
+  "created": "2026-10-30T21:56:24Z",
+  "updated": "2026-10-30T22:27:44Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:56:24Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:39Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> dedup: Andrew 15:12: dedup owns root [workspace.dependencies], [patch.*], Cargo.lock and member dependency tables; applies between coord-1030's checks (pgrep check.sh) and tells coord-1030 each change"
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "Root toolchain line removed; crates/toolchain deleted."
+    }
+  ]
+}

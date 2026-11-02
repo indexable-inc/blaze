@@ -1,0 +1,36 @@
+{
+  "id": "01353",
+  "from_lane": "codegen-later",
+  "owner": "codegen-allocs",
+  "paths": [
+    "crates/blaze-codegen/src/settings.rs",
+    "crates/blaze-codegen/src/plan.rs"
+  ],
+  "what": "01035 point 2 (single flight keys a shared callee apart by unrelated overrides), for codegen-allocs (settings.rs, plan.rs are yours). Spec::policy is Policy::id() of the whole policy (plan.rs:322), so two units whose policies differ only in an override of some other package ([profile.dev.package.foo]) give syn's functions different settings, keys and stored keys, and the memo's single flight compiles syn once per policy. A callee's settings never change its caller's template: template.rs says Target::Function vs Target::Direct changes no byte, a callee edit renames relocations and compiles nothing, built-in callees are in the stored key (driver::stored) and release imports in the blob key. Everything else Policy holds that changes a function's code is already resolved into its own Spec (toolchain, backend, checks, assertions, panic, debuginfo, fold, counted, mir_inline, sanitize, pgo). Asked (best long-term, one way): delete Spec::policy and its hashing (settings.rs:185 and Spec::settings, bump SETTINGS_DOMAIN to 5, its field test at :332, the literal at :295), drop policy: self.id() in Policy::choose (plan.rs:322), and in plan.rs tests replace the_policy_is_in_every_setting with: two policies differing only in profile.packages[x] give equal choose(Member(app)).first.settings() and equal choose(Dependency(syn)).first.settings(), while packages[syn] changes the second; and the tiered test's Spec { policy: tiered.id(), ..as_output.first } becomes as_output.first. Other literals of the field to update by the same change (queue their owners or do them as exact replacements): crates/blaze-global/src/public.rs:991, crates/hir-ty-codegen/v2/release.rs:870, hir-ty-codegen/v2/tests.rs:110, v2/lowered/tests.rs:67, v2/refs/tests.rs:81. Nothing in driver/ reads Spec::policy (driver.rs uses Policy::id only for the key an unplannable function's error names). Tell codegen-later when it lands: it then adds a driver test that two builds of one memo under such policies compile syn once.",
+  "state": "applied",
+  "created": "2026-10-31T21:13:14Z",
+  "updated": "2026-10-31T23:45:28Z",
+  "taken_by": "codegen-allocs",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:13:14Z",
+      "by": "codegen-later",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:44:31Z",
+      "by": "codegen-allocs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:45:28Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Spec::policy and its hashing gone (settings.rs, SETTINGS_DOMAIN 5, field test and literal), Policy::choose no longer sets it, plan.rs test an_override_of_another_package_changes_no_setting replaces the_policy_is_in_every_setting, tiered test compares as_output.first; policy literal lines removed as exact replacements in blaze-global public.rs, hir-ty-codegen v2/release.rs (speed), v2/tests.rs, v2/lowered/tests.rs, v2/refs/tests.rs. RA 0 errors; build asked in b2-build/ready.txt. codegen-later: add the driver test once it builds"
+    }
+  ]
+}

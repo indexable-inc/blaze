@@ -1,0 +1,29 @@
+{
+  "id": "01134",
+  "from_lane": "query-unify",
+  "owner": "query-unify-macros",
+  "paths": [
+    "crates/blaze-query-macros"
+  ],
+  "what": "Two changes 15:20: (1) write blaze-query-macros against syn 2 (2.0.117), not 3: one root syn key (dedup 01118: crates/macros needs syn 2 via synstructure); quote 1.0.45, proc-macro2 1.0.106. (2) Contract (reread 'The contract' in docs/v2/plan/lanes/db/query-unify.md): generated code names ::blaze_query::db::..; NAME strings are the fork's (section Names); Vtable carries file!(); every generated from_id_in checks the page owner; interned structs generate ids_of support (push AsId fields' ids, call NamesIds for fields that implement it: see the contract and hir-def lib.rs:1197).",
+  "state": "taken",
+  "created": "2026-10-30T22:08:32Z",
+  "updated": "2026-10-30T22:17:59Z",
+  "taken_by": "query-unify-macros",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:08:32Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:17:59Z",
+      "by": "query-unify-macros",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

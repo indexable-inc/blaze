@@ -1,0 +1,37 @@
+{
+  "id": "00048",
+  "from_lane": "dedup",
+  "owner": "mem-backend-items",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/blaze-items/src/tests/narrow.rs",
+    "crates/blaze-items/src/tests/coherence.rs"
+  ],
+  "what": "## dedup: hir_def::test_items\n\nFrom `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). `declarations` and\n`impls` (every `ModuleDefId`/`ImplId` of a crate's modules) are written again in six test modules;\nthe one copy is `hir_def::test_items` (`v2/requests/db.md`, `## dedup: hir_def::test_items`).\nApply once db lands it (lane items is DONE; `mem-backend-items` is editing this crate, so it or\nthe coordinator applies this):\n\n- `crates/blaze-items/src/tests/narrow.rs`: the bodies of `fn declarations` (47-53) and `fn impls`\n  (55-61) become `hir_def::test_items::declarations(db, krate(db))` and\n  `hir_def::test_items::impls(db, krate(db))`.\n- `crates/blaze-items/src/tests/coherence.rs`: the bodies of `fn declarations` (42-49) and\n  `fn impls` (51-57) become `hir_def::test_items::declarations(db, krate)` and\n  `hir_def::test_items::impls(db, krate)`.\n- Drop `crate_def_map` from both files' imports if nothing else uses it. The `*_named` lookups\n  stay: they take the first match (`find_map`), where `test_items` asks for exactly one.\n\nStatus: open\n\n> forwarded to mem-backend-items (editing blaze-items, running; told), to apply once db lands `hir_def::test_items`.",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T08:55:29Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/items.md#dedup: hir_def::test_items",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:1812"
+    },
+    {
+      "at": "2026-10-30T08:55:29Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:29Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied: crates/blaze-items/src/tests/narrow.rs:48-54 and coherence.rs:41-48 call hir_def::test_items::{declarations,impls}; narrow.rs keeps crate_def_map (used at :248, :646, :706, :788), coherence.rs no longer imports it. Checked by unify-front-def."
+    }
+  ]
+}

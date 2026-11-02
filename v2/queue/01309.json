@@ -1,0 +1,26 @@
+{
+  "id": "01309",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/facts",
+    "crates/hir-def/src/nameres/delta",
+    "crates/hir-def/src/nameres/collector.rs",
+    "crates/hir-def/src/signatures.rs"
+  ],
+  "what": "Round 8 hir-def nameres failures (round8-test.log): (a) the facts differential tests and delta random tests: the old collector and facts::collect_crate / the maintained map differ in use_imports_{types,values,macros} (a glob import used by several names keeps one next link, last writer wins, and the two collectors write in different orders: glob_cycle_with_shadowing root glob -> a glob vs -> c struct), plus builtin_derive_impls/derive_macros/impls/diagnostics on the derive fixtures (builtin_derive_macro test_debug_expand and others) and unresolved on generated case 2 seed 0xa03faffe29e4cd3e. (b) Fixture setup panics: crate main depends on dep, which the fixture has no crate of (differential nameres_tests_globs_imports_paths, delta batched_edits_over_the_fixtures). (c) name_records_equal_the_old_ones: the fixture imports go through bindings ([], [1,1,2,0,0]). (d) delta trace an_item_added_reruns_only_its_module reruns crate::b::foo twice. (e) facts trace adding_an_import_reruns_the_partition...: reruns all modules, not {a, c}. (f) incremental crate_metadata_changes_should_not_invalidate_unrelated_def_maps: crate_local_def_map runs 3 times, not 2 (the assert now prints the events). (g) signatures relative_tests: a body edit re-lowers StructSignature/ConstSignature/VariantFields::kept and runs 17 signature_syntax, which is probably downstream of the outline/reparse item given to tests-fuzz.",
+  "state": "open",
+  "created": "2026-10-31T15:24:18Z",
+  "updated": "2026-10-31T15:24:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:24:18Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

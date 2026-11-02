@@ -1,0 +1,23 @@
+{
+  "id": "01183",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/lib.rs"
+  ],
+  "what": "crates/hir-ty-borrowck/src/lib.rs check_def: a body with a record literal that misses fields (E0063) or is `S { .. }` with no default (E0797) is borrow checked, so MIR lowering refuses it and hir reports `blaze cannot borrow-check X: TypeError(\"missing field in record literal\")` / `NotSupported(\"empty record spread\")` beside the real error (9 blaze-diagnostics tests: check::an_error_leaves_out_the_late_lints, members::a_missing_field_in_*, ...). rustc reports both in typeck, which taints the body, and mir_borrowck checks no tainted body. They are not in InferenceResult::diagnostics: hir-ty reports them from BodyValidationDiagnostic (diagnostics/expr.rs:110). Fix: in check_def, beside the TypeErrors test, return NotChecked::TypeErrors when any `(id, expr)` of `Body::of(db, def).exprs()` has `hir_ty::diagnostics::record_literal_missing_fields(db, infer, id, expr).is_some()` or `record_literal_spread_only(infer, id, expr).is_some()` (make the latter pub).",
+  "state": "open",
+  "created": "2026-10-30T23:41:29Z",
+  "updated": "2026-10-30T23:41:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:41:29Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

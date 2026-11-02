@@ -1,9 +1,0 @@
-[registries.local]
-index = "file://@HERE@/registry/index"
-
-[source.local-registry-src]
-registry = "file://@HERE@/registry/index"
-replace-with = "vendored"
-
-[source.vendored]
-directory = "vendor"

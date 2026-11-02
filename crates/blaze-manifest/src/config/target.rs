@@ -12,6 +12,7 @@ use cargo_platform::{Cfg, CfgExpr, Platform};
 use serde::Deserialize;
 
 use super::{Config, ConfigRelativePath, OptValue, PathAndArgs, StringList};
+use crate::files::Files;
 
 /// A `[target.'cfg(..)']` table.
 #[derive(Debug, Deserialize)]
@@ -73,7 +74,7 @@ impl Flags {
     }
 }
 
-impl Config {
+impl<F: Files> Config<F> {
     /// The `[target.'cfg(..)']` tables by name, as cargo's `GlobalContext::target_cfgs`.
     pub fn target_cfgs(&self) -> anyhow::Result<&Vec<(String, TargetCfgConfig)>> {
         if let Some(cfgs) = self.target_cfgs.get() {

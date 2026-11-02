@@ -1,0 +1,39 @@
+{
+  "id": "00389",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/mem-codegen-unit.md",
+    "crates/blaze-engine",
+    "crates/hir-ty-codegen/mod.rs",
+    "crates/intern/src/symbol.rs",
+    "Cargo.toml"
+  ],
+  "what": "## Where the engine meets a codegen unit, and who opens the frame\n\nThe engine never drives a unit itself. `build` (`src/lib.rs:5232`) hands the whole program to\n`CodegenUnit::compile_or_hold` (`lib.rs:5411`); the backend splits it into units and runs them on\nevery core through `SymbolResolver::in_parallel_beside` (`lib.rs:1429`). Each `work(&db,\n&resolver, at)` call there is one worker's whole job loop (`hir-ty-codegen/units.rs:365`,\n`everywhere`: \"Runs `work`, which takes jobs until there are none\"), so the loop over units, the\n`CompiledFunction`s, and their symbol, relocation and section lists are all the backend's.\n\n**The backend opens `blaze_mem::frame::task(Tag::Codegen, ..)` around each unit**, inside its job\nloop; the engine opens none per unit. Agreed with mem-codegen-unit:\n`v2/requests/mem-codegen-unit.md` section 4.\n\n> Revised 2026-10-29 20:50, after pass 17 forwarded it: requests 3 and 5 and the \"Depends on\"\n> section now follow the trait as mem-codegen-unit section 4.2 writes it. Answers are\n> `intern::Symbol`s, `makers`/`copies` fill the caller's buffer, no `Frame` crosses the trait,\n> `item` keeps `String`, and `closure` returns a `Symbol`. Apply this text, not the one\n> forwarded first.\n\nWhat the engine does do per unit is answer the backend's questions: a symbol for every function\ncalled, a path for every type named, a file name for every panic location, a crate's ids. Today\neach answer is worked out again or cloned out of a `Mutex<FxHashMap>`, an allocation per\nquestion per unit. Requests 2 to 5 make a warm unit's questions allocate nothing and take no\nlock. Requests 6 and 7 move the per-build lists into the request arena; 8 to 10 make the\nno-op rebuild's walk allocate nothing.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).\n\n### Depends on: `SymbolResolver` answers without allocating (hir-ty-codegen, mem-codegen-unit)\n\nA question asked again can only allocate nothing if its answer is not a fresh `String`.\nRequest 5 implements `SymbolResolver` (`crates/hir-ty-codegen/mod.rs:339`) as\n`v2/requests/mem-codegen-unit.md` section 4.2 changes it. That request also changes the call\nsites in hir-ty-codegen and blaze-wasm's two implementations. The two requests go in together.\n\n```rust\n    fn function(&self, func: FunctionId) -> Option<intern::Symbol>;\n    fn static_(&self, id: StaticId) -> Option<intern::Symbol>;\n    fn path(&self, path: &str) -> Option<&str>;\n    fn source_path(&self, file: base_db::FileId) -> Option<intern::Symbol>;\n    fn closure(&self, _owner: FunctionId, _expr: hir_def::hir::ExprId) -> Option<intern::Symbol>;\n    fn makers(&self, _function: &str, _out: &mut Vec<u64>) {}\n    fn copies(&self, _symbol: &str, _out: &mut Vec<(intern::Symbol, u64)>) {}\n```\n\n`item` keeps `-> Option<String>`. An `intern::Symbol` is `Copy`, four bytes, and its text is\n`&'static str` (`crates/intern/src/symbol.rs:53`, `:190`); interning a string already interned\nis a lookup. blaze-engine already depends on `intern` (`Cargo.toml:49`).\n\n---\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:50:00Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#Where the engine meets a codegen unit, and who opens the frame",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:7"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

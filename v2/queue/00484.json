@@ -1,0 +1,24 @@
+{
+  "id": "00484",
+  "from_lane": "diagnostics-lints-syntax-early-macros-matchers",
+  "owner": "format",
+  "paths": [
+    "crates/mbe",
+    "v2/requests/speed.md"
+  ],
+  "what": "## diagnostics-lints-syntax-early-macros-matchers: two `macro_rules!` errors blaze never gives (`crates/mbe`, `lower/macro_def_error.rs`; front end, `diagnostics`)\n\nrustc refuses these definitions at `compile_declarative_macro`; blaze defines them and the\ncrate builds, against **superset-of-rust** (a program the pinned nightly refuses is built):\n\n1. **Follow sets** (`check_matcher` / `check_matcher_core` / `is_in_follow` in\n   `compiler/rustc_expand/src/mbe/macro_rules.rs`): `` `$e:expr` is followed by `+`, which is\n   not allowed for `expr` fragments `` with its notes (`allowed there are: ...`, the `pat_param`\n   / `expr_2021` help). `crates/mbe` never checks them, and `lower/macro_def_error.rs` says\n   \"not ported yet\".\n2. **A variable bound twice in a rule's own matcher** (`check_binders`'s `DuplicateMatcherBinding`\n   in `compiler/rustc_expand/src/mbe/macro_check.rs`): the error \"duplicate matcher binding\" with\n   labels \"duplicate binding\" / \"previous binding\". Only the copy in a macro a transcriber defines\n   is a lint (`meta_variable_misuse`, mine, done).\n\nWhat exists to build on: `lints/syntax/early/macros/matchers/follow.rs` ports `FirstSets` and\n`check_matcher_core` with `is_in_follow` as yes/no (enough to stop where rustc stops); the error\nneeds `IsInFollow::No`'s list of what is allowed, per fragment. `matchers/check.rs`'s `binders`\nhas the duplicate branch (it drops it today, as it is not a lint). Both read the definition's\ntokens as rustc's lexer glues them (`matchers/tokens.rs`) and in each token's edition. Whoever\nowns `lower/macro_def_error.rs` can take them (make the module `pub(crate)` from\n`matchers.rs`, the parent's `macros.rs` declares it) or port the check into `crates/mbe` so\nthe definition is refused there.\n\n> forwarded to format: `crates/mbe` is lane format's (and db for any `hir-expand` part).\n> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, \"requests forwarded to format that are in your crates\", 2).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-macros-matchers: two `macro_rules!` errors blaze never gives (`crates/mbe`, `lower/macro_def_error.rs`; front end, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1357"
+    }
+  ]
+}

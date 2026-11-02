@@ -7,7 +7,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use hir_def::TraitId;
+use hir_def::{GenericDefId, TraitId};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::elaborate::Elaboratable;
 use rustc_type_ir::{
@@ -19,8 +19,7 @@ use tracing::debug;
 use crate::{
     Span,
     next_solver::{
-        Clause, DbInterner, Goal, ParamEnv, PolyTraitPredicate, Predicate, TraitPredicate,
-        TraitRef, Ty,
+        Clause, DbInterner, Goal, ParamEnv, PolyTraitClause, Predicate, TraitClause, TraitRef, Ty,
     },
 };
 
@@ -31,12 +30,49 @@ use super::InferCtxt;
 pub struct ObligationCause {
     #[type_visitable(ignore)]
     span: Span,
+    #[type_visitable(ignore)]
+    #[type_foldable(identity)]
+    code: ObligationCauseCode,
+}
+
+/// rustc's `ObligationCauseCode`, the codes diagnostics read. Ids only, so a cause stays `Copy`
+/// (rustc boxes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ObligationCauseCode {
+    /// Not well classified or should be obvious from the span.
+    Misc,
+    /// Like rustc's `WhereClauseInExpr`: the `bound_index`th predicate of `item`, required by
+    /// a use of it in an expression; `arg_index` is the argument the bound is about, if any.
+    WhereClauseInExpr { item: GenericDefId, bound_index: u32, arg_index: Option<u32> },
+    /// The type of a function argument must be `Sized`.
+    SizedArgumentType,
+    /// The declared return type of a body must be `Sized`.
+    SizedReturnType,
+    /// The tail expression of a block.
+    BlockTailExpression,
+    /// The value of a `return`, or a body's tail.
+    ReturnValue,
+    /// The arms of an `if` must agree.
+    IfExpression,
+    /// A `match` arm must agree with the `prior_arms` before it.
+    MatchExpressionArm { prior_arms: u32 },
+    /// The type of a `let` must be `Sized`.
+    LetType,
+    /// An `if` without an `else` is `()`, which must agree with what the `if` is expected to be.
+    IfExpressionWithNoElse,
+    /// A `return` without a value returns `()`, which must agree with the return type.
+    ReturnNoExpression,
 }
 
 impl ObligationCause {
     #[inline]
     pub fn new<S: Into<Span>>(span: S) -> ObligationCause {
-        ObligationCause { span: span.into() }
+        ObligationCause::with_code(span, ObligationCauseCode::Misc)
+    }
+
+    #[inline]
+    pub fn with_code<S: Into<Span>>(span: S, code: ObligationCauseCode) -> ObligationCause {
+        ObligationCause { span: span.into(), code }
     }
 
     #[inline]
@@ -48,6 +84,11 @@ impl ObligationCause {
     pub(crate) fn span(&self) -> Span {
         self.span
     }
+
+    #[inline]
+    pub fn code(&self) -> ObligationCauseCode {
+        self.code
+    }
 }
 
 /// An `Obligation` represents some trait reference (e.g., `i32: Eq`) for
@@ -56,7 +97,7 @@ impl ObligationCause {
 /// either identifying an `impl` (e.g., `impl Eq for i32`) that
 /// satisfies the obligation, or else finding a bound that is in
 /// scope. The eventual result is usually a `Selection` (defined below).
-#[derive(Clone, Debug, TypeVisitable, TypeFoldable)]
+#[derive(Clone, Copy, Debug, TypeVisitable, TypeFoldable)]
 pub struct Obligation<'db, T> {
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
@@ -74,8 +115,17 @@ pub struct Obligation<'db, T> {
     /// If this goes over a certain threshold, we abort compilation --
     /// in such cases, we can not say whether or not the predicate
     /// holds for certain. Stupid halting problem; such a drag.
-    pub recursion_depth: usize,
+    ///
+    /// `u32`: fulfillment stops an obligation once this passes the crate's `recursion_limit`,
+    /// itself a `u32`.
+    #[type_foldable(identity)]
+    #[type_visitable(ignore)]
+    pub recursion_depth: u32,
 }
+
+// `PredicateObligation` is moved per nested goal. Make sure it doesn't unintentionally get bigger:
+// 8 bytes of span, at most 24 of cause code (a `GenericDefId` and two `u32`s), 12 of the rest.
+const _: () = assert!(size_of::<PredicateObligation<'static>>() <= 44);
 
 /// A callback that can be provided to `inspect_typeck`. Invoked on evaluation
 /// of root obligations.
@@ -106,7 +156,7 @@ impl<'db> Elaboratable<DbInterner<'db>> for PredicateObligation<'db> {
         &self,
         clause: Clause<'db>,
         span: Span,
-        _parent_trait_pred: PolyTraitPredicate<'db>,
+        _parent_trait_pred: PolyTraitClause<'db>,
         _index: usize,
     ) -> Self {
         let cause = ObligationCause::new(span);
@@ -153,7 +203,7 @@ impl<'db, P> From<Obligation<'db, P>> for Goal<'db, P> {
 }
 
 pub(crate) type PredicateObligation<'db> = Obligation<'db, Predicate<'db>>;
-pub(crate) type TraitObligation<'db> = Obligation<'db, TraitPredicate<'db>>;
+pub(crate) type TraitObligation<'db> = Obligation<'db, TraitClause<'db>>;
 
 pub(crate) type PredicateObligations<'db> = Vec<PredicateObligation<'db>>;
 
@@ -185,14 +235,14 @@ impl<'db, O> Obligation<'db, O> {
     ///
     /// To deal with this evaluate and fulfill explicitly update the depth
     /// of nested obligations using this function.
-    pub fn set_depth_from_parent(&mut self, parent_depth: usize) {
+    pub fn set_depth_from_parent(&mut self, parent_depth: u32) {
         self.recursion_depth = cmp::max(parent_depth + 1, self.recursion_depth);
     }
 
     pub fn with_depth(
         interner: DbInterner<'db>,
         cause: ObligationCause,
-        recursion_depth: usize,
+        recursion_depth: u32,
         param_env: ParamEnv<'db>,
         predicate: impl Upcast<DbInterner<'db>, O>,
     ) -> Obligation<'db, O> {
@@ -239,4 +289,59 @@ fn pred_known_to_hold_modulo_regions<'db>(
     debug!(?result);
 
     result.must_apply_modulo_regions()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::BuildHasher;
+
+    use super::{Obligation, ObligationCause};
+    use crate::next_solver::ParamEnv;
+
+    fn obligation(predicate: u32, depth: u32) -> Obligation<'static, u32> {
+        Obligation {
+            cause: ObligationCause::dummy(),
+            param_env: ParamEnv::empty(),
+            predicate,
+            recursion_depth: depth,
+        }
+    }
+
+    #[test]
+    fn eq_and_hash_ignore_cause_and_depth() {
+        let hasher = blaze_hash::FixedState;
+        let (a, b) = (obligation(7, 0), obligation(7, 5));
+        assert_eq!(a, b);
+        assert_eq!(hasher.hash_one(a), hasher.hash_one(b));
+        assert_ne!(a, obligation(8, 0));
+    }
+
+    #[test]
+    fn depth_from_parent_takes_the_deeper() {
+        let mut child = obligation(1, 3);
+        child.set_depth_from_parent(1);
+        assert_eq!(child.recursion_depth, 3);
+        child.set_depth_from_parent(9);
+        assert_eq!(child.recursion_depth, 10);
+    }
+
+    /// Fulfillment copies, re-depths, hashes and turns obligations into goals once per nested
+    /// goal; none of that may touch the heap.
+    #[test]
+    fn obligation_hot_path_allocates_nothing() {
+        let hasher = blaze_hash::FixedState;
+        // `ParamEnv::empty` initializes the default interned values once.
+        let parent = obligation(1, 4);
+        let mut sum = 0u64;
+        blaze_alloc_count::assert_at_most(0, "copying an obligation into a goal", || {
+            for predicate in 0..1024 {
+                let mut child = parent;
+                child.predicate = predicate;
+                child.set_depth_from_parent(parent.recursion_depth);
+                let goal = child.as_goal();
+                sum = sum.wrapping_add(hasher.hash_one(child)) ^ u64::from(goal.predicate);
+            }
+        });
+        assert_ne!(sum, 0);
+    }
 }

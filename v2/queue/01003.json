@@ -1,0 +1,25 @@
+{
+  "id": "01003",
+  "from_lane": "item-hash",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen",
+    "crates/blaze-codegen",
+    "crates/blaze-link"
+  ],
+  "what": "Andrew (via coordinator): locations as data, design docs/v2/plan/design/item-hash.md section 12. A per-crate location table, entries named by (item identity, slot): code loads its &Location / line!() / file!() from it by relocation; patch identity (patch.rs Mark::new locations, patch_hash DataRequest::Location) leaves values out, so a move or line edit is a live patch that writes only data. Release bakes values. Differential test: program output (line!, column!, file!, track_caller, panic text) equal to a fresh build and the nightly after moves, and the live patch has no code section. Builds on 00957.",
+  "state": "open",
+  "created": "2026-10-30T13:22:18Z",
+  "updated": "2026-10-30T13:22:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:22:18Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00150",
+  "from_lane": "solver-sync",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/rustc_transmute",
+    "tools/v2/solver_sync.py"
+  ],
+  "what": "## 5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`\n\nWhat: add `compiler/rustc_transmute` to `/tmp/rust-solver`'s sparse checkout, at the same\ncommit (`git -C /tmp/rust-solver sparse-checkout add compiler/rustc_transmute`, which fetches\nits blobs). solver-sync then:\n- vendors it as `vendor/rustc_transmute` with the `rustc` feature off: the layout tree, the\n  DFA/NFA and the query are generic over `Def`/`Ref` traits, and only the `rustc` feature ties\n  them to `rustc_middle`;\n- records its own `PATCHES.md` series and adds it to `tools/v2/solver_sync.py`'s `CRATES`, so\n  it follows each nightly.\n\nThen hir-ty implements the crate's `Def`/`Ref`/`Region`/`Type` traits and builds `Tree`s from\nits own layouts, which ports rustc's `Tree::from_ty`. That is lane db's, in `solver.rs`\n(db-ty-port-solver), whose `is_transmutable` then calls it in place of today's panic. Its owner\ngets a request when the crate is vendored.\n\nWhy: `SolverDelegate::is_transmutable` must give rustc's answer to `TransmuteFrom` goals\n(superset-of-rust). Today it stops with an error naming the goal (`solver.rs:618`), which is\nright until the port exists. solver-sync fetches nothing itself.\n\n> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T01:51:29Z",
+  "updated": "2026-10-30T08:33:53Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/solver-sync.md#5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync.md:113"
+    },
+    {
+      "at": "2026-10-30T08:33:53Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:53Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "vendor/rustc_transmute: upstream src at 16d1ffac (from /tmp/rust-16d1ffac-env, no fetch) with PATCHES.md series 0001-standalone (indexmap+rustc-hash for rustc_data_structures fx maps; Answer/Condition/Reason from rustc_type_ir::transmute, since upstream imports rustc_middle outside the rustc feature) and 0002-generic-entry (layout::{Tree, Endian, Byte, Reference}, Def/Region/Type, every Tree builder, QueryContext public; pub fn is_transmutable(src, dst, assume, context)). Cargo.toml (rustc off), Cargo.toml.orig. tools/v2/solver_sync.py CRATES gains it (replay checked locally: same tree, byte-identical patches). Root Cargo.toml: rustc_transmute workspace dependency. No user yet, so Cargo.lock unchanged. /tmp/rust-solver still lacks compiler/rustc_transmute: a checkout-mode run needs it added there. The hir-ty side is a new request to db."
+    }
+  ]
+}

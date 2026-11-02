@@ -1,0 +1,37 @@
+{
+  "id": "00995",
+  "from_lane": "integrate-store",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/src/versions.rs",
+    "crates/blaze-engine/build.rs",
+    "crates/blaze-engine/src/lib.rs"
+  ],
+  "what": "integrate-store (00031): the last of blaze-engine's v1 store and remote, so `crates/blaze-store` and `crates/blaze-cargo/src/remote*` can be deleted.\n\n1. `src/versions.rs:165-167` (`read_at`, the release download) uses v1 remote's HTTPS helpers `blaze_cargo::remote::{Traffic, Https, runtime}` and `Https::read_small`. Move it to v2's HTTP client, `blaze_registry::http::{Http, HyperHttp}` (`HyperHttp::shared()`, then `send`, as `blaze-cargo/src/serve/fetch.rs` does), keeping its size limit `MOST` and `PATIENCE`. It is the only use of `blaze_cargo::remote` left in blaze-engine.\n\n2. `build.rs` makes `BLAZE_SOURCES` (a hash of every workspace source) for `blaze_store::built_from`, which nothing calls any more: v1's `Identity` has no v2 equivalent by design (#1439; v2 keys a value with `blaze_cas::Key::of(schema, producer, inputs)`). Delete the `BLAZE_SOURCES` part of build.rs, or the whole build.rs if that is all it does.\n\nPlease mark this done when blaze-engine names neither `blaze_store` nor `blaze_cargo::remote`.",
+  "state": "applied",
+  "created": "2026-10-30T13:02:16Z",
+  "updated": "2026-10-30T13:03:46Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:02:16Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:03:45Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:03:46Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "blaze-engine names neither blaze_store nor blaze_cargo::remote. versions.rs read_at fetches through blaze_registry::http::HyperHttp::new(PATIENCE) + Http::get under Retry::default() (404 -> no asset, 2xx over MOST -> error, other -> HttpNotSuccessful); Cargo.toml has blaze-registry by path (and Cargo.lock). build.rs keeps only BLAZE_VERSION/BLAZE_VERSION_LINE; BLAZE_SOURCES, listed() and the blaze-sha256 build-dependency are gone. My 00967 to you is answered by this."
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00504",
+  "from_lane": "diagnostics",
+  "owner": "format",
+  "paths": [
+    "crates/mbe",
+    "crates/hir-expand",
+    "v2/requests/speed.md"
+  ],
+  "what": "## 6. `crates/mbe`, `crates/hir-expand` (format, db): a metavariable's span in the definition (rustc's metavar spans)\n\nFrom the parent, `diagnostics`, for diagnostics-lints-bodies-types-casts and\ndiagnostics-lints-syntax-early-validation (item 3 of theirs above).\n\nWhat: when `macro_rules!` substitutes a fragment `$e`, record the span of `$e` in the\ndefinition for the substituted tokens (rustc's `rustc_span::with_metavar_spans`, filled by\n`rustc_expand/src/mbe/transcribe.rs` `maybe_use_metavar_location`), and give it from the\nexpansion: `ExpansionInfo::metavar_span(db, range: TextRange) -> Option<FileRange>` (the\ndefinition's range of the `$var` whose substitution covers `range` of the expansion).\n\nWhy: rustc's `Span::to` and `with_lo`/`with_hi` of two spans in different contexts, one in the\nmacro's and one a substituted argument's, take the argument's metavariable span in the\ndefinition (`Span::prepare_to_combine`), so `&$e as *const i32` called as `ref_cast!(*x)`\npoints at `$e as *const i32` in the definition (`tests/ui/lint/lint-raw-borrows-via-references.stderr`,\n68:10), and `break '_l $f` at the definition (`tests/ui/parser/issues/issue-87812.rs`).\nblaze's span map gives the substituted tokens the call site's spans only, so `Cx::span` of a\nrange across both can only say the call site. With the query, `Cx::span` does what\n`prepare_to_combine` does.\n\n> forwarded to format (`crates/mbe`) and db (`crates/hir-expand`).\n> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, \"requests forwarded to format that are in your crates\", 3).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#6. `crates/mbe`, `crates/hir-expand` (format, db): a metavariable's span in the definition (rustc's metavar spans)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1984"
+    }
+  ]
+}

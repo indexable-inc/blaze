@@ -1,0 +1,26 @@
+{
+  "id": "00068",
+  "from_lane": "speed-hir",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/la-arena",
+    "Cargo.toml",
+    "crates/blaze-doc/src/collect.rs",
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## speed-hir: vendor `la-arena` with a niche in `RawIdx`\n\nWhat: copy crates.io `la-arena` 0.3.1 into `vendor/la-arena/` and point the root `Cargo.toml`'s\n`la-arena = { version = \"0.3.1\" }` (line 179) at `{ path = \"vendor/la-arena\" }`. In it, `RawIdx`\nholds `NonZeroU32` of the index's complement (`!raw`), so `from_u32`/`into_u32`/`From<u32>` keep\ntheir meaning, `u32::MAX` is the one index refused (`from_u32(u32::MAX)` panics naming it), and\n`Option<Idx<T>>` and `Option<RawIdx>` become 4 bytes. `Idx<T>` stays 4 bytes; `Arena` refuses to\ngrow past `u32::MAX - 1` elements. No public signature changes.\n\nWhy: every `Option<ExprId>`, `Option<PatId>`, `Option<TypeRefId>`, `Option<LabelId>` in hir-def\nis 8 bytes today. With the niche, `Statement` goes from 32 to 20 bytes, `MatchArm` 16 to 12,\n`RefType` 16 to 12 (speed-hir-store's report, \"For speed-hir\"), toward data.md's 12-byte budget,\nwith no edit in any user. Checked: no code in `crates/` or `vendor/` builds a `RawIdx` from\n`u32::MAX`. The `const` size asserts in hir-def (`Statement`, `MatchArm`, `RefType`, `Binding`)\nthen need their numbers lowered; speed-hir-store will do that once this lands (tell window\n`speed-hir`).\n\n> forwarded to coordinator: `vendor/` is the coordinator's, and copying the crate needs its 0.3.1 source. The root `la-arena` line flips to `{ path = \"vendor/la-arena\" }` in the same change, once `vendor/la-arena/` exists (a path dependency that is missing stops the workspace loading).\n> forwarded to the coordinator: a new `vendor/` copy (from the registry cache) is not among `requests`' paths; the root line goes with it. On the list in `/tmp/blaze-lanes/v2-requests.md`.\n\n### from db-ty: `hir::Type::instantiate_type_params` takes the database (2026-10-29)\n\n`DbInterner::conjure` is deleted (unsound: it stretched the attached database's borrow, safety\naudit `interner.rs:411`), so hir's `Type::instantiate_type_params` takes the database. One site\nin `crates/blaze-doc/src/collect.rs:1209`:\n`ty.instantiate_type_params(args.iter())` -> `ty.instantiate_type_params(db, args.iter())` (`db`\nis `self.db`, bound above). The result is unchanged. `blaze-diagnostics`' six sites are in\n`v2/requests/diagnostics.md`.",
+  "state": "open",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T00:39:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed.md#speed-hir: vendor `la-arena` with a niche in `RawIdx`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:291"
+    }
+  ]
+}

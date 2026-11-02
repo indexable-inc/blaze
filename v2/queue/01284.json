@@ -1,0 +1,36 @@
+{
+  "id": "01284",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/tests/const_valtree.rs",
+    "crates/hir-ty-mir/src/tests.rs"
+  ],
+  "what": "Move of hir-ty tests::const_valtree (round 7c: it panicked in coroutine_witness_tests::no_build, the hir-ty test binary builds no MIR, and the value [0u8; 100001] is evaluated by MIR). I removed it from hir-ty. Add /tmp/blaze-lanes/no-fallback-front-ty-const-valtree-test.rs as crates/hir-ty-mir/src/tests/const_valtree.rs (exact, uses hir_ty::{const_valtree, db::signature_anon_consts_and_diagnostics, attach_db}) and `mod const_valtree;` after `mod consteval;` in crates/hir-ty-mir/src/tests.rs.",
+  "state": "applied",
+  "created": "2026-10-31T14:24:57Z",
+  "updated": "2026-10-31T14:57:21Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:24:57Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:53:04Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:57:21Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "crates/hir-ty-mir/src/tests/const_valtree.rs added exactly from /tmp/blaze-lanes/no-fallback-front-ty-const-valtree-test.rs; `mod const_valtree;` after `mod consteval;` in tests.rs. ra clean."
+    }
+  ]
+}

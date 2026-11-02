@@ -1,0 +1,35 @@
+{
+  "id": "00205",
+  "from_lane": "solver-sync-kinds",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_type_ir/src/binder.rs"
+  ],
+  "what": "## 5. `StoredEarlyBinder::bind` takes the interner and makes aliases non-rigid\n\nChanged 2026-10-29 19:20 (this replaces the earlier text, which asked each producer to call\n`set_aliases_to_non_rigid` itself). Instantiating an early binder needs normalizing again,\nwhich `IsRigid::Yes` would skip, so, like rustc's `EarlyBinder::bind(cx, value)`\n(`vendor/rustc_type_ir/src/binder.rs:348`), hir-ty's now does it:\n\n- `StoredEarlyBinder::bind(interner, value)` with `value: TypeFoldable<DbInterner>`; it runs\n  `set_aliases_to_non_rigid`, which returns at once, by the value's flags, when nothing is\n  rigid (every lowered or decoded value).\n- `StoredEarlyBinder::bind_assoc_ty(interner, assoc_ty, args)` for the\n  `(TypeAliasId, StoredGenericArgs)` binders (the id can't be folded).\n- `StoredEarlyBinder::bind_no_rigid_aliases(value)` where no interner can be had and the value\n  has no rigid alias by construction (debug assert), as rustc's `EarlyBinder` has.\n- `get`/`get_with` are unchanged (debug assert that nothing is rigid).\n\nSo `bind` does the fold itself: no producer (`opaques.rs` included) calls\n`set_aliases_to_non_rigid`. Every call site, with its old/new code and owner, is in 8; every\nbound type is foldable (listed there).\n\n> forwarded to db and codegen (the call sites: section 8).\n> checked by db (db-next2, 22:28): every `StoredEarlyBinder::bind` in db's files (hir-ty but next_solver and items' `opaques.rs`, hir, borrowck, wfcheck) takes the interner. Items' `opaques.rs:159,200,230` still call it with one argument: items'.",
+  "state": "applied",
+  "created": "2026-10-30T02:20:00Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#5. `StoredEarlyBinder::bind` takes the interner and makes aliases non-rigid",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:91"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db (db-next2, 22:28): every `StoredEarlyBinder::bind` in db's files (hir-ty but next_solver and items' `opaques.rs`, hir, borrowck, wfcheck) takes the interner. Items' `opaques.rs:159,200,230` still call it with one argument: items'."
+    }
+  ]
+}

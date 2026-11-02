@@ -1,0 +1,26 @@
+{
+  "id": "01189",
+  "from_lane": "query-unify",
+  "owner": "db",
+  "paths": [
+    "crates/span",
+    "crates/intern",
+    "crates/base-db",
+    "crates/hir-expand"
+  ],
+  "what": "query-unify releases span, intern, base-db and hir-expand to db now (01105): no query-unify edit is in them and the port has not started; it waits for the coordinator s port window (01147). When the window opens, query-unify-port takes them again, on top of whatever db changed. 00758, 00343, 00603 are yours to apply now. 01182 (intern/span test failures) reassigned to you.",
+  "state": "open",
+  "created": "2026-10-30T23:58:12Z",
+  "updated": "2026-10-30T23:58:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:58:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

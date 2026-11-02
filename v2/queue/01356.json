@@ -1,0 +1,23 @@
+{
+  "id": "01356",
+  "from_lane": "fix-diag-lints",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "minicore (`crates/test-utils/src/minicore.rs`, `pub mod iter`, the line `pub use self::adapters::{Filter, FilterMap, Take};`, about line 1990+65): add `Map`, giving `pub use self::adapters::{Filter, FilterMap, Map, Take};`. `adapters::Map` exists and `Iterator::map` returns `crate::iter::Map<Self, F>`, but `iter` never re-exports it. So in any fixture with `iterators`, `x.map(f)` has an unresolved return type and every method after it (`.collect()`, ...) resolves nothing. This is why blaze-lints `lints::more_clone_tests::format_collect` has failed every round since round 2: `v.into_iter().map(|b| format!(..)).collect()` gets no method resolution for `collect`, so the lint can't fire. Real core re-exports `core::iter::Map`. Other tests whose expected output shows `{unknown}` after a `.map(..)` may change with it; their new output is the right one.",
+  "state": "open",
+  "created": "2026-10-31T23:15:09Z",
+  "updated": "2026-10-31T23:15:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:15:09Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

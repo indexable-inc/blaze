@@ -142,8 +142,11 @@ CfgPredicate =
   CfgAtom
 | CfgComposite
 
+// A literal is a predicate only as `version`'s argument; elsewhere it is an error
+// (rustc's `parse_cfg_entry`).
 CfgAtom =
   ('#ident' | 'true' | 'false') ('=' '@string')?
+| Literal
 
 CfgComposite =
   keyword:'#ident' '(' (CfgPredicate (',' CfgPredicate)* ','?) ')'
@@ -209,7 +212,7 @@ MacroDef =
 
 Module =
   AnyAttr* Visibility?
-  'mod' Name
+  'unsafe'? 'mod' Name
   (ItemList | ';')
 
 ItemList =
@@ -450,6 +453,7 @@ Expr =
 | UnderscoreExpr
 | IncludeBytesExpr
 | CfgPredExpr
+| UnsafeBinderCastExpr
 
 // We need a special expression for this because we don't have access to the file,
 // and emitting a specific array will have problems with the length.
@@ -458,6 +462,10 @@ IncludeBytesExpr =
 
 CfgPredExpr =
   'builtin' '#' 'cfg' '(' CfgPredicate ','? ')'
+
+// What core's `wrap_binder!` and `unwrap_binder!` expand to.
+UnsafeBinderCastExpr =
+  AnyAttr* 'builtin' '#' ('wrap_binder' | 'unwrap_binder') '(' Expr (',' Type)? ')'
 
 OffsetOfExpr =
   AnyAttr* 'builtin' '#' 'offset_of' '(' Type ',' fields:(NameRef ('.' NameRef)* ) ')'
@@ -568,7 +576,7 @@ TupleExpr =
   AnyAttr* '(' AnyAttr* fields:(Expr (',' Expr)* ','?)? ')'
 
 RecordExpr =
-  Path RecordExprFieldList
+  AnyAttr* Path RecordExprFieldList
 
 RecordExprFieldList =
   '{'
@@ -683,6 +691,7 @@ Type =
 | RefType
 | SliceType
 | TupleType
+| UnsafeBinderType
 
 ParenType =
   '(' Type ')'
@@ -720,6 +729,10 @@ FnPtrType =
 ForType =
   ForBinder Type
 
+// `unsafe<'a> T`, `#![feature(unsafe_binders)]`.
+UnsafeBinderType =
+  'unsafe' GenericParamList Type
+
 PatternType =
   'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
 
@@ -734,7 +747,7 @@ TypeBoundList =
 
 TypeBound =
   Lifetime
-| ForBinder? ('~' 'const' | '[' 'const' ']' | 'const')? 'async'? '?'? Type
+| ForBinder? ('~' 'const' | '[' 'const' ']' | 'const')? 'async'? ('?' | '!')? Type
 | 'use' UseBoundGenericArgs
 
 UseBoundGenericArgs =
@@ -768,6 +781,11 @@ Pat =
 | DerefPat
 | NotNull
 | CfgPredPat
+| GuardPat
+
+// A sub-pattern with a guard, `(x if cond)` (`guard_patterns`)
+GuardPat =
+  Pat guard:MatchGuard
 
 NotNull =
     '!' 'null'
@@ -796,7 +814,7 @@ RangePat =
   | op:('..' | '..=') end:Pat
 
 RefPat =
-  '&' 'mut'? Pat
+  '&' ('pin' ('const' | 'mut') | 'mut')? Pat
 
 RecordPat =
   Path RecordPatFieldList

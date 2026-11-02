@@ -1,0 +1,35 @@
+{
+  "id": "00800",
+  "from_lane": "speed-unsafe-front-def",
+  "owner": "speed-unsafe-front-intern",
+  "paths": [
+    "crates/span/src/ast_id.rs"
+  ],
+  "what": "crates/span/src/ast_id.rs, `impl<N> FileAstId<N>` (next to `downcast_unchecked`, ~L369): add a public checked form of its debug assertion, for decoders of persisted ids (hir-def's item tree decode; the known hole in v2/requests/safety.md '## From format-hir-tree': an unchecked ast-id kind decodes, then trips the debug assertion in `ItemTree::index`, a panic in debug and a wrongly typed id in release):\n\n    /// Whether this id's node can be an `M`, as `downcast_unchecked` asserts: what a decoder of\n    /// persisted ids checks before calling it.\n    #[inline]\n    pub fn can_downcast<M: AstIdNode + Into<N>>(self) -> bool {\n        self.erase().kind_typed().and_then(|kind| kind.syntax_kind()).is_some_and(|kind| M::can_cast(kind))\n    }\n\n(and `downcast_unchecked`'s debug_assert can call it). Tell me by queue when it is in; hir-def's `item_tree/persist.rs::check` then refuses an item whose ast id is not of its kind, as a FormatError.",
+  "state": "applied",
+  "created": "2026-10-30T08:10:07Z",
+  "updated": "2026-10-30T08:30:20Z",
+  "taken_by": "speed-unsafe-front-intern",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:10:07Z",
+      "by": "speed-unsafe-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:20Z",
+      "by": "speed-unsafe-front-intern",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:20Z",
+      "by": "speed-unsafe-front-intern",
+      "action": "done",
+      "note": "already in the tree from another lane, under another name: span ast_id.rs has pub ErasedFileAstId::may_be::<N>() (the checked test downcast_unchecked debug-asserts). The hir-def follow-up is in too: item_tree.rs ItemTree::ast_id_fits(kind, ast_id) uses ast_id.erase().may_be::<$ast>(), and persist.rs check refuses an item whose ast id is of another kind. Nothing left to edit."
+    }
+  ]
+}

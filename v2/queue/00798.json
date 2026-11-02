@@ -1,0 +1,26 @@
+{
+  "id": "00798",
+  "from_lane": "speed-unsafe-front-syntax",
+  "owner": "safety",
+  "paths": [
+    "fuzz/targets/syntax_parse.rs",
+    "fuzz/Cargo.toml",
+    "fuzz/README.md",
+    "fuzz/corpus/syntax_parse/"
+  ],
+  "what": "fuzz target syntax_parse for the lexer (LexedStr::new, SIMD front) and parser (SourceFile::parse) of untrusted source text: fuzz/targets/syntax_parse.rs, fuzz/Cargo.toml (parser with feature fuzz, [[bin]]), README row, corpus; full text in v2/requests/safety.md section From speed-unsafe-front-syntax. parser gained feature fuzz with LexedStr::lexes_alike for it.",
+  "state": "open",
+  "created": "2026-10-30T08:09:09Z",
+  "updated": "2026-10-30T08:09:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:09:09Z",
+      "by": "speed-unsafe-front-syntax",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

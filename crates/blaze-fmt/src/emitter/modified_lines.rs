@@ -6,10 +6,10 @@ use crate::rustfmt_diff::{ModifiedLines, make_diff};
 #[derive(Debug, Default)]
 pub(crate) struct ModifiedLinesEmitter;
 
-impl Emitter for ModifiedLinesEmitter {
-    fn emit_formatted_file(
+impl ModifiedLinesEmitter {
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        output: &mut dyn Write,
+        output: &mut impl Write,
         FormattedFile {
             original_text,
             formatted_text,

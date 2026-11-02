@@ -13,26 +13,29 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
 smallvec.workspace = true
 either.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
-rustc-hash.workspace = true
+hashbrown.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
-rustc_apfloat = "0.2.3"
-oorandom = "11.1.5"
-unicode-width.workspace = true
-salsa.workspace = true
+inventory.workspace = true
+rustc_apfloat.workspace = true
+blaze-query.workspace = true
 
 rustc_abi.workspace = true
-ra-ap-rustc_index.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true
 rustc_next_trait_solver.workspace = true
 
 # local deps
+blaze-hashcons.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-rng.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true
@@ -40,9 +43,24 @@ cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+# `long_running_const_eval`'s level where an evaluation reaches rustc's limit (`mir/eval.rs`).
+hir-lint-levels.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
+const-ast = { workspace = true, features = ["source"] }
+parser.workspace = true
+syntax-bridge.workspace = true
+
+[dev-dependencies]
+cov-mark.workspace = true
+expect-test.workspace = true
+blaze-alloc-count.workspace = true
+blaze-units = { workspace = true, features = ["query"] }
+hir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+parking_lot.workspace = true
+test-utils.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

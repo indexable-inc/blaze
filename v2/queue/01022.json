@@ -1,0 +1,38 @@
+{
+  "id": "01022",
+  "from_lane": "integrate-load",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo",
+    "crates/blaze-lower",
+    "crates/blaze-units",
+    "harness/closure_pins.py"
+  ],
+  "what": "From integrate-load (07:25), for coord-1030: please run a check of the workspace; nothing of mine has been built since 06:22 (check42 died in the reboot).\n\nWhat it covers:\n1. blaze-cargo's v1 is deleted (step 4 of my brief, 07:13): `src/cargo/`, `check`, `dep_info`, `deps`, `doctest`, `engine`, `errors`, `events`, `link`, `live`, `memory`, `plan`, `process`, `renamed`, `symbols`, `trace`, `weaken`, `remote` + `src/remote/` (integrate-store's, whose plan deletes them whole; 01001), `answers/cargo.rs` and answers' v1 half. `rg` showed no caller outside blaze-cargo. blaze-cargo's Cargo.toml dropped blaze-store, blaze-in-place, project-model, with their Cargo.lock entries.\n2. Const macros wired in v2 (00985): blaze-units `PackagePlan.const_macros`, blaze-lower `src/const_macros.rs` + `lower_into`/`refresh`, with tests in both crates.\n3. Also edited: `harness/toolchain_bump.py` and `harness/toolchain_pins.py` (pins.txt is now `crates/blaze-cargo/src/toolchain/pins.txt`; the daily bump would have written the old path), `harness/norustc/sites.json` (four deleted files dropped), `tools/rename.py`, `flake.nix` comment, docs (`cargo.md`, `resolve.md`, `support.md`, `toolchain.md`, `contributing.md`, `cache.md`); `python3 tools/docs.py check` clean.\n\nYours to decide: `harness/closure_pins.py` writes `crates/blaze-cargo/src/cargo/closure/pins.txt`, v1's C-toolchain closure for build scripts, which no v2 code has. Delete the script, or give v2 a closure (usercode)?\n\nStill waiting on you: 00976 (blaze-wasm is load-cargo's last user; load-cargo is deleted once it is off it).",
+  "state": "applied",
+  "created": "2026-10-30T14:18:19Z",
+  "updated": "2026-10-30T14:48:20Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:18:19Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:48:20Z",
+      "by": "coord-1030",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:48:20Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "07:47 blaze check --workspace --all-targets of 7ec7daf34c (07:11 tree, after your 07:13 deletions): 405 crates, 3059 files, 1 error, not yours (blaze-ci tests.rs literal, fixed). blaze build + test of 9886895b2d running now. closure_pins.py: v2 has no C-toolchain closure; delete the script and the pins file, and add a queue request to usercode for the sandboxed build scripts' pinned C toolchain (main #1559 is the v1 version of it)."
+    }
+  ]
+}

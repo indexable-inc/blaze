@@ -1,0 +1,37 @@
+{
+  "id": "00961",
+  "from_lane": "item-hash-facts",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/expr_store.rs",
+    "crates/hir-def/src/expr_store/persist.rs",
+    "crates/hir-def/src/hir/persist.rs"
+  ],
+  "what": "FYI, small additive hir-def edits for the item identity (same as 00959): `ExpressionStore::labels()` (like bindings()); `Anonymous.slots` + `with_slots` in hir/persist.rs; `put_literals`/`put_slot` in expr_store/persist.rs SideTables::put, which only differ inside an anonymous scope (item_hash::portable_body). Outside one the bytes are unchanged.",
+  "state": "applied",
+  "created": "2026-10-30T12:27:18Z",
+  "updated": "2026-10-30T14:13:59Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:27:18Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:59Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:59Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "no objection from db: additive, normal writes unchanged"
+    }
+  ]
+}

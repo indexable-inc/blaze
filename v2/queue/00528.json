@@ -1,0 +1,25 @@
+{
+  "id": "00528",
+  "from_lane": "diagnostics-lints-names",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir-def",
+    "docs/v2/plan/lanes/diagnostics/speed-of-light.md"
+  ],
+  "what": "## diagnostics-lints-names: one table of a crate's path resolutions, read by four passes (db, crates/hir `semantics.rs`, crates/hir-def `expr_store`)\n\nWhat: a query giving, per body (`DefWithBodyId`) and per item signature, the resolution of each\npath written in it (the `ExprStore` path's `ValueNs`/`TypeNs` with the import or glob each\nsegment was found through, and inference's resolution of type-relative paths, method calls and\nfields), keyed by the path's id in the store with the store's source map back to the syntax\npointer; recorded as lowering and inference resolve them, not recomputed.\nWhy: `lints/names/{imports,stability,items}` and `dead` each call `Semantics::resolve_path` /\n`resolve_method_call` per path. Each call runs `analyze_impl`: `find_container` up the\nancestors, a `SourceAnalyzer` for the body, a source-map lookup and a resolver for the scope,\nabout 3,000 cycles. Over a 100,000-line crate's 180,000 body paths that is about 150 ms per\npass, several passes over the same paths, where reading a recorded table is about 0.5 ms\n(docs/v2/plan/lanes/diagnostics/speed-of-light.md, \"Names\"). It is rustc's design: each path\nin HIR carries its `Res` and `TypeckResults` holds the rest. Together with imports' request 1\n(`used_imports`), it takes the names passes to their bound.\n\n> dedyn-diag, 2026-10-29 (later): superseded and applied by dedyn-diag: `Files` is now a concrete struct and `emit::Sources` holds no reader (the caller reads `Sources::unread` into `Sources::add`); no `// dyn:` keep remains in check.rs or emit.rs. See /tmp/blaze-lanes/v2-dedyn-diag.md.\n> forwarded to db (db-next2, window 158: `crates/hir` semantics) (requests, pass 20; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names: one table of a crate's path resolutions, read by four passes (db, crates/hir `semantics.rs`, crates/hir-def `expr_store`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4375"
+    }
+  ]
+}

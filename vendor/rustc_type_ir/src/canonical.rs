@@ -1,5 +1,4 @@
 use std::fmt;
-use std::ops::Index;
 
 use arrayvec::ArrayVec;
 use derive_where::derive_where;
@@ -8,8 +7,9 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContex
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
 };
+use thin_vec::ThinVec;
 
-use crate::data_structures::HashMap;
+use crate::data_structures::{DelayedMap, HashMap};
 use crate::inherent::*;
 use crate::{self as ty, Interner, TypingModeEqWrapper, UniverseIndex};
 
@@ -230,85 +230,6 @@ pub struct CanonicalVarValues<I: Interner> {
 impl<I: Interner> Eq for CanonicalVarValues<I> {}
 
 impl<I: Interner> CanonicalVarValues<I> {
-    pub fn is_identity(&self) -> bool {
-        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.kind() {
-            ty::GenericArgKind::Lifetime(r) => {
-                matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if br.var().as_usize() == bv)
-            }
-            ty::GenericArgKind::Type(ty) => {
-                matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if bt.var().as_usize() == bv)
-            }
-            ty::GenericArgKind::Const(ct) => {
-                matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if bc.var().as_usize() == bv)
-            }
-        })
-    }
-
-    pub fn is_identity_modulo_regions(&self) -> bool {
-        let mut var = ty::BoundVar::ZERO;
-        for arg in self.var_values.iter() {
-            match arg.kind() {
-                ty::GenericArgKind::Lifetime(r) => {
-                    if matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if var == br.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        // It's ok if this region var isn't an identity variable
-                    }
-                }
-                ty::GenericArgKind::Type(ty) => {
-                    if matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if var == bt.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-                ty::GenericArgKind::Const(ct) => {
-                    if matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if var == bc.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    // Given a list of canonical variables, construct a set of values which are
-    // the identity response.
-    pub fn make_identity(cx: I, infos: I::CanonicalVarKinds) -> CanonicalVarValues<I> {
-        CanonicalVarValues {
-            var_values: cx.mk_args_from_iter(infos.iter().enumerate().map(
-                |(i, kind)| -> I::GenericArg {
-                    match kind {
-                        CanonicalVarKind::Ty { .. }
-                        | CanonicalVarKind::Int
-                        | CanonicalVarKind::Float
-                        | CanonicalVarKind::PlaceholderTy(_) => {
-                            Ty::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                        CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
-                            Region::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                        CanonicalVarKind::Const(_) | CanonicalVarKind::PlaceholderConst(_) => {
-                            Const::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                    }
-                },
-            )),
-        }
-    }
-
-    /// Creates dummy var values which should not be used in a
-    /// canonical response.
-    pub fn dummy() -> CanonicalVarValues<I> {
-        CanonicalVarValues { var_values: Default::default() }
-    }
-
     pub fn instantiate(
         cx: I,
         var_kinds: I::CanonicalVarKinds,
@@ -346,27 +267,51 @@ impl<I: Interner> CanonicalVarValues<I> {
     }
 }
 
-impl<'a, I: Interner> IntoIterator for &'a CanonicalVarValues<I> {
-    type Item = I::GenericArg;
-    type IntoIter = <I::GenericArgs as SliceLike>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.var_values.iter()
-    }
-}
-
-impl<I: Interner> Index<ty::BoundVar> for CanonicalVarValues<I> {
-    type Output = I::GenericArg;
-
-    fn index(&self, value: ty::BoundVar) -> &I::GenericArg {
-        &self.var_values.as_slice()[value.as_usize()]
-    }
-}
+#[derive_where(Default; I: Interner)]
+pub struct CanonicalParamEnvCache<I: Interner>(
+    pub HashMap<I::ParamEnv, CanonicalParamEnvCacheEntry<I>>,
+);
 
 #[derive_where(Clone, Debug; I: Interner)]
 pub struct CanonicalParamEnvCacheEntry<I: Interner> {
+    // Note: this `param_env` is the canonicalized form of the key for this entry in the enclosing
+    // `CanonicalParamEnvCache`.
     pub param_env: I::ParamEnv,
-    pub variables: Vec<I::GenericArg>,
+    pub variables: ThinVec<I::GenericArg>,
     pub variable_lookup_table: HashMap<I::GenericArg, usize>,
     pub var_kinds: Vec<CanonicalVarKind<I>>,
+}
+
+/// State used and modified by a canonicalizer during canonicalization. To avoid many allocations,
+/// this state is reused by many canonicalizers from a single `InferCtxt`.
+#[derive_where(Default; I: Interner)]
+pub struct CanonicalizerState<I: Interner> {
+    pub variables: ThinVec<I::GenericArg>,
+    pub var_kinds: Vec<CanonicalVarKind<I>>,
+    pub variable_lookup_table: HashMap<I::GenericArg, usize>,
+
+    /// Maps each `sub_unification_table_root_var` to the index of the first
+    /// variable which used it.
+    ///
+    /// This means in case two type variables have the same sub relations root,
+    /// we set the `sub_root` of the second variable to the position of the first.
+    /// Otherwise the `sub_root` of each type variable is just its own position.
+    pub sub_root_lookup_table: HashMap<ty::TyVid, usize>,
+
+    /// We can simply cache based on the ty itself, because we use
+    /// `ty::BoundVarIndexKind::Canonical`.
+    pub cache: DelayedMap<I::Ty, I::Ty>,
+}
+
+impl<I: Interner> CanonicalizerState<I> {
+    pub fn clear(&mut self) {
+        // Deconstruct to ensure no fields are missed.
+        let Self { variables, var_kinds, variable_lookup_table, sub_root_lookup_table, cache } =
+            self;
+        variables.clear();
+        var_kinds.clear();
+        variable_lookup_table.clear();
+        sub_root_lookup_table.clear();
+        cache.clear();
+    }
 }

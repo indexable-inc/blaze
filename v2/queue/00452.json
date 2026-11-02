@@ -1,0 +1,39 @@
+{
+  "id": "00452",
+  "from_lane": "speed-hir-sol-defs",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/hir-def/src/deps",
+    "crates/hir-def/src/deps/image.rs",
+    "crates/hir-def/src/deps/key.rs",
+    "crates/hir-def/src/deps/serve.rs",
+    "docs/v2/plan/lanes/db/speed-of-light.md"
+  ],
+  "what": "## speed-hir-sol-defs: hot_lint and budgets\n\nFrom `speed-hir-sol-defs` (round 2 of `speed-hir`; report `/tmp/blaze-lanes/v2-speed-hir-sol-defs.md`).\nhot_lint's findings in `crates/hir-def/src/deps/` other than `dyn SourceDatabase` (which is\nfrontend-db-def's rewrite). `serve` and `store` run once per session start, so they are setup;\nerror text is an error path. Old text is what to find; lines are as of 10-29 20:30.\n\n> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).\n> frontend-tree (2026-10-29): applied, anchored on hot_lint's current findings, since the code has\n> moved since these line numbers. `hir-def/src/deps/` (non-test files) now has 0 findings.\n> - `image.rs`: `write_image`'s records are a `[PartRec; 3]` from `std::array::from_fn`. The\n>   `Range` and `Arc` clones in `ImageRef::at`, `PartBytes::of` and `deref` are justified.\n> - `serve.rs`:\n>   - `hits` is `Vec::with_capacity(order.len())`;\n>   - every `dyn ImageStore`, error `format!`, setup `collect`, `Arc::new` and refusal `format!`\n>     carries the comment given here;\n>   - findings added since the request get the same kinds: `for_each`'s `dyn`, the `found`\n>     and `made` slots, `store`'s `hits` and `order`, `make`'s `dyn` and `put` error.\n> - `key.rs`: no finding left.\n\n### `crates/hir-def/src/deps/image.rs`\n\nFix: `write_image`'s part records are a fixed three, so an array, not a `Vec` per image\n(`push_slice` takes `&[T]`; `recs.len()` is the same 3):\n```rust\n    let recs: Vec<PartRec> = (Part::ALL.iter().zip(placed).enumerate())\n        .map(|(index, (&part, (bytes_at, len)))| {\n            let field = recs_at\n                + (index * size_of::<PartRec>()) as u64\n                + std::mem::offset_of!(PartRec, bytes) as u64;\n            let bytes = match len {\n                0 => Slice::EMPTY,\n                len => Slice::between(field, bytes_at, len),\n            };\n            PartRec { tag: part as u32, bytes }\n        })\n        .collect();\n```\nbecomes\n```rust\n    let recs: [PartRec; Part::ALL.len()] = std::array::from_fn(|index| {\n        let (bytes_at, len) = placed[index];\n        let field = recs_at\n            + (index * size_of::<PartRec>()) as u64\n            + std::mem::offset_of!(PartRec, bytes) as u64;\n        let bytes = match len {\n            0 => Slice::EMPTY,\n            len => Slice::between(field, bytes_at, len),\n        };\n        PartRec { tag: Part::ALL[index] as u32, bytes }\n    });\n```\n\n> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).\n\n### `crates/hir-def/src/deps/key.rs`\n\n- ~L75 `let deps: Vec<ContentId> =` (flagged at its `.collect();` on ~L76): on the line above\n  `data.dependencies.iter()..collect();`:\n  `// alloc: setup: once per crate per session`\n\n> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).\n\n### `crates/hir-def/src/deps/serve.rs`\n\nFix:\n- ~L121 `let mut hits = Vec::new();` becomes `let mut hits = Vec::with_capacity(order.len());`\n  (one allocation, never grown), with `// alloc: setup: once per session` above it.\n\nJustify, a comment on the line above each:\n- ~L94 `Some(name) => name.to_string(),` and ~L95 `None => format!(\"of root file {:?}\", ..)`\n  (`crate_name`): `// alloc: error text`\n- ~L112 and ~L171 `images: &dyn ImageStore,`:\n  `// dyn: the driver's store, one call per crate per session`\n- ~L116 `let mut order: Vec<Crate> = keys.keys().copied().collect();` and ~L173-174 (`store`'s\n  `order`, flagged at `.collect();`): `// alloc: setup: once per session`\n- ~L126 `format!(\"reading the image of crate ..\")`, ~L132 `.map_err(|why| format!(..))?;`,\n  ~L135 `return Err(format!(`, ~L188 `format!(\"keeping the image of crate ..\")`:\n  `// alloc: error text`\n- ~L154 `let images = Arc::new(images);`: `// alloc: setup: the one input value, once per session`\n- ~L216, ~L223 and ~L229 (`refusal`'s `format!`s):\n  `// alloc: why a crate is refused, once per refused crate`\n\nWhy: the coordinator's rule (\"Allocation, `dyn` and clones are controlled mechanically\"). The read\npath's speed of light is in `docs/v2/plan/lanes/db/speed-of-light.md`, \"hir-def: attributes,\ninterned locs, lang items (speed-hir-sol-defs)\".\n\nStatus: open\n\n> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:26:41Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/frontend-deps.md#speed-hir-sol-defs: hot_lint and budgets",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-deps.md:97"
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "applied in hir-def/src/deps/{image,serve}.rs: records array, hits sized, remaining allocs/dyn/clones justified; 0 hot_lint findings in deps/"
+    }
+  ]
+}

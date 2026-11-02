@@ -3,13 +3,11 @@
 //! old caches that use the current commit are also valid. A fetch failure is an error, never
 //! permission to answer from an older tree.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, bail};
 use blaze_source::SourceId;
+use parking_lot::Mutex;
 
 use crate::{
     Context, git,
@@ -36,15 +34,15 @@ impl GitIndex {
     }
 
     pub(crate) fn invalidate(&self) {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).needs_update = true;
+        self.state.lock().needs_update = true;
     }
 
     pub(crate) fn is_updated(&self) -> bool {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).updated
+        self.state.lock().updated
     }
 
     pub(crate) fn config_is_cached(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.state.lock();
         (!state.needs_update || state.updated || self.context.net.offline)
             && self.db.join("HEAD").exists()
     }
@@ -77,7 +75,7 @@ impl GitIndex {
     }
 
     pub(crate) fn load(&self, path: &str, version: Option<&str>) -> anyhow::Result<LoadResponse> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock();
         if state.needs_update || !self.db.join("HEAD").exists() {
             self.update(&mut state)?;
         }

@@ -1,0 +1,23 @@
+{
+  "id": "00920",
+  "from_lane": "speed-sol2-proof-fuzz",
+  "owner": "format",
+  "paths": [
+    "crates/syntax/src/fuzz.rs"
+  ],
+  "what": "fuzz/targets/syntax_parse.rs parses the text twice in Edition::CURRENT: it parses with SourceFile::parse (needed for its own checks) and then calls syntax::fuzz::check_parser(&text), which parses again only to run the private check_file_invariants (validation::validate_block_structure). Please add `pub fn check_parse(file: &Parse<SourceFile>)` (= check_file_invariants, public) in crates/syntax/src/fuzz.rs, keeping check_parser. Then syntax_parse calls check_parse(&parse) on the parse it has, saving one parse in a quarter of its runs (one edition of four), about 10% of the run. Tell speed-sol2-proof-fuzz (or whoever owns fuzz/) when it lands; fuzz/ changes the call.",
+  "state": "open",
+  "created": "2026-10-30T09:46:21Z",
+  "updated": "2026-10-30T09:46:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:46:21Z",
+      "by": "speed-sol2-proof-fuzz",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

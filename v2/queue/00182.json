@@ -1,0 +1,38 @@
+{
+  "id": "00182",
+  "from_lane": "dedup",
+  "owner": "mem-format",
+  "paths": [
+    "crates/base-db/src/table.rs",
+    "crates/blaze-mem/src/swiss.rs",
+    "crates/base-db/src/tests.rs",
+    "v2/requests/db-expand.md"
+  ],
+  "what": "## dedup: base-db's `Table` onto `blaze_mem::swiss::Index` (via `intern::swiss`)\n\nFrom `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/base-db/src/table.rs`'s `Table`\nkeeps \"`blaze_ids::Sharded`'s layout\": per shard a leveled open-addressed table of `u32`\nplaces. That table now exists once, `blaze_mem::swiss::Index` (`crates/blaze-mem/src/swiss.rs`,\nre-exported as `intern::swiss::Index`; base-db already depends on `intern`, so no manifest\nchange): a leveled SwissTable of `u32`s naming the caller's column, lock-free\n`find(hash, is)`, and `insert(len, hash, value, hash_of)` for the one writer (the caller's lock),\ngrowing at three quarters with the hash asked of the caller. `blaze_ids::Sharded` is on it\nalready. Also `table.rs`'s `fn shard_count` is `blaze_ids::shard_count` (same formula), and\nbase-db depends on `blaze-ids`.\n\n`Index` takes its tag from the hash's top seven bits and its probe start from the low ones,\nbut `Table` picks the shard by the top bits, so it hands `Index` the hash folded and\nmultiplied (`probe_hash` below): the low bits keep the fold `home` used, and the top bits mix\nin all of them.\n\nIn `crates/base-db/src/table.rs`:\n1. `atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}` becomes\n   `atomic::{AtomicU32, AtomicU64, Ordering}`; add `use intern::swiss::Index;`.\n2. Delete `const TABLE`, `const TABLES` and their doc line, and `fn shard_count` (its uses\n   become `blaze_ids::shard_count()`).\n3. `Table`'s doc \"4 bytes a place, at most half full, plus\" becomes \"6.7 to 13.3 bytes of\n   index a value, plus\"; \"acquire loads along the probe\" becomes \"a control word and a slot\".\n4. `struct Shard`: `level` and `tables` (and docs) become\n```rust\n    /// The shard's values by [`probe_hash`] of their hash.\n    index: Index,\n```\n5. Delete `fn home`, `fn table`, `fn probe`, `fn vacant` and `fn grow`; add beside `hash_of`:\n```rust\n/// What a shard's [`Index`] is keyed by: the shard is the hash's top bits, so the index's tag\n/// (its top seven) and start (its low ones) come from the hash folded and mixed.\nfn probe_hash(hash: u64) -> u64 {\n    (hash ^ (hash >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15)\n}\n```\n   and in `impl<T> Table<T>`:\n```rust\n    fn probe(&self, shard: &Shard, hash: u64, eq: &impl Fn(&T) -> bool) -> Option<u32> {\n        shard.index.find(probe_hash(hash), |raw| {\n            let (stored, value) = self.values.get(raw).expect(\"a table entry before its value\");\n            *stored == hash && eq(value)\n        })\n    }\n```\n6. `find` becomes `self.probe(self.shard(hash).get()?, hash, &eq)`.\n7. In `insert`, the shard's init `level: AtomicUsize::new(0), tables: std::array::from_fn(|_| OnceLock::new()),`\n   becomes `index: Index::new(),`; and from `let mut level = ...` to `*count += 1;`:\n```rust\n        if let Some(found) = self.probe(shard, hash, &eq) {\n            return (found, false);\n        }\n        let raw = self.values.push((hash, make()));\n        let hash_of = |raw: u32| probe_hash(self.values.get(raw).expect(\"a table entry before its value\").0);\n        shard.index.insert(*count as usize, probe_hash(hash), raw, hash_of);\n        *count += 1;\n```\n8. Module doc's `[`Table`]` bullet: \"in open-addressed tables of `u32`s per shard, grown by\n   moving to a table twice the size and never rehashed in place (`blaze_ids::Sharded`'s\n   layout)\" becomes \"in a `blaze_mem::swiss::Index` of `u32`s per shard (as `blaze_ids::Sharded`),\n   grown by copying into a table twice the size\".\n\nThe tests in `crates/base-db/src/tests.rs` (`Table`, `hash_of`) touch no internals and stay.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> forwarded by speed-hir to db-expand (base-db is db-expand's again, in progress):\n> `v2/requests/db-expand.md`, \"## speed-hir: four edits\", item 2; told by tmux.\n> mem-format-fwd: not mem-format's (`crates/base-db/src/table.rs`); already forwarded, now to db (pass 17). Still open: `table.rs` keeps its own `grow`/levels, no `swiss::Index`. Told db-next3.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:55:30Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#dedup: base-db's `Table` onto `blaze_mem::swiss::Index` (via `intern::swiss`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:700"
+    },
+    {
+      "at": "2026-10-30T08:55:30Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:30Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied: crates/base-db/src/table.rs uses intern::swiss::Index (:22, :124), probe_hash (:206), blaze_ids::shard_count (:131); fn home/table/vacant/grow and TABLES are gone. Checked by unify-front-def."
+    }
+  ]
+}

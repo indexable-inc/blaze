@@ -1,0 +1,23 @@
+{
+  "id": "01431",
+  "from_lane": "repro",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/"
+  ],
+  "what": "Rebuilding a one-line bin after an edit on the same daemon fails: `linking target/debug/build/repro/<h>/out/repro: staging the change: linking: the function InstanceKey(56bcf0e7eca8) is removed, and Got(Address, Body(InstanceKey(56bcf0e7eca8))) still refers to it`. The edit: main() { println!(\"before\") } -> println!(\"after\"). A removed function still named by a GOT entry must drop or retarget the entry in the same patch, not refuse. Repro test: an_edited_crate_rebuilds_on_one_daemon in crates/blaze-engine/tests/repro.rs (crate under tests/repro/an_edited_crate_rebuilds_on_one_daemon/; the edit is in the test). It can hit the db lane segment.rs:367 panic first (queued separately); with that fixed this is what remains. Binary: self6 build (/Volumes/Projects/blaze-v2-self, 2026-10-31 ~18:58).",
+  "state": "open",
+  "created": "2026-11-01T02:21:49Z",
+  "updated": "2026-11-01T02:21:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:21:49Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -4,6 +4,7 @@
 //! promoted though `OPEN_PAREN`'s type has a `Cell` in another variant, and `&Signals::EMPTY`
 //! is though `Signals` holds an `Arc` it would drop.
 
+use base_db::Db;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, ItemContainerId, Lookup,
     expr_store::{Body, ExpressionStore},
@@ -13,7 +14,7 @@ use hir_def::{
 };
 use std::cell::RefCell;
 
-use rustc_hash::FxHashMap;
+use crate::mem::FMap;
 use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
@@ -51,21 +52,21 @@ impl Qualifs {
 }
 
 /// A body whose values are asked their qualifs: the one borrow checked, or a `const` item's.
-pub(crate) struct ValueCx<'a, 'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+pub(crate) struct ValueCx<'a, 'f, 'db> {
+    pub(crate) db: &'db Db,
     pub(crate) infcx: &'a InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
     pub(crate) owner: InferBodyId<'db>,
     pub(crate) store: &'a ExpressionStore,
     pub(crate) infer: &'a InferenceResult<'db>,
     /// What each `const` item's value has, asked once as rustc's `mir_const_qualif` query.
-    pub(crate) consts: &'a RefCell<FxHashMap<ConstId, Qualifs>>,
+    pub(crate) consts: &'a RefCell<FMap<'f, ConstId, Qualifs>>,
 }
 
 /// rustc stops at no depth; this does where a value nests deeper than any real one.
 const MAX_DEPTH: usize = 32;
 
-impl<'db> ValueCx<'_, 'db> {
+impl<'db> ValueCx<'_, '_, 'db> {
     /// rustc's `in_any_value_of_ty`.
     fn of_ty(&self, ty: Ty<'db>) -> Qualifs {
         Qualifs {
@@ -102,12 +103,12 @@ impl<'db> ValueCx<'_, 'db> {
                 return Qualifs::default();
             }
         }
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Path(_) => {
                 if self.infer.variant_resolution_for_expr(expr).is_some()
                     && !matches!(ty.kind(), TyKind::FnDef(..))
                 {
-                    return self.aggregate(ty, &[], depth);
+                    return self.aggregate(ty, std::iter::empty(), depth);
                 }
                 let of_ty = self.of_ty(ty);
                 match self.const_item(expr) {
@@ -118,23 +119,22 @@ impl<'db> ValueCx<'_, 'db> {
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
                 exprs.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)))
             }
-            &Expr::Array(Array::Repeat { initializer, .. }) => self.value(initializer, depth + 1),
+            Expr::Array(Array::Repeat { initializer, .. }) => self.value(initializer, depth + 1),
             Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                let parts: Vec<_> = fields.iter().map(|it| it.expr).collect();
-                self.aggregate(ty, &parts, depth)
+                self.aggregate(ty, fields.iter().map(|it| it.expr), depth)
             }
             Expr::Call { callee, args }
-                if matches!(self.infer.expr_ty(*callee).kind(), TyKind::FnDef(def, _)
+                if matches!(self.infer.expr_ty(callee).kind(), TyKind::FnDef(def, _)
                     if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
             {
-                self.aggregate(ty, args, depth)
+                self.aggregate(ty, args.iter().copied(), depth)
             }
-            &Expr::Ref { expr: inner, .. } => self.borrowed(inner, depth + 1),
-            &Expr::Cast { expr: inner, .. }
-            | &Expr::UnaryOp { expr: inner, op: UnaryOp::Not | UnaryOp::Neg } => {
+            Expr::Ref { expr: inner, .. } => self.borrowed(inner, depth + 1),
+            Expr::Cast { expr: inner, .. }
+            | Expr::UnaryOp { expr: inner, op: UnaryOp::Not | UnaryOp::Neg } => {
                 self.value(inner, depth + 1)
             }
-            &Expr::BinaryOp { lhs, rhs, op: Some(op) }
+            Expr::BinaryOp { lhs, rhs, op: Some(op) }
                 if !matches!(op, hir_def::hir::BinaryOp::Assignment { .. }) =>
             {
                 self.value(lhs, depth + 1).or(self.value(rhs, depth + 1))
@@ -143,7 +143,7 @@ impl<'db> ValueCx<'_, 'db> {
             Expr::Block { statements, tail: Some(tail), .. }
                 if statements.iter().all(|it| matches!(it, Statement::Item(_))) =>
             {
-                self.value(*tail, depth + 1)
+                self.value(tail, depth + 1)
             }
             Expr::Field { .. } | Expr::UnaryOp { op: UnaryOp::Deref, .. } | Expr::Index { .. } => {
                 self.place(expr, depth)
@@ -155,9 +155,14 @@ impl<'db> ValueCx<'_, 'db> {
     /// rustc's `Rvalue::Aggregate`: a struct or variant is made of its fields unless it is
     /// a union, or its type has a `Drop` impl (for `NeedsDrop`) or is `UnsafeCell` (for
     /// `HasMutInterior`), which have what any value of the type has.
-    fn aggregate(&self, ty: Ty<'db>, parts: &[ExprId], depth: usize) -> Qualifs {
+    fn aggregate(
+        &self,
+        ty: Ty<'db>,
+        parts: impl Iterator<Item = ExprId>,
+        depth: usize,
+    ) -> Qualifs {
         let parts =
-            || parts.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)));
+            || parts.fold(Qualifs::default(), |acc, it| acc.or(self.value(it, depth + 1)));
         let TyKind::Adt(def, _) = ty.kind() else { return parts() };
         let id = def.def_id();
         if matches!(id, AdtId::UnionId(_)) {
@@ -180,7 +185,7 @@ impl<'db> ValueCx<'_, 'db> {
     /// rustc's `Rvalue::Ref`: the qualifs of the place borrowed, but a reborrow `&*r` of a
     /// reference is a copy of `r`, and `&STATIC` is one of the constant pointer to the static.
     fn borrowed(&self, place: ExprId, depth: usize) -> Qualifs {
-        if let &Expr::UnaryOp { expr: base, op: UnaryOp::Deref } = &self.store[place]
+        if let Expr::UnaryOp { expr: base, op: UnaryOp::Deref } = self.store.expr(place)
             && self.infer.expr_adjustment(base).is_none_or(|it| it.is_empty())
             && matches!(self.infer.expr_ty(base).kind(), TyKind::Ref(..))
         {
@@ -199,7 +204,7 @@ impl<'db> ValueCx<'_, 'db> {
         if depth > MAX_DEPTH || self.infer.expr_adjustment(expr).is_some_and(|it| !it.is_empty()) {
             return self.of_ty(ty);
         }
-        match self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Field { expr: base, .. } | Expr::Index { base, .. } => {
                 self.of_ty(ty).and(self.place(base, depth + 1))
             }
@@ -209,7 +214,7 @@ impl<'db> ValueCx<'_, 'db> {
     }
 
     fn resolve(&self, expr: ExprId) -> Option<ValueNs> {
-        let Expr::Path(path) = &self.store[expr] else { return None };
+        let Expr::Path(path) = self.store.expr(expr) else { return None };
         let mut resolver = self.owner.resolver(self.db);
         let _guard = resolver.update_to_inner_scope(
             self.db,

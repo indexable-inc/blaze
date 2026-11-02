@@ -1,0 +1,36 @@
+{
+  "id": "00033",
+  "from_lane": "store",
+  "owner": "format",
+  "paths": [
+    "crates/blaze-ids",
+    "Cargo.toml"
+  ],
+  "what": "## 5. For format: batched BLAKE3 (`ContentId::of_many`) and NEON\n\n- What:\n  - In `crates/blaze-ids`: `ContentId::of_many(domain: &'static str, inputs: &[&[u8]]) ->\n    Vec<ContentId>`. It must give exactly `inputs.iter().map(|it| ContentId::of(domain, it))`,\n    but hash many small inputs in one SIMD pass: 16 at a time with AVX-512, 4 with NEON. The\n    `blake3` crate only has this internally (`hash_many`) and does not export it.\n  - In the root `Cargo.toml`: add the `neon` feature to `blake3`. On aarch64 (Graviton,\n    Apple) NEON is chosen at compile time, not at run time, and has no effect elsewhere.\n    AVX-512 on x86_64 is already detected at run time.\n- Where: `crates/blaze-ids` (format) and the root `Cargo.toml` (coordinator).\n- Why: plan/hardware.md, \"BLAKE3 ... one batched call per many small inputs\". The store\n  would batch:\n  - in `Store::verify`, which hashes every record;\n  - at open, the record headers it reads past the index;\n  - in `put` of a chunked output, its chunks;\n  - on the remote server, many small answers.\n\n  Until it exists, the store hashes one input at a time, which is bit-identical.\n\n> applied: `blake3`'s `neon` feature in the root `Cargo.toml`.\n> forwarded to format: `ContentId::of_many` (`crates/blaze-ids`) is not there yet.",
+  "state": "applied",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T09:37:19Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/store.md#5. For format: batched BLAKE3 (`ContentId::of_many`) and NEON",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:67"
+    },
+    {
+      "at": "2026-10-30T09:37:18Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:37:19Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "ContentId::of_many / of_many_into exist (crates/blaze-ids/src/many.rs). speed-sol2-format (2026-10-30): last blocks now run 16 lanes in AVX-512 registers and 8 in AVX2 on every x86-64 target (they ran at SSE2 width, about 4x their bound), inputs of one block start from a splat of the key, and messages are transposed in registers (std::simd interleave). Tests: many/tests.rs."
+    }
+  ]
+}

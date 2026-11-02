@@ -1,0 +1,23 @@
+{
+  "id": "00586",
+  "from_lane": "requests-goals",
+  "owner": "requests-goal-reads",
+  "paths": [
+    "crates/hir-ty/src/specialization.rs"
+  ],
+  "what": "## requests-goals, for requests (lane items' files in hir-ty): a `Specializes` read (2026-10-29)\n\n**What.** In `crates/hir-ty/src/specialization.rs`, key `specializes_query` by one interned\nstruct of `(specializing, parent)` with public fields, so its read's key decodes; and\n`specialized_ancestor`'s reads likewise (it is not tracked: what it reads are the queries it\ncalls). `fact_of_read` then maps it to `Fact::Specializes(specializing impl)`, whose value\ncovers the impls it could overlap (`facts::write_coherence`).\n\n**Why.** A two-argument tracked fn is keyed by its interned arguments, which only the fn's own\ningredient can read: outside salsa's macro nothing can tell which impls a read was of. Also\n`specializes` reads `UnstableFeatures::query(krate)` before the query, which stands for no fact.\nThe other way, a salsa API giving a multi-argument fn's arguments from a `DatabaseKeyIndex`, is\ndb-salsa's; the interned struct needs no change to salsa.\n> applied by requests-goal-reads, one part differently: `specializes_query(db, ImplPair)` is keyed by `ImplPair { specializing, parent }` (fields public), re-exported as `hir_ty::method_resolution::ImplPair`. The feature check that `specializes` and `specialized_ancestor` made through `UnstableFeatures::query(krate)` is now `may_specialize(db, impl)`, keyed by the impl, and `fact_of_read` maps it to `Specializes(impl)`, whose value hashes those features. `specialized_ancestor` reads `relevant_impls`. Refused: mapping `specializes_query` to `Specializes(specializing)`, because that would be unsound. The query proves the parent's where clauses under the specializing impl's env, so it reads impls of any trait those clauses name. Example: `impl<T: Clone> Tr for T` and `impl Tr for X`, then `X` loses `Clone`. The answer changes, but neither impl's interface nor `Implements(Tr, X)` does. It maps to `Fact::Crate(crate_key(specializing impl's crate))` instead, which covers all that crate sees. Only crates enabling specialization (in practice std) ever make that read. `Fact::Crate`'s value arm in `facts.rs` is still missing; another agent added the variant at 22:13.\n\n> forwarded to requests-goal-reads (requests' child, with the `Implements` read) (requests, pass 29).",
+  "state": "open",
+  "created": "2026-10-30T05:07:41Z",
+  "updated": "2026-10-30T05:07:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-goals.md#requests-goals, for requests (lane items' files in hir-ty): a `Specializes` read (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-goals.md:30"
+    }
+  ]
+}

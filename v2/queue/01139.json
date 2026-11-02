@@ -1,0 +1,35 @@
+{
+  "id": "01139",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/lib.rs"
+  ],
+  "what": "crates/hir-ty-borrowck/src/lib.rs check_def: borrow checking runs on items rustc has no MIR body for, so hir reports BorrowckSkipped (`blaze cannot borrow-check X: IncompleteExpr` / `TraitFunctionDefinition`) on them. Seen on ~100 blaze-diagnostics tests: every enum variant without an explicit discriminant (DefWithBodyId::VariantId, body root Expr::Missing), every trait fn and assoc const without a default, and every fn without a body. Fix: in check_def, before the inference checks, return BorrowckResult::default() when `Body::of(db, def)` has `body[body.root_expr()]` == Expr::Missing (rustc builds no body there, so there is nothing to check or refuse); parse errors that leave a Missing root are already reported by the parser.",
+  "state": "applied",
+  "created": "2026-10-30T22:23:08Z",
+  "updated": "2026-10-31T14:56:00Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:23:08Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:56:00Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:56:00Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: hir-ty-borrowck check_def returns an empty BorrowckResult (nothing checked, nothing refused) when the body's root expression is Expr::Missing: a fn or associated item without a body, a variant without a discriminant, as rustc builds no MIR there. Ready for the next round"
+    }
+  ]
+}

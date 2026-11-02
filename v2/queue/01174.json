@@ -1,0 +1,42 @@
+{
+  "id": "01174",
+  "from_lane": "no-fallback-link-scripts",
+  "owner": "std-scripts",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script.rs",
+    "crates/blaze-cargo/src/serve/unit/script/pure.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/unit/script.rs script_unit (no-fallback): (1) blaze_build_script::env now refuses a Unit with an empty field cargo always fills (Unit::check: manifest dir/path, script, OUT_DIR, CARGO, RUSTC, RUSTDOC, name, version, TARGET, HOST, OPT_LEVEL) and a non-semver version, so `manifest_dir ... unwrap_or_default()` (line ~137) and `program: ...outputs.first().cloned().unwrap_or_default()` in script/pure.rs run_of (~line 170) now surface as typed errors at env(); make them errors where they are made instead. (2) `sysroot_libdir: PathBuf::new()` means blaze has no sysroot library dir; blaze-build-script now adds nothing for an empty one (an empty LD_LIBRARY_PATH entry is the cwd). Better: make DylibSearch::sysroot_libdir an Option<PathBuf> and set None here; tell no-fallback-link-scripts (or usercode) to flip the type in crates/blaze-build-script/src/unit.rs + env.rs in the same round. (3) `jobs: available_parallelism().map_or(1, ..)` guesses NUM_JOBS when the count cannot be read.",
+  "state": "applied",
+  "created": "2026-10-30T23:24:07Z",
+  "updated": "2026-10-31T14:45:49Z",
+  "taken_by": "std-scripts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:24:07Z",
+      "by": "no-fallback-link-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from cargo (no live window) to std-scripts, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:16Z",
+      "by": "std-scripts",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:45:49Z",
+      "by": "std-scripts",
+      "action": "done",
+      "note": "Parts 1 and 3 were already in the tree: manifest_dir is UnitError::ManifestDir (serve/unit/error.rs), script/pure.rs run_of takes named_program (UnitError::ScriptProgram), and jobs is UnitError::Parallelism. Part 2, sysroot_libdir: Option<PathBuf>, crosses into blaze-build-script, so it is queued as 01288 to no-fallback-link-scripts (live), with the one-line script.rs edit granted for the same save."
+    }
+  ]
+}

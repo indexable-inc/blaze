@@ -1,0 +1,24 @@
+{
+  "id": "01342",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "harness/selects.py",
+    "docs/cargo.md"
+  ],
+  "what": "`unsandboxed-proc-macros` and `wasi-build-scripts` in [workspace.metadata.blaze.sandbox] are now load errors naming the key and its list (crates/blaze-units/src/load/sandbox.rs, queue 01072 item 2: they were accepted and ignored, a silent no-op). `build-script-env` stays accepted: every script already gets the whole environment, so it is honoured. (1) harness/selects.py:62 writes `unsandboxed-proc-macros = [\"devmacro\"]` into its fixture workspace: drop that line. devmacro's marks can't be written from blaze's evaluator either way, so the harness must stop expecting a mark from the proc macro (or mark it from devdep's build script instead). (2) docs/cargo.md:409-413 says v2 checks the three keys are lists and does nothing else: say `build-script-env` is accepted because scripts see the whole environment, and the other two are errors with the reason. Root Cargo.toml:27 uses only build-script-env, unaffected.",
+  "state": "open",
+  "created": "2026-10-31T20:36:01Z",
+  "updated": "2026-10-31T20:36:01Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:36:01Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

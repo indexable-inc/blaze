@@ -1,0 +1,33 @@
+{
+  "id": "00276",
+  "from_lane": "codegen-mir-prov-shim",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## Replies from codegen-mir\n\n- 1: done. `move_memory(dst, src: Interval)` is the tail of `copy_from_interval` (no hook);\n  `copy_memory` calls it after the machine's non-overlapping `copy`, the 256-byte loop is gone.\n- 3: the call path runs no `typed` on a call's destination (only `typed_assign` and the\n  `FnEntry` retag of arguments in `fill_locals_for_body` do). Call `self.machine.typed` in\n  the shim.\n\n> forwarded to codegen-mir-prov-shim: a reply for its author, nothing to apply.",
+  "state": "refused",
+  "created": "2026-10-30T02:54:43Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": "coord-apply",
+  "why": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)",
+  "source": "v2/requests/codegen-mir-prov-shim.md#Replies from codegen-mir",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov-shim.md:96"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "refuse",
+      "note": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)"
+    }
+  ]
+}

@@ -1,99 +1,23 @@
 //! blaze-resolve's [`Registry`] over the registries' indexes, as cargo 1.99 answers the
-//! resolver: each line of an index file made a [`Summary`] as `index_package_to_summary` and
-//! `registry_dependency_into_dep` make it (`src/sources/registry/index/mod.rs`), the versions a
+//! resolver: each line of an index file made a [`blaze_resolve::Summary`] by blaze-units'
+//! [`index_summary`] (cargo's `index_package_to_summary` and `registry_dependency_into_dep` in
+//! `src/sources/registry/index/mod.rs`), the versions a
 //! dependency is offered as `RegistrySource::query` and `RegistryIndex::query_inner` offer them
 //! (`src/sources/registry/mod.rs`), behind `[source]` replacement as `SourceConfigMap` and
 //! `ReplacedSource` put it (`src/sources/{config.rs,replaced.rs}`). Sources that are not
 //! registries (paths, git checkouts, vendored directories) are answered by another registry.
 
-use std::collections::BTreeMap;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
 use blaze_resolve::{
-    DepKind, Dependency, IndexSummary, InternedString, OptVersionReq, PackageId, QueryKind,
-    Registry as Resolver, SourceId, SourceKind, Summary,
+    Dependency, IndexSummary, OptVersionReq, QueryKind, Registry as Resolver, SourceId,
 };
 
 use crate::{
     Registry, Sources,
-    index::{self, IndexDependency, IndexEntry, IndexLine, Status},
+    index::{IndexEntry, IndexLine},
 };
 
-/// A line of an index of `source` as the resolver takes it, as cargo's `IndexSummary::parse`:
-/// a line whose summary cannot be made is [`IndexSummary::Invalid`], with its name, version and
-/// `rust-version` alone. None for a name or version no package id has.
-pub fn index_summary(line: &IndexLine, source: SourceId) -> Option<IndexSummary> {
-    let made = match line.status {
-        Status::Invalid => None,
-        _ => summary(&line.entry, source).ok(),
-    };
-    let Some(summary) = made else {
-        let IndexEntry { name, version, rust_version, .. } = &line.entry;
-        let id = PackageId::new(InternedString::new(name), version.clone(), source);
-        let rust_version = rust_version.and_then(|it| it.to_string().parse().ok());
-        let none = BTreeMap::new();
-        return Summary::new(id, Vec::new(), &none, None::<&str>, rust_version)
-            .ok()
-            .map(IndexSummary::Invalid);
-    };
-    Some(match line.status {
-        Status::Candidate => IndexSummary::Candidate(summary),
-        Status::Yanked => IndexSummary::Yanked(summary),
-        Status::Unsupported(v) => IndexSummary::Unsupported(summary, v),
-        Status::Invalid => unreachable!("an invalid line has no summary made"),
-    })
-}
-
-/// cargo's `index_package_to_summary`.
-fn summary(entry: &IndexEntry, source: SourceId) -> Result<Summary> {
-    let id = PackageId::new(InternedString::new(&entry.name), entry.version.clone(), source);
-    let deps = entry.deps.iter().map(|it| dependency(it, source)).collect::<Result<Vec<_>>>()?;
-    let features: BTreeMap<InternedString, Vec<InternedString>> = entry
-        .features
-        .iter()
-        .map(|(name, values)| (name.into(), values.iter().map(InternedString::from).collect()))
-        .collect();
-    let rust_version = entry.rust_version.map(|it| it.to_string().parse()).transpose()?;
-    let mut summary = Summary::new(id, deps, &features, entry.links.as_deref(), rust_version)?;
-    summary.set_checksum(entry.checksum.clone());
-    if let Some(pubtime) = &entry.pubtime {
-        summary.set_pubtime(pubtime.clone());
-    }
-    Ok(summary)
-}
-
-/// cargo's `registry_dependency_into_dep`: a dependency of a package of the registry
-/// `default`.
-fn dependency(dep: &IndexDependency, default: SourceId) -> Result<Dependency> {
-    if dep.artifact.is_some() {
-        bail!(
-            "`{}` is an artifact dependency (`-Zbindeps`), which blaze does not read",
-            dep.package
-        );
-    }
-    if dep.public && dep.kind != index::DepKind::Normal {
-        bail!("`{}` is public but not a normal dependency", dep.package);
-    }
-    let id = dep.registry.unwrap_or(default);
-    let mut it = Dependency::parse(dep.package.as_str(), Some(&dep.req.to_string()), id)?;
-    if dep.name_in_toml != dep.package {
-        it.set_explicit_name_in_toml(dep.name_in_toml.as_str());
-    }
-    if !id.is_crates_io() {
-        it.set_registry_id(id);
-    }
-    it.set_optional(dep.optional)
-        .set_default_features(dep.default_features)
-        .set_features(dep.features.iter().map(String::as_str))
-        .set_platform(dep.platform.clone())
-        .set_kind(match dep.kind {
-            index::DepKind::Normal => DepKind::Normal,
-            index::DepKind::Development => DepKind::Development,
-            index::DepKind::Build => DepKind::Build,
-        })
-        .set_public(dep.public);
-    Ok(it)
-}
+pub use blaze_units::index::index_summary;
 
 impl Registry {
     /// cargo's `RegistryIndex::query_inner`: each version of `name` that `req` matches, with
@@ -105,7 +29,7 @@ impl Registry {
         name: &str,
         req: &OptVersionReq,
         source: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let summaries = self.summaries(name).await?;
         let lines: Vec<IndexLine> = summaries.select(|version| req.matches(version)).collect();
@@ -136,7 +60,7 @@ impl Registry {
         dep: &Dependency,
         kind: QueryKind,
         source: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let name = dep.package_name();
         let mut req = dep.version_req().clone();
@@ -227,11 +151,7 @@ impl<'a, R: Resolver> IndexRegistry<'a, R> {
 
     /// The source `id`'s packages come from, when it is a registry's index.
     pub fn registry_of(&self, id: SourceId) -> Result<Option<SourceId>> {
-        if !id.is_registry() {
-            return Ok(None);
-        }
-        let from = self.sources.map().replacement(id)?;
-        Ok(from.is_registry().then_some(from))
+        self.sources.map().registry_of(id)
     }
 }
 
@@ -240,7 +160,7 @@ impl<R: Resolver> Resolver for IndexRegistry<'_, R> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let id = dep.source_id();
         let Some(from) = self.registry_of(id)? else {
@@ -258,34 +178,10 @@ impl<R: Resolver> Resolver for IndexRegistry<'_, R> {
     /// As cargo's `ReplacedSource::describe`: the source read, and the one it replaces unless
     /// that is crates.io read over its sparse index.
     fn describe_source(&self, source: SourceId) -> String {
-        let from = self.sources.map().replacement(source).unwrap_or(source);
-        if from == source || (from.is_crates_io() && source.is_crates_io()) {
-            describe(from)
-        } else {
-            format!("{} (which is replacing {source})", describe(from))
-        }
+        self.sources.map().describe(source)
     }
 
     fn is_replaced(&self, source: SourceId) -> bool {
-        let from = self.sources.map().replacement(source).unwrap_or(source);
-        from != source && !(from.is_crates_io() && source.is_crates_io())
-    }
-}
-
-/// How cargo's sources describe themselves (each `Source::describe`).
-fn describe(id: SourceId) -> String {
-    match id.kind() {
-        SourceKind::Registry | SourceKind::SparseRegistry | SourceKind::LocalRegistry => {
-            id.display_index()
-        }
-        SourceKind::Directory => match id.url().to_file_path() {
-            Ok(path) => format!("directory source `{}`", path.display()),
-            Err(()) => id.to_string(),
-        },
-        SourceKind::Git(_) => format!("Git repository {id}"),
-        SourceKind::Path => match id.url().to_file_path() {
-            Ok(path) => path.display().to_string(),
-            Err(()) => id.to_string(),
-        },
+        self.sources.map().is_replaced(source)
     }
 }

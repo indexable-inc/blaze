@@ -1,0 +1,34 @@
+{
+  "id": "01445",
+  "from_lane": "may-suspend",
+  "owner": "sched",
+  "paths": [
+    "crates/blaze-graph/src/sched/fiber.rs",
+    "crates/blaze-graph/src/sched/mod.rs",
+    "crates/blaze-graph/src/lib.rs",
+    "crates/blaze-graph/src/pump.rs",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/db.rs"
+  ],
+  "what": "For lane may-suspend (docs/v2/plan/lanes/may-suspend.md), which replaces phase 2's thread-local and lock audit with a compiler check, and the lead's fiber-boundary lint (20:45):\n1. crates/blaze-graph/src/lib.rs: `#![feature(register_tool)]` and `#![register_tool(blaze)]`.\n2. fiber.rs: `#[blaze::may_suspend]` on the fields `Here::wait` and `Here::relocate` (the fn pointers through which code without a Cx suspends; `claim` and `key_done` never suspend and stay unmarked).\n3. fiber.rs: `Cx` becomes `Sync`, soundly: `Cx::switch` asserts it runs on its own fiber (`HERE`'s job is `self.job`, the read `check_no_wait` already sits beside) and panics otherwise; then `unsafe impl<W: Work> Sync for Cx<'_, W> {}` with that SAFETY. Why: a job holds `&Cx` across every wait, and the check rejects a `!Send` value held across a may-suspend call (`&Yielder`'s Cell makes `Cx` !Sync today). The driver's own bodies in sched::fiber are not checked.\n4. The fiber-boundary lint (`blaze::fiber_boundary`, child may-suspend-lint) rejects a path through `sched::fiber` outside `blaze_graph::sched`: re-export the free API from `sched` (`pub use fiber::{wait, claim, key_done, miss, current_job, carry, Carried, NoWait}`), make `fiber` `pub(crate)` or narrower, and move pump.rs (`sched::{.., fiber}`), blaze-query/src/lib.rs (`sched::fiber`, `fiber::carry`, `fiber::Carried`) and blaze-query/src/db.rs (`blaze_graph::sched::fiber::Carried`) onto those re-exports. `Driver`, `Cx`, `Work`, `Config` stay named only inside sched (the lint catches a re-export of them).",
+  "state": "taken",
+  "created": "2026-11-01T03:51:28Z",
+  "updated": "2026-11-01T03:53:20Z",
+  "taken_by": "sched",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:51:28Z",
+      "by": "may-suspend",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:53:20Z",
+      "by": "sched",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

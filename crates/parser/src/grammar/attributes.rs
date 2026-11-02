@@ -63,7 +63,8 @@ fn cfg_attr_meta(p: &mut Parser<'_>, m: Marker) {
     m.complete(p, CFG_ATTR_META);
 }
 
-const CFG_PREDICATE_FIRST_SET: TokenSet = TokenSet::new(&[T![true], T![false], T![ident]]);
+const CFG_PREDICATE_FIRST_SET: TokenSet =
+    expressions::LITERAL_FIRST.union(TokenSet::new(&[T![ident]]));
 
 pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
     let m = p.start();
@@ -71,6 +72,17 @@ pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
         // test cfg_true_false_pred
         // #![cfg(true)]
         // #![cfg(false)]
+        m.complete(p, CFG_ATOM);
+        return;
+    }
+    if p.at_ts(expressions::LITERAL_FIRST) {
+        // rustc's `parse_cfg_entry` takes any literal here and refuses all but `version`'s
+        // argument after parsing, so the error is the attribute checks', not the parser's.
+
+        // test cfg_literal_pred
+        // #![cfg(version("1.42"))]
+        // #![cfg(any(1, "a", b'c'))]
+        expressions::literal(p);
         m.complete(p, CFG_ATOM);
         return;
     }
@@ -97,6 +109,7 @@ pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
             T!['('],
             T![')'],
             T![,],
+            // alloc: error path only; the parser's error table holds `String`s
             || "expected a cfg predicate".to_owned(),
             CFG_PREDICATE_FIRST_SET,
             |p| {

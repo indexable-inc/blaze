@@ -11,6 +11,8 @@
 //! only `load`s it and `store`s a function's address made into a pointer in it. A body there
 //! of an `async` block or a coroutine, whose code is not gone through, makes it none.
 
+use base_db::Db;
+use blaze_hash::HashSet;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, HasModule, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body,
@@ -27,14 +29,13 @@ use hir_ty::{
     },
     next_solver::TyKind,
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
 /// Whether `id` is a static that chooses a function, as the module says.
-pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
+pub(super) fn is_cache(db: &Db, id: StaticId) -> bool {
     let not = why_not(db, id);
     if let Some(why) = not
-        && std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some()
+        && *super::TRACE
     {
         eprintln!("fn-cache: static {id:?} chooses no function: {why}");
     }
@@ -42,7 +43,7 @@ pub(super) fn is_cache(db: &dyn HirDatabase, id: StaticId) -> bool {
 }
 
 /// Why `id` is not a static that chooses a function.
-fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
+fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
     if StaticSignature::of(db, id).flags.contains(StaticFlags::MUTABLE)
         || !is_atomic_ptr(db, db.type_for_static(id).skip_binder())
     {
@@ -53,13 +54,16 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     };
     let Some(block) = module.block(db) else { return Some("not of a module's block") };
     // A block in a block is in the same body: a body with a macro call has a block of its own.
-    // SAFETY: the module is used in this call alone, as hir-def's own search for a block's body.
-    let mut outer = unsafe { block.module(db).to_static() };
+    let mut outer = block.module(db);
     while let Some(it) = outer.block(db) {
-        outer = unsafe { it.module(db).to_static() };
+        outer = it.module(db);
     }
-    let Some(owner) = owners(db, outer)
-        .into_iter()
+    // alloc: one worklist of bodies a static, filled with the owners first
+    let mut bodies = Vec::new();
+    owners(db, outer, &mut bodies);
+    let Some(owner) = bodies
+        .iter()
+        .copied()
         .find(|&it| Body::of(db, it).blocks(db).any(|(found, _)| found == block))
     else {
         return Some("no body has its block");
@@ -67,36 +71,41 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     let Ok(init) = db.mir_body(InferBodyId::DefWithBodyId(id.into())) else {
         return Some("its initializer has no MIR");
     };
-    if !made_of_fn(db, init, return_slot(), &mut FxHashSet::default()) {
-        if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+    if !made_of_fn(db, init, return_slot(), &mut HashSet::default()) {
+        if *super::TRACE {
             eprintln!("fn-cache: {:#?}", init.basic_blocks);
         }
         return Some("its first value is no function's address");
     }
-    let mut bodies = vec![owner];
-    let mut seen = FxHashSet::from_iter([owner]);
+    bodies.clear();
+    bodies.push(owner);
+    let mut seen = HashSet::from_iter([owner]);
+    // alloc: reused for every module of a block, a static
+    let mut found = Vec::new();
+    // alloc: reused for every body, a static
+    let mut mir = Vec::new();
     while let Some(at) = bodies.pop() {
         let store = Body::of(db, at);
         let coroutine = store.exprs().any(|(_, expr)| {
-            matches!(expr, Expr::Closure { closure_kind, .. } if *closure_kind != ClosureKind::Closure)
+            matches!(expr, Expr::Closure { closure_kind, .. } if closure_kind != ClosureKind::Closure)
         });
         if coroutine {
             return Some("a coroutine can name it");
         }
         for (_, def_map) in store.blocks(db) {
             for (_, data) in def_map.modules(db) {
-                let mut found = Vec::new();
                 declared(db, data.scope(db), &mut found);
-                bodies.extend(found.into_iter().filter(|&it| seen.insert(it)));
+                bodies.extend(found.drain(..).filter(|&it| seen.insert(it)));
             }
         }
         let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else {
             return Some("a body that can name it has no MIR");
         };
-        let mut mir = vec![body];
+        mir.clear();
+        mir.push(body);
         while let Some(body) = mir.pop() {
             if !only_dispatches(db, body, id) {
-                if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+                if *super::TRACE {
                     eprintln!("fn-cache: {:?}: {:#?}", body.owner, body.basic_blocks);
                 }
                 return Some("a body uses it otherwise");
@@ -115,22 +124,22 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
 /// Whether `operand`, which a body of a crate outside the toolchain makes a function pointer
 /// of, is what it loaded from a static `is_cache` says chooses a function.
 pub(super) fn loaded_from(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: &MirBody<'_>,
     operand: &Operand,
-    is_cache: &dyn Fn(StaticId) -> bool,
+    is_cache: &impl Fn(StaticId) -> bool,
 ) -> bool {
     let Some(local) = whole_local(operand) else { return false };
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     loaded(db, body, local, is_cache, &mut seen)
 }
 
 fn loaded(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: &MirBody<'_>,
     local: LocalId,
-    is_cache: &dyn Fn(StaticId) -> bool,
-    seen: &mut FxHashSet<LocalId>,
+    is_cache: &impl Fn(StaticId) -> bool,
+    seen: &mut HashSet<LocalId>,
 ) -> bool {
     if !seen.insert(local) {
         return true;
@@ -174,7 +183,7 @@ fn loaded(
 }
 
 /// The bodies of what `scope` declares.
-fn declared(db: &dyn HirDatabase, scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>) {
+fn declared(db: &Db, scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>) {
     let assoc = |bodies: &mut Vec<DefWithBodyId>, item: AssocItemId| match item {
         AssocItemId::FunctionId(id) => bodies.push(id.into()),
         AssocItemId::ConstId(id) => bodies.push(id.into()),
@@ -201,23 +210,20 @@ fn declared(db: &dyn HirDatabase, scope: &ItemScope, bodies: &mut Vec<DefWithBod
     }
 }
 
-/// The bodies of what `module`, of no block, declares: one of them is the body a block of
-/// the module is in.
-fn owners(db: &dyn HirDatabase, module: hir_def::ModuleId) -> Vec<DefWithBodyId> {
+/// Pushes to `bodies` the bodies of what `module`, of no block, declares: one of them is the
+/// body a block of the module is in.
+fn owners<'db>(db: &'db Db, module: hir_def::ModuleIdLt<'db>, bodies: &mut Vec<DefWithBodyId>) {
     let def_map = module.def_map(db);
-    let Some((_, data)) = def_map.modules(db).find(|(it, _)| *it == module) else {
-        return Vec::new();
-    };
-    let mut bodies = Vec::new();
-    declared(db, data.scope(db), &mut bodies);
-    bodies
+    if let Some((_, data)) = def_map.modules(db).find(|(it, _)| *it == module) {
+        declared(db, data.scope(db), bodies);
+    }
 }
 
 /// Whether `body` uses the static `id` only as the module says: copies of where it is in
 /// locals, `load` of it, and `store` in it of a function's address.
-fn only_dispatches(db: &dyn HirDatabase, body: &MirBody<'_>, id: StaticId) -> bool {
+fn only_dispatches(db: &Db, body: &MirBody<'_>, id: StaticId) -> bool {
     // The locals that hold where the static is.
-    let mut at: FxHashSet<LocalId> = FxHashSet::default();
+    let mut at: HashSet<LocalId> = HashSet::default();
     loop {
         let before = at.len();
         for (_, block) in body.basic_blocks.iter() {
@@ -291,7 +297,7 @@ fn only_dispatches(db: &dyn HirDatabase, body: &MirBody<'_>, id: StaticId) -> bo
                 return false;
             }
             if method == "store"
-                && !args.get(1).is_some_and(|it| fn_address(body, it, &mut FxHashSet::default()))
+                && !args.get(1).is_some_and(|it| fn_address(body, it, &mut HashSet::default()))
             {
                 return false;
             }
@@ -312,7 +318,7 @@ fn only_dispatches(db: &dyn HirDatabase, body: &MirBody<'_>, id: StaticId) -> bo
 }
 
 /// Whether `rvalue` is where the static `id` is, or a copy of what a local of `at` holds.
-fn copies(rvalue: &Rvalue, id: StaticId, at: &FxHashSet<LocalId>) -> bool {
+fn copies(rvalue: &Rvalue, id: StaticId, at: &HashSet<LocalId>) -> bool {
     match rvalue {
         Rvalue::Use(Operand { kind: OperandKind::Static(it), .. }) => *it == id,
         Rvalue::Use(it) => whole_local(it).is_some_and(|it| at.contains(&it)),
@@ -333,7 +339,7 @@ fn static_of(body: &MirBody<'_>, operand: &Operand) -> Option<StaticId> {
         return Some(*id);
     }
     let mut local = whole_local(operand)?;
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     loop {
         if !seen.insert(local) || body.param_locals.contains(&local) {
             return None;
@@ -363,8 +369,8 @@ fn static_of(body: &MirBody<'_>, operand: &Operand) -> Option<StaticId> {
 
 /// Whether `operand` is a function's address, as a function pointer or made into a pointer,
 /// by the locals it is copied through: never one a body is handed, nor one a call returns.
-fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut FxHashSet<LocalId>) -> bool {
-    if super::fn_item(operand).is_some() {
+fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut HashSet<LocalId>) -> bool {
+    if operand.fn_item().is_some() {
         return true;
     }
     let Some(local) = whole_local(operand) else { return false };
@@ -415,10 +421,10 @@ fn fn_address(body: &MirBody<'_>, operand: &Operand, seen: &mut FxHashSet<LocalI
 
 /// Whether the initializer `body`'s `local` is an `AtomicPtr` made of a function's address.
 fn made_of_fn(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: &MirBody<'_>,
     local: LocalId,
-    seen: &mut FxHashSet<LocalId>,
+    seen: &mut HashSet<LocalId>,
 ) -> bool {
     if !seen.insert(local) || borrowed(body, local) {
         return false;
@@ -449,7 +455,7 @@ fn made_of_fn(
         any = true;
         let made = destination.projection.as_slice().is_empty()
             && atomic_ptr_method(db, func) == Some("new")
-            && args.first().is_some_and(|it| fn_address(body, it, &mut FxHashSet::default()));
+            && args.first().is_some_and(|it| fn_address(body, it, &mut HashSet::default()));
         if !made {
             return false;
         }
@@ -478,8 +484,8 @@ fn whole_local(operand: &Operand) -> Option<LocalId> {
 }
 
 /// Which of core's `AtomicPtr::new`, `load` and `store` an operand is the function of.
-fn atomic_ptr_method(db: &dyn HirDatabase, func: &Operand) -> Option<&'static str> {
-    let (func, _) = super::fn_item(func)?;
+fn atomic_ptr_method(db: &Db, func: &Operand) -> Option<&'static str> {
+    let (func, _) = func.fn_item()?;
     if !matches!(
         func.krate(db).data(db).origin,
         base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core)
@@ -500,7 +506,7 @@ fn atomic_ptr_method(db: &dyn HirDatabase, func: &Operand) -> Option<&'static st
 
 /// Whether `ty` is core's `AtomicPtr`: a struct of its own, or `Atomic<*mut T>` it is an
 /// alias of.
-fn is_atomic_ptr(db: &dyn HirDatabase, ty: hir_ty::next_solver::Ty<'_>) -> bool {
+fn is_atomic_ptr(db: &Db, ty: hir_ty::next_solver::Ty<'_>) -> bool {
     let TyKind::Adt(def, args) = ty.kind() else { return false };
     let AdtId::StructId(id) = def.def_id() else { return false };
     if !matches!(

@@ -1,8 +1,0 @@
-{
-  "row": "`links` and `DEP_<name>_<key>` metadata",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep"
-  ]
-}

@@ -1,0 +1,35 @@
+{
+  "id": "00955",
+  "from_lane": "drop-oracles",
+  "owner": "item-hash-store",
+  "paths": [
+    "harness/v2/frontend/item_store.py"
+  ],
+  "what": "Andrew 2026-10-30 dropped every harness that compares blaze with rustc or cargo (docs/harness.md, AGENTS.md best-long-term-design). harness/difftest.py is deleted (its helpers live in harness/mixed.py: mixed.symptom), so item_store.py fails to import at lines 370-371. Please: (1) drop the plain-cargo reference build (engine.reference_env/engine.cargo build at ~403-427 and the cargo verdicts at ~365-371) and hold each step to what blaze builds of the same state from nothing (fresh home and store, as harness/v2/budgets.py now does with target-scratch), keeping the fresh-run comparison; (2) replace difftest.symptom with mixed.symptom if still needed; (3) reword the docstring (\"against rustc\" goes). harness/apps.py stays.",
+  "state": "applied",
+  "created": "2026-10-30T11:58:49Z",
+  "updated": "2026-10-30T12:01:23Z",
+  "taken_by": "item-hash-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:58:49Z",
+      "by": "drop-oracles",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:59:59Z",
+      "by": "item-hash-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:01:23Z",
+      "by": "item-hash-store",
+      "action": "done",
+      "note": "harness/v2/frontend/item_store.py: the plain-cargo reference build is gone. Each step builds the same tree with blaze from nothing (scratch-home, scratch-store, target-scratch of its own, BLAZE_ITEM_STORE=off; App.build then App.forget_fresh stops its daemon and removes them after the step, as budgets.py wrong). The fresh-run comparison stays: the verify build vs the from-nothing build, both build outcomes and each check behaviour. difftest.symptom -> mixed.symptom; docstring and verdict wording no longer name rustc or cargo; outcome number cargo_s -> fresh_s."
+    }
+  ]
+}

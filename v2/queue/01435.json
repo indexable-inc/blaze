@@ -1,0 +1,37 @@
+{
+  "id": "01435",
+  "from_lane": "sched",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/db/local.rs",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/segment.rs"
+  ],
+  "what": "Phase 2 of lane sched (stackful fibers, Andrew 18:29; lead 19:40 'start now'): a query run on a fiber can now suspend inside Flights::get_or_run (crates/blaze-graph/src/pump.rs get_or_run_on_fiber) and resume on ANOTHER worker thread, while other fibers run queries on the thread it left. The engine's per-run thread-locals must move with the job. blaze_graph::sched::fiber gives the hook: fiber::carry(fiber::Carried { take: fn() -> usize, put: fn(usize) }), registered once before any driver runs; at every switch out `take` moves the value off the thread (leaving it empty) and `put` moves it onto the thread that resumes the job (test: sched/fiber_tests.rs a_carried_thread_local_follows_its_job_across_waits). Please, in crates/blaze-query:\n1. db/local.rs:158 LOCAL (frames, edges, captures, members, pending, walk, bloom, serial, occurrences, attached): per job. E.g. the thread-local becomes a Cell<*mut Local> into a pool of Locals (warm: no allocation); take = swap in an empty pooled Local and return the old pointer; put = return the thread's (empty) Local to the pool and install the job's.\n2. lib.rs:490 INSIDE: per job, and inside_a_query() (lib.rs ~518, `INSIDE == pump::depth()`) needs a fiber answer: on a fiber (fiber::current_job().is_some()) a job is inside a query iff its own carried INSIDE says so; pump::depth() means nothing there.\n3. lib.rs STACKS and UNREADABLE: carried the same way (STACKS as LOCAL; UNREADABLE take = Cell::take, put = set). BUFFERS only if a buffer is held across a query call; else note it is per-call scratch.\n4. segment.rs:61 LANE stays per thread: check every lane() result is used for one write and never held across a query call (a wait).\nEach take/put must be #[inline(never)] (a thread-local's address must not be kept across a wait). Register them from the engine's init (one call, before blaze_graph::sched::fiber::Driver::start). No caller runs queries on fibers yet (pool/par/exec move in step 3), so this changes nothing today; it is what lets step 3 land. Design: docs/v2/plan/lanes/sched.md, Phase 2, step 4.",
+  "state": "applied",
+  "created": "2026-11-01T02:59:04Z",
+  "updated": "2026-11-01T03:22:00Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:59:04Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:15:05Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:22:00Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied: LOCAL/STACKS swapped with pooled empties, INSIDE/UNREADABLE carried, registered via carry_with_fiber_jobs from Database::blank and Storage::new; every TLS read #[inline(never)] (lead 20:27 accepted); test a_switching_job_takes_its_query_marks_and_stacks_with_it"
+    }
+  ]
+}

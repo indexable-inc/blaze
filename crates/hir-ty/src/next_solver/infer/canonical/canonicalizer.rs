@@ -5,19 +5,22 @@
 //!
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
-use rustc_hash::FxHashMap;
+use std::marker::PhantomData;
+
+use blaze_hash::HashMap;
 use rustc_index::Idx;
 use rustc_type_ir::InferTy::{self, FloatVar, IntVar, TyVar};
-use rustc_type_ir::inherent::{Const as _, IntoKind as _, Region as _, Ty as _};
+use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 use rustc_type_ir::{
-    BoundVar, BoundVarIndexKind, DebruijnIndex, Flags, InferConst, RegionKind, TyVid, TypeFlags,
-    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    BoundVar, BoundVarIndexKind, DebruijnIndex, Flags, InferConst, PredicateProxy, RegionKind,
+    TyVid, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    UniverseIndex,
 };
 use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::next_solver::{
-    Binder, Canonical, CanonicalVarKind, CanonicalVarKinds, Const, ConstKind, DbInterner,
+    Binder, Canonical, CanonicalVarKind, CanonicalVarKinds, Clauses, Const, ConstKind, DbInterner,
     GenericArg, PlaceholderConst, PlaceholderRegion, Region, Ty, TyKind,
 };
 use crate::next_solver::{PlaceholderType, infer::InferCtxt};
@@ -72,11 +75,10 @@ impl<'db> InferCtxt<'db> {
     where
         V: TypeFoldable<DbInterner<'db>>,
     {
-        Canonicalizer::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeAllFreeRegions>::canonicalize(
             value,
             self,
             self.interner,
-            &CanonicalizeAllFreeRegions,
             query_state,
         )
     }
@@ -111,11 +113,10 @@ impl<'db> InferCtxt<'db> {
         V: TypeFoldable<DbInterner<'db>>,
     {
         let mut query_state = OriginalQueryValues::default();
-        Canonicalizer::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeQueryResponse>::canonicalize(
             value,
             self,
             self.interner,
-            &CanonicalizeQueryResponse,
             &mut query_state,
         )
     }
@@ -125,11 +126,10 @@ impl<'db> InferCtxt<'db> {
         V: TypeFoldable<DbInterner<'db>>,
     {
         let mut query_state = OriginalQueryValues::default();
-        Canonicalizer::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeUserTypeAnnotation>::canonicalize(
             value,
             self,
             self.interner,
-            &CanonicalizeUserTypeAnnotation,
             &mut query_state,
         )
     }
@@ -142,25 +142,26 @@ impl<'db> InferCtxt<'db> {
 /// maximally general query. But if we are canonicalizing a *query
 /// response*, then we don't typically replace free regions, as they
 /// must have been introduced from other parts of the system.
-trait CanonicalizeMode {
-    fn canonicalize_free_region<'db>(
-        &self,
-        canonicalizer: &mut Canonicalizer<'_, 'db>,
-        r: Region<'db>,
-    ) -> Region<'db>;
-
-    fn any(&self) -> bool;
+trait CanonicalizeMode: Sized {
+    const ANY: bool;
 
     // Do we preserve universe of variables.
-    fn preserve_universes(&self) -> bool;
+    const PRESERVE_UNIVERSES: bool;
+
+    fn canonicalize_free_region<'db>(
+        canonicalizer: &mut Canonicalizer<'_, 'db, Self>,
+        r: Region<'db>,
+    ) -> Region<'db>;
 }
 
 struct CanonicalizeQueryResponse;
 
 impl CanonicalizeMode for CanonicalizeQueryResponse {
+    const ANY: bool = false;
+    const PRESERVE_UNIVERSES: bool = true;
+
     fn canonicalize_free_region<'db>(
-        &self,
-        canonicalizer: &mut Canonicalizer<'_, 'db>,
+        canonicalizer: &mut Canonicalizer<'_, 'db, Self>,
         mut r: Region<'db>,
     ) -> Region<'db> {
         let infcx = canonicalizer.infcx;
@@ -170,7 +171,7 @@ impl CanonicalizeMode for CanonicalizeQueryResponse {
                 .inner
                 .borrow_mut()
                 .unwrap_region_constraints()
-                .opportunistic_resolve_var(canonicalizer.tcx, vid);
+                .shallow_resolve_region_var(canonicalizer.tcx, vid);
             debug!(
                 "canonical: region var found with vid {vid:?}, \
                      opportunistically resolved to {r:?}",
@@ -192,7 +193,7 @@ impl CanonicalizeMode for CanonicalizeQueryResponse {
                     .inner
                     .borrow_mut()
                     .unwrap_region_constraints()
-                    .probe_value(vid)
+                    .try_resolve_region_var(vid)
                     .unwrap_err();
                 canonicalizer.canonical_var_for_region(CanonicalVarKind::Region(universe), r)
             }
@@ -210,22 +211,16 @@ impl CanonicalizeMode for CanonicalizeQueryResponse {
             }
         }
     }
-
-    fn any(&self) -> bool {
-        false
-    }
-
-    fn preserve_universes(&self) -> bool {
-        true
-    }
 }
 
 struct CanonicalizeUserTypeAnnotation;
 
 impl CanonicalizeMode for CanonicalizeUserTypeAnnotation {
+    const ANY: bool = false;
+    const PRESERVE_UNIVERSES: bool = false;
+
     fn canonicalize_free_region<'db>(
-        &self,
-        canonicalizer: &mut Canonicalizer<'_, 'db>,
+        canonicalizer: &mut Canonicalizer<'_, 'db, Self>,
         r: Region<'db>,
     ) -> Region<'db> {
         match r.kind() {
@@ -241,37 +236,23 @@ impl CanonicalizeMode for CanonicalizeUserTypeAnnotation {
             }
         }
     }
-
-    fn any(&self) -> bool {
-        false
-    }
-
-    fn preserve_universes(&self) -> bool {
-        false
-    }
 }
 
 struct CanonicalizeAllFreeRegions;
 
 impl CanonicalizeMode for CanonicalizeAllFreeRegions {
+    const ANY: bool = true;
+    const PRESERVE_UNIVERSES: bool = false;
+
     fn canonicalize_free_region<'db>(
-        &self,
-        canonicalizer: &mut Canonicalizer<'_, 'db>,
+        canonicalizer: &mut Canonicalizer<'_, 'db, Self>,
         r: Region<'db>,
     ) -> Region<'db> {
         canonicalizer.canonical_var_for_region_in_root_universe(r)
     }
-
-    fn any(&self) -> bool {
-        true
-    }
-
-    fn preserve_universes(&self) -> bool {
-        false
-    }
 }
 
-struct Canonicalizer<'cx, 'db> {
+struct Canonicalizer<'cx, 'db, M> {
     /// Set to `None` to disable the resolution of inference variables.
     infcx: &'cx InferCtxt<'db>,
     tcx: DbInterner<'db>,
@@ -279,21 +260,21 @@ struct Canonicalizer<'cx, 'db> {
     query_state: &'cx mut OriginalQueryValues<'db>,
     // Note that indices is only used once `var_values` is big enough to be
     // heap-allocated.
-    indices: FxHashMap<GenericArg<'db>, BoundVar>,
+    indices: HashMap<GenericArg<'db>, BoundVar>,
     /// Maps each `sub_unification_table_root_var` to the index of the first
     /// variable which used it.
     ///
     /// This means in case two type variables have the same sub relations root,
     /// we set the `sub_root` of the second variable to the position of the first.
     /// Otherwise the `sub_root` of each type variable is just its own position.
-    sub_root_lookup_table: FxHashMap<TyVid, usize>,
-    canonicalize_mode: &'cx dyn CanonicalizeMode,
+    sub_root_lookup_table: HashMap<TyVid, usize>,
     needs_canonical_flags: TypeFlags,
 
     binder_index: DebruijnIndex,
+    mode: PhantomData<M>,
 }
 
-impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
+impl<'cx, 'db, M: CanonicalizeMode> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db, M> {
     fn cx(&self) -> DbInterner<'db> {
         self.tcx
     }
@@ -321,7 +302,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
             | RegionKind::ReLateParam(_)
             | RegionKind::RePlaceholder(..)
             | RegionKind::ReVar(_)
-            | RegionKind::ReErased => self.canonicalize_mode.canonicalize_free_region(self, r),
+            | RegionKind::ReErased => M::canonicalize_free_region(self, r),
         }
     }
 
@@ -338,7 +319,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
                 }
 
                 debug!("canonical: type var found with vid {:?}", vid);
-                match self.infcx.probe_ty_var(vid) {
+                match self.infcx.try_resolve_ty_var(vid) {
                     // `t` could be a float / int variable; canonicalize that instead.
                     Ok(t) => {
                         debug!("(resolved to {:?})", t);
@@ -348,7 +329,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
                     // `TyVar(vid)` is unresolved, track its universe index in the canonicalized
                     // result.
                     Err(mut ui) => {
-                        if !self.canonicalize_mode.preserve_universes() {
+                        if !M::PRESERVE_UNIVERSES {
                             // FIXME: perf problem described in #55921.
                             ui = UniverseIndex::ROOT;
                         }
@@ -360,7 +341,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
             }
 
             TyKind::Infer(IntVar(vid)) => {
-                let nt = self.infcx.opportunistic_resolve_int_var(vid);
+                let nt = self.infcx.shallow_resolve_int_var(vid);
                 if nt != t {
                     self.fold_ty(nt)
                 } else {
@@ -368,7 +349,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
                 }
             }
             TyKind::Infer(FloatVar(vid)) => {
-                let nt = self.infcx.opportunistic_resolve_float_var(vid);
+                let nt = self.infcx.shallow_resolve_float_var(vid);
                 if nt != t {
                     self.fold_ty(nt)
                 } else {
@@ -383,7 +364,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
             }
 
             TyKind::Placeholder(mut placeholder) => {
-                if !self.canonicalize_mode.preserve_universes() {
+                if !M::PRESERVE_UNIVERSES {
                     placeholder.universe = UniverseIndex::ROOT;
                 }
                 self.canonicalize_ty_var(CanonicalVarKind::PlaceholderTy(placeholder), t)
@@ -442,7 +423,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
                 }
 
                 debug!("canonical: const var found with vid {:?}", vid);
-                match self.infcx.probe_const_var(vid) {
+                match self.infcx.try_resolve_const_var(vid) {
                     Ok(c) => {
                         debug!("(resolved to {:?})", c);
                         return self.fold_const(c);
@@ -451,7 +432,7 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
                     // `ConstVar(vid)` is unresolved, track its universe index in the
                     // canonicalized result
                     Err(mut ui) => {
-                        if !self.canonicalize_mode.preserve_universes() {
+                        if !M::PRESERVE_UNIVERSES {
                             // FIXME: perf problem described in #55921.
                             ui = UniverseIndex::ROOT;
                         }
@@ -481,16 +462,23 @@ impl<'cx, 'db> TypeFolder<DbInterner<'db>> for Canonicalizer<'cx, 'db> {
             ct
         }
     }
+
+    fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P {
+        if p.flags().intersects(self.needs_canonical_flags) { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: Clauses<'db>) -> Clauses<'db> {
+        if c.flags().intersects(self.needs_canonical_flags) { c.super_fold_with(self) } else { c }
+    }
 }
 
-impl<'cx, 'db> Canonicalizer<'cx, 'db> {
+impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
     /// The main `canonicalize` method, shared impl of
     /// `canonicalize_query` and `canonicalize_response`.
     fn canonicalize<V>(
         value: V,
         infcx: &InferCtxt<'db>,
         tcx: DbInterner<'db>,
-        canonicalize_region_mode: &dyn CanonicalizeMode,
         query_state: &mut OriginalQueryValues<'db>,
     ) -> Canonical<'db, V>
     where
@@ -501,14 +489,7 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
             var_kinds: CanonicalVarKinds::empty(),
             value: (),
         };
-        Canonicalizer::canonicalize_with_base(
-            base,
-            value,
-            infcx,
-            tcx,
-            canonicalize_region_mode,
-            query_state,
-        )
+        Canonicalizer::<'_, '_, M>::canonicalize_with_base(base, value, infcx, tcx, query_state)
         .unchecked_map(|((), val)| val)
     }
 
@@ -517,13 +498,12 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
         value: V,
         infcx: &InferCtxt<'db>,
         tcx: DbInterner<'db>,
-        canonicalize_region_mode: &dyn CanonicalizeMode,
         query_state: &mut OriginalQueryValues<'db>,
     ) -> Canonical<'db, (U, V)>
     where
         V: TypeFoldable<DbInterner<'db>>,
     {
-        let needs_canonical_flags = if canonicalize_region_mode.any() {
+        let needs_canonical_flags = if M::ANY {
             TypeFlags::HAS_INFER | TypeFlags::HAS_PLACEHOLDER | TypeFlags::HAS_FREE_REGIONS
         } else {
             TypeFlags::HAS_INFER | TypeFlags::HAS_PLACEHOLDER
@@ -534,16 +514,16 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
             return base.unchecked_map(|b| (b, value));
         }
 
-        let mut canonicalizer = Canonicalizer {
+        let mut canonicalizer = Canonicalizer::<'_, '_, M> {
             infcx,
             tcx,
-            canonicalize_mode: canonicalize_region_mode,
             needs_canonical_flags,
             variables: SmallVec::from_slice(base.var_kinds.as_slice()),
             query_state,
-            indices: FxHashMap::default(),
+            indices: HashMap::default(),
             sub_root_lookup_table: Default::default(),
             binder_index: DebruijnIndex::ZERO,
+            mode: PhantomData,
         };
         if canonicalizer.query_state.var_values.spilled() {
             canonicalizer.indices = canonicalizer
@@ -552,6 +532,7 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
                 .iter()
                 .enumerate()
                 .map(|(i, &kind)| (kind, BoundVar::from(i)))
+                // alloc: only past 8 variables, where the linear search would cost more.
                 .collect();
         }
         let out_value = value.fold_with(&mut canonicalizer);
@@ -584,7 +565,7 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
 
         let universe = info.universe();
         if universe != UniverseIndex::ROOT {
-            assert!(self.canonicalize_mode.preserve_universes());
+            assert!(M::PRESERVE_UNIVERSES);
 
             // Insert universe into the universe map. To preserve the order of the
             // universes in the value being canonicalized, we don't update the
@@ -621,6 +602,7 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
                         .iter()
                         .enumerate()
                         .map(|(i, &kind)| (kind, BoundVar::new(i)))
+                        // alloc: once, when the ninth variable spills `var_values`.
                         .collect();
                 }
                 // The cv is the index of the appended element.
@@ -652,42 +634,42 @@ impl<'cx, 'db> Canonicalizer<'cx, 'db> {
             return self.variables;
         }
 
-        let reverse_universe_map: FxHashMap<UniverseIndex, UniverseIndex> = self
-            .query_state
-            .universe_map
-            .iter()
-            .enumerate()
-            .map(|(idx, universe)| (*universe, UniverseIndex::from_usize(idx)))
-            .collect();
+        let universe_map = &self.query_state.universe_map;
+        let reverse_universe_map = |u: UniverseIndex| {
+            UniverseIndex::from_usize(
+                universe_map.binary_search(&u).expect("every variable's universe is in the map"),
+            )
+        };
 
         self.variables
             .iter()
             .map(|v| match *v {
                 CanonicalVarKind::Int | CanonicalVarKind::Float => *v,
                 CanonicalVarKind::Ty { ui, sub_root } => {
-                    CanonicalVarKind::Ty { ui: reverse_universe_map[&ui], sub_root }
+                    CanonicalVarKind::Ty { ui: reverse_universe_map(ui), sub_root }
                 }
-                CanonicalVarKind::Region(u) => CanonicalVarKind::Region(reverse_universe_map[&u]),
-                CanonicalVarKind::Const(u) => CanonicalVarKind::Const(reverse_universe_map[&u]),
+                CanonicalVarKind::Region(u) => CanonicalVarKind::Region(reverse_universe_map(u)),
+                CanonicalVarKind::Const(u) => CanonicalVarKind::Const(reverse_universe_map(u)),
                 CanonicalVarKind::PlaceholderTy(placeholder) => {
                     CanonicalVarKind::PlaceholderTy(PlaceholderType::new(
-                        reverse_universe_map[&placeholder.universe],
+                        reverse_universe_map(placeholder.universe),
                         placeholder.bound,
                     ))
                 }
                 CanonicalVarKind::PlaceholderRegion(placeholder) => {
                     CanonicalVarKind::PlaceholderRegion(PlaceholderRegion::new(
-                        reverse_universe_map[&placeholder.universe],
+                        reverse_universe_map(placeholder.universe),
                         placeholder.bound,
                     ))
                 }
                 CanonicalVarKind::PlaceholderConst(placeholder) => {
                     CanonicalVarKind::PlaceholderConst(PlaceholderConst::new(
-                        reverse_universe_map[&placeholder.universe],
+                        reverse_universe_map(placeholder.universe),
                         placeholder.bound,
                     ))
                 }
             })
+            // alloc: inline up to 8 variables.
             .collect()
     }
 

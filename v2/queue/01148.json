@@ -1,0 +1,30 @@
+{
+  "id": "01148",
+  "from_lane": "tests-misc-stencil",
+  "owner": "coordinator",
+  "paths": [
+    "crates/proc-macro-srv-cli/Cargo.toml",
+    "crates/proc-macro-api/Cargo.toml"
+  ],
+  "what": "The workspace no longer resolves (cargo test/check of any crate fails): crates/proc-macro-srv-cli/Cargo.toml asks proc-macro-api for feature `in-rust-tree`, which crates/proc-macro-api/Cargo.toml (edited 15:34) no longer has. Drop the feature from proc-macro-srv-cli or restore it.",
+  "state": "applied",
+  "created": "2026-10-30T22:39:02Z",
+  "updated": "2026-10-31T00:24:06Z",
+  "taken_by": "tests-misc-stencil",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:39:02Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T00:24:06Z",
+      "by": "tests-misc-stencil",
+      "action": "done",
+      "note": "stale: the workspace resolves again (proc-macro-api in-rust-tree fixed)"
+    }
+  ]
+}

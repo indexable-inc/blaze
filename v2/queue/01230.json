@@ -1,0 +1,39 @@
+{
+  "id": "01230",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/autoderef_recursion_limit.rs",
+    "crates/blaze-diagnostics/src/lower/method_on_unknown_raw_pointee.rs",
+    "crates/blaze-diagnostics/src/lower/inherited_ref_mutability_mismatch.rs",
+    "crates/blaze-diagnostics/src/lower/fn_trait_args_not_tuple.rs",
+    "crates/blaze-diagnostics/src/lower/mod.rs"
+  ],
+  "what": "01168 batch 5: emitters for four new hir diagnostics: AutoderefRecursionLimit (E0055), MethodOnUnknownRawPointee (E0282), InheritedRefMutabilityMismatch (E0308) and FnTraitArgsNotTuple (E0059). hir has the AnyDiagnostic variants now, so blaze-diagnostics lower() is non-exhaustive until this lands. Exact code in /tmp/blaze-lanes/no-fallback-front-ty-01168-probe-emitters.rs.",
+  "state": "applied",
+  "created": "2026-10-31T02:14:04Z",
+  "updated": "2026-10-31T02:55:07Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:14:04Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:55:07Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:55:07Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "applied: four lower files + arms; method_name_span helper in autoderef_recursion_limit.rs (no span_syntax_narrowed_to_method_name exists); display_name via expect; suggestion_verbose; inherited_ref_mutability_mismatch refuses with an error when the pattern is no `&mut` RefPat. Also lowered TyvarBehindRawPointer and PatternTypeNotLowered (your batch7 code) since mod.rs did not compile without them. Tests in tests/items/refused.rs. rust-analyzer clean, uncompiled."
+    }
+  ]
+}

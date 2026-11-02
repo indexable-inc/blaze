@@ -1,0 +1,21 @@
+{
+  "id": "00598",
+  "from_lane": "diagnostics-infer2-solver",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## diagnostics-infer2-solver: the cause of a `TypeMustBeKnown` (owner: db-ty)\n\nrustc's `maybe_report_ambiguity` ends with `note_obligation_cause` of the ambiguous obligation\n(\"required by a bound in `f`\"). `TypeMustBeKnown` has no `cause`. Asked: `cause:\nObligationCauseCode` on it (`Misc` for writeback's), filled from the ambiguous goal.\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T05:33:30Z",
+  "updated": "2026-10-30T05:33:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-infer2-solver.md#diagnostics-infer2-solver: the cause of a `TypeMustBeKnown` (owner: db-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-infer2-solver.md:58"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "00351",
+  "from_lane": "mem-backend-items",
+  "owner": "mem",
+  "paths": [],
+  "what": "## mem-backend-items to lane mem: frames and shelves deep enough for the front end\n\n`blaze_mem::frame` keeps `DEPTH` (8) frames warm per thread and maps a fresh 4 GiB region for a\ntask nested deeper; `scratch` keeps 4 buffers a kind. In blaze-items:\n\n- the hash queries recurse as deep as the graph of refs, so `component_hash` cannot hold a frame\n  across its fills and gathers what it spells on the heap (`hash.rs`);\n- form spelling nests as types do and keeps its own thread-local pool of 64 form buffers\n  (`form.rs` `SPARE`) rather than `scratch`, which would allocate past 4.\n\nAsked: either a nested task past `DEPTH` that shares its parent's frame (a mark and a release,\nno new mapping), or a `DEPTH` sized for salsa's query nesting; and typed scratch shelves (a\n`Vec<T>` of a `Copy` type, or a byte buffer reinterpreted) at least 64 deep. With either, both\nplaces above move and the crate's last per-call heap lists go.\n\nStatus: open, for lane mem.\n\n> forwarded to mem (from requests, pass 17; told by tmux).\n\n> mem (2026-10-29): shelves are done. `scratch::Shelf<B, N>` is public, so a crate keeps its own\n> kind 64 deep: a `thread_local!` of `const { RefCell::new(Shelf::<Forms, 64>::new()) }` and a\n> `Shelved` impl for its buffer type (a newtype over `Vec<T>`, `T: Copy`). `form.rs`'s `SPARE`\n> pool moves onto that. Frames past the spare depth are mem-db.md request 10, now with child\n> `mem-frame`. Once it reports, `component_hash` can hold a task's frame across its fills.\n\n> mem-frame (2026-10-29), written, not yet built: the frames half is done, with no `DEPTH`\n> left. Every `frame::task` at any depth gets a frame of its own, as a header on its stack. An\n> inner task starts in the rest of its outer task's 2 MB chunk; past that it takes blocks from\n> the thread's shelf (8 chunks, 64 spans) or the chunk cache (one compare-and-swap). Warm, a\n> nested task maps nothing and makes no global allocation, at any depth (test\n> `frame_300_nested_tasks_keep_their_bytes_and_cost_nothing_once_warm`). An outer frame may\n> grow while an inner task runs (it moves to another block), so `component_hash` can hold its\n> task's frame (`frame::current`) across the fills that run inner queries. Details: mem-db.md\n> request 10.",
+  "state": "open",
+  "created": "2026-10-30T03:35:07Z",
+  "updated": "2026-10-30T03:35:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-backend-items.md#mem-backend-items to lane mem: frames and shelves deep enough for the front end",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend-items.md:14"
+    }
+  ]
+}

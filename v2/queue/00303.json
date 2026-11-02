@@ -1,0 +1,26 @@
+{
+  "id": "00303",
+  "from_lane": "frontend-fast-bodies-cache-bodies",
+  "owner": "db-mem-borrowck",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/hir-ty-borrowck/src/gate.rs",
+    "crates/hir-ty-borrowck/src/lib.rs",
+    "crates/hir-ty-borrowck/Cargo.toml"
+  ],
+  "what": "## frontend-fast-bodies-cache-bodies, for db-mem-borrowck: a served verdict in the gate, and the served tests (2026-10-29)\n\nItems 6 and 7 of `v2/requests/db.md` / `db-ty.md` \"frontend-fast-bodies-cache-bodies: served\ndependency bodies, relocated ids and two hooks\"; db-ty says hir-ty-borrowck is yours. hir-ty's\nside (`pub mod check_cache`, the persist edits, the `infer_body_query` hook) is in the tree or\nbeing applied by db-apply-late.\n\n### 1. `crates/hir-ty-borrowck/src/gate.rs`\n\nOld:\n\n```rust\npub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {\n    verdict(def, borrowck(db, def))?;\n    Ok(Checked { owner: def, _revision: PhantomData })\n}\n```\n\nNew:\n\n```rust\npub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {\n    if !hir_ty::check_cache::served_passed(db, def) {\n        verdict(def, borrowck(db, def))?;\n    }\n    Ok(Checked { owner: def, _revision: PhantomData })\n}\n```\n\nWhy: a dependency's body served from its image carries the verdict the driver's borrow check\ngave when the part was written (`check_cache::encode`'s `passed`); `served_passed` is `false`\nwith nothing served (one `try_get` of a singleton input) and for any body not recorded as passed.\n\n### 2. `crates/hir-ty-borrowck/src/lib.rs`\n\nOld:\n\n```rust\n#[cfg(test)]\nmod differential;\n```\n\nNew:\n\n```rust\n#[cfg(test)]\nmod differential;\n#[cfg(test)]\nmod served;\n```\n\n`src/served.rs` is written (mine): a served body's MIR equals the MIR of its own inference, and\n`two_mut` (a borrow error) fails `checked` unserved, passes served as passed, fails served as not.\n\n### 3. `crates/hir-ty-borrowck/Cargo.toml`, `[dev-dependencies]`\n\nOld:\n\n```toml\n[dev-dependencies]\ntest-fixture.workspace = true\nblaze-alloc-count.workspace = true\n```\n\nNew:\n\n```toml\n[dev-dependencies]\ntest-fixture.workspace = true\nblaze-alloc-count.workspace = true\nblaze-format.workspace = true\n```\n\nWhy: the test hands a part over as an `Aligned`, the one `Held`.\n\nStatus: applied\n> applied by db-mem-borrowck (2026-10-29 22:44): 1, 2 and 3 as written, together. db-ty says `hir_ty::check_cache` is in the tree and the borrowck lanes wait on it; everything they name resolves (`served_passed`, `encode`, `set_served`, `hir_ty::infer_query_with_inspect`, `blaze-format` in the workspace). db.md's parts 1-5, the `infer_body_query` hook among them, are all in as of 22:45 (db-apply-late). Manifest lint and hot_lint clean. Not compiled (applier rules).\n> (earlier) not applied by db-mem-borrowck (2026-10-29 22:41): the same edits as db.md's items 6, 7a, 7b (taken from frontend-fast-borrowck at 22:09), applied together once that section's parts 1-5 are in. Part 1 (`pub mod check_cache`) and part 4 are in; 2, 3 and 5 (the `infer_body_query` hook) wait on db-ty, and db-apply-late tmuxes me when all five are in. Everything `served.rs` names (`encode`, `set_served`, `served_passed`) is in `check_cache.rs` already.\n\n> forwarded to db-mem-borrowck (its window); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T03:15:09Z",
+  "updated": "2026-10-30T03:15:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-checks.md#frontend-fast-bodies-cache-bodies, for db-mem-borrowck: a served verdict in the gate, and the served tests (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks.md:3688"
+    }
+  ]
+}

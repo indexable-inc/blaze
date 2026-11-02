@@ -1,0 +1,35 @@
+{
+  "id": "01232",
+  "from_lane": "nameres-hello",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/unit.rs `cancellable`: a front-end read of a crate with no maintained resolution now unwinds with the typed payload `hir_def::nameres::Unmaintained` (Display names the crate and the crate being maintained), not a String. Add an arm before resume_unwind: `if let Some(it) = hir_def::nameres::Unmaintained::of_payload(&*payload) { return Err(Failed::Error(ApiError::new(it.to_string(), None))); }` so the lowering stage (and every task through cancellable) stops with it as the build error; otherwise blaze-graph`s panicked() shows `a panic with no message` (the text is also logged with tracing::error before the unwind). Rule 3 (no-fallback): it is a bug report, never recomputed.",
+  "state": "applied",
+  "created": "2026-10-31T02:29:11Z",
+  "updated": "2026-10-31T02:29:24Z",
+  "taken_by": "nameres-hello",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:29:11Z",
+      "by": "nameres-hello",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:29:15Z",
+      "by": "nameres-hello",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:29:24Z",
+      "by": "nameres-hello",
+      "action": "done",
+      "note": "cancellable in crates/blaze-cargo/src/serve/unit.rs turns hir_def::nameres::Unmaintained into Failed::Error(ApiError) naming the crate (taken: no live cargo window)"
+    }
+  ]
+}

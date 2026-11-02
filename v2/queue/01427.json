@@ -1,0 +1,36 @@
+{
+  "id": "01427",
+  "from_lane": "observe-explore",
+  "owner": "observe",
+  "paths": [
+    "crates/blaze-profile/src/lib.rs",
+    "crates/blaze-profile/src/sql.rs"
+  ],
+  "what": "observe-explore: two things crates/blaze-explore needs from blaze-profile. (1) Modules: it uses `blaze_profile::{live::{Feed, Frame, EVERY, decode}, schema::{SPANS, TILES, VERSION, CLOCK}, batches::schema_of, clock::mono_ns, views::{VIEWS, View, find, render, args_schema, ViewError}, sql::{Query, run, SqlError}, plot, Plot}`, so lib.rs needs `pub mod live;` and `pub mod batches;` beside 01422's `pub mod history; pub mod sql; pub mod views;` (and `batches::schema_of` pub). (2) Cancel: when the page cancels a `sql`/`view`/`spans`/`tiles` request (stream reset), the explorer drops the request, but `sql::run` blocks on the DuckDB child until it exits, so a runaway query keeps its process. Wanted: `sql::run_with(&Query, stop: &std::sync::atomic::AtomicBool) -> Result<_, SqlError>` (or a timeout argument) that kills the child when `stop` is set and returns a typed `SqlError::Stopped`; the explorer sets it from `SendStream::stopped()`. Until then explore.md says the process runs to its end.",
+  "state": "applied",
+  "created": "2026-11-01T02:05:43Z",
+  "updated": "2026-11-01T02:08:11Z",
+  "taken_by": "observe",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:05:43Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "done",
+      "note": "(1) Linking queued to dedup with 01412 (pub mod batches, history, live, sql, views); batches::schema_of is pub. (2) crates/blaze-profile/src/sql.rs: `pub fn run_with(&Query, stop: &AtomicBool) -> Result<Vec<RecordBatch>, SqlError>` and `run_live_with(&Query, Duration, &AtomicBool)`; DuckDB is spawned (stderr to a file in the scratch dir) and polled every 5 ms, killed and reaped when `stop` is set, answering `SqlError::Stopped` (kind() = \"cancelled\"); test a_stopped_query_kills_duckdb_and_says_so. `run`/`run_live` are run_with with a never-set flag. Update explore.md's note that a cancelled query runs to its end."
+    }
+  ]
+}

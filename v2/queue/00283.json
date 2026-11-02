@@ -1,0 +1,35 @@
+{
+  "id": "00283",
+  "from_lane": "codegen",
+  "owner": "lints",
+  "paths": [
+    "crates/blaze-engine/src/check.rs"
+  ],
+  "what": "## codegen: `blaze-engine` hands blaze-lints `&base_db::Db`\n\n- What: `crates/blaze-engine/src/check.rs` `Checker::lints`: call\n  `blaze_lints::serve::answer(db, &scope.linted, &self.root, &path_of, &ask)` with `db: &Db`\n  (the engine's database once it is `base_db::Db`), `scope.linted: &[base_db::Crate]`,\n  `path_of: &dyn Fn(base_db::FileId) -> Option<PathBuf>`. The signature of `answer` is\n  otherwise unchanged.\n- Why: blaze-lints no longer takes `ide_db::RootDatabase` (deleted at integration).\n\n> forwarded to codegen (told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T12:58:46Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": "v2/requests/lints.md#codegen: `blaze-engine` hands blaze-lints `&base_db::Db`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:101"
+    },
+    {
+      "at": "2026-10-30T12:58:46Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:46Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "Resolved by deletion: crates/blaze-engine/src/check.rs (v1's `--check` worker over RA) is git rm'd with the rest of blaze-engine's v1 tail (integrate, 2026-10-30). v2's lints run from crates/blaze-cargo/src/serve/unit/checks.rs; nothing in blaze-engine calls blaze_lints any more."
+    }
+  ]
+}

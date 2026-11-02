@@ -1,0 +1,29 @@
+{
+  "id": "01315",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "01176 hir side: hir-def added ExpressionStoreDiagnostics::IntLiteralTooLarge; crates/hir/src/diagnostics.rs collect_store_diagnostics needs its arm (hir does not compile without it), plus the IntLiteralTooLarge struct and list entry. Exact code: section 1 of /tmp/blaze-lanes/01176-int-too-large.md. Same round as the hir-def edit.",
+  "state": "applied",
+  "created": "2026-10-31T16:39:44Z",
+  "updated": "2026-10-31T16:46:08Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:39:44Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:46:08Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "coord-1030 asked me to unblock hir: applied section 1 myself (list entry after AwaitOutsideOfAsync, struct after AwaitOutsideOfAsync, arm after MissingBody in collect_store_diagnostics). rust-analyzer clean on crates/hir."
+    }
+  ]
+}

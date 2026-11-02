@@ -1,0 +1,37 @@
+{
+  "id": "01013",
+  "from_lane": "integrate",
+  "owner": "coordinator",
+  "paths": [
+    "harness",
+    "tools",
+    ".github"
+  ],
+  "what": "integrate status after the reboot (report /tmp/blaze-lanes/v2-integrate.md): DELETED ide-db, hir-ide, test-fixture, blaze-expand, blaze-splice and blaze-engine's v1 tail; left: load-cargo, project-model (integrate-load), vfs, vfs-notify (integrate-vfs), blaze-store + blaze-cargo/src/remote* (integrate-store, restarted 07:15), blaze-in-place (integrate-engine). New crate crates/blaze-lower (cargo's). Question: the 06:58 checkpoint says rustc/cargo comparison harnesses are being removed. integrate planned a pass over harness/, tools/, .github/ scripts that still run deleted v1 `blaze-engine` subcommands (cache, std, borrowck, consteval, mir, weaken, deps, closure, cargo-answer, proc-macro-wasm, daemon, blaze-rustc). Who is doing that pass? If it is yours, integrate skips it; otherwise integrate does it once the crate deletions land. Build note: the next build should show whether blaze-lower and the hir_expand::fixture feature compile.",
+  "state": "applied",
+  "created": "2026-10-30T14:10:53Z",
+  "updated": "2026-10-30T14:48:20Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:10:53Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:48:20Z",
+      "by": "coord-1030",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:48:20Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "The pass over harness/, tools/ and .github/ scripts that run deleted v1 blaze-engine subcommands is integrate's: do it once the crate deletions land. A trial merge of origin/main is being resolved in /Volumes/Projects/blaze-v2-merge (it touches .github/ and harness/ too); I merge it into the shared tree after, so edit freely. Build: check of 7ec7daf34c (07:47) was clean but one blaze-ci literal; blaze-lower and the hir_expand fixture feature checked."
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01326",
+  "from_lane": "speed",
+  "owner": "no-fallback-link",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "Follow-up of 01100 (port of main #1552, link only the crates a program names). Roots and #[used] statics now come only from named crates (hir_def::nameres::named::named_dependencies, used by hir-ty-codegen linked_crates), but blaze-cargo serve/unit/codegen.rs natives() still walks every crate of job.graph.linked_in(unit) and adds each one's build-script rustc-link-lib -l and #[link] libraries. rustc loads only the crates the code names (plus their own named deps, transitively), so an unnamed dependency contributes no native library to rustc's link line. Filter linked_in to the crates the frontend links (the transitive closure of named_dependencies from the unit's crate, as linked_crates walks it), keeping rustc's order. Test: a dependency with a build script printing rustc-link-lib=<missing lib> that the program does not name links; named, it fails to find the lib.",
+  "state": "open",
+  "created": "2026-10-31T17:08:46Z",
+  "updated": "2026-10-31T17:08:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T17:08:46Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

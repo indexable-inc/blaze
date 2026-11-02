@@ -3,14 +3,14 @@
 //! read, so that blaze knows a workspace without running cargo: its packages, targets,
 //! dependencies and features, and the configuration that applies. What cargo accepts reads
 //! the same here; what it rejects is rejected with its message. `cargo metadata --no-deps` is
-//! the check: [`metadata`] prints the same JSON, and `harness/resolve.py` compares the two
-//! over a corpus.
+//! the check: [`metadata`] prints the same JSON, held by the tests to the output cargo printed
+//! for each fixture, recorded once.
 
 pub mod config;
 pub mod dependency;
 pub mod diagnostic;
-mod edit_distance;
 pub mod features;
+pub mod files;
 pub mod manifest;
 pub mod metadata;
 pub mod paths;
@@ -18,6 +18,8 @@ pub mod profiles;
 pub mod source;
 pub mod targets;
 pub mod workspace;
+
+use stdx::edit_distance::cargo as edit_distance;
 
 pub use config::Config;
 pub use manifest::Context;

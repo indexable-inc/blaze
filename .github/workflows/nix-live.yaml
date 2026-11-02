@@ -84,7 +84,7 @@ jobs:
         run: |
           for attr in daemon daemon-units; do
             out=$(nix build --no-link --print-out-paths .#$attr)
-            for bin in blaze blaze-engine blaze-rustc; do test -x "$out/bin/$bin"; done
+            for bin in blaze blaze-engine; do test -x "$out/bin/$bin"; done
           done
 
   nix-darwin:

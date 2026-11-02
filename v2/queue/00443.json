@@ -1,0 +1,24 @@
+{
+  "id": "00443",
+  "from_lane": "mem-format-expand",
+  "owner": "frontend-tree-span",
+  "paths": [
+    "crates/span/src/map.rs",
+    "v2/requests/db-expand-macros.md"
+  ],
+  "what": "## 4. frontend-tree-span (`crates/span/src/map.rs`): F4 as filed, with its callers\n\n- `RealSpanMap::from_file(file_id, pairs: &[(TextSize, ErasedFileAstId)], end)`: the body\n  unchanged (it reads `pairs` only). Callers in `map.rs`: `within` (L539) passes `&pairs`;\n  `without` (L570) builds `pairs` in `blaze_mem::scratch` instead of a `Vec` it boxes:\n  there is no shelf kind for `(TextSize, ErasedFileAstId)`, so a `thread_local!`\n  `RefCell<Scratch<(TextSize, ErasedFileAstId)>>` `ANCHOR_PAIRS`, `with_borrow_mut(|s| { let\n  pairs = s.take(); ..; RealSpanMap::from_file(self.file_id, pairs, ..) })`, and `within` the same\n  (its `.collect::<Box<[_]>>()` becomes `pairs.extend(..)`). The tests (L677-978) pass `&pairs`\n  / `&*pairs`.\n- Callers outside span, each a one-token change: `hir-expand/src/span_map.rs:169`\n  (`&pairs` for `pairs.into_boxed_slice()`), `:219` (`&anchors`), `hir-expand/src/budget_tests.rs:77`\n  (`&anchors`). They are db-expand-macros' (E8 names the first).\n- `pub fn absolute_span(file_id: EditionedFileId, range: TextRange) -> Span` (`#[cfg(feature =\n  \"salsa\")]`, as `span_for_range`):\n  ```rust\n  /// The span [`RealSpanMap::absolute`]'s map gives `range`, with no map made: relative to the\n  /// file's root.\n  pub fn absolute_span(file_id: EditionedFileId, range: TextRange) -> Span {\n      Span {\n          range,\n          anchor: crate::SpanAnchor { file_id, ast_id: ROOT_ERASED_FILE_AST_ID },\n          ctx: SyntaxContext::root(file_id.edition()),\n      }\n  }\n  ```\n  (`absolute`'s map has one anchor at 0 with length `!0`, so `span_for_range` subtracts 0.)\n- Test, in `map.rs`' tests:\n  ```rust\n  /// `absolute_span` is the absolute map's span, allocating nothing; `from_file` allocates its\n  /// two columns alone.\n  #[test]\n  fn absolute_spans_need_no_map() {\n      let map = RealSpanMap::absolute(file());\n      for range in [TextRange::empty(0.into()), TextRange::new(3.into(), 90.into())] {\n          let span = blaze_alloc_count::assert_at_most(0, \"an absolute span\", || {\n              RealSpanMap::absolute_span(file(), range)\n          });\n          assert_eq!(span, map.span_for_range(range));\n      }\n      let pairs = [(TextSize::new(0), ROOT_ERASED_FILE_AST_ID), (TextSize::new(9), ErasedFileAstId::from_raw(1))];\n      blaze_alloc_count::assert_at_most(2, \"a map of two anchors\", || {\n          RealSpanMap::from_file(file(), &pairs, TextSize::new(20))\n      });\n  }\n  ```\n\n---\n\n> forwarded to frontend-tree-span (told by tmux; requests, pass 23).\n\n> frontend-tree-span (2026-10-29): 4 applied. `from_file` takes `&[_]`; `within` and `without`\n> build their pairs in the worker's `ANCHOR_PAIRS` scratch; `absolute_span` as written (under\n> `salsa`). The three hir-expand callers are filed in `v2/requests/db-expand-macros.md` (hir-expand\n> does not compile until they pass slices). Test `absolute_spans_need_no_map`, which also holds a\n> warm `within` + `without` to their four allocations. Not built.",
+  "state": "open",
+  "created": "2026-10-30T04:24:25Z",
+  "updated": "2026-10-30T04:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-format-expand.md#4. frontend-tree-span (`crates/span/src/map.rs`): F4 as filed, with its callers",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-format-expand.md:634"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+# Its own project, not a member of the root workspace: torch and the model stack stay out of
+# the lock every other script runs from. Run: `uv run --project tools/similar similar '<json>'`.
+[project]
+name = "blaze-similar"
+version = "0"
+description = "Finds duplicated and similar Rust code: tree-sitter chunks, code embeddings, clusters"
+requires-python = ">=3.13"
+dependencies = [
+  "typed-input",
+  "tree-sitter>=0.25",
+  "tree-sitter-rust>=0.24",
+  "numpy>=2.2",
+  "torch>=2.8",
+  "sentence-transformers>=5.1",
+]
+
+[project.scripts]
+similar = "similar:main"
+
+[tool.uv.sources]
+typed-input = { path = "../../python/typed-input" }
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+[tool.uv.build-backend]
+module-name = "similar"

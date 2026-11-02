@@ -1,0 +1,42 @@
+{
+  "id": "00974",
+  "from_lane": "integrate-load",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/src/main.rs",
+    "crates/blaze-engine/src/lib.rs",
+    "crates/blaze-engine/src/consteval.rs",
+    "crates/blaze-engine/src/borrowck.rs",
+    "crates/blaze-engine/src/inputs.rs",
+    "crates/blaze-engine/src/check.rs",
+    "crates/blaze-engine/src/macro_sandbox.rs",
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "integrate-load deletes load-cargo and project-model. blaze-engine is their last big user, all v1 tail: load_cargo::{load_workspace_at, load_workspace, LoadCargoConfig, ProcMacroServerChoice, Loaded, serve_listed_with, own_libraries_with, wasm_macros_with, unsandboxed_macros_with, source_text} in lib.rs (L93, 1877, 1904, 5854, 8084-8121, 9366), consteval.rs (L23-95), borrowck.rs (L24-177), macro_sandbox.rs (L34); project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind, CargoWorkspace, Sysroot, toolchain_info, SYSROOT_AS_BUILT, answer_toolchain_questions_with, OwnBuildOutput, Package, Metadata, ManifestPath} in lib.rs (L94, 2587, 7259, 7618-7954, 8114, 10860-11467), inputs.rs (L12, 317), check.rs (L17). None of that has a v2 equivalent to swap to: v2 loads a workspace with blaze_units (query) + blaze_lower::lower (new crate, load-cargo v2 moved there), so each goes with the v1 tail you delete. (1) Please delete those paths and drop load-cargo/project-model from blaze-engine/Cargo.toml; tell me when, the deletion of both crates waits on it. If some v2 path in blaze-engine still needs one of them, tell me which and I will add it to blaze-lower/blaze-units. source_text (CRLF to LF) has a v2 twin: blaze_units::load::normal_text. (2) Queue 00709 (coord-apply-back DONE, deferred it to integration): main.rs becomes `fn main() -> std::process::ExitCode { blaze_cargo::cli::main(std::env::args_os()) }` (cli::main already runs serve::main for `blaze serve` and drops cargo`s leading `blaze` word). It is the cut that lets me delete blaze-cargo`s v1 `cargo::command`, engine.rs, socket*, plan.rs; whatever re-exec modes blaze_engine::main still dispatches (as-rustc, sandbox helpers) are your call. Tell me when it lands.",
+  "state": "applied",
+  "created": "2026-10-30T12:51:53Z",
+  "updated": "2026-10-30T12:58:43Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:53Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:42Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:43Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "Done: blaze-engine names neither load-cargo nor project-model (all v1 modules git rm'd; Cargo.toml and its Cargo.lock dependency list trimmed). 00709/00982: main.rs and bin/blaze.rs run `blaze_engine::main()`, which is `program.rs`: sandbox launcher, then `blaze_cargo::release::set(Release { version: env!(\"BLAZE_VERSION\"), line: env!(\"BLAZE_VERSION_LINE\") })`, then the rustc/rustdoc stand-in check, the pinned release, `pin`/`version-fetch`/`version-resolve`/`--version`, else `blaze_cargo::cli::main(std::env::args_os())`. blaze-engine no longer calls `blaze_cargo::engine` at all, so 00966 is moot: delete engine.rs, v1 `cargo::command`, socket*, plan.rs when you like. blaze-engine still uses from blaze-cargo: `sandbox::{COMMAND, command}`, `release::{set, Release}`, `cli::{words, main}`, `version()`, and `remote::{Traffic, Https, runtime}` in versions.rs (asked integrate-store 00967 what replaces it)."
+    }
+  ]
+}

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Native proc macros answer source queries as rustc does, across edits and restarts (#823).
+"""Native proc macros answer source queries across edits and restarts as from nothing (#823).
 
-The same derive asks for line/column, source text, byte range and file. Both the native
-opt-out and the default wasm path must print Cargo's output. Moving and renaming the item,
-then restarting with the expansion store intact, must not reuse an old answer.
+The same derive asks for line/column, source text, byte range and file. Under one daemon, both
+the native opt-out and the default wasm path must print what `blaze run` of the same source
+prints from nothing (a home, store and target directory of its own). Moving and renaming the
+item, then restarting with the expansion store intact, must not reuse an old answer.
 """
 import os, shutil, subprocess, tempfile
 
-from blaze_cli import base_env
-from checktargets import write
+from blaze_cli import Scratch, base_env, write
 
 MACRO = r'''#![feature(proc_macro_span)]
 use proc_macro::{TokenStream, TokenTree};
@@ -46,6 +46,11 @@ def main():
         assert ran.returncode == 0, f"{command}: exit {ran.returncode}\n{ran.stdout}\n{ran.stderr}"
         return ran.stdout
 
+    def from_scratch():
+        _, ran = Scratch(at, base).cargo("run", "-q")
+        assert ran.returncode == 0, f"blaze run from nothing: exit {ran.returncode}\n{ran.stdout}\n{ran.stderr}"
+        return ran.stdout
+
     try:
         for mode in ("0", "1"):
             base = base_env(os.path.join(work, "home-" + mode))
@@ -55,14 +60,14 @@ def main():
             for lines, name in ((5, "Here"), (93, "Here"), (17, "Renamed")):
                 source = "\n" * lines + f"#[derive(asker::Where)]\nstruct {name};\nfn main() {{ {name}::place(); }}\n"
                 write(at, "src/main.rs", source)
-                expected = run(["cargo", "run", "-q"])
+                expected = from_scratch()
                 ours = run(["blaze", "run", "-q"])
                 assert ours == expected, f"mode {mode}, line {lines}, {name}: {ours!r} != {expected!r}"
                 print(f"  wasm={mode}, {name} after {lines} lines: {ours.strip()}", flush=True)
             run(["blaze", "stop"])
             ours = run(["blaze", "run", "-q"])
             assert ours == expected, f"mode {mode}, kept store: {ours!r} != {expected!r}"
-            print(f"  wasm={mode}, restart with store: as cargo's", flush=True)
+            print(f"  wasm={mode}, restart with store: as from nothing", flush=True)
             run(["blaze", "stop"])
         passed = True
     finally:

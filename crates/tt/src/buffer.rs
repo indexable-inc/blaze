@@ -1,108 +1,77 @@
 //! Stateful iteration over token trees.
 //!
 //! We use this as the source of tokens for parser.
-use crate::{Leaf, Subtree, TokenTree, TokenTreesView, storage::TokenTreesSlice};
+use crate::{DelimiterKind, Leaf, Subtree, TokenTree, TokenTreesView};
 
 pub struct Cursor<'a> {
-    origin: TokenTreesSlice<'a>,
-    buffer_before_current: TokenTreesSlice<'a>,
-    buffer_after_current: TokenTreesSlice<'a>,
-    /// The number of times we called [`Self::advance()`]. Also the index of [`Self::next`].
-    advances_count: usize,
-    len: usize,
-    next: Option<TokenTree>,
-    subtrees_stack: Vec<(usize, Subtree)>,
+    origin: TokenTreesView<'a>,
+    /// The token tree the cursor is at, `origin.end` once past the last.
+    at: u32,
+    /// The subtrees the cursor is in, the innermost last: each one's index, and the index after
+    /// its last token tree.
+    subtrees_stack: Vec<(u32, u32)>,
 }
 
 impl<'a> Cursor<'a> {
     pub fn new(origin: TokenTreesView<'a>) -> Self {
-        let mut buffer_after_current = origin.slice;
-        let buffer_before_current = buffer_after_current;
-        let len = origin.len;
-        let next = if len >= 1 { buffer_after_current.advance() } else { None };
-        Self {
-            origin: origin.slice,
-            buffer_after_current,
-            buffer_before_current,
-            advances_count: 0,
-            len,
-            next,
-            subtrees_stack: Vec::new(),
-        }
+        // alloc: one buffer per walk, at its first subtree, as deep as the nesting.
+        Self { origin, at: origin.start, subtrees_stack: Vec::new() }
     }
 
     /// Check whether it is eof
     pub fn eof(&self) -> bool {
-        self.next.is_none() && self.subtrees_stack.is_empty()
+        self.at >= self.origin.end && self.subtrees_stack.is_empty()
     }
 
     pub fn is_root(&self) -> bool {
         self.subtrees_stack.is_empty()
     }
 
-    fn last_subtree(&self) -> Option<(usize, Subtree)> {
-        self.subtrees_stack.last().copied()
+    /// Whether the cursor is past the last token tree of the subtree it is in.
+    #[inline]
+    fn at_subtree_end(&self) -> bool {
+        self.subtrees_stack.last().is_some_and(|&(_, end)| end == self.at)
     }
 
     pub(crate) fn remaining(&self) -> TokenTreesView<'a> {
-        TokenTreesView { slice: self.buffer_before_current, len: self.len - self.advances_count }
+        TokenTreesView { start: self.at, ..self.origin }
     }
 
     pub fn end(&mut self) -> Subtree {
-        let (last_subtree_idx, last_subtree) =
-            self.last_subtree().expect("called `Cursor::end()` without an open subtree");
-        // +1 because `Subtree.len` excludes the subtree itself.
-        assert_eq!(
-            last_subtree_idx + last_subtree.usize_len() + 1,
-            self.advances_count,
-            "called `Cursor::end()` without finishing a subtree"
-        );
+        let &(subtree, end) =
+            self.subtrees_stack.last().expect("called `Cursor::end()` without an open subtree");
+        assert_eq!(end, self.at, "called `Cursor::end()` without finishing a subtree");
         self.subtrees_stack.pop();
-        last_subtree
+        self.origin.tree.subtree_at(subtree)
     }
 
     /// Returns the `TokenTree` at the cursor if it is not at the end of a subtree.
     pub fn token_tree(&self) -> Option<TokenTree> {
-        if let Some((last_subtree_idx, last_subtree)) = self.last_subtree() {
-            // +1 because `Subtree.len` excludes the subtree itself.
-            if last_subtree_idx + last_subtree.usize_len() + 1 == self.advances_count {
-                return None;
-            }
+        if self.at_subtree_end() || self.at >= self.origin.end {
+            return None;
         }
-        self.next.clone()
+        Some(self.origin.tree.token_tree_at(self.at))
     }
 
     fn advance(&mut self) {
-        if self.advances_count >= self.len {
+        if self.at >= self.origin.end {
             return;
         }
-        if let Some(TokenTree::Subtree(subtree)) = self.next {
-            self.subtrees_stack.push((self.advances_count, subtree));
+        let tree = self.origin.tree;
+        if tree.is_subtree(self.at) {
+            self.subtrees_stack.push((self.at, self.at + 1 + tree.subtree_len(self.at)));
         }
-        self.advances_count += 1;
-        self.buffer_before_current = self.buffer_after_current;
-        self.next =
-            if self.advances_count < self.len { self.buffer_after_current.advance() } else { None };
+        self.at += 1;
     }
 
     /// Bump the cursor, and enters a subtree if it is on one.
     pub fn bump(&mut self) {
-        if let Some((last_subtree_idx, last_subtree)) = self.last_subtree() {
-            // +1 because `Subtree.len` excludes the subtree itself.
-            assert_ne!(
-                last_subtree_idx + last_subtree.usize_len() + 1,
-                self.advances_count,
-                "called `Cursor::bump()` when at the end of a subtree"
-            );
-        }
+        assert!(!self.at_subtree_end(), "called `Cursor::bump()` when at the end of a subtree");
         self.advance();
     }
 
     pub fn bump_or_end(&mut self) {
-        // +1 because `Subtree.len` excludes the subtree itself.
-        if let Some((last_subtree_idx, last_subtree)) = self.last_subtree()
-            && last_subtree_idx + last_subtree.usize_len() + 1 == self.advances_count
-        {
+        if self.at_subtree_end() {
             self.subtrees_stack.pop();
             return;
         }
@@ -112,9 +81,9 @@ impl<'a> Cursor<'a> {
     /// Steps out of the token trees without delimiters that end here, which a parser that
     /// counts tokens does not see.
     pub fn leave_invisible(&mut self) {
-        while let Some((last_subtree_idx, last_subtree)) = self.last_subtree()
-            && last_subtree.delimiter.kind == crate::DelimiterKind::Invisible
-            && last_subtree_idx + last_subtree.usize_len() + 1 == self.advances_count
+        while let Some(&(subtree, end)) = self.subtrees_stack.last()
+            && end == self.at
+            && self.origin.tree.delimiter_kind_at(subtree) == DelimiterKind::Invisible
         {
             self.subtrees_stack.pop();
         }
@@ -125,35 +94,35 @@ impl<'a> Cursor<'a> {
     pub fn skip_invisible(&mut self) {
         loop {
             self.leave_invisible();
-            match self.token_tree() {
-                Some(TokenTree::Subtree(subtree))
-                    if subtree.delimiter.kind == crate::DelimiterKind::Invisible =>
-                {
-                    self.advance()
-                }
-                _ => break,
+            let tree = self.origin.tree;
+            if !self.at_subtree_end()
+                && self.at < self.origin.end
+                && tree.is_subtree(self.at)
+                && tree.delimiter_kind_at(self.at) == DelimiterKind::Invisible
+            {
+                self.advance();
+            } else {
+                break;
             }
         }
     }
 
     pub fn peek_two_leaves(&self) -> Option<[Leaf; 2]> {
-        if let Some((last_subtree_idx, last_subtree)) = self.last_subtree() {
-            // +1 because `Subtree.len` excludes the subtree itself.
-            let last_end = last_subtree_idx + last_subtree.usize_len() + 1;
-            if last_end == self.advances_count || last_end == self.advances_count + 1 {
-                return None;
-            }
+        if let Some(&(_, end)) = self.subtrees_stack.last()
+            && (end == self.at || end == self.at + 1)
+        {
+            return None;
         }
-        let mut buffer = self.buffer_after_current;
-        let next_next = if self.advances_count + 1 < self.len { buffer.advance() } else { None };
-        self.next.clone().zip(next_next).and_then(|it| match it {
-            (TokenTree::Leaf(a), TokenTree::Leaf(b)) => Some([a, b]),
-            _ => None,
-        })
+        let tree = self.origin.tree;
+        if self.at + 1 >= self.origin.end || tree.is_subtree(self.at) || tree.is_subtree(self.at + 1)
+        {
+            return None;
+        }
+        Some([tree.leaf_at(self.at), tree.leaf_at(self.at + 1)])
     }
 
     pub fn crossed(&self) -> TokenTreesView<'a> {
         assert!(self.is_root());
-        TokenTreesView { slice: self.origin, len: self.advances_count }
+        TokenTreesView { end: self.at, ..self.origin }
     }
 }

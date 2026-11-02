@@ -10,7 +10,7 @@ use crate::ast::{
 use crate::ast_pretty as pprust;
 use crate::feature::is_builtin_attr_name;
 use crate::span::{BytePos, LocalExpnId, Span, Symbol, SyntaxContext, sym, symbol};
-use unicode_width::UnicodeWidthStr;
+use rustfmt_unicode_width::UnicodeWidthStr;
 
 use crate::comment::{CharClasses, FullCodeCharKind, LineClasses, filter_normal_code};
 use crate::config::{Config, StyleEdition};

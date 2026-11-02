@@ -1,0 +1,29 @@
+{
+  "id": "01434",
+  "from_lane": "sched",
+  "owner": "coordinator",
+  "paths": [
+    "crates/stdx/src/lib.rs"
+  ],
+  "what": "stdx::ensure_sufficient_stack is wrong on a fiber (crates/stdx/src/lib.rs:34). stacker keeps the stack limit per THREAD (stacker-0.1.25 src/lib.rs:120 STACK_LIMIT, from the thread's own stack). A job on a fiber of blaze_graph::sched::fiber runs on its own mmap'd stack, so remaining_stack() is sp minus the worker thread's limit: either saturates to 0 (a new 1/8 MiB segment mmap'd on EVERY call) or is huge (never grows: the fiber overflows into its guard page and the process dies). Asked by lane sched (phase 2, fibers; Andrew 18:29). Please add to crates/stdx/src/lib.rs:\n\nthread_local! { static FIBER_STACK_LIMIT: Cell<usize> = const { Cell::new(0) }; }\n/// The lowest usable address of the fiber stack this thread runs now; 0 on the thread's own stack.\n#[inline(never)] pub fn fiber_stack_limit() -> usize { FIBER_STACK_LIMIT.get() }\n#[inline(never)] pub fn set_fiber_stack_limit(limit: usize) { FIBER_STACK_LIMIT.set(limit) }\n\nand in ensure_sufficient_stack (non-wasm): let limit = fiber_stack_limit(); if limit == 0 { stacker::maybe_grow(RED_ZONE, SEGMENT, f) } else { let here = { let x = 0u8; std::ptr::addr_of!(x).addr() }; if here.saturating_sub(limit) >= RED_ZONE { f() } else { stacker::grow(SEGMENT, || { let here = { let x = 0u8; std::ptr::addr_of!(x).addr() }; let segment = here - stacker::remaining_stack().expect(\"stacker knows a segment it made\"); let outer = fiber_stack_limit(); set_fiber_stack_limit(segment); let out = f(); set_fiber_stack_limit(outer); out }) } }. (#[inline(never)] on the two accessors matters: a job can resume on another thread after a wait, and an inlined thread-local address could be kept across it.) Once it is in, sched registers it as a fiber::Carried (take = replace with 0, put = set) and sets each fiber's own limit at job start; tell lane sched.",
+  "state": "applied",
+  "created": "2026-11-01T02:58:40Z",
+  "updated": "2026-11-01T03:23:27Z",
+  "taken_by": "lead",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:58:40Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:23:27Z",
+      "by": "lead",
+      "action": "done",
+      "note": "stdx: fiber_stack_limit / set_fiber_stack_limit (inline(never)), ensure_sufficient_stack uses the fiber limit when set; a drop guard restores the outer limit on return and unwind. Test tests::on_a_fiber_near_its_limit_the_stack_grows_and_the_limit_comes_back: fails with the per-thread behavior, passes with this."
+    }
+  ]
+}

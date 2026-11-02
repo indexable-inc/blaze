@@ -1,0 +1,23 @@
+{
+  "id": "00180",
+  "from_lane": "speed-hir-store-srcmap",
+  "owner": "mem-format",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower/format_args.rs"
+  ],
+  "what": "## speed-hir-store-srcmap: format_args and asm skip the source map too (to speed-hir-store-lower)\n\nWhat: `crates/hir-def/src/expr_store/lower/format_args.rs` (the `template_map` pushes at :73 and\n:106, the `expr_map_back.insert` at :572) and `lower/asm.rs:356` (`template_map`) each go under\n`if self.store.record { .. }`, as every write in `lower.rs` now does. Without it `finish` drops\nwhat they pushed, so the store and map are right either way.\nWhy: a body with a `format_args!` lowered by `Body::of` (no map) still allocates the\n`PendingTemplate` box and its vectors, only to drop them.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n\n> applied: by speed-hir-store-lower, not compiled. The four writes are under `record` (read once\n> into a local per macro). Without it the `mappings` vectors stay empty too: `format_args!`'s\n> capture spans aren't pushed, and `asm!` doesn't grow one vector per template piece.\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> mem-format-fwd: already in (`expr_store/lower/format_args.rs` L61 `let record = self.store.record;`, its writes at ~L80, ~L93, ~L114, ~L585; `expr_store/lower/asm.rs` L196, ~L232, ~L366).",
+  "state": "open",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T02:12:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#speed-hir-store-srcmap: format_args and asm skip the source map too (to speed-hir-store-lower)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:511"
+    }
+  ]
+}

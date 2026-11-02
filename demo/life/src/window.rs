@@ -46,8 +46,6 @@ struct App {
     /// part of it the edit waited in the editor for the one before.
     outcome: Option<(String, bool)>,
     edit_to_running: Option<(Duration, Duration)>,
-    /// What applying the last patch took, and how long it waited to be applied.
-    apply: Option<(Duration, Duration)>,
     patches: u64,
     editor: Editor,
     build: BuildStatus,
@@ -99,17 +97,17 @@ impl App {
                             .color(t.function),
                     );
                     // Where the time of this one edit went, adding up to it: waiting in the
-                    // editor for the edit before to be answered, the daemon's build and the
-                    // patch's way here, and the program's wait for its apply thread and the
-                    // apply (what blaze-live's line says too).
-                    let mut parts = vec![format!("in the editor {:.1} ms", ms(queued))];
-                    if let Some((took, waited)) = self.apply {
-                        let daemon = total.saturating_sub(queued + waited + took);
-                        parts.push(format!("daemon {:.1} ms", ms(daemon)));
-                        parts.push(format!("in the program {:.2} ms", ms(waited)));
-                        parts.push(format!("apply {:.2} ms", ms(took)));
-                    }
-                    ui.colored_label(t.comment, format!("({})", parts.join(", ")));
+                    // editor for the edit before to be answered, then the daemon's build, the
+                    // patch's way here and its switch.
+                    let daemon = total.saturating_sub(queued);
+                    ui.colored_label(
+                        t.comment,
+                        format!(
+                            "(in the editor {:.1} ms, build and switch {:.1} ms)",
+                            ms(queued),
+                            ms(daemon)
+                        ),
+                    );
                 }
                 (Some((_, true)), None) => {
                     ui.heading(egui::RichText::new("edit applied").color(t.function));
@@ -204,11 +202,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok((outcome, took)) = self.applied.try_recv() {
             let applied = matches!(outcome, Outcome::Applied { .. });
-            if let Outcome::Applied { took, waited, .. } = outcome {
-                self.patches += 1;
-                self.apply = Some((took, waited));
-            }
             if applied {
+                self.patches += 1;
                 self.edit_to_running = took;
             }
             self.outcome = Some((outcome.to_string(), applied));
@@ -367,7 +362,6 @@ pub fn run(life: Life) -> eframe::Result {
         live_note,
         outcome: None,
         edit_to_running: None,
-        apply: None,
         patches: 0,
         editor,
         build: BuildStatus::default(),

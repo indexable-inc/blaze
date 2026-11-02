@@ -1,0 +1,21 @@
+{
+  "id": "00517",
+  "from_lane": "diagnostics-lints",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints: whether rustc makes code, in the UI harness (the parent, `diagnostics`, `src/tests.rs`)\n\n`lints::CommandLine` has `codegen: bool` now, read from `--emit` as rustc's\n`OutputTypes::should_codegen` reads it (no `--emit` is rustc's `link`: true). `lints::early`\npasses it to `bodies::before_abort(cx, codegen)`: with it, the known-panics lint and a `Drop`\nimpl's `unconditional_recursion` run on every body, not only on those of consts.\n`CommandLine::default()` is `cargo check`'s (false).\n\n- `tests::compiletest(mode, options)` builds its `CommandLine` from compiletest's flags, which\n  have no `--emit`, so every UI test is now `codegen: true`. compiletest passes\n  `--emit=metadata` for a check pass or fail mode (`runtest.rs`, `make_compile_args`): add it\n  for those, and leave it out for `build-*` and `run-*` (so `Mode` needs `Check` and `Build`, or\n  the test's `//@` pass mode).\n- `check.rs`: `blaze check`'s `options.lints` should have `codegen: false`, `blaze build`/`test`/\n  `run`'s true (from cargo's `--emit`, if `CommandLine::parse` is given rustc's arguments).\n\n> forwarded to diagnostics (the parent, `src/tests.rs`).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints: whether rustc makes code, in the UI harness (the parent, `diagnostics`, `src/tests.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2792"
+    }
+  ]
+}

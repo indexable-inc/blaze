@@ -89,19 +89,37 @@ pub(crate) enum OverflowableItem<'a> {
     PreciseCapturingArg(&'a ast::PreciseCapturingArg),
 }
 
+/// `$body` with `$item` bound to the item inside each variant, as its own type.
+macro_rules! each_overflowable_item {
+    ($self:expr, $item:ident => $body:expr) => {
+        match *$self {
+            OverflowableItem::Expr($item) => $body,
+            OverflowableItem::GenericParam($item) => $body,
+            OverflowableItem::MacroArg($item) => $body,
+            OverflowableItem::MetaItemInner($item) => $body,
+            OverflowableItem::SegmentParam($item) => $body,
+            OverflowableItem::FieldDef($item) => $body,
+            OverflowableItem::TuplePatField($item) => $body,
+            OverflowableItem::Ty($item) => $body,
+            OverflowableItem::Pat($item) => $body,
+            OverflowableItem::PreciseCapturingArg($item) => $body,
+        }
+    };
+}
+
 impl<'a> Rewrite for OverflowableItem<'a> {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
-        self.map(|item| item.rewrite(context, shape))
+        each_overflowable_item!(self, item => Rewrite::rewrite(item, context, shape))
     }
 
     fn rewrite_result(&self, context: &RewriteContext<'_>, shape: Shape) -> RewriteResult {
-        self.map(|item| item.rewrite_result(context, shape))
+        each_overflowable_item!(self, item => Rewrite::rewrite_result(item, context, shape))
     }
 }
 
 impl<'a> Spanned for OverflowableItem<'a> {
     fn span(&self) -> Span {
-        self.map(|item| item.span())
+        each_overflowable_item!(self, item => Spanned::span(item))
     }
 }
 
@@ -114,24 +132,6 @@ impl<'a> OverflowableItem<'a> {
             OverflowableItem::MacroArg(MacroArg::Expr(expr)) => !expr.attrs.is_empty(),
             OverflowableItem::MacroArg(MacroArg::Item(item)) => !item.attrs.is_empty(),
             _ => false,
-        }
-    }
-
-    pub(crate) fn map<F, T>(&self, f: F) -> T
-    where
-        F: Fn(&dyn IntoOverflowableItem<'a>) -> T,
-    {
-        match self {
-            OverflowableItem::Expr(expr) => f(*expr),
-            OverflowableItem::GenericParam(gp) => f(*gp),
-            OverflowableItem::MacroArg(macro_arg) => f(*macro_arg),
-            OverflowableItem::MetaItemInner(nmi) => f(*nmi),
-            OverflowableItem::SegmentParam(sp) => f(*sp),
-            OverflowableItem::FieldDef(sf) => f(*sf),
-            OverflowableItem::TuplePatField(pat) => f(*pat),
-            OverflowableItem::Ty(ty) => f(*ty),
-            OverflowableItem::Pat(pat) => f(*pat),
-            OverflowableItem::PreciseCapturingArg(arg) => f(*arg),
         }
     }
 

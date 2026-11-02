@@ -41,7 +41,6 @@ SKIPPED = {
     "docs/rename.md",
     # What blaze says of the old names, which it has to name.
     "crates/ra-jit/src/renamed.rs",
-    "crates/blaze-cargo/src/renamed.rs",
 }
 # A line that names an old name on purpose, as install.sh's clean-up of a blaze from before the
 # rename does, says so with this in a comment, and is left as it is.
@@ -109,10 +108,9 @@ RULES = ENV + [
 ]
 
 # Forks renamed with it: rowan is syntax-tree, and the rustc crates lose rust-analyzer's
-# `ra-ap-` (their own names stay). Not in vendor/proc-macro-srv, a workspace of its own on
-# crates.io's rowan, nor in what docs/upstream and docs/research quote of others, nor on a
-# line that cites the upstream crate: one that says crates.io, or a name and its version.
-FORKS_ELSEWHERE = ("vendor/proc-macro-srv/", "docs/upstream/", "docs/research/")
+# `ra-ap-` (their own names stay). Not in what docs/upstream and docs/research quote of others,
+# nor on a line that cites the upstream crate: one that says crates.io, or a name and its version.
+FORKS_ELSEWHERE = ("docs/upstream/", "docs/research/")
 RUSTC_FORKS = "rustc_abi|rustc_type_ir|rustc_next_trait_solver"
 FORKS = [
     (r"crates/rowan(?![\w-])", "crates/syntax-tree"),

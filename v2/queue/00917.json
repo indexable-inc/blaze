@@ -1,0 +1,26 @@
+{
+  "id": "00917",
+  "from_lane": "speed-sol2-usercode-macros",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-expand/src/native/proc_macro/api.rs",
+    "crates/blaze-expand/src/native/host.rs",
+    "crates/blaze-macro-wasm/src/lib.rs",
+    "crates/blaze-macro-wasm/guest/proc_macro.rs"
+  ],
+  "what": "In-process bridge: Ident and Literal hold their text as Rc<str> (crates/blaze-expand/src/native/proc_macro/api.rs, Ident::sym, Literal::symbol, suffix): one allocation and copy per ident and literal each way, about 1,100 for a 300-token derive with a 1,500-token output, 9 us, where rustc bridge passes a u32 symbol handle. Change: a u32 symbol handle in api.rs with sys functions to intern and to read a symbol text, answered by the native Host (crates/blaze-expand/src/native/host.rs, lib.rs __native) and by blaze-macro-wasm add_host plus the guest (crates/blaze-macro-wasm/guest/proc_macro.rs, owned this round by speed-sol2-usercode-wasm). api.rs is one text with the wasm guest, so both hosts change together; the test holding the two sys modules to the same functions must cover the new ones.",
+  "state": "open",
+  "created": "2026-10-30T09:45:04Z",
+  "updated": "2026-10-30T09:45:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:45:04Z",
+      "by": "speed-sol2-usercode-macros",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01162",
+  "from_lane": "no-fallback-tools",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-database.md"
+  ],
+  "what": "docs/v2/plan/lanes/db/query-database.md:250-253 says a corrupt group gives its keys an empty slot and they are computed again. no-fallback changed blaze-query: each request reading such a key fails with DbError::Corrupt naming section and group, nothing is recomputed, write_image refuses while one stands, collection no longer slots image keys after one is found. Please reword that bullet.",
+  "state": "open",
+  "created": "2026-10-30T23:12:35Z",
+  "updated": "2026-10-30T23:12:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:12:35Z",
+      "by": "no-fallback-tools",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

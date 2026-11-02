@@ -1,0 +1,36 @@
+{
+  "id": "00831",
+  "from_lane": "dbsp-engine",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.lock",
+    "Cargo.toml"
+  ],
+  "what": "Cargo.lock: base-db now depends on `inventory` and `blaze-dbsp` (crates/base-db/Cargo.toml, for the maintainer hook crates/base-db/src/maintain.rs, design docs/v2/plan/design/dbsp.md section 3). Same change as 00817 (root [workspace.dependencies] `blaze-dbsp = { path = \"crates/blaze-dbsp\" }`), plus these two entries in base-db's Cargo.lock dependency list. The blaze-dbsp lock entry already matches its manifest.",
+  "state": "applied",
+  "created": "2026-10-30T08:37:31Z",
+  "updated": "2026-10-30T08:40:16Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:37:31Z",
+      "by": "dbsp-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:40:16Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:40:16Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "Cargo.lock base-db entry gains blaze-bytes, blaze-dbsp and inventory (each one version in the lock, so unsuffixed; blaze-bytes was missing too, base-db/Cargo.toml names it). The root blaze-dbsp line was already in (00817). hir-def entry still lacks blaze-dbsp: next lock refresh."
+    }
+  ]
+}

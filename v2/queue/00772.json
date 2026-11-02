@@ -1,0 +1,39 @@
+{
+  "id": "00772",
+  "from_lane": "hot-sweep-syntax",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/syntax-tree/src/flat.rs",
+    "crates/mbe/src/expander/model",
+    "crates/mbe/src",
+    "crates/tt/src/storage/varint.rs"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: recognize all test code (196 false findings over syntax-tree/mbe/tt)\n\n- `in_test_module` counts `{`/`}` inside string and char literals: `crates/syntax-tree/src/flat.rs:2941`\n  (`\" }\"`) ends `mod tests` early, so 90 test lines (2960..3785) are reported. Strip literals first.\n- `#[cfg(test)] mod x;` (no body) leaves `pending` set, so the next `{` anywhere after it starts a\n  phantom test region that hides real code. Clear `pending` on a `;`-terminated `mod` line.\n- Files that are `#[cfg(test)] mod x;` in their parent are linted as hot: `crates/mbe/src/expander/model{,/*}.rs`,\n  `crates/mbe/src/{benchmark,differential}.rs`, `crates/tt/src/storage/varint.rs` (106 findings).\n  Skip a file (and its submodule directory) whose `mod` declaration is under `#[cfg(test)]`.\nA working version is `/tmp/hss_truelint.py` (monkeypatches `in_test_module` and the file skip).",
+  "state": "applied",
+  "created": "2026-10-30T07:20:45Z",
+  "updated": "2026-10-30T08:31:28Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/hot-sweep-syntax.md#`tools/v2/hot_lint.py`: recognize all test code (196 false findings over syntax-tree/mbe/tt)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-syntax.md:3"
+    },
+    {
+      "at": "2026-10-30T08:31:28Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:28Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

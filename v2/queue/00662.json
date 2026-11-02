@@ -1,0 +1,45 @@
+{
+  "id": "00662",
+  "from_lane": "frontend-db",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/providers.rs",
+    "docs/v2/plan/lanes/frontend/db.md",
+    "v2/requests/db.md",
+    "crates/hir-ty-mir/src/mir",
+    "crates/hir-ty-mir/Cargo.toml",
+    "tools/v2/concrete_db.py",
+    "python/typed-input/src",
+    "Cargo.toml",
+    "v2/tests/db.rs",
+    "v2/frontend.rs",
+    "v2/fold.rs"
+  ],
+  "what": "## frontend-db: hir-ty-mir registers the MIR providers; the codegen crates take `&Db` (frontend.md item 15; 2026-10-29)\n\n> applied by frontend-db-ty (hir-ty-mir only; hir-ty-codegen and blaze-engine are\n> frontend-db-tyx's and frontend-db-edge's): items 1-4 (`compute_X`, registration in\n> `crates/hir-ty-mir/src/mir/providers.rs`, `type_name`'s `None` is a `MirEvalError::NotSupported`\n> naming the type, the crate doc) and the tool on hir-ty-mir (its test database is the alias).\n\nFrom `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`; the hir-ty side is in\n`v2/requests/db.md`, \"frontend-db: the concrete database\", section 5). The memos behind\n`HirDatabase`'s MIR methods move into hir-ty (`hir_ty::providers`), because hir-ty,\nhir-ty-borrowck and blaze-items read them from below. Their code stays here and becomes the\nproviders.\n\n1. In `crates/hir-ty-mir/src/mir/{lower,monomorphization,optimize}.rs` (and wherever the\n   `runtime_*` forms are), each `#[salsa::tracked(...)] pub fn X_query` that a `HirDatabase`\n   method calls (today through `impl_hir_database!`) loses its attribute and becomes\n   `pub(crate) fn compute_X`. The rename is what makes every caller that bypassed the memo\n   fail to compile; such a caller calls `hir_ty::providers::X(db, ..)` or `db.X(..)` instead.\n   The `promoted_*` queries stay tracked here, as they are. Their cycle-result fns move to\n   hir-ty with the memos.\n2. New in hir-ty-mir's `lib.rs` (or a `providers.rs`), the one registration:\n   ```rust\n   inventory::submit! {\n       hir_ty::providers::Mir {\n           mir_body: mir::lower::compute_mir_body,\n           // ... one field per moved query, and\n           interpret_mir: mir::eval::interpret_mir,\n           opaque_of_impl: mir::monomorphization::opaque_of_impl,\n       }\n   }\n   ```\n   `crates/hir-ty-mir/Cargo.toml`: `inventory.workspace = true` (the coordinator adds the\n   workspace entry, 0.3.24, the version already locked for salsa). There is no `provide()` to\n   call. rustc links a `#[used]` static from every rlib in the graph (rust-lang/rust#95604), so\n   any binary that links hir-ty-mir has the table, and one that doesn't panics on the first MIR\n   miss, naming what to link.\n3. `db.type_name(ty, module)` returns `Option<String>` now. The `type_name` intrinsic in\n   `mir/eval` turns `None` into a `MirEvalError` that names the type. The old body's fallback\n   to the human-readable display (`impl_db_macro.rs` L267-275) goes, because rustc's\n   `type_name` is always the path.\n4. The module doc at `lib.rs:6` (\"`impl_hir_database!` implements with them\") becomes \"hir-ty\n   declares the memos (`hir_ty::providers`); this crate registers their code\".\n5. Run `tools/v2/concrete_db.py` on `hir-ty-mir`, `hir-ty-codegen` (its `mod.rs` and `v2/`)\n   and `blaze-engine` (dry run: 170, 382 and 19 sites; 2, 3 and 1 left, each printed with what\n   to do):\n   ```sh\n   PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \\\n     '{\"root\": \".\", \"crates\": [\"hir-ty-mir\"], \"write\": true}'\n   ```\n   blaze-engine's `Cargo.toml` needs `base-db.workspace = true`. Test databases become\n   `type TestDB = base_db::Db;` made by `Db::for_tests()` (the tool rewrites\n   `TestDB::default()`), and their `impl_hir_database!` goes.\n   `optimize/inline/fixtures.rs` is one of them.\n\n> applied by frontend-db-tyx (item 5, hir-ty-codegen only): the tool (383 sites); `v2/tests/db.rs`\n> is `pub(crate) type TestDB = base_db::Db;` with `use hir as _;`; `Databases` in\n> `v2/frontend.rs` holds `&'db Db` (the tool had written `&'db (Db + Sync)`). The tool's third\n> note, `v2/fold.rs:1007`, is an `as &dyn Fn`, not a database, and stays. No caller bypasses a\n> moved memo: the direct calls left are `*_promoted_mir_body_query` (still tracked in hir-ty-mir)\n> and the unmemoized `interpret_mir`.\n\n> applied by codegen-engine (2026-10-29): item 5 for blaze-engine. The `&Db` rewrites were\n> already in, and `base-db.workspace = true` was already in the manifest. The tool's last 8 sites\n> were `SourceDatabase` imports that `Db`'s inherent methods made unused. It left nothing.\n\nWhy: a memo hit on `&Db` is a static call with no vtable (frontend.md item 15). The table is\nread only on a miss.\n\nStatus: open\n\n> forwarded to codegen (codegen-next1 told). The root `inventory = \"0.3.24\"` is in (requests).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:50:36Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen.md#frontend-db: hir-ty-mir registers the MIR providers; the codegen crates take `&Db` (frontend.md item 15; 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:1453"
+    },
+    {
+      "at": "2026-10-31T20:50:36Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:36Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Settled by 04cca11739 (salsa gone, front end on blaze_query): hir-ty-mir/src/mir/providers.rs submits the MIR providers; codegen crates take &Db (v2/frontend.rs Databases)."
+    }
+  ]
+}

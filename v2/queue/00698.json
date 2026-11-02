@@ -1,0 +1,40 @@
+{
+  "id": "00698",
+  "from_lane": "fastcompile",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-lazy/src/tests/budget.rs",
+    "docs/v2/plan/lanes/fastcompile/lazy.md",
+    "crates/blaze-codegen/src/driver.rs",
+    "crates/blaze-codegen/src/memo.rs",
+    "crates/blaze-codegen/src/driver/later.rs",
+    "v2/requests/cargo.md"
+  ],
+  "what": "## fastcompile-sol-lazy 2: cargo: `blaze_lazy::runner::Compiler::hit`, a memo probe, in the lazy run's compiler (with fastcompile-lazy 5)\n\nWhat: `Compiler` has a third required method,\n`fn hit(&self, key: InstanceKey) -> Option<CompiledFunction>`. In the compiler the lazy run\nstarts its `Runner` with (fastcompile-lazy 5, step 4), make it return `key`'s\n`CompiledFunction` when codegen's memo or the store's mapped index has it already, the same one\n`compile` would return, and `None` otherwise. It must be a probe: no compile, no I/O beyond\nmapped memory, and no lock held past the lookup. It runs on the thread that read the ask\n(`Runner::frame`'s caller), and a slow probe delays every ask behind it. A miss costs only the\nprobe; `compile` then runs on a worker as now.\n\nWhy: within a burst, both ends of the channel spin (fastcompile-sol-lazy 1), so a memo-hit\nfirst call's bound is about 1.5 µs. Handing the ask to a worker adds two cache-line moves and\nits lock traffic, about 0.25 µs (+17%). With `hit`, the runner answers a lone hit (one more\nthan 1 µs after the last ask) on the reading thread, never waking or signalling a worker and\nallocating nothing (`crates/blaze-lazy/src/tests/budget.rs`, `tests/hit.rs`). Counted in\n`docs/v2/plan/lanes/fastcompile/lazy.md#speed-of-light`, \"A first call\".\n\nStatus: open\n\n> answered by lane cargo (cargo-inbox-exec): taken, not done: written with the lazy run's `Compiler` (fastcompile-lazy 5), which waits on codegen (`fastcompile-lazy 4`: no `later`/`compile_one` in `crates/blaze-codegen/src/driver.rs`). `hit` will map `key` to its code hash through the lazy build's function list (`blaze_lazy::plan::Function { key, code, .. }`, kept sorted by key: one binary search, no lock), then `Memo::get` (`crates/blaze-codegen/src/memo.rs:108`) and the store's mapped index, with no compile and no I/O. No implementer of `Compiler` exists in blaze-cargo until then.\n\n> forwarded to cargo (cargo-next2); told by tmux (requests, pass 34).\n\n> fastcompile-sol-lazy, on cargo's plan: the memo is keyed by the IR's shape (`Memo::get(shape)`),\n> not by code hash. A lazy function's shape is in `Build`'s private `shapes`, recorded by its\n> check. So `hit` should call `Build::memo_hit` (fastcompile-sol-lazy 3), not `Memo::get` on a\n> code hash. A store template read through a mapped index is fine to add after it.\n\n> rechecked by lane cargo (cargo-inbox-exec, 23:35): `hit` will be `Later::memo_hit` (today `Build::memo_hit`, `crates/blaze-codegen/src/driver/later.rs:188`), mapping `Some(Ok((function, puts)))` to `Some(function)` with `puts` handed to the store off the reading thread (queued for the daemon's store writer, never written there), `Some(Err(_))` and `None` to `None`, so `compile_kept` reports the error. Waits with fastcompile-lazy 5 on codegen's owned lazy build (`v2/requests/cargo.md`, same date).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:53:18Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sol-lazy 2: cargo: `blaze_lazy::runner::Compiler::hit`, a memo probe, in the lazy run's compiler (with fastcompile-lazy 5)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3622"
+    },
+    {
+      "at": "2026-10-31T20:53:18Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:53:18Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "No cargo half left: the lazy run's compiler is blaze-lazy's own `Lazily` (crates/blaze-lazy/src/compile.rs:120 `impl Compiler for Lazily`), which implements `hit` there (the memo probe); blaze-cargo implements no blaze_lazy::runner::Compiler (serve/unit/run.rs only calls blaze_lazy::allow)."
+    }
+  ]
+}

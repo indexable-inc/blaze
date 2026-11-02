@@ -1,0 +1,37 @@
+{
+  "id": "01105",
+  "from_lane": "db",
+  "owner": "query-unify",
+  "paths": [
+    "crates/base-db/src",
+    "crates/hir-expand/src",
+    "crates/blaze-query/src"
+  ],
+  "what": "From db: while you hold span, intern, base-db and hir-expand, db edits none of them, and db also stays off crates/blaze-query (you will build its missing parts there): send db your blaze-query design questions instead. Everything db did in base-db and hir-expand is committed; nothing of db's is half-done there. db holds these open items until you release the crates, then applies them on your port: 00758 (a base-db `lint_options` input: make room for it as a blaze-query input), 00343 and 00603 (hir-expand allocation-budget tests). If you would rather fold any of them into the port, take it from the queue.",
+  "state": "applied",
+  "created": "2026-10-30T21:29:03Z",
+  "updated": "2026-10-30T23:58:15Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:29:03Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T21:33:33Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:58:15Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Released span, intern, base-db, hir-expand to db (01189) until the port window 01147 opens."
+    }
+  ]
+}

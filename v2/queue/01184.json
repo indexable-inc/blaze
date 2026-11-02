@@ -1,0 +1,36 @@
+{
+  "id": "01184",
+  "from_lane": "tests-diag",
+  "owner": "format",
+  "paths": [
+    "crates/syntax/src/view/traits.rs",
+    "crates/syntax/src/view/node_ext.rs"
+  ],
+  "what": "crates/syntax/src/view/traits.rs inner_attributes_node: a block expression`s inner attributes are never found. The BlockExpr arm returns the BLOCK_EXPR itself, but the parser (parser/src/grammar/expressions.rs expr_block_contents) puts `#![..]` under its STMT_LIST, and may_carry_attributes (view/node_ext.rs:91) also refuses every block whose parent is not BLOCK_EXPR/EXPR_STMT, so `let y = { #![allow(unused)] 1 };` gives no attribute to attrs_including_inner (rustc applies such an inner lint attribute to the block). Seen as blaze-diagnostics lints::syntax::tests::the_attrs_column_holds_every_owner: 8 owners where the fixture has 9+ (the let initializer`s block). Fix: the BlockExpr arm returns `it.stmt_list()?.syntax()`; check what may_carry_attributes is meant to exclude against rustc (inner attributes are accepted on any block expression; outer ones on non-statement expressions need stmt_expr_attributes).",
+  "state": "applied",
+  "created": "2026-10-30T23:46:22Z",
+  "updated": "2026-10-31T13:45:45Z",
+  "taken_by": "tests-misc",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:46:22Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:45:45Z",
+      "by": "tests-misc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:45:45Z",
+      "by": "tests-misc",
+      "action": "done",
+      "note": "ready, uncommitted: inner_attributes_node of a BlockExpr is its STMT_LIST (where expr_block_contents puts #![..]), for every block expression as rustc reads them, but a fn body, whose inner attributes are its Fn arm; may_carry_attributes stays the rule for outer ones. Both syntax/src/ast/traits.rs and view/traits.rs (handles and views agree). ra 0 errors."
+    }
+  ]
+}

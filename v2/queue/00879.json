@@ -1,0 +1,35 @@
+{
+  "id": "00879",
+  "from_lane": "speed-sol-vfs",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/session.rs"
+  ],
+  "what": "blaze-vfs has `Vfs::commit_owned(&mut self, head: &str, base: ContentId, ops: Vec<Op>) -> Result<Commit, CommitError>`, the same as `commit` but taking the ops by value so each write's bytes become the store's with no copy (commit copies each once). In crates/blaze-api/src/session.rs at the two `cx.vfs.commit(&head, base, &ops)` calls (about lines 474 and 532): where `ops` is not used after the call, write `cx.vfs.commit_owned(&head, base, ops)`. Same root, same rebase, same errors.",
+  "state": "applied",
+  "created": "2026-10-30T09:18:25Z",
+  "updated": "2026-10-30T09:27:13Z",
+  "taken_by": "speed-sol2-ci",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:25Z",
+      "by": "speed-sol-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:27:02Z",
+      "by": "speed-sol2-ci",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:27:13Z",
+      "by": "speed-sol2-ci",
+      "action": "done",
+      "note": "crates/blaze-api/src/session.rs: both commits (edit_ended, Request::Commit) call cx.vfs.commit_owned(&head, base, ops); ops was unused after each."
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "01458",
+  "from_lane": "cargo",
+  "owner": "repro",
+  "paths": [
+    "crates/blaze-engine/tests/repro.rs",
+    "crates/blaze-engine/tests/repro/a_second_workspace_on_one_daemon_compiles_no_std_crate"
+  ],
+  "what": "The daemon-level test of 01455 (repro #6), named for the property: a second workspace on the same daemon compiles no std crate. Lands after cargo's 01455 and 01457.\n\nCrate tests/repro/a_second_workspace_on_one_daemon_compiles_no_std_crate/: Cargo.toml `[package] name = \"first\" version = \"0.1.0\" edition = \"2024\"` and src/main.rs printing `one`.\n\nTest (repro.rs): build it in Case::new's dir with `blaze run` (== \"one\\n\"). Then copy the dir to `case.root.join(\"second\")`, rename the package there to `second`, and run `blaze build` in that dir with the same BLAZE_HOME (a Case helper taking a dir, or a `Case::beside(name)` sharing root and home). Assert it succeeds and that no stderr line of `Compiling <name>` names a std crate (core, alloc, std, compiler_builtins, panic_unwind, panic_abort, unwind, hashbrown, libc, object, addr2line, gimli, miniz_oxide, adler2, memchr, rustc-demangle, cfg-if, rustc-std-workspace-*, std_detect, proc_macro, test, getopts): `Compiling second` is the only Compiling line. Std's outputs are in `<BLAZE_HOME>/v2/std/<StdKey id>/` now, never the workspace's target dir; also assert `case.dir.join(\"target/debug/deps\")` holds no `libcore-*` file.",
+  "state": "applied",
+  "created": "2026-11-01T04:20:59Z",
+  "updated": "2026-11-01T04:54:03Z",
+  "taken_by": "repro",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:20:59Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:54:03Z",
+      "by": "repro",
+      "action": "done",
+      "note": "crates/blaze-engine/tests/repro/a_second_workspace_on_one_daemon_compiles_no_std_crate/{one,two} (two workspaces, packages repro-one/repro-two, no deps) + repro.rs test of that name: run one, then two on the same BLAZE_HOME; the second run must print exactly one Compiling line, repro-two (covers std vendored crates whose lines carry no /library/ path), and neither target/debug/deps holds libcore-*. Case gains blaze_in/ok_in(sub). Unbuilt, unrun. Run: cargo test -p blaze-engine --features llvm --test repro -- a_second_workspace_on_one_daemon_compiles_no_std_crate --nocapture"
+    }
+  ]
+}

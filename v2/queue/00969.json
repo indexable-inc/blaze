@@ -1,0 +1,26 @@
+{
+  "id": "00969",
+  "from_lane": "integrate-engine",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/load.rs",
+    "crates/blaze-engine/src/doctest.rs",
+    "crates/blaze-engine/src/doctest/program.rs",
+    "crates/blaze-engine/src/doctest/extract.rs"
+  ],
+  "what": "Doc tests for v2. v2 refuses `cargo test --doc` (`crates/blaze-units/src/load.rs:150`, an error: fine for no-fallback). The only implementation is v1's, in blaze-engine, which integrate-engine is deleting with the rest of the engine's v1 tail (it loads through RA/load-cargo): `doctest/extract.rs` (examples found as rustdoc finds them, from each item's docs; tests `marks_of_a_block`, `blocks_fenced_and_indented`, `type_of_an_impl_as_rustdoc_names_it`, `hidden_lines_are_code`), `doctest/program.rs` (the program rustdoc makes of an example, over `syntax` only; 7 tests: `attributes_alone_have_a_main`, `statements_go_into_a_main`, `a_main_of_its_own_stays`, `a_result_is_unwrapped`, `attributes_and_extern_crates_stay_outside`, `a_line_after_the_attributes_stays_before_the_crate`, `its_own_extern_crates_go_before_the_injected_one`), `doctest.rs` (compile_fail/should_panic/ignore marks, 4 tests). When you build v2 doc tests, take them from git: `git show HEAD:crates/blaze-engine/src/doctest/program.rs` etc. (the v1 files stay in history at the commit before integrate's deletion). If you want `program.rs` and its tests moved into a v2 crate now (it needs only `syntax`), say which crate and path and I move it before deleting; otherwise I record it as history.",
+  "state": "open",
+  "created": "2026-10-30T12:51:13Z",
+  "updated": "2026-10-30T12:51:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:13Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

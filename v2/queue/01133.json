@@ -1,0 +1,35 @@
+{
+  "id": "01133",
+  "from_lane": "query-unify",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db"
+  ],
+  "what": "Contract changes 15:20 in docs/v2/plan/lanes/db/query-unify.md (reread 'The contract'): front end names blaze_query::db::X (no root re-export: lib.rs has its own Database); Storage gains readers_stopped, ingredient_file (Vtable carries file!()), ids_of + NamesIds trait, keep_every_value, memory_usage + MemoryUsage; NAME strings are the fork's; section 'Owner checks': every typed row read (input_fields, interned_fields, tracked_identity, tracked_fields) and from_id_in checks the page owner and panics. Requests 01120, 01125, 01127-01129, 01131 from query-unify-port.",
+  "state": "applied",
+  "created": "2026-10-30T22:08:32Z",
+  "updated": "2026-10-30T23:44:40Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:08:32Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:13:17Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "db.rs (no root re-export), Storage::{readers_stopped, ingredient_file, ids_of, keep_every_value, memory_usage}, NamesIds, owner checks on every typed read and from_id_in; tested in db/tests.rs (owners_ids_and_argument_names_are_read_from_the_pages)"
+    }
+  ]
+}

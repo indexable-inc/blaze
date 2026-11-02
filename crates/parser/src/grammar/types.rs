@@ -43,6 +43,10 @@ pub(super) fn type_no_bounds(p: &mut Parser<'_>) {
 }
 
 fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
+    stdx::ensure_sufficient_stack(|| type_with_bounds_cond_here(p, allow_bounds))
+}
+
+fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
     match p.current() {
         T!['('] => paren_or_tuple_type(p),
         T![!] => never_type(p),
@@ -50,6 +54,7 @@ fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
         T!['['] => array_or_slice_type(p),
         T![&] => ref_type(p),
         T![_] => infer_type(p),
+        T![unsafe] if p.nth_at(1, T![<]) => unsafe_binder_type(p),
         T![fn] | T![unsafe] | T![extern] => fn_ptr_type(p),
         T![for] => for_type(p, allow_bounds),
         T![impl] => impl_trait_type(p),
@@ -275,6 +280,11 @@ pub(super) fn for_type(p: &mut Parser<'_>, allow_bounds: bool) {
     let m = p.start();
     for_binder(p);
     match p.current() {
+        // test_err for_type_unsafe_binder
+        // type A = for<'a> unsafe<'b> &'a &'b ();
+        T![unsafe] if p.nth_at(1, T![<]) => {
+            p.error("expected a function pointer or path");
+        }
         T![fn] | T![unsafe] | T![extern] => {}
         // OK: legacy trait object format
         _ if paths::is_use_path_start(p) => {}
@@ -290,6 +300,19 @@ pub(super) fn for_type(p: &mut Parser<'_>, allow_bounds: bool) {
     if allow_bounds {
         opt_type_bounds_as_dyn_trait_type(p, completed);
     }
+}
+
+// test unsafe_binder_type
+// type A = unsafe<'a> &'a ();
+// type B = unsafe<'a, 'b> &'a &'b ();
+// type C = unsafe<> u8;
+fn unsafe_binder_type(p: &mut Parser<'_>) {
+    assert!(p.at(T![unsafe]) && p.nth_at(1, T![<]));
+    let m = p.start();
+    p.bump(T![unsafe]);
+    generic_params::generic_param_list(p);
+    type_(p);
+    m.complete(p, UNSAFE_BINDER_TYPE);
 }
 
 // test impl_trait_type

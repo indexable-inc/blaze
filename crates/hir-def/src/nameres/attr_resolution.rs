@@ -1,6 +1,6 @@
 //! Post-nameres attribute resolution.
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use hir_expand::{
     AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},
@@ -30,7 +30,7 @@ impl DefMap {
     pub(crate) fn resolve_attr_macro(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         original_module: ModuleId,
         ast_id: AstIdWithPath<ast::Item>,
         attr: &Attr,
@@ -62,7 +62,7 @@ impl DefMap {
                     return Ok(ResolvedAttr::Other);
                 }
             }
-            None => return Err(UnresolvedMacro { path: (*ast_id.path).clone() }),
+            None => return Err(UnresolvedMacro { path: ast_id.path }),
         };
 
         Ok(ResolvedAttr::Macro(attr_macro_as_call_id(
@@ -104,13 +104,23 @@ impl DefMap {
             {
                 return true;
             }
+
+            // `#[blaze::reassociate]`, blaze's own inert attribute (`blaze::parallelizable` reads
+            // it from the item's syntax). `blaze` is no tool namespace: `#[blaze::cache]` stays
+            // the `blaze` crate's attribute macro.
+            if let [_, attr] = segments
+                && name.as_str() == "blaze"
+                && attr.symbol().as_str() == "reassociate"
+            {
+                return true;
+            }
         }
         false
     }
 }
 
 pub(super) fn attr_macro_as_call_id(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item_attr: &AstIdWithPath<ast::Item>,
     macro_attr: &Attr,
     censored_attr_ids: AttrMacroAttrIds,
@@ -120,7 +130,8 @@ pub(super) fn attr_macro_as_call_id(
 ) -> MacroCallId {
     let arg = match macro_attr.input.as_deref() {
         Some(AttrInput::TokenTree(tt)) => {
-            let mut tt = tt.clone();
+            // alloc: the attribute macro call's own argument (its delimiter is changed), once per call
+            let mut tt = tt.copy();
             tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
             Some(tt)
         }
@@ -133,7 +144,7 @@ pub(super) fn attr_macro_as_call_id(
         krate,
         MacroCallKind::Attr {
             ast_id: item_attr.ast_id,
-            attr_args: arg.map(Box::new),
+            attr_args: arg.map(Into::into),
             censored_attr_ids,
         },
         macro_attr.ctxt,
@@ -142,7 +153,7 @@ pub(super) fn attr_macro_as_call_id(
 }
 
 pub(super) fn derive_macro_as_call_id(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item_attr: &AstIdWithPath<ast::Adt>,
     derive_attr_index: AttrId,
     derive_pos: u32,
@@ -154,7 +165,7 @@ pub(super) fn derive_macro_as_call_id(
 ) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
     let (macro_id, def_id) = resolver(&item_attr.path)
         .filter(|(_, def_id)| def_id.is_derive())
-        .ok_or_else(|| UnresolvedMacro { path: (*item_attr.path).clone() })?;
+        .ok_or_else(|| UnresolvedMacro { path: item_attr.path })?;
     let call_id = def_id.make_call(
         db,
         krate,

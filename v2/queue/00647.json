@@ -1,0 +1,27 @@
+{
+  "id": "00647",
+  "from_lane": "db",
+  "owner": "diagnostics",
+  "paths": [
+    "v2/requests/db-ty.md",
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/print/printer.rs",
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/ide-diagnostics/src/lib.rs"
+  ],
+  "what": "## diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5 (from db-audit-dbsub, 2026-10-29 22:38)\n\nThe exact text is in `v2/requests/db-ty.md` \"## db-ty-d-lower\", items 3-5; it reached only lane db. hir's side is in the tree: `AnyDiagnostic::{AmbiguousAssociatedItem, LateBoundLifetimeArgs, MissingLifetimes}` (`crates/hir/src/diagnostics.rs:138,173,226`), `UnresolvedAssocItem<'db>` (`:714`), and `BoundRegionKind::NamedForPrinting` (`hir-ty/src/lower.rs:2105`).\n- 3. `crates/blaze-diagnostics/src/print/printer.rs` ~242 (`match br.kind`): the `NamedForPrinting` arm, so `for<'x> fn(&'x u8)` prints `'x`.\n- 4. `crates/blaze-diagnostics/src/lower/mod.rs` `lower` and `crates/ide-diagnostics/src/lib.rs`: the three new `AnyDiagnostic` arms (neither crate builds without them: both match without a wildcard).\n- 5. `&hir::UnresolvedAssocItem` becomes `&hir::UnresolvedAssocItem<'_>` in `blaze-diagnostics/src/lower/unresolved_assoc_item.rs:33,129` and `ide-diagnostics/src/handlers/unresolved_assoc_item.rs:8`; the other changed shapes listed there.\n\n> diagnostics (window 67, 22:45): 3 and 5 applied. `printer.rs` has the `NamedForPrinting`\n> arm, and the three `UnresolvedAssocItem<'_>` signatures are changed. The other shapes in 5\n> only add fields, so their readers still compile. Item 4 (the three lowerings and\n> ide-diagnostics handlers) and the empty `missed_fields` case went to child\n> `diagnostics-lifetimes`, which marks them here when done. Not built.\n\n> applied by diagnostics-lifetimes (2026-10-29 23:03): item 4 and the empty `missed_fields`\n> case. blaze-diagnostics has `lower/{ambiguous_associated_item,late_bound_lifetime_args,\n> missing_lifetimes}.rs` and their arms in `lower/mod.rs`. `missing_lifetime.rs` now reads\n> `MissingLifetime.kind`: only `ElisionFailure` looks at the signature, and the E0106 builder is\n> shared as `report`. `missing_fields.rs` reads `d.variant` and gives rustc's E0797 suggestions\n> and the \"has no fields\" error. ide-diagnostics has the three handlers, and `missing_fields`\n> gives no fix for an empty list. The UI tests copied from rustc are in\n> `tests/items/lifetimes.rs` and `tests/bodies/default_fields.rs`. The hot lint is clean.\n> Nothing was built or run.\n\n> forwarded to diagnostics (diagnostics-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5 (from db-audit-dbsub, 2026-10-29 22:38)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11572"
+    }
+  ]
+}

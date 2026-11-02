@@ -1,0 +1,21 @@
+[package]
+name = "blaze-bytes"
+description = "blaze v2's held bytes and text: a heap Arc, a range of a mapped image or a static, checked UTF-8 once and lent as &str, never copied; and the one copy of little-endian reads at an offset"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+
+[lints]
+workspace = true

@@ -1,8 +1,12 @@
 //! Tests for `builtin_fn_macro.rs` from `hir_expand`.
 
 use expect_test::expect;
+use hir_expand::fixture;
 
-use crate::macro_expansion_tests::check;
+use crate::{
+    ModuleDefId, expr_store::Body, macro_expansion_tests::check, nameres::crate_def_map,
+    test_db::TestDBExt,
+};
 
 #[test]
 fn test_column_expand() {
@@ -17,7 +21,7 @@ fn main() { column!(); }
 #[rustc_builtin_macro]
 macro_rules! column {() => {}}
 
-fn main() { 0u32; }
+fn main() { 13u32; }
 "#]],
     );
 }
@@ -94,9 +98,86 @@ fn main() { line!() }
 #[rustc_builtin_macro]
 macro_rules! line {() => {}}
 
-fn main() { 0u32 }
+fn main() { 4u32 }
 "#]],
     );
+}
+
+/// rustc's `expansion_cause`: a call that a macro's body writes is where that macro is called, a
+/// call passed to a macro is where it is written, and a column counts code points.
+#[test]
+fn line_and_column_are_where_the_call_is_written() {
+    let db = fixture::db(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! line {() => {}}
+#[rustc_builtin_macro]
+macro_rules! column {() => {}}
+macro_rules! here { () => { (line!(), column!()) } }
+macro_rules! pass { ($e:expr) => { $e } }
+
+fn main() {
+    let 人之初 = here!();
+    let _ = pass!(column!());
+    let _ = line!(column);
+}
+"#,
+    )
+    .into_db();
+    let krate = db.fetch_test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let main = def_map.module(&db, def_map.root).scope(&db).declarations().find_map(|it| match it {
+        ModuleDefId::FunctionId(it) => Some(it),
+        _ => None,
+    });
+    let (_, source_map) = Body::with_source_map(&db, main.unwrap().into());
+    let mut placed = source_map
+        .macro_calls()
+        .map(|(_, call)| {
+            let written = call.loc(&db).to_node_view(&db).value.to_string();
+            let expansion = call.parse_macro_expansion(&db);
+            (written, expansion.value.0.root().to_string(), expansion.err.is_some())
+        })
+        .filter(|(_, expanded, _)| expanded.ends_with("u32"))
+        .collect::<Vec<_>>();
+    placed.sort();
+    let placed = placed.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), *c)).collect::<Vec<_>>();
+    assert_eq!(
+        placed,
+        [
+            ("column!()", "15u32", false),
+            ("column!()", "19u32", false),
+            ("line!()", "9u32", false),
+            ("line!(column)", "11u32", true),
+        ]
+    );
+}
+
+/// rustc's `lookup_char_pos`: a byte order mark that starts the file is no column, and a `\r\n`
+/// ends a line as a `\n` does.
+#[test]
+fn line_and_column_after_a_byte_order_mark_and_crlf_lines() {
+    let first = "#[rustc_builtin_macro] macro_rules! column {() => {}} \
+        #[rustc_builtin_macro] macro_rules! line {() => {}} fn a() -> u32 { ";
+    let second = "fn b() -> (u32, u32) { (line!(), ";
+    let text = format!("\u{feff}{first}column!() }}\r\n{second}column!()) }}\r\n");
+    let db = fixture::db(&text).into_db();
+    let mut placed = super::builtin_errors::macro_calls(&db)
+        .into_iter()
+        .map(|call| {
+            let written = call.loc(&db).to_node_view(&db).value.to_string();
+            (written, call.parse_macro_expansion(&db).value.0.root().to_string())
+        })
+        .collect::<Vec<_>>();
+    placed.sort();
+    let column = |before: &str| format!("{}u32", before.chars().count() + 1);
+    let mut expected = vec![
+        ("column!()".to_owned(), column(first)),
+        ("column!()".to_owned(), column(second)),
+        ("line!()".to_owned(), "2u32".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(placed, expected);
 }
 
 #[test]
@@ -174,8 +255,8 @@ macro_rules! env {() => {}}
 fn main() {
     /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
     /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
-    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
-    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: error */"UNRESOLVED_ENV_VAR";
+    /* error: error */"UNRESOLVED_ENV_VAR";
 }
 "##]],
     );
@@ -201,7 +282,7 @@ macro_rules! option_env {() => {}}
 fn main() {
     $crate::option::Option::None:: < &str>;
     $crate::option::Option::None:: < &str>;
-    /* error: unexpected input */;
+    /* error: option_env! takes 1 argument */$crate::option::Option::None:: < &str>;
 }
 "#]],
     );
@@ -260,7 +341,7 @@ fn main() {
 fn main() {
      {
         if !(true ) {
-            $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
+            panic!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
 }

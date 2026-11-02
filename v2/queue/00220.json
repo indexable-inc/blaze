@@ -1,0 +1,35 @@
+{
+  "id": "00220",
+  "from_lane": "dedyn",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-fmt"
+  ],
+  "what": "## dedyn: crates/blaze-fmt: `&mut dyn Write` stays, with `// dyn:` (a CLI output writer, per file, not per token)\n\n> SUPERSEDED by dedyn-misc 2026-10-29: applied differently, no comments needed. `trait Emitter`\n> is deleted; `emitter.rs` has `pub(crate) enum Emitter` (one variant per emitter struct, built\n> by `Emitter::new(&Config)`, which replaces `lib.rs`'s `create_emitter`), its methods take\n> `&mut impl Write`, the session holds it by value and `write_file` takes `&mut Emitter`.\n> `print_docs` takes `&mut impl Write`. Test: `src/emitter/tests.rs`. Report:\n> `/tmp/blaze-lanes/v2-dedyn-misc.md`.\n> Being applied in the tree by dedyn-misc (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.\n\n\nChecked against the second sweep's item 4: the formatter does not write through these. It\nbuilds each file's text in a `String` (`rewrite` → `String`), and `source_file.rs::write_file`\nhands the whole text to the session's emitter once per file; the emitters write it with one\n`write!` (stdout, files) or a line per mismatch (diff, checkstyle, json, modified lines).\n`print_docs` is `--print-config`'s output. These are CLI output writers, on the user's leave-alone\nlist. `Session<'b, T: Write>` is already generic; only the emitter's boundary is erased. Making\n`Emitter` an enum of its seven modes to make the writer generic would move upstream rustfmt's\nstructure for one indirect call per file. So: no code change, a comment on each.\n\nAdd the line `// dyn: the session's output, written once per formatted file, never per token.`\ndirectly above each of these (today's line numbers):\n\n- `src/emitter.rs:34` (`fn emit_formatted_file(`), `:40` (`fn emit_header`), `:44` (`fn emit_footer`)\n- `src/emitter/stdout.rs:20`, `src/emitter/files.rs:22`, `src/emitter/files_with_backup.rs:12`,\n  `src/emitter/diff.rs:20`, `src/emitter/modified_lines.rs:12`, `src/emitter/json.rs:30` and `:37`,\n  `src/emitter/checkstyle.rs:13`, `:19` and `:25` (each `output: &mut dyn Write` parameter line)\n- `src/config/config_type.rs:388`: `// dyn: --print-config's output, written once.`\n\n`emitter: Box<dyn Emitter + 'b>` (`lib.rs:441`, `create_emitter` `:516`) and\n`source_file.rs:23` (`&mut dyn Emitter`): `// dyn: the emit mode, chosen once per session from\nthe config; called once per formatted file.` above each.\n\n> forwarded to the coordinator: `crates/blaze-fmt` is the coordinator's own (crates.md \"every other path\"), not requests'; on requests' coordinator list (requests, pass 22).",
+  "state": "refused",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:33:08Z",
+  "taken_by": "coord-apply-front",
+  "why": "superseded and already done: dedyn-misc replaced trait Emitter with `pub(crate) enum Emitter` (crates/blaze-fmt/src/emitter.rs:37) and writers take `&mut impl Write`; no `dyn Write`/`dyn Emitter` is left in crates/blaze-fmt/src, so no `// dyn:` comments are needed.",
+  "source": "v2/requests/coordinator.md#dedyn: crates/blaze-fmt: `&mut dyn Write` stays, with `// dyn:` (a CLI output writer, per file, not per token)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:1667"
+    },
+    {
+      "at": "2026-10-30T08:33:03Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:08Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "superseded and already done: dedyn-misc replaced trait Emitter with `pub(crate) enum Emitter` (crates/blaze-fmt/src/emitter.rs:37) and writers take `&mut impl Write`; no `dyn Write`/`dyn Emitter` is left in crates/blaze-fmt/src, so no `// dyn:` comments are needed."
+    }
+  ]
+}

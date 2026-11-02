@@ -1,0 +1,30 @@
+{
+  "id": "00904",
+  "from_lane": "speed-sol2-link-live",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/pe.rs",
+    "crates/blaze-link/src/place.rs"
+  ],
+  "what": "PE: link the patch code section runnable and writable, and put a patch's UNWIND_INFO in it (Windows part of 'The live runtime' in docs/v2/plan/lanes/link/speed-of-light.md; `pe.rs` is speed-sol2-link-pewasm's, the placement yours).\n\nWindows can't map part of a loaded image twice (a SEC_IMAGE view can't be unmapped in part, and placeholders only replace placeholders), so the second-mapping bound Linux reaches is out of reach for a patch region inside the image. What reaches the same 0 system calls: the section holding `Class::Patch` (`pe.rs:194`, `Segment::Text`) gets its own section header with `IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE` (the rest of `.text` stays read and execute). blaze-live (`slots/windows.rs` `Os::write`) already writes pages whose protection is writable in place, and now skips `FlushInstructionCache` for patch code (x86-64 keeps fetch coherent; the bytes were never run), so each patch's code costs 0 system calls instead of a `VirtualProtect` pair per run with a TLB shootdown when write is taken away (about 1 us + 2 us per other core). This is the W^X trade Live++ makes on Windows (its patch pages are PAGE_EXECUTE_READWRITE); only the patch section is W+X, in a live image. Also place a patch's fresh UNWIND_INFO (`piece.function().windows`) in `Class::Patch` after its code, as ELF frames: it only has to be readable and within 32 bits of the image base, and today it lands in a read-only class and costs a `VirtualProtect` pair per patch with functions.",
+  "state": "refused",
+  "created": "2026-10-30T09:35:50Z",
+  "updated": "2026-10-30T09:41:33Z",
+  "taken_by": null,
+  "why": "The gain needs the patch section W+X (pe.rs, speed-sol2-link-pewasm), a W^X policy change for every live PE image that wants a maintainer decision, not a speed lane. Without it, UNWIND_INFO in Class::Patch (R+X) still costs the VirtualProtect pair it costs in PatchData, so moving it alone gains nothing. Recorded as an open design item in speed-of-light.md (speed-sol2-link).",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:35:50Z",
+      "by": "speed-sol2-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:33Z",
+      "by": "speed-sol2-link",
+      "action": "refuse",
+      "note": "The gain needs the patch section W+X (pe.rs, speed-sol2-link-pewasm), a W^X policy change for every live PE image that wants a maintainer decision, not a speed lane. Without it, UNWIND_INFO in Class::Patch (R+X) still costs the VirtualProtect pair it costs in PatchData, so moving it alone gains nothing. Recorded as an open design item in speed-of-light.md (speed-sol2-link)."
+    }
+  ]
+}

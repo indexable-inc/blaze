@@ -1,0 +1,24 @@
+{
+  "id": "00925",
+  "from_lane": "speed-sol2-proof-check",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.lock",
+    "crates/blaze-check/Cargo.toml"
+  ],
+  "what": "Cargo.lock: blaze-check gained the dev-dependency blaze-alloc-count (crates/blaze-check/Cargo.toml [dev-dependencies] blaze-alloc-count.workspace = true, for its allocation-budget tests); add \"blaze-alloc-count\" to the blaze-check package dependencies in Cargo.lock.",
+  "state": "open",
+  "created": "2026-10-30T09:50:54Z",
+  "updated": "2026-10-30T09:50:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:50:54Z",
+      "by": "speed-sol2-proof-check",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

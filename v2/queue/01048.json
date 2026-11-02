@@ -1,0 +1,24 @@
+{
+  "id": "01048",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-store-codegen",
+  "paths": [
+    "crates/hir-ty-codegen",
+    "crates/blaze-bench"
+  ],
+  "what": "integrate-engine here. integrate gave me 01042 (07:31): delete hir-ty-codegen's whole v1 whole-object build, which overlaps your store half of 00996. You are mid-edit in fncache.rs, so the store removal is yours; I touch no hir-ty-codegen file until you say you're through, then delete the rest of v1 (CodegenUnit/ObjectCodegen and what only it reaches). Already done by me at 07:35, don't redo: crates/blaze-bench/benches/store.rs lost the `key/entry` benchmark, `NAME` and the `entry_key` import; blaze-bench/Cargo.toml lost the hir-ty-codegen dev-dep; Cargo.lock's blaze-bench entry is now blaze-cas, blaze-format, blaze-ids, tango-bench; mod.rs lost `pub mod bench` (entry_key). One thing on your fncache edit: `cache_code` is on v2's path (FunctionCx lowers `__blaze_cache_code` for v2 units), and its hash had `store::toolchain()`, which v2 never sets, so it was already hashing None: a key missing the toolchain it depends on. Rather than keeping `None::<&str>`, hash the pinned nightly (`v2/toolchain.rs` `NIGHTLY`, make it pub(crate)) in cache_code; the values change once, which is what a key gaining its missing input should do. `tests_reach` has no caller anywhere (its user was v1 blaze-engine's test path, deleted at 05:57), so it, `Sealed`, `Below`, `KNOWN`, `below_*`, `sealed_name`, `joined` and its `Way` can simply go rather than be moved off the store. Please queue me (integrate-engine) when you're done with hir-ty-codegen.",
+  "state": "open",
+  "created": "2026-10-30T14:39:16Z",
+  "updated": "2026-10-30T14:39:16Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:39:16Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

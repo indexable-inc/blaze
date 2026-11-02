@@ -1,0 +1,40 @@
+{
+  "id": "00745",
+  "from_lane": "cargo-inbox-tests",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/test.rs",
+    "crates/blaze-testsel/src/api.rs",
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-testsel/src/table.rs",
+    "crates/blaze-testsel",
+    "crates/blaze-macro-eval/src/expander.rs"
+  ],
+  "what": "## cargo-inbox-tests: to lane fastcompile, `blaze_testsel::api::result` and the emptied slot (2026-10-29)\n\nFrom `cargo-inbox-tests` (lane cargo; report `/tmp/blaze-lanes/v2-cargo-inbox-tests.md`). Cargo\nnow selects and keeps every test through one `blaze_testsel::Selector` per suite\n(`crates/blaze-cargo/src/serve/unit/test.rs`, `serve/unit/test/image.rs`).\n\n1. **`crates/blaze-testsel/src/api.rs`, `result`:** `blaze_api::TestResult` has two fields it\n   doesn't set, `outside: bool` and `executable: u32` (`crates/blaze-api/src/lib.rs:771-776`), so\n   blaze-testsel doesn't compile. Cargo doesn't call `result`: it needs the executable's index,\n   which only the daemon knows, so it builds the result itself around `api::to_api`\n   (`serve/unit/test.rs`, `cached`). Either delete `result` and change its test to build the\n   `TestResult` around `to_api`, or give it `executable: u32` and set `outside: false` (a cached\n   result's run is not this one).\n2. **`crates/blaze-testsel/src/table.rs`, `Image::new`** (codegen.md \"From codegen-fc-built\" item\n   4, already forwarded): take `blaze_codegen::ExecTable::EMPTY` (`u32::MAX`) in `slot_fn` as a\n   slot of no function, keep it in `slot_fn` so `slots()` counts it, and make `executed` refuse a\n   hit on it with a `TableError` (today `self.rank[function as usize]` would index past the end).\n   Cargo hands `slot_fn` over unchanged, so until this lands an incrementally relinked test\n   binary with an emptied slot stops its test run with \"the execution table of `<binary>`: slot N\n   names function 4294967295 ...\". That error is correct but stops the run. The cargo test\n   `a_table_is_its_image_slot_for_slot` (`serve/unit/test/tests.rs`) expects the new behavior.\n3. **Positions (note, for select):** cargo's old selection put a hash of every span table of the\n   binary into each test's reached set (`serve/unit/compile.rs`, `SPANS`). That way, an edit that\n   only moves a `panic!` or a `line!()` reran the binary's tests, since a test can observe the\n   position (`#[should_panic(expected = \"src/lib.rs:12\")]`, `assert_eq!(line!(), ..)`).\n   `exec::bound` leaves a function's `Position`s out (codegen.md \"From codegen-fc-built\" item 4),\n   so under blaze-testsel such an edit keeps the cached pass. Cargo can't add the span tables to\n   a `Set`. Either `Bound` covers the positions a function names, or `Image` carries a hash of\n   the span tables as `unlogged` carries the unlogged code.\n   `ExecTable::beside` would hold it if codegen hashes the span tables into it; cargo passes\n   whatever codegen and link give.\n\n> forwarded to fastcompile-next1 (requests, pass 40: `crates/blaze-testsel` is fastcompile's; told by tmux)\n\n> acknowledged by lane cargo (cargo-inbox-user, 2026-10-29): read at\n> `crates/blaze-macro-eval/src/expander.rs:122` (`verdict` through `blaze_expand::keeping()`)\n> and `:131` (`tell` as a put). The daemon publishes `flush`'s puts in `serve/job.rs`\n> `plane_finished` (cargo-inbox's edit 10, the same handling as `kept`). Still open, small: with\n> no store installed, `load` runs every macro in a session without saying so (`verdict` gives\n> `Unseen`). The asked error isn't there; the daemon always installs a store, so only tests see it.\n\n> fastcompile-macros (2026-10-30): kept as is, on purpose. No store installed is\n> `blaze_expand`'s \"keeps nothing\" mode, which the evaluator's differential and corpus tests\n> run in. There, nothing is found or kept for any expander (wasm and native too), so running in\n> a session is not a slower path taken instead of a faster one: no faster path exists. Refusing\n> in `load` would only stop those tests. The daemon can't reach this mode (`serve.rs:223`\n> installs the store before any build). Closed from fastcompile's side.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T14:21:25Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/cargo.md#cargo-inbox-tests: to lane fastcompile, `blaze_testsel::api::result` and the emptied slot (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6307"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:21:25Z",
+      "by": "fastcompile-testsel",
+      "action": "done",
+      "note": "Items 1 and 2 were done (api.rs `result` sets `executable` and `outside: false`; table.rs `Image::new` keeps an `ExecTable::EMPTY` slot and `executed` refuses a hit on it, `TableError::EmptySlot`). Item 3 (positions): decided in docs/v2/plan/lanes/fastcompile/select.md \"Positions\": each function's `Bound` covers the span tables it names (positions, data relocations, debug lines), not one hash of the binary's tables beside `unlogged`, which would rerun every test on any edit that adds a line. A test sees a position only by running code that names it, so this reruns exactly the tests that executed a moved function. blaze-testsel's half: `Bound`'s doc states the contract (table.rs); sim_tests.rs moves positions that tests observe (a `should_panic` with a location) and checks that no cached test executed a moved function and that moves of functions a test did not execute keep its pass. Codegen's half is queue 01028 (`ExecTable::new` folds the span tables into each `Bound`, and a referenced static's value, which no `Bound` held either); cargo's is 01029 (pass `&side.spans`). The macro-eval note at the end was closed by fastcompile-macros. Not built."
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "id": "00224",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/cargo.md",
+    "crates/blaze-new/Cargo.toml",
+    "crates/blaze-new/src/lib.rs",
+    "Cargo.toml"
+  ],
+  "what": "## dedup: blaze-new's `normalize_path` onto blaze-manifest's (from dedup-sim-edge, 2026-10-29)\n\nThe last `normalize_path` copy with no request (the others: `v2/requests/cargo.md` \"one copy of\neach piece the load ported from v1's cargo crates\" item 10 and \"the rest of the cargo crates'\ncopies\" item 1, and this file's \"the v1 cargo crates call blaze-units' copies\" items 1 to 3).\n\n- `crates/blaze-new/Cargo.toml` `[dependencies]` += `blaze-manifest.workspace = true` (no cycle:\n  blaze-manifest does not depend on blaze-new).\n- `crates/blaze-new/src/lib.rs`: delete `fn normalize_path` (691-707, with its doc line); line 760\n  becomes `let manifest_path = blaze_manifest::paths::normalize_path(&path.join(\"Cargo.toml\"));`.\n  `path` is `cwd.join(..)`, absolute, where the two rules agree (cargo-util's keeps a leading `..`\n  of a relative path, which this copy dropped).\n\n> forwarded to the coordinator: `blaze-new` is its; on requests' coordinator list (requests, pass 29).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:28:16Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: blaze-new's `normalize_path` onto blaze-manifest's (from dedup-sim-edge, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:2753"
+    },
+    {
+      "at": "2026-10-30T08:28:16Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:16Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "crates/blaze-new/Cargo.toml += blaze-manifest.workspace = true; crates/blaze-new/src/lib.rs fn normalize_path deleted, mk calls blaze_manifest::paths::normalize_path (path is absolute, where both agree). Manifest lint clean."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "id": "01255",
+  "from_lane": "tests-engine",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "Files::relative (cx.rs:64) with root \"\" strips the leading / of an absolute path: root.trim_end_matches(\"/\") is \"\", path.strip_prefix(\"\") always matches, then strip_prefix(\"/\") turns \"/var/x/probe.rs\" into \"var/x/probe.rs\". Its doc says a root of \"\" keeps each path whole. Fix: `if root.is_empty() { return path; }` after the trim (a root of \"/\" trims to \"\" too: names stay absolute, as rustc run at / would still print a path given absolute... rustc prints the path as given, so keeping it whole is right for both). Breaks blaze-engine as_rustc::tests::anyhow_backtrace_probe (round6-test.log): probe.rs calls Files::new(&paths, \"\") with the probe named by its absolute path (as rustc names a file given on the command line), the diag names `var/...`, emit::Sources finds no such file and emit.rs:345 panics `a file that can't be read`. From tests-engine (edit-only).",
+  "state": "applied",
+  "created": "2026-10-31T12:15:11Z",
+  "updated": "2026-10-31T14:45:29Z",
+  "taken_by": "tests-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:15:11Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:36:39Z",
+      "by": "tests-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:36:39Z",
+      "by": "tests-engine",
+      "action": "done",
+      "note": "at the coordinator's ask (round 7c): Files::relative returns the path whole for a root of \"\" (a root of \"/\" still names from /), with two cases added to its unit test in cx.rs."
+    },
+    {
+      "at": "2026-10-31T14:45:29Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "The empty-root check now runs after the trim, so a root of \"/\" keeps paths whole too, as the item says."
+    }
+  ]
+}

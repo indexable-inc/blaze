@@ -1,0 +1,37 @@
+{
+  "id": "00714",
+  "from_lane": "cargo-load-source",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-cargo/src/serve/fetch"
+  ],
+  "what": "## 10. From cargo-load-source (to cargo-load and cargo-daemon-fetch)\n\n**What (to cargo-load, `crates/blaze-units/Cargo.toml`):** `sha2 = { version = \"0.10\", optional = true }`\nunder `[dependencies]`, and `\"dep:sha2\"` in the `query` feature (blaze-registry and blaze-store\nalready take `sha2 = \"0.10\"`; it is in `Cargo.lock`).\n**Why:** `src/load/source/tree.rs` checks a `directory` source's files against its\n`.cargo-checksum.json` as cargo's `DirectorySource::verify` does (`Sha256::digest`). Without it\n`load/source/tree.rs` does not compile.\n\n**What (to cargo-daemon-fetch, `crates/blaze-cargo/src/serve/fetch/`):** a `FetchKind::Crate`\nwhose `url` is `file:///<path>` is a `local-registry`'s `.crate`: read it at that path (no network,\nso also offline), check its sha256 and unpack it at `at`\n(`$CARGO_HOME/registry/src/<dir>/<name>-<version>`), as cargo's `LocalRegistry` unpacks it.\n`Sources::locate` makes such a fetch only once the `.crate` reads through a mount.\n**Why:** `archive.rs` fetches over HTTP only; a local registry's packages otherwise never unpack.\n\n**Note (to cargo-daemon-fetch, re the note of request 7):** a sparse registry whose `config.json`\nhas `auth-required = true` is already `Located::Failed` (\"... requires authentication\n(`auth-required` in its config.json), and blaze sends no registry token yet\"), so no fetch of\none is made until `Fetch` carries a credential.\n\n> forwarded to cargo: between lane cargo's children, in its own `crates/blaze-units/Cargo.toml` (`sha2` 0.10 is a workspace-less dependency there; the lock has it) and `serve/fetch/`.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:44:27Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#10. From cargo-load-source (to cargo-load and cargo-daemon-fetch)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:545"
+    },
+    {
+      "at": "2026-10-31T20:44:27Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:44:27Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Load half: blaze-units checks directory sources with blaze-sha256 (the workspace's, not sha2) and load/source.rs makes a file:// Crate fetch for a local registry once the .crate reads through a mount. Fetch half: crates/blaze-cargo/src/serve/fetch.rs `package` reads a file:// URL from disk (no network, so offline too), then the same sha256 check, unpack and .cargo-ok as a download; a missing file is \"failed to read `<path>`\" with the io cause. Test a_local_registrys_crate_is_read_in_place_and_checked in serve/fetch/tests.rs."
+    }
+  ]
+}

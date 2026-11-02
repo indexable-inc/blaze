@@ -1,0 +1,37 @@
+{
+  "id": "00663",
+  "from_lane": "speed-link-edge-sol-live",
+  "owner": "codegen",
+  "paths": [
+    "docs/v2/plan/lanes/link/speed-of-light.md",
+    "v2/requests/link.md",
+    "crates/blaze-live/src/lib.rs"
+  ],
+  "what": "## From speed-link-edge-sol-live: level-2 counters share cache lines across functions (`hir-ty-codegen/tier.rs` `count`, and whoever picks `first`)\n\nStatus: open, does not block. For lead `codegen`. See \"The live runtime\" in\n`docs/v2/plan/lanes/link/speed-of-light.md`, \"The sampler's counters\".\n\n`count` makes each counted function `call blaze_live_counters()` at entry, then a plain\n`load; iadd_imm 1; store` per counter, into `first .. first + 1 + 2 * branches` of one\n`[u64; 65536]`. Functions' ranges are packed one after another, so eight counters share a\n64-byte line (sixteen a 128-byte pair, which x86 and arm64 prefetch together), and two hot\nfunctions on two threads write one line: each add then waits for the line to come from the other\ncore (about 50 to 100 ns on one socket, against about one cycle for an add to a line the core\nowns). The adds are also not atomic, so two threads in the same function lose counts, and the\nsampler's relaxed loads race them (item 12 d of `v2/requests/link.md`).\n1. Start every function's range on a multiple of 16 counters (128 bytes): `first` rounded up\n   where ranges are handed out, so no two functions share a line pair. That costs at most 15\n   counters per function of the 65536.\n2. Make the add `atomic_rmw add` with relaxed ordering (`ldadd` / `lock xadd`), so no count is\n   lost and the sampler's loads don't race. It costs nothing more while one thread runs the\n   function, the case 1 leaves.\n3. The bound, if one function is hot on many threads at once: a block of counters per thread,\n   summed by the sampler. That needs `blaze_live_counters` to hand out a thread's own block and\n   the sampler to know every block; ask blaze-live's owner if 1 and 2 measure short.\n\n> applied by codegen-v1 (2026-10-29): items 1 and 2 in `tier.rs` and `llvm/lower.rs`: `Prepared::finish` starts each function's counters on a multiple of `tier::COUNTER_ALIGN` (16) through `counted_from` (tested), so the engine's `first + used` needs no change; each add is an `atomic_rmw add` in the alias region `tier::COUNTER_REGION`, which LLVM's lowering makes `monotonic` (other atomics stay seq-cst). Item 1 holds only if the array starts on 128 bytes: asked of link below (\"To link: `blaze-live`'s counters on 128 bytes\"). Item 3 left for measurement, as the item says.\n\n### To link: `blaze-live`'s counters on 128 bytes (from codegen-v1, 2026-10-29)\n\nWhat: in `crates/blaze-live/src/lib.rs`, give `COUNTERS` a 128-byte alignment, e.g.\n\n```rust\n#[repr(C, align(128))]\nstruct Counters([std::sync::atomic::AtomicU64; format::COUNTERS]);\n\nstatic COUNTERS: Counters =\n    Counters([const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS]);\n```\n\nwith `blaze_live_counters` returning `COUNTERS.0.as_ptr() as *mut u64` and `sample.rs:249`\nreading `crate::COUNTERS.0[..used]`.\nWhy: `hir-ty-codegen/tier.rs` now starts every function's counters on a multiple of 16 (128\nbytes from the array's start), so two functions never share a cache-line pair; with the\narray only 8-aligned, the pairs straddle and the fix is lost. The daemon's adds are now\natomic and relaxed, as the comment on `COUNTERS` asks.\n\n> forwarded to codegen (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:48:42Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen.md#From speed-link-edge-sol-live: level-2 counters share cache lines across functions (`hir-ty-codegen/tier.rs` `count`, and whoever picks `first`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:1581"
+    },
+    {
+      "at": "2026-10-31T20:48:42Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:42Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Items 1 and 2 are in tier.rs (COUNTER_ALIGN 16, counted_from; atomic add in COUNTER_REGION, monotonic in LLVM lowering). The 128-byte alignment of blaze-live COUNTERS was asked of link. Item 3 waits for a measurement, as the item says."
+    }
+  ]
+}

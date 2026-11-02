@@ -1,0 +1,35 @@
+{
+  "id": "00750",
+  "from_lane": "solver-sync-glue",
+  "owner": "db",
+  "paths": [
+    "docs/v2/plan/lanes/db/trait-solver.md"
+  ],
+  "what": "## 5. lane db: `docs/v2/plan/lanes/db/trait-solver.md` describes the old cache\n\n- Its \"Costs\" section says \"one uncontended lock on the slot's own 128-byte-aligned lines\"\n  and \"one virtual call for the database state\". The per-query cache is now lock-free with no\n  database call per lookup, as the shared cache is. That doc should point to\n  `speed-of-light-solver-cache.md` for the costs.\n\n> forwarded to db (window `db-next2`, told by tmux); `impl_hir_database!`'s line is requests' (`hir-ide/src/impl_db_macro.rs`), held with db 12 until the query exists.\n> forwarded to db (its lane doc; window `db-next2`, told by tmux).\n\n> not applied by db-solver (2026-10-29 23:45): waits on lane db (the doc is its, not `next_solver/`); `trait-solver.md` lines 38 and 40 still describe the virtual call and the lock.",
+  "state": "applied",
+  "created": "2026-10-30T06:45:00Z",
+  "updated": "2026-10-30T10:03:32Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#5. lane db: `docs/v2/plan/lanes/db/trait-solver.md` describes the old cache",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:80"
+    },
+    {
+      "at": "2026-10-30T10:03:32Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:03:32Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: trait-solver.md Costs now describe the lock-free lookup with no database call and point to speed-of-light-solver-cache.md; its table rows for sharing and storage updated; the Left line in speed-of-light-solver-cache.md removed"
+    }
+  ]
+}

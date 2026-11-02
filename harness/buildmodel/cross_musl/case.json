@@ -1,9 +1,0 @@
-{
-  "row": "`--target x86_64-unknown-linux-musl`",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "target": "x86_64-unknown-linux-musl",
-  "on": "x86_64"
-}

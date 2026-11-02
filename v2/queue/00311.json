@@ -1,0 +1,37 @@
+{
+  "id": "00311",
+  "from_lane": "mem-format-tree",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax/src/syntax_node.rs",
+    "crates/syntax/src/lib.rs",
+    "crates/syntax/src/parsing/kept.rs"
+  ],
+  "what": "## mem-format-tree: an unchanged file's parse allocates nothing\n\nWhy: `SourceFile::parse_file(key, text, ..)` of a file whose text did not change is\n`kept::take` (a clone), `reparse_to` (`self.clone()`), then `kept::keep` (a clone, the slot's old\none dropped). Every `Parse` dropped on the way (the taken one, the slot's old one) is a count of\na tree something else still holds, yet `Drop for Parse` sends each to the drop thread over\n`std::sync::mpsc`, whose list channel allocates a block every 31 sends on the sending thread. So\nthe warm path allocates once every 16 parses, and `taking_and_keeping_allocate_nothing` (whose\n`keep` drops the slot's old parse) fails whenever its send lands on a block boundary. Only the\nlast count of a tree frees anything, so only it needs the drop thread; `Arc::into_inner` says\nwhich one is the last, atomically. Same trees freed, on the same thread as before (the drop\nthread for a `Parse`'s last count), and a non-last count is a decrement where it is dropped\ninstead of 0 to 100 ms later on the drop thread.\n\n> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).\n> frontend-tree (2026-10-29): applied as written. `Tree::into_unique` is in `syntax_node.rs`;\n> `Drop for Parse` sends only a last count; `reparse_to` compares `ptr_eq` before the bytes; and\n> the test `an_unchanged_file_parses_again_allocating_nothing` is in `parsing/kept.rs`.\n\n### `crates/syntax/src/syntax_node.rs`\n\nBefore:\n\n```rust\n    pub fn flat(&self) -> &Arc<FlatTree> {\n        &self.0\n    }\n}\n```\n\nAfter:\n\n```rust\n    pub fn flat(&self) -> &Arc<FlatTree> {\n        &self.0\n    }\n\n    /// The tree, when this is the last count of it.\n    pub(crate) fn into_unique(self) -> Option<FlatTree> {\n        Arc::into_inner(self.0)\n    }\n}\n```\n\n> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).\n\n### `crates/syntax/src/lib.rs`, `Drop for Parse`\n\nBefore:\n\n```rust\n        let Some(tree) = self.tree.take() else {\n            return;\n        };\n        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Tree>> =\n            std::sync::OnceLock::new();\n        PARSE_DROP_THREAD\n            .get_or_init(|| {\n                let (sender, receiver) = std::sync::mpsc::channel::<Tree>();\n```\n\nAfter:\n\n```rust\n        // A count that is not the tree's last frees nothing: it is dropped here, not sent.\n        let Some(tree) = self.tree.take().and_then(Tree::into_unique) else {\n            return;\n        };\n        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<FlatTree>> =\n            std::sync::OnceLock::new();\n        PARSE_DROP_THREAD\n            .get_or_init(|| {\n                let (sender, receiver) = std::sync::mpsc::channel::<FlatTree>();\n```\n\n(The rest of the impl is unchanged; `FlatTree` is already in scope through `pub use syntax_tree::{..}`.)\n\n> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).\n\n### `crates/syntax/src/lib.rs`, `Parse::reparse_to`\n\nThe same text is most often the same bytes (base-db hands the file's `Text` again): compare\naddresses before bytes.\n\nBefore:\n\n```rust\n        if **tree.source() == *text && self.outline.is_none_or(|it| it == edition) {\n```\n\nAfter:\n\n```rust\n        let same = tree.source().ptr_eq(&text) || **tree.source() == *text;\n        if same && self.outline.is_none_or(|it| it == edition) {\n```\n\n> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).\n\n### `crates/syntax/src/parsing/kept.rs`, the budget test (append to `mod tests`)\n\n```rust\n    /// The parse of a file whose text did not change allocates nothing, however often: it is\n    /// the kept parse, and every count dropped on the way is not its tree's last, so nothing\n    /// goes to the drop thread (whose channel allocates a block every 31 sends).\n    #[test]\n    fn an_unchanged_file_parses_again_allocating_nothing() {\n        for outline in [false, true] {\n            let key = 13 + 4 * outline as u32 + super::SLOTS as u32 * 9;\n            let text = Text::from(\"fn f() { 1 + 2 }\\nstruct S { a: u8 }\\n\");\n            let first = SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline);\n            let again = blaze_alloc_count::assert_at_most(0, \"an unchanged file parsed again\", || {\n                SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline)\n            });\n            assert!(std::sync::Arc::ptr_eq(\n                again.tree.as_ref().unwrap().flat(),\n                first.tree.as_ref().unwrap().flat()\n            ));\n            // Equal bytes at another address: compared, and the same parse.\n            let copy = Text::from(&*text);\n            let same = SourceFile::parse_file(key, copy.clone(), Edition::CURRENT, outline);\n            assert!(std::sync::Arc::ptr_eq(\n                same.tree.as_ref().unwrap().flat(),\n                first.tree.as_ref().unwrap().flat()\n            ));\n            blaze_alloc_count::assert_at_most(0, \"an unchanged file parsed 100 times\", || {\n                for _ in 0..100 {\n                    drop(SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline));\n                }\n            });\n        }\n    }\n```\n\n(`Parse::tree` is private to the crate root, which `parsing::kept::tests` is under. The keys'\nslots, 13 and 17, are no other test's.)\n\n> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:23:05Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/mem-format-tree.md#mem-format-tree: an unchanged file's parse allocates nothing",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-format-tree.md:12"
+    },
+    {
+      "at": "2026-10-30T07:49:59Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "Tree::into_unique (syntax_node.rs:54), Drop for Parse, reparse_to ptr_eq, test in parsing/kept.rs"
+    }
+  ]
+}

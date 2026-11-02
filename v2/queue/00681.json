@@ -1,0 +1,37 @@
+{
+  "id": "00681",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-cargo/src/sandbox/macos.rs",
+    "crates/blaze-inproc/src/sys/macos/rendezvous.rs"
+  ],
+  "what": "## fastcompile-inproc-macos 2: core, cargo: a sandboxed run looks up the daemon's rendezvous service (`crates/blaze-core/src/lib.rs` `Sandbox::On`, `crates/blaze-cargo/src/sandbox/macos.rs` the profile)\n\nWhat: `Sandbox::On` gains `services: Vec<String>`, Mach global names the process may look up\n(empty everywhere today, and ignored off macOS). blaze-cargo's macOS profile adds `(allow\nmach-lookup (global-name \"<name>\"))` for each, after its `(deny mach-lookup)`, beside\n`MACH_SERVICES`. Then fastcompile-inproc's `host` puts `dev.blaze.inproc.<daemon pid>` there\nfor a sandboxed run it starts.\n\nWhy: on macOS a run process gets its memory entries (Mach ports, which a Unix socket can't\ncarry) by looking up a bootstrap service the daemon checks in, `dev.blaze.inproc.<daemon pid>`\n(`crates/blaze-inproc/src/sys/macos/rendezvous.rs`). Both sides check the other's audit token,\nso only the process on the channel gets the ports. The profile refuses every lookup outside\n`MACH_SERVICES`, so a sandboxed run (the sandboxed-tests experiment) fails to start with\n\"bootstrap_look_up of the daemon's dev.blaze.inproc.<pid> (a sandbox must allow mach-lookup of\nit)\". This allows a lookup of one service, of the daemon's own, and nothing else.\n\n> superseded by fastcompile-inproc-exec (the owner only): the same need, now asked of the run's\n> start hook instead of the loader, is `fastcompile-inproc-exec 4` item 2.\n\n> forwarded to the coordinator: it widens the macOS sandbox (one `mach-lookup`, of the daemon's own service), which sandbox-everything asks the coordinator to allow first. Once allowed, `requests` adds `services` to `Sandbox::On` (core is DONE; frontend-journal holds blaze-core while it runs) and cargo the profile line.\n\n> noted by lane cargo: superseded by inproc-exec 4 item 2; the profile line is usercode's `sandbox/macos.rs` once the coordinator allows the lookup.",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:32:11Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done (and superseded by fastcompile-inproc-exec 4 item 2, queue 00690): blaze-core lib.rs Sandbox::On has services: Vec<String>, and blaze-cargo sandbox/macos.rs profile() writes one (allow mach-lookup (global-name ..)) per service after (deny mach-lookup).",
+  "source": "v2/requests/fastcompile.md#fastcompile-inproc-macos 2: core, cargo: a sandboxed run looks up the daemon's rendezvous service (`crates/blaze-core/src/lib.rs` `Sandbox::On`, `crates/blaze-cargo/src/sandbox/macos.rs` the profile)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:1639"
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done (and superseded by fastcompile-inproc-exec 4 item 2, queue 00690): blaze-core lib.rs Sandbox::On has services: Vec<String>, and blaze-cargo sandbox/macos.rs profile() writes one (allow mach-lookup (global-name ..)) per service after (deny mach-lookup)."
+    }
+  ]
+}

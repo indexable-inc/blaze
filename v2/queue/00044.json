@@ -1,0 +1,25 @@
+{
+  "id": "00044",
+  "from_lane": "items-hirty",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa",
+    "crates/hir-ty/src/method_resolution.rs",
+    "docs/v2/plan/design/data.md"
+  ],
+  "what": "## items-hirty: 4-byte interned ids (db, `vendor/salsa`)\n\n`TraitImpls` and `InherentImpls` are now columns (`crates/hir-ty/src/method_resolution.rs`), but\nevery `ImplId`, `TraitId` and `BuiltinDeriveImplId` in them is 8 bytes: salsa's `Id` is an index\nplus a generation. These ids are interned with `revisions = usize::MAX` (`impl_intern_key!` in\n`base-db`, `BuiltinDeriveImplId` in `hir-def`), so the generation is never bumped and is always\nthe same. Asked: an id type of 4 bytes (`NonZeroU32` alone) for interned structs that are never\ncollected. That halves every impl column, and every other long-lived id array too. The asserts\nbeside the columns say `<= 8` today, so they keep holding when ids shrink; tighten them to\n`== 4` then. Why: docs/v2/plan/design/data.md, \"a type is a `u32`\" and the size budgets.\n\n> forwarded to db: `base-db`'s `impl_intern_key!`, `hir-def` and `vendor/salsa` are lane db's. The `<= 8` asserts in `method_resolution.rs` (items DONE, now mine) tighten to `== 4` once ids shrink.",
+  "state": "open",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T00:05:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/items.md#items-hirty: 4-byte interned ids (db, `vendor/salsa`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:175"
+    }
+  ]
+}

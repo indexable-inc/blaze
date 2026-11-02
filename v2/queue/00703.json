@@ -1,0 +1,35 @@
+{
+  "id": "00703",
+  "from_lane": "fastcompile-macros-os",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/fastcompile.md"
+  ],
+  "what": "- `v2/requests/fastcompile.md`, \"fastcompile-macros-os 1\": codegen-mir: `Foreign::call` may\n  decline a call (`Claimed::Declined`), which the evaluator then runs with its own shims.\n  Applied by codegen-mir.\n- To the parent, fastcompile-macros: `run.rs`'s `Foreign::call` maps `Os::call`'s\n  `Ok(Answer::Answered)` to `Ok(Claimed::Answered)` and `Ok(Answer::Evaluator)` to\n  `Ok(Claimed::Declined)`. Applied by the parent.",
+  "state": "refused",
+  "created": "2026-10-30T06:24:41Z",
+  "updated": "2026-10-30T08:32:12Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done, as it says: Claimed::Declined is in, and blaze-macro-eval run.rs maps Answer::Evaluator to Claimed::Declined (:266).",
+  "source": "v2/requests/fastcompile-macros-os.md#",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-macros-os.md:2"
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:12Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done, as it says: Claimed::Declined is in, and blaze-macro-eval run.rs maps Answer::Evaluator to Claimed::Declined (:266)."
+    }
+  ]
+}

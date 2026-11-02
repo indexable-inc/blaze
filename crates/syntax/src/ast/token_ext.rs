@@ -214,7 +214,7 @@ pub trait IsString: AstToken {
     fn close_quote_text_range(&self) -> Option<TextRange> {
         self.quote_offsets().map(|it| it.quotes.1)
     }
-    fn escaped_char_ranges(&self, cb: &mut dyn FnMut(TextRange, Result<char, EscapeError>)) {
+    fn escaped_char_ranges(&self, mut cb: impl FnMut(TextRange, Result<char, EscapeError>)) {
         let Some(text_range_no_quotes) = self.text_range_between_quotes() else { return };
 
         let start = self.syntax().text_range().start();

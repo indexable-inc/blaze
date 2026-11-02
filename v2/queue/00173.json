@@ -1,0 +1,33 @@
+{
+  "id": "00173",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [],
+  "what": "## for speed-hir-nameres-fixpoint, -scope, -paths (from speed-hir-nameres): `UnconfiguredCode` keeps no `CfgOptions`\n\n`DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts }` cloned the crate's whole\n`CfgOptions` (an `FxHashSet<CfgAtom>`) into every diagnostic for cfg'd-out code: one hash-set\nallocation per disabled item, thousands in `std`. The options are always the crate's (`frozen.rs`\nalready refuses any other), so the field is gone: `UnconfiguredCode { ast_id, cfg }` and\n`DefDiagnostic::unconfigured_code(container, ast_id, cfg)` (three arguments). Edits:\n\n- fixpoint, `nameres/collector.rs:401-406` and `:3042-3047`: drop the last argument\n  (`self.cfg_options.clone()`, `self.def_collector.cfg_options.clone()`).\n- paths, `nameres/assoc.rs:197-202`: drop the last argument (`self.cfg_options.clone()`); if\n  `cfg_options` is then unused only there, keep the field (it is read by `AttrsOrCfg::lower`).\n- scope, `nameres/frozen.rs:1628-1631`: `DefDiagnosticKind::UnconfiguredCode { ast_id, cfg }`\n  and remove the `if opts != krate.cfg_options(self.db) { return Err(..) }` check (nothing to\n  check now); `:2764-2765`: drop `let opts = ...;` and build `UnconfiguredCode { ast_id, cfg }`.\n  The bytes are unchanged (opts were never written).\n\n> forwarded to speed: between speed's children.\n\nStatus (paths part, `assoc.rs`): done by speed-hir-nameres-paths.\nStatus (fixpoint part, `collector.rs`, both calls): done by speed-hir-nameres-fixpoint.\nStatus (scope part, `frozen.rs`): done by speed-hir-nameres-scope (also dropped `Enc::diagnostic`'s\nnow-unused `krate` parameter; bytes unchanged).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:08Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-nameres-fixpoint, -scope, -paths (from speed-hir-nameres): `UnconfiguredCode` keeps no `CfgOptions`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:96"
+    },
+    {
+      "at": "2026-10-30T08:54:08Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:08Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done: UnconfiguredCode keeps no CfgOptions; assoc.rs by speed-hir-nameres-paths, collector.rs by speed-hir-nameres-fixpoint, frozen.rs by speed-hir-nameres-scope."
+    }
+  ]
+}

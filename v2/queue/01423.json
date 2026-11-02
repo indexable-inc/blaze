@@ -1,0 +1,31 @@
+{
+  "id": "01423",
+  "from_lane": "sched",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-graph/Cargo.toml"
+  ],
+  "what": "Add corosensei (latest, 0.3.x; 0.3.4 is in the local registry) as a root workspace dependency in Cargo.toml [workspace.dependencies], default features. Why: Andrew 18:29 decided phase 2 of lane sched is stackful fibers on corosensei, as a workspace dependency (brief: briefs/v2/sched.md, Decision). Only crates/blaze-graph will use it (corosensei.workspace = true), for the fiber driver behind blaze_graph::sched; design in docs/v2/plan/lanes/sched.md, Phase 2. crates/blaze-graph/Cargo.toml is lane core's path: please add the member line there too, or tell me to queue it to core.",
+  "state": "applied",
+  "created": "2026-11-01T02:03:53Z",
+  "updated": "2026-11-01T02:31:49Z",
+  "taken_by": "lead",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:03:53Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:31:49Z",
+      "by": "lead",
+      "action": "done",
+      "note": "corosensei = 0.3.4 (latest) in root [workspace.dependencies]; corosensei.workspace = true in crates/blaze-graph/Cargo.toml"
+    }
+  ]
+}

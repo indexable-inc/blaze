@@ -1,0 +1,23 @@
+{
+  "id": "00545",
+  "from_lane": "usercode",
+  "owner": "safety",
+  "paths": [
+    "crates/proc-macro-api/src/bidirectional_protocol"
+  ],
+  "what": "## 7. safety (safety-fuzz, `fuzz/`): fuzz targets for usercode's parsers of untrusted bytes\n\nWhat: one target each, against these public APIs. Each target checks that the parser returns\n`Ok` or `Err` without panicking, and that what it accepts round-trips where an encoder exists.\n- `blaze_usercode::trace::parse(&str)`: the live record. A sandboxed program can write it on\n  macOS. Invariant: the returned `used` is at most `text.len()`, and it ends at a line end.\n- `blaze_usercode::trace::decode(&[u8])`: the launcher's report. Round-trips with\n  `trace::encode`.\n- `blaze_usercode::test::wire::Frames::push` then `pop` in a loop, and `Frame::decode`: frames\n  from a sandboxed test's fork server. Invariant: no frame body over the 64 MiB limit is\n  buffered; round-trips with `Frame::encode`.\n- `blaze_usercode::index::Shape::decode` and `blaze_usercode::run::Value::decode`: store values,\n  which may come from the remote. Each round-trips with its `encode`.\n- proc-macro-api's warm-server message reader (`crates/proc-macro-api/src/bidirectional_protocol*`):\n  bytes from a sandboxed proc-macro server.\n\nWhy: unsafe.md, \"Done when\": every parser of untrusted bytes has a fuzz target.\n\n> forwarded to safety: `fuzz/` is lane safety's.",
+  "state": "open",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T04:38:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode.md#7. safety (safety-fuzz, `fuzz/`): fuzz targets for usercode's parsers of untrusted bytes",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:511"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "00004",
+  "from_lane": "speed-link-edge-macho",
+  "owner": "link",
+  "paths": [],
+  "what": "## 7. From speed-link-edge-macho (found by speed-link-edge-macho-dylib): a name index per `Shared`\n\nStatus: open. For lead `link`.\n\nWhat is slow: `native.rs:672-677` builds an `FxHashMap<&str, (usize, &SharedSymbol)>` over every\nsymbol of every shared library on every link (libSystem's stub alone is about 10k names) only to\nlook up the names the link imports.\n\nThe change: `model.rs` `Shared` gains `pub index: Vec<u32>` (open addressing, a power of two\nlong, at most half full, each slot an index into `symbols` or `u32::MAX`, slot\n`FxBuildHasher.hash_one(name) as usize & (len - 1)`, probed linearly) and\n`impl Shared { pub fn find(&self, hash: u64, name: &str) -> Option<&SharedSymbol> }`. `native.rs`\nhashes each wanted name once and asks each library in order\n(`libraries.iter().enumerate().find_map(|(at, (_, it))| it.find(hash, name).map(|s| (at, s)))`),\nthe same first-library-wins answer. The readers build it once per file: Mach-O's `tbd.rs`\nalready builds exactly this table to deduplicate (`Seen`), a 3-line move; `dylib.rs`, ELF and\nCOFF build it the same way.\n\nWhy: the work becomes proportional to the imports, not the exports, and is done once per parsed\ninput rather than per link.\n\n> forwarded to link.",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-29T23:49:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#7. From speed-link-edge-macho (found by speed-link-edge-macho-dylib): a name index per `Shared`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:395"
+    }
+  ]
+}

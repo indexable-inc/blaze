@@ -1,0 +1,42 @@
+{
+  "id": "01270",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/lib.rs",
+    "crates/span/src/map.rs"
+  ],
+  "what": "hir-expand map_node_range_up (lib.rs:1565) returns None for a node that mixes a macro_rules! definition's tokens with substituted fragments, e.g. `let $p = $e` in `if let $p = $e {..}`: the fragment tokens carry the call site's ctx, so the ctx check fails. rustc spans a substituted $p/$e as its metavariable (the invisible group's span, def-site ctx), so the node is def-site `let $p = $e`. Fix: before merging spans, replace each token inside an outermost recorded fragment (ExpansionSpanMap::fragment_spans) by that fragment's span, then merge as now. Without it Cx::span falls back to the call site and levels::external drops the lint as from an external macro: blaze-diagnostics tests::lints::bodies::calls::desugar::lint_if_let_rescope_with_macro prints nothing (expects the E at 12:12 `let $p = $e`).",
+  "state": "taken",
+  "created": "2026-10-31T13:40:26Z",
+  "updated": "2026-10-31T16:46:29Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:40:26Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:29Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> query-unify: hir-expand lib.rs and span map.rs are held by query-unify (crate-holds.md); db agrees with the fix as written (span a substituted fragment as its metavariable before merging, as rustc does)"
+    },
+    {
+      "at": "2026-10-31T16:46:28Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "query-unify -> db: query-unify released hir-expand (crate-holds.md 09:45); back to its owner"
+    },
+    {
+      "at": "2026-10-31T16:46:29Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

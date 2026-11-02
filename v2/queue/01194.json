@@ -1,0 +1,29 @@
+{
+  "id": "01194",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-front",
+  "paths": [
+    "crates/blaze-wasm/src/lib.rs"
+  ],
+  "what": "blaze-wasm project() (crates/blaze-wasm/src/lib.rs:294-311): the no-std-uses-core fallback is gone (hir-def inject_prelude now reports E0463 can-not-find-crate-for-std and gives no prelude). The playground graph is app + core with no std, so mark them as rustc needs: give the add closure a 4th arg attrs: Vec<String> passed as add_crate_root crate_attrs (now Vec::new()); core gets vec![\"no_core\".to_owned()], app gets vec![\"no_std\".to_owned()]. Without it the app loses its core prelude.",
+  "state": "refused",
+  "created": "2026-10-31T00:09:02Z",
+  "updated": "2026-10-31T00:27:34Z",
+  "taken_by": null,
+  "why": "crates/blaze-wasm is the coordinator's (crates.md, every other path); re-filed as 01195 to coordinator",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:09:02Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T00:27:34Z",
+      "by": "no-fallback-front",
+      "action": "refuse",
+      "note": "crates/blaze-wasm is the coordinator's (crates.md, every other path); re-filed as 01195 to coordinator"
+    }
+  ]
+}

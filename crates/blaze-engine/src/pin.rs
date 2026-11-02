@@ -5,8 +5,7 @@
 //! A project pins blaze, and so the Rust blaze ships; Rust's own toolchain files are not read
 //! (docs/toolchain.md).
 //!
-//! Shared by the launcher (`bin/blaze.rs`), which must stay small and quick on every
-//! command: std and `toml` only.
+//! Asked before every command (`program.rs`), so it stays small and quick: std and `toml` only.
 
 use std::path::{Path, PathBuf};
 
@@ -36,46 +35,99 @@ pub(crate) fn start(args: &[String], cwd: &Path) -> PathBuf {
     cwd.to_owned()
 }
 
+/// Why which blaze a workspace pins can't be told: blaze stops rather than run itself in the
+/// pinned one's place.
+#[derive(Debug)]
+pub(crate) enum PinError {
+    /// A manifest on the way to the workspace's root that is there and can't be read.
+    Unread { manifest: PathBuf, error: std::io::Error },
+    /// A manifest on the way to the workspace's root that is not TOML.
+    NotToml { manifest: PathBuf, error: toml::de::Error },
+    /// A pin that names neither a version nor a channel.
+    NotAVersion { manifest: PathBuf, pinned: toml::Value },
+    /// The working directory, where the workspace is looked for, can't be read.
+    NoWorkingDirectory(std::io::Error),
+}
+
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinError::Unread { manifest, error } => write!(
+                f,
+                "reading {}, which may pin the blaze that runs here: {error}",
+                manifest.display()
+            ),
+            PinError::NotToml { manifest, error } => write!(
+                f,
+                "{} is not TOML, so which blaze it pins can't be told: {error}",
+                manifest.display()
+            ),
+            PinError::NotAVersion { manifest, pinned } => write!(
+                f,
+                "{} pins blaze to {pinned} under `[workspace.metadata.blaze]`, which is not a \
+                 version of blaze (`0.YYYYMMDD.N`, as `blaze pin` writes it) or a channel \
+                 (\"stable\", \"canary\")",
+                manifest.display()
+            ),
+            PinError::NoWorkingDirectory(error) => write!(
+                f,
+                "the working directory, whose workspace may pin the blaze that runs here, can't \
+                 be read: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PinError {}
+
+/// The text of `manifest`, `None` when there is none.
+fn manifest_text(manifest: &Path) -> Result<Option<String>, PinError> {
+    match std::fs::read_to_string(manifest) {
+        Ok(text) => Ok(Some(text)),
+        Err(error)
+            if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(PinError::Unread { manifest: manifest.to_owned(), error }),
+    }
+}
+
 /// The root manifest of the workspace `dir` is in, as cargo finds it: the nearest
 /// `Cargo.toml` that has a `[workspace]`, or the one its `package.workspace` names, or else
-/// the nearest `Cargo.toml` itself. `None` outside any package.
-pub(crate) fn root_manifest(dir: &Path) -> Option<PathBuf> {
+/// the nearest `Cargo.toml` itself. `None` outside any package. A manifest on the way that
+/// can't be read is an error, as it is to cargo.
+pub(crate) fn root_manifest(dir: &Path) -> Result<Option<PathBuf>, PinError> {
     let mut nearest = None;
     for dir in dir.ancestors() {
         let manifest = dir.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else { continue };
-        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
-            // cargo says what is wrong with it.
-            return Some(nearest.unwrap_or(manifest));
-        };
+        let Some(text) = manifest_text(&manifest)? else { continue };
+        let table = toml::from_str::<toml::Table>(&text)
+            .map_err(|error| PinError::NotToml { manifest: manifest.clone(), error })?;
         if table.contains_key("workspace") {
-            return Some(manifest);
+            return Ok(Some(manifest));
         }
         let named = table.get("package").and_then(|it| it.get("workspace"));
         if let Some(root) = named.and_then(toml::Value::as_str) {
-            return Some(dir.join(root).join("Cargo.toml"));
+            return Ok(Some(dir.join(root).join("Cargo.toml")));
         }
         nearest.get_or_insert(manifest);
     }
-    nearest
+    Ok(nearest)
 }
 
-/// The version of blaze `manifest` pins, `None` when it pins none. `Err` is a pin that is not
-/// a version.
-pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, String> {
-    let Ok(text) = std::fs::read_to_string(manifest) else { return Ok(None) };
-    let Ok(table) = toml::from_str::<toml::Table>(&text) else { return Ok(None) };
+/// The version of blaze `manifest` pins, `None` when it pins none or there is no manifest.
+/// `Err` is a manifest that can't be read, or a pin that is not a version.
+pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, PinError> {
+    let Some(text) = manifest_text(manifest)? else { return Ok(None) };
+    let table = toml::from_str::<toml::Table>(&text)
+        .map_err(|error| PinError::NotToml { manifest: manifest.to_owned(), error })?;
     let blaze =
         table.get("workspace").and_then(|it| it.get("metadata")).and_then(|it| it.get("blaze"));
     let Some(version) = blaze.and_then(|it| it.get("version")) else { return Ok(None) };
     match version.as_str() {
         Some(version) if is_version(version) || is_channel(version) => Ok(Some(version.to_owned())),
-        _ => Err(format!(
-            "{} pins blaze to {version} under `[workspace.metadata.blaze]`, which is not a \
-             version of blaze (`0.YYYYMMDD.N`, as `blaze pin` writes it) or a channel \
-             (\"stable\", \"canary\")",
-            manifest.display()
-        )),
+        _ => Err(PinError::NotAVersion { manifest: manifest.to_owned(), pinned: version.clone() }),
     }
 }
 
@@ -96,14 +148,15 @@ pub(crate) fn channel_file(channel: &str) -> Option<PathBuf> {
 }
 
 /// The version `file` (a [`channel_file`]) holds, and whether it was read within
-/// [`CHANNEL_FRESH`].
+/// [`CHANNEL_FRESH`]: one dated in the future, whose age can't be told, is not. `None` when
+/// none is kept, which has the channel read again.
 pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
     let version = std::fs::read_to_string(file).ok()?.trim().to_owned();
     if !is_version(&version) {
         return None;
     }
-    let age = std::fs::metadata(file).ok()?.modified().ok()?.elapsed().unwrap_or_default();
-    Some((version, age < CHANNEL_FRESH))
+    let age = std::fs::metadata(file).ok()?.modified().ok()?.elapsed();
+    Some((version, age.is_ok_and(|age| age < CHANNEL_FRESH)))
 }
 
 /// Whether `version` is a release's version: numbers with dots between, so that it names a
@@ -152,13 +205,18 @@ mod tests {
         )
         .unwrap();
         std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
-        let found = root_manifest(&member.join("src")).unwrap();
+        let found = root_manifest(&member.join("src")).unwrap().unwrap();
         assert_eq!(found, root.join("Cargo.toml"));
         assert_eq!(pinned(&found).unwrap().as_deref(), Some("0.20261027.0"));
         assert_eq!(pinned(&member.join("Cargo.toml")).unwrap(), None);
+        assert_eq!(pinned(&root.join("none/Cargo.toml")).unwrap(), None);
         std::fs::write(root.join("Cargo.toml"), "[workspace.metadata.blaze]\nversion = 3\n")
             .unwrap();
-        assert!(pinned(&found).is_err());
+        assert!(matches!(pinned(&found), Err(PinError::NotAVersion { .. })));
+        // A manifest that can't be read pins what can't be told: no blaze runs in its place.
+        std::fs::write(root.join("Cargo.toml"), "[workspace\n").unwrap();
+        assert!(matches!(pinned(&found), Err(PinError::NotToml { .. })));
+        assert!(matches!(root_manifest(&member), Err(PinError::NotToml { .. })));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -180,6 +238,9 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "0.20261028.1\n").unwrap();
         assert_eq!(channel_known(&file), Some(("0.20261028.1".to_owned(), true)));
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(future).unwrap();
+        assert_eq!(channel_known(&file), Some(("0.20261028.1".to_owned(), false)), "dated ahead");
         std::fs::write(&file, "../x\n").unwrap();
         assert_eq!(channel_known(&file), None);
         std::fs::remove_dir_all(&root).unwrap();

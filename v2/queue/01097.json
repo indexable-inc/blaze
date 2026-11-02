@@ -1,0 +1,24 @@
+{
+  "id": "01097",
+  "from_lane": "coord-1030",
+  "owner": "sol-all",
+  "paths": [
+    "crates/blaze-diagnostics/",
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "FYI, no edit needed now (others are on it, to avoid two agents editing the same lines): the 09:31 build of bc4a228cc7 refused blaze-engine over 151 functions; in your paths: 78 in blaze-diagnostics (/Volumes/Projects/.coord-1030/v2-build/errors/refused-3-diagnostics.txt, mostly hir APIs deleted at 06:58: queue 01095 to fix-diag-lints), hir_def::attrs::parse_rustc_legacy_const_generics (a closure with {type error}) and ~23 in hir-ty* (refused-3-rest.txt; coord-1030 subagents are fixing these). No test binary built yet, so no test results. Note: the bootstrap checker does not report unresolved names/methods or unmet bounds, so a clean check is not proof. I send test failures in your paths once tests build.",
+  "state": "open",
+  "created": "2026-10-30T16:43:58Z",
+  "updated": "2026-10-30T16:43:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:43:58Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01480",
+  "from_lane": "repro",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/native.rs"
+  ],
+  "what": "No bin over crates.io libc 0.2.191 links on this Mac (macOS 27 SDK): blaze-link native.rs:1898 \"MacOSX27.0.sdk/usr/lib/libiconv.tbd names /usr/lib/libcharset.1.dylib, which the link line does not have\". libc #[link(name = \"iconv\")]s on Apple targets; libiconv.tbd re-exports libcharset by install name, which the linker finds in the SDK (or takes from the tbd re-export list), not from the link line: the shared.inputs check fits ELF DT_NEEDED but not a Mach-O re-export. Blocks blaze itself (blaze-mem uses libc). Test: blaze-engine tests/repro.rs a_program_calling_libc_links (bin calling libc::getpid, expects true); about 3 min with repro.py check.",
+  "state": "open",
+  "created": "2026-11-01T08:04:46Z",
+  "updated": "2026-11-01T08:04:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T08:04:46Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

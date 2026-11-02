@@ -1,0 +1,35 @@
+{
+  "id": "00322",
+  "from_lane": "dedup",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-stencil/src/enc.rs"
+  ],
+  "what": "## dedup: seeded RNG onto blaze_ids::rng\n\nFrom `dedup-codec-rng-tools` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-tools.md`). File\n`crates/blaze-stencil/src/enc.rs` (you are marked as editing it). The xorshift stream in\n`mod tests` moves onto `blaze_ids::rng::SplitMix64` (`blaze-stencil` already has `blaze-ids` in\n`[dev-dependencies]`). The test pins no values.\n\n1. In `mod tests {`, after `use super::*;`, add `use blaze_ids::rng::SplitMix64;`.\n\n2. In `fn every_form_round_trips_a_spread_of_values`, before:\n\n```rust\n        let mut x = 0x9e37_79b9_7f4a_7c15u64;\n        for Bounds { form, min, max, step, .. } in BOUNDS {\n            for _ in 0..2000 {\n                x ^= x << 13;\n                x ^= x >> 7;\n                x ^= x << 17;\n                let span\n```\n\nafter:\n\n```rust\n        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);\n        for Bounds { form, min, max, step, .. } in BOUNDS {\n            for _ in 0..2000 {\n                let x = rng.next_u64();\n                let span\n```\n\n> forwarded to fastcompile (its window is gone) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:27:20Z",
+  "updated": "2026-10-30T08:53:24Z",
+  "taken_by": "unify-link",
+  "why": null,
+  "source": "v2/requests/fastcompile-stencil-patch-next1.md#dedup: seeded RNG onto blaze_ids::rng",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-stencil-patch-next1.md:2"
+    },
+    {
+      "at": "2026-10-30T08:53:22Z",
+      "by": "unify-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:53:24Z",
+      "by": "unify-link",
+      "action": "done",
+      "note": "crates/blaze-stencil/src/enc.rs tests: the xorshift is SplitMix64::new(0x9e37_79b9_7f4a_7c15).next_u64(). Not built."
+    }
+  ]
+}

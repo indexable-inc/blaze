@@ -1,0 +1,25 @@
+{
+  "id": "00197",
+  "from_lane": "solver-sync-interner",
+  "owner": "requests-solver-tests",
+  "paths": [
+    "crates/hir-ide/src/tests",
+    "crates/hir-ide/src/tests/next_solver_items.rs",
+    "crates/hir-ide/src/tests.rs"
+  ],
+  "what": "## 4. Tests that need a database (hir-ide, which has the test fixture)\n\nhir-ty has no test database; `crates/hir-ide/src/tests/` does. Rules ported here that only a\nfixture can exercise, for whoever owns those tests (solver-sync-callers collects):\n\n- `GenericsOf::param_region_def_id`: for `fn f<'a, T>()` and an impl method `fn g<'b>()` in\n  `impl<'a> S<'a>`, the early region at each index maps to the declaring item (`f`, the impl,\n  `g`), and a non-lifetime index panics.\n- `Interner::item_name`: a struct, function, const, trait and enum variant give their names; an\n  impl, closure and anonymous const give `'_` (so `BoundRegionKind::Named` of them has no name).\n- `Interner::check_alias_term_args_compatible`: an inherent associated type `S::Assoc<u8>` in\n  \"Self form\" (args `[S, u8]`) holds, `[u8]` (no self) and `[S]` (one missing) do not; a\n  projection holds only with the trait's and the item's every parameter.\n- `Interner::type_of` for an `ImplId` (the impl's self type), a `ConstId`, a `StaticId` and an\n  `AnonConstId` (its type).\n\n> taken by requests (child `requests-solver-tests`, new `crates/hir-ide/src/tests/next_solver_items.rs`); the outcome follows when it is done.\n> applied: `param_region_def_id_is_the_declaring_item`, `param_region_def_id_at_a_type_parameter_panics` (`#[should_panic]`), `item_name_is_the_declared_name_or_anonymous`, `alias_term_args_compatible_by_form` and `type_of_impls_consts_statics_and_anon_consts`, in `crates/hir-ide/src/tests/next_solver_items.rs` (`mod next_solver_items;` in `crates/hir-ide/src/tests.rs`); not yet compiled.\n> forwarded to requests-solver-tests: a child of `requests` (another `requests` agent started it; my own duplicate, requests-interner, was stopped before it wrote anything).",
+  "state": "open",
+  "created": "2026-10-30T02:15:55Z",
+  "updated": "2026-10-30T02:15:55Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-interner.md#4. Tests that need a database (hir-ide, which has the test fixture)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-interner.md:58"
+    }
+  ]
+}

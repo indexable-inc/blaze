@@ -18,8 +18,6 @@
     clippy::rc_buffer
 )]
 
-extern crate ra_ap_rustc_lexer as rustc_lexer;
-
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -438,12 +436,12 @@ pub struct Session<'b, T: Write> {
     pub out: Option<&'b mut T>,
     pub(crate) errors: ReportedErrors,
     source_file: SourceFile,
-    emitter: Box<dyn Emitter + 'b>,
+    emitter: Emitter,
 }
 
 impl<'b, T: Write + 'b> Session<'b, T> {
     pub fn new(config: Config, mut out: Option<&'b mut T>) -> Session<'b, T> {
-        let emitter = create_emitter(&config);
+        let emitter = Emitter::new(&config);
 
         if let Some(ref mut out) = out {
             let _ = emitter.emit_header(out);
@@ -510,24 +508,6 @@ impl<'b, T: Write + 'b> Session<'b, T> {
             || self.has_diff()
             || self.has_unformatted_code_errors()
             || self.errors.has_macro_format_failure)
-    }
-}
-
-pub(crate) fn create_emitter<'a>(config: &Config) -> Box<dyn Emitter + 'a> {
-    match config.emit_mode() {
-        EmitMode::Files if config.make_backup() => {
-            Box::new(emitter::FilesWithBackupEmitter::default())
-        }
-        EmitMode::Files => Box::new(emitter::FilesEmitter::new(
-            config.print_misformatted_file_names(),
-        )),
-        EmitMode::Stdout | EmitMode::Coverage => {
-            Box::new(emitter::StdoutEmitter::new(config.verbose()))
-        }
-        EmitMode::Json => Box::new(emitter::JsonEmitter::default()),
-        EmitMode::ModifiedLines => Box::new(emitter::ModifiedLinesEmitter::default()),
-        EmitMode::Checkstyle => Box::new(emitter::CheckstyleEmitter::default()),
-        EmitMode::Diff => Box::new(emitter::DiffEmitter::new(config.clone())),
     }
 }
 

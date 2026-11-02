@@ -1,0 +1,23 @@
+{
+  "id": "00249",
+  "from_lane": "db-ty-port-solver",
+  "owner": "solver-sync",
+  "paths": [
+    "crates/hir-ty/src/next_solver/solver.rs"
+  ],
+  "what": "## 1. solver-sync: where a port of `rustc_transmute` lives\n\n`SolverDelegate::is_transmutable` (`crates/hir-ty/src/next_solver/solver.rs`) answered\n`Ok(Answer::Yes)` for every pair, so every `TransmuteFrom` goal held unproven. That is a\nfallback, so it now stops with a panic that names the goal. rustc answers with\n`rustc_transmute::TransmuteTypeEnv::is_transmutable(src, dst, Assume::from_const(assume))`\n(`rustc_trait_selection/src/solve/delegate.rs` at 16d1ffac). Only code under\n`#![feature(transmutability)]` reaches it.\n\nWanted: a decision on where the port goes. It is a layout-level analysis, so it is front-end\nsemantics (semantics-in-front-end): its own salsa crate beside `hir-ty`, over `hir-ty`'s layout.\nsolver-sync-glue asked the same at 19:22. Once it exists, `is_transmutable` calls it as rustc's\ndelegate does.\n\n> forwarded to solver-sync (the same as solver-sync-glue 2; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:35:09Z",
+  "updated": "2026-10-30T02:35:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-port-solver.md#1. solver-sync: where a port of `rustc_transmute` lives",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-port-solver.md:3"
+    }
+  ]
+}

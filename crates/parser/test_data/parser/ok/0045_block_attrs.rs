@@ -18,7 +18,7 @@ fn outer() {
 
 // https://github.com/rust-lang/rust-analyzer/issues/689
 impl Whatever {
-    fn salsa_event(&self, event_fn: impl Fn() -> Event<Self>) {
+    fn query_event(&self, event_fn: impl Fn() -> Event<Self>) {
         #![allow(unused_variables)] // this is  `inner_attr` of the block
     }
 }

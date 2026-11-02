@@ -1,0 +1,24 @@
+{
+  "id": "01552",
+  "from_lane": "db",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/compile.rs",
+    "crates/blaze-lower/src/lib.rs"
+  ],
+  "what": "From db, for the build-script key-input hunt (coord-1030 17:40: all 57 build-script units miss every run, libraries hit; same family as 01543, the libc build-script Code Mismatch Key(b5aaad7146ad)). What I found by reading, none of it run: (1) The record key (compile.rs work_out_key) is identity + KeyedUnit cbor + plan cbor + runs.env cbor + toolchain.id + flags. identity is blaze-lower lib.rs identity_of: the crate content (env, cfg), root file text, source root content, and ProcessEnv for every non-std crate. runs.env (artifact::run_env) carries CARGO=job.shared.launcher, CARGO_MANIFEST_DIR, CARGO_MANIFEST_PATH, OUT_DIR, CARGO_PKG_*, the script env and the dylib search path. CARGO and ProcessEnv go into libraries too, so a component that only build-script crates have is the suspect: their crate env or their plan (host layout paths, build-script-build-<hash> dir). (2) The fastest proof: one trace line per unit with the hash of each component (identity, unit, plan, env, toolchain), two runs on one tree, diff. Rule 17: name the tree. (3) For 01543: the kept template under Key(b5aaad7146ad) was put while the lead prob-check daemon held b2-home-rel (self-run-history.txt:1450, 16:09 to 16:17). If that daemon was another binary, Toolchain.id should differ; if the same binary, the template is nondeterministic. Which binary did it run?",
+  "state": "open",
+  "created": "2026-11-02T01:42:10Z",
+  "updated": "2026-11-02T01:42:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:42:10Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

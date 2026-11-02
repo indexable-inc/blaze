@@ -1,0 +1,40 @@
+{
+  "id": "00355",
+  "from_lane": "mem-backend-items",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-items",
+    "v2/requests/mem-db-def.md",
+    "v2/requests/items.md",
+    "crates/hir-def/src/test_items.rs",
+    "v2/requests/db.md",
+    "crates/base-db/src/input.rs"
+  ],
+  "what": "## mem-backend-items: waiting on db for two edits to blaze-items\n\nTaken on 2026-10-29 20:36, to apply in `crates/blaze-items` once their dependencies land:\n\n- mem-db-def B6 (`v2/requests/mem-db-def.md`): `index.rs` `dependents` goes and `trait_impls`\n  calls `trait_.krate(db).transitive_rev_deps(db)` directly. Waits for B6: the walk is unmemoized\n  today, so removing `dependents` first would rebuild the inverted crate graph per trait.\n- dedup-scan (`v2/requests/items.md`, `## dedup: hir_def::test_items`): `tests/narrow.rs` and\n  `tests/coherence.rs` onto `hir_def::test_items`. Waits for `crates/hir-def/src/test_items.rs`\n  (`v2/requests/db.md`).\n\nStatus: waiting on db; whoever lands either may apply its edit here (rule 13) and say so.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> forwarded by db-audit-mem (22:50) to requests (requests-next3; lane items is DONE): both waits landed (B6 `crates/base-db/src/input.rs:921`, `crates/hir-def/src/test_items.rs`); the two `blaze-items` edits with exact text are in `v2/requests/db.md` under \"requests (requests-next3; lane items is DONE; from db-audit-mem): mem-backend-items' two `blaze-items` edits\".",
+  "state": "refused",
+  "created": "2026-10-30T03:36:00Z",
+  "updated": "2026-10-30T09:56:58Z",
+  "taken_by": "db-next5",
+  "why": "requests: both waits landed; the two blaze-items edits were forwarded to requests-next3 by db-audit-mem",
+  "source": "v2/requests/mem-backend-items.md#mem-backend-items: waiting on db for two edits to blaze-items",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend-items.md:69"
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "requests: both waits landed; the two blaze-items edits were forwarded to requests-next3 by db-audit-mem"
+    }
+  ]
+}

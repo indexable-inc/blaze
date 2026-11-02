@@ -1,5 +1,6 @@
-# rowan 0.17.0 from crates.io, with a second kind of tree in its cursor: a flat one (`flat.rs`),
-# made for the trees nobody edits. Everything else is as published.
+# blaze's syntax trees: flat trees (`flat.rs`), packed arrays (a token 4 bytes, a node 8) over a
+# shared source, with lazy nodes whose parts are parsed when a cursor enters them, and the cursors
+# over them. Every parse makes one; an edit makes a new one. (It began as rowan 0.17.0.)
 [package]
 name = "syntax-tree"
 version = "0.0.0"
@@ -10,18 +11,22 @@ description = "Library for generic lossless syntax trees"
 edition = "2021"
 publish = false
 
-exclude = [".github/", "bors.toml", "rustfmt.toml"]
-
 [dependencies]
-rustc-hash = "1.0.1"
-hashbrown = { version = "0.14.3", features = [
-    "inline-more",
-], default-features = false }
-text-size = "1.1.0"
-memoffset = "0.9"
-countme = "3.0.0"
+blaze-bytes.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+text-size.workspace = true
 
-serde = { version = "1.0.89", optional = true, default-features = false }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-spin.workspace = true
+parking_lot.workspace = true
 
 [features]
 serde1 = ["serde", "text-size/serde"]
+
+[lints]
+workspace = true

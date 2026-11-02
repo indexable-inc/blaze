@@ -1,0 +1,24 @@
+{
+  "id": "00680",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-global/src/sign.rs",
+    "crates/blaze-global"
+  ],
+  "what": "## fastcompile-global 4: ci: the builders publish, and the cache serves (`.github/`, `crates/blaze-global/src/sign.rs` `PINNED`)\n\nWhat:\n\n- A publisher key: an Ed25519 seed of 32 bytes made once, kept as the secret\n  `BLAZE_GLOBAL_PUBLISHER_SEED` of the release environment and never exposed to pull requests\n  from forks. Its public key goes into `blaze_global::sign::PINNED` (in `crates/blaze-global`,\n  through a PR naming the key in hex). Rotation is a release that adds the new key, then one that\n  drops the old.\n- A release-train job per target, in an ix VM, after main's build. Cold-build the crates.io\n  dependencies of blaze itself and of the corpus (`harness/`) with the pinned toolchain. Then,\n  for every value made from public inputs (`Rule` passes it), call\n  `client.publish(&public, bytes, &publisher, &secrets, ..)`, with\n  `secrets.publisher(&publisher)` and `secrets.env(std::env::vars_os(), &[])`, and publish each\n  lock's `Manifest::sign(BundleId::of(&spec), ..)` with `client.publish_bundle`. A value\n  `Secrets` refuses fails the job, naming the key and the secret's source.\n- The server: `blaze_global::Server::new(at, TlsServer::new(config), Trust::pinned()?, tags)`\n  with its own store, behind TLS (a certificate for the cache's host), routing completions as\n  the daemon does. `Server::durable` is called with the store's durable tickets.\n\nWhy: idea 8, the publish side. Only blaze's builders hold a pinned key, so only what they built\nis fetched. A machine needs no credential to fetch, and the server needs none to take a publish:\na record is taken only when signed by a pinned key.\n\n> forwarded to coordinator (the release-train job, the publisher secret, the server's deployment in `.github/`) and fastcompile (`PINNED` in `crates/blaze-global/src/sign.rs`, once the key exists).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-global 4: ci: the builders publish, and the cache serves (`.github/`, `crates/blaze-global/src/sign.rs` `PINNED`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:891"
+    }
+  ]
+}

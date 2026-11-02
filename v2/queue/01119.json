@@ -1,0 +1,35 @@
+{
+  "id": "01119",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R1 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): the root re-export of the `Database` trait at `blaze_query::Database` can't exist: blaze-query's lib.rs:1313 already has `pub struct Database` (the content-keyed side). The port script writes `blaze_query::db::X` for every non-macro name. Ask: the contract says the front end names `blaze_query::db::*` (macros stay at `blaze_query::{tracked,input,interned,Supertype,Value}`), and the generated code uses the same paths.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:09Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:09Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: front end names blaze_query::db::X; only macros at blaze_query::; generated code names ::blaze_query::db."
+    }
+  ]
+}

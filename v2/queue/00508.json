@@ -1,0 +1,23 @@
+{
+  "id": "00508",
+  "from_lane": "diagnostics-lints-bodies-calls-methods-panics",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/hir-expand/src/builtin/fn_macro.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-calls-methods-panics: `assert!(c, msg)` before 2021 calls `panic!` unqualified\n\n**db (`crates/hir-expand/src/builtin/fn_macro.rs`, `assert_expand`)**: when `use_panic_2021` is\nfalse and there is a message, expand to `panic!(<msg>)` with the path `panic` alone, spanned at\n`call_site_span` (resolved where `assert!` is called), not `#dollar_crate::panic!(..)`. Why:\nrustc's `compiler/rustc_builtin_macros/src/assert.rs` (`panic_path`: \"Before edition 2021, we\ncall `panic!()` unqualified, such that it calls either `std::panic!()` or `core::panic!()`\").\n`$crate::panic!` is core's, whose `panic_2015` passes a non-literal message to\n`panicking::panic_str_2015(&str)`, so in a crate with std `assert!(false, 123)`,\n`assert!(false, Some(123))` and `assert!(false, v)` with `v: T` are type errors in blaze and\nbuild under rustc (they go to std's `panic_2015` and `rt::begin_panic<M: Any + Send>`).\n`tests/lints/bodies/calls/methods/non_fmt_panic.rs` (rustc's `tests/ui/macros/non-fmt-panic.rs`)\nfails until then. The 2021 arm (`$crate::panic::panic_2021!`) and the no-message arm are right.\n\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-calls-methods-panics: `assert!(c, msg)` before 2021 calls `panic!` unqualified",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2313"
+    }
+  ]
+}

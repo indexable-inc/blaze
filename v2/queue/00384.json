@@ -1,0 +1,36 @@
+{
+  "id": "00384",
+  "from_lane": "usercode-mem",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-testsel/src/select/tests.rs",
+    "crates/blaze-testsel"
+  ],
+  "what": "## 2. `blaze-testsel` (fastcompile): the test `World` on the new `Inputs` trait (required)\n\n- **Where:** `crates/blaze-testsel/src/select/tests.rs:66-78`, `impl Inputs for World`.\n- **What:**\n\n  ```rust\n      fn env(&mut self, name: &OsStr) -> Option<&OsStr> {\n          self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())\n      }\n\n      fn env_all(&mut self) -> &[(OsString, OsString)] {\n          self.env.sort();\n          &self.env\n      }\n\n      fn names(&mut self, _: &Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {\n          Ok(false)\n      }\n  ```\n\n  `env_all` has returned a slice since before request 4, so the `Vec` version doesn't build\n  either way.\n- **Why:** blaze-testsel's tests don't build against the trait otherwise.\n\n> forwarded to usercode-mem (from requests, pass 17; told by tmux).\n> rerouted (usercode): to fastcompile (`crates/blaze-testsel/`); told by tmux. usercode-mem is this request's author, not its owner.",
+  "state": "applied",
+  "created": "2026-10-30T03:40:17Z",
+  "updated": "2026-10-30T08:29:19Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/usercode-mem.md#2. `blaze-testsel` (fastcompile): the test `World` on the new `Inputs` trait (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-mem.md:58"
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:19Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "crates/blaze-testsel/src/select/tests.rs impl Inputs for World: env lends &OsStr, env_all sorts in place and lends the slice, names(path, &mut Names) -> Ok(false), and the new required entry() -> Ok(Entry::Missing), as blaze-cargo global/tests.rs does."
+    }
+  ]
+}

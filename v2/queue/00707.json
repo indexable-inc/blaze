@@ -1,0 +1,23 @@
+{
+  "id": "00707",
+  "from_lane": "db-expand-derive",
+  "owner": "db-expand-pointee",
+  "paths": [
+    "harness/v2/frontend/cases"
+  ],
+  "what": "## db-expand-derive: CoercePointee parts rustc has and blaze doesn't\n\nFiled by db-expand-derive (2026-10-29 23:41) after applying (12) and checking it against\nrustc's `coerce_pointee.rs` at the pin (`16d1ffac17ad8b739e32483ac2e65fe7e1804977`). With (12)\nthe impls blaze writes match rustc's. These four parts remain, each a superset-of-rust gap\nthat this lane can't close on its own:\n\n1. **`CoercePointeeValidated` impl.** rustc also emits\n   `unsafe impl<..> ::core::marker::CoercePointeeValidated for Ptr<..> {}`, and its builtin\n   coherence check (in `rustc_hir_analysis`) refuses with E0802 what the derive's syntactic\n   checks can't see. The impl text is\n   `derive_macro.rs`'s; the check belongs in hir-ty's coherence (semantics-in-front-end).\n2. **`NonGenericPointee` errors.** rustc's `DetectNonGenericPointeeAttr` visitor reports each\n   `#[pointee]` that isn't on a type parameter (on a lifetime, a const parameter, or anywhere\n   in the item), alongside any other error. `ExpandError` holds one error, so blaze can't\n   report them together. This needs a multi-error `ExpandResult` (hir-expand's `lib.rs`, not\n   this lane's files) before `coerce_pointee_derive` can push them.\n3. **TooManyPointees label.** rustc labels the second `#[pointee]` \"here another type\n   parameter is marked as `#[pointee]`\". Blaze's `BuiltinError` carries the primary span only;\n   the label needs secondary spans on `BuiltinError`.\n4. **Const argument expressions.** rustc's `TypeSubstitution` walks into a const argument's\n   expression and substitutes a type there. Blaze's walk stops at const arguments. Only\n   `generic_const_exprs` lets a struct's bounds hold such an expression, so this matters only\n   for that feature. It needs an expression walk in `pointee_paths`.\n\nEach needs a differential test against rustc in `harness/v2/frontend/cases/`.\n\n> routed by db-expand (db-expand-next2, 2026-10-29 23:44) to `db-expand-pointee`, after E11 and T1 (d). Parts 2, 3 and 4 and part 1's impl are hir-expand's (db-expand's), so this lane can close them:\n> - Part 4: the walk.\n> - Part 3: `BuiltinError::also_at` exists (`lib.rs:216`) but has no labels. The labels are added in hir-expand; the rendering is filed for diagnostics.\n> - Part 1: the impl is emitted. The E0802 coherence check is filed for db (hir-ty). If minicore lacks the trait, that is filed for the coordinator.\n> - Part 2: the multi-error expansion result. Its callers outside hir-expand are filed for their owners.\n> forwarded to db-expand-pointee (requests, pass 41: as db-expand-next2 routed it; hir-expand is db's)\n> db-expand-derive (23:52), for db-expand-pointee: `BuiltinDeriveExpander::expand` now runs `with_automatically_derived` on every derive's expansion (see the heading below). It marks every top-level `impl`, and every top-level invisible group that starts with `impl`. Write part 1's `CoercePointeeValidated` impl like the other two (`in_group` + `write_impl`) and it gets `#[automatically_derived]` too, as rustc's does.",
+  "state": "open",
+  "created": "2026-10-30T06:41:00Z",
+  "updated": "2026-10-30T06:41:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-derive: CoercePointee parts rustc has and blaze doesn't",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:18236"
+    }
+  ]
+}

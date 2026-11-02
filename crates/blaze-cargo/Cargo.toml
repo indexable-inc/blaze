@@ -23,130 +23,120 @@ unsandboxed-tests = [
 ]
 
 [dependencies]
-# The store of `#[blaze::cache]`, which `blaze cache` lists and clears; its library is
-# named `blaze` too.
-fn-cache = { package = "blaze-cache", path = "../blaze-cache" }
 anyhow.workspace = true
-serde.workspace = true
-serde_derive.workspace = true
+blaze-diagnostics.workspace = true
+blaze-hash.workspace = true
+blaze-item-hash.workspace = true
+blaze-items.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-ub.workspace = true
+hir-ty-pure.workspace = true
+# `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
+blaze-doc.workspace = true
+# `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
+# blaze-wasm's `wasm` feature never reaches this build.
+blaze-wasm-pack.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
 cfg.workspace = true
-cargo-platform = "0.3.3"
-toolchain.workspace = true
 intern.workspace = true
-memmap2 = "0.9"
-object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
-# Writes an rlib again whose objects had statics made linkable (`weaken::shared`): rustc's own
-# archive writer.
-ar_archive_writer = "0.5.3"
-rustc-hash.workspace = true
-salsa.workspace = true
-same-file = "1"
-dunce = "1"
-sha2 = "0.10"
-cargo_metadata.workspace = true
-shlex = "2"
+blaze-sha256.workspace = true
 toml.workspace = true
-thorin-dwp = "0.10"
-typed-arena = "2.0.2"
 
 hir-ty-codegen.workspace = true
-blaze-macro-wasm.workspace = true
-blaze-store.workspace = true
-blaze-fmt.workspace = true
-blaze-lints.workspace = true
+blaze-macro-eval.workspace = true
 blaze-manifest.workspace = true
-blaze-metadata.workspace = true
-blaze-new.workspace = true
-blaze-profile.workspace = true
+blaze-global.workspace = true
 blaze-graph.workspace = true
+blaze-history.workspace = true
+# `BLAZE_PROFILE`: the client puts the profile together, the daemon writes its part of each build.
+blaze-profile.workspace = true
+# `blaze explore`: the explorer's server, started in the daemon on the first request for it.
+blaze-explore.workspace = true
+# The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
+arrow-array.workspace = true
+blaze-inproc.workspace = true
+blaze-intent.workspace = true
+# `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
+# baselines the client checks a run's counts against.
+blaze-lints.workspace = true
+blaze-image.workspace = true
+blaze-mem.workspace = true
 blaze-protocol.workspace = true
-blaze-tree.workspace = true
+proc-macro-api.workspace = true
 blaze-ui.workspace = true
-blaze-web.workspace = true
-blaze-units.workspace = true
-blaze-resolve = { path = "../blaze-resolve" }
-blaze-registry = { path = "../blaze-registry" }
-blaze-build-script = { path = "../blaze-build-script" }
-cargo-util-schemas = "=0.14.3"
-ide-db.workspace = true
-project-model.workspace = true
-vfs.workspace = true
-triomphe.workspace = true
+# With `query`: the workspace load and unit graph as queries, for v2's daemon.
+blaze-units = { workspace = true, features = ["query"] }
+blaze-registry.workspace = true
+# The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
+blaze-source.workspace = true
+blaze-build-script.workspace = true
 paths.workspace = true
 syntax.workspace = true
-# Without the features that bring a second HTTP and TLS stack (`rustls`), a C library built
-# with cmake (`default-https-client`, which is aws-lc) and SigV4A. The client is hyper 1 over
-# rustls with ring, which is in the tree already.
-aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
-aws-sdk-s3 = { version = "1.100", default-features = false, features = ["behavior-version-latest", "rt-tokio", "http-1x"] }
-# The TLS the client above is built on, named to tell a certificate that is refused from a
-# network that is down.
-rustls = { version = "0.23", default-features = false }
-aws-smithy-http-client = { version = "1.1", features = ["rustls-ring"] }
-# A remote over HTTPS, such as a release's assets, on the same client and TLS as S3's.
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
-http-body-util = "0.1"
-tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-ed25519-dalek = "2.2"
-getrandom = "0.3"
+stdx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
+futures-util = { workspace = true, features = ["std"] }
 url.workspace = true
 semver.workspace = true
-# `cargo remove` edits manifests as cargo's `toml_mut` does, layout and comments kept: the
-# version blaze-manifest and blaze-new read and write with.
-toml_edit = { version = "=0.25.12", default-features = false, features = ["display", "parse"] }
-tar = "0.4.44"
+tar = { workspace = true, features = ["default"] }
 # The zips build scripts download, unpacked where a crate's variable names a directory
 # (`cargo/fetches.rs`): deflate on flate2, which is in the tree already.
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+zip = { workspace = true, features = ["deflate-flate2"] }
 # The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
-flate2 = "1.1.9"
-zstd = "0.13.3"
+flate2 = { workspace = true, features = ["default"] }
+zstd = { workspace = true, features = ["default"] }
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
-# The keys and signatures of nixpkgs' binary cache (`cargo/closure/narinfo.rs`); already in the
-# graph, by hyper-util.
-base64 = "0.23"
-blaze-live = { path = "../blaze-live" }
-# What a client waits for of an executable the daemon splices in place (`crate::splice`).
-blaze-in-place = { path = "../blaze-in-place" }
-# blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
-# feature `wasi`.
-blaze-wasi = { path = "../blaze-wasi" }
+lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
+blaze-live.workspace = true
+# blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
+# query database, the store, the workspace load's queries, user code, codegen and the linker.
+blaze-api.workspace = true
+blaze-core.workspace = true
+blaze-vfs.workspace = true
+blaze-query.workspace = true
+blaze-cas.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
+blaze-codegen.workspace = true
+blaze-testsel.workspace = true
+blaze-lazy.workspace = true
+blaze-link.workspace = true
+blaze-lower.workspace = true
+base-db.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
+# `extended`: the `mi_collect` binding.
+libmimalloc-sys = { workspace = true, features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-tikv-jemalloc-ctl = "0.5.4"
-tikv-jemalloc-sys = "0.5.4"
-
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The in-process fake of the cache gateway that `remote/gateway/tests.rs` talks to.
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
-tokio = { version = "1.47", features = ["net"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "encoder"] }
-tempfile = "3"
+# Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
+blaze-alloc-count.workspace = true
+tokio = { workspace = true, features = ["net"] }
+lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-find-msvc-tools = "0.1"
-uds_windows = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
+uds_windows.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }
 
 [features]
 # Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
-heap-profile = ["tikv-jemalloc-sys/profiling"]
+heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm` or a profile's `opt-level`.
 llvm = ["hir-ty-codegen/llvm"]
 
-# Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
-# (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.
-wasi = ["blaze-wasi/run"]
 
 [lints]
 workspace = true

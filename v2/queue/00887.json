@@ -1,0 +1,23 @@
+{
+  "id": "00887",
+  "from_lane": "speed-sol2-small",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "## speed-sol2-small: intern hit 1.7x its bound: the second mix of the hash (solver-sync speed-of-light section 1, item 2)\n\n- Where: `crates/hir-ty/src/next_solver/interner.rs` ~3504, `hash_of`: Fx hash then murmur's 64-bit finalizer.\n- Why: the finalizer is ~8 of the hit's ~41 cycles (bound ~24). Fx's high bits are well mixed, its low bits are not.\n- Change: take the shard from bits 58..63 and the slot from bits 26..57 of the plain Fx hash; drop the finalizer. First check the slot spread on real types: a test that interns the corpus's types (or the hir-ty test fixtures' types) and asserts the mean probe length stays within 10% of today's.\n- With item 1 (00149, reserved column bases) the hit is ~26 cycles, within 10%.",
+  "state": "open",
+  "created": "2026-10-30T09:28:58Z",
+  "updated": "2026-10-30T09:28:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:28:58Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

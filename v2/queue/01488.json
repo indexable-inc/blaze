@@ -1,0 +1,26 @@
+{
+  "id": "01488",
+  "from_lane": "observe-history",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/serve/job.rs",
+    "crates/blaze-cargo/src/serve/observe.rs",
+    "crates/blaze-cargo/src/cli/observe.rs",
+    "crates/blaze-cargo/src/cli.rs"
+  ],
+  "what": "observe-history (Andrew: errors as rows + blaze debug diff A B): blaze-profile now has errors.rs (errors::rows, Said, Of, ErrorRow, Kind), History::errored(rows) and diff.rs (diff::run(a, b, duckdb, history) -> String, Side::parse). Two call sites are yours:\n1) Daemon: for each Response::Diagnostic of level Error a build says (serve/job.rs compiled(), ~line 2273, and the ApiError a job ends with), call blaze_profile::errors::rows(Said { code: diagnostic.code.as_deref(), message: &diagnostic.message, detail: first help/note child message, file/line: primary span }, Of { build_id, t_ns: Some(clock::mono_ns()), krate: unit package name, unit: cargo-style unit name e.g. `serde (build script)` }, &mut rows), and send the rows to the blaze-history thread with the build's BuildRow (serve/observe.rs: the ended channel; History::errored(rows) before history.build_ended/flush). For the refused-functions error (serve/unit/compile.rs:927) pass the message built with every function (refused_error(..., None)) to errors::rows, so each function is a row even past --refused 16.\n2) CLI: `blaze debug diff A B` in cli/observe.rs debug(): print blaze_profile::diff::run(&Side::parse(a), &Side::parse(b), observe::duckdb(env BLAZE_DUCKDB)?.as_deref(), &history::dir_in(&state)); a side is a build number or a build log path; errors are DiffError (Display). Add the line to cli.rs usage beside `debug sql`.\nAlso note: unit spans carry krate = target name, so every build script is `build-script-build` in the units diff; passing the package name too (a field `package`) would make units distinct.",
+  "state": "open",
+  "created": "2026-11-01T11:44:13Z",
+  "updated": "2026-11-01T11:44:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T11:44:13Z",
+      "by": "observe-history",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

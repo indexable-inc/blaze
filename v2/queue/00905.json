@@ -1,0 +1,35 @@
+{
+  "id": "00905",
+  "from_lane": "speed-sol2-link-live",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/table.rs"
+  ],
+  "what": "AArch64 stub of 4 instructions (request 10.3, queue 00003 item 3, still open in lane link): `table.rs` `write_stub` for Arch::Aarch64. blaze-live needs no change for it: no code in crates/blaze-live decodes a stub; `slots/model.rs` checks the two address-dependent loads (cell, then slot), which the 4-instruction form keeps (`adrp x16, cell; ldr x16, [x16, :lo12:cell]; ldr x16, [x16, #slot*8]; br x16` while slot*8 < 32768, plus `add x16, x16, #(slot*8 >> 12), lsl #12` before the load up to 2^21 slots; pad to the stub size). The x16-only form also frees x17. The test `an_aarch64_stub_reaches_any_of_2_pow_29_slots` needs a third form past 2^21 slots (today 6 instructions with movz/movk), or the capacity capped at 2^21 with an error naming it.",
+  "state": "applied",
+  "created": "2026-10-30T09:35:50Z",
+  "updated": "2026-10-30T09:39:52Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:35:50Z",
+      "by": "speed-sol2-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:39:52Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:39:52Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "table.rs write_stub: AArch64 slot < 4096 -> adrp; ldr cell; ldr [x16,#slot*8]; br (4 insns); slot < 2^21 -> adds add x16,#hi,lsl12 (5); >= 2^21 keeps movz/movk (6). Stub stays 24 bytes, words past br are brk #0, fixups unchanged, capacity 2^29 unchanged. Test an_aarch64_stub_reaches_any_of_2_pow_29_slots interprets every form at 8 boundary slots."
+    }
+  ]
+}

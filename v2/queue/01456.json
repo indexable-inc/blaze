@@ -1,0 +1,32 @@
+{
+  "id": "01456",
+  "from_lane": "coordinator",
+  "owner": "tests-misc-lints",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-lints/src/blaze/alloc.rs",
+    "crates/blaze-lints/src/level.rs",
+    "crates/blaze-lints/src/blaze/tests.rs"
+  ],
+  "what": "From Andrew: turn blaze::hot_alloc on for blaze's own code. New AGENTS.md rule bump-allocate (tools/agents/rules.ts:70): task-lifetime collections name their allocator (Vec::new_in(frame) from blaze_mem::frame::current); a global allocation needs '// alloc: <why>'. Today blaze::hot is allowed by default and no manifest turns it on. Steps: (1) set it to warn in the root workspace manifest's [workspace.lints.blaze] (cargo ignores lint tools it does not know; blaze reads [lints.blaze]; the root edit is the coordinator's file, so put the exact lines in your report and I apply them) and count findings per crate. The coordinator runs one blaze check for the counts; until v2 checks itself, give the counts from tools/v2/hot_lint.py over the workspace and say how its rules differ from the lint's. (2) Deny it crate by crate, starting with hir-ty, hir-def, blaze-query and base-db, fixing each finding (new_in(frame)) or exempting it with '// alloc: <why>'. (3) A test, named for the property, that a fresh Vec::new() in a denied crate fails the check. Report the per-crate counts before any deny lands.",
+  "state": "taken",
+  "created": "2026-11-01T04:20:46Z",
+  "updated": "2026-11-01T04:21:10Z",
+  "taken_by": "tests-misc-lints",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:20:46Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:21:10Z",
+      "by": "tests-misc-lints",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

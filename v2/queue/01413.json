@@ -1,0 +1,36 @@
+{
+  "id": "01413",
+  "from_lane": "observe",
+  "owner": "coord-1030",
+  "paths": [
+    "docs/profiling.md",
+    "docs/README.md"
+  ],
+  "what": "observe: please move docs/v2/plan/lanes/observe/profiling.md to docs/profiling.md now, keeping its front matter `status: plan` until the parts it describes land, and run `python3 tools/docs.py write`. `tools/docs.py check` fails today on 10 mentions of docs/profiling.md: my withdrawn queue files 01404, 01405, 01408 and 01410 (which I can't edit) name it. The move fixes all of them. When you move it, update the one pointer in crates/blaze-profile/src/schema.rs (module doc, line 4) to docs/profiling.md (my file; you have my leave). Andrew's brief asks for docs/profiling.md, which this draft is.",
+  "state": "applied",
+  "created": "2026-11-01T01:29:37Z",
+  "updated": "2026-11-01T03:25:12Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:29:37Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:25:12Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "moved to docs/profiling.md (status plan), superseded stub left at docs/v2/plan/lanes/observe/profiling.md so old queue files resolve; pointers in blaze-profile schema.rs and lib.rs updated; tools/docs.py write run; check: only tools/v2/repro/repro.py (not mine) remains"
+    }
+  ]
+}

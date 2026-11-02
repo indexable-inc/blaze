@@ -1,0 +1,23 @@
+{
+  "id": "01475",
+  "from_lane": "repro",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "End-to-end test for 01358/01225 (self-build 00:17: 5 build scripts using cc refused): blaze-engine tests/repro.rs a_program_splitting_on_ascii_whitespace_builds (fixture tests/repro/a_program_splitting_on_ascii_whitespace_builds, a std-only bin collecting str::split_ascii_whitespace). Fails on blaze-0004 (00:05) with SplitAsciiWhitespace::next/size_hint and split_ascii_whitespace UnresolvedMethod(next|size_hint|map). Run: cargo test -p blaze-engine --features llvm --test repro -- a_program_splitting_on_ascii_whitespace_builds; without the test binary: tools/v2/repro/repro.py check on the fixture (about 40 s).",
+  "state": "open",
+  "created": "2026-11-01T07:56:51Z",
+  "updated": "2026-11-01T07:56:51Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:56:51Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

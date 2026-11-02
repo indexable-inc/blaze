@@ -1,0 +1,24 @@
+{
+  "id": "01479",
+  "from_lane": "repro",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty-codegen/v2/build.rs"
+  ],
+  "what": "Two intermittent failures on blaze-0004 (00:05), each 1 of 2 runs of an unchanged crate, for routing: (1) daemon panic hir-ty next_solver/interner.rs:3522 \"row 0 of the GenericArgs table was never written\" on a cold home, crate /tmp/blaze-repro/work/gm2 (bin, memchr 2.8.2 no-default, a provided generic trait method); (2) \"the IR builder did not read the unit settings (v2::build::building), so it built the function with the crate s\" (hir-ty-codegen v2/build.rs:102) on 2 instances args [u8] building a path lib with #![feature(allocator_api)], crate /tmp/blaze-repro/work/mself. Both look like scheduling races (shared flights), not reducible by a deterministic interestingness test.",
+  "state": "open",
+  "created": "2026-11-01T07:56:52Z",
+  "updated": "2026-11-01T07:56:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:56:52Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

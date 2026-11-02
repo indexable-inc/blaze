@@ -1,0 +1,390 @@
+; Follows cranelift/filetests/filetests/runtests/i128-bitops.clif (and i128-bitrev.clif,
+; i128-bswap.clif, i128-cls.clif, i128-clz.clif, i128-ctz.clif, i128-popcnt.clif,
+; i128-rotate.clif, i128-bmask.clif), for the stencil set: `band`, `bor`, `bxor`, `bnot`,
+; `bitselect`, `bitrev`, `bswap`, `cls`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr` and `bmask`
+; of `i128`, on values whose halves differ, so a lowering that mixes up the halves shows.
+; Upstream's `band_not`, `bor_not` and `bxor_not` are gone from Cranelift's IR (written here
+; as `bnot` and the base op).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %band_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = band v0, v1
+    return v2
+}
+; run: %band_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x00020446088a8ccefecc8a8806440200
+; run: %band_i128(0x0123456789abcdeffedcba9876543210, 0xfedcba98765432100123456789abcdef) == 0
+; run: %band_i128(-1, 0x00000000000000017fffffffffffffff) == 0x00000000000000017fffffffffffffff
+; run: %band_i128(0, 0x0123456789abcdeffedcba9876543210) == 0
+; run: %band_i128(0x80000000000000000000000000000000, 1) == 0
+; run: %band_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0
+
+function %bor_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bor v0, v1
+    return v2
+}
+; run: %bor_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf1337577f9bbfdfffffdfbb9f7757331
+; run: %bor_i128(0x0123456789abcdeffedcba9876543210, 0xfedcba98765432100123456789abcdef) == -1
+; run: %bor_i128(-1, 0x00000000000000017fffffffffffffff) == -1
+; run: %bor_i128(0, 0x0123456789abcdeffedcba9876543210) == 0x0123456789abcdeffedcba9876543210
+; run: %bor_i128(0x80000000000000000000000000000000, 1) == 0x80000000000000000000000000000001
+; run: %bor_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x0000000000000001ffffffffffffffff
+
+function %bxor_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bxor v0, v1
+    return v2
+}
+; run: %bxor_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf1317131f131713101317131f1317131
+; run: %bxor_i128(0x0123456789abcdeffedcba9876543210, 0xfedcba98765432100123456789abcdef) == -1
+; run: %bxor_i128(-1, 0x00000000000000017fffffffffffffff) == 0xfffffffffffffffe8000000000000000
+; run: %bxor_i128(0, 0x0123456789abcdeffedcba9876543210) == 0x0123456789abcdeffedcba9876543210
+; run: %bxor_i128(0x80000000000000000000000000000000, 1) == 0x80000000000000000000000000000001
+; run: %bxor_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x0000000000000001ffffffffffffffff
+
+function %bnot_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = bnot v0
+    return v1
+}
+; run: %bnot_i128(0) == -1
+; run: %bnot_i128(1) == -2
+; run: %bnot_i128(-1) == 0
+; run: %bnot_i128(0x0000000000000000ffffffffffffffff) == 0xffffffffffffffff0000000000000000
+; run: %bnot_i128(0x00000000000000010000000000000000) == 0xfffffffffffffffeffffffffffffffff
+; run: %bnot_i128(0x80000000000000000000000000000000) == 0x7fffffffffffffffffffffffffffffff
+; run: %bnot_i128(0x7fffffffffffffffffffffffffffffff) == 0x80000000000000000000000000000000
+; run: %bnot_i128(0x0123456789abcdeffedcba9876543210) == 0xfedcba98765432100123456789abcdef
+; run: %bnot_i128(0xf0123456789abcdeffedcba987654321) == 0x0fedcba98765432100123456789abcde
+; run: %bnot_i128(0x00000000000000017fffffffffffffff) == 0xfffffffffffffffe8000000000000000
+; run: %bnot_i128(0xfffffffffffffffe8000000000000000) == 0x00000000000000017fffffffffffffff
+
+function %band_not_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = bnot v1
+    v3 = band v0, v2
+    return v3
+}
+; run: %band_not_i128(0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x01214121812141210010301070103010
+; run: %band_not_i128(0x0123456789abcdeffedcba9876543210, 0xfedcba98765432100123456789abcdef) == 0x0123456789abcdeffedcba9876543210
+; run: %band_not_i128(-1, 0x00000000000000017fffffffffffffff) == 0xfffffffffffffffe8000000000000000
+; run: %band_not_i128(0, 0x0123456789abcdeffedcba9876543210) == 0
+; run: %band_not_i128(0x80000000000000000000000000000000, 1) == 0x80000000000000000000000000000000
+; run: %band_not_i128(0x00000000000000010000000000000000, 0x0000000000000000ffffffffffffffff) == 0x00000000000000010000000000000000
+
+function %bitselect_i128(i128, i128, i128) -> i128 {
+block0(v0: i128, v1: i128, v2: i128):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect_i128(0x0000000000000000ffffffffffffffff, 0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf0123456789abcdefedcba9876543210
+; run: %bitselect_i128(0xffffffffffffffff0000000000000000, 0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x0123456789abcdefffedcba987654321
+; run: %bitselect_i128(0, 0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf0123456789abcdeffedcba987654321
+; run: %bitselect_i128(-1, 0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0x0123456789abcdeffedcba9876543210
+; run: %bitselect_i128(0x00ff00ff00ff00ff0f0f0f0f0f0f0f0f, 0x0123456789abcdeffedcba9876543210, 0xf0123456789abcdeffedcba987654321) == 0xf023346778abbceffeeccaa886644220
+
+function %bitrev_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = bitrev v0
+    return v1
+}
+; run: %bitrev_i128(0) == 0
+; run: %bitrev_i128(1) == 0x80000000000000000000000000000000
+; run: %bitrev_i128(-1) == -1
+; run: %bitrev_i128(0x0000000000000000ffffffffffffffff) == 0xffffffffffffffff0000000000000000
+; run: %bitrev_i128(0x00000000000000010000000000000000) == 0x00000000000000008000000000000000
+; run: %bitrev_i128(0x80000000000000000000000000000000) == 1
+; run: %bitrev_i128(0x7fffffffffffffffffffffffffffffff) == -2
+; run: %bitrev_i128(0x0123456789abcdeffedcba9876543210) == 0x084c2a6e195d3b7ff7b3d591e6a2c480
+; run: %bitrev_i128(0xf0123456789abcdeffedcba987654321) == 0x84c2a6e195d3b7ff7b3d591e6a2c480f
+; run: %bitrev_i128(0x00000000000000017fffffffffffffff) == 0xfffffffffffffffe8000000000000000
+; run: %bitrev_i128(0xfffffffffffffffe8000000000000000) == 0x00000000000000017fffffffffffffff
+
+function %bswap_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = bswap v0
+    return v1
+}
+; run: %bswap_i128(0) == 0
+; run: %bswap_i128(1) == 0x01000000000000000000000000000000
+; run: %bswap_i128(-1) == -1
+; run: %bswap_i128(0x0000000000000000ffffffffffffffff) == 0xffffffffffffffff0000000000000000
+; run: %bswap_i128(0x00000000000000010000000000000000) == 0x00000000000000000100000000000000
+; run: %bswap_i128(0x80000000000000000000000000000000) == 128
+; run: %bswap_i128(0x7fffffffffffffffffffffffffffffff) == -129
+; run: %bswap_i128(0x0123456789abcdeffedcba9876543210) == 0x1032547698badcfeefcdab8967452301
+; run: %bswap_i128(0xf0123456789abcdeffedcba987654321) == 0x21436587a9cbedffdebc9a78563412f0
+; run: %bswap_i128(0x00000000000000017fffffffffffffff) == 0xffffffffffffff7f0100000000000000
+; run: %bswap_i128(0xfffffffffffffffe8000000000000000) == 0x0000000000000080feffffffffffffff
+
+function %cls_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = cls v0
+    return v1
+}
+; run: %cls_i128(0) == 127
+; run: %cls_i128(1) == 126
+; run: %cls_i128(-1) == 127
+; run: %cls_i128(0x0000000000000000ffffffffffffffff) == 63
+; run: %cls_i128(0x00000000000000010000000000000000) == 62
+; run: %cls_i128(0x80000000000000000000000000000000) == 0
+; run: %cls_i128(0x7fffffffffffffffffffffffffffffff) == 0
+; run: %cls_i128(0x0123456789abcdeffedcba9876543210) == 6
+; run: %cls_i128(0xf0123456789abcdeffedcba987654321) == 3
+; run: %cls_i128(0x00000000000000017fffffffffffffff) == 62
+; run: %cls_i128(0xfffffffffffffffe8000000000000000) == 62
+
+function %clz_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = clz v0
+    return v1
+}
+; run: %clz_i128(0) == 128
+; run: %clz_i128(1) == 127
+; run: %clz_i128(-1) == 0
+; run: %clz_i128(0x0000000000000000ffffffffffffffff) == 64
+; run: %clz_i128(0x00000000000000010000000000000000) == 63
+; run: %clz_i128(0x80000000000000000000000000000000) == 0
+; run: %clz_i128(0x7fffffffffffffffffffffffffffffff) == 1
+; run: %clz_i128(0x0123456789abcdeffedcba9876543210) == 7
+; run: %clz_i128(0xf0123456789abcdeffedcba987654321) == 0
+; run: %clz_i128(0x00000000000000017fffffffffffffff) == 63
+; run: %clz_i128(0xfffffffffffffffe8000000000000000) == 0
+
+function %ctz_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = ctz v0
+    return v1
+}
+; run: %ctz_i128(0) == 128
+; run: %ctz_i128(1) == 0
+; run: %ctz_i128(-1) == 0
+; run: %ctz_i128(0x0000000000000000ffffffffffffffff) == 0
+; run: %ctz_i128(0x00000000000000010000000000000000) == 64
+; run: %ctz_i128(0x80000000000000000000000000000000) == 127
+; run: %ctz_i128(0x7fffffffffffffffffffffffffffffff) == 0
+; run: %ctz_i128(0x0123456789abcdeffedcba9876543210) == 4
+; run: %ctz_i128(0xf0123456789abcdeffedcba987654321) == 0
+; run: %ctz_i128(0x00000000000000017fffffffffffffff) == 0
+; run: %ctz_i128(0xfffffffffffffffe8000000000000000) == 63
+
+function %popcnt_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = popcnt v0
+    return v1
+}
+; run: %popcnt_i128(0) == 0
+; run: %popcnt_i128(1) == 1
+; run: %popcnt_i128(-1) == 128
+; run: %popcnt_i128(0x0000000000000000ffffffffffffffff) == 64
+; run: %popcnt_i128(0x00000000000000010000000000000000) == 1
+; run: %popcnt_i128(0x80000000000000000000000000000000) == 1
+; run: %popcnt_i128(0x7fffffffffffffffffffffffffffffff) == 127
+; run: %popcnt_i128(0x0123456789abcdeffedcba9876543210) == 64
+; run: %popcnt_i128(0xf0123456789abcdeffedcba987654321) == 68
+; run: %popcnt_i128(0x00000000000000017fffffffffffffff) == 64
+; run: %popcnt_i128(0xfffffffffffffffe8000000000000000) == 64
+
+function %rotl_i128_i8(i128, i8) -> i128 {
+block0(v0: i128, v1: i8):
+    v2 = rotl v0, v1
+    return v2
+}
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 4) == 0x123456789abcdeffedcba98765432100
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 63) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 65) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, 127) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, -128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, -127) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i8(0x0123456789abcdeffedcba9876543210, -1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i8(0x80000000000000000000000000000001, 1) == 3
+; run: %rotl_i128_i8(0x00000000000000010000000000000000, 64) == 1
+
+function %rotr_i128_i8(i128, i8) -> i128 {
+block0(v0: i128, v1: i8):
+    v2 = rotr v0, v1
+    return v2
+}
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 4) == 0x00123456789abcdeffedcba987654321
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 63) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 65) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, 127) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, -128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, -127) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i8(0x0123456789abcdeffedcba9876543210, -1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i8(0x80000000000000000000000000000001, 1) == 0xc0000000000000000000000000000000
+; run: %rotr_i128_i8(0x00000000000000010000000000000000, 64) == 1
+
+function %rotl_i128_i32(i128, i32) -> i128 {
+block0(v0: i128, v1: i32):
+    v2 = rotl v0, v1
+    return v2
+}
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 4) == 0x123456789abcdeffedcba98765432100
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 63) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 65) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 127) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, 129) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i32(0x0123456789abcdeffedcba9876543210, -1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i32(0x80000000000000000000000000000001, 1) == 3
+; run: %rotl_i128_i32(0x00000000000000010000000000000000, 64) == 1
+
+function %rotr_i128_i32(i128, i32) -> i128 {
+block0(v0: i128, v1: i32):
+    v2 = rotr v0, v1
+    return v2
+}
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 4) == 0x00123456789abcdeffedcba987654321
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 63) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 65) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 127) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, 129) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i32(0x0123456789abcdeffedcba9876543210, -1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i32(0x80000000000000000000000000000001, 1) == 0xc0000000000000000000000000000000
+; run: %rotr_i128_i32(0x00000000000000010000000000000000, 64) == 1
+
+function %rotl_i128_i64(i128, i64) -> i128 {
+block0(v0: i128, v1: i64):
+    v2 = rotl v0, v1
+    return v2
+}
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 4) == 0x123456789abcdeffedcba98765432100
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 63) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 65) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 127) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, 129) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i64(0x0123456789abcdeffedcba9876543210, -1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i64(0x80000000000000000000000000000001, 1) == 3
+; run: %rotl_i128_i64(0x00000000000000010000000000000000, 64) == 1
+
+function %rotr_i128_i64(i128, i64) -> i128 {
+block0(v0: i128, v1: i64):
+    v2 = rotr v0, v1
+    return v2
+}
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 4) == 0x00123456789abcdeffedcba987654321
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 63) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 65) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 127) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, 129) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i64(0x0123456789abcdeffedcba9876543210, -1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i64(0x80000000000000000000000000000001, 1) == 0xc0000000000000000000000000000000
+; run: %rotr_i128_i64(0x00000000000000010000000000000000, 64) == 1
+
+function %rotl_i128_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = rotl v0, v1
+    return v2
+}
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 4) == 0x123456789abcdeffedcba98765432100
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 63) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 65) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 127) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, 129) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotl_i128_i128(0x0123456789abcdeffedcba9876543210, -1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotl_i128_i128(0x80000000000000000000000000000001, 1) == 3
+; run: %rotl_i128_i128(0x00000000000000010000000000000000, 64) == 1
+
+function %rotr_i128_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = rotr v0, v1
+    return v2
+}
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 0) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 1) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 4) == 0x00123456789abcdeffedcba987654321
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 63) == 0xfdb97530eca8642002468acf13579bdf
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 64) == 0xfedcba98765432100123456789abcdef
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 65) == 0xff6e5d4c3b2a19080091a2b3c4d5e6f7
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 127) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 128) == 0x0123456789abcdeffedcba9876543210
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, 129) == 0x0091a2b3c4d5e6f7ff6e5d4c3b2a1908
+; run: %rotr_i128_i128(0x0123456789abcdeffedcba9876543210, -1) == 0x02468acf13579bdffdb97530eca86420
+; run: %rotr_i128_i128(0x80000000000000000000000000000001, 1) == 0xc0000000000000000000000000000000
+; run: %rotr_i128_i128(0x00000000000000010000000000000000, 64) == 1
+
+function %bmask_i128_i128(i128) -> i128 {
+block0(v0: i128):
+    v1 = bmask.i128 v0
+    return v1
+}
+; run: %bmask_i128_i128(0) == 0
+; run: %bmask_i128_i128(1) == -1
+; run: %bmask_i128_i128(-1) == -1
+; run: %bmask_i128_i128(0x80000000000000000000000000000000) == -1
+; run: %bmask_i128_i128(0x00000000000000010000000000000000) == -1
+; run: %bmask_i128_i128(0x0123456789abcdeffedcba9876543210) == -1
+
+function %bmask_i128_i64(i128) -> i64 {
+block0(v0: i128):
+    v1 = bmask.i64 v0
+    return v1
+}
+; run: %bmask_i128_i64(0) == 0
+; run: %bmask_i128_i64(1) == -1
+; run: %bmask_i128_i64(-1) == -1
+; run: %bmask_i128_i64(0x80000000000000000000000000000000) == -1
+; run: %bmask_i128_i64(0x00000000000000010000000000000000) == -1
+; run: %bmask_i128_i64(0x0123456789abcdeffedcba9876543210) == -1
+
+function %bmask_i128_i8(i128) -> i8 {
+block0(v0: i128):
+    v1 = bmask.i8 v0
+    return v1
+}
+; run: %bmask_i128_i8(0) == 0
+; run: %bmask_i128_i8(1) == -1
+; run: %bmask_i128_i8(-1) == -1
+; run: %bmask_i128_i8(0x80000000000000000000000000000000) == -1
+; run: %bmask_i128_i8(0x00000000000000010000000000000000) == -1
+; run: %bmask_i128_i8(0x0123456789abcdeffedcba9876543210) == -1
+
+function %bmask_i64_i128(i64) -> i128 {
+block0(v0: i64):
+    v1 = bmask.i128 v0
+    return v1
+}
+; run: %bmask_i64_i128(0) == 0
+; run: %bmask_i64_i128(1) == -1
+; run: %bmask_i64_i128(-1) == -1
+; run: %bmask_i64_i128(0x8000000000000000) == -1
+
+function %bmask_i8_i128(i8) -> i128 {
+block0(v0: i8):
+    v1 = bmask.i128 v0
+    return v1
+}
+; run: %bmask_i8_i128(0) == 0
+; run: %bmask_i8_i128(1) == -1
+; run: %bmask_i8_i128(-1) == -1
+; run: %bmask_i8_i128(-128) == -1

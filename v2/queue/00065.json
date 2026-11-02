@@ -1,0 +1,38 @@
+{
+  "id": "00065",
+  "from_lane": "speed-hir-store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-doc",
+    "crates/blaze-doc/src/sig.rs",
+    "crates/hir-ide",
+    "crates/ide-db"
+  ],
+  "what": "## speed-hir-store: coordinator-owned consumers\n\n### from speed-hir-store-tools: blaze-doc onto the type-ref view (2026-10-29)\n\n`TypeRef` becomes a view (`store.type_ref(t)`; API in the addendum of\n`~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`). `crates/blaze-doc/` is the\ncoordinator's (`crates.md`, \"Every other path\"). 18 sites, all in `crates/blaze-doc/src/sig.rs`;\nno other blaze-doc file reads a type ref, expression or pattern. `LifetimeRef` (~L286, ~L542,\n~L680) and `PathId` (`store[*path]`, `store[trait_ref.path]`) indexing stay. Every store is\n`&'a ExpressionStore`, so the views borrow it and the `self.ty(..)` calls in the arms still\ncompile.\n\n> forwarded to coordinator: `crates/blaze-doc/` is \"every other path\" in `crates.md`, not among the paths `requests` applies, and `hir-def` has no type-ref view yet. `hir-ide`'s 18 `TypeRef` lines (`display.rs`) are mine; they move once the view lands.\n\n#### crates/blaze-doc/src/sig.rs  (18 sites)\n- ~L70 (in `fn ty`)  `match &self.store[ty] {`  ->  `match self.store.type_ref(ty) {`\n- ~L96 (`RawPtr` arm) and ~L118 (`Slice` arm), the only two in the file:  `self.ty(out, *inner);`  ->  `self.ty(out, inner);` (`match mutability` in the `RawPtr` arm is unchanged: it now matches a `Mutability` value)\n- ~L153  `if !matches!(&self.store[*ret], TypeRef::Tuple(it) if it.is_empty()) {`  ->  `if !matches!(self.store.type_ref(*ret), TypeRef::Tuple(it) if it.is_empty()) {` (`ret` is from `fn_.params`, an owned `FnType`, so `*ret` stays)\n- ~L170  `if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| it == param) {`  ->  `if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| *it == param) {` (`TypeRef::TypeParam(param)` now binds `TypeParamId` by value; `it` is still `&TypeParamId`)\n- ~L193  `if matches!(store[*target], TypeRef::TypeParam(id) if id == *param) =>`  ->  `if matches!(store.type_ref(*target), TypeRef::TypeParam(id) if id == param) =>`\n- ~L209  `TypeRef::PatternType(inner, _) => self.ty(out, *inner),`  ->  `TypeRef::PatternType(inner, _) => self.ty(out, inner),`\n- ~L465  `match &self.store[*tuple] {`  ->  `match self.store.type_ref(*tuple) {` (`_ => self.ty(out, *tuple)` stays: `tuple` is from an owned `GenericArg`)\n- ~L479  `&& !matches!(&self.store[ret], TypeRef::Tuple(it) if it.is_empty())`  ->  `&& !matches!(self.store.type_ref(ret), TypeRef::Tuple(it) if it.is_empty())`\n- ~L625  `matches!(self.store[target], TypeRef::TypeParam(p) if p.local_id() == id)`  ->  `matches!(self.store.type_ref(target), TypeRef::TypeParam(p) if p.local_id() == id)`\n- ~L637  `&& match self.store[*target] {`  ->  `&& match self.store.type_ref(*target) {`\n- ~L815  `&& !matches!(&data.store[ret_ty], TypeRef::Tuple(it) if it.is_empty())`  ->  `&& !matches!(data.store.type_ref(ret_ty), TypeRef::Tuple(it) if it.is_empty())`\n- ~L852 (in `fn return_type`)  `match &data.store[ret] {`  ->  `match data.store.type_ref(ret) {` (`bounds.first()` and `data.store[*path]` are unchanged)\n- ~L867 (in `fn self_param`)  `match &store[ty] {`  ->  `match store.type_ref(ty) {`\n- ~L871  `TypeRef::Reference(reference) if matches!(&store[reference.ty], TypeRef::Path(p) if p.is_self_type()) =>`  ->  `TypeRef::Reference(reference) if matches!(store.type_ref(reference.ty), TypeRef::Path(p) if p.is_self_type()) =>`\n- ~L1200  `if matches!(data.store[*target], TypeRef::TypeParam(p)`  ->  `if matches!(data.store.type_ref(*target), TypeRef::TypeParam(p)`\n- ~L1272  `let TypeRef::Path(path) = &data.store[data.ty?] else { return None };`  ->  `let TypeRef::Path(path) = data.store.type_ref(data.ty?) else { return None };`\n\n`crates/hir-ide/` (removed at integration, no edits written): 18 `TypeRef` pattern lines in 1\nfile. `crates/ide-db/`: none.",
+  "state": "refused",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T08:26:51Z",
+  "taken_by": "coord-apply-front",
+  "why": "already done: every TypeRef site in crates/blaze-doc/src/sig.rs reads self.store.type_ref(..) (L67, 150, 190, 462, 476, 622, 634, 812, 849, 866, 870, 1199, 1271) with the by-value arms, and crates/hir-ide/src/display.rs is on store.type_ref too; LifetimeRef/PathId indexing stays as asked.",
+  "source": "v2/requests/speed.md#speed-hir-store: coordinator-owned consumers#2",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:97"
+    },
+    {
+      "at": "2026-10-30T08:26:51Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:51Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done: every TypeRef site in crates/blaze-doc/src/sig.rs reads self.store.type_ref(..) (L67, 150, 190, 462, 476, 622, 634, 812, 849, 866, 870, 1199, 1271) with the by-value arms, and crates/hir-ide/src/display.rs is on store.type_ref too; LifetimeRef/PathId indexing stays as asked."
+    }
+  ]
+}

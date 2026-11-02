@@ -21,10 +21,11 @@
 //! `index() .. index() + len()`.
 //!
 //! `tests` compares every view with `syntax::ast`'s accessor of the same name, on every node of
-//! the files of real crates; `crates/hir-ide`'s `const_ast` test runs the views in the
+//! the files of real crates; `crates/hir-ty-mir`'s `const_ast` test runs the views in the
 //! evaluator and compares what they read with the same code compiled.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 mod kinds;
 mod views;

@@ -8,8 +8,8 @@
 //! item cannot be reached where it is declared; a glob from a module that cannot be reached is
 //! inlined item by item; `#[doc(hidden)]` drops the item or the re-export.
 
-use std::sync::Mutex;
-
+use base_db::{Db, LangCrateOrigin};
+use blaze_hash::{HashMap, HashSet, SharedMap};
 use hir::{
     AsAssocItem, AssocItem, AssocItemContainer, Crate, HasAttrs, HasVisibility, Macro, MacroKind,
     Module, ModuleDef, Visibility,
@@ -18,8 +18,6 @@ use hir_def::{
     item_scope::{ImportOrExternCrate, ImportOrGlob},
     per_ns::PerNs,
 };
-use ide_db::{RootDatabase, base_db::LangCrateOrigin};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     TestOnly,
@@ -66,14 +64,14 @@ pub(crate) struct Places {
     pub(crate) crates: Vec<Documented>,
     /// Each crate's placements; `[0]` is its root module.
     pub(crate) placed: Vec<Vec<Placed>>,
-    canonical: FxHashMap<ModuleDef, (usize, usize)>,
+    canonical: HashMap<ModuleDef, (usize, usize)>,
     /// Each crate's own page of the items it places, inlined ones of other crates included.
-    own: Vec<FxHashMap<ModuleDef, usize>>,
+    own: Vec<HashMap<ModuleDef, usize>>,
     /// The page of an item of a crate not documented here, found once: on doc.rust-lang.org for
     /// the sysroot's crates, under its `html_root_url` for a crate that has one.
-    elsewhere: Mutex<FxHashMap<ModuleDef, Option<ItemRef>>>,
+    elsewhere: SharedMap<ModuleDef, Option<ItemRef>>,
     /// Each crate not documented here: its `html_root_url`.
-    roots: Mutex<FxHashMap<Crate, Option<String>>>,
+    roots: SharedMap<Crate, Option<String>>,
     test_only: TestOnly,
 }
 
@@ -128,7 +126,7 @@ impl<'a> Linking<'a> {
 
     /// Where the documentation of `def` is, for a link to it: the page in the docs written, or
     /// on doc.rust-lang.org for `std` and the crates under it, or nowhere.
-    pub(crate) fn target(&self, db: &RootDatabase, def: ModuleDef) -> Option<Target> {
+    pub(crate) fn target(&self, db: &Db, def: ModuleDef) -> Option<Target> {
         match def {
             ModuleDef::BuiltinType(builtin) => {
                 Some(Target::Item(primitive(builtin.name().as_str())))
@@ -156,7 +154,7 @@ impl<'a> Linking<'a> {
         }
     }
 
-    pub(crate) fn field_target(&self, db: &RootDatabase, field: hir::Field) -> Option<Target> {
+    pub(crate) fn field_target(&self, db: &Db, field: hir::Field) -> Option<Target> {
         let name = field.name(db);
         let mut parent = match field.parent_def(db) {
             hir::Variant::Struct(it) => self.item_ref(db, ModuleDef::Adt(it.into()))?,
@@ -175,7 +173,7 @@ impl<'a> Linking<'a> {
         Some(Target::Item(parent))
     }
 
-    pub(crate) fn assoc_target(&self, db: &RootDatabase, assoc: AssocItem) -> Option<Target> {
+    pub(crate) fn assoc_target(&self, db: &Db, assoc: AssocItem) -> Option<Target> {
         let (mut parent, in_trait) = match assoc.container(db) {
             AssocItemContainer::Trait(it) => (self.item_ref(db, ModuleDef::Trait(it))?, true),
             AssocItemContainer::Impl(it) => {
@@ -205,7 +203,7 @@ impl<'a> Linking<'a> {
         Some(Target::Item(parent))
     }
 
-    pub(crate) fn item_ref(&self, db: &RootDatabase, def: ModuleDef) -> Option<ItemRef> {
+    pub(crate) fn item_ref(&self, db: &Db, def: ModuleDef) -> Option<ItemRef> {
         if let Some(&at) = self.own[self.krate].get(&def) {
             return Some(self.placed_ref(self.krate, at));
         }
@@ -218,7 +216,7 @@ impl<'a> Linking<'a> {
         if self.crates.iter().any(|it| it.krate == krate) {
             return None;
         }
-        if let Some(found) = self.elsewhere.lock().unwrap().get(&def) {
+        if let Some(found) = self.elsewhere.pin().get(&def) {
             return found.clone();
         }
         let found = match lang_crate_name(db, krate) {
@@ -230,19 +228,19 @@ impl<'a> Linking<'a> {
                 it
             }),
         };
-        self.elsewhere.lock().unwrap().insert(def, found.clone());
+        self.elsewhere.pin().insert(def, found.clone());
         found
     }
 
-    fn html_root_url(&self, db: &RootDatabase, krate: Crate) -> Option<String> {
-        if let Some(found) = self.roots.lock().unwrap().get(&krate) {
+    fn html_root_url(&self, db: &Db, krate: Crate) -> Option<String> {
+        if let Some(found) = self.roots.pin().get(&krate) {
             return found.clone();
         }
-        let found = match krate.root_module(db).definition_source(db).value {
-            hir::ModuleSource::SourceFile(file) => crate::attrs::html_root_url(&file),
+        let found = match krate.root_module(db).definition_source_view(db).value {
+            hir::ModuleSourceView::SourceFile(file) => crate::attrs::html_root_url(file),
             _ => None,
         };
-        self.roots.lock().unwrap().insert(krate, found.clone());
+        self.roots.pin().insert(krate, found.clone());
         found
     }
 }
@@ -262,7 +260,7 @@ pub(crate) fn primitive(name: &str) -> ItemRef {
 
 /// `clap_builder::builder::command::Command`: the crate, the modules down to the one declaring
 /// `def` and its name.
-fn declared_path(db: &RootDatabase, def: ModuleDef) -> Option<String> {
+fn declared_path(db: &Db, def: ModuleDef) -> Option<String> {
     let mut parts = vec![def.name(db)?.as_str().to_owned()];
     let mut at = match def {
         ModuleDef::Macro(it) if is_macro_export(db, it) => {
@@ -287,9 +285,9 @@ fn declared_path(db: &RootDatabase, def: ModuleDef) -> Option<String> {
 }
 
 /// The name of a crate doc.rust-lang.org documents, as its URLs have it.
-pub(crate) fn lang_crate_name(db: &RootDatabase, krate: Crate) -> Option<&'static str> {
+pub(crate) fn lang_crate_name(db: &Db, krate: Crate) -> Option<&'static str> {
     match krate.origin(db) {
-        ide_db::base_db::CrateOrigin::Lang(lang) => match lang {
+        base_db::CrateOrigin::Lang(lang) => match lang {
             LangCrateOrigin::Core => Some("core"),
             LangCrateOrigin::Alloc => Some("alloc"),
             LangCrateOrigin::Std => Some("std"),
@@ -304,7 +302,7 @@ pub(crate) fn lang_crate_name(db: &RootDatabase, krate: Crate) -> Option<&'stati
 /// The page of an item of a crate not documented here where it is defined, as rustdoc links
 /// it: under a private module, a page the crate's docs redirect to where it is exported.
 /// `None` for an item the crate does not export, or only hidden.
-fn defined_ref(db: &RootDatabase, def: ModuleDef, krate_name: &str) -> Option<ItemRef> {
+fn defined_ref(db: &Db, def: ModuleDef, krate_name: &str) -> Option<ItemRef> {
     let kind = kind_of(db, def)?;
     if let ModuleDef::Module(it) = def
         && it.is_crate_root(db)
@@ -397,7 +395,7 @@ fn defined_ref(db: &RootDatabase, def: ModuleDef, krate_name: &str) -> Option<It
 }
 
 /// The kind of page rustdoc gives an item, or none for an item that has no page of its own.
-pub(crate) fn kind_of(db: &RootDatabase, def: ModuleDef) -> Option<Kind> {
+pub(crate) fn kind_of(db: &Db, def: ModuleDef) -> Option<Kind> {
     Some(match def {
         ModuleDef::Module(_) => Kind::Module,
         ModuleDef::Function(_) => Kind::Function,
@@ -420,14 +418,14 @@ pub(crate) fn kind_of(db: &RootDatabase, def: ModuleDef) -> Option<Kind> {
     })
 }
 
-pub(crate) fn trait_is_alias(db: &RootDatabase, it: hir::Trait) -> bool {
+pub(crate) fn trait_is_alias(db: &Db, it: hir::Trait) -> bool {
     let id: hir_def::TraitId = it.into();
     hir_def::signatures::TraitSignature::of(db, id)
         .flags
         .contains(hir_def::signatures::TraitFlags::ALIAS)
 }
 
-pub(crate) fn macro_kind(db: &RootDatabase, it: Macro) -> Option<Kind> {
+pub(crate) fn macro_kind(db: &Db, it: Macro) -> Option<Kind> {
     // The built-in ones are `core`'s, which documents them as it does any other.
     Some(match it.kind(db) {
         MacroKind::Declarative | MacroKind::ProcMacro | MacroKind::DeclarativeBuiltIn => {
@@ -439,18 +437,16 @@ pub(crate) fn macro_kind(db: &RootDatabase, it: Macro) -> Option<Kind> {
 }
 
 /// Places every item of every crate, in parallel over the crates.
-pub(crate) fn place(db: &RootDatabase, crates: Vec<Documented>, test_only: TestOnly) -> Places {
-    use rayon::prelude::*;
-    let placed: Vec<Vec<Placed>> = crates
-        .par_iter()
-        .map_with(db.clone(), |db, documented| {
-            hir::attach_db(db, || Walker::new(db, documented).walk())
-        })
-        .collect();
-    let mut canonical: FxHashMap<ModuleDef, ((u8, usize), (usize, usize))> = FxHashMap::default();
-    let mut own: Vec<FxHashMap<ModuleDef, usize>> = vec![];
+pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Places {
+    // A worker waiting on a query runs other jobs of the pool, which may be another database's:
+    // each item puts back the database attached below it.
+    let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
+        hir::attach_db_allow_change(db, || Walker::new(db, &crates[at]).walk())
+    });
+    let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize))> = HashMap::default();
+    let mut own: Vec<HashMap<ModuleDef, usize>> = vec![];
     for (krate, list) in placed.iter().enumerate() {
-        let mut here: FxHashMap<ModuleDef, ((u8, usize), usize)> = FxHashMap::default();
+        let mut here: HashMap<ModuleDef, ((u8, usize), usize)> = HashMap::default();
         for (at, placed) in list.iter().enumerate() {
             let own = krate_of(db, placed.def) == Some(crates[krate].krate);
             let rank = match (own, placed.via.is_none()) {
@@ -482,29 +478,29 @@ pub(crate) fn place(db: &RootDatabase, crates: Vec<Documented>, test_only: TestO
         placed,
         canonical: canonical.into_iter().map(|(def, (_, at))| (def, at)).collect(),
         own,
-        elsewhere: Mutex::default(),
-        roots: Mutex::default(),
+        elsewhere: SharedMap::default(),
+        roots: SharedMap::default(),
         test_only,
     }
 }
 
 struct Walker<'a> {
-    db: &'a RootDatabase,
+    db: &'a Db,
     krate: Crate,
     private: bool,
     out: Vec<Placed>,
     /// Modules being walked, so a module that re-exports its parent does not loop.
-    walking: FxHashSet<Module>,
+    walking: HashSet<Module>,
 }
 
 impl<'a> Walker<'a> {
-    fn new(db: &'a RootDatabase, documented: &Documented) -> Self {
+    fn new(db: &'a Db, documented: &Documented) -> Self {
         Walker {
             db,
             krate: documented.krate,
             private: documented.private,
             out: vec![],
-            walking: FxHashSet::default(),
+            walking: HashSet::default(),
         }
     }
 
@@ -564,7 +560,7 @@ impl<'a> Walker<'a> {
         let db = self.db;
         let id: hir_def::ModuleId = module.into();
         let scope = id.def_map(db).module(db, id).scope(db);
-        let mut seen_globs = FxHashSet::default();
+        let mut seen_globs = HashSet::default();
         let entries: Vec<(hir::Name, PerNs)> =
             scope.entries().map(|(name, per_ns)| (name.clone(), per_ns)).collect();
         for (name, per_ns) in entries {
@@ -593,7 +589,7 @@ impl<'a> Walker<'a> {
                     item.vis == hir_def::visibility::Visibility::Public,
                 ));
             }
-            let mut done: FxHashSet<ModuleDef> = FxHashSet::default();
+            let mut done: HashSet<ModuleDef> = HashSet::default();
             for (def, import, public) in defs {
                 if !done.insert(def) {
                     continue;
@@ -615,7 +611,7 @@ impl<'a> Walker<'a> {
         def: ModuleDef,
         import: Option<ImportOrExternCrate>,
         public: bool,
-        seen_globs: &mut FxHashSet<hir_def::item_scope::GlobId>,
+        seen_globs: &mut HashSet<hir_def::item_scope::GlobId>,
     ) {
         let db = self.db;
         if matches!(def, ModuleDef::BuiltinType(_) | ModuleDef::EnumVariant(_)) {
@@ -730,25 +726,24 @@ impl<'a> Walker<'a> {
     /// item a second time (`maybe_inline_local`, its `reexport_chain` check).
     fn through_public_reexport(&self, import: hir_def::item_scope::ImportId) -> bool {
         use hir_def::Lookup;
-        use syntax::{AstNode, ast};
+        use syntax::view::{self as ast, AstNode};
         let db = self.db;
         let loc = import.use_.lookup(db);
-        let tree = hir_def::src::use_tree_to_ast(db, loc.id, import.idx);
+        let tree = hir_def::src::use_tree_to_view(db, loc.id, import.idx);
         // `use a::{b::C}`: the leaf's path after those of the trees around it.
-        let mut segments: Vec<String> = vec![];
+        let mut segments: Vec<&str> = vec![];
         for tree in tree.syntax().ancestors().filter_map(ast::UseTree::cast) {
             if let Some(path) = tree.path() {
-                let mut outer: Vec<String> =
-                    path.segments().map(|it| it.syntax().text().to_string()).collect();
+                let mut outer: Vec<&str> = path.segments().map(|it| it.syntax().text()).collect();
                 outer.append(&mut segments);
                 segments = outer;
             }
         }
-        let Some((last, prefix)) = segments.split_last() else { return false };
+        let Some((&last, prefix)) = segments.split_last() else { return false };
         let here: Module = loc.container.into();
         let mut at = here;
-        for (i, segment) in prefix.iter().enumerate() {
-            let next = match segment.as_str() {
+        for (i, &segment) in prefix.iter().enumerate() {
+            let next = match segment {
                 "crate" if i == 0 => Some(here.krate(db).root_module(db)),
                 "self" if i == 0 => Some(here),
                 "super" => at.parent(db),
@@ -812,20 +807,20 @@ impl<'a> Walker<'a> {
 
 /// Whether a built-in attribute macro wrote the function: rust-analyzer's `#[global_allocator]`
 /// writes functions beside the `static` where rustc's writes nothing rustdoc shows.
-fn from_builtin_attr(db: &RootDatabase, def: ModuleDef) -> bool {
-    use hir::HasSource;
+fn from_builtin_attr(db: &Db, def: ModuleDef) -> bool {
+    use hir::view::HasSourceView;
     let ModuleDef::Function(it) = def else { return false };
-    it.source(db)
+    it.source_view(db)
         .and_then(|it| it.file_id.macro_file())
         .is_some_and(|call| call.kind(db) == hir_expand::MacroKind::AttrBuiltIn)
 }
 
 /// An item of another crate that rustdoc can inline: public there, not hidden.
-fn local_or_public(db: &RootDatabase, def: ModuleDef) -> bool {
+fn local_or_public(db: &Db, def: ModuleDef) -> bool {
     def.visibility(db) == Visibility::Public && !def.attrs(db).is_doc_hidden()
 }
 
-pub(crate) fn is_macro_export(db: &RootDatabase, it: Macro) -> bool {
+pub(crate) fn is_macro_export(db: &Db, it: Macro) -> bool {
     let id: hir_def::MacroId = it.into();
     hir_def::attrs::AttrFlags::query(db, id.into())
         .contains(hir_def::attrs::AttrFlags::IS_MACRO_EXPORT)
@@ -840,17 +835,17 @@ struct UseAttrs {
 }
 
 impl UseAttrs {
-    fn of(db: &RootDatabase, id: hir_def::UseId) -> UseAttrs {
+    fn of(db: &Db, id: hir_def::UseId) -> UseAttrs {
         use hir_def::{Lookup, src::HasSource};
-        use syntax::ast::HasAttrs as _;
+        use syntax::view::HasAttrs as _;
         let flags = hir_def::attrs::AttrFlags::query(db, id.into());
         let mut out = UseAttrs {
             hidden: flags.contains(hir_def::attrs::AttrFlags::IS_DOC_HIDDEN),
             ..UseAttrs::default()
         };
-        let source = id.lookup(db).source(db);
+        let source = id.lookup(db).source_view(db);
         for attr in source.value.attrs() {
-            for word in crate::attrs::doc_words(&attr) {
+            for word in crate::attrs::doc_words(attr) {
                 match word.as_str() {
                     "inline" => out.inline = true,
                     "no_inline" => out.no_inline = true,
@@ -865,8 +860,8 @@ impl UseAttrs {
 impl Places {
     /// The crates a documented crate's docs may link to and list impls from: itself and every
     /// crate it depends on, directly or not, but for its tests alone.
-    pub(crate) fn upstream(&self, db: &RootDatabase, krate: Crate) -> FxHashSet<Crate> {
-        let mut seen = FxHashSet::default();
+    pub(crate) fn upstream(&self, db: &Db, krate: Crate) -> HashSet<Crate> {
+        let mut seen = HashSet::default();
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if seen.insert(it) {
@@ -886,8 +881,8 @@ impl Places {
     /// compiler's own. Of the sysroot's crates, which rust-analyzer makes dependencies of every
     /// crate, `core` is linked; `std` and `alloc` unless the crate is `#![no_std]`, `proc_macro`
     /// for a crate of procedural macros, and any of them the crate names with `extern crate`.
-    pub(crate) fn linked(&self, db: &RootDatabase, krate: Crate) -> FxHashSet<Crate> {
-        let mut seen = FxHashSet::default();
+    pub(crate) fn linked(&self, db: &Db, krate: Crate) -> HashSet<Crate> {
+        let mut seen = HashSet::default();
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if !seen.insert(it) {
@@ -924,7 +919,7 @@ impl Places {
 
 /// The crate of what a type is: an ADT's, a `dyn Trait`'s trait's; `None` for a builtin type,
 /// a reference or anything else whose docs are the standard library's.
-pub(crate) fn type_home(db: &RootDatabase, ty: &hir::Type<'_>) -> Option<Crate> {
+pub(crate) fn type_home(db: &Db, ty: &hir::Type<'_>) -> Option<Crate> {
     if let Some(adt) = ty.as_adt() {
         return krate_of(db, ModuleDef::Adt(adt));
     }
@@ -932,7 +927,7 @@ pub(crate) fn type_home(db: &RootDatabase, ty: &hir::Type<'_>) -> Option<Crate> 
 }
 
 /// The crate an item belongs to.
-pub(crate) fn krate_of(db: &RootDatabase, def: ModuleDef) -> Option<Crate> {
+pub(crate) fn krate_of(db: &Db, def: ModuleDef) -> Option<Crate> {
     match def {
         ModuleDef::BuiltinType(_) => None,
         ModuleDef::Module(it) => Some(it.krate(db)),

@@ -1,0 +1,35 @@
+{
+  "id": "01122",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R4 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): settle `blaze_query::db::Cancelled` as the enum { PendingWrite, WouldWaitOnItself, PropagatedPanic } (blaze_graph::Cancelled is a unit struct) and add `Cancelled::catch<T>(f: impl FnOnce() -> T + UnwindSafe) -> Result<T, Cancelled>` (catches only a Cancelled payload, resumes any other panic). Users: base-db db.rs:537 run_on_pool downcast, db/shared/tests.rs:33,79,82,131, blaze-cargo serve/unit.rs:499, serve/unit/deps.rs:575, base-db tests.rs:915.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract already had the Cancelled enum with throw/catch; kept."
+    }
+  ]
+}

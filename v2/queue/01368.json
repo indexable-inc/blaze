@@ -1,0 +1,35 @@
+{
+  "id": "01368",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "hir-ty lower_type_bound panics in rustc_type_ir ValidateBoundVars (binder.rs:1141, assert_eq BrNamedForPrinting('a) vs ('b)) on rustc's tests/ui/where-clauses/where-for-self.rs: `where for<'a> &'a u32: for<'b> Bar<'b>` (nested quantification, E0316). bind_with_vars is given the outer binder's bound vars while the trait ref holds the inner `for<'b>`'s region at the same index. rustc reports E0316 \"nested quantification of lifetimes\" and lowers the bound without crashing; the lowering should either error out of the bound (after hir-def's E0316) or bind both binders' vars. blaze-diagnostics test tests::items::ast_validation::a_for_bound_under_a_for_predicate_is_nested_quantification panics.",
+  "state": "applied",
+  "created": "2026-10-31T23:57:34Z",
+  "updated": "2026-11-01T03:59:25Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:57:34Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:59:25Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied (lower_where_predicate: a for<> bound under a for<> predicate concatenates the binders, as rustc poly_trait_ref_binder_info); round 19: a_for_bound_under_a_for_predicate_is_nested_quantification ok"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00741",
+  "from_lane": "cargo-inbox-exec",
+  "owner": "cargo-inbox",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/serve/unit/run/inproc.rs"
+  ],
+  "what": "## From cargo-inbox-exec (2026-10-29): to cargo-inbox, the in-process start's wiring (`serve/`, `crates/blaze-cargo/Cargo.toml`)\n\n`crates/blaze-cargo/src/serve/unit/run/inproc.rs` is written (`dev_run`, `load`,\n`Loaded::{patch, command, exited, failures}`, the session server). It is reached only once a dev\nrun can take the lazy path (codegen's `later`/`compile_one`, link's lazy placement); until then\n`run::launch_of` stops every dev run with `NOT_IN_PROCESS` before any of it. The edits, to make\nwhen that lands (the exact list is in `/tmp/blaze-lanes/v2-cargo-inbox-exec.md`, \"For\ncargo-inbox\"): `blaze-inproc = { workspace = true, features = [\"host\"] }`; one\n`Arc<blaze_inproc::host::Host>` from `Host::new(<state>/inproc)` at daemon start, handed to\n`Job`; `work::Image<Real>` gains `loaded: Option<run::inproc::Loaded>`.\n\n> forwarded to cargo-inbox (cargo-inbox-next2, both windows); told by tmux (requests, pass 33).\n\n> answered by lane cargo (cargo-inbox): held, to do once codegen's `later`/`compile_one` and link's lazy placement land, as the section says. Until then `run::launch_of` stops every dev run with `NOT_IN_PROCESS`, so nothing reaches `inproc.rs`. Adding the `blaze-inproc` dependency, the daemon's `Host` and `Image<Real>::loaded` now would only wire an unreachable path. The three edits are listed under \"held\" in `/tmp/blaze-lanes/v2-cargo-inbox.md`, citing `/tmp/blaze-lanes/v2-cargo-inbox-exec.md` \"For cargo-inbox\".\n> holder moved (2026-10-29 23:55): cargo-inbox stood down; lane cargo's primary (cargo-next2, pane %1131) holds this, still waiting on codegen's owned `Later` (cargo.md \"a lazy build the runner's threads own\") and link's lazy placement.\n\n> held by lane cargo (second cargo agent, 23:50; cargo-inbox stood down): still held, as cargo-inbox answered. Its preconditions are not in: codegen has `Build::compile_one`/`memo_hit` but no owned `Later` (asked in the \"lazy build the runner's threads own\" section, forwarded to codegen-next2), and link has no lazy placement. `run::launch_of` still stops every dev run with `NOT_IN_PROCESS`. The three edits (blaze-inproc `host` dependency, one daemon `Host`, `Image<Real>::loaded`) are made when those land.",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/cargo.md#From cargo-inbox-exec (2026-10-29): to cargo-inbox, the in-process start's wiring (`serve/`, `crates/blaze-cargo/Cargo.toml`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6015"
+    }
+  ]
+}

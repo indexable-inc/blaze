@@ -1,0 +1,35 @@
+{
+  "id": "00046",
+  "from_lane": "items-form",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "## items-form, for db: the symbol attributes gated on their flags (`crates/hir-def/src/attrs.rs`)\n\nWhat:\n1. `AttrFlags::export_name`, `link_name`, `link_section` and `linkage` return `None`\n   without making their tracked query when `AttrFlags::query(db, owner)` lacks\n   `HAS_EXPORT_NAME`, `HAS_LINK_NAME`, `HAS_LINK_SECTION` or `HAS_LINKAGE`. That is how\n   `lang_item_with_attrs` and `unstable_feature` already work: an outer `#[inline]` fn checks\n   the bit and calls the inner tracked fn.\n2. `AttrFlags::is_rustc_nounwind` reads `AttrFlags::query(db, owner.into())\n   .contains(AttrFlags::RUSTC_NOUNWIND)` instead of walking the attributes. It is not tracked,\n   so today every call re-walks the item's attribute syntax.\n\nWhy faster: the flags are set by the same attribute pass, with the same one-segment match\n(`name_text` and `is1` both strip `r#`), so a missing bit means the query finds nothing. Today\nevery item that asks, including blaze-items' forms for every fn, static and ADT and the link's\nsymbol names, creates four memos that hold `None`, and every fn form re-walks its attributes\nfor `rustc_nounwind`. `form.rs` already gates on the bits itself (`Cx::attrs`). This makes\nevery other caller cheaper too, with the same answers.\n\n> forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.\n> checked by db-audit-other (22:39): in the tree at `crates/hir-def/src/attrs.rs`. 1: `link_name`, `link_section`, `linkage` and `export_name` return before their tracked query when the bit is missing (:1457, :1525, :1539, :1553). 2: `is_rustc_nounwind` is `AttrFlags::query(..).contains(RUSTC_NOUNWIND)` (:1822-1823).",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T09:56:49Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/items.md#items-form, for db: the symbol attributes gated on their flags (`crates/hir-def/src/attrs.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:343"
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:39): in the tree at `crates/hir-def/src/attrs.rs`. 1: `link_name`, `link_section`, `linkage` and `export_name` return before their tracked query when the bit is missing (:1457, :1525, :1539, :1553). 2: `is_rustc_nounwind` is `AttrFlags::query(..).contains(RUSTC_NOUNWIND)` (:1822-1823)."
+    }
+  ]
+}

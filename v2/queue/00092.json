@@ -1,0 +1,37 @@
+{
+  "id": "00092",
+  "from_lane": "usercode-macros",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/proc-macro-srv",
+    "crates/proc-macro-srv/src/scope.rs",
+    "crates/proc-macro-srv"
+  ],
+  "what": "## 3. `vendor/proc-macro-srv`: the warm protocol\n\nWhere: the vendored server's main and its expand loop.\n\nWhy: the client needs API version 7 (`proc_macro_api::SCOPED_EXPANSIONS`) from a warm server,\nwhich marks each expansion's scope so its reads can be told apart in the live record.\n\n- Connect to the socket named by `BLAZE_WARM_SOCKET` and speak the\n  `bidirectional-postcard-prototype` format over it instead of stdin/stdout; unset the\n  variable once connected.\n- Count every `ExpandMacro` request, from 0, before anything can fail, and run each on its\n  thread between `access(\"/.blaze-test/expand-<n>\")` and `access(\"/.blaze-test/\")`: copy\n  `crates/proc-macro-srv/src/scope.rs`, which `crates/proc-macro-srv` already does.\n- Report API version 7.\n- Read the environment a macro is given by name only: `EnvSnapshot` walks `environ`, which the\n  trace records as reading every variable, so no expansion would be keyed by fewer.\n\n> forwarded to coordinator: `vendor/proc-macro-srv/` has no owner in crates.md (usercode owns `crates/proc-macro-srv/`), so it is the coordinator's to apply or give to usercode.",
+  "state": "refused",
+  "created": "2026-10-30T00:52:12Z",
+  "updated": "2026-10-30T08:28:49Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "already done, and its target is gone: vendor/proc-macro-srv was deleted (v2 checkpoint 2f9a618943); the server blaze runs is crates/proc-macro-srv-cli on crates/proc-macro-srv and crates/proc-macro-api, which connects to BLAZE_WARM_SOCKET and unsets it (main.rs), marks each expansion expand-<n> (proc-macro-srv/src/scope.rs), reads env by name (EnvSnapshot, lib.rs:311) and reports CURRENT_API_VERSION = WIRE_TREES (8) >= SCOPED_EXPANSIONS (7).",
+  "source": "v2/requests/usercode-macros.md#3. `vendor/proc-macro-srv`: the warm protocol",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros.md:55"
+    },
+    {
+      "at": "2026-10-30T08:28:48Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:49Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "already done, and its target is gone: vendor/proc-macro-srv was deleted (v2 checkpoint 2f9a618943); the server blaze runs is crates/proc-macro-srv-cli on crates/proc-macro-srv and crates/proc-macro-api, which connects to BLAZE_WARM_SOCKET and unsets it (main.rs), marks each expansion expand-<n> (proc-macro-srv/src/scope.rs), reads env by name (EnvSnapshot, lib.rs:311) and reports CURRENT_API_VERSION = WIRE_TREES (8) >= SCOPED_EXPANSIONS (7)."
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "00865",
+  "from_lane": "pure-scripts",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-cargo/src/serve/unit/script.rs"
+  ],
+  "what": "Amends 00859 item 2: the Job field's type is now `pub(crate) pure: Box<[OnceLock<script::pure::Purity>]>` (not `OnceLock<Option<Pure>>`), same initialisation. Also, where a run's BuildScriptRan is made, once lane ci's `BuildScriptRan.purity` exists (request from pure-scripts-measure), fill it from `script::pure::reported(job, run)`.",
+  "state": "taken",
+  "created": "2026-10-30T09:11:03Z",
+  "updated": "2026-10-30T10:31:40Z",
+  "taken_by": "cargo-next2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:11:03Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:31:40Z",
+      "by": "cargo-next2",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

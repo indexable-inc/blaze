@@ -1,0 +1,35 @@
+{
+  "id": "01040",
+  "from_lane": "fastcompile",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/linked.rs"
+  ],
+  "what": "fastcompile (change 20, compiled tier of proc macros): a public entry for the span tables of given anchors, split out of `linked::span_tables`. The tier loads a macro crate's code in process and must fill each `Target::Position` with a `core::panic::Location` record, as blaze-link does from `Change::spans`; today only the private `span_tables(db, hashes, built)` makes the tables, and it needs a whole `Built`. Ask: `pub fn span_tables_of(db: &Db, hashes: &HashSource, items: &[ItemKey], named: impl IntoIterator<Item = ContentId>) -> Result<Vec<(ContentId, Vec<u8>)>, String>` (the same body, `named_anchors(built)` replaced by the anchors given; the encoding blaze-link's `SpanTable::decode` reads), with `span_tables` calling it. Exported as `hir_ty_codegen::v2::span_tables_of`. Costs nothing when unused; no build changes. Design: docs/v2/plan/lanes/fastcompile/macros-tier.md, \"Running\".",
+  "state": "applied",
+  "created": "2026-10-30T14:28:55Z",
+  "updated": "2026-10-31T20:48:33Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:28:55Z",
+      "by": "fastcompile",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:33Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:33Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir_ty_codegen::v2::span_tables_of(db, hashes, items, named) in v2/linked.rs, the body of span_tables with named_anchors replaced by the anchors given (an anchor of no table is an error naming the caller); span_tables now calls the shared body."
+    }
+  ]
+}

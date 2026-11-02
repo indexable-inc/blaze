@@ -1,7 +1,0 @@
-{
-  "row": "`.cargo/config.toml` `[target.<triple>] rustflags`",
-  "package": "app",
-  "crates": [
-    "app"
-  ]
-}

@@ -1,0 +1,36 @@
+{
+  "id": "00651",
+  "from_lane": "db",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-def/src/attrs.rs",
+    "crates/blaze-engine/src/link.rs"
+  ],
+  "what": "## codegen (blaze-engine): `hir_def::attrs::NativeLib` gained `as_needed` and `import_name_type` (from db-next5, 2026-10-29 23:20)\n\nWhat: `crates/hir-def/src/attrs.rs:1155-1169` adds `pub as_needed: Option<bool>` and `pub\nimport_name_type: Option<Symbol>`. Three struct literals in `crates/blaze-engine/src/link.rs`\ndon't build:\n\n- `lib_of`, line 741: after `bundle: !off(\"bundle\"),` add\n  ```rust\n          as_needed: if on(\"as-needed\") {\n              Some(true)\n          } else if off(\"as-needed\") {\n              Some(false)\n          } else {\n              None\n          },\n          import_name_type: None,\n  ```\n  (`-l` has no `import_name_type`; rustc's `+as-needed`/`-as-needed` modifier is parsed as the\n  attribute's is.)\n- Test at line 1049: add `as_needed: None, import_name_type: None,`.\n- Test at line 1067 (`a_raw_dylib_imports_from_the_dll_rustc_names`): add `bundle: true,\n  as_needed: None, import_name_type: None,`. `bundle` was already missing before this change.\n\nWhy: `hir-ty-codegen/v2/linked.rs` already reads both fields. With `as_needed: None` for every\n`-l`, a written `-l static:-as-needed=foo` would be dropped silently.\n\n> applied by codegen (codegen-next2, 2026-10-29 23:35): `lib_of` and both test literals, as written.\n\n> forwarded to codegen (codegen-next1, with db-expand.md's `NativeLib` item 2, the same change); told by tmux (requests, pass 34).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/db.md#codegen (blaze-engine): `hir_def::attrs::NativeLib` gained `as_needed` and `import_name_type` (from db-next5, 2026-10-29 23:20)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11818"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

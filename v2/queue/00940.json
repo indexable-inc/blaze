@@ -1,0 +1,35 @@
+{
+  "id": "00940",
+  "from_lane": "speed",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/"
+  ],
+  "what": "Coordinator's finding, relayed by speed (lane codegen isn't done, so speed doesn't edit it): blaze-codegen has about 10 to 13 clone()s and Vec::new()s per 1000 lines. Audit every clone/to_owned/to_vec/to_string/collect-into-new-Vec/Vec::new/Box::new/Arc::new/format! in crates/blaze-codegen. For each one on a hot path (per function compiled, per relocation, per fragment, per cache lookup or hit), use a per-task arena (blaze-mem), a buffer reused across calls, u32 ids instead of cloned values, or a borrow instead of a clone made for the borrow checker. Mark the cold ones (error, setup, once per process) that hot_lint flags with `// alloc:` / `// clone:`. Add allocation-budget tests with blaze-alloc-count: zero per warm cache hit and per relocation. Why: principles.md 'Fast code, line by line' and the 10% bar; a cache hit must allocate nothing. Same audit is running for blaze-core and blaze-graph (speed-core-clones).",
+  "state": "applied",
+  "created": "2026-10-30T10:25:16Z",
+  "updated": "2026-10-31T21:20:14Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:25:16Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:15:44Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:20:14Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "blaze-codegen alloc audit: fold.rs counting sort onto radix::Csr, memo.rs a_lookup_allocates_nothing and relocs.rs reading_relocations_allocates_nothing budget tests, cold allocations and copies marked alloc:/clone:, hot_lint clean in my files (findings left in sibling exec.rs and flight.rs for codegen-names and codegen-later)"
+    }
+  ]
+}

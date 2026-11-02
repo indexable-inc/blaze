@@ -6,17 +6,19 @@
 //! effective visibilities, which also leave out `pub` items no path outside the crate reaches,
 //! are not computed.
 
-use syntax::{
-    AstNode,
-    ast::{self, HasName, HasVisibility},
-};
+use syntax::view::{self as ast, AstNode as _, HasName as _, HasVisibility as _};
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "upper_case_acronyms";
+const LINT: super::Implemented = super::Implemented::UpperCaseAcronyms;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, item: &ast::Item) {
-    if !cx.on(LINT) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Item<'t>) {
+    if !cx.on(LINT)
+        || !matches!(
+            item,
+            ast::Item::Struct(_) | ast::Item::Trait(_) | ast::Item::TypeAlias(_) | ast::Item::Enum(_)
+        )
+    {
         return;
     }
     let aggressive = cx.conf().bool("upper-case-acronyms-aggressive", false);
@@ -38,7 +40,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, item: &ast::Item) {
     }
 }
 
-fn exported(item: &ast::Item) -> bool {
+fn exported(item: ast::Item<'_>) -> bool {
     let visibility = match item {
         ast::Item::Struct(it) => it.visibility(),
         ast::Item::Trait(it) => it.visibility(),
@@ -49,16 +51,20 @@ fn exported(item: &ast::Item) -> bool {
     visibility.is_some_and(|it| it.syntax().text() == "pub")
 }
 
-fn check_name(
-    cx: &mut Cx<'_, '_, '_>,
-    at: &syntax::SyntaxNode,
-    name: Option<ast::Name>,
+fn check_name<'t>(
+    cx: &mut Cx<'_, 't>,
+    at: ast::Node<'t>,
+    name: Option<ast::Name<'t>>,
     aggressive: bool,
 ) {
     let Some(name) = name else { return };
+    let ident = name.text();
+    // Every name it lints has three capitals in a row, or ends in two.
+    if ident.bytes().filter(u8::is_ascii_uppercase).nth(1).is_none() {
+        return;
+    }
     let Some(range) = cx.range(name.syntax()) else { return };
-    let ident = name.text().to_owned();
-    let Some(replacement) = replacement(&ident, aggressive) else { return };
+    let Some(replacement) = replacement(ident, aggressive) else { return };
     let span = cx.span(range);
     cx.lint(LINT, at, span.clone(), format!("name `{ident}` contains a capitalized acronym"))
         .suggestion(

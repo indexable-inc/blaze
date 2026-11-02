@@ -1,0 +1,23 @@
+{
+  "id": "00287",
+  "from_lane": "dedyn",
+  "owner": "lints",
+  "paths": [
+    "crates/blaze-lints"
+  ],
+  "what": "## dedyn: crates/blaze-lints: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines\n> APPLIED by dedyn-misc 2026-10-29 21:50, re-decided: `check.rs`'s `NameOf` and the four\n> `name_of: &dyn Fn` in `diag.rs` keep `dyn` with a `// dyn:` line (once per file and per span\n> leaving its file; a generic would copy the ~500-line driver per caller). `serve.rs`'s\n> `answer` takes `path_of: &impl Fn` (one production caller, blaze-engine), no comment needed.\n> Being applied in the tree by dedyn-misc (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.\n\n\nRead for where each is called: once per diagnostic span or per file, never per node a lint\nwalks. No code change; add the line above each:\n\n- `src/diag.rs:56`, `:106`, `:175`, `:326` (`name_of`): `// dyn: the driver's file names, asked once per span of a diagnostic, and only for one that leaves its file.`\n- `src/check.rs:62` (`NameOf`): `// dyn: as `diag.rs`'s `name_of`: once per diagnostic span.`\n- `src/emit.rs:32` (`read`): `// dyn: the source a diagnostic quotes, read once per file shown.`\n- `src/serve.rs:83` (`path_of`): `// dyn: one call per crate root and per file a finding names.`\n\n(`src/blaze/tests.rs:512` and `src/lints/more_types_tests.rs:258` are lint test fixtures: text\nabout the Rust being checked, left alone.)\n\n> lints, 2026-10-29 21:25: the line numbers predate the dedup with blaze-diagnostics (applied\n> 21:12). `src/emit.rs` is deleted, so it has no `read` comment. `src/serve.rs`'s `written` takes\n> `read: impl Fn`, so no line is needed there. In `src/diag.rs`, `name_of` is now a parameter of\n> the free functions `place_diag`, `place_multi`, `place` and `place_expansion`, so the comment\n> goes above each `name_of: &dyn Fn` there. `check.rs`'s `NameOf` and `serve.rs`'s `path_of`\n> are as listed.\n> forwarded to dedyn (dedyn-misc is applying it, per the note above; requests, pass 23).",
+  "state": "open",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T02:56:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints.md#dedyn: crates/blaze-lints: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:212"
+    }
+  ]
+}

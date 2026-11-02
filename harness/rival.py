@@ -10,16 +10,17 @@ same pinned source, each arm in a checkout, home, store and target directory of 
 
 Per project and arm:
   cold       the first build from nothing (no target, empty store, no daemon), plus for a blaze
-             arm the wait until its daemon has the workspace loaded (`ready_s`); the standard
-             library comes from a remote made once by the arm's own `std` command, as a release
-             ships it
+             arm the wait until its daemon has the workspace loaded (`ready_s`); under ours the
+             standard library's crates are units of that build like any other, under Astral's
+             they come from a remote made once by its own `std` command, as its release ships them
   no-op      the build again with nothing changed
   body       a statement added to one function's body (bench.py's `body` edit)
   signature  a method gets a parameter and every caller the argument (bench.py's `signature`)
-  tests      the project's tests (`test` of its spec), twice; the second is timed; every test
-             has to end as it does under cargo
+  tests      the project's tests (`test` of its spec), twice; the second is timed; under a
+             blaze arm every test has to pass by its own verdict but those `test_known` names
   output     after the cold build and the first of each edit the program runs (`run` of its
-             spec) and has to say what cargo's says
+             spec); under a blaze arm each edit's has to say what that arm's cold build said.
+             cargo is timed, never the answer
 Each phase but cold runs `runs` times. The arms take turns in a rotating order (round r starts
 with arm r mod n), never at once, so a slow minute of the machine falls on every arm alike; an
 edit is made in an arm's checkout, built, taken back and built again before the next arm's turn.
@@ -54,7 +55,7 @@ from dataclasses import MISSING, dataclass, field, fields
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import bench, blaze_cli
-from blaze_cli import Side, difference, program_output, test_results, wait_warm
+from blaze_cli import Side, difference, program_output, test_results, test_verdict, wait_warm
 
 LET = bench.LET
 # The longest wait for a daemon to load: one that has not loaded by then is not waited for again.
@@ -252,8 +253,8 @@ class Runner:
 
 
 def shipped_std(arm, runner, work):
-    """A remote with the arm's standard library unit, made by its own `std` command once, as its
-    release would ship it."""
+    """A remote with Astral's arm's standard library unit, made by its own `std` command once, as
+    its release would ship it."""
     remote = os.path.join(work, f"std-{arm.name}")
     if os.path.isdir(remote):
         return remote
@@ -314,13 +315,13 @@ def measure(name, spec, arms, given, log):
         return row(arm)["failed"] is None
 
     def output_is_right(arm, label):
-        if run is None or not live(arm):
+        if run is None or not live(arm) or arm.kind == "cargo":
             return
         _, ran = runners[arm.name].run("run", *build, "--", *run)
         said = program_output(ran)
-        if arm.kind == "cargo":
-            expected["out"] = said
-        elif "out" in expected and (wrong := difference(said, expected["out"])):
+        if arm.name not in expected:
+            expected[arm.name] = said
+        elif wrong := difference(said, expected[arm.name]):
             row(arm)["wrong"].append(f"{label}: {wrong}"[:400])
 
     def timed_build(arm):
@@ -339,7 +340,7 @@ def measure(name, spec, arms, given, log):
         runners[arm.name].stop()
     for arm in arms:
         r = runners[arm.name]
-        if r.prefix:
+        if r.prefix and arm.kind == "astral":
             try:
                 r.env[r.prefix + "STD_FROM"] = shipped_std(arm, r, given.work)
             except (RuntimeError, subprocess.CalledProcessError) as e:
@@ -415,10 +416,8 @@ def measure(name, spec, arms, given, log):
         for arm in arms:
             if arm.kind == "cargo" or not live(arm):
                 continue
-            if (cargo_arm.name in rejected) != (arm.name in rejected):
-                said = "builds" if arm.name not in rejected else "rejects"
-                row(arm)["wrong"].append(f"{kind}: {said} the edit cargo {'rejects' if said == 'builds' else 'builds'}"[:400])
             if arm.name in rejected:
+                row(arm)["wrong"].append(f"{kind}: rejects bench.py's edit, which is valid source"[:400])
                 row(arm)["phases"][kind] = dict(rejected=rejected[arm.name][-400:])
         if cargo_arm.name in rejected:
             row(cargo_arm)["phases"][kind] = dict(rejected=rejected[cargo_arm.name][-400:])
@@ -435,7 +434,7 @@ def measure(name, spec, arms, given, log):
                 outcomes[arm.name] = (round(took, 3), ran)
                 if round_ == 0:
                     row(arm)["phases"]["tests_first"] = dict(wall_s=round(took, 3))
-        cargo_said = test_results(outcomes[cargo_arm.name][1]) if cargo_arm.name in outcomes else None
+        known = frozenset(spec.get("test_known", ()))
         for arm in arms:
             if arm.name not in outcomes:
                 continue
@@ -445,11 +444,11 @@ def measure(name, spec, arms, given, log):
             status, tests, totals = test_results(ran)
             entry = dict(wall_s=took, status=status, passed=totals[1], failed=totals[2], ignored=totals[3],
                          built=runners[arm.name].built(ran))
-            if arm.kind != "cargo" and cargo_said and (wrong := difference((status, tests, totals), cargo_said)):
+            if arm.kind != "cargo" and (wrong := test_verdict((status, tests, totals), known)):
                 entry["differs"] = wrong[:400]
                 row(arm)["wrong"].append(f"tests: {wrong}"[:400])
             row(arm)["phases"]["tests"] = entry
-            print(f"  {arm.name:10} tests {took:8.2f}s  {totals[1]} passed {totals[2]} failed  {entry.get('differs', 'same as cargo') if arm.kind != 'cargo' else ''}", flush=True)
+            print(f"  {arm.name:10} tests {took:8.2f}s  {totals[1]} passed {totals[2]} failed  {entry.get('differs', 'all pass') if arm.kind != 'cargo' else ''}", flush=True)
 
     for arm in arms:
         runners[arm.name].stop()

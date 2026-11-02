@@ -1,0 +1,35 @@
+{
+  "id": "01161",
+  "from_lane": "no-fallback-tools",
+  "owner": "no-fallback-link",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/daemon.rs:654: blaze-query no longer recomputes a key whose image group is corrupt (Database::slot is Err(Corrupt), the request fails with DbError::Corrupt, write_image refuses while one stands). The daemon eprintln \"what it held was computed again\" is now untrue and a log-only fallback: make a take_corrupt() hit fail the build naming section+group (and decide what replaces the image: an explicit error telling the user, not a silent fresh start). Also check where DbError::is_image makes the daemon start empty: Refused (other schema) is a cold start, but Corrupt must be an error (no-fallback).",
+  "state": "applied",
+  "created": "2026-10-30T23:12:35Z",
+  "updated": "2026-10-31T03:10:34Z",
+  "taken_by": "no-fallback-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:12:35Z",
+      "by": "no-fallback-tools",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:10:34Z",
+      "by": "no-fallback-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:10:34Z",
+      "by": "no-fallback-link",
+      "action": "done",
+      "note": "already in the tree (no-fallback-link-cargo): daemon.rs between() fails the daemon with Failed::Corrupt(section, group) on take_corrupt or vfs.corrupt; the computed-again eprintln is gone; unopened(): DbError::Refused (missing or other schema) is a reported cold start (Started::cold, printed by serve.rs), any other DbError incl. Corrupt is StartError::Image(ImageFault::Db). Tests: daemon.rs mod tests (unrestored, unopened)."
+    }
+  ]
+}

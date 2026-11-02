@@ -2,7 +2,7 @@
 
 pub(crate) mod table;
 
-pub(crate) use table::{OpaqueTypeStorage, OpaqueTypeTable};
+pub(crate) use table::{OpaqueTypeMark, OpaqueTypeStorage, OpaqueTypeTable};
 
 use macros::{TypeFoldable, TypeVisitable};
 

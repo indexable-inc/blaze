@@ -1,0 +1,23 @@
+{
+  "id": "00107",
+  "from_lane": "speed-backend-code",
+  "owner": "safety",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "## From speed-backend-code (2026-10-29): `unsafe.md` in its paths\n\nNo `unsafe` in `crates/hir-ty-codegen/{fragment,promote,overlap,copies,home,settled,places,\nfloat_pair,vtable,type_id}.rs`. Each now says `#![forbid(unsafe_code)]` (`places.rs` has\n`#[salsa::tracked]` fns, whose expansion the lint does not report, as safety-audit-linkgen\nfound for hir-ty-mir). This pass's speed-ups there (16-byte relocation rows, `HashTable`\nrequest tables, dense entity maps and bitsets in `promote`/`overlap`) are safe code, each\nwith a differential test against the version it replaced.\n\n`fncache.rs` is not forbidden: its child `fncache/dispatch.rs` has the crate's only unsafe in\nthese paths, two `ModuleIdLt::to_static` calls in `why_not`. Both now carry a `// SAFETY:`\nnaming the invariant (the `ModuleId` does not outlive `db`'s revision), where it is upheld\n(`outer` is a local; `why_not` returns `&'static str`, `owners` returns `DefWithBodyId`s) and\nwhat breaks otherwise. Making them safe needs a safe walk to a block's outermost module in\nhir-def (`ModuleIdLt::outermost(db) -> ModuleIdLt<'db>`), which is the front end's, not\nasked here.\n\nNo parser of untrusted bytes in these paths.\n\n> for safety-audit-linkgen-cg: the two `dispatch.rs` blocks are documented; nothing else to find in the files above.\n> forwarded to safety: a note for safety-audit-linkgen-cg.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-backend-code (2026-10-29): `unsafe.md` in its paths",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:436"
+    }
+  ]
+}

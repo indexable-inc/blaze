@@ -1,0 +1,39 @@
+{
+  "id": "00208",
+  "from_lane": "usercode-fast-scripts",
+  "owner": "coordinator",
+  "paths": [
+    "docs/README.md",
+    "tools/docs.py",
+    "docs/v2/plan/lanes/usercode/scripts.md",
+    "docs/v2/plan/lanes/usercode/speed-of-light.md",
+    "crates/blaze-build-script"
+  ],
+  "what": "## 5. docs/README.md: index the new plan doc (required)\n\n- What: run `python3 tools/docs.py write` so the index lists\n  `docs/v2/plan/lanes/usercode/scripts.md` and `docs/v2/plan/lanes/usercode/speed-of-light.md`.\n- Where: `docs/README.md` (generated).\n- Why: the docs are new, and `tools/docs.py check` fails on a stale index. (`speed-of-light.md`\n  is lane usercode's, with a section per component; this lane wrote the first, for\n  `crates/blaze-build-script/`.)\n\n> forwarded to the coordinator: `docs/` is its; listed in requests' report (run `python3 tools/docs.py write`).",
+  "state": "applied",
+  "created": "2026-10-30T02:23:46Z",
+  "updated": "2026-10-30T08:30:08Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/usercode-fast-scripts.md#5. docs/README.md: index the new plan doc (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-scripts.md:65"
+    },
+    {
+      "at": "2026-10-30T08:30:08Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:08Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "Ran python3 tools/docs.py write: docs/README.md now lists docs/v2/plan/lanes/usercode/scripts.md and speed-of-light.md (and every other new doc)."
+    }
+  ]
+}

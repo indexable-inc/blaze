@@ -1,0 +1,23 @@
+{
+  "id": "01330",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/demand.rs"
+  ],
+  "what": "crates/hir-def/src/nameres/demand.rs: two per-crate Vecs grow by doubling, so a warm check of a crate allocates about log2(bodies) more times as it grows. That fails blaze-diagnostics lints::bodies::tests::late_passes_per_crate (10 allocations at 4 bodies, 19 at 64; trace in /tmp/blaze-lanes/trace-late_passes_per_crate.txt). (a) crate_body_owners (line 120) via push_scope_body_owners: owners grows 32 to 1024 B. Size it once: count each module scope first (unnamed_consts plus declarations, an upper bound) and reserve that total before the push loop, or reserve per scope in push_scope_body_owners. (b) every_body (line 177): bodies grows 32 to 1024 B. Use Vec::with_capacity(roots.len()) from crate_body_owners, and have walk_bodies hand back its own queue or seen count so nested bodies (rare) only grow it then. walk_bodies one seen set (1160 B) is a single allocation and fine. body_owners in blaze-diagnostics allocates a fixed number of times per crate, so it is not the growth.",
+  "state": "open",
+  "created": "2026-10-31T18:18:02Z",
+  "updated": "2026-10-31T18:18:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:18:02Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

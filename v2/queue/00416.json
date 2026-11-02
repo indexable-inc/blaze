@@ -1,0 +1,35 @@
+{
+  "id": "00416",
+  "from_lane": "codegen-mir",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/refs.rs"
+  ],
+  "what": "## 6. Refs walk (codegen-adapter-refs, `crates/hir-ty-codegen/v2/refs.rs`)\n\n- `refs.rs:978` (assert panics): list `panic_misaligned_pointer_dereference`,\n  `panic_null_pointer_dereference`, `panic_null_reference_constructed`,\n  `panic_invalid_enum_construction` for the new `AssertKind`s.\n- `refs.rs:862` (casts): `CastKind::Transmute => Ok(())`.\n- The checks read `<T as SizedTypeProperties>::SIZE`/`ALIGN` as unevaluated constants: the walk\n  must evaluate or list them like any other unevaluated constant operand.\n\n> forwarded to codegen.",
+  "state": "applied",
+  "created": "2026-10-30T04:06:19Z",
+  "updated": "2026-10-31T20:38:18Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir.md#6. Refs walk (codegen-adapter-refs, `crates/hir-ty-codegen/v2/refs.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir.md:114"
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "refs.rs lists the four UB-check panics (:1213-1222) and takes CastKind::Transmute (:1079)."
+    }
+  ]
+}

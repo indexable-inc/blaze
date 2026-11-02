@@ -1,0 +1,25 @@
+{
+  "id": "01196",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/unify.rs",
+    "crates/hir-ty/src/solver_errors.rs",
+    "crates/hir-ty/src/infer/fallback.rs"
+  ],
+  "what": "hir-ty inference: an undecided variable reaches the TypeMustBeKnown diagnostic already an error, so its origin and names are lost (round2-test.log, hir tests). tests::infer::an_undecided_variable_names_the_parameter_it_was_made_for: origin None, want Some((need, T)) (solver_errors.rs variable_origin); an_undecided_term_names_each_variable_by_its_parameter: NamedTerm params [] for `let _x = make::<T, N>()`, want [T, N]; an_undecided_pattern_keeps_its_type_with_every_variable_named: `NamedTerm { term: ({type error}, {type error}), params: [] }` for `let x = make::<T, U>()`, want 2 params. The term holds errors where rustc (ty_infer_name_resolver) still has the unresolved vars: look for fallback (infer/fallback.rs) or writeback (infer/unify.rs DiagnoseInferVars ~line 795, solver_errors.rs ~910 NamedTerm::new) replacing unconstrained vars with errors before the diagnostic is built, or fresh_args_for_item no longer recording each var origin.",
+  "state": "open",
+  "created": "2026-10-31T00:47:09Z",
+  "updated": "2026-10-31T00:47:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:47:09Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

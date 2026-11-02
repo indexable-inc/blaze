@@ -1,0 +1,40 @@
+{
+  "id": "01246",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-ty-mir/src/tests/incremental.rs",
+    "crates/hir-def/src/nameres/tests/incremental.rs",
+    "crates/hir-def/src/expr_store/tests/invalidation.rs",
+    "crates/hir-ty-mir/tests/mir/source_maps.rs",
+    "crates/blaze-items/src/tests/narrow.rs",
+    "crates/hir-ty/src/method_resolution/delta/tests/cost.rs"
+  ],
+  "what": "01226 fixed in blaze-query-macros (both trees, tracked_impl.rs): a tracked impl method's NAME is now the contract's `SelfTy::method` (type name without generics, the user's method name; `self_ty` text when given), not the fork's `Modules < 'db >::module_`. That makes the kind tables (hir-ty db.rs ItemBounds::of etc., blaze-item-hash RULES, blaze-items goals.rs) match. In blaze-v2-qu rewrite the ~200 log expectations that copied the fork form, as a recorded replay step: in the listed files replace regex `\"([A-Z][A-Za-z0-9]*)(?: < [^\"]*? >)?::([a-z_0-9]+?)_\"` with `\"\\1::\\2\"` (hir-ty-mir incremental.rs 164, hir-def nameres incremental.rs 28, invalidation.rs 3, source_maps.rs 2; the two doc comments in narrow.rs:33 and cost.rs:77 by hand). Then rg `::[a-z_0-9]+_\"` in crates/ should find nothing.",
+  "state": "applied",
+  "created": "2026-10-31T07:11:08Z",
+  "updated": "2026-10-31T12:16:31Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T07:11:08Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:12:26Z",
+      "by": "query-unify-port",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:16:31Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "blaze-v2-qu: tools/v2/salsa_to_query.py rule METHOD_NAME (your regex, with a unit test) rewrites the fork form in every replay: 199 in hir-ty-mir incremental.rs/source_maps.rs, hir-def nameres incremental.rs/invalidation.rs; doc comments in blaze-items narrow.rs:33 and hir-ty cost.rs:77 by hand. rg ::[a-z_0-9]+_\" in crates/ finds nothing. Records re-made on 9023f3e6d7."
+    }
+  ]
+}

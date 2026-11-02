@@ -1,0 +1,23 @@
+{
+  "id": "01392",
+  "from_lane": "fix-diag-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/builtin/attr_macro.rs"
+  ],
+  "what": "## `#[cfg_accessible]` is a dummy expander: malformed input is accepted, and the path is never resolved\n\ncrates/hir-expand/src/builtin/attr_macro.rs:80: `(cfg_accessible, CfgAccessible) => dummy_attr_expand`. rustc's builtin (`rustc_builtin_macros/src/cfg_accessible.rs`) validates the input: \"malformed `cfg_accessible` attribute input\" for `#[cfg_accessible]` and `#[cfg_accessible = ..]` (help: `#[cfg_accessible(path)]`); \"`cfg_accessible` path is not specified\" for `()`; \"multiple `cfg_accessible` paths are specified\"; \"`cfg_accessible` path cannot be a literal\"; \"`cfg_accessible` path cannot accept arguments\". It then keeps or removes the item by whether the path resolves (and is indeterminate until it can). The dummy keeps every item and reports nothing: a silent other path (no-fallback), and a program whose `cfg_accessible` item rustc removes builds differently. Fix: port the validation, with errors at the attribute, and the resolution (`resolve_path_as_*` once the path's module is collected; an indeterminate path waits). Test: blaze-diagnostics tests::items::attrs::misc::cfg_accessible_takes_one_path (empty output in rounds 12-15; 7 errors at lines 3-21 naming `cfg_accessible`).",
+  "state": "open",
+  "created": "2026-11-01T00:22:24Z",
+  "updated": "2026-11-01T00:22:24Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:22:24Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

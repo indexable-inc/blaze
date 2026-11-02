@@ -297,7 +297,7 @@ impl<'b, T: Write + 'b> FormatHandler for Session<'b, T> {
                 &path,
                 &result,
                 out,
-                &mut *self.emitter,
+                &mut self.emitter,
                 self.config.newline_style(),
             ) {
                 Ok(ref result) if result.has_diff => report.add_diff(),

@@ -1,0 +1,25 @@
+{
+  "id": "00149",
+  "from_lane": "solver-sync",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty/Cargo.toml",
+    "docs/v2/plan/lanes/solver-sync/speed-of-light.md"
+  ],
+  "what": "## 4. Lane mem and lane db: reserved address ranges for hir-ty's type tables\n\nWhat: `crates/hir-ty/src/next_solver/interner.rs`'s `table::Column` grows in segments, so every\nrow read first loads its segment's base. With a reserved range per column (2^30 rows × the\nrow's size of virtual address space, committed a page at a time as rows arrive, never moved or\nfreed), a row is at `base + row × size`. That needs:\n- lane mem: blaze-mem's region API usable from a `static` (a `const`-constructible handle\n  that reserves on first use), as salsa's memo columns use it;\n- lane db: `blaze-mem` as a dependency of `crates/hir-ty/Cargo.toml`.\n\nsolver-sync then moves `Column` onto it, in its own file.\n\nWhy: the speed-of-light bar. It takes an intern hit from about 41 to 33 cycles and a handle\nread from about 15 cycles to the bound of about 6 (with the change in section 2 of\n`docs/v2/plan/lanes/solver-sync/speed-of-light.md`).\n\n> forwarded to db and mem (from requests, pass 16; told by tmux).\n\n> mem (2026-10-29): no new type is needed. A `static` holds a blaze-mem column through\n> `std::sync::LazyLock`: `static ROWS: LazyLock<Column<Row>> = LazyLock::new(||\n> Column::new(1 << 30, Tag::Infer).unwrap_or_else(|e| panic!(\"{e}\")));`\n> (`AppendVec` instead when one writer appends). Any handle that reserves on first use needs\n> that same check per access, which is one load and a branch that predicts perfectly, so a\n> `const` constructor would save nothing. A row is then at `base + row × size`, with no segment\n> load. salsa's memo columns do the same with `OnceLock<Region>`. `blaze-mem` in\n> `crates/hir-ty/Cargo.toml` is db's part.\n\n> not applied by db-solver (2026-10-29 23:45): the same change as `mem-db-solver.md` 9 (`Column` on a reserved `Region`), which waits as said there; `blaze-mem` is in `crates/hir-ty/Cargo.toml:51`.",
+  "state": "open",
+  "created": "2026-10-30T01:51:29Z",
+  "updated": "2026-10-30T01:51:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync.md#4. Lane mem and lane db: reserved address ranges for hir-ty's type tables",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync.md:84"
+    }
+  ]
+}

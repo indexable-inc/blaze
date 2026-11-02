@@ -1,0 +1,38 @@
+{
+  "id": "00160",
+  "from_lane": "fix-radix-rest",
+  "owner": "format",
+  "paths": [
+    "crates/blaze-format/src/tiers.rs",
+    "docs/v2/plan/goals/principles.md",
+    "crates/blaze-radix/src/lib.rs",
+    "crates/blaze-format/Cargo.toml"
+  ],
+  "what": "## 1. `crates/blaze-format/src/tiers.rs`: use `blaze_ids::radix::sort` (for lane format)\n\nWhy: `docs/v2/plan/goals/principles.md` (\"Sorting and ordering\") wants one radix sort for integer\nkeys, and `crates/blaze-radix/src/lib.rs` (lane fix-radix) is it. `tiers.rs` has a private\n`fn radix_sort(values: &mut Vec<u32>)` (an LSD sort on bytes, `sort_unstable` below 256 values)\nthat is being written now, so I left the file alone. Once it settles, the change is: delete\n`radix_sort`, and call `radix::sort(&mut distinct)` at its two call sites (the `Shape` pass and\nthe dictionary build), with `use blaze_ids::radix;` and `blaze-ids.workspace = true` in\n`crates/blaze-format/Cargo.toml` if it is missing. The output is the same: the values are `u32`\nand the order is ascending, so ties are equal values.\n\n> forwarded to format.",
+  "state": "applied",
+  "created": "2026-10-30T02:03:57Z",
+  "updated": "2026-10-30T09:37:18Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/fix-radix-rest.md#1. `crates/blaze-format/src/tiers.rs`: use `blaze_ids::radix::sort` (for lane format)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fix-radix-rest.md:3"
+    },
+    {
+      "at": "2026-10-30T09:37:18Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:37:18Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Already in: crates/blaze-format/src/tiers.rs has no private radix_sort; Shape::of calls blaze_ids::radix::sort (the one sort, fix-radix), and encode_raw (test-only) too."
+    }
+  ]
+}

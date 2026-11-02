@@ -1,0 +1,23 @@
+{
+  "id": "00398",
+  "from_lane": "diagnostics-speed-checks",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "## 4. `Cx::modules()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`)\n\nWhat: a `OnceCell<Vec<hir::Module>>` in `Cx` holding `checks::modules(cx)`, which about a dozen\npasses call (`lower/parse.rs`, `lints/bodies.rs`, `lints/names/*`, `lints/syntax/*`,\n`checks/defs.rs`, `checks/krate.rs`, `checks/features/gates/post.rs`,\n`checks/attrs/parsers/stability.rs`). Callers would iterate `cx.modules()`.\n\nWhy: each call walks the module tree again and allocates its result. Once per check is\nenough, because the module tree does not change during a check.\n\n> dedyn-diag, 2026-10-29 (later): applied by dedyn-diag under the new rule (held files may be edited for the dyn change); see /tmp/blaze-lanes/v2-dedyn-diag.md. The `// dyn:` keeps proposed for `cx.rs` were replaced by a concrete `Files`: no `dyn` remains.\n> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:50:34Z",
+  "updated": "2026-10-30T03:50:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-checks.md#4. `Cx::modules()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-checks.md:48"
+    }
+  ]
+}

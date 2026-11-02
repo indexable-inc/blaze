@@ -1,0 +1,35 @@
+{
+  "id": "00136",
+  "from_lane": "diagnostics-lints-bodies-liveness",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir"
+  ],
+  "what": "## 2. hir-ty-mir: mark the capture copies at a closure's start\n\nWhat: on `MirBody`, the statements (or the locals) that copy a capture out of the closure's own\nlocal at its start (`cap = move _1.f` / `(*_1).f`, at `MirSpan::Unknown`), with the field.\nWhy: rustc has no such copies, so liveness must treat them as neither a use nor an assignment.\nIt now finds them as an `Assign` at `MirSpan::Unknown` of an `upvar_locals` local from the\nclosure's own local. `upvar_locals` already maps the capture to its local.\n\n> forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.\n\n> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.",
+  "state": "applied",
+  "created": "2026-10-30T01:33:34Z",
+  "updated": "2026-10-31T20:36:08Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-bodies-liveness.md#2. hir-ty-mir: mark the capture copies at a closure's start",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-bodies-liveness.md:20"
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:08Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "MirBody::capture_copies is in (hir-ty/src/mir.rs:1607) and filled by lower.rs."
+    }
+  ]
+}

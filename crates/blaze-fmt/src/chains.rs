@@ -561,15 +561,24 @@ impl Rewrite for Chain {
     fn rewrite_result(&self, context: &RewriteContext<'_>, shape: Shape) -> RewriteResult {
         debug!("rewrite chain {:?} {:?}", self, shape);
 
-        let mut formatter = match context.config.indent_style() {
+        match context.config.indent_style() {
             IndentStyle::Block => {
-                Box::new(ChainFormatterBlock::new(self)) as Box<dyn ChainFormatter>
+                self.rewrite_with(ChainFormatterBlock::new(self), context, shape)
             }
             IndentStyle::Visual => {
-                Box::new(ChainFormatterVisual::new(self)) as Box<dyn ChainFormatter>
+                self.rewrite_with(ChainFormatterVisual::new(self), context, shape)
             }
-        };
+        }
+    }
+}
 
+impl Chain {
+    fn rewrite_with(
+        &self,
+        mut formatter: impl ChainFormatter,
+        context: &RewriteContext<'_>,
+        shape: Shape,
+    ) -> RewriteResult {
         formatter.format_root(&self.parent, context, shape)?;
         if let Some(result) = formatter.pure_root() {
             return wrap_str(

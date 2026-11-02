@@ -1,0 +1,23 @@
+{
+  "id": "00354",
+  "from_lane": "usercode-wire",
+  "owner": "frontend-tokens",
+  "paths": [
+    "crates/tt"
+  ],
+  "what": "## 5. frontend-tokens (`crates/tt/`): two small exports (optional)\n\nWhat: (a) a `pub const` for the longest literal suffix a node holds (`u32::MAX >> 14` bytes),\nwhich `proc-macro-api` and `proc-macro-srv` restate as `LONGEST_SUFFIX` so they can refuse a\nlong suffix before `Node::literal` asserts. (b) `SubtreeView::write_wire`, or `write_wire` with\nfragment wrappers left out. `proc_macro_api::wire::write_tree` rebuilds the tree through\n`TopSubtreeBuilder` because `write_wire` exists only on a whole `TopSubtree`, and the\nparentheses of a passed-on fragment must not reach a proc macro. That costs one rebuild per\nrequest.\n\nWhy: (a) keeps the two crates' bound in step with tt's. (b) removes the copy that remains per\nrequest.\n\n> forwarded to frontend-tokens (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:35:14Z",
+  "updated": "2026-10-30T03:35:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-wire.md#5. frontend-tokens (`crates/tt/`): two small exports (optional)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-wire.md:98"
+    }
+  ]
+}

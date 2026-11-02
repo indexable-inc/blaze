@@ -1,9 +1,0 @@
-[package]
-name = "app"
-version = "0.1.0"
-edition = "2021"
-
-[profile.fast]
-inherits = "release"
-overflow-checks = true
-opt-level = 1

@@ -1,0 +1,41 @@
+{
+  "id": "01193",
+  "from_lane": "tests-misc",
+  "owner": "tests-misc",
+  "paths": [
+    "crates/tt/src/lib.rs"
+  ],
+  "what": "crates/tt/src/lib.rs token_to_literal (~line 530): a quoted literal with a suffix (`'c'u32`, `\"s\"x`, `b'b'_suff`) becomes LitKind::Err with the whole text; rustc lexes it as Char/Str/Byte with the suffix and refuses the suffix later in the parser/lowering. Replace the ill-suffixed arm with `suffix => Literal::new(lit, span, kind, suffix)` for quoted kinds (numbers keep the current arm: their text_and_suffix is the token text). Fails syntax-bridge lexing_then_parsing_gives_the_files_tree on parser test_data 0030_string_suffixes.rs (the tt-built parser input disagrees with the lexer on those tokens). Check callers that relied on Err for suffixed quoted literals (mbe/proc-macro-srv Display) once built.",
+  "state": "applied",
+  "created": "2026-10-31T00:06:42Z",
+  "updated": "2026-10-31T14:43:31Z",
+  "taken_by": "tests-misc",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:06:42Z",
+      "by": "tests-misc",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to tests-misc, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:15Z",
+      "by": "tests-misc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:43:31Z",
+      "by": "tests-misc",
+      "action": "done",
+      "note": "already in the tree since 4aa7f2c896 (round 3): token_to_literal keeps a quoted literal kind and suffix (Literal::new); numbers keep the token text. No caller relies on Err for them (Err users: storage codes, to_parser_input ERROR, args.rs display)."
+    }
+  ]
+}

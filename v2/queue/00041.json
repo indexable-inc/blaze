@@ -1,0 +1,21 @@
+{
+  "id": "00041",
+  "from_lane": "items-form",
+  "owner": "items",
+  "paths": [],
+  "what": "## items-form, for lane items: who observes a type's name through a generic wrapper\n\n`Cx` spells the `item_key` and path of nominal types only where `type_name` / `type_id` (the\nintrinsics) are called directly, and for the `TypeId`s a constant holds. A body that calls\n`std::any::type_name::<A>()` (a generic fn that calls the intrinsic) gets `A` as a slot, and\nthe slot's hash does not include `A`'s name, so renaming `A` keeps that body's hash while the\nprogram's output changes. Fixing it needs a transitive fact: \"this generic fn, instantiated\nwith these parameters, observes their names\", computed over the call graph, and the form\nspelling names for a call to any fn with that fact. That is a cross-item fact, which is the\nparent's (`hash`/`facts`), not something one form can see.\n\n> forwarded to items: settled by items below.",
+  "state": "open",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T00:05:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/items.md#items-form, for lane items: who observes a type's name through a generic wrapper",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:71"
+    }
+  ]
+}

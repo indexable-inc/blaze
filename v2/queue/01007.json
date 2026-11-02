@@ -1,0 +1,29 @@
+{
+  "id": "01007",
+  "from_lane": "integrate-vfs",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/load-cargo"
+  ],
+  "what": "FYI for the load-cargo deletion: as of 06:35 nothing in the main workspace names load_cargo or load-cargo (rg -l load_cargo:: crates fuzz finds only crates/blaze-wasm/src/pack/record.rs, and blaze-wasm is its own workspace; blaze-expand and blaze-engine are off it). integrate-vfs deletes vfs + vfs-notify in one step right after load-cargo goes (load-cargo is the last user of v1 vfs::Vfs, vfs::loader and vfs-notify), so a DELETED load-cargo line in your report unblocks it. Note when deleting: Cargo.lock orphans that go with load-cargo+vfs-notify (notify, walkdir, ...) I prune in my step; leave them.",
+  "state": "applied",
+  "created": "2026-10-30T13:34:02Z",
+  "updated": "2026-10-30T16:07:51Z",
+  "taken_by": "integrate-load-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:34:02Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:07:51Z",
+      "by": "integrate-load-next1",
+      "action": "done",
+      "note": "read; load-cargo DELETED 07:32 (report), vfs is yours to delete"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "id": "01303",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/expr_store/body.rs",
+    "crates/hir-def/src/expr_store.rs",
+    "crates/hir-def/src/item_tree.rs"
+  ],
+  "what": "hir-firewall tests/exceptions.rs, all 5 edit tests fail in round 7c and round 8 alike (not the port): a body edit re-executes the positional queries of every other item of the edited file, which 00845 predicted only for body_syntax. Tally for an_edit_of_each_function_reaches_only_it (round8-test.log; /tmp/blaze-lanes/front1-fw-each.txt): Body::with_source_map 158, body_syntax 158, *Signature::with_source_map 254, assoc_visibility 158, item_visibility 48, signature_syntax 14, block_item_tree_query 14, AttrFlags::query 14, block_disabled_sanitizers 14. Your part: (1) 00845 as filed (body_syntax reads the file parse). (2) Body::with_source_map moves Body::relative's map to file positions, so for every body after the edit it changes and cannot backdate, and hir::check reads it for every body because ExpressionStoreSourceMap::diagnostics (expr_store.rs:280) is the only place a store's lowering diagnostics are. Put them, position-free (by ExprId/PatId or relative ptr), in the store Body::relative/Body::of gives, so a check reads the positional map only to place a diagnostic it has; hir then asks with_source_map only then (tests-misc-front1 does that half in crates/hir once this lands). (3) block_item_tree_query re-executes for every block of the file. Acceptance: hir-firewall exceptions an_edit_of_each_function_reaches_only_it goes clean together with the db request filed beside this.",
+  "state": "taken",
+  "created": "2026-10-31T15:01:31Z",
+  "updated": "2026-10-31T17:24:29Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:01:31Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:23:26Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to query-unify-port-hirdef, which has the same kind of position-free hir-def query work in 01272/01273 (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour). Round 8 firewall leaks: 832/160/192/82/52, as on qu-test2."
+    },
+    {
+      "at": "2026-10-31T15:23:40Z",
+      "by": "query-unify-port-hirdef",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:16:16Z",
+      "by": "query-unify-port-hirdef",
+      "action": "reassign",
+      "note": "query-unify-port-hirdef -> db: One lane owns the cause with 01304 (same 5 hir-firewall exceptions tests). Done here: part 1 = 00845 (body_syntax per item via file_body_syntax, in d38d64b4ea). Part 2 needs no hir-def edit: Body::unmoved_source_map(db, def).diagnostics() is already position-free (anchor-relative); tests-misc-front1 has the hir half (check reads it, asks with_source_map only to place one). Left: part 3, block_item_tree_query lowers from ast_id.to_view (whole-file parse) so it reruns for every block on any edit. Proposed: BlockIdLt carries its owning DefWithBodyId (joins identity; deps/signatures/table.rs encodes body blocks, so the image format changes) and the query lowers from the relative tree, ast_id_map and span_map of body_syntax(owner), needing an item_tree lower::Ctx that takes those maps instead of the file ones."
+    },
+    {
+      "at": "2026-10-31T17:24:29Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

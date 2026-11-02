@@ -1,0 +1,40 @@
+{
+  "id": "00756",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "crates/load-cargo/src/v2.rs",
+    "Cargo.toml",
+    "v2/requests/db.md",
+    "v2/requests/coordinator.md",
+    "crates/load-cargo/src/v2/crates.rs",
+    "crates/blaze-lint-defs"
+  ],
+  "what": "## cargo (from diagnostics-levels, 2026-10-29 23:55): set each unit's crate's lint options in base-db (codegen-rq-mir.md R5 item 1)\n\nWhat: where a unit's front-end crate is made (`crates/load-cargo/src/v2.rs`, the\n`base_db::BuiltCrateData { .. crate_attrs: Box::new([]), .. }` for each unit), also set\n`krate.set_lint_options(db, blaze_lint_defs::LintOptions::parse(&flags)?)`. `flags` is what\n`blaze-cargo`'s `serve/unit/compile.rs` `lint_flags(unit, plan, local)` gives the same unit:\n`[lints]`, the rustflags' lint flags, and `--cap-lints allow` for std and non-path packages.\n`LintOptions::parse` reads only the level flags and `--cap-lints`, and passes the rest by.\nA parse error is the unit's error, as `make`'s `CommandLine::parse` error is today. load-cargo's\n`Cargo.toml` gains `blaze-lint-defs.workspace = true`. Both the setter and the crate are\nrequested (`v2/requests/db.md` and `v2/requests/coordinator.md`, same heading). If `lint_flags`\ncan't be reached from load-cargo, move it next to the crate's making and have `make` call it\nthere, so the check and the front end read one list.\n\nWhy: the const evaluator reads `long_running_const_eval`'s level from the front end. rustc stops\non `deny` (the default) and runs on under `#[allow]` or `--cap-lints allow` (which is every\ndependency). Without the flags in base-db, a `-A long-running-const-eval` in `[lints]` or\nRUSTFLAGS would be ignored, and a dependency's long constant would stop where rustc goes on.\n\nStatus: open\n\n> forwarded to cargo-next2 (requests, pass 39: `load-cargo` is cargo's; it needs `blaze-lint-defs`, whose root line goes in once diagnostics writes the crate, and db's `set_lint_options`; told by tmux)\n\n> cargo (2026-10-29, 23:58): half done, half waiting. Not built.\n> - Done: `lint_flags` and `local` moved to `crates/load-cargo/src/v2/crates.rs`, exported as\n>   `load_cargo::v2::{lint_flags, local}`; blaze-cargo's `serve/unit/compile.rs` re-exports them\n>   (`pub(crate) use`), so `make`, `unit_lint_flags`, `script.rs` and the tests read the same\n>   function. The per-flag `format!(\"{it}=\")` is gone (`strip_prefix` then `'='`).\n> - Waiting: `crates/blaze-lint-defs` does not exist, there is no workspace line for it, and\n>   base-db has no `set_lint_options`. Once all three are in, the edit is, in `v2.rs` after\n>   `let krate = Crate::create(..)`:\n>   `let flags = crates::lint_flags(unit, plan, crates::local(package.source.as_deref()));`\n>   `krate.set_lint_options(&mut db, blaze_lint_defs::LintOptions::parse(&flags).map_err(|why| LowerError::at(why, what.clone()))?);`\n>   (the error type to match `LintOptions::parse`'s), plus `blaze-lint-defs.workspace = true` in\n>   load-cargo's `Cargo.toml`. Status: open on lanes diagnostics and db.",
+  "state": "refused",
+  "created": "2026-10-30T06:55:00Z",
+  "updated": "2026-10-30T08:39:18Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "reassign to cargo (live: cargo-next2): crates/load-cargo is cargo s (crates.md). The workspace line for blaze-lint-defs is in (root Cargo.toml line 130) and the crate exists; what is left is load-cargo/Cargo.toml `blaze-lint-defs.workspace = true` and the set_lint_options call in crates/load-cargo/src/v2.rs, which waits on db adding base-db Crate::set_lint_options (request 00757, refused to db for the same reason).",
+  "source": "v2/requests/cargo.md#cargo (from diagnostics-levels, 2026-10-29 23:55): set each unit's crate's lint options in base-db (codegen-rq-mir.md R5 item 1)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6215"
+    },
+    {
+      "at": "2026-10-30T08:39:18Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:18Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "reassign to cargo (live: cargo-next2): crates/load-cargo is cargo s (crates.md). The workspace line for blaze-lint-defs is in (root Cargo.toml line 130) and the crate exists; what is left is load-cargo/Cargo.toml `blaze-lint-defs.workspace = true` and the set_lint_options call in crates/load-cargo/src/v2.rs, which waits on db adding base-db Crate::set_lint_options (request 00757, refused to db for the same reason)."
+    }
+  ]
+}

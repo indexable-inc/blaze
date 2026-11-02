@@ -3,15 +3,15 @@ use crate::{
     expr_store::pretty::{print_function, print_struct},
     nameres::crate_def_map,
     signatures::{FunctionSignature, StructSignature},
-    test_db::TestDB,
+    test_db::TestDBExt,
 };
 use expect_test::{Expect, expect};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::super::*;
 
 fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
@@ -39,6 +39,8 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
         match def {
             GenericDefId::AdtId(adt_id) => match adt_id {
                 crate::AdtId::StructId(struct_id) => {
+                    let (signature, source_map) = StructSignature::with_source_map(&db, struct_id);
+                    crate::expr_store::persist::assert_store_round_trip(&signature.store, source_map);
                     out += &print_struct(
                         &db,
                         struct_id,
@@ -51,6 +53,8 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
             },
             GenericDefId::ConstId(_id) => (),
             GenericDefId::FunctionId(function_id) => {
+                let (signature, source_map) = FunctionSignature::with_source_map(&db, function_id);
+                crate::expr_store::persist::assert_store_round_trip(&signature.store, source_map);
                 out += &print_function(
                     &db,
                     function_id,
@@ -116,6 +120,19 @@ fn ret_impl_trait() -> impl Trait {}
              {...}
             const async unsafe extern "C" fn a() -> impl ::core::future::Future::<Output = ()> {...}
             fn ret_impl_trait() -> impl Trait {...}
+        "#]],
+    );
+}
+
+/// Kept as written: the type lowering refuses it there (E0562, `ImplTraitNotAllowed`).
+#[test]
+fn an_impl_trait_where_none_is_allowed_is_kept_for_the_type_lowering() {
+    lower_and_print(
+        r"
+fn f<T = impl Trait>() {}
+",
+        expect![[r#"
+            fn f<T = impl Trait>() {...}
         "#]],
     );
 }

@@ -1,0 +1,23 @@
+{
+  "id": "01030",
+  "from_lane": "fastcompile-testsel",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/test/select.rs"
+  ],
+  "what": "## fastcompile-testsel 3: usercode: drop `Clone` from `test::Input` (the rest of queue 00331)\n\nblaze-testsel's `Choice` and `Why` no longer derive `Clone` (`crates/blaze-testsel/src/select.rs`), and blaze-testsel never clones an `Input`: `Why::Read(input)` takes it by move from `changed_input` and the selector's `read_changed`. So `pub enum Input` in `crates/blaze-usercode/src/test/select.rs` can drop `Clone`, as usercode-hot-core asked in 00331, once nothing in blaze-usercode clones one.",
+  "state": "open",
+  "created": "2026-10-30T14:21:25Z",
+  "updated": "2026-10-30T14:21:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:21:25Z",
+      "by": "fastcompile-testsel",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

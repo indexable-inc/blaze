@@ -42,7 +42,7 @@ macro_rules! m {
     }
 }
 fn f() {
-    m!()
+    m!();
 }
 "#,
         expect![[r#"
@@ -62,7 +62,7 @@ fn f() {
     let _ = 12E+99_f64;
     let _ = 45E+1234_f128;
     let _ = "rust1";
-    let _ = -92;
+    let _ = -92;;
 }
 "#]],
     );
@@ -101,7 +101,7 @@ macro_rules! m1 { ($x:ident) => { ($x } }
 macro_rules! m2 { ($x:ident) => {} }
 
 fn f1() { (x); }
-fn f2() { /* error: expected ident */ }
+fn f2() { /* error: this macro call's `(` is never closed, so it is not expanded */ }
 "#]],
     )
 }
@@ -117,7 +117,7 @@ fn f() { m!('a); }
         expect![[r#"
 macro_rules! m { ($t:ident) => { $t } }
 
-fn f() { /* error: expected ident */missing; }
+fn f() { /* error: no rules expected `'a` */missing; }
 "#]],
     )
 }

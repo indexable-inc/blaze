@@ -1,0 +1,23 @@
+{
+  "id": "01258",
+  "from_lane": "std-scripts",
+  "owner": "pure-scripts",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script/pure.rs"
+  ],
+  "what": "One way per job: crates/blaze-cargo/src/serve/unit/script.rs now has fn script_env(job, run) -> Result<(bs::Unit, Vec<(OsString, OsString)>), String> (the run as blaze_build_script describes it, its program named, and its whole sorted environment), which is what script/pure.rs run_of + script_env do. Make script_env pub(crate) and have pure.rs work_out call it (mapping the String error to ApiError with unit.package.descr()), deleting run_of and script_env in pure.rs. Not urgent; no behavior change.",
+  "state": "open",
+  "created": "2026-10-31T12:26:41Z",
+  "updated": "2026-10-31T12:26:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:26:41Z",
+      "by": "std-scripts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

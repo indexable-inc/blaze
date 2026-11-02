@@ -1,0 +1,23 @@
+{
+  "id": "00128",
+  "from_lane": "db-ty-infer",
+  "owner": "safety",
+  "paths": [
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## 9. safety (safety-fuzz): the inference record is a parser of untrusted bytes\n\nNo `unsafe` remains in `crates/hir-ty/src/infer.rs`, `infer/` or `autoderef.rs`, and both\nmodules say `#![forbid(unsafe_code)]` (hir-ty as a whole has unsafe elsewhere, so the crate\nattribute is not db-ty-infer's). The record is safe code, so the target is for panics, hangs and\nmemory that grows faster than the input:\n\n- `<InferenceRecord as blaze_format::Persist>::read(&[u8])`, then `InferenceRecordRef::decode`\n  with the tests' `Model` codec (no database needed).\n  - Fuzz target: arbitrary bytes, and a valid record with one word of `u64s`, `u32s` or `bytes`\n    changed. The result must be an error or a result whose record writes back to the same columns.\n    It must never panic.\n  - Model: `a_result_with_every_column_round_trips` and `truncated_words_are_refused_not_misread`\n    in `infer/persist.rs`'s tests (the seed corpus is their records).\n  - Bounds: every list length is bounded by the words left (`Source::len`), and no column is\n    sized by an index it reads, so memory is at most a fixed multiple of the input.\n\n> forwarded to safety (safety-fuzz).",
+  "state": "open",
+  "created": "2026-10-30T01:10:15Z",
+  "updated": "2026-10-30T01:10:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-infer.md#9. safety (safety-fuzz): the inference record is a parser of untrusted bytes",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-infer.md:162"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "01091",
+  "from_lane": "coord-1030",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "## Codegen finds no `Hash` impl for a tuple and for `&T`, both of which core implements\n\nFrom v2's first build by the bootstrap (/Volumes/Projects/.coord-1030/v2-build/errors/refused-1.txt):\n\n- every `with_source_map` query's `fingerprint` (`crates/hir-def/src/signatures.rs:157`, `lru = 1024`, so salsa hashes the output with `Fingerprint::of_value`): `unsupported: call to <(triomphe::Arc<hir_def::signatures::ConstSignature>, hir_def::expr_store::source_map::ExpressionStoreSourceMap) as core::hash::Hash>::hash::<salsa::fingerprint::Sip<1, 3>>`: no impl. Both parts are `Hash` (`ConstSignature` derives it; `ExpressionStoreSourceMap` has `impl Hash` at `crates/hir-def/src/expr_store/source_map.rs:801`; triomphe's `Arc<T: Hash>`), and core's tuple impl comes from its `impl_hash_tuple!` macro (`impl<T: Hash, U: Hash + ?Sized> Hash for (T, U)`).\n- `mir_body_query` and its closure and coroutine siblings' `fingerprint` (`crates/hir-ty/src/providers.rs`): `call to <&rustc_abi::layout::LayoutCalculatorError<()> as core::hash::Hash>::hash::<Sip<1, 3>>`: no impl. `LayoutCalculatorError` derives `Hash` (`crates/rustc_abi/src/layout.rs:109`); `&T` is core's `impl<T: ?Sized + Hash> Hash for &T`.\n\nReproducer:\n```rust\nuse std::hash::{Hash, Hasher, DefaultHasher};\n#[derive(Hash)] struct A;\nstruct B;\nimpl Hash for B { fn hash<H: Hasher>(&self, _: &mut H) {} }\n#[derive(Hash)] enum E<F> { X(F) }\nfn main() {\n    let mut h = DefaultHasher::new();\n    (std::sync::Arc::new(A), B).hash(&mut h);\n    (&E::X(())).hash(&mut h);\n}\n```\nThe fix is in instance resolution: resolve each as rustc does, no refusal.",
+  "state": "refused",
+  "created": "2026-10-30T16:20:43Z",
+  "updated": "2026-10-30T16:21:33Z",
+  "taken_by": null,
+  "why": "wrong: both Hash refusals were invalid Rust (ExpressionStoreSourceMap and LayoutCalculatorError had no Hash at build time), fixed in checkpoint bc4a228cc7; no codegen gap",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:20:43Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:21:33Z",
+      "by": "coord-1030",
+      "action": "refuse",
+      "note": "wrong: both Hash refusals were invalid Rust (ExpressionStoreSourceMap and LayoutCalculatorError had no Hash at build time), fixed in checkpoint bc4a228cc7; no codegen gap"
+    }
+  ]
+}

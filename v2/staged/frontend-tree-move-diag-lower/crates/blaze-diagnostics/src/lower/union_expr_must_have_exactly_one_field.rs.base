@@ -1,0 +1,39 @@
+//! E0784: a union's struct expression naming none of its fields or more than one, as `U {}`,
+//! `U { a, b }` or `U { ..u }`.
+//!
+//! Follows rustc's `compiler/rustc_hir_typeck/src/expr.rs` (`check_expr_struct_fields`)
+//! (MIT or Apache-2.0).
+
+use blaze_items::{Fact, ItemId};
+use hir::InFile;
+use syntax::{AstNode, ast};
+
+use crate::{
+    cx::Cx,
+    lints::code_fact,
+    lower::{Found, Phase},
+    model::Diag,
+};
+
+pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnionExprMustHaveExactlyOneField) -> Vec<Found> {
+    let node = cx.node(d.expr);
+    // alloc: empty, allocates nothing
+    let Some(ast::Expr::RecordExpr(record)) = node.value.left() else { return vec![] };
+    let span = match record.path() {
+        Some(path) => cx.span(InFile::new(node.file_id, path.syntax().text_range())),
+        None => cx.span_of_ptr(d.expr),
+    };
+    let mut diag = Diag::error(Some("E0784"), "union expressions should have exactly one field", span);
+    if let Some(hir::Variant::Union(union)) = cx.sema.resolve_variant(record) {
+        // alloc: the error's text, for an error hir found
+        let name = union.name(cx.db).display(cx.db, cx.edition).to_string();
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Adt(hir::Adt::Union(union).into()))),
+            // alloc: the error's text, for an error hir found
+            format!("that `{name}` is a union"),
+        );
+    }
+    code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
+    vec![Found::new(diag, Phase::Bodies)]
+}

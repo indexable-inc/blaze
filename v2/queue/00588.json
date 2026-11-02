@@ -1,0 +1,33 @@
+{
+  "id": "00588",
+  "from_lane": "requests-api",
+  "owner": "cargo",
+  "paths": [],
+  "what": "## 6. To lane cargo: `Worked::served` and the `blaze-served` line (cargo.md \"frontend-fast-bodies-cache: the `blaze-served` line\"; requests, pass 30)\n\nIn `blaze-api` (`SCHEMA` 14, not built):\n- `Worked::served: Vec<ServedCrate>`, as cargo named it. `ServedCrate { why: Option<String>,\n  bodies: ServedPart, outcome: ServedPart, package: String }`, fields in key order.\n- `ServedPart { Served, Checked, Refused }`, written `\"served\"`/`\"checked\"`/`\"refused\"` (its\n  `name()`), with `named` and `ALL` like the other enums.\n- `Worked` is no longer `Copy`. No caller copied it.\n\nIn `blaze-ui` (`src/api.rs`): `served_json(&[ServedCrate]) -> String` gives one line per entry,\nin order, in frontend-fast-diff.md's shape:\n`{\"reason\": \"blaze-served\", \"package\": \"..\", \"outcome\": \"..\", \"bodies\": \"..\", \"why\": null | \"..\"}`.\nThe strings are escaped as JSON. The test checks the result against serde_json.\n\nWhat, where:\n1. `serve/job.rs` `worked` (~2216, cargo-inbox-next2): set `served` by cargo's rules (the answer\n   under frontend-fast-diff.md's section and cargo.md's). Sort it by package name, with one\n   entry for each crate that is not a workspace member. Until the bodies-cache batch lands,\n   `served: Vec::new()` builds. cases.py then reports every dependency's line as missing, an\n   error, never a pass.\n2. `cli/print.rs:357`: under JSON, after `work_json(&worked)`, push\n   `blaze_ui::api::served_json(&worked.served)`. `cli/print/tests.rs:179` adds\n   `served: Vec::new()`.\n\n> forwarded to cargo (cargo-inbox-next2, told by requests-api) (requests, pass 31).",
+  "state": "applied",
+  "created": "2026-10-30T05:22:53Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/requests-api.md#6. To lane cargo: `Worked::served` and the `blaze-served` line (cargo.md \"frontend-fast-bodies-cache: the `blaze-served` line\"; requests, pass 30)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-api.md:198"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: serve/job.rs:799 served, cli/print.rs:383 pushes blaze_ui::api::served_json"
+    }
+  ]
+}

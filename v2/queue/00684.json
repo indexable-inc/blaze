@@ -1,0 +1,36 @@
+{
+  "id": "00684",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-inproc/src",
+    "docs/v2/plan/lanes/fastcompile/stencil.md"
+  ],
+  "what": "## fastcompile-stencil-tier 1: fastcompile-inproc: a cells part of the code memory, shared both ways (`crates/blaze-inproc/src/{lib.rs,load/*.rs,host.rs}`)\n\nWhat:\n\n1. `CodeMemory::with_cells(name, image, arena, cells: u64) -> Result<CodeMemory, Error>`:\n   as `new` (which becomes `with_cells(.., 0)`), with a third part of `cells` bytes (rounded\n   to the page) after the arena, zero. `CodeMemory::cells() -> CodeRange` says where it is.\n2. Every run process maps that part `Access::Shared` (readable and writable, shared both\n   ways, as the fence's control words are) at `base + image + arena`, on all three loaders\n   (ELF, Mach-O, PE). Nothing of it is executable.\n3. `CodeMemory::cell_view() -> CellView`: `Send + Sync + Clone` (an `Arc` of the daemon's\n   mapping of the part), with `fn load(&self, offset: u64) -> Result<u64, Error>`: one\n   relaxed atomic load of the aligned word at `offset` of the object, an error naming the\n   offset when it is unaligned or not in the cells part. No lock: the tier reader calls it\n   twice per counting function per round while compiles and placements hold `CodeMemory`'s.\n\nWhy: tier-up (idea 13; docs/v2/plan/lanes/fastcompile/stencil.md, \"Tier-up\") reads each\nfunction's counter cells in place. The image's data is mapped as a private copy, which the\ndaemon never sees on macOS, so the cells need memory shared both ways at an address the\nlinker knows before any process exists (`fastcompile-stencil 3` resolves `Target::Counter`\ninto it). blaze-stencil cannot depend on blaze-inproc (lane notes, dependency order), so the\ndaemon side wraps a `CellView` in a type that implements `blaze_stencil::tier::Cells`\n(`fastcompile-stencil-tier 2`).\n\n> told lane fastcompile (window `fastcompile`, by tmux): blaze-inproc's owners report DONE.\n\n> superseded by fastcompile-inproc-exec (item 2 only): the cells are an OS object of their own,\n> mapped shared at a linked address in the executable's second reservation (`CodeMemory::linked`\n> of a cell's offset), not at `base + image + arena`. Items 1 and 3 stand as applied.\n\n> forwarded to fastcompile (fastcompile-inproc's paths; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:32:11Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done: blaze-inproc lib.rs has CodeMemory::with_cells (:293), cells() (:638), cell_view() -> Option<CellView> (:643) and CellView::load (:777); item 2 is superseded (cells mapped at a linked address, per the note); blaze-lazy runner.rs implements tier::Cells over it.",
+  "source": "v2/requests/fastcompile.md#fastcompile-stencil-tier 1: fastcompile-inproc: a cells part of the code memory, shared both ways (`crates/blaze-inproc/src/{lib.rs,load/*.rs,host.rs}`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:2166"
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done: blaze-inproc lib.rs has CodeMemory::with_cells (:293), cells() (:638), cell_view() -> Option<CellView> (:643) and CellView::load (:777); item 2 is superseded (cells mapped at a linked address, per the note); blaze-lazy runner.rs implements tier::Cells over it."
+    }
+  ]
+}

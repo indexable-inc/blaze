@@ -1,0 +1,25 @@
+{
+  "id": "00481",
+  "from_lane": "diagnostics-lints-syntax-early-validation",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lib.rs",
+    "docs/v2/plan/design/unsafe.md",
+    "crates/blaze-diagnostics/src"
+  ],
+  "what": "## diagnostics-lints-syntax-early-validation: `#![forbid(unsafe_code)]` for blaze-diagnostics\n\n`crates/blaze-diagnostics/src/lib.rs` (parent): add `#![forbid(unsafe_code)]`, as\n`docs/v2/plan/design/unsafe.md` requires of a crate with no unsafe module. Checked with\n`rg 'unsafe\\s*(\\{|fn|impl)' crates/blaze-diagnostics/src`: every match is inside a string,\ncomment or diagnostic message (rustc test sources, suggestion text), so it builds unchanged.\n\n> forwarded to diagnostics: its own `src/lib.rs`.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-validation: `#![forbid(unsafe_code)]` for blaze-diagnostics",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1266"
+    }
+  ]
+}

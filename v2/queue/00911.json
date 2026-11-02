@@ -1,0 +1,35 @@
+{
+  "id": "00911",
+  "from_lane": "speed-sol2-link-inputs",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/model.rs"
+  ],
+  "what": "## Joining name arenas, for the `.tbd` decode on workers (speed-sol2-link-inputs, 2026-10-30)\n\nWhat is slow: `macho/tbd.rs` now parses a stream's documents in parallel (A6), but decodes them into the one `Names` arena of the `Shared` serially: about 0.5 ms of libSystem.tbd's 0.8 ms (see `docs/v2/plan/lanes/link/speed-of-light.md`, Mach-O, \"Parse `.tbd`\"). Each document could decode into its own `Names` on a worker if the reader could join them afterwards, which it can't: `Name`'s fields are private to `model.rs`.\n\nThe exact edit, in `model.rs` after `Names::bytes`:\n\n```rust\n    /// Appends `other`'s names, returning the offset its names start at here: a [`Name`] of\n    /// `other` is [`Name::shifted`] by it to name the same text in `self`. An error past 4 GiB.\n    pub fn append(&mut self, other: &Names) -> Result<u32, String> {\n        let at = u32::try_from(self.0.len()).ok();\n        let len = u32::try_from(other.0.len()).ok();\n        match (at, len) {\n            (Some(at), Some(len)) if at.checked_add(len).is_some() => {\n                self.0.push_str(&other.0);\n                Ok(at)\n            }\n            // alloc: error path\n            _ => Err(\"more than 4 GiB of names in one file\".to_owned()),\n        }\n    }\n```\n\nand on `Name`:\n\n```rust\nimpl Name {\n    /// The same name in the arena `by` came from: `by` must be what [`Names::append`] returned\n    /// for the arena this name was made in.\n    pub fn shifted(self, by: u32) -> Name {\n        Name { at: self.at + by, len: self.len }\n    }\n}\n```\n\nCharacter boundaries are kept: `other` is a whole `String` appended, so every boundary of it is one in `self`. Nothing else changes; the core still checks every name of a file when it takes it.\n\nMy side once it is in: `tbd.rs` `decode` per document on workers (`map_init` with a `Names` and a `Seen` each), then a serial join of the documents in order that appends each arena once, shifts its symbols' names, and deduplicates across documents with the one `Seen` it keeps today (only names seen in an earlier document are dropped, as now). Test: a differential against the serial decode on the seeded streams of `documents_parse_alike_on_workers_and_in_turn`.\n\nRelated, already filed, the core's: 00004 (`Shared::index`, so `Exports` hashes only imported names; `tbd.rs`'s `Seen` is that table).",
+  "state": "applied",
+  "created": "2026-10-30T09:41:16Z",
+  "updated": "2026-10-30T10:01:59Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:41:16Z",
+      "by": "speed-sol2-link-inputs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:01:59Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:01:59Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "model.rs: Names::append(&Names) -> Result<u32, String> and Name::shifted(by) as specified. tbd.rs side is speed-sol2-link-inputs (now DONE): take it from 00911 when next in macho/tbd.rs."
+    }
+  ]
+}

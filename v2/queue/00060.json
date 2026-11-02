@@ -1,0 +1,38 @@
+{
+  "id": "00060",
+  "from_lane": "db-ty-hir",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/check.rs",
+    "crates/hir-ty-wfcheck/Cargo.toml",
+    "crates/hir",
+    "crates/hir/src/check/bodies.rs"
+  ],
+  "what": "## 4. Lane db: `AnyDiagnostic` must stay `Send + Sync`; `hir-ty-wfcheck` gains `smallvec`\n\n`check_modules` (`crates/hir/src/check.rs`) now keeps each module's diagnostics in a\n`OnceLock` slot written once by its task (a compare-and-swap, no lock), which needs\n`AnyDiagnostic<'db>: Send + Sync` (it is today: interned types, pointers, names, strings).\n`crates/hir-ty-wfcheck/Cargo.toml` gains `smallvec.workspace = true` (outlives components and\nthe region walk's stacks on the stack); the manifest lint passes.\n\n> forwarded to db: `crates/hir/` and `crates/hir-ty-wfcheck/Cargo.toml` are lane db's (`smallvec` is a workspace dependency already).\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:21` (`smallvec`); `Send + Sync` of `AnyDiagnostic` is held by the compiler: `crates/hir/src/check/bodies.rs:178` shares `OnceLock<Vec<AnyDiagnostic>>` slots with `Db::run_all`'s `F: Sync` task (`base-db/src/db.rs:313`).",
+  "state": "applied",
+  "created": "2026-10-30T00:37:33Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-hir.md#4. Lane db: `AnyDiagnostic` must stay `Send + Sync`; `hir-ty-wfcheck` gains `smallvec`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-hir.md:40"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:21` (`smallvec`); `Send + Sync` of `AnyDiagnostic` is held by the compiler: `crates/hir/src/check/bodies.rs:178` shares `OnceLock<Vec<AnyDiagnostic>>` slots with `Db::run_all`'s `F: Sync` task (`base-db/src/db.rs:313`)."
+    }
+  ]
+}

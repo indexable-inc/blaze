@@ -1,0 +1,25 @@
+SOURCE_FILE
+  MODULE
+    UNSAFE_KW "unsafe"
+    WHITESPACE " "
+    MOD_KW "mod"
+    WHITESPACE " "
+    NAME
+      IDENT "m"
+    WHITESPACE " "
+    ITEM_LIST
+      L_CURLY "{"
+      R_CURLY "}"
+  WHITESPACE "\n"
+  MODULE
+    VISIBILITY
+      PUB_KW "pub"
+    WHITESPACE " "
+    UNSAFE_KW "unsafe"
+    WHITESPACE " "
+    MOD_KW "mod"
+    WHITESPACE " "
+    NAME
+      IDENT "n"
+    SEMICOLON ";"
+  WHITESPACE "\n"

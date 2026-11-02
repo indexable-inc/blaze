@@ -1,0 +1,35 @@
+{
+  "id": "00824",
+  "from_lane": "item-hash-mir",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/consteval.rs"
+  ],
+  "what": "crates/hir-ty/src/consteval.rs write_memory_map/read_memory_map: write StaticRec.id as crate::check_cache::id_bits(it.id) instead of AsId::as_id(&it.id).as_bits(), and read it with crate::check_cache::id_of::<StaticId>(it.id).ok_or(invalid(\"a static of salsa id index 0\"))? instead of FromId::from_id(Id::from_bits). Identical outside a relocating scope (id_bits/id_of are the salsa bits there), so dependency images and the goal store are unchanged. Why: the item store (docs/v2/plan/design/item-hash.md s7) files built MIR by item key inside check_cache relocating scope; an allocation operand pointing into a static is written by write_allocation, and with raw bits its static would be another database salsa id (wrong static read back, and bytes that differ between databases). Needed by crates/hir-ty/src/mir/persist.rs.",
+  "state": "applied",
+  "created": "2026-10-30T08:31:46Z",
+  "updated": "2026-10-30T10:00:06Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:31:46Z",
+      "by": "item-hash-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: crates/hir-ty/src/consteval.rs writes StaticRec.id with check_cache::id_bits and reads it with check_cache::id_of::<StaticId>, an error 'a static of salsa id index 0 or not in the table' otherwise"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00582",
+  "from_lane": "frontend-tree",
+  "owner": "db-expand",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/tree-move-expand.md",
+    "v2/requests"
+  ],
+  "what": "## frontend-tree: hir-def lib.rs: onto views (1)\n\nFrom `frontend-tree-move-def`, for `db-expand-items`. Adds the edge twin\n`GenericDefId::file_id_and_params_of_view` (src.rs's view lookups and hir read it), and moves\n`macro_call_as_call_id` onto hir-expand's `expand_eager_macro_input_view`.\n\nneeds: `## frontend-tree: hir-def src.rs: onto views (1)` (above, `HasSource::source_view`);\nfrontend-tree-move-expand's `## frontend-tree: hir-expand eager.rs: onto views (5)`\n(`expand_eager_macro_input_view(db, krate, macro_call: view::MacroCall<'_>, ast_id, ..)`, declared\nin `docs/v2/plan/lanes/frontend/tree-move-expand.md`).\n\n### Hunk 1\n\nOld:\n\n```rust\n    eager::{EagerCall, expand_eager_macro_input},\n```\n\nNew:\n\n```rust\n    eager::{EagerCall, expand_eager_macro_input_view},\n```\n\n### Hunk 2\n\nOld:\n\n```rust\n            GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),\n            GenericDefId::StaticId(it) => (it.lookup(db).id.file_id, None),\n        }\n    }\n\n    pub fn assoc_trait_container(self, db: &Db) -> Option<TraitId> {\n```\n\nNew:\n\n```rust\n            GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),\n            GenericDefId::StaticId(it) => (it.lookup(db).id.file_id, None),\n        }\n    }\n\n    /// [`Self::file_id_and_params_of`] as a view of the database's tree: the same list.\n    pub fn file_id_and_params_of_view(\n        self,\n        db: &Db,\n    ) -> (HirFileId, Option<syntax::view::GenericParamList<'_>>) {\n        fn of_item_loc<'db, Loc>(\n            db: &'db Db,\n            def: impl Lookup<Data = Loc>,\n        ) -> (HirFileId, Option<syntax::view::GenericParamList<'db>>)\n        where\n            Loc: src::HasSource,\n            Loc::Value: syntax::view::Typed,\n            for<'t> <Loc::Value as syntax::view::Typed>::Of<'t>: syntax::view::HasGenericParams<'t>,\n        {\n            let src = def.lookup(db).source_view(db);\n            (src.file_id, syntax::view::HasGenericParams::generic_param_list(&src.value))\n        }\n\n        match self {\n            GenericDefId::FunctionId(it) => of_item_loc(db, it),\n            GenericDefId::TypeAliasId(it) => of_item_loc(db, it),\n            GenericDefId::AdtId(AdtId::StructId(it)) => of_item_loc(db, it),\n            GenericDefId::AdtId(AdtId::UnionId(it)) => of_item_loc(db, it),\n            GenericDefId::AdtId(AdtId::EnumId(it)) => of_item_loc(db, it),\n            GenericDefId::TraitId(it) => of_item_loc(db, it),\n            GenericDefId::ImplId(it) => of_item_loc(db, it),\n            GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),\n            GenericDefId::StaticId(it) => (it.lookup(db).id.file_id, None),\n        }\n    }\n\n    pub fn assoc_trait_container(self, db: &Db) -> Option<TraitId> {\n```\n\nWhy: the edge twin, the same list as a view.\n\n### Hunk 3\n\nOld:\n\n```rust\n        MacroDefKind::BuiltInEager(..) => expand_eager_macro_input(\n            db,\n            krate,\n            &ast_id.to_node(db),\n```\n\nNew:\n\n```rust\n        MacroDefKind::BuiltInEager(..) => expand_eager_macro_input_view(\n            db,\n            krate,\n            ast_id.to_view(db),\n```\n\nWhy: the eager call's input read through a view, no handle made.\n\n> applied by db-expand (db-expand-items, 2026-10-29 21:45): hunks 1 to 3 as written (`file_id_and_params_of_view` beside `file_id_and_params_of`, `macro_call_as_call_id` on `expand_eager_macro_input_view(.., ast_id.to_view(db), ..)`). hot_lint is clean. Not in the code yet: `hir_expand::eager::expand_eager_macro_input_view`. It is only declared in `docs/v2/plan/lanes/frontend/tree-move-expand.md`, and no `## frontend-tree: hir-expand eager.rs: onto views` heading is filed in `v2/requests/`. Until it lands, `lib.rs` doesn't build.\n\n> forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#frontend-tree: hir-def lib.rs: onto views (1)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:5817"
+    }
+  ]
+}

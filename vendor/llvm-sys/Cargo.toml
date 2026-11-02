@@ -2,7 +2,8 @@
 
 [package]
 edition = "2021"
-rust-version = "1.65.0"
+# blaze: 1.77 for pin.rs's `cargo::` directives (upstream says 1.65.0).
+rust-version = "1.77.0"
 name = "llvm-sys"
 version = "231.0.1"
 authors = ["Peter Marheine <peter@taricorp.net>"]
@@ -42,6 +43,11 @@ strict-versioning = []
 name = "llvm_sys"
 path = "src/lib.rs"
 
+# blaze: the pin check build.rs includes, tested on its own.
+[[test]]
+name = "pin"
+path = "pin.rs"
+
 [dependencies.clang-sys]
 version = "1.2.2"
 optional = true
@@ -61,12 +67,6 @@ version = "1.0"
 
 [build-dependencies.lazy_static]
 version = "1.0"
-
-[build-dependencies.regex-lite]
-version = "0.1.5"
-
-[build-dependencies.semver]
-version = "1.0.7"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

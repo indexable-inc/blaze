@@ -1,0 +1,28 @@
+{
+  "id": "00657",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/cranelift-codegen",
+    "Cargo.toml",
+    "vendor/cranelift-object",
+    "crates/hir-ty-codegen/Cargo.toml",
+    "crates/hir-ty-codegen/v2/fold.rs",
+    "docs/v2/plan/lanes/codegen.md"
+  ],
+  "what": "## 5. coordinator: vendor `cranelift-codegen` for sibling calls (from codegen-fold)\n\nWhere: `vendor/` (a new `vendor/cranelift-codegen`, patched in the root `Cargo.toml`'s\n`[patch.crates-io]` as `vendor/cranelift-object` is), at the version `crates/hir-ty-codegen/Cargo.toml`\npins (0.136).\n\nWhat: let `return_call` and `return_call_indirect` verify and lower under the platform calling\nconventions (SystemV, AppleAarch64, AAPCS64, WindowsFastcall), not only `tail`, when caller and\ncallee use the same convention and the callee needs no more stack-argument space than the\ncaller received: the callee's stack arguments go into the caller's incoming area and the call\nis a jump. Anything else stays a verifier error, never a quiet ordinary call (no-fallback).\n\nWhy: every fold thunk (#1292, `crates/hir-ty-codegen/v2/fold.rs` `thunk`) passes its arguments\non with a few constants and calls the shared body. Today that is a call, a frame and a return,\nbecause Cranelift's verifier wants `tail` on both sides and blaze's functions use the platform's.\nAs a sibling call it is a few moves and a jump, so calling a folded function costs about what it\ncost unfolded. That keeps folding from costing dev run time (docs/v2/plan/lanes/codegen.md, \"dev\ncode at least as fast as cargo debug\"). Then lane codegen makes the thunk end in `return_call`.\n\n> forwarded to coordinator: `vendor/` and its `[patch.crates-io]` entry come with the vendored crate; listed in the requests report for integration.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#5. coordinator: vendor `cranelift-codegen` for sibling calls (from codegen-fold)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:224"
+    }
+  ]
+}

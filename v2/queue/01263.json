@@ -1,0 +1,23 @@
+{
+  "id": "01263",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "(re-filed from blaze-v2-qu queue 01249, which collided with main's ids) docs/v2/plan/lanes/db/query-unify.md lines 88-89 (backdating) say an lru function value is hashed when it is made. The engine now hashes it when it is evicted, and hashes a rerun value only for a row that was evicted (db/function.rs evict and finish, test an_evictable_function_hashes_its_value_only_when_evicted). Please reword those lines; they are outside The contract, so I left them. Also: a `no_eq` function never hashes, at eviction or rerun, and is never backdated by a hash (every no_eq run is a change; test an_evictable_no_eq_function_never_hashes_and_every_rerun_changes).",
+  "state": "open",
+  "created": "2026-10-31T13:18:37Z",
+  "updated": "2026-10-31T13:18:37Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:18:37Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

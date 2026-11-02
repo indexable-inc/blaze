@@ -1,0 +1,36 @@
+{
+  "id": "01310",
+  "from_lane": "builder-2",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/monomorphization.rs",
+    "crates/hir-ty-mir/src/mir/optimize/inline.rs"
+  ],
+  "what": "hello with blaze --features llvm (hello13, std at O3): the daemon dies \"thread <unknown> has overflowed its stack\" (b2-home-13/v2/serve.log; client prints only \"the daemon hung up\"). lldb stack (.coord-1030/b2-build/hello13-lldb-entry.log, hello13-lldb.log; 3000 frames on a rayon worker): codegen describe (hir-ty-codegen frontend.rs:506) -> refs::code_walk -> optimized_mir_body -> optimize -> inline (optimize.rs:160) -> try_inlining (inline.rs:339) -> callee optimized_mir_body, nested 3 deep; the innermost try_inlining (inline.rs:346) -> monomorphized (monomorphization.rs:405) -> fill_body:275 -> fill_ty:232 -> Filler::try_fold_ty spends ~2790 frames repeating Alias -> try_super_fold_with -> args -> try_fold_ty at monomorphization.rs:95 (after normalized), ~230 alias levels. Either normalization keeps growing the type (rustc stops at recursion_limit with an error naming the instance) or the type is deep and needs stack growth (rustc wraps normalization and the inliner in ensure_sufficient_stack). Neither file has ensure_sufficient_stack or a depth limit. Fix as rustc does: no stack overflow, an error naming the instance if the limit is hit.",
+  "state": "applied",
+  "created": "2026-10-31T15:25:05Z",
+  "updated": "2026-10-31T15:28:54Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:25:05Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:28:54Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:28:54Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "applied: monomorphization.rs Filler normalizes each alias under stdx::ensure_sufficient_stack and counts alias nesting, stopping past the crate recursion_limit with MirLowerError NotSupported(\"reached the recursion limit (N) normalizing <alias kind>\") (rustc AssocTypeNormalizer); inline.rs try_inlining asks the callee optimized_mir_body under ensure_sufficient_stack. The inliner refuses a callee monomorphized fails for, as rustc. If hello now reports the recursion-limit error, the type grows without end: a normalization bug to chase with that alias."
+    }
+  ]
+}

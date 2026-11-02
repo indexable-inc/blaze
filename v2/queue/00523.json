@@ -1,0 +1,26 @@
+{
+  "id": "00523",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics",
+    "Cargo.toml",
+    "docs/v2/plan/design/memory.md",
+    "v2/requests/mem.md"
+  ],
+  "what": "## diagnostics-lints-names-dead: `blaze-mem` in `blaze-diagnostics` (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)\n\nWhat: `blaze-mem.workspace = true` in `[dependencies]`, and `#![feature(allocator_api)]` in\n`src/lib.rs`, so the crate's passes can put per-run working state in a worker's frame\n(`blaze_mem::frame::task`, `Vec<T, &Frame>`), as docs/v2/plan/design/memory.md settles. The\ncrate stays `#![forbid(unsafe_code)]`: blaze-mem's allocators are safe to use.\n\nWhy: the dead-code pass rebuilds about 1.5 MB of per-run tables and worklists on every check\nof a crate, with about 150 to 200 global-allocator calls. memory.md's warm loop allows none. The\nlifetime plan and the hash-map question are with mem (`v2/requests/mem.md`).\n`lints/names/dead/` moves onto the frame once both are answered. Every other pass of the\ncrate has the same shape (per-run state, then an output vector).\n\nStatus: open\n\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: `blaze-mem` in `blaze-diagnostics` (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:3147"
+    }
+  ]
+}

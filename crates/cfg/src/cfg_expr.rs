@@ -27,11 +27,11 @@ impl PartialOrd for CfgAtom {
 impl Ord for CfgAtom {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (CfgAtom::Flag(a), CfgAtom::Flag(b)) => a.as_str().cmp(b.as_str()),
+            (CfgAtom::Flag(a), CfgAtom::Flag(b)) => a.cmp_order(b),
             (CfgAtom::Flag(_), CfgAtom::KeyValue { .. }) => std::cmp::Ordering::Less,
             (CfgAtom::KeyValue { .. }, CfgAtom::Flag(_)) => std::cmp::Ordering::Greater,
             (CfgAtom::KeyValue { key, value }, CfgAtom::KeyValue { key: key2, value: value2 }) => {
-                key.as_str().cmp(key2.as_str()).then(value.as_str().cmp(value2.as_str()))
+                key.cmp_order(key2).then_with(|| value.cmp_order(value2))
             }
         }
     }
@@ -47,7 +47,6 @@ impl fmt::Display for CfgAtom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum CfgExpr {
     Invalid,
     Atom(CfgAtom),
@@ -105,10 +104,11 @@ impl CfgExpr {
         next_cfg_expr(tt).unwrap_or(CfgExpr::Invalid)
     }
 
+    /// The `CfgExpr` of a `cfg` predicate, read from a view of it.
     #[cfg(feature = "syntax")]
-    pub fn parse_from_ast(ast: syntax::ast::CfgPredicate) -> CfgExpr {
+    pub fn parse_from_view(ast: syntax::view::CfgPredicate<'_>) -> CfgExpr {
         use intern::sym;
-        use syntax::ast::{self, AstToken};
+        use syntax::view::{self as ast, AstToken};
 
         match ast {
             ast::CfgPredicate::CfgAtom(atom) => {
@@ -118,13 +118,10 @@ impl CfgExpr {
                     Some(ast::CfgAtomKey::Ident(key)) => {
                         let key = Symbol::intern(key.text());
                         match atom.string_token().and_then(ast::String::cast) {
-                            Some(value) => {
-                                if let Ok(value) = value.value() {
-                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }
-                                } else {
-                                    return CfgExpr::Invalid;
-                                }
-                            }
+                            Some(value) => match value.value() {
+                                Ok(value) => CfgAtom::KeyValue { key, value: Symbol::intern(&value) },
+                                Err(_) => return CfgExpr::Invalid,
+                            },
                             None => CfgAtom::Flag(key),
                         }
                     }
@@ -138,17 +135,17 @@ impl CfgExpr {
                 };
                 match keyword.text() {
                     "all" => CfgExpr::All(
-                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                        composite.cfg_predicates().map(CfgExpr::parse_from_view).collect(),
                     ),
                     "any" => CfgExpr::Any(
-                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                        composite.cfg_predicates().map(CfgExpr::parse_from_view).collect(),
                     ),
                     "not" => {
                         let mut inner = composite.cfg_predicates();
                         let (Some(inner), None) = (inner.next(), inner.next()) else {
                             return CfgExpr::Invalid;
                         };
-                        CfgExpr::Not(Box::new(CfgExpr::parse_from_ast(inner)))
+                        CfgExpr::Not(Box::new(CfgExpr::parse_from_view(inner)))
                     }
                     _ => CfgExpr::Invalid,
                 }
@@ -157,7 +154,7 @@ impl CfgExpr {
     }
 
     /// Fold the cfg by querying all basic `Atom` and `KeyValue` predicates.
-    pub fn fold(&self, query: &dyn Fn(&CfgAtom) -> bool) -> Option<bool> {
+    pub fn fold(&self, query: &impl Fn(&CfgAtom) -> bool) -> Option<bool> {
         match self {
             CfgExpr::Invalid => None,
             CfgExpr::Atom(atom) => Some(query(atom)),
@@ -224,18 +221,4 @@ fn next_cfg_expr(it: &mut tt::iter::TtIter<'_>) -> Option<CfgExpr> {
         it.next();
     }
     Some(ret)
-}
-
-#[cfg(test)]
-impl arbitrary::Arbitrary<'_> for CfgAtom {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        if u.arbitrary()? {
-            Ok(CfgAtom::Flag(Symbol::intern(<_>::arbitrary(u)?)))
-        } else {
-            Ok(CfgAtom::KeyValue {
-                key: Symbol::intern(<_>::arbitrary(u)?),
-                value: Symbol::intern(<_>::arbitrary(u)?),
-            })
-        }
-    }
 }

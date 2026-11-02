@@ -50,12 +50,17 @@ use std::mem;
 use std::sync::Arc;
 
 use rustc_index::{Idx, IndexVec};
+use smallvec::SmallVec;
 use thin_vec::ThinVec;
 use tracing::{debug, instrument};
 
+use crate::data_structures::DelayedMap;
 use crate::inherent::*;
 use crate::visit::{TypeVisitable, TypeVisitableExt as _};
-use crate::{self as ty, BoundVarIndexKind, Interner};
+use crate::{
+    self as ty, Binder, BoundVarIndexKind, ClauseKind, Const, Flags, Interner, ProjectionClause,
+    Region, TypeSuperVisitable,
+};
 
 /// This trait is implemented for every type that can be folded,
 /// providing the skeleton of the traversal.
@@ -137,21 +142,48 @@ pub trait TypeFolder<I: Interner>: Sized {
 
     // The default region folder is a no-op because `Region` is non-recursive
     // and has no `super_fold_with` method to call.
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         r
     }
 
-    fn fold_const(&mut self, c: I::Const) -> I::Const {
+    fn fold_const(&mut self, c: Const<I>) -> Const<I> {
         c.super_fold_with(self)
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         p.super_fold_with(self)
     }
 
     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
         c.super_fold_with(self)
     }
+}
+
+/// [Fold predicate](TypeFolder::fold_predicate) deliberately doesn't get access
+/// to an actual predicate. This way, we can compress lists of predicates, and hide
+/// this detail to folders. Instead, some type implementing this trait, [`PredicateProxy`]
+/// is passed, with its limited API.
+///
+/// Most [`TypeFolder`]s only use `fold_predicate` to inspect type flags.
+pub trait PredicateProxy<I: Interner>:
+    TypeSuperFoldable<I> + TypeSuperVisitable<I> + Flags + Copy
+{
+    fn allow_normalization(&self) -> bool;
+
+    /// Gets the underlying clause kind (if this predicate is a clause, otherwise `None`).
+    /// The fact that it's `unchecked`, is because no attempt is made to hide implementation
+    /// details. For example, in the future we may compress clauses together. Code calling
+    /// `clause_kind_unchecked` will have to correctly deal with these implementation details,
+    /// and have code handling any edgecase arising as a result.
+    fn clause_kind_unchecked(&self) -> Option<Binder<I, ClauseKind<I>>>;
+
+    /// If self is a projection clause, call `f` with it. The result will be rebound and returned as `Some`.
+    /// Otherwise, when self is not a projection clause, `None` is returned.
+    fn map_projection(
+        self,
+        cx: I,
+        f: impl FnOnce(Binder<I, ProjectionClause<I>>) -> Binder<I, ProjectionClause<I>>,
+    ) -> Option<Self>;
 }
 
 /// This trait is implemented for every folding traversal. There is a fold
@@ -179,15 +211,15 @@ pub trait FallibleTypeFolder<I: Interner>: Sized {
 
     // The default region folder is a no-op because `Region` is non-recursive
     // and has no `super_fold_with` method to call.
-    fn try_fold_region(&mut self, r: I::Region) -> Result<I::Region, Self::Error> {
+    fn try_fold_region(&mut self, r: Region<I>) -> Result<Region<I>, Self::Error> {
         Ok(r)
     }
 
-    fn try_fold_const(&mut self, c: I::Const) -> Result<I::Const, Self::Error> {
+    fn try_fold_const(&mut self, c: Const<I>) -> Result<Const<I>, Self::Error> {
         c.try_super_fold_with(self)
     }
 
-    fn try_fold_predicate(&mut self, p: I::Predicate) -> Result<I::Predicate, Self::Error> {
+    fn try_fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> Result<P, Self::Error> {
         p.try_super_fold_with(self)
     }
 
@@ -257,6 +289,10 @@ impl<I: Interner, T: TypeFoldable<I>, E: TypeFoldable<I>> TypeFoldable<I> for Re
     }
 }
 
+/// Folds the `T` in `arc` in place when `arc` is its only owner, so a fold allocates no new
+/// `Arc` and clones nothing; `tests::fold_arc_matches_the_safe_fold` checks it against
+/// `Arc::new(fold(Arc::unwrap_or_clone(arc))?)`.
+#[allow(unsafe_code)]
 fn fold_arc<T: Clone, E>(
     mut arc: Arc<T>,
     fold: impl FnOnce(T) -> Result<T, E>,
@@ -264,6 +300,12 @@ fn fold_arc<T: Clone, E>(
     // We merely want to replace the contained `T`, if at all possible,
     // so that we don't needlessly allocate a new `Arc` or indeed clone
     // the contained type.
+    // SAFETY: `Arc::make_mut` leaves `arc` the one owner of its `T`, so `get_mut` is `Some`.
+    // `ManuallyDrop<T>` is `repr(transparent)` over `T`, so the two `Arc` casts name one
+    // allocation of one layout. The `T` moved out by `ManuallyDrop::take` is replaced before
+    // the `Arc` is cast back. If `fold` fails or unwinds, the slot is never dropped as a `T`
+    // (it is a `ManuallyDrop`): the moved-out value is dropped once, by `fold`, and never
+    // twice.
     unsafe {
         // First step is to ensure that we have a unique reference to
         // the contained type, which `Arc::make_mut` will accomplish (by
@@ -339,6 +381,16 @@ impl<I: Interner, T: TypeFoldable<I>> TypeFoldable<I> for ThinVec<T> {
     }
 }
 
+impl<I: Interner, T: TypeFoldable<I>, const N: usize> TypeFoldable<I> for SmallVec<[T; N]> {
+    fn try_fold_with<F: FallibleTypeFolder<I>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        self.into_iter().map(|t| t.try_fold_with(folder)).collect()
+    }
+
+    fn fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
+        self.into_iter().map(|t| t.fold_with(folder)).collect()
+    }
+}
+
 impl<I: Interner, T: TypeFoldable<I>> TypeFoldable<I> for Box<[T]> {
     fn try_fold_with<F: FallibleTypeFolder<I>>(self, folder: &mut F) -> Result<Self, F::Error> {
         Vec::from(self).try_fold_with(folder).map(Vec::into_boxed_slice)
@@ -392,7 +444,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         t
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         match r.kind() {
             ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br)
                 if debruijn >= self.current_index =>
@@ -418,7 +470,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         }
     }
 
-    fn fold_const(&mut self, ct: I::Const) -> I::Const {
+    fn fold_const(&mut self, ct: Const<I>) -> Const<I> {
         match ct.kind() {
             ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_ct)
                 if debruijn >= self.current_index =>
@@ -430,7 +482,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         }
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         if p.has_vars_bound_at_or_above(self.current_index) { p.super_fold_with(self) } else { p }
     }
 
@@ -439,7 +491,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
     }
 }
 
-pub fn shift_region<I: Interner>(cx: I, region: I::Region, amount: u32) -> I::Region {
+pub fn shift_region<I: Interner>(cx: I, region: Region<I>, amount: u32) -> Region<I> {
     match region.kind() {
         ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br) if amount > 0 => {
             Region::new_bound(cx, debruijn.shifted_in(amount), br)
@@ -461,12 +513,186 @@ where
 }
 
 ///////////////////////////////////////////////////////////////////////////
+// Bound variable replacer
+
+/// A delegate used when instantiating bound vars.
+///
+/// Each bound variable must always map to the same result. `BoundVarReplacer`
+/// caches folded types and may not call the delegate on every visit.
+pub trait BoundVarReplacerDelegate<I: Interner> {
+    fn replace_region(&mut self, br: ty::BoundRegion<I>) -> Region<I>;
+    fn replace_ty(&mut self, bt: ty::BoundTy<I>) -> I::Ty;
+    fn replace_const(&mut self, bc: ty::BoundConst<I>) -> Const<I>;
+}
+
+/// A simple delegate taking three mutable functions.
+pub struct FnMutDelegate<'a, I: Interner> {
+    pub regions: &'a mut (dyn FnMut(ty::BoundRegion<I>) -> Region<I> + 'a),
+    pub types: &'a mut (dyn FnMut(ty::BoundTy<I>) -> I::Ty + 'a),
+    pub consts: &'a mut (dyn FnMut(ty::BoundConst<I>) -> Const<I> + 'a),
+}
+
+impl<I: Interner> BoundVarReplacerDelegate<I> for FnMutDelegate<'_, I> {
+    fn replace_region(&mut self, br: ty::BoundRegion<I>) -> Region<I> {
+        (self.regions)(br)
+    }
+
+    fn replace_ty(&mut self, bt: ty::BoundTy<I>) -> I::Ty {
+        (self.types)(bt)
+    }
+
+    fn replace_const(&mut self, bc: ty::BoundConst<I>) -> Const<I> {
+        (self.consts)(bc)
+    }
+}
+
+/// Replaces escaping bound vars in a value.
+pub struct BoundVarReplacer<I: Interner, D> {
+    cx: I,
+    /// As with `RegionFolder`, represents the index of a binder *just outside*
+    /// the ones we have visited.
+    current_index: ty::DebruijnIndex,
+    delegate: D,
+    // Types can appear at different binder depths, so include the depth
+    // in the cache key.
+    cache: DelayedMap<(ty::DebruijnIndex, I::Ty), I::Ty>,
+}
+
+impl<I: Interner, D: BoundVarReplacerDelegate<I>> BoundVarReplacer<I, D> {
+    pub fn new(cx: I, delegate: D) -> Self {
+        Self { cx, current_index: ty::INNERMOST, delegate, cache: Default::default() }
+    }
+}
+
+impl<I: Interner, D: BoundVarReplacerDelegate<I>> TypeFolder<I> for BoundVarReplacer<I, D> {
+    fn cx(&self) -> I {
+        self.cx
+    }
+
+    fn fold_binder<T: TypeFoldable<I>>(&mut self, t: ty::Binder<I, T>) -> ty::Binder<I, T> {
+        self.current_index.shift_in(1);
+        let t = t.super_fold_with(self);
+        self.current_index.shift_out(1);
+        t
+    }
+
+    fn fold_ty(&mut self, t: I::Ty) -> I::Ty {
+        match t.kind() {
+            ty::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_ty)
+                if debruijn == self.current_index =>
+            {
+                let ty = self.delegate.replace_ty(bound_ty);
+                debug_assert!(!ty.has_vars_bound_above(ty::INNERMOST));
+                shift_vars(self.cx, ty, self.current_index.as_u32())
+            }
+            _ => {
+                if !t.has_vars_bound_at_or_above(self.current_index) {
+                    t
+                } else if let Some(&t) = self.cache.get(&(self.current_index, t)) {
+                    t
+                } else {
+                    let res = t.super_fold_with(self);
+                    assert!(self.cache.insert((self.current_index, t), res));
+                    res
+                }
+            }
+        }
+    }
+
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
+        match r.kind() {
+            ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br)
+                if debruijn == self.current_index =>
+            {
+                let region = self.delegate.replace_region(br);
+                if let ty::ReBound(ty::BoundVarIndexKind::Bound(inner), br) = region.kind() {
+                    // Bound regions returned by the delegate use INNERMOST.
+                    // Adjust them to the current binder depth.
+                    assert_eq!(inner, ty::INNERMOST);
+                    Region::new_bound(self.cx, debruijn, br)
+                } else {
+                    region
+                }
+            }
+            _ => r,
+        }
+    }
+
+    fn fold_const(&mut self, ct: Const<I>) -> Const<I> {
+        match ct.kind() {
+            ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_const)
+                if debruijn == self.current_index =>
+            {
+                let ct = self.delegate.replace_const(bound_const);
+                debug_assert!(!ct.has_vars_bound_above(ty::INNERMOST));
+                shift_vars(self.cx, ct, self.current_index.as_u32())
+            }
+            _ => ct.super_fold_with(self),
+        }
+    }
+
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
+        if p.has_vars_bound_at_or_above(self.current_index) { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if c.has_vars_bound_at_or_above(self.current_index) { c.super_fold_with(self) } else { c }
+    }
+}
+
+/// Replaces escaping bound vars using `delegate`.
+pub fn replace_escaping_bound_vars_uncached<I: Interner, T: TypeFoldable<I>>(
+    cx: I,
+    value: T,
+    delegate: impl BoundVarReplacerDelegate<I>,
+) -> T {
+    if !value.has_escaping_bound_vars() {
+        value
+    } else {
+        value.fold_with(&mut BoundVarReplacer::new(cx, delegate))
+    }
+}
+
+/// Shifts escaping bound-variable indices by `bound_vars` without changing
+/// their De Bruijn depth.
+pub fn shift_bound_var_indices<I: Interner, T: TypeFoldable<I>>(
+    cx: I,
+    bound_vars: usize,
+    value: T,
+) -> T {
+    if bound_vars == 0 || !value.has_escaping_bound_vars() {
+        return value;
+    }
+
+    let shift_bv = |bv: ty::BoundVar| bv + bound_vars;
+    replace_escaping_bound_vars_uncached(
+        cx,
+        value,
+        FnMutDelegate {
+            regions: &mut |r: ty::BoundRegion<I>| {
+                Region::new_bound(
+                    cx,
+                    ty::INNERMOST,
+                    ty::BoundRegion { var: shift_bv(r.var), kind: r.kind },
+                )
+            },
+            types: &mut |t: ty::BoundTy<I>| {
+                Ty::new_bound(cx, ty::INNERMOST, ty::BoundTy { var: shift_bv(t.var), kind: t.kind })
+            },
+            consts: &mut |c: ty::BoundConst<I>| {
+                Const::new_bound(cx, ty::INNERMOST, ty::BoundConst::new(shift_bv(c.var)))
+            },
+        },
+    )
+}
+
+///////////////////////////////////////////////////////////////////////////
 // Region folder
 
 pub fn fold_regions<I: Interner, T>(
     cx: I,
     value: T,
-    f: impl FnMut(I::Region, ty::DebruijnIndex) -> I::Region,
+    f: impl FnMut(Region<I>, ty::DebruijnIndex) -> Region<I>,
 ) -> T
 where
     T: TypeFoldable<I>,
@@ -505,7 +731,7 @@ impl<I, F> RegionFolder<I, F> {
 impl<I, F> TypeFolder<I> for RegionFolder<I, F>
 where
     I: Interner,
-    F: FnMut(I::Region, ty::DebruijnIndex) -> I::Region,
+    F: FnMut(Region<I>, ty::DebruijnIndex) -> Region<I>,
 {
     fn cx(&self) -> I {
         self.cx
@@ -519,7 +745,7 @@ where
     }
 
     #[instrument(skip(self), level = "debug", ret)]
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         match r.kind() {
             ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _)
                 if debruijn < self.current_index =>
@@ -542,15 +768,209 @@ where
         if t.has_regions() { t.super_fold_with(self) } else { t }
     }
 
-    fn fold_const(&mut self, ct: I::Const) -> I::Const {
+    fn fold_const(&mut self, ct: Const<I>) -> Const<I> {
         if ct.has_regions() { ct.super_fold_with(self) } else { ct }
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         if p.has_regions() { p.super_fold_with(self) } else { p }
     }
 
     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
         if c.has_regions() { c.super_fold_with(self) } else { c }
+    }
+}
+
+/// This function should ideally only be used if either the `TypingMode`
+/// or the `ParamEnv` differs from the environment the aliases were normalized
+/// in.
+///
+/// Cases outside these two should consider whether the problem can be
+/// fixed at the root instead.
+pub fn set_aliases_to_non_rigid<I: Interner, T>(cx: I, value: T) -> ty::Unnormalized<I, T>
+where
+    T: TypeFoldable<I>,
+{
+    let folded = set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::AllToNonRigid);
+    ty::Unnormalized::new(folded)
+}
+
+pub fn set_opaques_to_non_rigid<I: Interner, T>(cx: I, value: T) -> ty::Unnormalized<I, T>
+where
+    T: TypeFoldable<I>,
+{
+    let folded = set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::OpaqueToNonRigid);
+    ty::Unnormalized::new(folded)
+}
+
+pub fn set_aliases_to_rigid<I: Interner, T>(cx: I, value: T) -> T
+where
+    T: TypeFoldable<I>,
+{
+    set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::AllToRigid)
+}
+
+pub fn set_type_aliases_to_rigid<I: Interner, T>(cx: I, value: T) -> T
+where
+    T: TypeFoldable<I>,
+{
+    set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::TypeToRigid)
+}
+
+fn set_aliases_rigidness_with_mode<I: Interner, T>(cx: I, value: T, mode: RigidnessFoldMode) -> T
+where
+    T: TypeFoldable<I>,
+{
+    if !mode.needs_change(&value) {
+        return value;
+    }
+
+    let mut folder = RigidnessFolder { cx, mode };
+    value.fold_with(&mut folder)
+}
+
+enum RigidnessFoldMode {
+    AllToRigid,
+    AllToNonRigid,
+    TypeToRigid,
+    OpaqueToNonRigid,
+}
+
+impl RigidnessFoldMode {
+    fn needs_change<I: Interner, T: TypeVisitable<I>>(&self, v: &T) -> bool {
+        match self {
+            RigidnessFoldMode::AllToRigid => v.has_non_rigid_aliases(),
+            RigidnessFoldMode::AllToNonRigid => v.has_rigid_aliases(),
+            RigidnessFoldMode::TypeToRigid => {
+                v.has_non_rigid_aliases()
+                    && v.has_type_flags(ty::TypeFlags::HAS_ALIAS - ty::TypeFlags::HAS_CONST_ALIAS)
+            }
+            RigidnessFoldMode::OpaqueToNonRigid => v.has_rigid_aliases() && v.has_opaque_types(),
+        }
+    }
+}
+
+// Set aliases to be rigid or non-rigid according to the mode.
+struct RigidnessFolder<I: Interner> {
+    cx: I,
+    mode: RigidnessFoldMode,
+}
+
+impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+    #[inline]
+    fn cx(&self) -> I {
+        self.cx
+    }
+
+    fn fold_binder<T: TypeFoldable<I>>(&mut self, t: ty::Binder<I, T>) -> ty::Binder<I, T> {
+        if self.mode.needs_change(&t) { t.super_fold_with(self) } else { t }
+    }
+
+    fn fold_ty(&mut self, t: I::Ty) -> I::Ty {
+        if !self.mode.needs_change(&t) {
+            return t;
+        }
+
+        match t.kind() {
+            ty::Alias(is_rigid, alias_ty) => {
+                let alias_ty = alias_ty.fold_with(self);
+                match self.mode {
+                    RigidnessFoldMode::AllToRigid | RigidnessFoldMode::TypeToRigid => {
+                        I::Ty::new_alias(self.cx(), ty::IsRigid::Yes, alias_ty)
+                    }
+                    RigidnessFoldMode::AllToNonRigid => {
+                        I::Ty::new_alias(self.cx(), ty::IsRigid::No, alias_ty)
+                    }
+                    RigidnessFoldMode::OpaqueToNonRigid => {
+                        if let ty::AliasTyKind::Opaque { .. } = alias_ty.kind {
+                            I::Ty::new_alias(self.cx(), ty::IsRigid::No, alias_ty)
+                        } else {
+                            I::Ty::new_alias(self.cx(), is_rigid, alias_ty)
+                        }
+                    }
+                }
+            }
+            _ => t.super_fold_with(self),
+        }
+    }
+
+    fn fold_const(&mut self, c: Const<I>) -> Const<I> {
+        if !self.mode.needs_change(&c) {
+            return c;
+        }
+
+        match c.kind() {
+            ty::ConstKind::Alias(is_rigid, alias_const) => {
+                let alias_const = alias_const.fold_with(self);
+                match self.mode {
+                    RigidnessFoldMode::AllToRigid => {
+                        Const::new_alias(self.cx, ty::IsRigid::Yes, alias_const)
+                    }
+                    RigidnessFoldMode::AllToNonRigid => {
+                        Const::new_alias(self.cx(), ty::IsRigid::No, alias_const)
+                    }
+                    RigidnessFoldMode::OpaqueToNonRigid | RigidnessFoldMode::TypeToRigid => {
+                        Const::new_alias(self.cx(), is_rigid, alias_const)
+                    }
+                }
+            }
+            _ => c.super_fold_with(self),
+        }
+    }
+
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
+        if self.mode.needs_change(&p) { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if self.mode.needs_change(&c) { c.super_fold_with(self) } else { c }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::fold_arc;
+
+    /// The safe fold `fold_arc` must give the same value as.
+    fn safe_fold<T: Clone, E>(arc: Arc<T>, fold: impl FnOnce(T) -> Result<T, E>) -> Result<Arc<T>, E> {
+        Ok(Arc::new(fold(Arc::unwrap_or_clone(arc))?))
+    }
+
+    fn double(values: Vec<u32>) -> Result<Vec<u32>, ()> {
+        Ok(values.into_iter().map(|it| it * 2).collect())
+    }
+
+    #[test]
+    fn fold_arc_matches_the_safe_fold() {
+        let unique = Arc::new(vec![1, 2, 3]);
+        let at = Arc::as_ptr(&unique);
+        let folded = fold_arc(unique, double).unwrap();
+        assert_eq!(folded, safe_fold(Arc::new(vec![1, 2, 3]), double).unwrap());
+        assert_eq!(Arc::as_ptr(&folded), at, "a unique `Arc` is folded in place");
+
+        let shared = Arc::new(vec![4, 5]);
+        let kept = Arc::clone(&shared);
+        let folded = fold_arc(shared, double).unwrap();
+        assert_eq!(folded, safe_fold(Arc::clone(&kept), double).unwrap());
+        assert_eq!(*kept, vec![4, 5], "a shared `Arc`'s other owners keep the old value");
+    }
+
+    #[test]
+    fn a_failed_fold_drops_the_value_once() {
+        struct Counted(Arc<()>);
+        impl Clone for Counted {
+            fn clone(&self) -> Counted {
+                Counted(Arc::clone(&self.0))
+            }
+        }
+        let alive = Arc::new(());
+        let result = fold_arc(Arc::new(Counted(Arc::clone(&alive))), |it| {
+            drop(it);
+            Err(())
+        });
+        assert!(result.is_err());
+        assert_eq!(Arc::strong_count(&alive), 1, "dropped by the fold, and not again");
     }
 }

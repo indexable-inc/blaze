@@ -1,0 +1,33 @@
+{
+  "id": "00113",
+  "from_lane": "speed-backend-intrinsics",
+  "owner": "speed",
+  "paths": [],
+  "what": "## From speed-backend-intrinsics: FYI, `wasm_simd_intrinsic` now runs on every target\n\nNo edit needed. `FunctionCx::wasm_simd_intrinsic` (called first in `intrinsic`) now lowers the\ngeneric `simd_*` intrinsics with Cranelift vectors on AArch64 (NEON) and x86-64 (SSE2 only),\nnot just wasm: `simd_eq`/`lt`/..., `and`/`or`/`xor`, `add`/`sub`/`mul`, shifts by a splat,\n`select`, `splat`, `shuffle`, `cast`, `bitmask`, and on NEON `simd_reduce_*`. So the lane-by-\nlane arms for these in `intrinsic` now see only what `admits` refuses (x86-64 ops past SSE2,\nf16 lanes, non-16-byte shapes). The name is unchanged so no caller moves; if you rename it\n(`simd_vector_intrinsic`), tell me and I'll rename the definition.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T01:04:54Z",
+  "updated": "2026-10-30T08:54:05Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-backend-lower.md#From speed-backend-intrinsics: FYI, `wasm_simd_intrinsic` now runs on every target",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-backend-lower.md:61"
+    },
+    {
+      "at": "2026-10-30T08:54:04Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:05Z",
+      "by": "speed",
+      "action": "done",
+      "note": "FYI, no edit needed: hir-ty-codegen's intrinsic arms see only what admits refuses; name unchanged (v2/requests/speed-backend-lower.md)."
+    }
+  ]
+}

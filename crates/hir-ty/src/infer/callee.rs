@@ -2,6 +2,8 @@
 
 use std::iter;
 
+use blaze_ids::radix;
+use blaze_mem::Frame;
 use rustc_abi::ExternAbi;
 use tracing::debug;
 
@@ -12,6 +14,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
+    db::HirDatabase,
     Adjust, Adjustment, AutoBorrow,
     autoderef::{GeneralAutoderef, InferenceContextAutoderef},
     infer::{
@@ -21,7 +24,7 @@ use crate::{
     method_resolution::{MethodCallee, TreatNotYetDefinedOpaques},
     next_solver::{
         ConstKind, FnSig, Ty, TyKind,
-        infer::{BoundRegionConversionTime, traits::ObligationCause},
+        infer::{BoundRegionConversionTime, traits::{ObligationCause, ObligationCauseCode}},
     },
 };
 
@@ -33,7 +36,7 @@ enum CallStep<'db> {
     Overloaded(MethodCallee<'db>),
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn infer_call(
         &mut self,
         call_expr: ExprId,
@@ -106,9 +109,10 @@ impl<'db> InferenceContext<'db> {
         call_expr: ExprId,
         callee_expr: ExprId,
         arg_exprs: &[ExprId],
-        autoderef: &mut InferenceContextAutoderef<'_, 'db>,
+        autoderef: &mut InferenceContextAutoderef<'_, 'db, 'f>,
         error_reported: &mut bool,
     ) -> Option<CallStep<'db>> {
+        let frame = autoderef.ctx().frame;
         let final_ty = autoderef.final_ty();
         let adjusted_ty =
             autoderef.ctx().table.try_structurally_resolve_type(callee_expr.into(), final_ty);
@@ -116,10 +120,9 @@ impl<'db> InferenceContext<'db> {
         // If the callee is a function pointer or a closure, then we're all set.
         match adjusted_ty.kind() {
             TyKind::FnDef(..) | TyKind::FnPtr(..) => {
-                let adjust_steps = autoderef.adjust_steps_as_infer_ok();
-                let adjustments =
-                    autoderef.ctx().table.register_infer_ok(adjust_steps).into_boxed_slice();
-                autoderef.ctx().write_expr_adj(callee_expr, adjustments);
+                let adjust_steps = autoderef.adjust_steps_as_infer_ok(frame);
+                let adjustments = autoderef.ctx().table.register_infer_ok(adjust_steps);
+                autoderef.ctx().write_expr_adj(callee_expr, &adjustments);
                 return Some(CallStep::Builtin(adjusted_ty));
             }
 
@@ -135,7 +138,7 @@ impl<'db> InferenceContext<'db> {
                     BoundRegionConversionTime::FnCall,
                     closure_sig,
                 );
-                let adjust_steps = autoderef.adjust_steps_as_infer_ok();
+                let adjust_steps = autoderef.adjust_steps_as_infer_ok(frame);
                 let adjustments = autoderef.ctx().table.register_infer_ok(adjust_steps);
                 let def_id = def_id.0.loc(autoderef.ctx().db).expr;
                 autoderef.ctx().record_deferred_call_resolution(
@@ -188,7 +191,7 @@ impl<'db> InferenceContext<'db> {
                     coroutine_closure_sig.fn_sig_kind.safety(),
                     coroutine_closure_sig.fn_sig_kind.abi(),
                 );
-                let adjust_steps = autoderef.adjust_steps_as_infer_ok();
+                let adjust_steps = autoderef.adjust_steps_as_infer_ok(frame);
                 let adjustments = autoderef.ctx().table.register_infer_ok(adjust_steps);
                 let def_id = def_id.0.loc(autoderef.ctx().db).expr;
                 autoderef.ctx().record_deferred_call_resolution(
@@ -250,10 +253,10 @@ impl<'db> InferenceContext<'db> {
             .try_overloaded_call_traits(call_expr, adjusted_ty, Some(arg_exprs))
             .or_else(|| autoderef.ctx().try_overloaded_call_traits(call_expr, adjusted_ty, None))
             .map(|(autoref, method)| {
-                let adjustments = autoderef.adjust_steps_as_infer_ok();
+                let adjustments = autoderef.adjust_steps_as_infer_ok(frame);
                 let mut adjustments = autoderef.ctx().table.register_infer_ok(adjustments);
                 adjustments.extend(autoref);
-                autoderef.ctx().write_expr_adj(callee_expr, adjustments.into_boxed_slice());
+                autoderef.ctx().write_expr_adj(callee_expr, &adjustments);
                 CallStep::Overloaded(method)
             })
     }
@@ -359,26 +362,20 @@ impl<'db> InferenceContext<'db> {
         callee: Option<CallableDefId>,
         callee_ty: Ty<'db>,
         args: &[ExprId],
-    ) -> Box<[u32]> {
+    ) -> &'f mut [u32] {
+        let frame = self.frame;
         let (func, fn_generic_args) = match (callee, callee_ty.kind()) {
             (Some(CallableDefId::FunctionId(func)), TyKind::FnDef(_, fn_generic_args)) => {
-                (func, fn_generic_args)
+                (func, fn_generic_args.no_bound_vars().unwrap())
             }
             _ => return Default::default(),
         };
-        let generics = crate::generics::generics(self.db, func.into());
-        let const_params = generics
-            .iter_self_type_or_consts()
-            .filter(|(_, param_data)| param_data.const_param().is_some())
-            .map(|(id, _)| ConstParamId::from_unchecked(id))
-            .collect::<Vec<_>>();
-
         let data = FunctionSignature::of(self.db, func);
         let Some(legacy_const_generics_indices) = data.legacy_const_generics_indices(self.db, func)
         else {
             return Default::default();
         };
-        let mut legacy_const_generics_indices = Box::<[u32]>::from(legacy_const_generics_indices);
+        let legacy_const_generics_indices = frame.alloc_slice_copy(legacy_const_generics_indices);
 
         // only use legacy const generics if the param count matches with them
         if data.params.len() + legacy_const_generics_indices.len() != args.len() {
@@ -387,10 +384,19 @@ impl<'db> InferenceContext<'db> {
             } else {
                 // there are more parameters than there should be without legacy
                 // const params; use them
-                legacy_const_generics_indices.sort_unstable();
+                radix::sort(legacy_const_generics_indices);
                 return legacy_const_generics_indices;
             }
         }
+
+        let generics = crate::generics::generics(self.db, func.into());
+        let mut const_params = Vec::new_in(frame);
+        const_params.extend(
+            generics
+                .iter_self_type_or_consts()
+                .filter(|(_, param_data)| param_data.const_param().is_some())
+                .map(|(id, _)| ConstParamId::from_unchecked(id)),
+        );
 
         // check legacy const parameters
         for (const_idx, arg_idx) in legacy_const_generics_indices.iter().copied().enumerate() {
@@ -420,7 +426,7 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         }
-        legacy_const_generics_indices.sort_unstable();
+        radix::sort(legacy_const_generics_indices);
         legacy_const_generics_indices
     }
 
@@ -434,6 +440,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Ty<'db> {
         let (fn_sig, def_id) = match callee_ty.kind() {
             TyKind::FnDef(def_id, args) => {
+                let args = args.no_bound_vars().unwrap();
                 let fn_sig = self
                     .db
                     .callable_item_signature(def_id.0)
@@ -477,7 +484,7 @@ impl<'db> InferenceContext<'db> {
         {
             let span = arg_exprs.last().copied().unwrap_or(call_expr);
             self.table.register_bound(ty, tuple_trait, ObligationCause::new(span));
-            self.require_type_is_sized(ty, span.into());
+            self.require_type_is_sized(ty, span.into(), ObligationCauseCode::Misc);
         }
 
         fn_sig.output()
@@ -533,16 +540,16 @@ impl<'db> InferenceContext<'db> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DeferredCallResolution<'db> {
+pub(crate) struct DeferredCallResolution<'db, 'f> {
     call_expr: ExprId,
     callee_expr: ExprId,
     closure_ty: Ty<'db>,
-    adjustments: Vec<Adjustment>,
+    adjustments: Vec<Adjustment, &'f Frame>,
     fn_sig: FnSig<'db>,
 }
 
-impl<'db> DeferredCallResolution<'db> {
-    pub(crate) fn resolve(self, ctx: &mut InferenceContext<'db>) {
+impl<'db, 'f> DeferredCallResolution<'db, 'f> {
+    pub(crate) fn resolve(self, ctx: &mut InferenceContext<'db, 'f>) {
         debug!("DeferredCallResolution::resolve() {:?}", self);
 
         // we should not be invoked until the closure kind has been
@@ -578,7 +585,7 @@ impl<'db> DeferredCallResolution<'db> {
 
                 let mut adjustments = self.adjustments;
                 adjustments.extend(autoref);
-                ctx.write_expr_adj(self.callee_expr, adjustments.into_boxed_slice());
+                ctx.write_expr_adj(self.callee_expr, &adjustments);
 
                 ctx.write_method_resolution(
                     self.call_expr,

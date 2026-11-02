@@ -19,20 +19,20 @@
 //! [`Parser`]: crate::parser::Parser
 
 #![allow(rustdoc::private_intra_doc_links)]
+#![deny(unsafe_code)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_lexer as rustc_lexer;
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
-#[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
+pub mod cook;
 mod event;
 mod frontmatter;
 mod grammar;
 mod input;
 mod lexed_str;
+mod outline;
 mod output;
 mod parser;
 mod shortcuts;
@@ -49,10 +49,11 @@ pub(crate) use token_set::TokenSet;
 pub use edition::Edition;
 
 pub use crate::{
-    input::Input,
+    input::{FRAGMENT, Input, JOINT, Tokens, word},
     lexed_str::LexedStr,
-    output::{Output, Step},
-    shortcuts::StrStep,
+    outline::lazy_block_len,
+    output::{OutlineStep, Output, Step},
+    shortcuts::{OutlineStrStep, StrStep},
     syntax_kind::SyntaxKind,
 };
 
@@ -60,7 +61,7 @@ pub use crate::{
 ///
 /// See <https://doc.rust-lang.org/reference/whitespace.html>.
 pub fn is_rust_whitespace(c: char) -> bool {
-    frontmatter::is_whitespace(c)
+    rustc_lexer::is_whitespace(c)
 }
 
 /// Parse the whole of the input as a given syntactic construct.
@@ -84,7 +85,7 @@ pub fn is_rust_whitespace(c: char) -> bool {
 /// [`TopEntryPoint::parse`] makes a guarantee that
 ///   * all input is consumed
 ///   * the result is a valid tree (there's one root node)
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopEntryPoint {
     SourceFile,
     MacroStmts,
@@ -98,8 +99,18 @@ pub enum TopEntryPoint {
 }
 
 impl TopEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
-        let _p = tracing::info_span!("TopEntryPoint::parse", ?self).entered();
+    pub fn parse<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(input.into(), false)
+    }
+
+    /// As [`TopEntryPoint::parse`], as an outline: each `fn` item's body a lazy node
+    /// ([`OutlineStep::Lazy`], [`lazy_block_len`]) when it can be one, else parsed in full.
+    pub fn parse_outline<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(input.into(), true)
+    }
+
+    fn parse_with(&self, input: Tokens<'_>, outline: bool) -> Output {
+        let _p = tracing::info_span!("TopEntryPoint::parse", ?self, outline).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
             TopEntryPoint::MacroStmts => grammar::entry::top::macro_stmts,
@@ -109,7 +120,10 @@ impl TopEntryPoint {
             TopEntryPoint::Expr => grammar::entry::top::expr,
             TopEntryPoint::MetaItem => grammar::entry::top::meta_item,
         };
-        let mut p = parser::Parser::new(input);
+        let mut p = match outline {
+            true => parser::Parser::new_outline(input),
+            false => parser::Parser::new(input),
+        };
         entry_point(&mut p);
         let (events, errors) = p.finish();
         let res = event::process(events, errors);
@@ -117,16 +131,17 @@ impl TopEntryPoint {
         if cfg!(debug_assertions) {
             let mut depth = 0;
             let mut first = true;
-            for step in res.iter() {
+            for step in res.steps() {
                 assert!(depth > 0 || first);
                 first = false;
                 match step {
-                    Step::Enter { .. } => depth += 1,
-                    Step::Exit => depth -= 1,
-                    Step::FloatSplit { ends_in_dot: has_pseudo_dot } => {
+                    OutlineStep::Step(Step::Enter { .. }) => depth += 1,
+                    OutlineStep::Step(Step::Exit) => depth -= 1,
+                    OutlineStep::Step(Step::FloatSplit { ends_in_dot: has_pseudo_dot }) => {
                         depth -= 1 + !has_pseudo_dot as usize
                     }
-                    Step::Token { .. } | Step::Error { .. } => (),
+                    OutlineStep::Step(Step::Token { .. } | Step::Error { .. })
+                    | OutlineStep::Lazy { .. } => (),
                 }
             }
             assert!(!first, "no tree at all");
@@ -146,7 +161,7 @@ impl TopEntryPoint {
 /// `Option<Output>`. The way MBE work, by the time we *try* to parse `$e:expr`
 /// we already commit to expression. In other words, this API by design can't be
 /// used to implement "rollback and try another alternative" logic.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixEntryPoint {
     Vis,
     Block,
@@ -161,7 +176,7 @@ pub enum PrefixEntryPoint {
 }
 
 impl PrefixEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
+    pub fn parse<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             PrefixEntryPoint::Vis => grammar::entry::prefix::vis,
             PrefixEntryPoint::Block => grammar::entry::prefix::block,
@@ -181,7 +196,8 @@ impl PrefixEntryPoint {
     }
 }
 
-/// A parsing function for a specific braced-block.
+/// A parsing function for a specific braced-block, or for one item of a source file.
+#[derive(Clone, Copy)]
 pub struct Reparser(fn(&mut parser::Parser<'_>));
 
 impl Reparser {
@@ -194,13 +210,28 @@ impl Reparser {
         grammar::reparser(node, first_child, parent).map(Reparser)
     }
 
+    /// One item of a source file's top level, parsed as that level parses it. The parse goes
+    /// on past the item when the tokens do (an error node for a `;` after it): take the item
+    /// alone with [`Output::into_first_node`].
+    pub fn top_level_item() -> Reparser {
+        Reparser(grammar::top_level_item)
+    }
+
     /// Re-parse given tokens using this `Reparser`.
     ///
-    /// Tokens must start with `{`, end with `}` and form a valid brace
+    /// For a block, tokens must start with `{`, end with `}` and form a valid brace
     /// sequence.
-    pub fn parse(self, tokens: &Input) -> Output {
+    pub fn parse<'t>(self, tokens: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(parser::Parser::new(tokens))
+    }
+
+    /// As [`Reparser::parse`], as an outline ([`TopEntryPoint::parse_outline`]).
+    pub fn parse_outline<'t>(self, tokens: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(parser::Parser::new_outline(tokens))
+    }
+
+    fn parse_with(self, mut p: parser::Parser<'_>) -> Output {
         let Reparser(r) = self;
-        let mut p = parser::Parser::new(tokens);
         r(&mut p);
         let (events, errors) = p.finish();
         event::process(events, errors)

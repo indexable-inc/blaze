@@ -1,0 +1,23 @@
+{
+  "id": "00034",
+  "from_lane": "store",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core"
+  ],
+  "what": "## 6. For core: what the store's pack writes need of the io_uring driver\n\n- What:\n  - Open pack files (`pack-*` in a store directory) with `O_DIRECT` on Linux and write their\n    `Effect::Append`s from registered, 4 KiB-aligned buffers. Every append the store asks\n    for starts and ends on a 4 KiB block: each commit pads each pack to a block (format 2).\n  - Keep `Effect::Truncate` and `Effect::Sync` as they are; with `O_DIRECT`, `Sync` is still\n    needed for the file's length.\n  - Link each pack's `Truncate -> Append -> Sync` as io_uring linked submissions; the store\n    already orders them and waits for each.\n  - Use SQPOLL with registered files.\n  - Use multishot `accept` and `recv` for the remote's `Listen` and `Recv`.\n  - Map packs and index tables with `MADV_HUGEPAGE` (where the file system supports\n    huge pages for files) and `MADV_WILLNEED` for index tables. Map them on the NUMA node of\n    the worker that serves gets.\n- Where: `crates/blaze-core`'s drivers.\n- Why: plan/hardware.md's IO and memory rows. The store is sans-IO, so it can only ask for\n  these through its effects. A buffer that is not aligned (sim, threads driver) must still\n  work there; under io_uring an unaligned `Append` to a pack is a store bug, and the driver\n  should fail it with that name, not quietly write it buffered.\n\n> forwarded to core",
+  "state": "open",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T00:02:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/store.md#6. For core: what the store's pack writes need of the io_uring driver",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:90"
+    }
+  ]
+}

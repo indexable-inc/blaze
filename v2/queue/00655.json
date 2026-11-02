@@ -1,0 +1,25 @@
+{
+  "id": "00655",
+  "from_lane": "codegen",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link",
+    "crates/blaze-codegen/src/lib.rs",
+    "crates/blaze-link/src/reloc.rs"
+  ],
+  "what": "## 2. link: what codegen now gives (request link.md section 1 applied)\n\nWhere: `crates/blaze-link/`. This is information for link, not a change I ask of its code.\n\n- `CompiledFunction::unwind`, `CompiledFunction::lines`, `Line`, `Unwind`, `Static`, `Init`\n  and `Target::Weak` are in `crates/blaze-codegen/src/lib.rs`, exactly as link.md asked,\n  with one addition: `Static::data: Vec<Data>`. That is the read-only data the static's\n  value points at by `Target::Data` (a `&str`'s bytes, a promoted constant). The linker\n  places it as it places a function's `data`.\n- `Target::Function(k)` and `Target::Direct(k)` are written into one kind of instruction\n  (a direct call or address). Function goes through `k`'s jump-table stub, so the stub must\n  take the same relocation kinds as a direct call of `k`.\n- `driver::Built` gives the linker these fields:\n  - `functions`, after code dedupe;\n  - `statics: Vec<Static>`, never merged by content;\n  - `symbols: Vec<(InstanceKey, String)>` and `static_symbols: Vec<(ItemKey, ContentId, String)>`: the names outside code uses, for `Change::names`;\n  - `patchable` and `tiered`: the functions reached through slots;\n  - `roots`.\n- `Build::tier_up` gives `TieredUp::replaced: Vec<(InstanceKey, CompiledFunction)>`: for\n  each tiered function, the slot's key and the LLVM code that replaces the Cranelift code in\n  that slot. The replacement's own key differs (other settings). The linker must swap the\n  code behind the slot of the first key and leave every caller alone.\n\n> forwarded to link: information for lane link's `crates/blaze-link/`; no change asked.\n\n### 2b. link: new relocation kinds and two contracts to confirm\n\nWhere: `crates/blaze-link/src/reloc.rs` (`of_kind`), where it maps `RelocKind`.\n\n- `RelocKind` gained the TLS kinds. Each is one `Apply` link already has, and is valid\n  only on its format: refuse it on another with an error.\n\n  | `RelocKind` | `Apply` |\n  |---|---|\n  | `TlsGd32` | `X86TlsGd32` (x86-64 ELF) |\n  | `TlsGotTpOff32` | `X86GotTpOff32` (x86-64 ELF) |\n  | `TlvRel32` | `TlvRel32` (x86-64 Mach-O) |\n  | `TlvPage21` / `TlvPageOffset12` | `TlvPage21` / `TlvLo12` (AArch64 Mach-O) |\n  | `TlsDescPage21` / `TlsDescLd64Lo12` / `TlsDescAddLo12` / `TlsDescCall` | `A64TlsDescPage21` / `A64TlsDescLo12` / `A64TlsDescAdd12` / `A64TlsDescCall` (AArch64 ELF) |\n  | `TlsIePage21` / `TlsIeLo12` | `A64TlsIePage21` / `A64TlsIeLo12` (AArch64 ELF) |\n  | `TpHi12` / `TpLo12` | `A64TpHi12` / `A64TpLo12` (AArch64 ELF) |\n  | `SectionRel32` | `SecRel32` (COFF) |\n\n  `of_kind` takes only the arch today, so it needs the format too to refuse a kind on the\n  wrong one.\n- Confirm that codegen's addends are explicit, `S + A - P`, for `PcRel32` and every other\n  kind on every format (so `-4` for an x86-64 call, also on Mach-O), and that the linker\n  never reads an implicit addend from the code's bytes.\n- Confirm that a `Target::Extern(name)` resolves to a name the program defines\n  (`Built::symbols`, `Change::names`) before any native library. The allocator shim\n  (`__rust_alloc` and the rest) and `#[no_mangle]` functions called by name rely on it.\n\nWhy: thread-locals and the allocator are in every Rust program. Without these, the adapter\nrefuses every thread-local access.\n\n> forwarded to link: `crates/blaze-link/src/reloc.rs` `of_kind` (the TLS kinds, per format) and the two contracts are lane link's; lane link is still running.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#2. link: what codegen now gives (request link.md section 1 applied)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:31"
+    }
+  ]
+}

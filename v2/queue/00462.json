@@ -1,0 +1,37 @@
+{
+  "id": "00462",
+  "from_lane": "db-ty",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir/src/evict.rs",
+    "crates/hir-ty/src/mir.rs"
+  ],
+  "what": "## 9. Codegen: `lru = 0` on the 11 MIR queries that lack it\n\nWhat: add `lru = 0` to `promoted_mir_body_query` (`crates/hir-ty-mir/src/mir/lower.rs:4937`),\n`runtime_promoted_mir_body_query` (`mir/transform.rs:171`), `optimized_mir_body_query`,\n`optimized_mir_body_for_closure_query`, `monomorphized_optimized_mir_body_query`,\n`monomorphized_optimized_mir_body_for_closure_query` (`mir/optimize.rs`), and the five\n`monomorphized_*` in `mir/monomorphization.rs` (489, 500, 522, 542, 552).\nWhy: db-salsa's `evict_values` exists only for functions with `lru` (the `HasCapacity` bound,\n`/tmp/blaze-lanes/v2-db-salsa.md`). `crates/hir/src/evict.rs`'s `drop_mir` evicts all 23 MIR\nqueries after a store (#806: MIR was 15% of a cold build's heap, most of it monomorphized and\noptimized MIR), so it does not compile until these 11 have it. Their outputs already implement\n`Hash` (`MirBody`, `MirLowerError` in `crates/hir-ty/src/mir.rs`).\n\n> forwarded to codegen",
+  "state": "applied",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/db-ty.md#9. Codegen: `lru = 0` on the 11 MIR queries that lack it",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:115"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Already so: the MIR memos moved to hir-ty/src/providers.rs and hir-ty-mir, each lru = 0."
+    }
+  ]
+}

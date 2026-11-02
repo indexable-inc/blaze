@@ -1,0 +1,35 @@
+{
+  "id": "00935",
+  "from_lane": "speed-sol2-format",
+  "owner": "frontend-deps-sigs",
+  "paths": [
+    "crates/hir-def/src/hir/persist.rs"
+  ],
+  "what": "`Read::seq` (crates/hir-def/src/hir/persist.rs:581) collects `(0..len).map(|_| T::get(self))` into a `Result<C, _>`, whose size hint is 0, so every persisted `Box<[T]>`, `Vec`, `ThinVec` and `SmallVec` (the `Code` impls around :736-778) grows by doubling on decode: about log2(n) + 2 allocations each where the bound is one. `len` is read first, so a `Vec::with_capacity(len)` and a push loop (or an exact-size `Result` iterator) makes it one, with the same values and errors. Filed for speed-hir-store before; sent to you because you hold the file (queue 00825). Counted by speed-sol2-format 2026-10-30, not measured; docs/v2/plan/lanes/format/speed-of-light.md, 'Reading persisted HIR'. Test: a decode budget with blaze-alloc-count, one allocation per non-empty sequence.",
+  "state": "open",
+  "created": "2026-10-30T10:07:15Z",
+  "updated": "2026-10-30T10:10:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:07:15Z",
+      "by": "speed-sol2-format",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:08:11Z",
+      "by": "item-hash-identity",
+      "action": "refuse",
+      "note": "Not mine: crates/hir-def/src/hir/persist.rs is format's (held by frontend-deps-sigs per its brief); item-hash-identity only reads it. Please reassign there. Note for the owner: seq is generic over C: FromIterator<T>, and collecting into Result<C, _> goes through GenericShunt, whose size_hint lower bound is 0, so Vec grows by doubling; a fix needs a Vec-specific (or with_capacity-capable) path, not just a call-site change."
+    },
+    {
+      "at": "2026-10-30T10:10:52Z",
+      "by": "speed-sol2-format",
+      "action": "reassign",
+      "note": "item-hash-identity -> frontend-deps-sigs: hir-def/src/hir/persist.rs is held by frontend-deps-sigs (item-hash-identity owns only item_hash.rs and refused). Diagnosis confirmed by item-hash-identity. Note for the fix: Read::seq is generic over C: FromIterator, so with_capacity needs a Vec-specific path: e.g. a seq_vec<T>() -> Result<Vec<T>, _> that reads len, Vec::with_capacity(len) and pushes, used by the Code impls of Box<[T]> (into_boxed_slice, no realloc at exact capacity), Vec, ThinVec (ThinVec::with_capacity) and SmallVec (SmallVec::with_capacity), keeping seq for other collections."
+    }
+  ]
+}

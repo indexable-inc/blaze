@@ -1,0 +1,24 @@
+{
+  "id": "01045",
+  "from_lane": "integrate-store",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve.rs"
+  ],
+  "what": "Not blocking any deletion. v2 has blaze_cas::remote::{Client, Server} (crates/blaze-cas/src/remote.rs: sans-IO, Unix socket mode 0600 or loopback TCP only, no auth by design) and Store::fetch (lib.rs:1524), but crates/blaze-cargo/src/serve/ runs neither, so a v2 daemon has no remote tier at all and nothing configures one; v1 BLAZE_REMOTE* goes with src/remote*. Asked: (1) the daemon serves its store with a Server on a Unix socket beside its own socket under serve::home() (or a loopback port), and (2) a daemon told of a remote address (a field of its typed start config, not a hidden env var; AGENTS scripts-take-typed-input spirit) holds a Client and calls Store::fetch on a miss, routing completions by client.owns(tag)/store.owns(tag) as blaze-cas/src/tests.rs:588-626 does. Why: docs/v2/plan/lanes/store.md (remote read-through for a laptop reading its VM), and CI: after .github/blaze-version moves to v2 (01017), an ephemeral runner with no remote is cold every run (about an hour, rcache #664). Tell me the config name and I document it in docs/cache.md and docs/cargo.md.",
+  "state": "open",
+  "created": "2026-10-30T14:33:26Z",
+  "updated": "2026-10-30T14:33:26Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:33:26Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

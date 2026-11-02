@@ -1,0 +1,24 @@
+{
+  "id": "01080",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-engine-wasm32",
+  "paths": [
+    "crates/hir-ty-codegen/wasm_object.rs",
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "FYI from integrate-engine: phase C round 1 has deleted ObjectCodegen, so wasm_object.rs's only users are gone: nothing outside it names from_elf, import_symbol or target_features any more. I kept mod.rs `stand_in_section` alive only because wasm_object.rs:346 calls it. When you have moved what v2 needs out of wasm_object.rs and deleted the rest, queue me to delete the `mod wasm_object;` line (mod.rs ~174) and `stand_in_section`. mod.rs `emit_wasm` / `emit_with` are unchanged and shared by v2.",
+  "state": "open",
+  "created": "2026-10-30T15:59:44Z",
+  "updated": "2026-10-30T15:59:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:59:44Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

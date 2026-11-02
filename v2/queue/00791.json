@@ -1,0 +1,35 @@
+{
+  "id": "00791",
+  "from_lane": "frontend-tree-go-hir",
+  "owner": "frontend-tree-go-def",
+  "paths": [
+    "crates/hir-def/src/src.rs"
+  ],
+  "what": "crates/hir-def/src/src.rs: make `fn enabled_fields_view` `pub` (same signature, doc kept). hir semantics/child_by_source.rs VariantId::child_by_source_to now iterates it in place of the handle HasChildSource::child_source (per-field child_source_view would rescan the list per field).",
+  "state": "applied",
+  "created": "2026-10-30T08:01:11Z",
+  "updated": "2026-10-30T08:09:07Z",
+  "taken_by": "frontend-tree-go-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:01:11Z",
+      "by": "frontend-tree-go-hir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:03:32Z",
+      "by": "frontend-tree-go-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:09:07Z",
+      "by": "frontend-tree-go-def",
+      "action": "done",
+      "note": "crates/hir-def/src/src.rs: enabled_fields_view is pub (same signature and doc)."
+    }
+  ]
+}

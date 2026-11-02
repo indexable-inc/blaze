@@ -1,0 +1,37 @@
+{
+  "id": "00502",
+  "from_lane": "diagnostics-lints-bodies-types-values",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils",
+    "crates/test-utils/src/minicore.rs",
+    "crates/blaze-diagnostics/src/tests/lints/bodies/types/values.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-types-values: minicore's `Result::unwrap` (the coordinator, `crates/test-utils`)\n\nWhere: `crates/test-utils/src/minicore.rs`, region `result`, inside `impl<T, E> Result<T, E>`,\nas `library/core/src/result.rs` writes it:\n\n```rust\n        // region:fmt\n        #[track_caller]\n        pub fn unwrap(self) -> T\n        where\n            E: crate::fmt::Debug,\n        {\n            match self {\n                Ok(t) => t,\n                Err(_) => panic!(\"called `Result::unwrap()` on an `Err` value\"),\n            }\n        }\n        // endregion:fmt\n```\n\nWhy: `crates/blaze-diagnostics/src/tests/lints/bodies/types/values.rs`\n(`const_item_interior_mutations_const`) is rustc's\n`tests/ui/lint/const-item-interior-mutations-const.rs` byte for byte, which writes\n`mutex.lock().unwrap()`; without it the body has a type error and the late lints never run.\n\n> forwarded to coordinator: `crates/test-utils/` is \"every other path\" in `crates.md`.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-values: minicore's `Result::unwrap` (the coordinator, `crates/test-utils`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1936"
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `Result::unwrap` with `E: crate::fmt::Debug`, under region fmt inside `impl<T, E> Result<T, E>` (same edit as 00487 item 1)."
+    }
+  ]
+}

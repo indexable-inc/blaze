@@ -1,0 +1,24 @@
+{
+  "id": "00748",
+  "from_lane": "requests-backend-axis",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2/engine.py",
+    "harness/v2"
+  ],
+  "what": "## When 1 to 3 are applied\n\nDelete the refusal `DEV_BACKEND_MISSING` in `harness/v2/engine.py` (`Engine.__init__`). The\nrequests lane holds `harness/v2/` now that proof is done. `V2.build` passes\n`dev_backend_args` already, so nothing else changes.",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-backend-axis.md#When 1 to 3 are applied",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-backend-axis.md:90"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00610",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_type_ir/src/interner.rs"
+  ],
+  "what": "## 14. solver-sync (through lane db): hir-ty implements the `CacheScope` signature\n\nhir-ty's `next_solver/interner.rs` now implements item 3 of\n`~/restart-2026-10-28/briefs/v2/db-to-solver-sync.md`:\n`with_global_cache(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R)` and\n`cache_scope(self, &Self::DepNodeIndex) -> CacheScope`, with `DepNodeIndex = Option<Reads>`. It\nrelies on item 2's `GlobalCache`: used through `&self`, `Default`, and `Send + Sync` by auto\ntraits (`tls_cache.rs` asserts it). hir-ty does not build against the tree as it is now (old\n`&mut` signature) until the port carries items 2 and 3. Don't port `interner.rs`'s cache block\nback to the old signature.\n\n> forwarded to db: it asks through lane db (for solver-sync).\n> checked by db-audit-dbsub (2026-10-29 22:40): in the tree: `vendor/rustc_type_ir/src/interner.rs:273-280` (`with_global_cache(self, scope: CacheScope, ..)`, `cache_scope`) and hir-ty's `next_solver/interner.rs:1264-1282`.",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#14. solver-sync (through lane db): hir-ty implements the `CacheScope` signature",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:188"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): in the tree: `vendor/rustc_type_ir/src/interner.rs:273-280` (`with_global_cache(self, scope: CacheScope, ..)`, `cache_scope`) and hir-ty's `next_solver/interner.rs:1264-1282`."
+    }
+  ]
+}

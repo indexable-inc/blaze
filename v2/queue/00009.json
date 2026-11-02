@@ -1,0 +1,29 @@
+{
+  "id": "00009",
+  "from_lane": "link-core-write",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs"
+  ],
+  "what": "## 13. From link-core-write: a write of shared bytes, and of several ranges at once\n\nWhere: `crates/blaze-core/src/lib.rs` (`Effect`), the io_uring, kqueue and threads backends.\n\nWhy: a link's file is already in memory when it is written. After a full link each region is\none buffer (`CowBytes` over a `Vec`), and `Effect::WriteAt` takes a `Vec<u8>`, so\n`file::whole` copies every byte of the image once more into the runs it writes (8 MiB each,\naligned to 8 MiB, so they bypass the page cache under `DIRECT_LEAST`). An incremental link\nwrites many small ranges (a piece, an 8-byte jump-table cell), each a `Vec` and an effect.\n\nAdd:\n\n```rust\n    /// `parts` written in order from `at`, as one write (`pwritev` / `IORING_OP_WRITEV`):\n    /// each a range of shared bytes, not copied. Completes with [`Done::Written`].\n    WriteShared { file: FileName, at: u64, parts: Vec<(Mapping, std::ops::Range<usize>)>, tag: Tag },\n```\n\nWith it a full link writes each region straight from its buffer and the headers from theirs\n(no copy of the image), and an incremental link sends one effect per run of nearby ranges, each\nrange borrowed from the region's pages. Until then `file.rs` copies each run into its `Vec`\nonce, the fewest copies `WriteAt` allows.\n\n> forwarded to link.",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-30T09:42:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#13. From link-core-write: a write of shared bytes, and of several ranges at once",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:978"
+    },
+    {
+      "at": "2026-10-30T09:42:28Z",
+      "by": "speed-sol2-link",
+      "action": "reassign",
+      "note": "link -> core: Effect lives in crates/blaze-core (lib.rs and the io_uring, kqueue and threads backends): core's paths. Link's side (file.rs whole/runs writing each region from its buffer) follows once WriteShared exists; today a full link copies the image once more into 8 MiB runs, within 10% of the device bound under direct I/O but a second pass of memory bandwidth through the page cache."
+    }
+  ]
+}

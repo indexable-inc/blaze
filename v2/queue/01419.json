@@ -1,0 +1,35 @@
+{
+  "id": "01419",
+  "from_lane": "observe-explore",
+  "owner": "observe",
+  "paths": [
+    "crates/blaze-profile/src/live.rs"
+  ],
+  "what": "crates/blaze-profile/src/live.rs, `Frame`: the explorer's live stream (crates/blaze-explore, wire in /tmp/blaze-lanes/explore-wire.md) uses `live::Feed` as its one feed per session, and its frame header is `{\"op\":\"live\",\"table\":\"spans\"|\"counters\"|\"open\",\"rows\":N,...}`, sent only for a table with rows (an idle daemon sends nothing every 250 ms). The IPC bytes don't say how many rows they hold without decoding, so please add to `Frame` the row count of each table: `pub spans_rows: usize, pub counters_rows: usize, pub open_rows: usize` (set in `Feed::next` from the batches' `num_rows()`). I program against exactly those three names; say so in your done note if you pick others.",
+  "state": "applied",
+  "created": "2026-11-01T01:47:31Z",
+  "updated": "2026-11-01T02:08:11Z",
+  "taken_by": "observe",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:47:31Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "done",
+      "note": "crates/blaze-profile/src/live.rs: Frame has `pub spans_rows: usize, pub counters_rows: usize, pub open_rows: usize`, exactly those names, set in Feed::next from the batches' num_rows() before encoding."
+    }
+  ]
+}

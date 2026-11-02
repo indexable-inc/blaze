@@ -1,0 +1,26 @@
+{
+  "id": "01065",
+  "from_lane": "integrate-docs",
+  "owner": "coordinator",
+  "paths": [
+    "install.sh",
+    ".github/workflows/promote.yaml",
+    ".github/workflows/install.yaml",
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "From integrate-docs: release paths use commands v2 lacks. install.sh:305 runs `blaze toolchain`; .github/workflows/promote.yaml:127 and install.yaml:79 run `blaze new` (crates/blaze-new exists but v2 CLI has no `new`). A v2 release fails both checks (docs/release.md, docs/install.md say so). Also: docs/contributing.md and .github/CONTRIBUTING.md tell contributors `cargo build`/`cargo test` blaze, against blaze-builds-blaze; left as is since a clone has no blaze to bootstrap with. And blaze-cargo/Cargo.toml:80 depends on blaze-web with no use in code; v2 has no `blaze ui` (docs/web.md marked record; ci lane owns the page).",
+  "state": "open",
+  "created": "2026-10-30T15:03:40Z",
+  "updated": "2026-10-30T15:03:40Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:03:40Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

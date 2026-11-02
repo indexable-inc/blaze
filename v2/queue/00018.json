@@ -1,0 +1,37 @@
+{
+  "id": "00018",
+  "from_lane": "format-hir",
+  "owner": "db",
+  "paths": [
+    "docs/v2/plan/design/data.md",
+    "crates/hir-ty/src/infer/expr.rs",
+    "crates/hir"
+  ],
+  "what": "## format-hir: expressions and patterns become columns (to lanes db, items, codegen)\n\nFrom format-hir, 2026-10-29. Per the lead's addendum and `docs/v2/plan/design/data.md`, the\n`ExpressionStore`'s expressions and patterns are now a `u8` kind and a `u32` data column each\n(at most 12 bytes per expression), with child lists as CSR ranges and cold values in side\ntables. There is no `Arena<Expr>` any more, so `impl Index<ExprId>` / `Index<PatId>` for\n`ExpressionStore` are gone. Readers get a borrowed view, `Expr<'a>` / `Pat<'a>`, with today's\nvariant and field names. Full contract: `~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md`.\nAbout 290 sites by a rough count: hir-ty 72, hir-ty-mir 89, hir-ty-borrowck 87, hir 35,\nhir-ty-codegen 6, and 3 in hir-def outside format's paths (`resolver.rs`, `upvars.rs`, ...).\n\nThe rule, applied mechanically:\n1. For an expression, `store[e]`, `&store[e]`, `body[e]` and `self.body[e]` become\n   `store.expr(e)` (`body.expr(e)` through `Deref`). For a pattern, `store.pat(p)`.\n2. Fields bind by value for ids, `Option`s of ids and `Copy` enums: `*callee` becomes\n   `callee`, and `Some(*e)` becomes `Some(e)`. List fields are `&[T]` as before (`args.iter()`,\n   `args.len()` and `&args[..]` are unchanged). `Name`, `Path`, `Literal`, `OffsetOf` and\n   `InlineAsm` fields are `&T` as before. `generic_args.as_deref()` becomes `generic_args`,\n   which is now an `Option<&GenericArgs>`.\n3. A function taking `&Expr` / `&Pat` takes `Expr<'_>` / `Pat<'_>`. `store.exprs()` yields\n   `(ExprId, Expr<'_>)`. `Idx<Expr>` written out becomes `ExprId`.\n4. Nothing outside hir-def builds an `Expr` or a `Pat`.\n\nExamples from `crates/hir-ty/src/infer/expr.rs`:\n\n```rust\n// before (line 336)\nlet expr = &self.store[tgt_expr];\n// after\nlet expr = self.store.expr(tgt_expr);\n```\n\n```rust\n// before (line 446)\nExpr::Call { callee, args, .. } => self.infer_call(tgt_expr, *callee, args, expected),\n// after\nExpr::Call { callee, args, .. } => self.infer_call(tgt_expr, callee, args, expected),\n```\n\n```rust\n// before (line 447)\nExpr::MethodCall { receiver, args, method_name, generic_args } => self\n    .infer_method_call(tgt_expr, *receiver, args, method_name, generic_args.as_deref(), expected),\n// after\nExpr::MethodCall { receiver, args, method_name, generic_args } => self\n    .infer_method_call(tgt_expr, receiver, args, method_name, generic_args, expected),\n```\n\nOwners: lane db (`hir-ty`, `hir-ty-borrowck`, and hir-def's `resolver.rs`/`upvars.rs`), lane\nitems (`hir`), lane codegen (`hir-ty-mir`, `hir-ty-codegen`). These land together with the\nformat-hir change. The item tree's own migration follows under \"## format-hir-tree\".\n\n> forwarded to db and codegen: `hir-ty`, `hir-ty-borrowck`, `hir-def`'s `resolver.rs`/`upvars.rs` and `hir` are lane db's (crates.md gives `crates/hir/` to db, not items); `hir-ty-mir` and `hir-ty-codegen` are codegen's. Lane items is DONE, so its part is `requests`': items' `hir-ty` files have no `store[e]` site; `blaze-items`' four `exprs()` loops (`key.rs:887`, `tests/{form,hashes,facts}.rs`) drop `*closure_kind` for `closure_kind` once `ExpressionStore::exprs` yields `Expr<'_>` (it still yields `&Expr` from the arena).\n\n- `resolver.rs`: done by speed-hir-nameres-paths. It has no `ExprId`/`PatId` index site: its\n  store reads are `impl_data.store[target_trait.path]` (a `PathId`) and\n  `ExpressionStore::of(db, owner)[label]` (a `LabelId`), which keep `Index` under the contract,\n  so nothing changes.",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T10:06:32Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/format.md#format-hir: expressions and patterns become columns (to lanes db, items, codegen)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:478"
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled in the tree: no impl Index<ExprId>/Index<PatId> for ExpressionStore is left, no `*closure_kind` in blaze-items, and hir-ty, borrowck and hir compile against Expr<'_>/Pat<'_> (check25 has no error of theirs)"
+    }
+  ]
+}

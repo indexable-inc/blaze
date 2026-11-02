@@ -17,8 +17,8 @@ step goes to a file of link arguments that `bun-exe`'s build script reads (BUN_N
 and the member is added. It returns that tree, to be copied without its `build` directory, and
 the environment every build of it needs: bun's pinned toolchain, the code bun's build generated
 (BUN_CODEGEN_DIR) and the link arguments. `in_place(ws)` does the same in a checkout of its own
-(apps.py's `prepare`). `sources(ws)` only fetches the crates bun's workspace has under `vendor/`,
-what `cargo metadata` needs (borrowck_apps.py's `prepare`).
+(appruns.py's `prepare`). `sources(ws)` only fetches the crates bun's workspace has under
+`vendor/`, what `cargo metadata` needs.
 
 What bun's build needs is on PATH: what docs/project/contributing.mdx lists (LLVM 23, cmake,
 ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it, whose only Rust is
@@ -325,8 +325,8 @@ def sources(ws):
     """What `cargo metadata` needs of a checkout without bun's own build: the crates its
     Cargo.toml has under `vendor/`, which that build fetches (scripts/build/deps/<name>.ts) at
     the commit the file pins, with the `.patch` files it lists applied as that build applies them
-    (rust-argon2's lifts its memory floor). Enough for `blaze-engine borrowck --project`, which builds
-    nothing."""
+    (rust-argon2's lifts its memory floor). Enough for what reads the workspace without building
+    it."""
     for name in re.findall(r'path = "vendor/([^"/]+)"', open(os.path.join(ws, "Cargo.toml")).read()):
         dep = open(os.path.join(ws, "scripts", "build", "deps", f"{name}.ts")).read()
         if re.search(r'kind: "([^"]+)"', dep)[1] != "github-archive":

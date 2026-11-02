@@ -1,7 +1,8 @@
-# Microbenchmarks of the store's hot paths (crates/blaze-bench), run by tango in pairs: on a
+# Microbenchmarks of the store's hot paths (crates/blaze-bench), run in pairs by its own runner
+# (crates/blaze-bench/src/lib.rs; the job keeps the name `tango`, the harness it replaced): on a
 # pull request the binary of the change against the binary of its base, interleaved on one
 # runner, so that the runner's own drift cancels out. A benchmark fails the run only when it
-# is slower beyond doubt (tango's z-score) and by more than NOISE percent, twice in a row.
+# is slower beyond doubt (a paired z-score) and by more than NOISE percent, twice in a row.
 # On main they are run alone, for the times.
 name: bench
 on:
@@ -53,6 +54,11 @@ jobs:
               | jq -r 'select(.executable != null and .target.name == "store") | .executable' \
               | xargs -I{} cp {} "$RUNNER_TEMP/bench-base"
           fi
+          # A base built before blaze-bench had its own runner speaks no protocol to pair with.
+          if [ -x "$RUNNER_TEMP/bench-base" ] && [ "$("$RUNNER_TEMP/bench-base" protocol 2>/dev/null)" != "blaze-bench-protocol 1" ]; then
+            echo "The base's benchmarks predate blaze-bench's runner: nothing to pair with."
+            rm "$RUNNER_TEMP/bench-base"
+          fi
           git checkout -q --detach ${{ github.sha }}
       - name: Build the change
         run: |
@@ -64,15 +70,15 @@ jobs:
         run: |
           [ -x "$RUNNER_TEMP/bench-base" ] || { echo "The base has no benchmarks: nothing to compare."; exit 0; }
           compare() { "$RUNNER_TEMP/bench-head" --color never compare "$RUNNER_TEMP/bench-base" -t "$TIME" --noise-threshold "$NOISE" -o | tee -a "$RUNNER_TEMP/bench.txt"; }
-          { echo '### tango: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '### blaze-bench: change against base'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           status=0
           compare || { echo "A slowdown over ${NOISE}%: measuring again" | tee -a "$RUNNER_TEMP/bench.txt"; compare || status=$?; }
           { cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           [ "$status" = 0 ] || echo "::error::a benchmark is over ${NOISE}% slower than on the base, twice"
           exit "$status"
-      # On main, and on a pull request whose base has no benchmarks.
+      # On main, and on a pull request whose base has no benchmarks to pair with.
       - name: Times
         run: |
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
           "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
-          { echo '### tango'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '### blaze-bench'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

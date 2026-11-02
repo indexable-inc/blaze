@@ -14,6 +14,7 @@ enum ConflictStoreTrie {
     Leaf(ConflictMap),
     /// A map from an element to a subtrie where
     /// all the sets in the subtrie contains that element.
+    // BTreeMap: `find` takes range queries up to `must_contain`.
     Node(BTreeMap<PackageId, ConflictStoreTrie>),
 }
 

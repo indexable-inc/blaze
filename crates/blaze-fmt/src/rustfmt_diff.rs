@@ -145,7 +145,7 @@ impl std::str::FromStr for ModifiedLines {
 // This struct handles writing output to stdout and abstracts away the logic
 // of printing in color, if it's possible in the executing environment.
 pub(crate) struct OutputWriter {
-    terminal: Option<Box<dyn term::Terminal<Output = io::Stdout>>>,
+    terminal: Option<term::AnsiTerminal<io::Stdout>>,
 }
 
 impl OutputWriter {

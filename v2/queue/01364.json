@@ -1,0 +1,35 @@
+{
+  "id": "01364",
+  "from_lane": "fastcompile",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/frontend.rs"
+  ],
+  "what": "fastcompile (change 20, compiled tier of proc macros, tier/build.rs): a public root of a generic function whose type parameters are fn items: `impl HirFrontend<'_> { pub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, String> }` in v2/frontend.rs, as `root_in` makes a root but with `GenericArgs::for_item(interner, func.into(), ..)` giving each type parameter, in order, `Ty::new_fn_def(interner, CallableDefId::FunctionId(items[i]).into(), GenericArgs::default())` and each region erased (exactly what blaze-macro-eval run.rs `on_evaluator` builds for `expand_args`); an Err naming the function when the number of type parameters is not `items.len()` or a const parameter is met. Why: the tier compiles a macro crate rooted at `proc_macro::bridge::client::Client::expand1::<F>`/`expand2::<F>` for each `#[proc_macro*]` function F (the `BLAZE_PROC_MACROS` static is not in the daemon's database: nothing calls `proc_macro_list`), and `root` erases only regions. Costs nothing unless called. Until it lands tier/build.rs stays unnamed by any `mod` line and `Policy::compiled` stays false.",
+  "state": "applied",
+  "created": "2026-10-31T23:52:29Z",
+  "updated": "2026-10-31T23:53:39Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:52:29Z",
+      "by": "fastcompile",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:53:39Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:53:39Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "HirFrontend::root_with_fn_items in crates/hir-ty-codegen/v2/frontend.rs (root_in and it share rooted); Err names the function on a const parameter or a type parameter count other than items.len(); test a_root_takes_function_items_for_its_type_parameters in v2/tests.rs; rust-analyzer clean, waits on builder-2"
+    }
+  ]
+}

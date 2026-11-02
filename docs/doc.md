@@ -1,6 +1,7 @@
 ---
-status: current
-summary: blaze doc: HTML documentation written from the front end's HIR, with no rustdoc.
+status: record
+summary: blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet.
+date: 2026-10-30
 ---
 # `blaze doc`
 
@@ -126,8 +127,9 @@ Both go when the load stops needing them ([no-rustc.md](no-rustc.md)).
 
 ## How complete it is
 
-`harness/docdiff.py <workspace>` runs the pinned nightly's `cargo doc` and `blaze doc` with
-the same flags and compares, for each crate both documented: the item pages, the members and
+Until 2026-10-30 a harness (deleted with the other comparisons with rustc and cargo,
+[harness.md](harness.md)) ran the pinned nightly's `cargo doc` and `blaze doc` with the same
+flags and compared, for each crate both documented: the item pages, the members and
 impls anchored on pages both have (`method.new`, `impl-Debug-for-Foo`), the intra-doc links
 rustdoc resolved (by their titles), and the `unresolved link` warnings. On the bench apps (each
 with its dependencies; 2026-10-26, dev-aws-8, blaze at 69cbce21f5):

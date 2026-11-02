@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """experience.py: what a new user sees, step by step, on real projects: `blaze build`,
 the same again, `run`, `test`, `check`, an edit and its build and run, `status` and `stop`,
-each beside plain `cargo` on a copy of the same project, with what each step printed.
+each timed beside plain `cargo` on a copy of the same project, with what each step printed.
 
     python3 experience.py                          # every project, with the blaze on PATH
     python3 experience.py hello derives            # some of them
@@ -15,12 +15,13 @@ It is a user's view: it runs `blaze` from `PATH`, sets no `BLAZE_*`
 variable, and reads nothing but what the commands print and leave behind. A step fails the
 run when it is a rough edge a user would trip on:
 
-  - a command that exits other than as cargo's does (cargo exits 0 where blaze does not;
-    where cargo fails and blaze does not, cargo's last line is noted and the run goes on);
+  - a command that exits other than 0 (every project builds, runs, tests and checks);
   - a name blaze no longer has in anything printed (`DEAD_NAMES`, docs/rename.md);
   - a line that is not cargo's, the program's or the compiler's own, unless the project's
     transcript in `experience/` has it (a new message is looked at before it is accepted);
-  - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit);
+  - a build slower than cargo's of the same step, by more than `SLACK` (cold, no-op, edit):
+    cargo is the speed baseline, and where its step fails there is none, which is noted;
+  - a no-op build that says it compiles something;
   - a second no-op build that prints other than the first;
   - a cold build that shows a terminal nothing for more than `SILENT` seconds (it looks stuck);
   - an edit whose run does not print the edited output;
@@ -334,7 +335,7 @@ class Step:
 
 
 def plain_cargo(env):
-    """The blaze is compared with, and its environment: the user's, else, on a machine
+    """The cargo blaze is timed against, and its environment: the user's, else, on a machine
     with no Rust, the one blaze downloaded, with its toolchain first on PATH so that it finds
     its rustc."""
     users = shutil.which("cargo", path=env["PATH"])
@@ -394,7 +395,7 @@ def blaze_processes():
 
 
 def flow(name, spec, work, env):
-    """Every step, blaze's and cargo's, and the rough edges in them."""
+    """Every step, blaze's and cargo's (its speed baseline), and the rough edges in blaze's."""
     target = ["--target", spec["target"]] if spec.get("target") else []
     run_args = spec.get("run", [])
     blaze_dir, cargo_dir = os.path.join(work, name), os.path.join(work, name + "-cargo")
@@ -459,32 +460,25 @@ def flow(name, spec, work, env):
         rough.append(("stop", "blaze processes left after `blaze stop`: " + "; ".join(left), "P1"))
 
     where = [(blaze_dir, "$PROJECT"), (os.path.realpath(blaze_dir), "$PROJECT"), (env["HOME"], "$HOME")]
-    if pairs and pairs[0][1].code != 0:
-        said = (pairs[0][1].err + pairs[0][1].out).strip().splitlines()
-        rough = [(pairs[0][1].name, "cargo fails here too, so this says nothing of blaze: "
-                  + (said[-1] if said else ""), "env")]
-        return steps, rough, where, [theirs for _, theirs in pairs]
     last = lambda step: ((step.err + step.out).strip().splitlines() or [""])[-1]
     for ours, theirs in pairs:
-        if ours.code == 0 and theirs.code != 0:
-            rough.append((ours.name, f"cargo fails here (exit {theirs.code}), blaze does not: {last(theirs)}", "env"))
-        elif ours.code != theirs.code:
-            rough.append((ours.name, f"exit {ours.code}, cargo's {theirs.code}: {last(ours)}", "P0"))
+        if theirs.code != 0:
+            rough.append((ours.name, f"cargo fails here (exit {theirs.code}), so there is no time to hold blaze's to: {last(theirs)}", "env"))
         elif ours.code == 0 and ours.secs > theirs.secs * SLACK + SLACK_ABS:
             rough.append((ours.name, f"{ours.secs:.2f} s, cargo {theirs.secs:.2f} s", "P0"))
     for s in steps:
-        if s.code != 0 and s.name not in [ours.name for ours, _ in pairs]:
-            rough.append((s.name, f"exit {s.code}", "P0"))
+        if s.code != 0:
+            rough.append((s.name, f"exit {s.code}: {last(s)}", "P0"))
         for line in (s.out + s.err).splitlines():
             if DEAD_NAMES.search(line):
                 rough.append((s.name, f"says a name blaze no longer has: {line.strip()}", "P2"))
             # crates/blaze-ui says it at the end when the build spent UNNAMED_NS or more at no step.
             if "with no step named" in line:
                 rough.append((s.name, f"a second or more of it is at no step: {line.strip()}", "P1"))
-    for ours, theirs in pairs:
-        compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
-        if compiled(ours) and not compiled(theirs) and ours.code == 0:
-            rough.append((ours.name, f"says Compiling {', '.join(compiled(ours))}, where cargo compiles nothing", "P1"))
+    compiled = lambda step: sorted(l.split()[1] for l in step.err.splitlines() if l.strip().startswith("Compiling "))
+    for s in steps:
+        if s.name in ("build (no-op)", "build (no-op again)") and compiled(s) and s.code == 0:
+            rough.append((s.name, f"says Compiling {', '.join(compiled(s))}, where nothing has changed since the last build", "P1"))
     if cold.silent is not None and cold.silent > SILENT:
         rough.append((cold.name, f"a terminal is shown nothing for {cold.silent:.1f} s", "P1"))
     if normalized(noop.err, where) != normalized(noop2.err, where):

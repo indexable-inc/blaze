@@ -2,7 +2,7 @@
 name = "proc-macro-api"
 version = "0.0.0"
 repository.workspace = true
-description = "RPC Api for the `proc-macro-srv` crate of rust-analyzer."
+description = "The store of proc-macro expansions and the token bridge blaze-macro-eval's in-process server speaks"
 
 authors.workspace = true
 edition.workspace = true
@@ -13,29 +13,24 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-serde.workspace = true
-serde_derive.workspace = true
-serde_json = { workspace = true, features = ["unbounded_depth"] }
-tracing.workspace = true
-rustc-hash.workspace = true
-indexmap.workspace = true
+blaze-hash.workspace = true
+crossbeam-queue.workspace = true
+parking_lot.workspace = true
+rustc_lexer.workspace = true
 
 # local deps
-paths = { workspace = true, features = ["serde1"] }
+base-db.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+hir-expand.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
 tt.workspace = true
-stdx.workspace = true
-proc-macro-srv = {workspace = true, optional = true}
-# span = {workspace = true, default-features = false} does not work
-span = { path = "../span", version = "0.0.0", default-features = false}
-
+span.workspace = true
 intern.workspace = true
-postcard.workspace = true
-semver.workspace = true
-rayon.workspace = true
 
-[features]
-in-rust-tree = ["proc-macro-srv", "proc-macro-srv/in-rust-tree"]
-default = []
+[dev-dependencies]
+blaze-alloc-count.workspace = true
 
 [lints]
 workspace = true

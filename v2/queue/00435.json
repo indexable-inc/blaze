@@ -1,0 +1,35 @@
+{
+  "id": "00435",
+  "from_lane": "usercode-fast-tests",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/test_harness.rs"
+  ],
+  "what": "## usercode-fast-tests 3: codegen: the harness appends `fork_server(record)` (`crates/blaze-engine/src/test_harness.rs`)\n\nThis replaces step 2 of the `usercode-tests` request to codegen (\"start the fork server from\nthe test harness's `main`\"): `blaze_usercode::test::FORK_SERVER` is gone. Where that request\nsays `text.push_str(blaze_usercode::test::FORK_SERVER);`, push\n`blaze_usercode::test::fork_server(record)`, where `record` is whether the binary has\njump-table slots (`fastcompile-ident-select 5` and 9): with `true` the text declares\n`extern \"C\" { fn __blaze_exec_slots() -> u32; fn __blaze_exec_arm(region: *mut u8, len: usize) -> i32; }`\nand the binary must link the runtime that exports them; with `false` it names neither. Both\ntexts start with `#[allow(dead_code)]` before `pub mod fork_server {`; a test that compares\nthe text after `MARKED` compares it with `fork_server(record)`. The wire version is 2.\n\n> forwarded to codegen (window `codegen-next1`, told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:21:53Z",
+  "updated": "2026-10-31T20:28:50Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/usercode-fast-tests.md#usercode-fast-tests 3: codegen: the harness appends `fork_server(record)` (`crates/blaze-engine/src/test_harness.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-tests.md:51"
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Already so: roots/harness.rs pushes blaze_usercode::test::fork_server(exec::records(mode)) after the mark."
+    }
+  ]
+}

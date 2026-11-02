@@ -2,8 +2,8 @@
 //! `clean/cfg.rs` in librustdoc at rust 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0).
 
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SyntaxKind, T,
-    ast::{self},
+    NodeOrToken, SyntaxKind, T,
+    view::{self as ast, AstNode, AstToken},
 };
 
 enum Cfg {
@@ -16,7 +16,7 @@ enum Cfg {
 
 /// The condition inside `cfg(..)`, for "Available on **{}** only." The text is Markdown-free
 /// HTML: feature names in `<code>`.
-pub(crate) fn describe(tt: &ast::TokenTree) -> String {
+pub(crate) fn describe(tt: ast::TokenTree<'_>) -> String {
     let list = parse_list(tt);
     match list.len() {
         1 => render(&list[0], false),
@@ -24,8 +24,8 @@ pub(crate) fn describe(tt: &ast::TokenTree) -> String {
     }
 }
 
-fn parse_list(tt: &ast::TokenTree) -> Vec<Cfg> {
-    let mut items: Vec<NodeOrToken<_, _>> =
+fn parse_list(tt: ast::TokenTree<'_>) -> Vec<Cfg> {
+    let mut items: Vec<ast::Element<'_>> =
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
     // Drop the delimiters.
     if items.first().is_some_and(|it| matches!(it.kind(), T!['('] | T!['['] | T!['{'])) {
@@ -50,7 +50,7 @@ fn parse_list(tt: &ast::TokenTree) -> Vec<Cfg> {
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
                 let value = items
                     .get(at + 2)
-                    .and_then(|it| it.as_token().cloned())
+                    .and_then(|it| it.into_token())
                     .and_then(ast::String::cast)
                     .and_then(|it| it.value().ok().map(|it| it.into_owned()))
                     .unwrap_or_default();
@@ -58,7 +58,7 @@ fn parse_list(tt: &ast::TokenTree) -> Vec<Cfg> {
                 at += 3;
             }
             Some(NodeOrToken::Node(node)) => {
-                let inner = ast::TokenTree::cast(node.clone()).map(|it| parse_list(&it));
+                let inner = ast::TokenTree::cast(*node).map(parse_list);
                 let inner = inner.unwrap_or_default();
                 out.push(match name.as_str() {
                     "all" => Cfg::All(inner),

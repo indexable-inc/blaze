@@ -1,0 +1,21 @@
+{
+  "id": "00262",
+  "from_lane": "codegen-mir-prov",
+  "owner": "codegen-mir",
+  "paths": [],
+  "what": "## 4. To codegen-mir: `Machine::offset_from` (safety-check's answer to shim request 2)\n\nAdd to `Machine` in `eval/machine.rs`:\n`fn offset_from(&mut self, a: Ptr<Self::Prov>, b: Ptr<Self::Prov>, unsigned: bool) -> MResult<()>;`\n(doc: \"`ptr_offset_from(a, b)` (`unsigned`: `ptr_offset_from_unsigned`): both in bounds of one\nallocation, as rustc's evaluation requires\"), `Plain`: `#[inline(always)] ... Ok(())`, and in\n`eval/hooks.rs`:\n`pub(super) fn offset_from(&self, a: Ptr<M::Prov>, b: Ptr<M::Prov>, unsigned: bool) -> Result<'db, ()>`\n(`stopped(self.with(|m| m.offset_from(a, b, unsigned)))`). `check::Checker` already implements\nit (`check.rs` line ~561). `shim.rs`'s `ptr_offset_from*` arm already calls\n`self.machine.offset_from(self.ptr(lhs), self.ptr(rhs), unsigned)` behind `M::CHECKS`, so it\nwon't compile until the hook exists.\n\n> forwarded to codegen-mir (codegen-mir-next2 told).",
+  "state": "open",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-30T02:45:06Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov.md#4. To codegen-mir: `Machine::offset_from` (safety-check's answer to shim request 2)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:53"
+    }
+  ]
+}

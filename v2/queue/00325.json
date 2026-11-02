@@ -1,0 +1,36 @@
+{
+  "id": "00325",
+  "from_lane": "mem-codegen-stencil",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-history/Cargo.toml",
+    "crates/blaze-history/src/lib.rs"
+  ],
+  "what": "## E. blaze-history: budget tests only\n\n`History::predict`, `observe` and `record` already allocate nothing: the key table is a fixed\n`Box<[Slot]>` (`table.rs::Table::new`, once), `Writer::observe` writes a slot in place, and\n`Times::observe` grows its `FxHashMap` only for a kind it has not seen (bounded by the number of\ntask kinds). `codec::encode`/`decode` run once per save and load, so they are left as they are.\n`Estimates` is blaze-graph's.\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).\n\n### E1. `crates/blaze-history/Cargo.toml`\n\n```toml\n[dev-dependencies]\nblaze-alloc-count.workspace = true\n```\n\n(blaze-history needs no `blaze-mem`.)\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).\n\n### E2. `crates/blaze-history/src/lib.rs`\n\nBefore `#[cfg(test)] mod tests;` (line 26):\n\n```rust\n#[cfg(test)]\n#[global_allocator]\nstatic ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;\n```\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).\n\n### E3. The budget test (`tests.rs`)\n\n```rust\n#[test]\nfn predicting_and_learning_a_seen_kind_allocate_nothing() {\n    let mut history = History::new(config(64));\n    let kind = KIND;\n    let key = same_bucket(3);\n    history.observe(kind, Some(&key), 1_000, 4_096);\n    history.observe(kind, None, 2_000, 8_192);\n    let reader = history.reader();\n    let (_, used) = blaze_alloc_count::measure(|| {\n        for i in 0..1_000u64 {\n            let _ = history.predict(kind, Some(&key));\n            let _ = history.predict(kind, None);\n            let _ = history.record(kind, &key);\n            let _ = reader.get(kind, &key);\n            history.observe(kind, Some(&key), 1_000 + i, 4_096);\n            history.observe(kind, None, 2_000 + i, 8_192);\n        }\n    });\n    assert_eq!(used, blaze_alloc_count::Used::default(), \"the steady state of a kind and key seen before\");\n}\n```\n\n(`config`, `KIND` and `same_bucket` are the file's own helpers, lines 31-41. If blaze-graph's\n`Estimates::observe` turns out to allocate per call, this assertion fails on it, and that change\ngoes to blaze-graph's owner.)\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:28:11Z",
+  "updated": "2026-10-30T14:24:29Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/mem-codegen-stencil.md#E. blaze-history: budget tests only",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-stencil.md:2140"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "In the tree: crates/blaze-history/Cargo.toml dev blaze-alloc-count; src/lib.rs counting global allocator; src/tests.rs:535-540 hold predict, reader get and observe to zero allocations."
+    }
+  ]
+}

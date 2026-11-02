@@ -1,0 +1,29 @@
+{
+  "id": "00937",
+  "from_lane": "db",
+  "owner": "item-hash-facts",
+  "paths": [
+    "crates/blaze-item-hash/src/reads.rs"
+  ],
+  "what": "salsa: queue 00827 is in. `salsa::plumbing::interned_arguments::<F>(db: &dyn salsa::Database, key: salsa::Id) -> Option<F>` where key is a read's `DatabaseKeyIndex::key_index()` and F the tracked fn's argument tuple with every db lifetime 'static, e.g. `(Crate, SelfTyKey<'static>)`. The reads docs/v2/plan/lanes/item-hash/reads.md lists as refused can now be classified.",
+  "state": "applied",
+  "created": "2026-10-30T10:09:54Z",
+  "updated": "2026-10-30T10:40:48Z",
+  "taken_by": "item-hash-facts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:09:54Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:40:48Z",
+      "by": "item-hash-facts",
+      "action": "done",
+      "note": "reads.rs decodes multi-argument keys with interned_arguments: the impl and trait tables by crate (or module) are the named crate's Crate fact and are refused for the own crate; impl_value_item and trait_value_item are Fields; closure_exprs is covered for the own store; const_eval_query of a non-generic const with no arguments and no environment is ConstValue. The rest stay refused for want of a fact (layout, goals in an environment, method selection)."
+    }
+  ]
+}

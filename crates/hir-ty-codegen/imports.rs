@@ -19,17 +19,19 @@
 //! and optimize it: helix and nushell build in about twice the time of cargo's release build,
 //! and would with nothing imported. Codegen units that share their imports are #176.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::VecDeque,
-    hash::BuildHasher,
-    sync::{Arc, LazyLock, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, LazyLock, OnceLock, atomic::Ordering},
 };
 
+use base_db::Db;
+use blaze_hash::{HashSet, SharedMap};
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::{
     Instance, InstanceDef,
@@ -65,8 +67,9 @@ const CLIF_PER_IMPORTED: usize = 16;
 /// A function as the compiles that call it import it.
 pub(super) struct Export {
     /// The module of the function alone, under `llvm::OWN`, with what it refers to declared
-    /// under the names of `requests`, as LLVM's pre-link pipeline left it.
-    pub(super) bitcode: Vec<u8>,
+    /// under the names of `requests`, as LLVM's pre-link pipeline left it. Shared with the
+    /// function's own compile where the two are the same bytes (`v2::release`).
+    pub(super) bitcode: Arc<[u8]>,
     pub(super) requests: Requests,
     pub(super) signature: ir::Signature,
     /// Its instructions, as LLVM counts them.
@@ -96,7 +99,7 @@ pub(super) fn enabled() -> bool {
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &|_| false, BUDGET))
+    tallied(chosen_for(recorder, &HashSet::default(), BUDGET))
 }
 
 /// `chosen`, counted as imported.
@@ -112,16 +115,18 @@ pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
 /// room of all of them and imports none of them: `defined` says which instances it has.
 pub(super) fn chosen_for(
     recorder: &mut Recorder<'_>,
-    defined: &dyn Fn(&Instance) -> bool,
+    defined: &HashSet<Instance>,
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
+    // alloc: the result, owned by the caller; empty until an import is chosen
     let mut chosen = Vec::new();
-    let mut taken: FxHashSet<u32> = FxHashSet::default();
+    let mut taken: HashSet<u32> = HashSet::default();
     let mut spent = 0;
     // The calls to look at, by the number of the callee among the compile's requests, with
     // the share of a body's room left to it.
     let mut next: VecDeque<(u32, f32, u32)> =
+        // alloc: one exact block per compile, the queue of its calls
         (0..recorder.requests.funcs.len() as u32).map(|id| (id, 1.0, 0)).collect();
     while let Some((id, share, depth)) = next.pop_front() {
         if taken.contains(&id) {
@@ -129,7 +134,7 @@ pub(super) fn chosen_for(
         }
         let request = &recorder.requests.funcs[id as usize];
         let FuncTarget::Instance(instance, env) = &request.target else { continue };
-        if !super::tier::shared(db, instance) || defined(instance) {
+        if !super::tier::shared(db, instance) || defined.contains(instance) {
             continue;
         }
         let Some(export) = export(db, instance, env) else { continue };
@@ -151,7 +156,9 @@ pub(super) fn chosen_for(
         if depth + 1 < DEPTH {
             next.extend(funcs.iter().map(|it| (it.as_u32(), share * EVOLUTION, depth + 1)));
         }
+        // alloc: the import's own lists, one exact block each, kept with the result
         let funcs = funcs.iter().map(|it| it.as_u32()).collect();
+        // alloc: the import's own lists, one exact block each, kept with the result
         let datas = datas.iter().map(|it| it.as_u32()).collect();
         chosen.push(Import { export, id, funcs, datas });
     }
@@ -165,24 +172,20 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 
 /// The exports of the process, each built once: a compile that asks for one another is
 /// building waits for it, and no export asks for another while it is built.
-struct Exports {
-    shards: Vec<Mutex<FxHashMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>>>,
-}
-
-static EXPORTS: LazyLock<Exports> =
-    LazyLock::new(|| Exports { shards: (0..64).map(|_| Mutex::default()).collect() });
+static EXPORTS: LazyLock<SharedMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>> =
+    LazyLock::new(Default::default);
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
 fn export(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<Arc<Export>> {
+    // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
-    let shards = &EXPORTS.shards;
-    let shard = &shards[FxBuildHasher.hash_one(&key) as usize % shards.len()];
-    let slot = shard.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+    // clone: the slot's `Arc`, so the table's guard is let go before the export is built
+    let slot = EXPORTS.pin().get_or_insert_with(key, Arc::default).clone();
     slot.get_or_init(|| {
         let start = stdx::time::Instant::now();
         let built = build(db, instance, env).map(Arc::new);
@@ -191,13 +194,14 @@ fn export(
         tally.exports.add(start.elapsed(), bytes);
         built
     })
+    // clone: a refcount; the import holds the export past the slot's borrow
     .clone()
 }
 
 /// The export of `instance`: its body built alone, with nothing of what it calls built in but
 /// the small functions of the standard library every compile builds in.
 fn build(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<Export> {
@@ -242,7 +246,8 @@ fn build(
         // Drop glue is built from the type it drops, and has no MIR.
         let body = match instance.def {
             InstanceDef::DropGlue => None,
-            _ => Some(super::instance_body(db, instance, env.clone()).ok()?),
+            // clone: once per export in the process; the query takes its key
+            _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
         };
         let mut cg = Recorder::new(
             db,
@@ -251,6 +256,7 @@ fn build(
             instance.checked,
         );
         cg.unlocated = true;
+        // clone: once per export in the process, moved into the closure that builds it
         let args = instance.args.clone();
         let mut ctx =
             super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
@@ -282,6 +288,7 @@ fn build(
         if size > room || !requests.ordered() {
             return None;
         }
+        // clone: once per export in the process, kept with it
         let signature = ctx.func.signature.clone();
         Some(Export { bitcode, requests, signature, size, hint })
     })

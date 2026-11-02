@@ -1,0 +1,35 @@
+{
+  "id": "01267",
+  "from_lane": "tests-misc-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs"
+  ],
+  "what": "crates/hir/src/lib.rs:5172 Type::impls_trait returns false when args.references_error(); in vendor/rustc_type_ir HAS_ERROR now includes HAS_RE_ERROR, and every region an inference result holds is ReError, so any type with a reference (&str, &i32, &dyn T) never implements anything: blaze-lints useless_borrows_in_formatting (&str: Display, &i32: Debug through impl for &T) and unnecessary_to_owned (&str: AsRef<str>) miss findings. Check only type/const errors: args.has_type_flags(TypeFlags::HAS_NON_REGION_ERROR) (rustc solves modulo regions, a region error holds). Grep crates/hir and hir-ty for other references_error() guards meant for types. Also (coord-1030, round 9): blaze-lints blaze::parallel::tests::map_filter_map_and_for_each_chains misses iter_mut().for_each for the same cause: items_send asks impls_trait(Send) of item &mut u64, refused for its ReError region.",
+  "state": "applied",
+  "created": "2026-10-31T13:36:07Z",
+  "updated": "2026-10-31T19:21:18Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:36:07Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T19:21:18Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T19:21:18Z",
+      "by": "db",
+      "action": "done",
+      "note": "Type::impls_trait erases ReError regions before solving (hir lib.rs; test hir tests::types::a_reference_with_an_error_region_is_solved_modulo_regions). Round 11b: unnecessary_to_owned and parallel map_filter_map_and_for_each_chains pass; useless_borrows_in_formatting misses only &&n (2:27), the lint not getting a type for the inner &n split from the && token, routed to tests-misc-lints."
+    }
+  ]
+}

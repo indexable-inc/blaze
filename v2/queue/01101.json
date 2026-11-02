@@ -1,0 +1,41 @@
+{
+  "id": "01101",
+  "from_lane": "coord-1030",
+  "owner": "compile-time-sched",
+  "paths": [
+    "crates/blaze-graph/"
+  ],
+  "what": "Main #1539/#1568 (a worker admits its program builds by the memory budget; one not yet measured runs alone) had its home in the deleted blaze-engine admit.rs; v2 home is blaze-graph plane admission (admission::Estimates). Check v2 admits program builds (codegen + link of a program) against the budget the same way, so cold builds on CI runners do not OOM.",
+  "state": "applied",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-31T14:56:33Z",
+  "taken_by": "compile-time-sched",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from core (no live window) to compile-time-sched, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:14Z",
+      "by": "compile-time-sched",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:56:33Z",
+      "by": "compile-time-sched",
+      "action": "done",
+      "note": "v2 now admits program builds as #1539/#1568 did: bins/tests/benches/examples/cdylibs are kinds::PROGRAM nodes (Plane::push_program, keyed for the history by serve::unit::program_key, no plane key); never measured = predicted the whole budget and the plane runs it alone (plane.rs pick); measured alone by arena::high_water_from_now/high_water (all threads); beside others it never learns under its prediction. Before: every compile one per-kind estimate measured on the task thread only (codegen runs on rayon), so cold CI could start one program build per work thread. Tests: plane_tests a_task_predicted_the_whole_budget_runs_alone, arena a_watch_sees_what_every_thread_held_at_most, serve plane a_program_is_admitted_by_its_own_measure_and_one_never_measured_runs_alone. Notes: docs/v2/plan/lanes/compile-time-sched/notes.md. Open for core: per-task attribution of rayon work."
+    }
+  ]
+}

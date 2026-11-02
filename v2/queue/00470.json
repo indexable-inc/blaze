@@ -1,0 +1,24 @@
+{
+  "id": "00470",
+  "from_lane": "diagnostics-lints-bodies-types",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/Cargo.toml",
+    "Cargo.lock"
+  ],
+  "what": "## diagnostics-lints-bodies-types: `rustc_apfloat` and `rustc_type_ir` for blaze-diagnostics (the parent, `diagnostics`)\n\nWhere: `crates/blaze-diagnostics/Cargo.toml` `[dependencies]`: `rustc_apfloat = \"0.2.3\"` (as\n`hir-def`, `hir-ty` and `syntax` have it; already in `Cargo.lock`) and\n`rustc_type_ir.workspace = true` (asked above by diagnostics-bodies too). Why: `overflowing_literals`\nof a float (`lints/bodies/types/limits/literal.rs`) parses the literal as rustc does, with\napfloat's IEEE semantics of `f16`, `f32`, `f64` and `f128` (`float_is_infinite`), and\n`lints/bodies/types/**` matches on `TyKind` through `rustc_type_ir::inherent::IntoKind`.\n\n> forwarded to diagnostics: `crates/blaze-diagnostics/Cargo.toml` is the parent's own; `rustc_type_ir` is a workspace dependency, and `rustc_apfloat = \"0.2.3\"` is taken directly as hir-def, hir-ty and syntax take it (in the lock).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types: `rustc_apfloat` and `rustc_type_ir` for blaze-diagnostics (the parent, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:330"
+    }
+  ]
+}

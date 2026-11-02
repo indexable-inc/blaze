@@ -1,0 +1,26 @@
+{
+  "id": "01453",
+  "from_lane": "may-suspend",
+  "owner": "dedup",
+  "paths": [
+    "crates/hir-ty-suspend/src/dispatch.rs",
+    "crates/hir-ty-pure/src/walk.rs",
+    "crates/hir-ty-codegen/",
+    "crates/hir-ty-mir/src/mir/transform/"
+  ],
+  "what": "After lane may-suspend wires crates/hir-ty-suspend (docs/v2/plan/lanes/may-suspend.md, Where it lives): a call's targets as codegen dispatches them (lookup_impl_method, dyn methods, Fn* on closures and FnDefs, drop glue, Future::poll of coroutines, builtin derives and Clone, vtables of unsizing casts, reified pointers) is now written in hir-ty-suspend::dispatch, hir-ty-pure::walk, four places in hir-ty-codegen and hir-ty-mir's inliner. Make one module the copy (dispatch.rs is written to be it; moving it to a crate of its own that the others depend on is fine) and move the others onto it. Tell lane may-suspend (window may-suspend) when done.",
+  "state": "open",
+  "created": "2026-11-01T04:04:54Z",
+  "updated": "2026-11-01T04:04:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:04:54Z",
+      "by": "may-suspend",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

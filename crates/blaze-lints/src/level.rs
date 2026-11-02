@@ -12,75 +12,18 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    diag::{Diagnostic, MultiSpan, Span, Sublevel},
-    registry::{self, Group, Info, Named},
+    blaze,
+    diag::{Diag, MultiSpan, Span, Sublevel},
+    registry::{self, Group, Info, LintIndex, Named},
 };
 
-/// A lint level, in rustc's order: a level above another wins over it where one is capped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Level {
-    Allow,
-    Expect,
-    Warn,
-    ForceWarn,
-    Deny,
-    Forbid,
-}
-
-impl Level {
-    /// As an attribute names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Level::Allow => "allow",
-            Level::Expect => "expect",
-            Level::Warn => "warn",
-            Level::ForceWarn => "force-warn",
-            Level::Deny => "deny",
-            Level::Forbid => "forbid",
-        }
-    }
-
-    /// The level an attribute named `name` sets.
-    pub fn of_attr(name: &str) -> Option<Level> {
-        Some(match name {
-            "allow" => Level::Allow,
-            "expect" => Level::Expect,
-            "warn" => Level::Warn,
-            "deny" => Level::Deny,
-            "forbid" => Level::Forbid,
-            _ => return None,
-        })
-    }
-
-    /// The flag of rustc's that sets it.
-    pub fn to_cmd_flag(self) -> &'static str {
-        match self {
-            Level::Allow => "-A",
-            Level::Expect | Level::Warn => "-W",
-            Level::ForceWarn => "--force-warn",
-            Level::Deny => "-D",
-            Level::Forbid => "-F",
-        }
-    }
-
-    /// The level `--cap-lints` is given as.
-    fn of_cap(name: &str) -> Option<Level> {
-        Some(match name {
-            "allow" => Level::Allow,
-            "warn" => Level::Warn,
-            "force-warn" => Level::ForceWarn,
-            "deny" => Level::Deny,
-            "forbid" => Level::Forbid,
-            _ => return None,
-        })
-    }
-}
+pub use blaze_diagnostics::lints::{CommandLine, Level, LintOptions};
 
 /// What a level set applies to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
-    /// A lint of clippy's, without `clippy::`.
-    Lint(String),
+    /// A lint of clippy's.
+    Lint(LintIndex),
     Group(Group),
     /// `clippy::all`.
     All,
@@ -88,7 +31,28 @@ pub enum Target {
     Warnings,
     /// A lint of rustc's, by name.
     Rustc(String),
+    /// Lints of blaze's own (`blaze::`): bit `i` for [`blaze::Lint::ALL`]`[i]`, one for a
+    /// lint, several for the group `blaze::hot`.
+    Blaze(u32),
 }
+
+/// The lints of the group `blaze::hot` ([`blaze::HOT`]: the four hot lints, not the parallel ones), as a
+/// [`Target::Blaze`] has them.
+const BLAZE_HOT: u32 = {
+    let mut bits = 0;
+    let mut at = 0;
+    while at < blaze::HOT.len() {
+        bits |= blaze_bit(blaze::HOT[at]);
+        at += 1;
+    }
+    bits
+};
+
+pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u32 {
+    1 << lint as u32
+}
+
+const _: () = assert!(blaze::Lint::ALL.len() <= u32::BITS as usize);
 
 impl Target {
     /// What `name`, as an attribute or flag writes it, sets the level of, if it is a lint this
@@ -98,11 +62,14 @@ impl Target {
         if name == "warnings" {
             return Some(Target::Warnings);
         }
+        if let Some(rest) = name.strip_prefix("blaze::") {
+            return Target::blaze(rest).map(Target::Blaze);
+        }
         let Some(rest) = name.strip_prefix("clippy::") else {
             return (!name.contains("::")).then_some(Target::Rustc(name));
         };
         Some(match registry::named(rest)? {
-            Named::Lint(info) => Target::Lint(info.name.to_owned()),
+            Named::Lint(info) => Target::Lint(info.index()),
             Named::Group(group) => Target::Group(group),
             Named::All => Target::All,
             Named::Renamed(new) => return Target::of(new),
@@ -110,13 +77,23 @@ impl Target {
         })
     }
 
-    fn covers(&self, lint: Lint<'_>) -> bool {
+    /// The lints of blaze's own `blaze::<name>` stands for, as a [`Target::Blaze`] has them.
+    pub(crate) fn blaze(name: &str) -> Option<u32> {
+        if name == "hot" {
+            return Some(BLAZE_HOT);
+        }
+        blaze::Lint::ALL.iter().find(|it| it.name() == name).map(|it| blaze_bit(*it))
+    }
+
+    /// Whether it sets the level of `lint`, whose index is `index` when it is clippy's.
+    fn covers(&self, lint: Lint<'_>, index: Option<LintIndex>) -> bool {
         match (self, lint) {
-            (Target::Lint(name), Lint::Clippy(info)) => name == info.name,
+            (Target::Lint(it), Lint::Clippy(_)) => Some(*it) == index,
             (Target::Group(group), Lint::Clippy(info)) => *group == info.group,
             (Target::All, Lint::Clippy(info)) => info.group.in_all(),
             (Target::Warnings, Lint::Warnings) => true,
             (Target::Rustc(name), Lint::Rustc(lint)) => name == lint,
+            (Target::Blaze(lints), Lint::Blaze(lint)) => lints & blaze_bit(lint) != 0,
             _ => false,
         }
     }
@@ -126,6 +103,8 @@ impl Target {
 #[derive(Clone, Copy, Debug)]
 pub enum Lint<'a> {
     Clippy(&'a Info),
+    /// A lint of blaze's own, `allow` unless a crate turns it on.
+    Blaze(blaze::Lint),
     /// The `warnings` group, which rustc asks for as a lint.
     Warnings,
     /// A lint of rustc's, as `unfulfilled_lint_expectations`.
@@ -137,6 +116,7 @@ impl Lint<'_> {
     pub fn name(&self) -> String {
         match self {
             Lint::Clippy(info) => format!("clippy::{}", info.name),
+            Lint::Blaze(lint) => format!("blaze::{}", lint.name()),
             Lint::Warnings => "warnings".to_owned(),
             Lint::Rustc(name) => (*name).to_owned(),
         }
@@ -145,6 +125,7 @@ impl Lint<'_> {
     fn default_level(&self) -> Level {
         match self {
             Lint::Clippy(info) => info.default_level(),
+            Lint::Blaze(_) => Level::Allow,
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }
     }
@@ -169,74 +150,6 @@ pub struct Spec {
     pub source: Source,
 }
 
-/// The lint flags of a rustc command line, in order: rustc's `lint_opts` and `lint_cap`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CommandLine {
-    pub opts: Vec<(String, Level)>,
-    pub cap: Option<Level>,
-}
-
-impl CommandLine {
-    /// The lint flags of `args`, a rustc command line; its other flags are passed over.
-    pub fn parse(args: &[String]) -> Result<CommandLine, String> {
-        let mut flags = CommandLine::default();
-        let mut args = args.iter();
-        while let Some(arg) = args.next() {
-            let long = [
-                ("--allow", Level::Allow),
-                ("--warn", Level::Warn),
-                ("--force-warn", Level::ForceWarn),
-                ("--deny", Level::Deny),
-                ("--forbid", Level::Forbid),
-            ];
-            let short = [
-                ("-A", Level::Allow),
-                ("-W", Level::Warn),
-                ("-D", Level::Deny),
-                ("-F", Level::Forbid),
-            ];
-            let mut value = |arg: &str, flag: &str| -> Result<Option<String>, String> {
-                if arg == flag {
-                    let next = args.next().ok_or_else(|| format!("`{flag}` needs a lint"))?;
-                    return Ok(Some(next.clone()));
-                }
-                let rest = arg.strip_prefix(flag);
-                let rest = match flag.starts_with("--") {
-                    true => rest.and_then(|it| it.strip_prefix('=')),
-                    false => rest,
-                };
-                Ok(rest.map(str::to_owned))
-            };
-            if let Some(cap) = value(arg, "--cap-lints")? {
-                flags.cap = Some(
-                    Level::of_cap(&cap).ok_or_else(|| format!("unknown lint level: `{cap}`"))?,
-                );
-                continue;
-            }
-            let mut found = None;
-            for (flag, level) in long.into_iter().chain(short) {
-                if let Some(name) = value(arg, flag)? {
-                    found = Some((name, level));
-                    break;
-                }
-            }
-            if let Some((name, level)) = found {
-                flags.opts.push((name.replace('-', "_"), level));
-            }
-        }
-        Ok(flags)
-    }
-
-    /// What `cargo clippy --` is given after `--`: what `-W`, `-A`, `-D`, `-F` and
-    /// `--force-warn` there name, on top of `self`.
-    pub fn extend(&mut self, other: CommandLine) {
-        self.opts.extend(other.opts);
-        if other.cap.is_some() {
-            self.cap = other.cap;
-        }
-    }
-}
-
 /// The flags cargo gives rustc for a package's `[lints]`: by priority, then by name from last
 /// to first so that a group named `all` comes last.
 /// Follows cargo's `lints_to_rustflags` (`src/workspace/parser/mod.rs` at
@@ -255,7 +168,7 @@ pub fn of_manifest(lints: &[(String, String, Level, i8)]) -> CommandLine {
         .collect();
     flags.sort_by(|a, b| (a.0, a.1, flag_of(a.3), &a.2).cmp(&(b.0, b.1, flag_of(b.3), &b.2)));
     let opts = flags.into_iter().map(|(_, _, name, level)| (name.replace('-', "_"), level));
-    CommandLine { opts: opts.collect(), cap: None }
+    CommandLine { lints: LintOptions { opts: opts.collect(), cap: None }, ..CommandLine::default() }
 }
 
 /// cargo's flag for a level, which it sorts flags of one name by.
@@ -285,12 +198,12 @@ pub struct Levels {
 
 impl Levels {
     pub fn new(command_line: &CommandLine) -> Levels {
-        let sets = command_line.opts.iter().filter_map(|(name, level)| {
+        let sets = command_line.lints.opts.iter().filter_map(|(name, level)| {
             let target = Target::of(name)?;
             let source = Source::CommandLine { flag: name.clone(), level: *level };
             Some((target, Spec { level: *level, source }))
         });
-        Levels { sets: sets.collect(), cap: command_line.cap }
+        Levels { sets: sets.collect(), cap: command_line.lints.cap }
     }
 
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
@@ -315,13 +228,17 @@ impl Levels {
     /// The level set for `lint`, if one is: each set in order, the command line's first, a
     /// set of `forbid` or of `--force-warn` kept over those after it.
     fn probe(&self, lint: Lint<'_>, sets: &[Set]) -> Option<Spec> {
-        let mut found: Option<Spec> = None;
+        let index = match lint {
+            Lint::Clippy(info) => Some(info.index()),
+            Lint::Blaze(_) | Lint::Warnings | Lint::Rustc(_) => None,
+        };
+        let mut found: Option<&Spec> = None;
         let attrs = sets.iter().map(|it| (&it.target, &it.spec));
         for (target, spec) in self.sets.iter().map(|(target, spec)| (target, spec)).chain(attrs) {
-            if !target.covers(lint) {
+            if !target.covers(lint, index) {
                 continue;
             }
-            if let Some(current) = &found {
+            if let Some(current) = found {
                 let sticky = current.level == Level::Forbid
                     || (current.level == Level::ForceWarn
                         && matches!(current.source, Source::CommandLine { .. }));
@@ -329,15 +246,15 @@ impl Levels {
                     continue;
                 }
             }
-            found = Some(spec.clone());
+            found = Some(spec);
         }
-        found
+        found.cloned()
     }
 }
 
 /// Adds the notes rustc adds of where `spec`'s level came from: rustc's
 /// `explain_lint_level_source`. Notes said once a crate are marked as such.
-pub fn explain(diagnostic: &mut Diagnostic, lint: Lint<'_>, spec: &Spec) {
+pub fn explain(diagnostic: &mut Diag, lint: Lint<'_>, spec: &Spec) {
     let name = lint.name();
     let level = spec.level;
     if level == Level::Allow {
@@ -398,14 +315,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            flags.opts,
+            flags.lints.opts,
             vec![
                 ("clippy::all".to_owned(), Level::Warn),
                 ("warnings".to_owned(), Level::Deny),
                 ("clippy::needless_bool".to_owned(), Level::Allow),
             ]
         );
-        assert_eq!(flags.cap, Some(Level::Warn));
+        assert_eq!(flags.lints.cap, Some(Level::Warn));
     }
 
     #[test]
@@ -448,6 +365,30 @@ mod tests {
     }
 
     #[test]
+    fn blazes_lints_are_allowed_until_turned_on() {
+        let hot_alloc = Lint::Blaze(blaze::Lint::HotAlloc);
+        let none = Levels::new(&CommandLine::default());
+        assert_eq!(none.of(hot_alloc, &[]).level, Level::Allow);
+        assert_eq!(none.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
+        let hot = Levels::new(&CommandLine::parse(&args("--deny=blaze::hot")).unwrap());
+        assert_eq!(hot.of(hot_alloc, &[]).level, Level::Deny);
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Deny, "`blaze::hot` is all four");
+        assert_eq!(hot.of(Lint::Clippy(info("needless_bool")), &[]).level, Level::Warn);
+        let span = Span { file: "src/lib.rs".to_owned(), lo: 0, hi: 1, expansion: None };
+        let cold = Set {
+            target: Target::of("blaze::hot_alloc").unwrap(),
+            spec: Spec {
+                level: Level::Allow,
+                source: Source::Node { name: "blaze::hot_alloc".to_owned(), span, reason: None },
+            },
+        };
+        assert_eq!(hot.of(hot_alloc, &[cold.clone()]).level, Level::Allow);
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::HotClone), &[cold]).level, Level::Deny);
+        assert_eq!(Target::of("blaze::no_such_lint"), None);
+        assert_eq!(hot_alloc.name(), "blaze::hot_alloc");
+    }
+
+    #[test]
     fn manifest_flags_in_cargos_order() {
         let lints = vec![
             ("clippy".to_owned(), "all".to_owned(), Level::Warn, -1),
@@ -455,26 +396,25 @@ mod tests {
             ("clippy".to_owned(), "empty_enums".to_owned(), Level::Warn, 0),
             ("rust".to_owned(), "unsafe_code".to_owned(), Level::Deny, 0),
             ("cargo".to_owned(), "x".to_owned(), Level::Warn, 0),
+            ("blaze".to_owned(), "hot_alloc".to_owned(), Level::Deny, 0),
         ];
-        let names: Vec<_> = of_manifest(&lints).opts.into_iter().map(|it| it.0).collect();
+        let names: Vec<_> = of_manifest(&lints).lints.opts.into_iter().map(|it| it.0).collect();
         assert_eq!(
             names,
-            ["clippy::all", "unsafe_code", "clippy::needless_bool", "clippy::empty_enums"]
+            [
+                "clippy::all",
+                "unsafe_code",
+                "clippy::needless_bool",
+                "blaze::hot_alloc",
+                "clippy::empty_enums"
+            ]
         );
     }
 
     #[test]
     fn the_notes_rustc_adds() {
         let notes = |spec: Spec| {
-            let mut diagnostic = Diagnostic {
-                lint: "clippy::needless_bool".to_owned(),
-                level: spec.level,
-                message: String::new(),
-                span: MultiSpan::default(),
-                children: Vec::new(),
-                suggestions: Vec::new(),
-                suggestions_disabled: false,
-            };
+            let mut diagnostic = Diag::new(blaze_diagnostics::model::Level::Warning, None, String::new());
             explain(&mut diagnostic, Lint::Clippy(info("needless_bool")), &spec);
             diagnostic.children.into_iter().map(|it| it.message).collect::<Vec<_>>()
         };
@@ -502,5 +442,48 @@ mod tests {
             }),
             ["requested on the command line with `-W clippy::needless-bool`"]
         );
+    }
+
+    /// `Level`'s names as this crate wrote them, by string `match`.
+    fn reference_of_attr(name: &str) -> Option<Level> {
+        Some(match name {
+            "allow" => Level::Allow,
+            "expect" => Level::Expect,
+            "warn" => Level::Warn,
+            "deny" => Level::Deny,
+            "forbid" => Level::Forbid,
+            _ => return None,
+        })
+    }
+
+    #[hegel::test]
+    fn levels_are_named_as_the_reference_named_them(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
+        let name: String = tc.draw(hegel::one_of!(
+            gs::sampled_from(names.to_vec()),
+            gs::text().alphabet("abcdefghijklmnopqrstuvwxyz-").max_size(12),
+        ));
+        assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
+        let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
+        assert_eq!(Level::of_cap(&name), cap);
+    }
+
+    #[test]
+    fn cap_lints_takes_rustcs_levels_only() {
+        assert_eq!(Level::of_cap("force-warn"), None);
+        assert_eq!(Level::of_cap("expect"), None);
+        assert!(CommandLine::parse(&args("--cap-lints force-warn")).is_err());
+        for level in [Level::Allow, Level::Expect, Level::Warn, Level::ForceWarn, Level::Deny, Level::Forbid] {
+            let flag = match level {
+                Level::Allow => "-A",
+                Level::Expect | Level::Warn => "-W",
+                Level::ForceWarn => "--force-warn",
+                Level::Deny => "-D",
+                Level::Forbid => "-F",
+            };
+            assert_eq!(level.to_cmd_flag(), flag);
+            assert_eq!(Level::of_attr(level.as_str()), (level != Level::ForceWarn).then_some(level));
+        }
     }
 }

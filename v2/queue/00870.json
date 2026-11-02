@@ -1,0 +1,23 @@
+{
+  "id": "00870",
+  "from_lane": "speed-sol-core-ports",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/fs.rs"
+  ],
+  "what": "Speed of light (docs/v2/plan/lanes/core/speed-of-light.md, kqueue section). (1) fs::stamps caps its threads at 8; take one thread per 2,048 names up to available_parallelism, as iocp/stamp.rs sweepers() now does: 50,000 stamps go from 2.5 ms to 1.25 ms on 16 cores. Keep the order of the result exactly. (2) fs::entries on macOS: one getattrlistbulk call per buffer of entries with their attributes, in place of readdir plus an fstatat per entry; prove equal to today with a differential test over random trees.",
+  "state": "open",
+  "created": "2026-10-30T09:15:09Z",
+  "updated": "2026-10-30T09:15:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:15:09Z",
+      "by": "speed-sol-core-ports",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

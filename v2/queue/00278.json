@@ -1,0 +1,24 @@
+{
+  "id": "00278",
+  "from_lane": "db-ty-d-infer1",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/ide-diagnostics/src/lib.rs"
+  ],
+  "what": "## To diagnostics and ide-diagnostics: two new `AnyDiagnostic` variants (E0695, E0727)\n\n`hir::UnlabeledJumpInLabeledBlock { expr: InFile<ExprOrPatPtr>, is_break: bool }` and\n`hir::AsyncCoroutinesNotSupported { expr: InFile<ExprOrPatPtr> }` are new. Both\n`crates/blaze-diagnostics/src/lower/mod.rs` and `crates/ide-diagnostics/src/lib.rs` match\n`AnyDiagnostic` exhaustively, so each needs an arm:\n\n- `UnlabeledJumpInLabeledBlock`: rustc's `UnlabeledInLabeledBlock`. In\n  `lower/break_outside_of_loop.rs` the E0695 branch of `diagnostic` (the\n  `stack.last() == Some(&Context::LabeledBlock)` case) moves to a `lower_unlabeled(cx, d)` for\n  this variant: `E0695 \"unlabeled `{name}` inside of a labeled block\"` on the jump, labelled\n  \"`{name}` statements that would diverge to or through a labeled block need to bear a label\".\n  hir-ty now gives this instead of `BreakOutsideOfLoop` for such a jump, inside a loop or not\n  (rustc's `require_label_in_labeled_block` returns before any other check), so the old branch\n  is never reached; a `try` block's desugared label does not count, as in rustc.\n  Tests: `tests/ui/label/label_break_value_unlabeled_break.rs`, `label_break_value_continue.rs`.\n- `AsyncCoroutinesNotSupported`: `E0727 \"`async` coroutines are not yet supported\"` on the\n  `yield` expression (rustc's `lower_expr_yield`). The `yield`'s operand is still type checked\n  and the `yield` is the error type. Test: `tests/ui/coroutine/async-coroutine-issue-67158.rs`.\n  ide-diagnostics: `DiagnosticCode::RustcHardError(\"E0695\")`/`(\"E0727\")` with the same messages.\n\n> forwarded to diagnostics (blaze-diagnostics and ide-diagnostics are its; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:55:50Z",
+  "updated": "2026-10-30T02:55:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-infer1.md#To diagnostics and ide-diagnostics: two new `AnyDiagnostic` variants (E0695, E0727)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-infer1.md:17"
+    }
+  ]
+}

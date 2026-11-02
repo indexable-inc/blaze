@@ -1,0 +1,23 @@
+{
+  "id": "00279",
+  "from_lane": "db-ty-d-infer1",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower"
+  ],
+  "what": "## To diagnostics (`crates/blaze-diagnostics/src/lower/{binary,unary}_operator_cannot_be_applied.rs`)\n\n`hir::BinaryOperatorCannotBeApplied` now carries `unmet: Vec<SolverGoal>` and\n`output: Option<Type>`, and `hir::UnaryOperatorCannotBeApplied` carries `unmet`. `unmet` is\nrustc's `errors` of the failed lookup: each fulfillment error's leaf goal (`X: PartialEq` for\n`W(X) == W(X)` with `impl<T: PartialEq> PartialEq for W<T>`; the operator's own\n`lhs: Trait<rhs>` when nothing nested failed), empty when the operator's trait is missing.\n`output` is `ObligationCauseCode::BinOp`'s `output_ty` (the expected type, as resolved at the\nend of inference). With them the lowering can port `note_unmet_impls_on_type` (the trait\ngoals on ADT self types: \"an implementation of `..` might be missing for `..`\", the derive\nsuggestion when `can_eq(lhs, rhs)`), the `suggest_restricting_param_bound` loop when `lhs`\nhas a type parameter (with `Output = {output}` for a binop whose output is suggestable), and\n\"the trait `..` is not implemented for `..`\" exactly when `unmet` is empty, in place of\nknowing only the operator's own trait. Tests: `binop/issue-93927.rs`,\n`suggestions/invalid-bin-op.rs`, `binop/binary-op-not-allowed-issue-125631.rs`.\n\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:55:50Z",
+  "updated": "2026-10-30T02:55:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-infer1.md#To diagnostics (`crates/blaze-diagnostics/src/lower/{binary,unary}_operator_cannot_be_applied.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-infer1.md:40"
+    }
+  ]
+}

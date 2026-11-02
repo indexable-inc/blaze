@@ -1,0 +1,24 @@
+{
+  "id": "01510",
+  "from_lane": "coordinator",
+  "owner": "hir-expand",
+  "paths": [
+    "crates/hir-expand",
+    "crates/hir-def/src/macro_expansion_tests/builtin_errors.rs"
+  ],
+  "what": "hir-def macro_expansion_tests::builtin_errors::coerce_pointee_errors_have_their_code and from_derive_errors fail at HEAD d4d8268391: the derive error is placed at the derive token instead of at From/the derived item. Old failure, not from any lock or hash port. Log: /tmp/blaze-lanes/test-bisect4.log section (1).",
+  "state": "open",
+  "created": "2026-11-01T14:07:16Z",
+  "updated": "2026-11-01T14:07:16Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:07:16Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

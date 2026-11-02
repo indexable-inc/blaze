@@ -3,17 +3,18 @@
 
 use std::{borrow::Cow, iter::Enumerate};
 
+use base_db::Db;
 use base_db::target::{self, TargetData};
 use hir_def::{
-    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, lang_item::LangItems,
-    signatures::FunctionSignature,
+    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, expr_store::ExpressionStore,
+    hir::PatId, lang_item::LangItems, signatures::FunctionSignature,
 };
 use rustc_abi::TargetDataLayout;
+use rustc_ast_ir::Mutability;
 use span::Edition;
 
 use crate::{
-    TargetFeatures,
-    db::HirDatabase,
+    BindingMode, ByRef, TargetFeatures,
     layout::{Layout, RustcEnumVariantIdx, TagEncoding},
     lower::SupertraitsInfo,
     mir::{IsSigned, pad16},
@@ -24,13 +25,27 @@ pub fn fn_traits(lang_items: &LangItems) -> impl Iterator<Item = TraitId> + '_ {
 }
 
 /// Returns an iterator over the direct super traits (including the trait itself).
-pub fn direct_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
-    &SupertraitsInfo::query(db, trait_).direct_supertraits
+pub fn direct_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
+    SupertraitsInfo::query(db, trait_).direct_supertraits()
 }
 
 /// Returns the whole super trait hierarchy (including the trait itself).
-pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
-    &SupertraitsInfo::query(db, trait_).all_supertraits
+pub fn all_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
+    SupertraitsInfo::query(db, trait_).all_supertraits()
+}
+
+/// rustc's `pat_has_ref_mut_binding`: whether `pat` binds anything by `ref mut`, by the binding
+/// modes typeck gave (`mode`), so match ergonomics' adjustments count.
+pub fn pat_has_ref_mut_binding(
+    store: &ExpressionStore,
+    pat: PatId,
+    mode: impl Fn(PatId) -> Option<BindingMode>,
+) -> bool {
+    let mut found = false;
+    store.walk_pats(pat, &mut |pat| {
+        found |= matches!(mode(pat), Some(BindingMode(ByRef::Yes(Mutability::Mut), _)));
+    });
+    found
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,13 +70,23 @@ pub fn target_feature_is_safe_in_target(target: &TargetData) -> TargetFeatureIsS
 }
 
 pub fn is_fn_unsafe_to_call(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     caller_target_features: &TargetFeatures<'_>,
     call_edition: Edition,
     target_feature_is_safe: TargetFeatureIsSafeInTarget,
 ) -> Unsafety {
     let data = FunctionSignature::of(db, func);
+    // Before `is_unsafe`: a `#[rustc_deprecated_safe_2024]` function is also `unsafe`, yet a call
+    // of it before 2024 is only linted.
+    if data.is_deprecated_safe_2024() {
+        if call_edition.at_least_2024() {
+            return Unsafety::Unsafe;
+        } else {
+            return Unsafety::DeprecatedSafe2024;
+        }
+    }
+
     if data.is_unsafe() {
         return Unsafety::Unsafe;
     }
@@ -69,16 +94,8 @@ pub fn is_fn_unsafe_to_call(
     if data.has_target_feature() && target_feature_is_safe == TargetFeatureIsSafeInTarget::No {
         // RFC 2396 <https://rust-lang.github.io/rfcs/2396-target-feature-1.1.html>.
         let callee_target_features = TargetFeatures::from_fn_no_implications(db, func);
-        if !caller_target_features.enabled.is_superset(&callee_target_features.enabled) {
+        if !caller_target_features.is_superset(&callee_target_features) {
             return Unsafety::Unsafe;
-        }
-    }
-
-    if data.is_deprecated_safe_2024() {
-        if call_edition.at_least_2024() {
-            return Unsafety::Unsafe;
-        } else {
-            return Unsafety::DeprecatedSafe2024;
         }
     }
 
@@ -95,7 +112,7 @@ pub fn is_fn_unsafe_to_call(
 
 pub fn detect_variant_from_bytes<'a>(
     layout: &'a Layout,
-    db: &dyn HirDatabase,
+    db: &Db,
     target_data_layout: &TargetDataLayout,
     b: &[u8],
     e: EnumId,
@@ -121,10 +138,11 @@ pub fn detect_variant_from_bytes<'a>(
                         }
                         false => tag,
                     };
-                    let (def, var_idx) = variants.indices().find_map(|var_idx| {
-                        let def = e.enum_variants(db).variants[var_idx.0].0;
-                        (db.const_eval_discriminant(def) == Ok(tag)).then_some((def, var_idx))
-                    })?;
+                    let index =
+                        crate::consteval::discriminants::enum_discriminants(db, e).variant_of(tag)?;
+                    let var_idx = RustcEnumVariantIdx(index);
+                    assert!(var_idx.0 < variants.len());
+                    let def = e.enum_variants(db).variants[index].0;
                     (def, Cow::Owned(Layout::for_variant(layout, var_idx)))
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {

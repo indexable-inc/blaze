@@ -1,0 +1,36 @@
+{
+  "id": "01396",
+  "from_lane": "coordinator",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty-borrowck/src/check/tests.rs",
+    "crates/hir-ty-borrowck/src/budget.rs"
+  ],
+  "what": "round 15 hir-ty-borrowck: check::tests::a_body_with_no_error_takes_nothing_from_the_global_allocator: indexes (rows[1][i], grid[i][j]) is not_checked TypeErrors although CLEAN (check/tests.rs:268) has minicore index, slice since round 10, so inference of nested indexing fails; find the type error. Also budget::a_typical_clean_body_allocates_nothing and a_body_with_errors_allocates_its_diagnostics_alone (3 allocations, panic_display 92 bytes) and a_large_clean_body_and_smaller_ones_after_it_allocate_nothing (2): budget.rs:156.",
+  "state": "applied",
+  "created": "2026-11-01T00:50:08Z",
+  "updated": "2026-11-01T03:48:43Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:50:08Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:52:42Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:48:43Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "round 19: hir-ty-borrowck a_body_with_no_error_takes_nothing_from_the_global_allocator and hir-ty index_places pass. Cause: lookup_method_for_operator skipped rustc normalize of the method signature, so a[i][j] += 1 saw Index::Output. Budget tests moved to 01441 (sol-all-ty)."
+    }
+  ]
+}

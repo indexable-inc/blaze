@@ -1,8 +1,0 @@
-{
-  "row": "crate types `dylib` and `rlib` together",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep"
-  ]
-}

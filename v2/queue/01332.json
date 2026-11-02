@@ -1,0 +1,23 @@
+{
+  "id": "01332",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/infer"
+  ],
+  "what": "Inference reports a type error (InferenceResult has_type_mismatches/is_erroneous/diagnostics) on `fn indexes(rows: &[&[u32]], grid: &mut [[u32; 4]; 4], i: usize, j: usize) -> u32 { grid[i][j] += 1; rows[1][i] + grid[j][i] }` with `//- minicore: sized, copy, clone, fn, index, slice, add` (round 10, hir-ty-borrowck check::tests::a_body_with_no_error_takes_nothing_from_the_global_allocator: not_checked TypeErrors). rustc accepts it. Without `add` (no AddAssign) inference passed and MIR lowering then refused `grid[i][j] += 1` (no &mut adjustment recorded), so the suspect is the AddAssign lookup on an overloaded-index place whose type is `<usize as SliceIndex<[u32]>>::Output` with an integer-variable rhs: rustc normalizes the Index output (to u32) before looking up the op and picks `impl AddAssign for u32`. A hir-ty infer test with this fixture would pin it.",
+  "state": "open",
+  "created": "2026-10-31T18:20:20Z",
+  "updated": "2026-10-31T18:20:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:20:20Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

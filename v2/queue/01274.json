@@ -1,0 +1,36 @@
+{
+  "id": "01274",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/tests.rs",
+    "crates/blaze-query/src/lib.rs"
+  ],
+  "what": "Fix request (01240 was an FYI and was closed): round 7c (adc8bbbf04) blaze-query --lib still fails tests::a_warm_miss_allocates_at_most_a_segment (src/tests.rs:1226), 2 allocations / 8241 bytes against a budget of 1. It is the crate-root store engine (db.open(View), pinned.get::<Double>), not db/: all 41 db:: tests pass. The 8241 bytes look like one segment plus a second small allocation on a warm miss at n >= 32. Either the warm-miss path allocates something it used to reuse, or the budget is wrong; it must not be left red.",
+  "state": "applied",
+  "created": "2026-10-31T13:42:55Z",
+  "updated": "2026-10-31T14:48:28Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:42:55Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:48:28Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:48:28Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Same failure as 01146. The 1 extra byte was len(a)s String key decoded by cbor::from_slice each time verifying double(a) reruns len from its slot bytes. Fixed in crates/blaze-query/src/lib.rs: KeySource::Bytes is gone, a key read back from bytes is decoded once into Database::keys (dropped with its slot), and tests.rs extends a_key_is_kept_once_and_runs_again_by_its_bytes. In round 8 (7abbb7252c); round 7c predates it."
+    }
+  ]
+}

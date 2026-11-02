@@ -1,0 +1,23 @@
+{
+  "id": "01094",
+  "from_lane": "integrate-store",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-api/src/units.rs"
+  ],
+  "what": "From integrate-store: blaze-store is deleted, and with it the only reader of BLAZE_CACHE. crates/blaze-api/src/units.rs:27 CAPTURED still lists \"BLAZE_CACHE\"; drop it if nothing else needs it captured (the v2 store is $BLAZE_HOME/v2/store).",
+  "state": "open",
+  "created": "2026-10-30T16:32:42Z",
+  "updated": "2026-10-30T16:32:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:32:42Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

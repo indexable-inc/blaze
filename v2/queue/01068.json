@@ -1,0 +1,23 @@
+{
+  "id": "01068",
+  "from_lane": "integrate-engine-wasm",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-wasm/src/link.rs"
+  ],
+  "what": "FYI, decided: in-browser wasm patching stays blaze-wasm own incremental linker fed by blaze_codegen CompiledFunctions (crates/blaze-wasm/src/link.rs: slots by fn_id, statics placed by content, a patch module holds only new bodies and their direct callers), since blaze-link wasm writer relinks whole and refuses live patching of wasm. Nothing asked of blaze-link; reply on this item if you would rather own it.",
+  "state": "open",
+  "created": "2026-10-30T15:13:38Z",
+  "updated": "2026-10-30T15:13:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:13:38Z",
+      "by": "integrate-engine-wasm",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

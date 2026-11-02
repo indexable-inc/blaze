@@ -1,0 +1,21 @@
+{
+  "id": "00042",
+  "from_lane": "items-form",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## items-form, for lane items: share type forms across items and revisions\n\n`form::Cx` memoizes a type's `Sub` in a `RefCell<FxHashMap<Ty, Rc<Sub>>>` that lives only as\nlong as one `Cx`. Every item's form re-spells the types it shares with others (`Vec<T>`,\n`Option<&str>`, every std type in a signature), and every revision re-spells them all. A\nsalsa-tracked `ty_form(db, Ty) -> Sub` would compute each once per revision and keep it across\nedits that don't touch it. That needs `Sub: salsa::Update` (its fields are `ContentId`,\n`Vec<ItemId>`, `Option<&'static str>`), and the `spelling` cycle guard turned into salsa cycle\nhandling. I didn't make the change without a compiler to check it; the parent, which builds,\nshould decide where it goes and measure it.\n\n> forwarded to items: the parent's call, in its own crate.\n> forwarded to coordinator: lane items is DONE and left this among its \"costs that need profiling\"; a tracked `ty_form` changes items' own crate, not an interface type, and wants measuring after the first compile.",
+  "state": "open",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T00:05:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/items.md#items-form, for lane items: share type forms across items and revisions",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:84"
+    }
+  ]
+}

@@ -1,7 +1,0 @@
-{
-  "row": "`panic = \"abort\"`",
-  "package": "app",
-  "crates": [
-    "app"
-  ]
-}

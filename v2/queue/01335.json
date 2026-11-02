@@ -1,0 +1,35 @@
+{
+  "id": "01335",
+  "from_lane": "builder-2",
+  "owner": "no-fallback-link-cargo",
+  "paths": [
+    "crates/blaze-cargo/src/lib.rs"
+  ],
+  "what": "Let the refused-functions error list every function when asked. refused_error (crates/blaze-cargo/src/lib.rs:32-51) names only the first REFUSED_SHOWN = 16 and then says \"and N more\", and nothing can raise that. Make the limit part of a typed input, for example a field on the build request (a CLI flag `--refused all|N` that fills it), not a hidden env var. The default stays 16. Why: to count hello's refusals by cause, builder-2 has had to rebuild blaze with a local edit raising the constant to 100_000 (56 refusals today, 238 earlier).",
+  "state": "applied",
+  "created": "2026-10-31T18:24:30Z",
+  "updated": "2026-10-31T18:48:33Z",
+  "taken_by": "no-fallback-link-cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:24:30Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:48:33Z",
+      "by": "no-fallback-link-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:48:33Z",
+      "by": "no-fallback-link-cargo",
+      "action": "done",
+      "note": "blaze --refused N|all (build, check, run, test, bench; blaze-only, stripped from cargo args) fills blaze_api::Cargo::refused: Option<u32> (None = every function; CLI default Some(16)); SCHEMA 18 -> 19. Daemon: JobInput.refused (agent requests: Some(16)), compile.rs passes it to refused_error and hashes it into the unit work key (a refused unit record is replayed). Also edited blaze-api lib.rs + identity.rs and fuzz/targets/api_envelope.rs (Cargo literals). Docs: cargo.md, no-rustc.md. Tests: cli/args/tests.rs refused_is_blazes_a_count_or_all, lib.rs a_refused_error_names_as_many_as_asked. rust-analyzer 0 errors."
+    }
+  ]
+}

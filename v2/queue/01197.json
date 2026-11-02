@@ -1,0 +1,23 @@
+{
+  "id": "01197",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-wfcheck/src/compare.rs"
+  ],
+  "what": "hir-ty-wfcheck compare.rs:125 compare_impl_method_signature returns None for `impl Foo for Bar { fn bar(&mut self) {} }` against `trait Foo { fn bar(&self); }` (rustc E0053, tests/ui/mismatched_types/E0053.rs); hir test tests::api::an_impl_method_s_signature_is_compared_with_the_trait_s line 215. The `foo` i16/u16 case passes, so plain params work; `&mut Self` vs `&Self` does not. Suspect `ocx.sup(trait_sig, impl_sig)` over FnSigs whose reference mutabilities differ succeeding or its error dropped, or the region variables of the impl's late-bound `&self` lifetime taking another path; rustc compare_method_predicate_entailment reports Sorts on the self param (ParamMutability(0)).",
+  "state": "open",
+  "created": "2026-10-31T00:47:09Z",
+  "updated": "2026-10-31T00:47:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:47:09Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

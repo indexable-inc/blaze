@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
+use blaze_hash::HashMap;
 use intern::{Symbol, sym};
 use span::{Edition, Span, SyntaxContext};
 use tt::{
@@ -53,7 +54,7 @@ pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, P
 ///
 /// Stuff to the right is a [`MetaTemplate`] template which is used to produce
 /// output.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MetaTemplate(pub(crate) Box<[Op]>);
 
 impl MetaTemplate {
@@ -80,6 +81,7 @@ impl MetaTemplate {
         mut src: TtIter<'_>,
         mode: Mode,
     ) -> Result<Self, ParseError> {
+        // alloc: the template, once per rule, when the macro is defined.
         let mut res = Vec::new();
         while let Some(first) = src.peek() {
             let op = next_op(edition, first, &mut src, mode)?;
@@ -90,13 +92,29 @@ impl MetaTemplate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The number of a metavariable its rule's pattern declares, given by [`resolve_binders`]: the
+/// index of its bindings, so that matching and transcribing never hash a name.
+pub(crate) type Binder = u32;
+
+/// A metavariable the pattern does not declare (or one not resolved yet).
+pub(crate) const NO_BINDER: Binder = u32::MAX;
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Op {
-    Var { name: MetaVar, kind: Option<MetaVarKind>, id: Span },
-    Ignore { name: MetaVar, id: Span },
+    /// `spec` is a pattern's fragment specifier as written (`pat`, `pat_param`, `expr_2021`),
+    /// and `decl` the span of `$name:spec` (a template's `$name`): rustc's `MetaVarDecl`.
+    Var {
+        name: MetaVar,
+        kind: Option<MetaVarKind>,
+        id: Span,
+        binder: Binder,
+        spec: Option<Symbol>,
+        decl: Span,
+    },
+    Ignore { name: MetaVar, id: Span, binder: Binder },
     Index { depth: usize },
     Len { depth: usize },
-    Count { name: MetaVar, depth: usize },
+    Count { name: MetaVar, depth: usize, binder: Binder },
     Concat { elements: Box<[ConcatMetaVarExprElem]>, span: Span },
     Repeat { tokens: MetaTemplate, kind: RepeatKind, separator: Option<Arc<Separator>> },
     Subtree { tokens: MetaTemplate, delimiter: tt::Delimiter },
@@ -108,7 +126,7 @@ pub(crate) enum Op {
 /// The name of a metavariable. Two of one spelling are two variables when they were written by
 /// different expansions, as the `$arg`s of a macro that another macro writes out an argument at a
 /// time.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MetaVar {
     sym: Symbol,
     ctx: SyntaxContext,
@@ -137,7 +155,7 @@ pub(crate) enum ConcatMetaVarExprElem {
     Ident(tt::Ident),
     /// There is a preceding dollar sign, which means that this identifier should be expanded
     /// and interpreted as a variable.
-    Var(tt::Ident),
+    Var { ident: tt::Ident, binder: Binder },
     /// For example, a number or a string.
     Literal(tt::Literal),
 }
@@ -225,6 +243,7 @@ fn next_op(
                     return Ok(Op::Punct({
                         let mut res = ArrayVec::new();
                         res.push(p);
+                        // alloc: the template, once per rule, when the macro is defined.
                         Box::new(res)
                     }));
                 }
@@ -263,16 +282,20 @@ fn next_op(
                         })
                     }
                     tt::Leaf::Ident(ident) => {
-                        let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = MetaVar::new(ident.sym.clone(), ident.span);
+                        let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
+                        let name = MetaVar::new(ident.sym, ident.span);
                         let id = ident.span;
-                        Op::Var { name, kind, id }
+                        let decl = p.span.cover(spec.as_ref().map_or(id, |it| it.span));
+                        let spec = spec.map(|it| it.sym);
+                        Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }
                     tt::Leaf::Literal(lit) if is_boolean_literal(&lit) => {
-                        let kind = eat_fragment_kind(edition, src, mode)?;
-                        let name = MetaVar::new(lit.text_and_suffix.clone(), lit.span);
+                        let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
+                        let name = MetaVar::new(lit.text_and_suffix, lit.span);
                         let id = lit.span;
-                        Op::Var { name, kind, id }
+                        let decl = p.span.cover(spec.as_ref().map_or(id, |it| it.span));
+                        let spec = spec.map(|it| it.sym);
+                        Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }
                     tt::Leaf::Punct(punct @ tt::Punct { char: '$', .. }) => match mode {
                         Mode::Pattern => {
@@ -283,6 +306,7 @@ fn next_op(
                         Mode::Template => Op::Punct({
                             let mut res = ArrayVec::new();
                             res.push(punct);
+                            // alloc: the template, once per rule, when the macro is defined.
                             Box::new(res)
                         }),
                     },
@@ -295,17 +319,20 @@ fn next_op(
 
         TtElement::Leaf(tt::Leaf::Literal(it)) => {
             src.next().expect("first token already peeked");
+            // clone: the template, once per rule, when the macro is defined.
             Op::Literal(it.clone())
         }
 
         TtElement::Leaf(tt::Leaf::Ident(it)) => {
             src.next().expect("first token already peeked");
+            // clone: the template, once per rule, when the macro is defined.
             Op::Ident(it.clone())
         }
 
         TtElement::Leaf(tt::Leaf::Punct(_)) => {
             // There's at least one punct so this shouldn't fail.
             let puncts = src.expect_glued_punct().unwrap();
+            // alloc: the template, once per rule, when the macro is defined.
             Op::Punct(Box::new(puncts))
         }
 
@@ -322,7 +349,7 @@ fn eat_fragment_kind(
     edition: impl Copy + Fn(SyntaxContext) -> Edition,
     src: &mut TtIter<'_>,
     mode: Mode,
-) -> Result<Option<MetaVarKind>, ParseError> {
+) -> Result<(Option<MetaVarKind>, Option<tt::Ident>), ParseError> {
     if let Mode::Pattern = mode {
         src.expect_char(':').map_err(|()| ParseError::unexpected("missing fragment specifier"))?;
         let ident = src
@@ -356,11 +383,11 @@ fn eat_fragment_kind(
             "tt" => MetaVarKind::Tt,
             "lifetime" => MetaVarKind::Lifetime,
             "literal" => MetaVarKind::Literal,
-            _ => return Ok(None),
+            _ => return Ok((None, Some(ident))),
         };
-        return Ok(Some(kind));
+        return Ok((Some(kind), Some(ident)));
     };
-    Ok(None)
+    Ok((None, None))
 }
 
 fn is_boolean_literal(lit: &tt::Literal) -> bool {
@@ -381,10 +408,12 @@ fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind),
         match tt {
             tt::Leaf::Ident(ident) => match separator {
                 Separator::Puncts(puncts) if puncts.is_empty() => {
+                    // clone: the template, once per rule, when the macro is defined.
                     separator = Separator::Ident(ident.clone());
                 }
                 Separator::Puncts(puncts) => match puncts.as_slice() {
                     [tt::Punct { char: '\'', .. }] => {
+                        // clone: the template, once per rule, when the macro is defined.
                         separator = Separator::Lifetime(puncts[0], ident.clone());
                     }
                     _ => return Err(ParseError::InvalidRepeat),
@@ -392,6 +421,7 @@ fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind),
                 _ => return Err(ParseError::InvalidRepeat),
             },
             tt::Leaf::Literal(_) if has_sep => return Err(ParseError::InvalidRepeat),
+            // clone: the template, once per rule, when the macro is defined.
             tt::Leaf::Literal(lit) => separator = Separator::Literal(lit.clone()),
             tt::Leaf::Punct(punct) => {
                 let repeat_kind = match punct.char {
@@ -425,7 +455,11 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
         s if sym::ignore == *s => {
             args_iter.expect_dollar()?;
             let ident = args_iter.expect_ident()?;
-            Op::Ignore { name: MetaVar::new(ident.sym.clone(), ident.span), id: ident.span }
+            Op::Ignore {
+                name: MetaVar::new(ident.sym, ident.span),
+                id: ident.span,
+                binder: NO_BINDER,
+            }
         }
         s if sym::index == *s => Op::Index { depth: parse_depth(&mut args_iter)? },
         s if sym::len == *s => Op::Len { depth: parse_depth(&mut args_iter)? },
@@ -434,20 +468,23 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
             let ident = args_iter.expect_ident()?;
             let depth =
                 if try_eat_comma(&mut args_iter) { parse_depth(&mut args_iter)? } else { 0 };
-            Op::Count { name: MetaVar::new(ident.sym.clone(), ident.span), depth }
+            Op::Count { name: MetaVar::new(ident.sym, ident.span), depth, binder: NO_BINDER }
         }
         s if sym::concat == *s => {
+            // alloc: the template, once per rule, when the macro is defined.
             let mut elements = Vec::new();
             while let Some(next) = args_iter.peek() {
                 let element = if let TtElement::Leaf(tt::Leaf::Literal(lit)) = next {
                     args_iter.next().expect("already peeked");
+                    // clone: the template, once per rule, when the macro is defined.
                     ConcatMetaVarExprElem::Literal(lit.clone())
                 } else {
                     let is_var = try_eat_dollar(&mut args_iter);
+                    // clone: the template, once per rule, when the macro is defined.
                     let ident = args_iter.expect_ident_or_underscore()?.clone();
 
                     if is_var {
-                        ConcatMetaVarExprElem::Var(ident)
+                        ConcatMetaVarExprElem::Var { ident, binder: NO_BINDER }
                     } else {
                         ConcatMetaVarExprElem::Ident(ident)
                     }
@@ -500,4 +537,48 @@ fn try_eat_dollar(src: &mut TtIter<'_>) -> bool {
         return true;
     }
     false
+}
+
+/// Numbers the metavariables `lhs` declares, one number per name in the order the names first
+/// appear, and gives every metavariable of `lhs` and `rhs` its name's number ([`NO_BINDER`] for
+/// one `lhs` declares no binding for). Returns how many numbers there are. Runs once per rule,
+/// when the macro is defined.
+pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) -> u32 {
+    let mut binders = HashMap::default();
+    declare(lhs, &mut binders);
+    resolve(rhs, &binders);
+    return binders.len() as u32;
+
+    fn declare(template: &mut MetaTemplate, binders: &mut HashMap<MetaVar, Binder>) {
+        for op in template.0.iter_mut() {
+            match op {
+                Op::Var { name, binder, .. } => {
+                    let next = binders.len() as Binder;
+                    *binder = *binders.entry(*name).or_insert(next);
+                }
+                Op::Repeat { tokens, .. } | Op::Subtree { tokens, .. } => declare(tokens, binders),
+                _ => (),
+            }
+        }
+    }
+
+    fn resolve(template: &mut MetaTemplate, binders: &HashMap<MetaVar, Binder>) {
+        let lookup = |name: &MetaVar| binders.get(name).copied().unwrap_or(NO_BINDER);
+        for op in template.0.iter_mut() {
+            match op {
+                Op::Var { name, binder, .. }
+                | Op::Ignore { name, binder, .. }
+                | Op::Count { name, binder, .. } => *binder = lookup(name),
+                Op::Concat { elements, .. } => {
+                    for element in elements.iter_mut() {
+                        if let ConcatMetaVarExprElem::Var { ident, binder } = element {
+                            *binder = lookup(&MetaVar::new(ident.sym, ident.span));
+                        }
+                    }
+                }
+                Op::Repeat { tokens, .. } | Op::Subtree { tokens, .. } => resolve(tokens, binders),
+                _ => (),
+            }
+        }
+    }
 }

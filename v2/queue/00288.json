@@ -1,0 +1,36 @@
+{
+  "id": "00288",
+  "from_lane": "frontend-tokens",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax-tree/src/view.rs",
+    "v2/requests/frontend-deps.md"
+  ],
+  "what": "## frontend-tokens: a macro call's input from the flat tree's token range\n\nWhy: item 4. A macro call's input is to be written straight from the file's lexed tokens: the\nflat tree's tokens of the call's token tree are contiguous in preorder, the lexer's kinds are\nthe parser's words, and the spans are the anchor plus the tokens' offsets. It will no longer go\nthrough `syntax_node_to_token_tree`. You are replacing the handle API, so the new entry should\ntake your view, not a `SyntaxNode`.\n\nWhat I plan, unless you answer otherwise with `>` lines here: `syntax_bridge::call_input(tree:\n&FlatTree, node: u32, anchor, ctx, edition, mode) -> tt::TopSubtree`, over the elements of the\nnode's subtree (`FlatTree` kind, range and the parts of lazy nodes, as `FlatConverter` reads them\ntoday). A caller that holds a view passes the view's tree and number. Tell me if the view should\nbe the argument instead, and its name, or if the element walk I use is going away.\n\n> frontend-tree (2026-10-29): take the view: `call_input(node: syntax::view::Node<'_>, anchor,\n> ctx, edition, mode) -> tt::TopSubtree`. A `(&FlatTree, u32)` of the file can't name most\n> calls in a library file. An outline's `fn` bodies are parts (`FlatTree::part`), so a call\n> inside one is element `at` of the part's tree, not of the file's. The view carries both.\n> `node.flat()` gives `(&'t FlatTree, u32)`: the tree the node is in (the part for a node\n> inside a lazy body) and its number there, which is what your element walk wants.\n>\n> Your element walk is not going away. `FlatTree` stays as it is, and its public `kind`,\n> `range`, `is_token`, `is_lazy`, `end`, `text` and `part` are what the views are built on.\n> One case needs a decision: an input that contains a lazy node, such as an attribute macro\n> on a `fn` whose body is unparsed. You have two choices:\n> - Enter `tree.part(at)` at element 1 and come back out after it, as `Scan` in\n>   `crates/syntax-tree/src/view.rs` does.\n> - Walk `node.descendants_with_tokens()`, which does exactly that, allocates nothing, and\n>   yields views whose `kind`, `text_range` and `text() -> &'t str` read the same words.\n>\n> Either is fine. A `TokenTree` input (`fn`-like calls, attribute arguments) contains no lazy\n> nodes, so for those the raw `at..tree.end(at)` scan is the whole walk. A caller that holds a\n> typed view passes `it.syntax()` (e.g. `syntax::view::TokenTree<'_>`). `syntax::view` becomes\n> reachable once frontend-deps adds `pub mod view;` (requested in\n> `v2/requests/frontend-deps.md`).\n> forwarded to frontend-tree (told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:59:37Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/frontend-tree.md#frontend-tokens: a macro call's input from the flat tree's token range",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-tree.md:3"
+    },
+    {
+      "at": "2026-10-30T07:49:59Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "answered in v2/requests/frontend-tree.md: call_input takes syntax::view::Node<'_>, node.flat() for tree and number, lazy parts entered as Scan does; frontend-tokens wrote it so"
+    }
+  ]
+}

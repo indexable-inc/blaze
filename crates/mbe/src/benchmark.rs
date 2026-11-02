@@ -1,16 +1,13 @@
 //! This module add real world mbe example for benchmark tests
 
+use base_db::Db;
+use blaze_hash::HashMap;
 use intern::Symbol;
-use rustc_hash::FxHashMap;
 use stdx::itertools::Itertools;
-use syntax::{
-    AstNode,
-    ast::{self, HasName},
-};
+use syntax::view::{self as ast, AstNode as _, HasName as _};
 use syntax_bridge::{
-    DocCommentDesugarMode,
+    DocCommentDesugarMode, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-    syntax_node_to_token_tree,
 };
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
@@ -29,7 +26,7 @@ fn benchmark_parse_macro_rules() {
         let _pt = bench("mbe parse macro rules");
         rules
             .into_iter()
-            .sorted_by_key(|(id, _)| id.clone())
+            .sorted_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(_, it)| {
                 DeclarativeMacro::parse_macro_rules(&it, |_| span::Edition::CURRENT).rules.len()
             })
@@ -43,7 +40,7 @@ fn benchmark_expand_macro_rules() {
     if skip_slow_tests() {
         return;
     }
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let rules = macro_rules_fixtures();
     let invocations = invocation_fixtures(&db, &rules);
 
@@ -61,25 +58,26 @@ fn benchmark_expand_macro_rules() {
     assert_eq!(hash, 450144);
 }
 
-fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
+pub(crate) fn macro_rules_fixtures() -> HashMap<String, DeclarativeMacro> {
     macro_rules_fixtures_tt()
         .into_iter()
-        .sorted_by_key(|(id, _)| id.clone())
+        .sorted_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(id, tt)| (id, DeclarativeMacro::parse_macro_rules(&tt, |_| span::Edition::CURRENT)))
         .collect()
 }
 
-fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
+fn macro_rules_fixtures_tt() -> HashMap<String, tt::TopSubtree> {
     let fixture = bench_fixture::numerous_macro_rules();
-    let source_file = ast::SourceFile::parse(&fixture, span::Edition::CURRENT).ok().unwrap();
+    let parse = syntax::SourceFile::parse(&fixture, span::Edition::CURRENT);
+    assert!(parse.errors().is_empty(), "the macro_rules fixture parses");
 
-    source_file
-        .syntax()
+    parse
+        .root()
         .descendants()
         .filter_map(ast::MacroRules::cast)
         .map(|rule| {
-            let id = rule.name().unwrap().to_string();
-            let def_tt = syntax_node_to_token_tree(
+            let id = rule.name().unwrap().text().to_owned();
+            let def_tt = call_input(
                 rule.token_tree().unwrap().syntax(),
                 DummyTestSpanMap,
                 DUMMY,
@@ -91,9 +89,9 @@ fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
 }
 
 /// Generate random invocation fixtures from rules
-fn invocation_fixtures(
-    db: &dyn salsa::Database,
-    rules: &FxHashMap<String, DeclarativeMacro>,
+pub(crate) fn invocation_fixtures(
+    db: &Db,
+    rules: &HashMap<String, DeclarativeMacro>,
 ) -> Vec<(String, tt::TopSubtree)> {
     let mut seed = 123456789;
     let mut res = Vec::new();

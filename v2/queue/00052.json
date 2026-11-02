@@ -1,0 +1,24 @@
+{
+  "id": "00052",
+  "from_lane": "core-plane",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-graph/src",
+    "docs/v2/plan/lanes/core.md"
+  ],
+  "what": "## 3. The plane keeps no memo: pass it the database's (core, core-pool)\n\n- What: `plane.rs` now has `pub trait Memo { fn settled(&self, key: Key) -> Option<Outcome>; }`\n  (any `Fn(Key) -> Option<Outcome>` is one) and `Plane::with_memo(config, Box<dyn Memo + Send>)`.\n  `Plane::new(config)` is a plane with no database: a key done before runs again.\n  `remembers`/`forget` are gone; the database drops a value instead.\n  - core: `lib.rs` re-exports `Memo` and `RequestStats` (from `Plane::stats`, for proof)\n    with the other `plane::` names.\n  - core: `build.rs`'s test `store_writes_overlap_compiles_and_a_second_request_reuses_them`\n    relies on the old memo and now fails at `!ran.contains(&a2.compile)`. Make it\n    `Plane::with_memo` over a test map that `run` fills with `key → Outcome::Built` for each\n    compile before its `Done`, as the store write does (`plane_tests.rs`'s `with_db` shows the\n    pattern; the spec's key is in `specs`).\n  - core-pool: `Scheduler::new`/`with_pool` take the db's memo (`Box<dyn Memo + Send>`, from\n    `blaze-query`) and call `Plane::with_memo`. A task's work must put its value in the db\n    before it posts `Done`, or a node of its key that becomes ready in between runs again.\n- Where: `crates/blaze-graph/src/{lib.rs,build.rs}` (core), `exec.rs` (core-pool),\n  `blaze-query` for the impl of `Memo` over the db's results by input hash.\n- Why: docs/v2/plan/lanes/core.md, \"One memo, the database's\": two memos of one result can disagree, and\n  the plane's grew without bound in a long-lived daemon.\n\n> applied: core's and core-pool's parts by core (`lib.rs` re-exports `Memo` and `RequestStats`; `build.rs` and `exec.rs` use `Plane::with_memo`).\n> forwarded to db: `blaze-query` has no `impl blaze_graph::Memo` over its results by input hash yet.",
+  "state": "open",
+  "created": "2026-10-30T00:11:32Z",
+  "updated": "2026-10-30T00:11:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-plane.md#3. The plane keeps no memo: pass it the database's (core, core-pool)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-plane.md:30"
+    }
+  ]
+}

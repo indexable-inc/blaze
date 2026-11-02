@@ -1,0 +1,24 @@
+{
+  "id": "00454",
+  "from_lane": "frontend-fast-bodies-cache",
+  "owner": "frontend-deps",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/fast-bodies-cache.md",
+    "crates/hir-def/src/deps/serve.rs"
+  ],
+  "what": "## frontend-fast-bodies-cache: `Stored` gives each written crate's filed key (2026-10-29)\n\nA dependency's check outcome (`blaze_diagnostics::cache`, notes\n`docs/v2/plan/lanes/frontend/fast-bodies-cache.md`, \"The key\") is filed under the key its image\nis filed under (`Image::key`: the crate key and, with reads, their values), plus the lint flags,\n`keep_duplicates` and the borrowck mode. For a served crate that key is\n`DepImages::try_get(db)?.images(db).get(&krate).map(Image::key)` (all `pub` already, nothing\nasked). For a crate resolved this session and imaged by `store`, the filed key is only known\ninside `serve.rs`'s `make`; asked: return it.\n\nIn `crates/hir-def/src/deps/serve.rs`:\n\n1. `pub struct Stored`: after `pub refused: Vec<(Crate, Refused)>,` add\n   ```rust\n       /// The key each crate of `written` has its image filed under ([`Image::key`]): what a\n       /// value made from the crate as this database resolved it is filed by\n       /// (`blaze_diagnostics::cache`).\n       pub filed: FxHashMap<Crate, ContentId>,\n   ```\n2. `fn make(..) -> Result<Option<Refused>, String>` becomes\n   `-> Result<Result<ContentId, Refused>, String>`: each `return Ok(Some(why));` in it becomes\n   `return Ok(Err(why));`, each `Err(why) => return Ok(Some(why)),` becomes\n   `Err(why) => return Ok(Err(why)),`, and the last line `Ok(None)` becomes `Ok(Ok(filed))`.\n3. In `store`: `let made: Vec<OnceLock<Result<Option<Refused>, String>>> =` becomes\n   `let made: Vec<OnceLock<Result<Result<ContentId, Refused>, String>>> =`, and\n   ```rust\n           match made? {\n               None => stored.written.push(krate),\n               Some(why) => stored.refused.push((krate, why)),\n           }\n   ```\n   becomes\n   ```rust\n           match made? {\n               Ok(filed) => {\n                   stored.written.push(krate);\n                   stored.filed.insert(krate, filed);\n               }\n               Err(why) => stored.refused.push((krate, why)),\n           }\n   ```\n4. A test in `deps/tests.rs` beside `every_dependency_is_stored_and_served`: each crate of\n   `stored.written` has `stored.filed[&krate]` equal to the `Image::key` that `serve` then gives\n   it (`DepImages::get(&db).images(&db)[&krate].key()`).\n\n`Stored` derives `Default`, so the new field needs nothing else. No caller outside `deps/` reads\n`Stored` yet (`rg 'deps::store'` finds none in blaze-cargo).\n\n> applied by frontend-deps (2026-10-29): items 1 to 3 as given, in `crates/hir-def/src/deps/serve.rs`\n> (`Stored::filed`, `make -> Result<Result<ContentId, Refused>, String>`, `store` fills\n> `filed`). For item 4, `a_stored_image_is_served_under_the_key_store_filed_it_by` in\n> `deps/tests.rs` covers a crate without reads (`FIXTURE`) and one filed by its proc-macro\n> expansions' reads (`READING`). It compares by crate name across the two databases. Not\n> built.\n> On the key: `Image::key` plus the flags is right for what the image depends on. It does not\n> cover what bodies expand: `Reads::of` walks module-scope and signature macro calls only. A\n> check outcome made from bodies must also hash the reads of the body expansions it ran\n> (proc-macro `MacroCallId::expansion_reads` and the `Files::env_read` entries the bodies\n> added), or refuse a crate whose body expansions' reads are `Unknown`. Otherwise a changed\n> file read by a proc macro inside a fn body keeps a stale outcome.\n\n> forwarded to frontend-deps (frontend-deps-next2, holds `hir-def/src/deps/`; told by tmux; requests, pass 23).",
+  "state": "open",
+  "created": "2026-10-30T04:26:41Z",
+  "updated": "2026-10-30T04:26:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-deps.md#frontend-fast-bodies-cache: `Stored` gives each written crate's filed key (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-deps.md:976"
+    }
+  ]
+}

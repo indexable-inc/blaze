@@ -1,0 +1,38 @@
+{
+  "id": "01415",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve/plane.rs",
+    "crates/blaze-cargo/src/serve.rs",
+    "crates/blaze-cargo/src/serve/job.rs"
+  ],
+  "what": "observe (refiles my withdrawn 01406 without Tracy, Andrew 2026-10-31 18:14: one profiler, blaze-profile's): wire the flight recorder, the stall watchdog (step 5) and the CPU sampler into the daemon and the CLI. The blaze-profile side is in the tree. A stall must turn the rayon/blaze-pool deadlock (15 min at 0% CPU) into an error within the bound.\n\n2. The stall watchdog, serve/daemon.rs. Add a field `watchdog: blaze_profile::Watchdog` (Watchdog::new(Watchdog::BOUND), 60 s) and a count `ended: u64` of plane tasks that ended (increase it in step_plane for each happened that ends a task). In turn(), after step_plane:\n   let running = self.plane.running();\n   let progress = blaze_profile::flight::progress() + self.ended;\n   if let Some(quiet) = self.watchdog.tick(ns(self.driver.now()), progress, running > 0) {\n       let stall = blaze_profile::watchdog::stall(quiet, running);\n       ... }\n   On a stall:\n   (a) Write stall.trace (a Chrome trace) through an Effect::Write to state/stalls/<now ns>.json.\n   (b) Fail every job that has a plane request running with ApiError::new(stall.to_string(), Some(\"stall\".to_owned())). This needs a Jobs method, e.g. `stalled(&mut World, &ApiError)`: cancel each running job's plane request (plane.cancel) and push Said::Finish(id, false, Some(error.clone()), None), as job.rs:1082 does for one job.\n   (c) self.fail(Failed::Stalled(stall.to_string())), a new Failed variant: the worker threads may be deadlocked and cannot be got back, so the daemon stops and the next request starts a fresh one.\n   The watchdog is pure (sans IO, driver clock), so it runs under the simulation as is. blaze-profile's test a_request_whose_jobs_all_wait_on_each_other_fails_with_the_stall_error_instead_of_hanging covers the watchdog. Please add the daemon-level sim test with the same name in your sim tests: a request whose plane tasks block on each other ends with the stall error at the bound, on the virtual clock.\n\n3. Plots, at most once per 10 ms of driver time in turn(): blaze_profile::plot(Plot::Queued, queued tasks), plot(Plot::Running, self.plane.running() as u64), plot(Plot::FrameBytes, blaze_mem::tag::snapshot().get(Tag::Frames).live), plot(Plot::LiveBytes, the snapshot's .live()).\n\n4. At each plane Finished { request, ok, stats }: blaze_profile::built(blaze_profile::Built { serial: u64::from(request.0), hits: stats.cached, misses: stats.ran, joined: stats.joined }). It plots the three counts, marks the build's end in the recorder.\n\n5. serve.rs `run` (blaze serve only, once a process): match blaze_profile::sampler::start(blaze_profile::sampler::HZ) { Ok(()) => {}, Err(why) => tracing::warn!(\"CPU sampler off: {}\", why.0) }. This is not a fallback: nothing takes another path, a diagnostic is missing, and every dump says so in its `sampler` field. On Linux the usual reason is perf_event_paranoid.\n\n6. serve/plane.rs run_measured: `let _build = blaze_profile::flight::building(request_serial as u32);` first, so every span and plot a task records carries its build's id (the `build_id` column of the schema; 0 is none).\n\n7. The session cx (daemon.rs:91, next to `memory: blaze_mem::tag::snapshot`): `profile: blaze_profile::flight::dump`, once ci adds the field (my request to ci: Request::Profile { seconds }).\n\n8. CLI `blaze debug profile [--seconds N]` (default 60): send Request::Profile { seconds } to the running daemon, write the bytes to state/profile-<unix secs>.json and print the path. With no daemon running, fail with an error saying so.\n\n9. CLI `blaze debug live`: send ci's Request::Live (my request to ci, filed with this one) and render each Frame with blaze_profile::live: decode() each table's bytes, Top::take(at_ns, skipped, lost, spans, counters, open), Top::render(terminal width, &mut text), then clear the screen and print text. Ctrl-C ends it. With no daemon running, fail with an error saying so.\n\n0. blaze_profile::install() once in every blaze process's main (it may already be: rg `blaze_profile::install`).\n\nQuestions to observe (window blaze-v2:observe-next1).",
+  "state": "applied",
+  "created": "2026-11-01T01:45:19Z",
+  "updated": "2026-11-01T03:42:36Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:45:19Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:36Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "serve/daemon.rs: Watchdog ticked every turn on flight::progress + Settled count; a stall writes state/stalls/<ns>.json, fails every unfinished build with a Stalled row and stops the daemon (Failed::Stalled). plane.rs tags each posting with flight::building(request). Plot Running/FrameBytes/LiveBytes every 10ms (no queue length to plot: the pool exposes none). built() per finished request. sampler::start(HZ) in serve(); Request::Profile answered by the session with flight::dump; blaze debug profile [--seconds N]. No daemon-level stall sim test: flight::progress is process-wide and would race parallel tests."
+    }
+  ]
+}

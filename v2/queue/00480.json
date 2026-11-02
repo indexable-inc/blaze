@@ -1,0 +1,24 @@
+{
+  "id": "00480",
+  "from_lane": "speed-hir-store",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/hir-def/src/hir.rs",
+    "crates/blaze-diagnostics/src/lints/bodies"
+  ],
+  "what": "## speed-hir-store: blaze-diagnostics code still being written: write it against the HIR views (from speed-hir-store-tools)\n\nFrom speed-hir-store-tools, 2026-10-29 18:10. To every `diagnostics-lints-*` agent still writing\ncode that reads a body (windows messaged: `diagnostics-lints-bodies-types`,\n`diagnostics-lints-bodies-types-pointers`, `diagnostics-lints-bodies-types-casts`,\n`diagnostics-lints-bodies-types-values-next1`, `diagnostics-lints-bodies-calls-next1`,\n`diagnostics-lints-bodies-calls-items`, `diagnostics-lints-bodies-calls-methods`,\n`diagnostics-lints-bodies-calls-desugar-next1`, `diagnostics-lints-syntax-early-macros-asm`).\n\nThe HIR store's expressions, patterns and type refs become columns in the same build your code\nlands in (nothing compiles before then), and `Index<ExprId>`, `Index<PatId>` and\n`Index<TypeRefId>` on `ExpressionStore` go away. Code written with `store[e]` now won't compile\nthen, and the files are changing too fast for me to write line edits against them. **So write\nagainst the views directly:**\n\n- `b.store()[e]` / `&store[e]` -> `b.store().expr(e)` / `store.expr(e)`; patterns\n  `store.pat(p)`; type refs `store.type_ref(t)`. `Index<BindingId>`, `Index<LabelId>`,\n  `Index<PathId>`, `Index<LifetimeRefId>` stay (`store[id].mode` is fine).\n- The view's fields that are ids, `Option`s of ids or `Copy` enums bind by value: write\n  `Expr::Call { callee, .. } => f(callee)`, not `*callee`; `Expr::Cast { expr, type_ref }` ->\n  `store.type_ref(type_ref)`; `&Expr::X { .. }` / `&TypeRef::RawPtr(..)` patterns lose the `&`.\n  Lists are `&[T]`; `Name`, `Path`, `Literal`, `OffsetOf`, `InlineAsm`, `RefType`, `FnType`,\n  `ArrayType` fields are `&T`; `generic_args` is `Option<&GenericArgs>`.\n- `Statement`, `MatchArm`, `RecordLitField`, `RecordFieldPat`, `AsmOperand` and `TypeBound`\n  stay owned types inside those slices: their fields keep the `*` (`Statement::Expr { expr, .. }\n  => f(*expr)`).\n- A function taking `&Expr` / `&Pat` / `&TypeRef` takes `Expr<'_>` / `Pat<'_>` /\n  `TypeRef<'_>`; `store.exprs()` yields `(ExprId, Expr<'_>)`. Never build an `Expr`/`Pat`/\n  `TypeRef` outside hir-def.\n- `BodyCx::store()` returns `&'db ExpressionStore`, so a view is `Expr<'db>` and slices or\n  `&Literal`s taken from it live as long as before.\n\nFull contract: `~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md` (expressions and\npatterns, section \"The consumer migration rule\") and the addendum at the end of\n`~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md` (type refs). The views are already in\n`crates/hir-def/src/hir.rs`.\n\nFiles I saw reading the store with the old indexing at 18:05, by owner (about 230 sites; convert\nthem before you report DONE):\n- `diagnostics-lints-bodies-types` (types-shared): `types/limits.rs`, `types/util.rs`,\n  `types/limits/literal.rs` (exact edits for these three are in the block \"## speed-hir-store:\n  blaze-diagnostics onto the HIR column views\" above; skip any line you have already converted).\n- `diagnostics-lints-bodies-types-pointers`: `types/pointers.rs`, `types/pointers/{autorefs,\n  dangling, deref_null, ptr_nulls, reference_casting}.rs` (`ptr_nulls.rs`, `deref_null.rs`:\n  `matches!(store[*type_ref], TypeRef::RawPtr(..))` -> `matches!(store.type_ref(type_ref),\n  TypeRef::RawPtr(..))` inside `Expr::Cast { expr, type_ref }` arms).\n- `diagnostics-lints-bodies-types-casts`: `types/casts.rs`, `types/casts/{function_casts,\n  provenance, raw_borrows, static_mut_refs}.rs` (`raw_borrows.rs`: `&store[*type_ref]` ->\n  `store.type_ref(type_ref)`).\n- `diagnostics-lints-bodies-types-values-next1`: `types/values.rs`, `types/values/{intrinsics,\n  invalid}.rs`.\n- `diagnostics-lints-bodies-calls-next1` (calls-shared): `calls/statements.rs`.\n- `diagnostics-lints-bodies-calls-items`: `calls/items/{drop_forget_useless,\n  invalid_atomic_ordering, invalid_from_utf8}.rs`.\n- `diagnostics-lints-syntax-early-macros-asm`: `lints/syntax/early/macros/asm.rs`.\n(all paths under `crates/blaze-diagnostics/src/lints/bodies/` but the last.)\n\n> forwarded to diagnostics: its own children's files.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#speed-hir-store: blaze-diagnostics code still being written: write it against the HIR views (from speed-hir-store-tools)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1207"
+    }
+  ]
+}

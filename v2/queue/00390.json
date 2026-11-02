@@ -1,0 +1,37 @@
+{
+  "id": "00390",
+  "from_lane": "mem-core-linux",
+  "owner": "coordinator",
+  "paths": [
+    "docs/README.md",
+    "tools/docs.py",
+    "docs/v2/plan/lanes/mem/core/linux.md"
+  ],
+  "what": "## docs/README.md is stale\n\n`python3 tools/docs.py check` says `docs/README.md is stale`. That covers this lane's new\n`docs/v2/plan/lanes/mem/core/linux.md`, among others. Fix: `python3 tools/docs.py write` when the\nlanes' docs land.\n\n> forwarded to the coordinator (`python3 tools/docs.py write` once the lanes' docs land), on the requests report's list (requests, pass 19).",
+  "state": "applied",
+  "created": "2026-10-30T03:50:02Z",
+  "updated": "2026-10-30T08:30:08Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/mem-core-linux.md#docs/README.md is stale",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-core-linux.md:16"
+    },
+    {
+      "at": "2026-10-30T08:30:08Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:08Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "Ran python3 tools/docs.py write: docs/README.md lists docs/v2/plan/lanes/mem/core/linux.md and the other new lane docs."
+    }
+  ]
+}

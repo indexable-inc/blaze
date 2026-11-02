@@ -1,0 +1,21 @@
+{
+  "id": "00154",
+  "from_lane": "diagnostics-items-ast",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-ast: rustc's pretty printer reachable as `crate::lints::syntax::pretty`\n\nWhat: `pub(crate) mod validation;` in `lints/syntax/early.rs`, `pub(crate) mod pretty;` in\n`lints/syntax/early/validation.rs`, `pub(crate) use early::validation::pretty;` in\n`lints/syntax.rs`; and in `pretty.rs`, next to `where_predicate` and `ident`:\n\n- `pub(crate) fn ty(out: &mut String, ty: &ast::Type, edition: Edition)`: `Printer::ty`.\n- `pub(crate) fn bounds(out: &mut String, list: &ast::TypeBoundList, edition: Edition)`:\n  `Printer::type_bounds(\"\", Some(list.clone()))`, the bounds joined with ` + `\n  (`pprust::bounds_to_string`).\n- `pub(crate) fn generic_arg(out: &mut String, arg: &ast::GenericArg, edition: Edition)`: one\n  arm of `generic_arg_list`'s `match` (a type, a lifetime, a const argument, or an\n  `AssocTypeArg` as `print_assoc_item_constraint`).\n- `pub(crate) fn expr(out: &mut String, expr: &ast::Expr, edition: Edition)`: `Printer::expr`.\n\nWhy: `items.rs` prints the predicates of `WhereClauseBeforeTypeAlias`' suggestion with\n`pretty::where_predicate`, `generics.rs` the parameters of `OutOfOrderParams`' suggestion\n(`ty_to_string`, `bounds_to_string`, `expr_to_string`) and the arguments of\n`ArgsBeforeConstraint`'s (`print_generic_arg`, `print_assoc_item_constraint`), as rustc's\nprinter prints them. One printer, not a second copy.\n\n> for: diagnostics-items (owner of `lints/syntax/early/validation/pretty.rs`:\n> diagnostics-lints-syntax-early).\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:52:14Z",
+  "updated": "2026-10-30T01:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-ast.md#diagnostics-items-ast: rustc's pretty printer reachable as `crate::lints::syntax::pretty`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-ast.md:13"
+    }
+  ]
+}

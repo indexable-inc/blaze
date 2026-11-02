@@ -1,0 +1,37 @@
+{
+  "id": "00493",
+  "from_lane": "diagnostics-lints-syntax-early-lexer",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs",
+    "crates/blaze-diagnostics/src/tests/lints/syntax/early/lexer.rs",
+    "crates/test-utils"
+  ],
+  "what": "## diagnostics-lints-syntax-early-lexer: `Debug` for arrays in minicore (test-utils, `crates/test-utils/src/minicore.rs`)\n\nWhat: in the `fmt` region's `// region:builtin_impls`, beside `impl<T: Debug> Debug for [T]`:\n\n```rust\nimpl<T: Debug, const N: usize> Debug for [T; N] {\n    fn fmt(&self, _f: &mut Formatter<'_>) -> Result {\n        Ok(())\n    }\n}\n```\n\nWhy: core has it, and `tests/ui/parser/unicode-control-codepoints.rs`\n(`crates/blaze-diagnostics/src/tests/lints/syntax/early/lexer.rs`,\n`codepoints_in_comments_and_literals_are_denied`) prints the valid byte string\n`br##\"us\\u{202B}e\\u{202A}r\"##` with `{:?}`. Without the impl, blaze gives an E0277 that rustc's\n`.stderr` doesn't have, and the test fails for a reason that isn't the lexer's.\n\n> forwarded to coordinator: `crates/test-utils/` is \"every other path\" in `crates.md`.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-lexer: `Debug` for arrays in minicore (test-utils, `crates/test-utils/src/minicore.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1657"
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `impl<T: Debug, const N: usize> Debug for [T; N]` beside `Debug for [T]` in fmt builtin_impls (same edit as 00487 item 3)."
+    }
+  ]
+}

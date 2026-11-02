@@ -3,12 +3,8 @@
 * text=auto eol=lf
 
 # Committed with CRLF on purpose (CRLF source a test or a build reads as is); git leaves them as they are.
-harness/breakers/cases/src/crlf_literal.rs -text
 crates/hir-def/src/nameres/tests/imports.rs -text
 crates/proc-macro-srv/src/bridge.rs -text
-vendor/proc-macro-srv/crates/proc-macro-srv/src/bridge.rs -text
-vendor/proc-macro-srv/crates/proc-macro-srv-cli/README.md -text
-
 crates/test-utils/bench_data/** binary
 
 # The standard library is upstream's bytes with blaze's changes (harness/library.py), not blaze's code.

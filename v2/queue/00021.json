@@ -1,0 +1,38 @@
+{
+  "id": "00021",
+  "from_lane": "speed-span-tt",
+  "owner": "format",
+  "paths": [
+    "crates/syntax-tree/src/flat.rs",
+    "docs/v2/plan/lanes/format/speed-span-tt.md",
+    "crates/syntax-bridge",
+    "crates/syntax-tree"
+  ],
+  "what": "## speed-span-tt: an in-order token walk of a flat tree (`crates/syntax-tree/src/flat.rs`)\n\nFrom `speed-span-tt`, for format-tree (live as format-edit). Notes:\n`docs/v2/plan/lanes/format/speed-span-tt.md`.\n\n`syntax_node_to_token_tree` on a flat node, through syntax-bridge's `FlatTokens`, reads every\ntoken of a macro input in order through `FlatTree::range(at)`. `range` computes `offset(at)` from\nthe last mark, which is up to `MARK` (8) `text_len` steps per token. That is the bridge's only\nper-token cost above O(1). Before this change it called `range` and then `token_text`, so the\ncost was paid twice; now it is paid once, with the text sliced from `text()`.\n\n1. **`FlatTree::tokens_in(&self, at: u32) -> impl Iterator<Item = (u32, TextRange)>`**: the tokens\n   and lazy nodes from `at` to `end(at)` in order, each with its range. It starts from\n   `offset(at)` once, then adds `text_len` as it goes, so each step is O(1). A lazy node gets its\n   range, and its text is skipped. Same ranges as `range(it)` for each `it`. Or make `text_len`\n   public, and the bridge keeps the running offset itself. Tell `speed-span-tt` or whoever owns\n   `crates/syntax-bridge/` then; `FlatTokens::next` is the only caller to change.\n\n> forwarded to format: `crates/syntax-tree/` is lane format's.",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T09:54:25Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/format.md#speed-span-tt: an in-order token walk of a flat tree (`crates/syntax-tree/src/flat.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:752"
+    },
+    {
+      "at": "2026-10-30T09:54:25Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:54:25Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Done by the request's second option: FlatTree::text_len is public (flat.rs) and syntax-bridge's FlatTokens::next keeps the running offset itself (crates/syntax-bridge/src/lib.rs, FlatTokens, with a debug_assert against range), so each token is O(1). No tokens_in needed. Checked by speed-sol2-format, 2026-10-30."
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "id": "00383",
+  "from_lane": "mem-codegen-unit",
+  "owner": "codegen",
+  "paths": [
+    "v2/release.rs",
+    "v2/statics.rs",
+    "v2/shape.rs",
+    "v2/side.rs",
+    "v2/backend.rs"
+  ],
+  "what": "## 3. Structs that gain a lifetime or an allocator parameter, and their callers\n\n> applied by codegen-v1 (2026-10-29): the `hir-ty-codegen` rows other than `v2/` (with `KeptLayouts` lifetime-free, see 1.4) and `emit_with(ctx, store, speed, relocs, lines)`.\n\n> applied by codegen-v2 (2026-10-29), in part: `Placer`, `Placed`, `convert::function(frame, ..)` and `convert::value(frame, ..)` and their callers in `v2/release.rs` and `v2/statics.rs` by codegen-v2-mem-v2a; the rest is the other owners'. Section 4 touches none of these files.\n\n> applied by codegen-v2 (2026-10-29), in part: `v2/shape.rs`'s `Out<'b>` and `Data<'f>`, `v2/side.rs`'s `Written*`, and the new parameters of `side::of`/`encode`, `shape::of`, `named`, `scoped` and `colocate`, with every caller in `v2/backend.rs`, by codegen-v2-mem-v2b; no signature declared in `v2.rs` changes. Section 4 touches none of codegen-v2-mem-v2b's files either.\n\n| struct | new parameter | callers that change |\n| --- | --- | --- |\n| `hir-ty-codegen` `FunctionCx<'cx, 'db>` | none new; gains `frame: &'cx Frame` | `build()` only (1.4). Every method keeps its signature. |\n| `GivenAway` | `GivenAway<'f>` | `FunctionCx::given_away`; the three users in 1.4 |\n| `KeptLayouts` | `KeptLayouts<'f>` | `build()`, `Layouts::new`, the test at 20011 |\n| `Layouts<'cx, 'db>` | none new; `kept: &'cx KeptLayouts<'cx>`, frame maps | `Layouts::new(&kept, frame)` in `build()` |\n| `Lent<P>` | `Lent<P, A: Allocator = Global>` | none: `Default` stays for `Global` |\n| `Placer<'a>` | `Placer<'a, A: Allocator = Global>` | `prepared` (`listed_in(.., frame)`); `place_requests` is generic over `A`. Every other caller is unchanged. |\n| `Placed<'a>` | none new; gains `frame: &'a Frame` | built only in `resolve`/`resolve_owning`; its users call `resolve.frame()` (`told`, `release::emitted`, `statics`) |\n| `v2/shape.rs` `Out` | `Out<'b>` | `of`, `value`, and helpers taking `&mut Out` (unchanged spelling) |\n| `v2/shape.rs` `Data` | `Data<'f>` | `of`, `value` |\n| `v2/side.rs` `Written*` | new, `'a`/`'f` | `encode`, `ranges`, `inlined_ranges`, `extend` |\n| `blaze-codegen` `Shape(Vec<u8>)` | becomes `Shape(ContentId)`, `Copy` | `shape::of`, `driver.rs:777`, `driver/tests.rs:151` |\n| `TemplateView<'a>`, `DataView<'a>`, `UnwindView<'a>` | new | `Template::view`, `blob::decode_view`, `stored_function` |\n\nNew or changed function parameters:\n\n- `convert::function(frame, ..)`, `convert::value(frame, ..)`;\n- `side::of(.., frame)`, `side::encode(.., frame)`;\n- `shape::of(unit, function, frame)`;\n- `named(.., frame)`, `scoped(.., frame)`, `colocate(.., frame)`;\n- `emit_with(ctx, store, relocs, lines)`;\n- `Lookup::get(key) -> Result<Option<Vec<u8>>, String>` becomes\n  `Lookup::read(key) -> Result<Option<&[u8]>, String>`, borrowed from the store, with no callback\n  and no new `dyn`;\n- `Out::side(&mut Emitted)`, `Out::template_of(Emitted)`.\n\nEvery caller is listed with its change above.\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:39:13Z",
+  "updated": "2026-10-31T20:50:36Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/mem-codegen-unit.md#3. Structs that gain a lifetime or an allocator parameter, and their callers",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-unit.md:4183"
+    },
+    {
+      "at": "2026-10-31T20:50:36Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:36Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In the tree: hir-ty-codegen frame_map.rs and lent.rs, FunctionCx and Layouts on a Frame (mod.rs), blaze-codegen backend.rs Shape(ContentId), Lookup::read borrowed (driver.rs), template.rs and blob.rs views, v2/shape.rs of(.., frame); hot_lint reads crates without src (hot_lint.py:220)."
+    }
+  ]
+}

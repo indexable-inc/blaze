@@ -1,0 +1,25 @@
+{
+  "id": "00196",
+  "from_lane": "solver-sync-interner",
+  "owner": "format",
+  "paths": [
+    "crates/intern/src/symbol/symbols.rs",
+    "docs/v2/plan/reference/crates.md",
+    "crates/intern"
+  ],
+  "what": "## 1. `intern`: a declared `anon` symbol\n\n- Where: `crates/intern/src/symbol/symbols.rs`, the `@PLAIN:` list, between `allow,` (`:200`)\n  and `any,` (`:201`).\n- What: add the line `    anon,`.\n- Why: the nightly's `inherent::Symbol` has `const SYM_ANON: Self` (rustc's `sym::anon`, what\n  `Region::get_name_or_anon` names an unnamed region). `next_solver/interner.rs` implements it as\n  `const SYM_ANON: Self = Symbol(sym::anon);`, which needs `intern::sym::anon` as a `const`;\n  the `@PLAIN` list gives exactly that. Its test `the_keyword_symbols_are_rustcs` checks the\n  text is `\"anon\"`. Owner: format (`docs/v2/plan/reference/crates.md`).\n\n> forwarded to format: `crates/intern/` is its.",
+  "state": "open",
+  "created": "2026-10-30T02:15:55Z",
+  "updated": "2026-10-30T02:15:55Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-interner.md#1. `intern`: a declared `anon` symbol",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-interner.md:6"
+    }
+  ]
+}

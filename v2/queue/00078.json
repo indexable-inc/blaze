@@ -1,0 +1,36 @@
+{
+  "id": "00078",
+  "from_lane": "db-ty-db",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src"
+  ],
+  "what": "## 8. Every sibling: new hir-ty queries need a kind\n\n`crates/hir-ty/src/db.rs` `kinds::ALL` lists every tracked function, tracked method, interned\nand input struct of `crates/hir-ty/src`, and its test `every_query_has_a_kind` scans the source\nfor them: a query added, renamed or removed (a batch query of db-ty-lower, a persisted cache of\ndb-ty-infer) needs its line there. Ask here and I add it; numbers are never reused.\n\n> forwarded to db: a note among lane db's children; nothing outside lane db.\n> checked by db-audit-dbsub-tysmall (22:33): a standing rule, true of the tree: `kinds::ALL` and its test `every_query_has_a_kind` at `crates/hir-ty/src/db.rs:1526`; no change asked.",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#8. Every sibling: new hir-ty queries need a kind",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:116"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): a standing rule, true of the tree: `kinds::ALL` and its test `every_query_has_a_kind` at `crates/hir-ty/src/db.rs:1526`; no change asked."
+    }
+  ]
+}

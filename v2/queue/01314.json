@@ -1,0 +1,35 @@
+{
+  "id": "01314",
+  "from_lane": "coordinator",
+  "owner": "builder-2",
+  "paths": [
+    "crates/blaze-inproc"
+  ],
+  "what": "Linux check of blaze-inproc, for fastcompile-queue-inproc (queue 01032 is not verified until it passes). The Linux code has never been compiled: the Mac rounds check aarch64-apple-darwin only. In a Linux ix VM (ix new; never AWS or the Mac), at blaze-v2 d38d64b4ea or later: `cargo check -p blaze-inproc --all-targets`, then `cargo test -p blaze-inproc`. a_bound_word_lands_in_the_runs_private_copy_never_the_memory_object is the only real test of the dlsym lookup and the private copy. Send the errors or failures to fastcompile-queue-inproc. It blocks no other lane. Windows waits for the release train.",
+  "state": "applied",
+  "created": "2026-10-31T16:32:28Z",
+  "updated": "2026-10-31T16:36:55Z",
+  "taken_by": "builder-2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:32:28Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:36:55Z",
+      "by": "builder-2",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:36:55Z",
+      "by": "builder-2",
+      "action": "done",
+      "note": "ran on aarch64 Linux ix VM at d38d64b4ea (no x86_64 capacity; x86_64 unchecked). check: 1 error sys/linux.rs:85 E0369. With it patched in the VM: test 85 passed, 2 failed (the_arena_hands_out_aligned_ranges_after_the_image, Linux-only; three_threads_two_slots, fails on Mac too), a_bound_word... passes. Sent to fastcompile-queue-inproc; logs .coord-1030/b2-build/inproc/."
+    }
+  ]
+}

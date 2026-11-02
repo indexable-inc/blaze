@@ -53,7 +53,6 @@ fn main() -> anyhow::Result<()> {
     let mut offered = vec![0; deps.len()];
     let queries = deps.iter().zip(&mut offered).map(|(dep, count)| {
         Box::pin(async move { registry.query(dep, QueryKind::Exact, &mut |_| *count += 1).await })
-            as Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>>
     });
     if one_at_a_time {
         queries.into_iter().try_for_each(block_on)?;
@@ -77,21 +76,21 @@ impl Wake for Unpark {
     }
 }
 
-fn block_on<T>(future: Pin<Box<dyn Future<Output = T> + '_>>) -> T {
+fn block_on<F: Future + Unpin>(future: F) -> F::Output {
     join(vec![future]).pop().unwrap()
 }
 
 /// Each of `futures` run to its end on this thread, as blaze-resolve's resolver runs its
 /// queries.
-fn join<T>(mut futures: Vec<Pin<Box<dyn Future<Output = T> + '_>>>) -> Vec<T> {
+fn join<F: Future + Unpin>(mut futures: Vec<F>) -> Vec<F::Output> {
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut cx = TaskContext::from_waker(&waker);
-    let mut done: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+    let mut done: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
     let mut left = futures.len();
     while left > 0 {
         for (future, out) in futures.iter_mut().zip(&mut done) {
             if out.is_none()
-                && let Poll::Ready(it) = future.as_mut().poll(&mut cx)
+                && let Poll::Ready(it) = Pin::new(future).poll(&mut cx)
             {
                 *out = Some(it);
                 left -= 1;

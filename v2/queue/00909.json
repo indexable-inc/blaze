@@ -1,0 +1,35 @@
+{
+  "id": "00909",
+  "from_lane": "fix-back",
+  "owner": "front-def",
+  "paths": [
+    "crates/hir-expand/src/inert_attr_macro.rs"
+  ],
+  "what": "crates/hir-expand/src/inert_attr_macro.rs lists `no_sanitize` (line ~237) but not `sanitize`, the built-in that replaced it in rustc (feature `sanitize`, on the pinned nightly-2026-10-27). So `#[sanitize(address = \"off\")]` resolves as a macro and fails (`unresolved macro sanitize`, 11 lines in fuzz/src/raw.rs in check22). hir-def attrs already know it (AttrFlags::HAS_SANITIZE) and blaze-diagnostics parses it. Add `sanitize` as a Normal gated (experimental!(sanitize)) inert attribute, as rustc builtin_attrs.rs has it.",
+  "state": "applied",
+  "created": "2026-10-30T09:38:34Z",
+  "updated": "2026-10-30T09:43:03Z",
+  "taken_by": "fix-fuzz",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:38:34Z",
+      "by": "fix-back",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:42:04Z",
+      "by": "fix-fuzz",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:43:03Z",
+      "by": "fix-fuzz",
+      "action": "done",
+      "note": "crates/hir-expand/src/inert_attr_macro.rs: no_sanitize entry replaced by gated sanitize (List template of rustc SanitizeParser at 16d1ffac1, feature sanitize); crates/intern/src/symbol/symbols.rs: declared symbol no_sanitize -> sanitize. Tests: hir-expand inert_attr_macro::tests::sanitize_replaced_no_sanitize, hir-def nameres::tests::sanitize_is_a_builtin_attribute_and_no_sanitize_is_not."
+    }
+  ]
+}

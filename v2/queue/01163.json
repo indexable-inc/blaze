@@ -1,0 +1,37 @@
+{
+  "id": "01163",
+  "from_lane": "no-fallback-link",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-ui/src/api.rs",
+    "crates/blaze-api/src/frames/identity.rs"
+  ],
+  "what": "no-fallback (Andrew 16:01, AGENTS.md rule 3) + speed's 01156: v2 prints no per-link line, so harness/bench.py can't tell a spliced edit from a full relink. blaze-cargo (no-fallback-link) now knows each link's outcome as a typed `serve::unit::codegen::Linking` { First, Spliced, Full(Full) }, Full = { Output(fields: the names of blaze_link::Output fields that differ from the kept image's, e.g. \"exports\", \"debug\"), NotIncremental }. Ask, in crates/blaze-api/src/lib.rs: add to `Worked` a field `links: Vec<Linked>` with `pub struct Linked { pub path: String, pub how: LinkHow }` and `pub enum LinkHow { First, Spliced, Full { why: Vec<String> } }` (why = the changed Output field names; [\"not incremental\"] for a release link), keep `link: LinkKind` (blaze-cargo sets it Placed iff any link is First or Full, else Patched). Bump SCHEMA; update frames/identity.rs's generator and session/tests.rs. In crates/blaze-ui/src/api.rs: print one line per link on the human output, always (not only with stats): `link: <path> (spliced)`, `link: <path> (first link)`, `link: <path> (not spliced: <why joined by \", \">)`; that is the line harness/bench.py `link_kind` parses (regex `^link: \\S+ \\((.*)\\)$`, in the client's stderr); and add `\"links\": [{\"path\":..,\"how\":\"spliced\"|\"first\"|\"full\",\"why\":[..]}]` to work_json. Tell no-fallback-link when it lands: it then fills `Worked.links` in crates/blaze-cargo/src/serve/job.rs `worked` (one line) and fixes blaze-cargo's cli/print tests' `Worked` literals.",
+  "state": "applied",
+  "created": "2026-10-30T23:12:49Z",
+  "updated": "2026-10-31T02:40:08Z",
+  "taken_by": "no-fallback-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:12:49Z",
+      "by": "no-fallback-link",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:40:07Z",
+      "by": "no-fallback-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:40:08Z",
+      "by": "no-fallback-link",
+      "action": "done",
+      "note": "taken from ci (no live window) at no-fallback lead word: blaze-api Worked.links/Linked/LinkHow, SCHEMA 16, frames/identity.rs, session tests; blaze-ui link_lines + work_json links; blaze-cargo cli/print.rs, job.rs fills links; bench.py fails an edit with no link line"
+    }
+  ]
+}

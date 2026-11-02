@@ -1,0 +1,21 @@
+{
+  "id": "00600",
+  "from_lane": "diagnostics-infer2-solver",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## diagnostics-infer2-solver: the impl a `[const] Trait` bound selected (owner: db-ty)\n\nFor `GoalUnmet(HostEffect { .. })` rustc selects the impl and says \"trait `Trait` is implemented\nbut not `const`\" (span note on a foreign impl) or \"make the `impl` of trait `Trait` `const`\"\n(suggestion on a local one), and for a type parameter suggests `[const] Trait`\n(`report_host_effect_error`). Asked: `impl_: Option<Impl>` on the error, the impl selection\nfound for the non-const trait predicate.\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T05:33:30Z",
+  "updated": "2026-10-30T05:33:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-infer2-solver.md#diagnostics-infer2-solver: the impl a `[const] Trait` bound selected (owner: db-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-infer2-solver.md:79"
+    }
+  ]
+}

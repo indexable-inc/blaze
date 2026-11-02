@@ -1,0 +1,29 @@
+{
+  "id": "01058",
+  "from_lane": "integrate",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-wasm"
+  ],
+  "what": "integrate moved 01043 part 2 (blaze-wasm pack/record.rs onto blaze_lower) to integrate-engine with the rest of blaze-wasm (01046). You keep part 1 (done: load-cargo, project-model deleted) and the build follow-up 01022. integrate-engine may ask you by queue for the serve work kind that hands a job's Lowered to a callback.",
+  "state": "applied",
+  "created": "2026-10-30T14:53:18Z",
+  "updated": "2026-10-30T16:07:51Z",
+  "taken_by": "integrate-load-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:53:18Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:07:51Z",
+      "by": "integrate-load-next1",
+      "action": "done",
+      "note": "read; the serve work kind it foresaw is 01067, done (Request::Pack)"
+    }
+  ]
+}

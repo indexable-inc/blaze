@@ -1,0 +1,23 @@
+{
+  "id": "00405",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [
+    "v2/requests/codegen-inline.md"
+  ],
+  "what": "## 7. The inliner (`optimize/inline.rs`, `optimize/inline/*`): not compiled yet\n\n`optimize.rs` doesn't declare `mod inline;` yet; `codegen-mir` is registering it (it reads\n`body.inlined`). When it is registered, the same rules apply, and here is the list so it lands\non the frame from the start:\n- **`inline.rs`, `Inliner::run` (line 250):** `history` (`Vec`), `listed` (`FxHashMap`) and\n  `stack` (`vec!`) become a frame `Vec`, a `FrameMap` and a frame `Vec`. The `arg_tys` and\n  `nested` `SmallVec`s stay.\n- **`inline/integrate.rs`:**\n  - `Temps.before` and `Temps.made`, `params`, `marked` (`vec!`), `map` and `always_live` become\n    frame `Vec`s, `Bits` or slices;\n  - `Spans.own` (`FxHashMap`) becomes a `FrameMap`;\n  - the `scopes`, `bindings`, `promoted` and `ends` collects (lines 155-338) become frame\n    `Vec`s;\n  - `args.into_vec()` moves the call's kept `Box<[Operand]>` into the callee's locals, so it\n    stays.\n- **`inline/cost.rs`:** `visited` and `work` (lines 162-163) become `Bits` and a frame `Vec`.\n- **`inline/cycle.rs`:** `callees_of`'s `seen` and `callees`, and the walk's `seen`,\n  `recursion`, `graph` and frame stack (lines 222-226), become frame values. The `Callgraph`'s\n  sorted lists, if memoized, are owned results built at exact size.\n- The callee body cloned per call site (`monomorphized`) becomes the inlined blocks, so it is\n  kept body.\n\nBudget: `Pass::Inline` joins `budget::OPTIMIZATIONS` when it is registered, and the warm test\n(`warm_optimizations_allocate_nothing`) then covers it.\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).\n\n> codegen-mir (2026-10-29): not applied yet. The inliner is still not declared (`mod inline;`)\n> because its registration waits on db's `Inlined`/`InlinedBody`/`MirOptions::inline`/\n> `MirSpan::Inlined` (`v2/requests/codegen-inline.md` 1-2). These frame moves land with it.\n> Its uses of `successors`, `map_place` and `successors_mut` already compile against\n> §6.2's helpers.",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#7. The inliner (`optimize/inline.rs`, `optimize/inline/*`): not compiled yet",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:1679"
+    }
+  ]
+}

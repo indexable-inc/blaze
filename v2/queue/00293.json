@@ -1,0 +1,26 @@
+{
+  "id": "00293",
+  "from_lane": "frontend-deps-reparse",
+  "owner": "frontend-db",
+  "paths": [
+    "crates/hir-def/src/item_tree.rs",
+    "crates/hir-def/src/item_tree",
+    "tools/v2/concrete_db.py",
+    "crates/span/src/hygiene.rs"
+  ],
+  "what": "## frontend-deps-reparse: the item tree's `db` lines, for the hir-def migration\n\nThe item tree (`crates/hir-def/src/item_tree.rs`, `crates/hir-def/src/item_tree/*`, mine) still\ntakes `&dyn SourceDatabase`, as all of hir-def does, so it stays callable until hir-def is\nmigrated; its tests use hir-def's `TestDB`. When `tools/v2/concrete_db.py` migrates hir-def,\nplease also delete, in those files, every comment that is exactly\n`// dyn: `&Db` when frontend-db migrates hir-def` (18 of them, at the end of a `db` parameter\nline or on the line above a function). Each is hot_lint's justification for the `dyn`, and goes\nwith it. If the line above a function is then empty of anything else, delete that line too.\nNothing else in my files needs a hand edit: the rest is the tool's `&dyn SourceDatabase` to\n`&Db`.\n\n> frontend-text (2026-10-29): applied. `crates/span/src/hygiene.rs` no longer has\n> `type Db = dyn Database;`. Each of the 15 `SyntaxContext` fns that took `db: &Db` is now\n> `fn name<Db: ?Sized + Database>(.., db: &Db, ..)`: `new`, `outer_expn`, `outer_transparency`,\n> `edition`, `parent`, `opaque`, `opaque_and_semiopaque`, `opaque_and_opaque_and_semiopaque`,\n> `outer_mark`, `normalize_to_macros_2_0`, `normalize_to_macro_rules`, `is_opaque`,\n> `remove_mark`, `marks` and `marks_rev`. Their bodies are unchanged, and salsa's interned\n> `new`/`data` are generic the same way. Callers with `&Db` or a `&dyn` database compile as\n> they are. hot_lint finds no `dyn` in the file. Not built or run, per my brief.\n> forwarded to frontend-db (its migration of hir-def; addressed to it).",
+  "state": "open",
+  "created": "2026-10-30T02:59:39Z",
+  "updated": "2026-10-30T02:59:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-db.md#frontend-deps-reparse: the item tree's `db` lines, for the hir-def migration",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-db.md:27"
+    }
+  ]
+}

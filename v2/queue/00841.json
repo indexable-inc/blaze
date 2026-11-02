@@ -1,0 +1,42 @@
+{
+  "id": "00841",
+  "from_lane": "frontend-tree",
+  "owner": "coordinator",
+  "paths": [
+    "crates/ide-db",
+    "crates/hir-ide",
+    "crates/blaze-engine",
+    "crates/blaze-cargo",
+    "crates/load-cargo",
+    "crates/blaze-doc",
+    "crates/blaze-wasm",
+    "crates/hir"
+  ],
+  "what": "frontend-tree: detach the build path from ide-db and hir-ide, so the syntax handle layer can be deleted.\n\nWhy: every build-path caller of the handle API is moved (frontend-tree-go-*). What is left is hir's handle Semantics, SourceAnalyzer, HasSource and symbols.rs, and the hir-expand/hir-def handle functions only they call (list: /tmp/blaze-lanes/v2-frontend-tree-go-expand.md, \"IDE-only list\"). They serve only ide-db and hir-ide. But those two crates are still build-path dependencies, so deleting the chain now would break the build:\n- ide-db: blaze-cargo, blaze-engine, load-cargo, blaze-doc and blaze-wasm. They mostly use ide_db::base_db::* re-exports (Crate, all_crates, relevant_crates, Env, process_env_var, salsa::Cancelled), which can import from base_db directly. Beyond that: ide_db::RootDatabase (blaze-engine 15, blaze-doc 7, blaze-wasm 1), which becomes base_db::Db, and ide_db::const_macro::{load, CONST_AST} (load-cargo, see also queue 00187).\n- hir-ide: hir (next_solver Mutability, Clause, TraitClause, Span::Dummy, mir::MirSpan, replace_errors_with_variables, type_or_const_param_idx).\n- blaze-engine/src/lib.rs callers_of_generic takes its callers from ide_db::defs::Definition::usages, so it needs a build-path caller index.\n\nAsk: at integration, (1) move those imports off ide-db and hir-ide, (2) delete crates/ide-db and crates/hir-ide, (3) hand back to frontend-tree. frontend-tree then deletes hir's handle Semantics chain, the IDE-only hir-expand/hir-def functions, and the handle layer in syntax/syntax-tree in one pass. Their reference tests become stored expectations. Until then no new code may call that chain.",
+  "state": "applied",
+  "created": "2026-10-30T08:44:49Z",
+  "updated": "2026-10-30T13:09:28Z",
+  "taken_by": "integrate-ide",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:44:49Z",
+      "by": "frontend-tree",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:41:35Z",
+      "by": "integrate-ide",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:09:28Z",
+      "by": "integrate-ide",
+      "action": "done",
+      "note": "ide-db deleted (git rm crates/ide-db, root Cargo.toml, Cargo.lock, blaze-wasm Cargo.lock). Users moved: ide_db::base_db -> base_db, RootDatabase -> base_db::Db, RootDatabaseExt -> db.files().X / krate.set_env / change.apply(db), const_macro -> hir::const_macro (hir_ty_mir::const_macro); callers_of_generic needed no new index (by_references oracle dropped, stored expectations kept); as_rustc known_feature by integrate-engine (00984). blaze-lints (00283) has no ide_db use. macros UpmapFromRaFixture derive and hir ConstParam::default_source_code deleted with it. hir-ide deleted too (code in hir-ty / hir-ty-mir, tests in hir-ty-mir/src/tests)."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "01259",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-def/src/deps/tests.rs",
+    "crates/hir-def/src/nameres/frozen.rs"
+  ],
+  "what": "qu-test1 (b7c951d585) vs main: against round 6 no test that passed fails (round 6 ran no hir-* binary); against round 5 (last main run of hir-*) 10 regressions, 188 fail on both, 8 fixed. (a) 8 expect snapshots print raw ids, which blaze_query numbers otherwise (Id(580)->Id(13312), SyntaxContext 2562->22529): hir-def expr_store::tests::body::block::nested_module_scoping, macro_expansion_tests::mbe::{test_match_group_pattern_with_multiple_defs,token_mapping_across_files,token_mapping_smoke_test}, nameres::tests::views::a_modules_source_views, src::tests::{child_source_view,use_tree_views}; hir-expand view_tests::walks_and_ranges_up. Re-bless the expectations (they are ids, not behavior). (b) 2 real: hir-def deps::tests::a_served_dependency_resolves_as_a_fresh_one (tests.rs:301, main Serve) and a_changed_read_misses_the_image_and_the_next_one_is_found (tests.rs:504): frozen.rs:1076 \"a module not in its def map\": a ModuleId reached from main is not a key of its crate_def_map(krate).table on the served database. The engine keeps a tracked struct id across its creator rerun (db/tracked.rs), so look at where the served path makes ModuleIds (decode of an image def map vs crate_def_map table, creator/occurrence of the ModuleIdLt). List: /tmp/qu-reg5.txt; log /Volumes/Projects/.coord-1030/qu-build/qu-test1.log.",
+  "state": "open",
+  "created": "2026-10-31T12:31:40Z",
+  "updated": "2026-10-31T12:31:40Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:31:40Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

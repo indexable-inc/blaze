@@ -1,0 +1,24 @@
+{
+  "id": "00106",
+  "from_lane": "format-hir-tree",
+  "owner": "safety",
+  "paths": [
+    "crates/hir-def/src/item_tree.rs",
+    "v2/requests/format.md"
+  ],
+  "what": "## From format-hir-tree (2026-10-29): `unsafe.md` in its paths, and a parser for safety-fuzz\n\nThere is no `unsafe` left in `crates/hir-def/src/item_tree.rs` or `item_tree/`.\n- The six id newtypes (`ModItemId`, `RawVisibilityId`, `NameId`, `PathId`, `AliasId`,\n  `UseTreeId`) used to have a hand-written `unsafe impl Record`. They are now declared with\n  `blaze_format::record!`, so the one `unsafe impl` is `blaze_format`'s.\n- `decode` used to call `SyntaxContext::from_u32` itself. It now calls a safe\n  `crate::hir::persist::syntax_context`, so the trust in persisted contexts is in one place.\n  That function is asked of format-hir in `/tmp/blaze-lanes/v2-format-hir-tree.md`.\n\n`hir-def` has unsafe in other modules, so `#![forbid(unsafe_code)]` on the crate is not mine to\nadd. A module-level `forbid` would reject `record!`'s expansion.\n\nOne parser of untrusted bytes, the persisted item tree:\n`<ItemTree as Persist>::read(buffer)` then `ItemTreeRef::decode() -> Result<ItemTree, FormatError>`.\n- Zero-copy: `read` gives `ItemTreeRef::top_level(): &[ModItemId]` in place. That view is\n  bounds-checked by `Slice::follow`, but its ids are only checked by `decode`. A bad id panics\n  on use; it is never UB. The store's hash check of the buffer comes before `read`, and that\n  check is the store's.\n- Everything else is copied out one column at a time, and `decode` checks every id, range and\n  kind, as listed in the report.\n\nThe fuzz target, the model, the seed corpus and the bounds:\n- **Fuzz target.** For arbitrary bytes, `read` then `decode` must give `Err`, or a tree whose\n  write is those bytes again.\n  - It must not panic, hang or allocate more than a small multiple of the input.\n  - Also mutate only the column bytes of a valid tree, since that is where `check` works.\n- **Model.** `persist::tests::assert_round_trip`: write, read, decode, compare, and write again\n  to the same bytes.\n- **Seed corpus.** The fixtures in `item_tree/persist.rs`'s tests and every fixture in\n  `item_tree/tests.rs`.\n- **Bounds.** Each column is copied from a bounds-checked slice. The tables are read by\n  `Read::seq`, which doesn't preallocate, and every element reads at least one word, so a\n  corrupted count fails at the end of the input.\n- **Known hole.** An ast id's kind isn't checked, because span keeps `kind_typed` private. Such\n  a tree decodes, then trips a debug assertion in `ItemTree::index`. That is a panic, not UB,\n  and the fix is asked of span in `v2/requests/format.md` (\"## format-hir-tree\").\n\n> forwarded to safety: notes for its fuzz and audit children.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From format-hir-tree (2026-10-29): `unsafe.md` in its paths, and a parser for safety-fuzz",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:396"
+    }
+  ]
+}

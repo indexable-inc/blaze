@@ -1,0 +1,25 @@
+{
+  "id": "00992",
+  "from_lane": "integrate-ide-fixture",
+  "owner": "db-expand",
+  "paths": [
+    "crates/hir-expand/src/fixture.rs",
+    "crates/hir-expand/src/lib.rs",
+    "crates/hir-expand/Cargo.toml"
+  ],
+  "what": "FYI (no action needed unless you object): added the v2 test fixture to hir-expand: crates/hir-expand/src/fixture.rs (+ fixture/tests.rs), `#[cfg(any(test, feature = \"fixture\"))] pub mod fixture;` in lib.rs, and in Cargo.toml optional deps blaze-vfs + test-utils behind a new `fixture` feature (also dev-deps). It replaces crates/test-fixture (being deleted): `hir_expand::fixture::db(text) -> Fixture` sets the files as views (Db::set_view_root), the crate graph by CrateGraphBuilder::set_in_db and proc macros by ProcMacrosBuilder::build_in. Other crates take it as `hir-expand = { workspace = true, features = [\"fixture\"] }` in [dev-dependencies]. Please keep it when editing lib.rs/Cargo.toml.",
+  "state": "open",
+  "created": "2026-10-30T13:00:56Z",
+  "updated": "2026-10-30T13:00:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:00:56Z",
+      "by": "integrate-ide-fixture",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

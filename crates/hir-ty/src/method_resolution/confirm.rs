@@ -1,6 +1,8 @@
 //! Confirmation step of method selection, meaning ensuring the selected candidate
 //! is valid and registering all obligations.
 
+use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
     FunctionId, GenericDefId, GenericParamId, TraitId,
     expr_store::path::{GenericArg as HirGenericArg, GenericArgs as HirGenericArgs},
@@ -18,6 +20,7 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, IncorrectGenericsLenKind, InferenceDiagnostic,
     LifetimeElisionKind, PointerCast, Span,
     db::HirDatabase,
+    generics::parent_generic_def,
     infer::{AllowTwoPhase, AutoBorrowMutability, ExplicitDropMethodUseKind, InferenceContext},
     lower::{
         GenericPredicates,
@@ -25,7 +28,7 @@ use crate::{
     },
     method_resolution::{CandidateId, MethodCallee, probe},
     next_solver::{
-        Binder, Clause, ClauseKind, Const, DbInterner, EarlyParamRegion, ErrorGuaranteed, FnSig,
+        Binder, ClauseKind, Const, DbInterner, EarlyParamRegion, ErrorGuaranteed, FnSig,
         GenericArg, GenericArgs, ParamConst, PolyExistentialTraitRef, PolyTraitRef, Region,
         TraitRef, Ty, TyKind, Unnormalized,
         infer::{
@@ -36,27 +39,29 @@ use crate::{
     },
 };
 
-struct ConfirmContext<'a, 'db> {
-    ctx: &'a mut InferenceContext<'db>,
+struct ConfirmContext<'a, 'db, 'f> {
+    ctx: &'a mut InferenceContext<'db, 'f>,
     candidate: FunctionId,
     call_expr: ExprId,
 }
 
 #[derive(Debug)]
-pub(crate) struct ConfirmResult<'db> {
+pub(crate) struct ConfirmResult<'db, 'f> {
     pub(crate) callee: MethodCallee<'db>,
-    pub(crate) illegal_sized_bound: bool,
-    pub(crate) adjustments: Box<[Adjustment]>,
+    /// rustc's `Option<Span>` of the `Self: Sized` bound on a trait object: whose own clauses
+    /// hold it, or `None` in it where only elaboration gives it (rustc's `DUMMY_SP`).
+    pub(crate) illegal_sized_bound: Option<Option<GenericDefId>>,
+    pub(crate) adjustments: Vec<Adjustment, &'f Frame>,
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn confirm_method(
         &mut self,
         pick: &probe::Pick<'db>,
         unadjusted_self_ty: Ty<'db>,
         expr: ExprId,
-        generic_args: Option<&HirGenericArgs>,
-    ) -> ConfirmResult<'db> {
+        generic_args: Option<HirGenericArgs<'_>>,
+    ) -> ConfirmResult<'db, 'f> {
         debug!(
             "confirm(unadjusted_self_ty={:?}, pick={:?}, generic_args={:?})",
             unadjusted_self_ty, pick, generic_args,
@@ -70,17 +75,17 @@ impl<'db> InferenceContext<'db> {
     }
 }
 
-impl<'a, 'db> ConfirmContext<'a, 'db> {
+impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
     fn new(
-        ctx: &'a mut InferenceContext<'db>,
+        ctx: &'a mut InferenceContext<'db, 'f>,
         candidate: FunctionId,
         call_expr: ExprId,
-    ) -> ConfirmContext<'a, 'db> {
+    ) -> ConfirmContext<'a, 'db, 'f> {
         ConfirmContext { ctx, candidate, call_expr }
     }
 
     #[inline]
-    fn db(&self) -> &'db dyn HirDatabase {
+    fn db(&self) -> &'db Db {
         self.ctx.table.infer_ctxt.interner.db
     }
 
@@ -98,8 +103,8 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
         &mut self,
         unadjusted_self_ty: Ty<'db>,
         pick: &probe::Pick<'db>,
-        generic_args: Option<&HirGenericArgs>,
-    ) -> ConfirmResult<'db> {
+        generic_args: Option<HirGenericArgs<'_>>,
+    ) -> ConfirmResult<'db, 'f> {
         // Adjust the self expression the user provided and obtain the adjusted type.
         let (self_ty, adjustments) = self.adjust_self_ty(unadjusted_self_ty, pick);
 
@@ -135,11 +140,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
                 }
             },
         );
-        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(
-            GenericPredicates::query_all(self.db(), self.candidate.into())
-                .iter_instantiated(self.interner(), filler_args.as_slice())
-                .map(Unnormalized::skip_norm_wip),
-        );
+        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(filler_args);
 
         // Unify the (adjusted) self type with what the method expects.
         //
@@ -163,7 +164,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
         // Add any trait/regions obligations specified on the method's type parameters.
         // We won't add these if we encountered an illegal sized bound, so that we can use
         // a custom error in that case.
-        if !illegal_sized_bound {
+        if illegal_sized_bound.is_none() {
             self.add_obligations(method_sig, all_args, method_predicates);
         }
 
@@ -179,18 +180,19 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
         &mut self,
         unadjusted_self_ty: Ty<'db>,
         pick: &probe::Pick<'db>,
-    ) -> (Ty<'db>, Box<[Adjustment]>) {
+    ) -> (Ty<'db>, Vec<Adjustment, &'f Frame>) {
+        let frame = self.ctx.frame;
         // Commit the autoderefs by calling `autoderef` again, but this
         // time writing the results into the various typeck results.
         let mut autoderef =
             self.ctx.table.autoderef_with_tracking(unadjusted_self_ty, self.call_expr.into());
         let Some((mut target, n)) = autoderef.nth(pick.autoderefs) else {
-            return (Ty::new_error(self.interner(), ErrorGuaranteed), Box::new([]));
+            return (Ty::new_error(self.interner(), ErrorGuaranteed), Vec::new_in(frame));
         };
         assert_eq!(n, pick.autoderefs);
 
         let mut adjustments =
-            self.ctx.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok());
+            self.ctx.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok(frame));
         match pick.autoref_or_ptr_adjustment {
             Some(probe::AutorefOrPtrAdjustment::Autoref { mutbl, unsize }) => {
                 let region = self.infcx().next_region_var(self.call_expr.into());
@@ -241,7 +243,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
             None => {}
         }
 
-        (target, adjustments.into_boxed_slice())
+        (target, adjustments)
     }
 
     /// Returns a set of generic parameters for the method *receiver* where all type and region
@@ -312,7 +314,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
 
     fn extract_existential_trait_ref<R, F>(&self, self_ty: Ty<'db>, mut closure: F) -> R
     where
-        F: FnMut(&ConfirmContext<'a, 'db>, Ty<'db>, PolyExistentialTraitRef<'db>) -> R,
+        F: FnMut(&ConfirmContext<'a, 'db, 'f>, Ty<'db>, PolyExistentialTraitRef<'db>) -> R,
     {
         // If we specified that this is an object method, then the
         // self-type ought to be something that can be dereferenced to
@@ -345,16 +347,16 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
 
     fn instantiate_method_args(
         &mut self,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         parent_args: GenericArgs<'db>,
     ) -> GenericArgs<'db> {
-        struct LowererCtx<'a, 'db> {
-            ctx: &'a mut InferenceContext<'db>,
+        struct LowererCtx<'a, 'db, 'f> {
+            ctx: &'a mut InferenceContext<'db, 'f>,
             expr: ExprId,
             parent_args: &'a [GenericArg<'db>],
         }
 
-        impl<'db> GenericArgsLowerer<'db> for LowererCtx<'_, 'db> {
+        impl<'db> GenericArgsLowerer<'db> for LowererCtx<'_, 'db, '_> {
             fn report_len_mismatch(
                 &mut self,
                 def: GenericDefId,
@@ -385,6 +387,13 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
                 });
             }
 
+            fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, _hard_error: bool) {
+                self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallLateBoundLifetimeArgs {
+                    expr: self.expr,
+                    def,
+                });
+            }
+
             fn provided_kind(
                 &mut self,
                 param_id: GenericParamId,
@@ -412,13 +421,22 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
 
             fn provided_type_like_const(
                 &mut self,
-                _type_ref: TypeRefId,
+                type_ref: TypeRefId,
                 _const_ty: Ty<'db>,
                 arg: TypeLikeConst<'_>,
             ) -> Const<'db> {
                 match arg {
-                    TypeLikeConst::Path(path) => self.ctx.make_path_as_const(path),
-                    TypeLikeConst::Infer => self.ctx.table.next_const_var(Span::Dummy),
+                    // Resolved where the call is, as a path expression is: a `let` binding
+                    // before it is in scope there and not at the block's start.
+                    TypeLikeConst::Path(path) => {
+                        let ctx = &mut *self.ctx;
+                        let guard =
+                            ctx.resolver.update_to_inner_scope(ctx.db, ctx.store_owner, self.expr);
+                        let konst = ctx.make_path_as_const(path, type_ref);
+                        ctx.resolver.reset_to_guard(guard);
+                        konst
+                    }
+                    TypeLikeConst::Infer => self.ctx.table.next_const_var(type_ref.into()),
                 }
             }
 
@@ -460,6 +478,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
             }
         }
 
+        let frame = self.ctx.frame;
         substs_from_args_and_bindings(
             self.db(),
             self.ctx.store,
@@ -474,6 +493,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
                 expr: self.call_expr,
                 parent_args: parent_args.as_slice(),
             },
+            frame,
         )
     }
 
@@ -562,21 +582,32 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
 
     fn predicates_require_illegal_sized_bound(
         &self,
-        predicates: impl Iterator<Item = Clause<'db>>,
-    ) -> bool {
-        let Some(sized_def_id) = self.ctx.lang_items.Sized else {
-            return false;
+        filler_args: GenericArgs<'db>,
+    ) -> Option<Option<GenericDefId>> {
+        let sized_def_id = self.ctx.lang_items.Sized?;
+        let predicates = GenericPredicates::query(self.db(), self.candidate.into());
+        let clauses = || {
+            predicates
+                .all_predicates()
+                .iter_instantiated(self.interner(), filler_args.as_slice())
+                .map(Unnormalized::skip_norm_wip)
         };
 
-        elaborate(self.interner(), predicates)
+        let clause = elaborate(self.interner(), clauses())
             // We don't care about regions here.
-            .filter_map(|pred| match pred.kind().skip_binder() {
-                ClauseKind::Trait(trait_pred) if trait_pred.def_id().0 == sized_def_id => {
-                    Some(trait_pred)
+            .find(|pred| match pred.kind().skip_binder() {
+                ClauseKind::Trait(trait_pred) => {
+                    trait_pred.def_id().0 == sized_def_id
+                        && matches!(trait_pred.self_ty().kind(), TyKind::Dynamic(..))
                 }
-                _ => None,
-            })
-            .any(|trait_pred| matches!(trait_pred.self_ty().kind(), TyKind::Dynamic(..)))
+                _ => false,
+            })?;
+        let at = clauses().position(|it| it == clause);
+        Some(at.map(|at| match at < predicates.own_predicates_start as usize {
+            true => parent_generic_def(self.db(), self.candidate.into())
+                .expect("a function with its parent's clauses is in a trait or impl"),
+            false => self.candidate.into(),
+        }))
     }
 
     fn check_for_illegal_method_calls(&self) {

@@ -1,0 +1,24 @@
+{
+  "id": "01449",
+  "from_lane": "may-suspend-lint",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-lint-defs/src/lints.rs",
+    "Cargo.toml"
+  ],
+  "what": "Register and turn on the new blaze lint `blaze::fiber_boundary` (crates/blaze-lints/src/blaze/fiber.rs, docs/v2/plan/lanes/may-suspend/fiber-boundary.md). (1) crates/blaze-lint-defs/src/lints.rs: append to the `BLAZE` table `l(\"blaze::fiber_boundary\", Allow, \"detects a path to blaze's fibers or corosensei outside `blaze_graph::sched`\")` so `#[deny(blaze::fiber_boundary)]` is not an unknown lint. (2) root Cargo.toml: add a `[workspace.lints.blaze]` table with `fiber_boundary = \"deny\"` (none exists yet; blaze-lints reads `[lints.blaze]` in crates/blaze-lints/src/manifest.rs and level.rs, so members with `[lints] workspace = true` pick it up). Land (2) only after lane sched moves crates/blaze-graph/src/pump.rs, crates/blaze-query/src/lib.rs and crates/blaze-query/src/db.rs onto sched:: re-exports, or the tree fails its own lint.",
+  "state": "open",
+  "created": "2026-11-01T03:57:05Z",
+  "updated": "2026-11-01T03:57:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:57:05Z",
+      "by": "may-suspend-lint",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

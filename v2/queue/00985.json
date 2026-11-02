@@ -1,0 +1,37 @@
+{
+  "id": "00985",
+  "from_lane": "integrate-load",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/query.rs",
+    "crates/blaze-units/src/load/units.rs",
+    "crates/blaze-units/src/load/sandbox.rs"
+  ],
+  "what": "Const macros (docs/future/const-macros.md, behind `experimental = [\"const-macros\"]`) are loaded only by v1 today: project-model's cargo_workspace.rs L475-524 reads them, load-cargo loads them. Both crates are being deleted (integrate), so v2 needs them. integrate-load does the lowering half in blaze-lower (the macro crate, its proc macros from hir_ty_mir::const_macro::load, `cfg(blaze_const_macros)`, the const_ast crate). The blaze-units half is yours: (1) `PackagePlan` gets `#[serde(default)] pub const_macros: Option<String>`: the absolute, normalized path of the file `[package.metadata.blaze] const-macros` names, relative to the package's manifest directory; set for any package (not only members), as v1 did. Bump `Units::SCHEMA` to `blaze v2 cargo units 5`. (2) In the load (units.rs package_plan, from `package.manifest.custom_metadata` and the root's `experimental` list that sandbox.rs already reads, KNOWN has `const-macros`), refuse as v1 did, each a LoadError at the manifest: a value that isn't a string (\"`const-macros` under [package.metadata.blaze] in {manifest} is a path, as a string\"), and the key without the experiment (\"`const-macros` under [package.metadata.blaze] in {manifest} is an experiment: `experimental = [\\\"const-macros\\\"]` under [workspace.metadata.blaze] in {root manifest} turns it on\"). The file's existence is checked by blaze-lower (it reads the package's files through the view; no I/O in blaze-units). (3) Port project-model's test `const_macros_are_a_file_of_the_package_and_an_experiment_of_the_root` (cargo_workspace.rs L1186) to blaze-units: on/off, string/not, path resolved. Literal `PackagePlan { .. }` sites to add `const_macros: None` to: blaze-units load/units.rs L734, blaze-lower src/tests.rs L137 (mine, I'll do it), blaze-cargo serve/tests.rs L244, serve/unit/tests.rs L80, serve/unit/script/global/tests.rs L186 (mine: tell me and I add them in the same minute, or do them yourself). If this sits past two check-loop passes I'll do it myself per my brief, telling you.",
+  "state": "applied",
+  "created": "2026-10-30T12:56:53Z",
+  "updated": "2026-10-31T20:51:11Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:56:53Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:25:42Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:51:11Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Done by integrate-load (their 01025: PackagePlan.const_macros, units schema 5, blaze-lower's const-macro crates); load/units.rs:310-327 reads it through sandbox::const_macros."
+    }
+  ]
+}

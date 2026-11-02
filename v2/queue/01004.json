@@ -1,0 +1,25 @@
+{
+  "id": "01004",
+  "from_lane": "item-hash",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/debuginfo",
+    "crates/hir-ty-codegen/v2/side.rs",
+    "crates/blaze-link"
+  ],
+  "what": "Andrew (via coordinator): debug info off the edit path, design docs/v2/plan/design/item-hash.md section 13. Line rows and variable names as a debug record keyed by (code hash, presentation hash); patch identity (patch.rs Mark::of_function lines) leaves them out; the link step writes only a debug map (Apple N_OSO style); the daemon builds records after the edit at low priority or serves them lazily (split DWARF .dwo materialized on open, debuginfod-style by build ID on a user-only socket; lldb debug-map objects on macOS). An edit never waits on them; records byte-identical to a fresh build.",
+  "state": "open",
+  "created": "2026-10-30T13:22:19Z",
+  "updated": "2026-10-30T13:22:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:22:19Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -51,12 +51,30 @@ pub(super) fn item_or_macro(
     is_in_extern: bool,
     is_in_trait: bool,
 ) {
+    stdx::ensure_sufficient_stack(|| {
+        item_or_macro_here(p, stop_on_r_curly, is_in_extern, is_in_trait, true)
+    })
+}
+
+/// One item and no more, as a macro's `$i:item` takes it: a `;` after the item is the
+/// macro's next token (`($i:item ; $l:lifetime)`), not a stray one of a list of items.
+pub(super) fn item_fragment(p: &mut Parser<'_>) {
+    stdx::ensure_sufficient_stack(|| item_or_macro_here(p, true, true, false, false))
+}
+
+fn item_or_macro_here(
+    p: &mut Parser<'_>,
+    stop_on_r_curly: bool,
+    is_in_extern: bool,
+    is_in_trait: bool,
+    stray_semicolon: bool,
+) {
     let m = p.start();
     attributes::outer_attrs(p);
 
     let m = match opt_item(p, m, is_in_extern, is_in_trait) {
         Ok(()) => {
-            if p.at(T![;]) {
+            if stray_semicolon && p.at(T![;]) {
                 p.err_and_bump(
                     "expected item, found `;`\n\
                      consider removing this semicolon",
@@ -172,6 +190,9 @@ pub(super) fn opt_item(
         has_mods = true;
     }
 
+    // rustc's `parse_item_kind` reads `unsafe mod` as a module, which AST validation refuses.
+    let is_unsafe_mod = !has_mods && p.at(T![unsafe]) && p.nth(1) == T![mod];
+
     // test_err unsafe_block_in_mod
     // fn foo(){} unsafe { } fn bar(){}
     if p.at(T![unsafe]) && p.nth(1) != T!['{'] {
@@ -241,6 +262,11 @@ pub(super) fn opt_item(
     // items
     match p.current() {
         T![fn] => fn_(p, m, is_in_trait),
+
+        // test unsafe_mod
+        // unsafe mod m {}
+        // pub unsafe mod n;
+        T![mod] if is_unsafe_mod => mod_item(p, m),
 
         T![const] if p.nth(1) != T!['{'] => consts::konst(p, m),
         T![static] if matches!(p.nth(1), IDENT | T![_] | T![mut]) => consts::static_(p, m),
@@ -480,7 +506,12 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     // test fn_decl
     // trait T { fn foo(); }
     if !p.eat(T![;]) {
-        expressions::block_expr(p);
+        // An outline skips the body, or parses it, and all in it, in full: the same tree
+        // either way (`crate::outline`).
+        match p.lazy_body() {
+            Some(n_tokens) => p.bump_lazy(BLOCK_EXPR, n_tokens),
+            None => p.in_full(expressions::block_expr),
+        }
     }
     m.complete(p, FN);
 }
@@ -516,6 +547,10 @@ pub(super) fn macro_call_after_excl(p: &mut Parser<'_>) -> BlockLike {
 }
 
 pub(crate) fn token_tree(p: &mut Parser<'_>) {
+    stdx::ensure_sufficient_stack(|| token_tree_here(p))
+}
+
+fn token_tree_here(p: &mut Parser<'_>) {
     let closing_paren_kind = match p.current() {
         T!['{'] => T!['}'],
         T!['('] => T![')'],

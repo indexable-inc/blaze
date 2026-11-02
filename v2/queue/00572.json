@@ -1,0 +1,40 @@
+{
+  "id": "00572",
+  "from_lane": "db-expand-inputs2",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/v2/crates.rs",
+    "crates/blaze-units/src/stdlib/target.rs",
+    "crates/project-model/src/toolchain_info/target_data.rs",
+    "crates/base-db/src/input.rs",
+    "v2/requests/cargo.md",
+    "crates/base-db/src/target.rs"
+  ],
+  "what": "## db-expand-inputs2: a dependency's `priv` flag, and the target tuple and `has_thumb_interworking` (cargo, crates/load-cargo/src/v2/crates.rs, crates/blaze-units/src/stdlib/target.rs, crates/project-model/src/toolchain_info/target_data.rs)\n\nWhat: cargo fills the new base-db fields of db-expand tasks 19 and 23. Both are in the crate's\ncontent id already.\n\n1. `crates/load-cargo/src/v2/crates.rs:278`, `dependency`: cargo passes `--extern priv:name`\n   for a dependency whose unit-graph `public` is `Some(false)` (`-Zpublic-dependency`):\n\n```rust\nlet private = dep.public == Some(false);\nOk(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std).with_private(private))\n```\n\n   (`Dependency::with_private(self, bool) -> Self` and `is_private(&self) -> bool`,\n   `crates/base-db/src/input.rs`.) Test: a unit whose dep has `public: Some(false)` gives a\n   dependency with `is_private()`; `None` and `Some(true)` do not.\n\n2. `crates/blaze-units/src/stdlib/target.rs`, beside the `data_layout` of request 12 in\n   `v2/requests/cargo.md`: `pub fn has_thumb_interworking(triple: &str) -> Result<bool, String>`,\n   the recorded spec's `\"has-thumb-interworking\"` (`#[serde(rename = \"has-thumb-interworking\",\n   default)] has_thumb_interworking: bool` on `Spec`; rustc's spec JSON leaves out a field that\n   is false, so a missing key is `false`), with the same error as `data_layout` for a triple\n   with no recorded spec. None of the three recorded specs (`rustc.json` `target_spec_json`)\n   has the key today; recording an ARM spec makes it true there.\n\n3. `crates/load-cargo/src/v2/crates.rs:94`, `workspace_data`:\n\n```rust\ntarget: Ok(TargetData {\n    tuple: Symbol::intern(triple),\n    data_layout: data_layout.into_boxed_str(),\n    arch,\n    has_thumb_interworking: target::has_thumb_interworking(triple)\n        .map_err(|what| LowerError::at(what, triple))?,\n}),\n```\n\n4. `crates/project-model/src/toolchain_info/target_data.rs:49` (compiles against the struct\n   until project-model is removed): add `#[serde(rename = \"has-thumb-interworking\", default)]\n   has_thumb_interworking: bool` to its `TargetSpec`, and to the literal\n   `has_thumb_interworking: target_spec.has_thumb_interworking` and `tuple`: `target` when\n   given, else the `host:` line of the same tool's `-vV` (the spec JSON has no tuple; its\n   `llvm-target` differs from it on Apple targets, so it is not the tuple), as\n   `intern::Symbol::intern(..)`.\n\nWhy: `TargetData` (`crates/base-db/src/target.rs`) now has `tuple: Symbol` and\n`has_thumb_interworking: bool` (`DOMAIN` \"blaze v2 target data 2\"): rustc's\n`UnsupportedInstructionSet` names the tuple and is given only without thumb interworking\n(diagnostics' request \"diagnostics-items-attrs\"). Every `TargetData { .. }` literal without\nthem stops compiling.\n\n> forwarded to cargo (told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-inputs2: a dependency's `priv` flag, and the target tuple and `has_thumb_interworking` (cargo, crates/load-cargo/src/v2/crates.rs, crates/blaze-units/src/stdlib/target.rs, crates/project-model/src/toolchain_info/target_data.rs)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:618"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "item 2 in the tree (blaze-units stdlib/target.rs:951 has_thumb_interworking, blaze-lower crates.rs:88). Item 1 left as is on purpose: cargo passes --extern priv: only when -Zpublic-dependency or cargo-features public-dependency is on and the target is a lib. blaze-manifest drops every dependency's public (manifest.rs:913, cargo's rule without the feature) and blaze refuses -Z public-dependency, so no dependency is ever private under blaze, as under cargo. The unit graph's public is Some(false) for every dependency (cargo prints it so on a nightly), so keying on it would mark every dependency private and fire exported_private_dependencies where rustc does not."
+    }
+  ]
+}

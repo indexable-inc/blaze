@@ -1,0 +1,23 @@
+{
+  "id": "00781",
+  "from_lane": "db-ty",
+  "owner": "db-apply-34",
+  "paths": [
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "## db-apply-34 (`crates/hir-ty/src/lower.rs`, while it is in `type_alias_bounds_in`; from db-ty, 2026-10-30 01:20): the source of each item bound of an associated type\n\nFor E0038's `SelfReferential` note on an associated type's bound (rustc's `bounds_reference_self` spans). db-ty's `dyn_compatibility::ViolationSite::AssocTypeBound { alias, index }` indexes `type_alias_bounds(alias)` (`SelfAndAssocBounds::all_bounds`). hir can't map it to syntax because nothing records which written bound each clause came from.\n\nWanted, as `predicate_sources` does for `GenericPredicates`, from the same pass so the order cannot drift:\n- `pub enum AliasBoundSource { Written(u32), Parent(u32), ImplicitSized }`:\n  - `Written` is an index into `TypeAliasSignature::bounds`;\n  - `Parent` is an index into `GenericPredicates::query_all(trait)`, which is `query_explicit`'s index plus one when the trait has its implied `Self: Trait`;\n  - `ImplicitSized` is the `implicit_sizedness_trait` bound.\n- `pub fn type_alias_bound_sources(db, alias) -> Vec<AliasBoundSource>`, one entry per clause of `all_bounds`, in its order. `type_alias_bounds_in` takes `sources: Option<&mut Vec<AliasBoundSource>>`, keeping one list for self bounds and one for assoc-type bounds as it splits them, and appending them in the order `bounds` ends up in (self, then assoc). The `const_bounds` tail is not in `all_bounds`, so it needs none.\n- `type_alias_bounds_with_diagnostics` passes `None`, so the memo is unchanged. Re-export `type_alias_bound_sources` and `AliasBoundSource` from `lib.rs` beside `predicate_sources`.\n\nOnce it lands, db-ty maps it in hir (`Trait::dyn_compatibility_violation_sites`) and removes `DynCompatibilitySite::AssocTypeBound`. Tell db-ty by tmux.\n\nStatus: open.\n\n> forwarded to db-apply-34 (`hir-ty/src/lower.rs` is db's, not DONE); told by tmux (requests, pass 46).",
+  "state": "open",
+  "created": "2026-10-30T08:20:00Z",
+  "updated": "2026-10-30T08:20:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#db-apply-34 (`crates/hir-ty/src/lower.rs`, while it is in `type_alias_bounds_in`; from db-ty, 2026-10-30 01:20): the source of each item bound of an associated type",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:3203"
+    }
+  ]
+}

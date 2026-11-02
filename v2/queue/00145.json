@@ -1,0 +1,35 @@
+{
+  "id": "00145",
+  "from_lane": "fix-intrinsics-sweep",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/hir-ty-share"
+  ],
+  "what": "## To fastcompile-ident-share (`crates/hir-ty-share/`)\n\n`src/lib.rs` declares `mod intrinsics` (`classify`, `Class`) and\n`Unshared::UnknownIntrinsic(String)`, but `src/intrinsics.rs` does not exist. Write it as an\nexhaustive `match` on `hir_ty::intrinsic::Intrinsic` (from `TerminatorKind::Call::intrinsic`, or\n`intrinsic_of` with only a `FunctionId`), not a table by name; an unknown name is\n`intrinsic_of`'s `Err(UnknownIntrinsic)`.\n\n> forwarded to fastcompile: fastcompile-ident-share is its child.",
+  "state": "applied",
+  "created": "2026-10-30T01:48:06Z",
+  "updated": "2026-10-30T14:24:29Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/fix-intrinsics-sweep.md#To fastcompile-ident-share (`crates/hir-ty-share/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fix-intrinsics-sweep.md:32"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "In the tree: crates/hir-ty-share/src/intrinsics.rs, classify() is one exhaustive match over hir_ty::intrinsic::Intrinsic (Class::{Layout,Identity,PerInstance}); an unknown name is intrinsic_of's Err, mapped at walk.rs:922 to Unshared::UnknownIntrinsic."
+    }
+  ]
+}

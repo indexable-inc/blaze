@@ -1,0 +1,168 @@
+; Shaped like what hir-ty-codegen makes for `u128::wrapping_mul`, `u128 / u128` and
+; `u128 % u128`: the multiply is `imul.i128`; the division is a call to compiler-builtins'
+; `__udivti3`/`__umodti3` (hir-ty-codegen calls them by name for `i128` division) after the
+; debug check for a zero divisor, which branches to a cold block calling
+; `core::panicking::panic_const::panic_const_div_by_zero`. Here the builtins are CLIF too:
+; `__udivmodti4` is a restoring division, one quotient bit per turn of a 128-turn loop,
+; storing the remainder through its third argument when that is not null.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %mul_u128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+    v2 = imul v0, v1
+    return v2
+}
+; run: %mul_u128(0, 5) == 0
+; run: %mul_u128(6, 7) == 42
+; run: %mul_u128(-1, -1) == 1
+; run: %mul_u128(-1, 2) == -2
+; run: %mul_u128(0x100000000, 0x100000000) == 0x10000000000000000
+; run: %mul_u128(0x10000000000000000, 0x10000000000000000) == 0
+; run: %mul_u128(0xffffffffffffffff, 0xffffffffffffffff) == 0xfffffffffffffffe0000000000000001
+; run: %mul_u128(0x123456789abcdef0, 0x10) == 0x123456789abcdef00
+; run: %mul_u128(3, 0x55555555555555555555555555555555) == -1
+; run: %mul_u128(0xffffffffffffffff0000000000000000, 2) == 0xfffffffffffffffe0000000000000000
+; run: %mul_u128(0x80000000000000000000000000000000, 3) == 0x80000000000000000000000000000000
+
+function %__udivmodti4(i128, i128, i64) -> i128 {
+block0(v0: i128, v1: i128, v2: i64):
+    v3 = iconst.i64 0
+    v4 = uextend.i128 v3
+    v5 = iconst.i32 128
+    jump block1(v4, v4, v0, v5)
+
+block1(v6: i128, v7: i128, v8: i128, v9: i32):
+    v10 = iconst.i32 1
+    v11 = ishl v7, v10
+    v12 = iconst.i32 127
+    v13 = ushr v8, v12
+    v14 = bor v11, v13
+    v15 = ishl v8, v10
+    v16 = ishl v6, v10
+    v17 = isub v9, v10
+    v18 = icmp uge v14, v1
+    brif v18, block2, block3(v16, v14)
+
+block2:
+    v19 = isub v14, v1
+    v20 = iconst.i64 1
+    v21 = uextend.i128 v20
+    v22 = bor v16, v21
+    jump block3(v22, v19)
+
+block3(v23: i128, v24: i128):
+    brif v17, block1(v23, v24, v15, v17), block4
+
+block4:
+    brif v2, block5, block6
+
+block5:
+    store notrap aligned v24, v2
+    jump block6
+
+block6:
+    return v23
+}
+
+function %__udivti3(i128, i128) -> i128 {
+    fn0 = %__udivmodti4(i128, i128, i64) -> i128
+
+block0(v0: i128, v1: i128):
+    v2 = iconst.i64 0
+    v3 = call fn0(v0, v1, v2)
+    return v3
+}
+; run: %__udivti3(100, 7) == 14
+; run: %__udivti3(5, 10) == 0
+; run: %__udivti3(0, 1) == 0
+; run: %__udivti3(-1, 1) == -1
+; run: %__udivti3(-1, -1) == 1
+; run: %__udivti3(-2, -1) == 0
+; run: %__udivti3(-1, 0x10000000000000000) == 0xffffffffffffffff
+; run: %__udivti3(0x10000000000000000, 0x100000000) == 0x100000000
+; run: %__udivti3(0x80000000000000000000000000000000, 3) == 0x2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+; run: %__udivti3(0x80000000000000000000000000000000, 0x80000000000000000000000000000001) == 0
+; run: %__udivti3(-1, 0x80000000000000000000000000000001) == 1
+; run: %__udivti3(0xfffffffffffffffe0000000000000001, 0xffffffffffffffff) == 0xffffffffffffffff
+
+function %__umodti3(i128, i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+    fn0 = %__udivmodti4(i128, i128, i64) -> i128
+
+block0(v0: i128, v1: i128):
+    v2 = stack_addr.i64 ss0
+    v3 = call fn0(v0, v1, v2)
+    v4 = load.i128 notrap aligned v2
+    return v4
+}
+; run: %__umodti3(100, 7) == 2
+; run: %__umodti3(5, 10) == 5
+; run: %__umodti3(0, 1) == 0
+; run: %__umodti3(-1, -1) == 0
+; run: %__umodti3(-2, -1) == -2
+; run: %__umodti3(-1, 3) == 0
+; run: %__umodti3(-1, 7) == 3
+; run: %__umodti3(-1, 0x10000000000000000) == 0xffffffffffffffff
+; run: %__umodti3(0x10000000000000005, 0x10000000000000000) == 5
+; run: %__umodti3(0x80000000000000000000000000000000, 3) == 2
+; run: %__umodti3(-1, 0x80000000000000000000000000000001) == 0x7ffffffffffffffffffffffffffffffe
+
+function %panic_const_div_by_zero(i64) {
+block0(v0: i64):
+    trap user1
+}
+
+function %panic_const_rem_by_zero(i64) {
+block0(v0: i64):
+    trap user1
+}
+
+function %div_u128(i128, i128) -> i128 {
+    fn0 = %panic_const_div_by_zero(i64)
+    fn1 = %__udivti3(i128, i128) -> i128
+
+block0(v0: i128, v1: i128):
+    v2 = iconst.i64 0
+    v3 = uextend.i128 v2
+    v4 = icmp eq v1, v3
+    brif v4, block2, block1
+
+block1:
+    v5 = call fn1(v0, v1)
+    return v5
+
+block2 cold:
+    v6 = iconst.i64 0
+    call fn0(v6)
+    trap user1
+}
+; run: %div_u128(1000, 10) == 100
+; run: %div_u128(-1, 2) == 0x7fffffffffffffffffffffffffffffff
+; trap: %div_u128(1, 0)
+; trap: %div_u128(0, 0)
+
+function %rem_u128(i128, i128) -> i128 {
+    fn0 = %panic_const_rem_by_zero(i64)
+    fn1 = %__umodti3(i128, i128) -> i128
+
+block0(v0: i128, v1: i128):
+    v2 = iconst.i64 0
+    v3 = uextend.i128 v2
+    v4 = icmp eq v1, v3
+    brif v4, block2, block1
+
+block1:
+    v5 = call fn1(v0, v1)
+    return v5
+
+block2 cold:
+    v6 = iconst.i64 0
+    call fn0(v6)
+    trap user1
+}
+; run: %rem_u128(1003, 10) == 3
+; run: %rem_u128(0x10000000000000001, 0x10000000000000000) == 1
+; trap: %rem_u128(-1, 0)

@@ -1,0 +1,36 @@
+{
+  "id": "00987",
+  "from_lane": "integrate-engine-splice",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/macho/unwind.rs",
+    "crates/blaze-link/src/dwarf.rs"
+  ],
+  "what": "From integrate-engine-splice (deleting blaze-splice, whose Mach-O tests are about this): a Mach-O image whose `__eh_frame` puts an FDE past 16 MiB can't be linked by blaze-link. `crates/blaze-link/src/macho/unwind.rs` (the merge, ~line 1255, and `dwarf_encoding`, ~line 1121) refuses it: \"__unwind_info: the FDE of .. is at .. in __eh_frame, past the 24 bits DWARF mode has for it\". Real programs have that: bun's base (#173) has 20 MiB of frames and 700k functions; blaze-splice's tests `room_for_both_tables_of_a_program_of_16_mb_of_frames` and `a_first_link_has_the_room_its_objects_unwind_information_wants` (crates/blaze-splice/src/macho.rs, being deleted) were built on it. Why: superset-of-rust, every program ld64 links must link.\n\nProposal to check against libunwind (please verify before taking it): the 24-bit DWARF-mode offset is a hint. libunwind's `CFI_Parser::findFDE` (DwarfParser.hpp) starts at `ehSectionStart + hint` and scans CFI records forward to the section's end until one covers the pc. So for an FDE past 0xFFFFFF, the encoding can name the last CIE/FDE record start at or below 0xFFFFFF: correct, slower lookup only for those functions. Alternatively order `__eh_frame` so the FDEs of functions with no compact encoding come first. Either way, add a test in `macho/unwind.rs`: an `__eh_frame` of more than 16 MiB whose last function's row decodes to a hint at a record start <= 0xFFFFFF and <= its FDE's offset, and the merge no longer errors.\n\nSecond, speed only: `dwarf.rs` makes the debug sections again whole when a function changes. blaze-splice's `debug.rs` (5 tests, nushell's 300 MB of DWARF) kept room behind each debug section so an edit moved only a section that outgrew its room, block-aligned so a clone shares the rest. blaze-link's line-only DWARF is far smaller, so this may be within speed-of-light; noting it for `docs/v2/plan/lanes/link/speed-of-light.md`, not asking for code.",
+  "state": "applied",
+  "created": "2026-10-30T12:57:42Z",
+  "updated": "2026-10-30T13:01:04Z",
+  "taken_by": "integrate-engine-splice",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:57:42Z",
+      "by": "integrate-engine-splice",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:01:04Z",
+      "by": "integrate-engine-splice",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:01:04Z",
+      "by": "integrate-engine-splice",
+      "action": "done",
+      "note": "Done by integrate-engine-splice (link has no live window). Checked against the pinned nightly libunwind (DwarfParser.hpp findFDE, UnwindCursor.hpp getInfoFromDwarfSection): the DWARF-mode offset is a hint; with 0 libunwind scans __eh_frame from the start, then caches. crates/blaze-link/src/macho/unwind.rs: dwarf_encoding now returns u32, offset 0 past 24 bits (was None / an error); merge uses it and lost its now-unused functions parameter (4 callers updated); tail no longer returns None for it; the reference builder regular() in tests uses dwarf_encoding too. Test an_fde_past_24_bits_of_eh_frame_is_dwarf_mode_from_the_start (aarch64 and x86-64, an __eh_frame of 16 MiB + 1 KiB). The debug-sections speed note is left for link, no code asked."
+    }
+  ]
+}

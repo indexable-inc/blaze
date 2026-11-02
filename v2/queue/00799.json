@@ -1,0 +1,35 @@
+{
+  "id": "00799",
+  "from_lane": "frontend-tree-go-def",
+  "owner": "frontend-tree-go-tools",
+  "paths": [
+    "crates/hir-ty-codegen/places.rs"
+  ],
+  "what": "crates/hir-ty-codegen/places.rs:305: the doc link names hir_def BodySyntax::root, which frontend-tree-go-def deleted (a handle); point it at BodySyntax::tree.",
+  "state": "applied",
+  "created": "2026-10-30T08:09:12Z",
+  "updated": "2026-10-30T08:09:53Z",
+  "taken_by": "frontend-tree-go-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:09:12Z",
+      "by": "frontend-tree-go-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:09:43Z",
+      "by": "frontend-tree-go-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:09:53Z",
+      "by": "frontend-tree-go-tools",
+      "action": "done",
+      "note": "crates/hir-ty-codegen/places.rs: place_of doc link now names BodySyntax::tree"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00316",
+  "from_lane": "fastcompile-stencil-gen",
+  "owner": "fastcompile",
+  "paths": [
+    "docs/v2/plan/lanes/fastcompile/stencil.md"
+  ],
+  "what": "## fastcompile-stencil-gen 1: fastcompile-stencil: `stencil.md` is behind the generator (`docs/v2/plan/lanes/fastcompile/stencil.md`)\n\nWhat, three places in the parent's doc:\n\n- Line 175 says the generator compiles with `-stack-size-section` and refuses a stack size\n  other than 0. LLVM's C API has no setter for `TargetOptions::EmitStackSizeSection` (only\n  the C++ `TargetMachine` does), and blaze-llvm-sys binds only the C API. The generator\n  instead refuses, from the disassembly, every instruction that names the stack pointer, the\n  frame pointer, x18, x29 or x30, and every push, pop, call and return (`bl`, `blr`, `ret` on\n  AArch64). That is stricter than a stack size of 0: it also refuses a stencil that keeps a\n  zero-size frame but touches the stack or a reserved register. The line could say that.\n- Line 211 gives a 12-byte stencil row. Since request `fastcompile-stencil-patch 1` the\n  library is format 3: a 16-byte row whose last word is `first fault u24 | faults u8`, a\n  `u16` fault column after the holes, and an 84-byte header (eight counts, then the id).\n  `src/table/format.rs`'s module docs have the layout.\n- Line 303 says `LLVMParseIRInContext`; the generator uses `LLVMParseIRInContext2`, which\n  does not take ownership of the buffer.\n\nWhy: the doc is `current`-adjacent design the siblings read; the generator owns none of it.\n\nStatus: done by fastcompile-stencil in stencil.md (all three places).\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:23:29Z",
+  "updated": "2026-10-30T14:24:29Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/fastcompile-stencil-gen.md#fastcompile-stencil-gen 1: fastcompile-stencil: `stencil.md` is behind the generator (`docs/v2/plan/lanes/fastcompile/stencil.md`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-stencil-gen.md:3"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "In the tree: docs/v2/plan/lanes/fastcompile/stencil.md says the generator checks the disassembly (no stack/frame pointer, x18/x29/x30, push/pop/call/ret; ~line 197), gives format 3 (84-byte header, 16-byte row with first_fault u24 | faults u8; ~line 228), and LLVMParseIRInContext2 (~line 333)."
+    }
+  ]
+}

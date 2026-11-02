@@ -1,6 +1,8 @@
 ---
-status: current
-summary: A map of the code: the worker, the cargo drop-in, the splice, and how a build and an edit flow through them.
+status: superseded
+summary: A map of blaze v1's code: the worker, the cargo drop-in, the splice, and how a build and an edit flowed through them.
+date: 2026-10-30
+superseded_by: v2/plan.md
 ---
 # How blaze works
 
@@ -387,8 +389,7 @@ there wanted (`headerpad_ahead`), so it is not linked twice.
 
 An alternative wrapper exists in `stub.rs` (`BLAZE_WRAPS_RUSTC`), where rustc compiles only
 a stub for each workspace crate and all code is blaze's. It makes the first build faster,
-but a function blaze refuses then has no rustc copy to fall back on, so it is used by
-`harness/alone.py` and not by `blaze`.
+but a function blaze refuses then has no rustc copy to fall back on, so `blaze` does not use it.
 
 ## Debug info
 

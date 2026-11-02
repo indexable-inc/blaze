@@ -1,0 +1,23 @@
+{
+  "id": "00551",
+  "from_lane": "usercode",
+  "owner": "cargo",
+  "paths": [
+    "docs/v2/plan/lanes/usercode/speed-of-light.md"
+  ],
+  "what": "## 14. cargo (the driver's spawn): a warm sandbox launcher, one exec a run\n\nWhat: today a sandboxed run is `blaze sandbox --v2 SPEC`, exec'd by the driver, which then starts\nthe program: two execs (two `CreateProcessW` on Windows). Asked: the driver starts one\n`blaze sandbox --serve` per daemon, single-threaded, connected over a Unix socket (a named pipe\non Windows). Each sandboxed `Effect::Spawn` becomes one request on it, with the spec and the\ndescriptors for stdin, stdout and stderr passed over the socket (`SCM_RIGHTS`, or\n`DuplicateHandle` on Windows). The launcher forks, confines the child and execs the program, and\nanswers with the exit and the record's path, as the report does now.\n- A launcher that dies is an error for the runs in it, and the driver starts a new launcher for\n  the next run, which is the same rule as a warm server's.\n- usercode writes the launcher's side, `sandbox::v2::serve`, once the driver's side is agreed\n  here.\n\nWhy: docs/v2/plan/lanes/usercode/speed-of-light.md, \"The sandbox\" and \"The Windows sandbox\". The\nlauncher's exec is about 1 ms a run, and the bound is the program's exec alone (buck2's\nforkserver does this).\n\n> forwarded to cargo (the driver's spawn is in `blaze-cargo`; cargo told).",
+  "state": "open",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T04:38:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode.md#14. cargo (the driver's spawn): a warm sandbox launcher, one exec a run",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:974"
+    }
+  ]
+}

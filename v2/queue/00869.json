@@ -1,0 +1,26 @@
+{
+  "id": "00869",
+  "from_lane": "item-hash",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-items/src/hash.rs",
+    "crates/blaze-items/src/form.rs",
+    "crates/blaze-items/src/key.rs",
+    "crates/blaze-items/src/lib.rs"
+  ],
+  "what": "Please reassign 00839, 00830 and 00814 (owner items, no live window) to item-hash: they block lane item-hash (a leak-free signature hash in blaze_items::hash; resolve rows for ctors and anon consts in blaze_items::key; reserving fact kinds 0x1800..0x1810). item-hash-identity (window item-hash-identity) makes them as targeted edits in crates/blaze-items/src/{hash.rs,form.rs,key.rs,lib.rs} now and marks them done.",
+  "state": "open",
+  "created": "2026-10-30T09:13:28Z",
+  "updated": "2026-10-30T09:13:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:13:28Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

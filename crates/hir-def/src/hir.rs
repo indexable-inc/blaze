@@ -14,18 +14,24 @@
 //!
 //! [`body`]: crate::expr_store::body
 
+// A store's columns in one slab or read in place in an image: no allocation a column.
+#[allow(unsafe_code)]
+pub(crate) mod col;
+pub(crate) mod columns;
 pub mod format_args;
 pub mod generics;
+pub(crate) mod persist;
 pub mod type_ref;
 
-use std::{fmt, mem};
+pub use columns::{ExprKind, PatKind};
+
+use std::{fmt, iter::FusedIterator, mem};
 
 use hir_expand::{MacroDefId, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
-use syntax::ast;
-use thin_vec::ThinVec;
+use syntax::{ast, view};
 use type_ref::TypeRefId;
 
 use crate::{
@@ -33,7 +39,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     expr_store::{
         HygieneId,
-        path::{GenericArgs, Path},
+        path::{GenericArgs, Path, PathIdx},
     },
     type_ref::{Mutability, Rawness},
 };
@@ -42,9 +48,9 @@ pub use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, Unar
 
 pub type BindingId = Idx<Binding>;
 
-pub type ExprId = Idx<Expr>;
+pub type ExprId = Idx<Expr<'static>>;
 
-pub type PatId = Idx<Pat>;
+pub type PatId = Idx<Pat<'static>>;
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ExprOrPatId {
@@ -76,7 +82,7 @@ impl ExprOrPatId {
     }
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, salsa::SalsaValue)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, blaze_query::Value)]
 pub struct ExprOrPatIdPacked(u32);
 
 const _: () = assert!(mem::size_of::<ExprOrPatIdPacked>() == mem::size_of::<u32>());
@@ -153,22 +159,41 @@ impl From<PatId> for ExprOrPatIdPacked {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Label {
     pub name: Name,
 }
 pub type LabelId = Idx<Label>;
 
+// The flat arrays' elements, on 64-bit (`docs/v2/plan/design/data.md`'s budgets). An
+// `Option<ExprId>` is 8 bytes because `la_arena::Idx` has no niche: with one, `MatchArm` would
+// be 12. Statements are columns (`columns::STATEMENT_BYTES`); a block's handle on its run of
+// them is 24 bytes.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(mem::size_of::<Label>() == 4);
+    assert!(mem::size_of::<MatchArm>() == 16);
+    assert!(mem::size_of::<RecordLitField>() == 8);
+    assert!(mem::size_of::<RecordFieldPat>() == 8);
+    assert!(mem::size_of::<Statements<'static>>() == 24);
+    assert!(mem::size_of::<Binding>() == 12);
+};
+
 // We leave float values as a string to avoid double rounding.
 // For PartialEq, string comparison should work, as ordering is not important
 // https://github.com/rust-lang/rust-analyzer/issues/12380#issuecomment-1137284360
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct FloatTypeWrapper(Symbol);
 
 // FIXME(#17451): Use builtin types once stabilised.
 impl FloatTypeWrapper {
     pub fn new(sym: Symbol) -> Self {
         Self(sym)
+    }
+
+    /// The literal's text, as it is written (and as `Display` writes it).
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 
     pub fn to_f128(&self) -> Quad {
@@ -190,10 +215,11 @@ impl FloatTypeWrapper {
     /// The literal with its sign flipped, as `-1.0` is written in a pattern.
     fn negate(&self) -> Self {
         let text = self.0.as_str();
-        Self(Symbol::intern(&match text.strip_prefix('-') {
-            Some(positive) => positive.to_owned(),
-            None => format!("-{text}"),
-        }))
+        Self(match text.strip_prefix('-') {
+            Some(positive) => Symbol::intern(positive),
+            // alloc: a negative float in a pattern, once per such literal
+            None => Symbol::intern(&format!("-{text}")),
+        })
     }
 }
 
@@ -203,7 +229,7 @@ impl fmt::Display for FloatTypeWrapper {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)] // clone: a borrowed expression pushed; lowering moves them
 pub enum Literal {
     String(Symbol),
     ByteString(Box<[u8]>),
@@ -235,9 +261,9 @@ impl Literal {
     }
 }
 
-impl From<ast::LiteralKind> for Literal {
-    fn from(ast_lit_kind: ast::LiteralKind) -> Self {
-        use ast::LiteralKind;
+impl From<view::LiteralKind<'_>> for Literal {
+    fn from(ast_lit_kind: view::LiteralKind<'_>) -> Self {
+        use view::LiteralKind;
         match ast_lit_kind {
             LiteralKind::IntNumber(lit) => {
                 if let builtin @ Some(_) = lit.suffix().and_then(BuiltinFloat::from_suffix) {
@@ -290,11 +316,13 @@ pub enum Unsafe {
     No,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Expr {
+/// An expression of a store, decoded from the store's columns: ids and small enums by value,
+/// lists and cold values borrowed from the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expr<'a> {
     /// This is produced if the syntax tree does not have a required expression piece.
     Missing,
-    Path(Path),
+    Path(Path<'a>),
     If {
         condition: ExprId,
         then_branch: ExprId,
@@ -306,7 +334,7 @@ pub enum Expr {
     },
     Block {
         id: Option<BlockId>,
-        statements: Box<[Statement]>,
+        statements: Statements<'a>,
         tail: Option<ExprId>,
         label: Option<LabelId>,
         unsafe_: Unsafe,
@@ -319,17 +347,17 @@ pub enum Expr {
     },
     Call {
         callee: ExprId,
-        args: Box<[ExprId]>,
+        args: &'a [ExprId],
     },
     MethodCall {
         receiver: ExprId,
-        method_name: Name,
-        args: Box<[ExprId]>,
-        generic_args: Option<Box<GenericArgs>>,
+        method_name: &'a Name,
+        args: &'a [ExprId],
+        generic_args: Option<GenericArgs<'a>>,
     },
     Match {
         expr: ExprId,
-        arms: Box<[MatchArm]>,
+        arms: &'a [MatchArm],
     },
     Continue {
         label: Option<LabelId>,
@@ -351,13 +379,13 @@ pub enum Expr {
         expr: Option<ExprId>,
     },
     RecordLit {
-        path: Path,
-        fields: ThinVec<RecordLitField>,
+        path: Path<'a>,
+        fields: &'a [RecordLitField],
         spread: RecordSpread,
     },
     Field {
         expr: ExprId,
-        name: Name,
+        name: &'a Name,
     },
     Await {
         expr: ExprId,
@@ -391,29 +419,33 @@ pub enum Expr {
         index: ExprId,
     },
     Closure {
-        args: Box<[PatId]>,
-        arg_types: Box<[Option<TypeRefId>]>,
+        args: &'a [PatId],
+        arg_types: &'a [Option<TypeRefId>],
         ret_type: Option<TypeRefId>,
         body: ExprId,
         closure_kind: ClosureKind,
         capture_by: CaptureBy,
     },
     Tuple {
-        exprs: Box<[ExprId]>,
+        exprs: &'a [ExprId],
     },
-    Array(Array),
-    Literal(Literal),
+    Array(Array<'a>),
+    Literal(&'a Literal),
     Underscore,
-    OffsetOf(OffsetOf),
-    InlineAsm(InlineAsm),
+    OffsetOf(&'a OffsetOf),
+    InlineAsm(&'a InlineAsm),
     IncludeBytes,
+    /// `builtin # wrap_binder(expr[, ty])` or `builtin # unwrap_binder(expr[, ty])`, what core's
+    /// `wrap_binder!` and `unwrap_binder!` expand to (rustc's `ExprKind::UnsafeBinderCast`).
+    UnsafeBinderCast {
+        kind: UnsafeBinderCastKind,
+        expr: ExprId,
+        ty: Option<TypeRefId>,
+    },
 }
 
-#[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Expr>() == 48);
-
-impl Expr {
-    pub fn precedence(&self) -> ast::prec::ExprPrecedence {
+impl Expr<'_> {
+    pub fn precedence(self) -> ast::prec::ExprPrecedence {
         use ast::prec::ExprPrecedence;
 
         match self {
@@ -431,7 +463,8 @@ impl Expr {
             | Expr::Tuple { .. }
             | Expr::OffsetOf(_)
             | Expr::Underscore
-            | Expr::IncludeBytes => ExprPrecedence::Unambiguous,
+            | Expr::IncludeBytes
+            | Expr::UnsafeBinderCast { .. } => ExprPrecedence::Unambiguous,
 
             Expr::Await { .. }
             | Expr::Call { .. }
@@ -484,13 +517,22 @@ pub enum LoopSource {
     ForLoop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which way an [`Expr::UnsafeBinderCast`] goes (rustc's `UnsafeBinderCastKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnsafeBinderCastKind {
+    /// `wrap_binder!`: a value into an `unsafe<..> T`.
+    Wrap,
+    /// `unwrap_binder!`: an `unsafe<..> T` place or value out to `T`.
+    Unwrap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Literal`'s
 pub struct OffsetOf {
     pub container: TypeRefId,
     pub fields: Box<[Name]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Literal`'s
 pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
     /// What to assemble, the template strings joined by newlines. `None` when a string could
@@ -505,7 +547,7 @@ pub struct InlineAsm {
     pub clobber_abi: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: MIR lowering, once per `asm!` block
 pub enum AsmPiece {
     Lit(Box<str>),
     /// The operand at `index`, written as its `modifier` says: `{0:e}`.
@@ -548,6 +590,7 @@ impl AsmOptions {
     pub const NAKED_OPTIONS: Self = Self::ATT_SYNTAX.union(Self::RAW).union(Self::NORETURN);
 
     pub fn human_readable_names(&self) -> Vec<&'static str> {
+        // alloc: for printing (the edge)
         let mut options = vec![];
 
         if self.contains(AsmOptions::PURE) {
@@ -612,7 +655,8 @@ pub enum AsmOperand {
     },
     Label(ExprId),
     Const(ExprId),
-    Sym(Path),
+    /// A path of the store's, read with `ExpressionStore::path_at`.
+    Sym(PathIdx),
 }
 
 impl AsmOperand {
@@ -683,27 +727,28 @@ pub enum Movability {
     Movable,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Array {
-    ElementList { elements: Box<[ExprId]> },
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Array<'a> {
+    ElementList { elements: &'a [ExprId] },
     Repeat { initializer: ExprId, repeat: ExprId },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct MatchArm {
     pub pat: PatId,
     pub guard: Option<ExprId>,
     pub expr: ExprId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct RecordLitField {
     pub name: Name,
     pub expr: ExprId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Statement {
+/// A statement of a block, decoded from the store's statement columns as [`Expr`] is.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Statement<'a> {
     Let {
         pat: PatId,
         type_ref: Option<TypeRefId>,
@@ -716,19 +761,141 @@ pub enum Statement {
         expr: ExprId,
         has_semi: bool,
     },
-    Item(Item),
+    Item(Item<'a>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Item {
-    MacroDef(Box<MacroDefId>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item<'a> {
+    MacroDef(&'a MacroDefId),
     Other,
 }
+
+/// The statements of a block: a run of rows of the store's statement columns, each decoded
+/// when it is read.
+#[derive(Clone, Copy)]
+pub struct Statements<'a> {
+    rows: columns::Rows<'a>,
+    start: u32,
+    len: u32,
+}
+
+impl Statements<'static> {
+    /// No statements, for a block lowering makes without any.
+    pub const EMPTY: Self = Statements { rows: columns::Rows::Empty, start: 0, len: 0 };
+}
+
+impl<'a> Statements<'a> {
+    #[inline]
+    pub fn len(self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// The statement at `index` of the block, `None` past its last.
+    #[inline]
+    pub fn get(self, index: usize) -> Option<Statement<'a>> {
+        (index < self.len()).then(|| self.rows.get(self.start + index as u32))
+    }
+
+    #[inline]
+    pub fn first(self) -> Option<Statement<'a>> {
+        self.get(0)
+    }
+
+    #[inline]
+    pub fn last(self) -> Option<Statement<'a>> {
+        self.len().checked_sub(1).and_then(|index| self.get(index))
+    }
+
+    #[inline]
+    pub fn iter(self) -> StatementIter<'a> {
+        StatementIter { rows: self.rows, at: self.start, end: self.start + self.len }
+    }
+}
+
+impl PartialEq for Statements<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for Statements<'_> {}
+
+impl fmt::Debug for Statements<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for Statements<'a> {
+    type Item = Statement<'a>;
+    type IntoIter = StatementIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> StatementIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &Statements<'a> {
+    type Item = Statement<'a>;
+    type IntoIter = StatementIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> StatementIter<'a> {
+        self.iter()
+    }
+}
+
+/// The statements of a block in order ([`Statements::iter`]).
+#[derive(Clone)]
+pub struct StatementIter<'a> {
+    rows: columns::Rows<'a>,
+    at: u32,
+    end: u32,
+}
+
+impl<'a> Iterator for StatementIter<'a> {
+    type Item = Statement<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Statement<'a>> {
+        (self.at < self.end).then(|| {
+            let statement = self.rows.get(self.at);
+            self.at += 1;
+            statement
+        })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = (self.end - self.at) as usize;
+        (left, Some(left))
+    }
+}
+
+impl DoubleEndedIterator for StatementIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        (self.at < self.end).then(|| {
+            self.end -= 1;
+            self.rows.get(self.end)
+        })
+    }
+}
+
+impl ExactSizeIterator for StatementIter<'_> {}
+
+impl FusedIterator for StatementIter<'_> {}
 
 /// Explicit binding annotations given in the HIR for a binding. Note
 /// that this is not the final binding *mode* that we infer after type
 /// inference.
-#[derive(Clone, PartialEq, Eq, Debug, Copy)]
+#[derive(Clone, PartialEq, Eq, Debug, Copy, Hash)]
 pub enum BindingAnnotation {
     /// No binding annotation given: this means that the final binding mode
     /// will depend on whether we have skipped through a `&` reference
@@ -758,7 +925,7 @@ impl BindingAnnotation {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum BindingProblems {
     /// <https://doc.rust-lang.org/stable/error_codes/E0416.html>
     BoundMoreThanOnce,
@@ -768,7 +935,7 @@ pub enum BindingProblems {
     NotBoundAcrossAll,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Binding {
     pub name: Name,
     pub mode: BindingAnnotation,
@@ -778,27 +945,28 @@ pub struct Binding {
     pub hygiene: HygieneId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct RecordFieldPat {
     pub name: Name,
     pub pat: PatId,
 }
 
-/// Close relative to rustc's hir::PatKind
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Pat {
+/// Close relative to rustc's hir::PatKind. A pattern of a store, decoded from the store's
+/// columns as [`Expr`] is.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Pat<'a> {
     Missing,
     /// A rest pattern. Not valid outside special context.
     Rest,
     Wild,
     Tuple {
-        args: Box<[PatId]>,
+        args: &'a [PatId],
         ellipsis: Option<u32>,
     },
-    Or(Box<[PatId]>),
+    Or(&'a [PatId]),
     Record {
-        path: Path,
-        args: Box<[RecordFieldPat]>,
+        path: Path<'a>,
+        args: &'a [RecordFieldPat],
         ellipsis: bool,
     },
     Range {
@@ -807,19 +975,19 @@ pub enum Pat {
         range_type: RangeOp,
     },
     Slice {
-        prefix: Box<[PatId]>,
+        prefix: &'a [PatId],
         slice: Option<PatId>,
-        suffix: Box<[PatId]>,
+        suffix: &'a [PatId],
     },
-    Path(Path),
+    Path(Path<'a>),
     Lit(ExprId),
     Bind {
         id: BindingId,
         subpat: Option<PatId>,
     },
     TupleStruct {
-        path: Path,
-        args: Box<[PatId]>,
+        path: Path<'a>,
+        args: &'a [PatId],
         ellipsis: Option<u32>,
     },
     Ref {
@@ -839,8 +1007,8 @@ pub enum Pat {
     Expr(ExprId),
 }
 
-impl Pat {
-    pub fn walk_child_pats(&self, mut f: impl FnMut(PatId)) {
+impl Pat<'_> {
+    pub fn walk_child_pats(self, mut f: impl FnMut(PatId)) {
         match self {
             Pat::Range { .. }
             | Pat::Lit(..)
@@ -851,20 +1019,20 @@ impl Pat {
             | Pat::Expr(_)
             | Pat::NotNull => {}
             Pat::Bind { subpat, .. } => {
-                subpat.iter().copied().for_each(f);
+                subpat.into_iter().for_each(f);
             }
             Pat::Or(args) | Pat::Tuple { args, .. } | Pat::TupleStruct { args, .. } => {
                 args.iter().copied().for_each(f);
             }
-            Pat::Ref { pat, .. } => f(*pat),
+            Pat::Ref { pat, .. } => f(pat),
             Pat::Slice { prefix, slice, suffix } => {
-                let total_iter = prefix.iter().chain(slice.iter()).chain(suffix.iter());
-                total_iter.copied().for_each(f);
+                let total_iter = prefix.iter().copied().chain(slice).chain(suffix.iter().copied());
+                total_iter.for_each(f);
             }
             Pat::Record { args, .. } => {
                 args.iter().map(|f| f.pat).for_each(f);
             }
-            Pat::Box { inner } | Pat::Deref { inner } => f(*inner),
+            Pat::Box { inner } | Pat::Deref { inner } => f(inner),
         }
     }
 }

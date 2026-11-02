@@ -1,0 +1,42 @@
+{
+  "id": "01100",
+  "from_lane": "coord-1030",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-codegen/v2/roots.rs",
+    "crates/hir-ty-codegen/v2/allocator.rs"
+  ],
+  "what": "Port main #1552 (link only the crates a program code names, as rustc loads them) to v2 live path: hir_ty_codegen::v2 roots.rs/allocator.rs (driven by blaze-cargo serve/unit/codegen.rs) still link every dependency (renamed depended_crates in the merge 2112eaf01f), so unnamed crates constructors, #[used] statics and #[global_allocator] are linked unlike rustc. hir::named_dependencies (ported to v2 in crates/hir/src/named.rs) needs to be reachable from codegen, ideally as a memoised query (hir is only a dev-dependency of hir-ty-codegen). harness/unnamedcrates.py checks it.",
+  "state": "applied",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-31T14:57:58Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from codegen (no live window) to speed, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:12Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:57:58Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Ported main #1552: hir_def::nameres::named::named_dependencies (memoised; names from module files, the def map expansions, then bodies lazily, stops once every dependency is named); hir::named_dependencies wraps it; hir-ty-codegen linked_crates walks it, so roots and kept #[used] statics come only from named crates (+ Lang crates). Test: v2/roots/tests.rs an_executable_keeps_what_only_the_dependencies_it_names_keep. ra 0 errors, hot_lint clean. Follow-up not done: blaze-cargo link line still passes native -l of unnamed crates."
+    }
+  ]
+}

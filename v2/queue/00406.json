@@ -1,0 +1,23 @@
+{
+  "id": "00406",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "## 11. Needed from outside this crate\n\n- **D1, `hir-ty` (`src/mir.rs:118-130` and `next_solver/allocation.rs`): intern a constant from\n  borrowed bytes.**\n  - The problem: `Operand::from_concrete_const(data: Box<[u8]>, ..)` and `from_bytes` box the\n    bytes before interning. On a hit (every constant after the first of its value, which is\n    nearly all of them on a warm build), the box is freed again. Lowering makes one per literal,\n    discriminant and flag write, `elaborate_drops` one per flag statement, and asserts one per\n    check.\n  - The ask: `Allocation::from_slice(ty, memory: &[u8], memory_map: MemoryMap) -> Allocation`,\n    which looks the row up by hash and `==` on the borrowed slice (an `Equivalent` lookup in\n    `table::Values`) and boxes the bytes only on a miss. Then\n    `Operand::from_slice(&[u8], ty) -> Operand` on top of it.\n  - This crate's sites then change from\n    `Operand::from_bytes(Box::new([value as u8]), ty)` to `Operand::from_slice(&[value as u8], ty)`\n    (`rg 'from_bytes\\(|from_concrete_const\\('` in `src/mir`), and the same for `Box::default()`\n    (`const_zst`).\n  - Without D1, the lowering budget test fails by the number of constants, which is how it\n    should fail.\n- **D2, `hir-ty` (`src/mir.rs:1727`): `MirBody::mark_moves`'s `copy` parameter.**\n  - The problem: it takes `&mut FxHashMap<Ty<'db>, bool>`, which pins lowering's `Copy` cache\n    (`MirLowerCtx::copy`, asked on every statement that may panic) to the global allocator. It\n    grows log(types) times per body.\n  - The ask: make it generic over the allocator,\n    `copy: &mut hashbrown::HashMap<Ty<'db>, bool, FxBuildHasher, A>` with\n    `A: core::alloc::Allocator`. It only uses `entry(..).or_insert_with`, which hashbrown's map\n    has. Or a `&mut impl FnMut(Ty<'db>) -> bool`.\n  - Then `CopyCache<'f, 'db> = FrameMap<'f, Ty<'db>, bool>` here.\n  - Until then, `copy` stays an `FxHashMap`:\n    `// alloc: mark_moves (hir-ty) takes this map by type; frame once D2 lands`.\n- **D3, root `Cargo.toml`: hashbrown's `nightly` feature.** Already filed by mem-db (§1).\n- Nothing is needed from `hir-ty-codegen`: `operands` stays source-compatible (§9.4), and\n  `StorageConflicts`' API is unchanged (§9.2).\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#11. Needed from outside this crate",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:2525"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00875",
+  "from_lane": "unify",
+  "owner": "coordinator",
+  "paths": [
+    "harness/resolve_graph.py"
+  ],
+  "what": "harness/resolve_graph.py: blaze-resolve metadata_resolve example moved to blaze-units (crates/blaze-units/examples/metadata_resolve.rs; blaze-resolve examples/ deleted). Line 84 \"-p\", \"blaze-resolve\" becomes \"-p\", \"blaze-units\"; line 11 docstring \"The `metadata_resolve` example of blaze-resolve\" names blaze-units. Binary path unchanged. Harness fails until applied.",
+  "state": "open",
+  "created": "2026-10-30T09:18:16Z",
+  "updated": "2026-10-30T09:18:16Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:16Z",
+      "by": "unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

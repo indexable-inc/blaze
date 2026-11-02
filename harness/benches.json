@@ -1,8 +1,6 @@
 {
   "toy": {"workspace": "../demo", "target": ["-p", "app"], "crate": "hot", "cargo": ["build"],
           "file": "hot/src/lib.rs", "find": "wrapping_mul(31)", "replace": "wrapping_mul(37)"},
-  "corpus": {"workspace": "corpus", "target": ["-p", "runner"], "crate": "cases", "cargo": ["build"],
-             "file": "cases/src/lib.rs", "find": "if n < 2 {", "replace": "if n < 3 {"},
   "semver": {"workspace": "vendor/semver", "target": ["--test", "test_version_req"], "crate": "semver",
              "touch": "tests/test_version_req.rs", "cargo": ["test", "--no-run", "--test", "test_version_req"],
              "file": "src/parse.rs", "find": "Some(('x', rest))", "replace": "Some(('X', rest))"},

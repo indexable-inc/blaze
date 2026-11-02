@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Edits of the kinds people and agents make, thrown at one warm daemon, each checked against cargo.
+"""Edits of the kinds people and agents make, thrown at one warm daemon, each held to a fresh
+build of the same source.
 
-usage: stress.py [--only TEXT] [--from N] [--keep]
+usage: stress.py [--only TEXT]
 
-Copies harness/stress (three crates) to a scratch directory, starts the daemon on all of them, and
-applies STEPS in order. The edits stay: each step builds on the ones before. After each, `blaze
-sync` is asked for a build, the program is run, and `cargo build` of the same source is run and its
-program's output compared. A step marked broken is one cargo rejects: the daemon has to say
-so and survive it, and the first step after it that cargo builds has to be a patch: the text
-refused leaves the build the next edit is a patch of as it was (issue #31). Writes STRESS.md,
-and exits 1 when a step is wrong.
+Copies harness/stress (three crates) to a scratch directory and applies STEPS in order. The
+edits stay: each step builds on the ones before. After each, the daemon is asked for the
+program by `blaze build`, and it is run and held to what a fresh build of the same source does
+(rebuild.py). A step marked broken is one that is not Rust: both builds have to be refused and
+the daemon has to survive it. Writes STRESS.md, and exits 1 when a step is wrong.
 """
-import json, os, re, shlex, shutil, subprocess, sys, tempfile, time
-import socket as unix
+import os, re, shutil, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
-import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built, toolchain
+sys.path.insert(0, HERE)
+from rebuild import WRONG, Project, copy, scratch
 
 BASE, SHAPES, STACK = "base/src/lib.rs", "base/src/shapes.rs", "base/src/stack.rs"
 MID, TEXT, TASKS = "mid/src/lib.rs", "mid/src/text.rs", "mid/src/tasks.rs"
@@ -42,17 +39,6 @@ def delete(path):
 
 def step(name, *ops, broken=False):
     return (name, ops, broken)
-
-
-def ask_edit(at, path, text):
-    """An `edit` request, as an editor sends one on each keystroke: the file's whole text, built
-    with no look at the disk. The daemon's answer."""
-    escape = lambda s: s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
-    with unix.socket(unix.AF_UNIX) as s:
-        s.settimeout(120)
-        s.connect(at)
-        s.sendall(f"edit\t{escape(path)}\t{escape(text)}\n\n".encode())
-        return s.makefile().readline().strip()
 
 
 PROBE = '    report::line("guarded", guarded());\n'
@@ -181,7 +167,7 @@ STEPS = [
     step("#[inline(never)] and #[cold] added", sub(TEXT, "pub fn count_words(", "#[inline(never)]\n#[cold]\npub fn count_words(")),
     step("cfg(debug_assertions) branch", append(MID, "\npub fn mode() -> &'static str {\n    if cfg!(debug_assertions) {\n        \"debug\"\n    } else {\n        \"release\"\n    }\n}\n\n#[cfg(not(debug_assertions))]\npub fn only_release() {}\n"), probe("mode", "smid::mode()")),
     step("visibility narrowed and widened", sub(MID, "pub struct Evens {", "pub(crate) struct Evens2;\n\npub struct Evens {")),
-    # Things cargo rejects: the daemon has to survive and then recover.
+    # Text that is not Rust: the daemon has to survive and then recover.
     step("BROKEN: syntax error", sub(TEXT, "pub fn words(s: &str) -> Vec<&str> {", "pub fn words(s: &str -> Vec<&str> {"), broken=True),
     step("fixed again, with a body change", sub(TEXT, "pub fn words(s: &str -> Vec<&str> {\n    s.split_whitespace().collect()", "pub fn words(s: &str) -> Vec<&str> {\n    s.split(' ').collect()")),
     step("BROKEN: type error in a body", sub(MID, "    Ok(n + 1)", "    Ok(n + \"1\")"), broken=True),
@@ -209,7 +195,7 @@ STEPS = [
     step("mended: the import removed", sub(MAIN, "\nuse smid::text::nothing_here;\n", "")),
     step("whole file rewritten in another order", "reorder"),
     step("large generated function added", "bulk"),
-    step("an editor's edit while another client's build runs", "meanwhile"),
+    step("a file edited again while a build runs", "meanwhile"),
     step("everything back to the first source", "reset"),
     step("and forward again to the last source", "replay"),
 ]
@@ -217,46 +203,9 @@ STEPS = [
 
 def main():
     only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
-    ws = tempfile.mkdtemp(prefix="blaze-stress-")
-    shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
-    crates = ["sapp", "sbase", "smid"]
-    work = tempfile.mkdtemp(prefix="blaze-stress-out-")
-    obj, patch, binary = (os.path.join(work, n) for n in ("blaze.o", "blaze.patch.o", "bin-blaze"))
-    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    # Cargo's reference build has its own directory: the daemon links against the rlibs of the
-    # build it started from.
-    reference = os.path.join(work, "reference")
-    out = open(log_path, "a")
-
-    def start():
-        """Builds the source as it is with cargo, then starts a daemon on top of that build."""
-        fx = Fixture(ws, crates, ["-p", "sapp"])
-        fx.rustc_build()
-        symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
-        for path in (socket, binary):
-            if os.path.exists(path):
-                os.remove(path)
-        seen = len(open(log_path).read())
-        # Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full.
-        splice = ["--binary", binary]
-        daemon = subprocess.Popen(
-            [BLAZE, ws, *[x for c in crates for x in ("--crate", c)], "--out", obj, "--socket", socket,
-             "--patch", patch, "--link-cmd", linkline.join(link), *splice, *symbols], stderr=out, stdout=out)
-        while "watching" not in open(log_path).read()[seen:]:
-            if daemon.poll() is not None:
-                print("    daemon does not start on this source", flush=True)
-                break
-            time.sleep(0.05)
-        return daemon
-
-    def run(path):
-        try:
-            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
-        except Exception as error:
-            return f"did not run: {error}"
-        return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
+    work = scratch("blaze-stress-")
+    ws = copy(os.path.join(HERE, "stress"), os.path.join(work, "ws"))
+    project = Project(ws, work)
 
     def files():
         found = {}
@@ -278,38 +227,24 @@ def main():
             if not os.path.exists(os.path.join(ws, p)) or open(os.path.join(ws, p)).read() != text:
                 open(os.path.join(ws, p), "w").write(text)
 
-    daemon = start()
     first_state, rows, restarts = files(), [], 0
-    after_refused = False
     for index, (name, ops, broken) in enumerate(STEPS):
         if only and not re.search(only, name):
             continue
-        mended, after_refused = after_refused and not broken, broken
-        meanwhile = None
-        time.sleep(0.05)
         if ops and isinstance(ops[0], str):
             ops = ops[0]
         if ops == "meanwhile":
-            # A build for one client (`blaze build`, after a program was told to restart)
-            # and an editor's edits come together: the edit waits for the build, and is not told
-            # that no program is built (issue #32).
+            # The file is edited once, a build of it is asked for, and the file is edited again
+            # while that build runs: the build after it has to be of the second edit.
             path = os.path.join(ws, BASE)
             text = open(path).read()
             assert "wrapping_mul(3)" in text, name
             text = text.replace("wrapping_mul(3)", "wrapping_mul(7)", 1)
             open(path, "w").write(text)
-            text = text.replace("wrapping_mul(7)", "wrapping_mul(9)", 1)
-            if hasattr(unix, "AF_UNIX"):
-                seen = len(open(log_path).read())
-                other = subprocess.Popen([BLAZE, "sync", socket], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                began = time.time()
-                while not re.search(r"^request: sync[^\n]*\n(?:.*\n)*?change: ", open(log_path).read()[seen:], re.M):
-                    assert time.time() - began < 60, f"{name}: the daemon did not take the build"
-                    time.sleep(0.002)
-                time.sleep(0.005)
-                meanwhile = ask_edit(socket, path, text)
-                other.wait(timeout=120)
-            open(path, "w").write(text)
+            other = project.asking("sapp")
+            time.sleep(0.05)
+            open(path, "w").write(text.replace("wrapping_mul(7)", "wrapping_mul(9)", 1))
+            project.answer(other, "sapp")
         elif ops == "reset":
             last_state = files()
             put(first_state)
@@ -338,60 +273,27 @@ def main():
                     open(path, "a").write(op[2])
                 elif op[0] == "delete":
                     os.remove(path)
-        if os.environ.get("BLAZE_PATCH_FIRST"):
-            # The edit is first built for a request that does not link.
-            subprocess.run([BLAZE, "patch", socket], capture_output=True, text=True, timeout=120)
         asked = time.time()
-        try:
-            asked_for = subprocess.run([BLAZE, "sync", socket], capture_output=True, text=True, timeout=120)
-            reply = asked_for.stdout.strip() or asked_for.stderr.strip().removeprefix("Error: daemon: ")
-        except subprocess.TimeoutExpired:
-            reply = "no reply in 120 s"
+        built = project.build("sapp")
         took = (time.time() - asked) * 1000
-        died = daemon.poll() is not None
-        cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        if (cargo.returncode != 0) != broken:
-            raise SystemExit(f"step {index} {name!r}: cargo {'failed' if cargo.returncode else 'passed'}:\n{cargo.stderr[-2000:]}")
-        kind = "patch" if reply.startswith("ok patch") else "full" if reply.startswith("ok object") else "unchanged" if reply.startswith("ok unchanged") else "error"
-        if died:
-            verdict = "DAEMON DIED"
-        elif broken:
-            verdict = ("said so (" if kind == "error" else "ANSWERED OK (") + reply[:60].replace("|", "/") + ")"
-        elif kind == "error":
-            verdict = "REFUSED: " + reply[:120].replace("|", "/").replace("\n", " ")
-        else:
-            ours, theirs = run(binary), run(built(reference, "sapp"))
-            if ours == theirs and mended and kind != "patch" and not os.environ.get("BLAZE_PATCH_FIRST"):
-                verdict = "WRONG: not a patch, as if the refused text had been built"
-            elif ours == theirs and meanwhile is not None and not meanwhile.startswith("ok"):
-                verdict = "WRONG: the edit sent meanwhile was answered " + meanwhile[:100]
-            elif ours == theirs:
-                verdict = "same"
-            else:
-                a, b = ours.splitlines(), theirs.splitlines()
-                diff = [f"`{x}` for `{y}`" for x, y in zip(a, b) if x != y][:3]
-                verdict = "WRONG: " + ("; ".join(diff) or f"{len(a)} lines for {len(b)}")
-        rows.append((index, name, kind, took, verdict))
-        print(f"{index:3} {kind:9} {took:7.0f} ms  {verdict[:150]}  | {name}", flush=True)
-        if died or (kind == "error") != broken or verdict.startswith("WRONG"):
+        verdict, said = project.held(built, "sapp", broken=broken)
+        said = said.replace("|", "/").replace("\n", " ")[:150]
+        rows.append((index, name, took, verdict, said))
+        print(f"{index:3} {verdict:16} {took:7.0f} ms  {said}  | {name}", flush=True)
+        if verdict in WRONG:
             # Start again from the source as it is, so that one failure is not counted many times.
-            if not died:
-                daemon.kill()
-                daemon.wait()
-            open(log_path, "a").write(f"\n=== restart after step {index}\n")
-            try:
-                daemon = start()
-            except BaseException as error:
-                print(f'    cargo cannot build this source: {str(error)[:200]}', flush=True)
+            project.stop()
             restarts += 1
-    daemon.kill()
-    good = sum(1 for r in rows if r[4] == "same" or r[4].startswith("said so"))
+    project.stop()
+    good = sum(1 for row in rows if row[3] not in WRONG)
     with open(os.path.join(HERE, "STRESS.md"), "w") as md:
-        md.write(f"# Stress edits\n\n{good} of {len(rows)} steps right, {restarts} restarts. Log: {log_path}\n\n| # | Edit | Reply | ms | Result |\n|---|---|---|---:|---|\n")
-        for index, name, kind, took, verdict in rows:
-            md.write(f"| {index} | {name} | {kind} | {took:.0f} | {verdict} |\n")
-    print(f"{good} of {len(rows)} right, {restarts} restarts; log {log_path}; source {ws}")
+        md.write(f"# Stress edits\n\n{good} of {len(rows)} steps right, {restarts} restarts. Daemon logs: {project.home}\n\n"
+                 "| # | Edit | ms | Result | Said |\n|---|---|---:|---|---|\n")
+        for index, name, took, verdict, said in rows:
+            md.write(f"| {index} | {name} | {took:.0f} | {verdict} | {said} |\n")
+    print(f"{good} of {len(rows)} right, {restarts} restarts; daemon logs {project.home}; source {ws}")
+    if good == len(rows):
+        shutil.rmtree(work, ignore_errors=True)
     sys.exit(0 if good == len(rows) else 1)
 
 

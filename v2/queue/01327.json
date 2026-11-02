@@ -1,0 +1,31 @@
+{
+  "id": "01327",
+  "from_lane": "nameres-hello",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs",
+    "crates/hir-def/src/expr_store/body.rs",
+    "crates/hir-def/src/item_tree.rs"
+  ],
+  "what": "01303 part 3, second case: hello (builder-2, wt3-run.log, tree 17:23 UTC) panics at span ast_id.rs:1518 Cant find ast id BlockExpr index 0 hash 0000 (not in_body) in a body-relative AstIdMap (anchor IMPL 0..61886, no BlockExpr entries), from block_item_tree_query <- block_def_map <- expr_store collect_block. The block was made with owner Some(def) from a map other than body_syntax(def).ast_id_map, with the same file id, so the file check from the 10:26 fix lets it through. One such path: lower_body sets block_owner = Some(owner) also when lower_in_file lowers with the whole-file map (maps None), which Body::of/with_source_map do whenever lower_relative returns None through a ? (cast or const_arg miss) although body_syntax is Some. Suggested: set block_owner only when lowering from body_syntax maps (maps.is_some()), and have block_item_tree_query error naming owner and id when the owner map lacks the id, rather than panic.",
+  "state": "taken",
+  "created": "2026-10-31T17:29:12Z",
+  "updated": "2026-10-31T17:30:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T17:29:12Z",
+      "by": "nameres-hello",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:30:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

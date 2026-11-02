@@ -1,0 +1,38 @@
+{
+  "id": "00141",
+  "from_lane": "usercode-macros-native",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/native-macros",
+    "Cargo.toml",
+    "crates/blaze-expand/src/native/tests.rs",
+    "crates/blaze-expand/src/native/proc_macro"
+  ],
+  "what": "## 1. To the coordinator: vendor nine crates under `vendor/native-macros/`\n\n> withdrawn 2026-10-29: superseded by compile-time.md change 20.\n\nWhat: one directory per package, named `<name>-<version>`, holding exactly the files of its\n`.crate` as published on crates.io (the same as `~/.cargo/registry/src/index.crates.io-*/<name>-<version>/`\nless `.cargo-ok` and `.cargo-checksum.json`), with the changes below and nothing else:\n\n| directory | package |\n| --- | --- |\n| `unicode-ident-1.0.27` | unicode-ident 1.0.27 |\n| `proc-macro2-1.0.107` | proc-macro2 1.0.107 |\n| `quote-1.0.47` | quote 1.0.47 |\n| `syn-2.0.119` | syn 2.0.119 |\n| `syn-3.0.9` | syn 3.0.9 |\n| `serde_derive-1.0.229` | serde_derive 1.0.229 |\n| `thiserror-impl-1.0.69` | thiserror-impl 1.0.69 |\n| `thiserror-impl-2.0.21` | thiserror-impl 2.0.21 |\n| `tokio-macros-2.7.2` | tokio-macros 2.7.2 |\n\nChanges, in every directory:\n\n- Move the published `Cargo.toml` to `.published/Cargo.toml`, byte for byte, and write blaze's\n  `Cargo.toml` in its place (below).\n- In the four macro crates (serde_derive, both thiserror-impl, tokio-macros) also copy the\n  published `src/lib.rs` to `.published/src/lib.rs`, byte for byte, and in `src/lib.rs` delete\n  every line whose text after leading whitespace starts with `#[proc_macro_derive(` or is exactly\n  `#[proc_macro_attribute]` or `#[proc_macro]` (2, 1, 1 and 8 lines). Nothing else changes.\n- `git add -f` the whole directory: unicode-ident's, proc-macro2's and quote's own `.gitignore`\n  ignore `/Cargo.lock`, which they ship and blaze includes; unicode-ident's `tests/fst/.gitignore`\n  ignores `/prop_list.rs` (not shipped, nothing to add).\n\n`crates/blaze-expand/src/native/tests.rs` (`every_package_is_its_vendored_copy`,\n`a_macro_crate_is_built_from_its_published_source_less_its_attributes`) fails on any other\ndifference.\n\nWhy: the expanders are the macros' own published code compiled into blaze as libraries\nagainst blaze's `proc_macro` (`crates/blaze-expand/src/native/proc_macro/`), and the table of\nverified closures is the hash of every published file, so the vendored copy is both the code\nand the table.\n\n> forwarded to coordinator: `vendor/native-macros/` is the coordinator's (crates.md, \"Every other path\"), not among the paths `requests` applies, and request 1 needs `git add -f`, which agents may not run. All nine published sources are in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`.\n\n### Blaze's `Cargo.toml` of each\n\nEach is the published `Cargo.toml` with these edits, so edition, rust-version, `[lints]`,\n`[features]` and `build` stay as published:\n\n- `[package]`: `name = \"blaze-native-<published name>\"` (e.g. `blaze-native-syn` would collide\n  between the two syns: use `blaze-native-syn-2` and `blaze-native-syn-3`, and\n  `blaze-native-thiserror-impl-1` / `-2`), `publish = false`. Keep `version` as published:\n  serde_derive and thiserror-impl 2 read `env!(\"CARGO_PKG_VERSION_PATCH\")` into their output.\n  Drop `description`, `documentation`, `readme`, `homepage`, `repository`, `keywords`,\n  `categories`, `license`, `include`, `exclude` (they don't change the build; keep them if\n  simpler).\n- `[lib]`: keep `name` and `path`; delete `proc-macro = true`; add `test = false` and\n  `doctest = false`.\n- Delete every `[dev-dependencies*]`, `[[test]]`, `[[bench]]`, `[[example]]`, `[[bin]]`,\n  `[package.metadata*]` and `[badges]` table (the packages join the workspace as path\n  dependencies, and their tests' dependencies are not here).\n- Each `[dependencies.X]` on another package of the table: keep its `version`, `features`,\n  `default-features` and `optional` as published, add `package = \"blaze-native-…\"` and\n  `path = \"../<directory>\"` (syn 2 for thiserror-impl 1, syn 3 for the rest).\n- Every package but unicode-ident links `proc_macro` (`extern crate proc_macro` or\n  `proc_macro::` in a proc-macro crate), so add:\n\n  ```toml\n  [dependencies.proc_macro]\n  package = \"blaze-native-proc-macro\"\n  path = \"../../../crates/blaze-expand/src/native/proc_macro\"\n  ```\n\n  If cargo refuses the dependency name `proc_macro`, say so (to me through the parent): the\n  sources can't be changed to name it otherwise without breaking the byte-for-byte rule.\n\nFeatures end up as `verified.rs` has them only through blaze-expand's dependencies (request 3)\nand these specs: syn 3 gets clone-impls, default, derive, full, parsing, printing, proc-macro;\nsyn 2 the default set; proc-macro2 and quote default and proc-macro; serde_derive default.\n`native/tests.rs`'s `the_table_is_well_formed` and `the_verified_copy_matches_itself` check them.\n\n> forwarded to coordinator: with request 1.",
+  "state": "refused",
+  "created": "2026-10-30T01:41:30Z",
+  "updated": "2026-10-30T08:29:17Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "withdrawn by its author (2026-10-29: superseded by docs/v2/plan/design/compile-time.md change 20); nothing to vendor.",
+  "source": "v2/requests/usercode-macros-native.md#1. To the coordinator: vendor nine crates under `vendor/native-macros/`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros-native.md:14"
+    },
+    {
+      "at": "2026-10-30T08:29:16Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:17Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "withdrawn by its author (2026-10-29: superseded by docs/v2/plan/design/compile-time.md change 20); nothing to vendor."
+    }
+  ]
+}

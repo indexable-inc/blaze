@@ -1,0 +1,23 @@
+{
+  "id": "00838",
+  "from_lane": "sol-all",
+  "owner": "vfs",
+  "paths": [
+    "crates/vfs/src/file_set.rs"
+  ],
+  "what": "FYI, already applied by sol-all-base (no vfs window was live): crates/vfs/src/file_set.rs gained FileSet::remove (shift_remove; drops files[path] only if it names that file), used by base-db view.rs write_root_files to edit a root in place. Keep it; open question for Andrew in /tmp/blaze-lanes/v2-sol-all.md: may shift_remove become swap_remove (O(1), changes SourceRoot::iter order)?",
+  "state": "open",
+  "created": "2026-10-30T08:42:03Z",
+  "updated": "2026-10-30T08:42:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:42:03Z",
+      "by": "sol-all",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "00339",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "v2/requests/mem-format.md",
+    "crates/hir-expand",
+    "crates/span/src/ast_id.rs"
+  ],
+  "what": "## E6. `ast_id_map`: no change in hir-expand\n\n`HirFileId::ast_id_map`'s body is `AstIdMap::from_source(&self.parse_or_expand(db))`; the\ntemporaries are span's: `entries` grown by doubling and shrunk into the result, `found`\n(bodies), the next-index map. `v2/requests/mem-format.md` (\"What allocates today, per\n`AstIdMap::from_source`\", line 905 on) already moves them: `from_source` runs its walk in a\n`frame::task(Tag::Parse, ..)` of its own and builds the result with `Box::from(&entries[..])`.\nInside this query run that task nests (contract 1: a frame one level deeper, reset on return),\nso the body stays as it is and the bytes count under `Tag::Parse`, the ast ids' subsystem.\nMade: once per file parse or expansion. F6 is that request; nothing more is asked.\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:39): nothing asked here; `AstIdMap::from_source` runs in its own `frame::task(Tag::Parse, ..)` (crates/span/src/ast_id.rs:1262).",
+  "state": "applied",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#E6. `ast_id_map`: no change in hir-expand",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:407"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:39): nothing asked here; `AstIdMap::from_source` runs in its own `frame::task(Tag::Parse, ..)` (crates/span/src/ast_id.rs:1262)."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00761",
+  "from_lane": "cargo-harness",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/roots.rs",
+    "crates/hir-ty-codegen"
+  ],
+  "what": "## 2. lane codegen (`crates/hir-ty-codegen/v2/roots.rs:56`, `roots/harness.rs:36`): name the harness module publicly\n\nWhat: make `roots::harness::MODULE` public and export it: in `roots/harness.rs`,\n`pub(super) const MODULE` becomes `pub const MODULE`. In `v2.rs:56`, `pub use roots::{RootKind,\nRootTest, Roots, proc_macros as proc_macro_list};` gains `harness::MODULE as HARNESS_MODULE`\n(`roots.rs:20`'s `mod harness;` becomes `pub(crate) mod harness;`, or `roots.rs` re-exports it).\n\nWhy: `base_db::Db::set_appended_root_module` takes the module's name, which `HirFrontend::harness`\nwrites and only hir-ty-codegen knows. Until it's exported, `serve/unit/harness.rs` keeps its own\n`const MODULE: &str = \"__blaze_test_harness\"`. It refuses a harness whose text doesn't open\n`pub mod __blaze_test_harness {`, so a rename fails loudly, never with a wrong appended module.\nOnce exported, that const becomes `hir_ty_codegen::v2::HARNESS_MODULE` and the check can go.\n\n> forwarded by lane cargo (cargo-next2) to requests for lane codegen (`crates/hir-ty-codegen` is codegen's); told by tmux.",
+  "state": "applied",
+  "created": "2026-10-30T07:00:27Z",
+  "updated": "2026-10-31T20:28:50Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/cargo-harness.md#2. lane codegen (`crates/hir-ty-codegen/v2/roots.rs:56`, `roots/harness.rs:36`): name the harness module publicly",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo-harness.md:56"
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "roots::harness::MODULE is pub, exported as hir_ty_codegen::v2::HARNESS_MODULE (v2.rs). cargo's serve/unit/harness.rs can drop its module! copy and use it."
+    }
+  ]
+}

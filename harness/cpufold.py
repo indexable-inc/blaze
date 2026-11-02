@@ -41,7 +41,7 @@ KINDS = [
     ("layout", ("hir_ty::layout",)),
     ("code generation", ("hir_ty_codegen::", "cranelift", "llvm")),
     ("debug types described", ("hir_ty_codegen::debuginfo",)),
-    ("the store read and written", ("blaze_store::",)),
+    ("the store read and written", ("blaze_cas::",)),
     ("diagnostics collected", ("diagnostic", "Diagnostic")),
     ("salsa revalidating memos", ("maybe_changed_after",)),
     ("salsa interning", ("salsa::interned::",)),

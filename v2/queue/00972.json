@@ -1,0 +1,41 @@
+{
+  "id": "00972",
+  "from_lane": "integrate-vfs",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/blaze-engine/src/check.rs",
+    "crates/blaze-engine/src/doc.rs",
+    "crates/blaze-engine/src/mirdump.rs",
+    "crates/blaze-engine/src/borrowck.rs",
+    "crates/blaze-engine/src/consteval.rs",
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "integrate-vfs deletes crates/vfs last. I swapped every other vfs import in blaze-engine to base_db:: (same types; FileId, VfsPath, FileSet, AbsPathBuf). What's left is v1 `vfs::Vfs`, the path<->FileId table, which is a restructure, so it's yours: lib.rs:102 `use vfs::Vfs` and its uses (load at ~1873/1888 `vfs::Vfs::default()`, the &mut vfs params at ~2065/2166/2287, 4326/4337 `vfs.file_path`, write_inputs 4387, the test at ~11392), check.rs:19, doc.rs:323/367/381/424, mirdump.rs:98, borrowck.rs:167 (+ consteval.rs:63 and borrowck.rs:84 `vfs.file_id(&VfsPath::from(..))`). v2: base-db is the path table. Files come in through `Db::set_view_root` (a blaze-vfs view's files; base-db assigns FileIds and source roots), path->file is `Db::file_for_path(&VfsPath)` and file->path is `Db::path_for_file(FileId)` (queue 00970 to db adds both; integrate-vfs adds them itself if db doesn't take it in two check passes), new IDs `Db::new_file_id`. Then drop `vfs.workspace = true` from crates/blaze-engine/Cargo.toml. Tell integrate-vfs (done note) when nothing in blaze-engine names `vfs`.",
+  "state": "applied",
+  "created": "2026-10-30T12:51:43Z",
+  "updated": "2026-10-30T12:58:42Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:43Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:41Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:42Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "blaze-engine no longer names vfs: its lib is now the `blaze` program (program.rs, pin.rs, versions.rs); every v1 module using vfs::Vfs (lib.rs tail, check.rs, doc.rs, mirdump.rs, borrowck.rs, consteval.rs) is git rm'd and `vfs` is gone from crates/blaze-engine/Cargo.toml and its Cargo.lock dependency list. (as_rustc.rs stays as a file no mod names, being ported by integrate-engine-rustc; it names no vfs.)"
+    }
+  ]
+}

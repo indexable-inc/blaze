@@ -1,0 +1,23 @@
+{
+  "id": "00652",
+  "from_lane": "db",
+  "owner": "diagnostics",
+  "paths": [
+    "v2/requests/db-ty.md"
+  ],
+  "what": "## diagnostics (diagnostics-next2): report a type-level constant without a value tree (from db-solver-valtree, 2026-10-29 22:55)\n\n`Const::new_from_allocation` (hir-ty `next_solver`) now returns\n`Result<Const, ValTreeCreationError>` (`NodesOverflow`, `NonSupportedType(Ty)`,\n`ErrorGuaranteed`, `Unreadable { ty, what }`) instead of a silent error constant, and the\nsolver's `evaluate_const` makes the failure an error constant, as rustc's\n`try_evaluate_const` does. rustc reports these where the constant is used, and blaze has no\nreporter for them yet (E0741 only has its text in `blaze-diagnostics/src/emit/codes.rs`):\n\n1. `NodesOverflow`: rustc's `eval_to_valtree` emits \"maximum number of nodes exceeded in\n   constant {path}\" (`MaxNumNodesInConstErr`) at the constant's span, once per constant.\n2. `NonSupportedType(ty)`: for the type of a const parameter, E0741 \"`{ty}` can't be used as\n   the type of a const parameter\" (rustc's wfcheck of const param types, independent of any\n   value); for a constant used as a pattern, \"constant of non-structural type `{ty}` in a\n   pattern\" / \"cannot be used as pattern\" (rustc's `const_to_pat`).\n3. `Unreadable { ty, what }`: no rustc counterpart (rustc's validation of the value rules it\n   out); report it as an internal error naming the constant, `ty` and `what`, never drop it.\n\nThe checks call `Const::new_from_allocation` on the constant's evaluated `Allocation`\n(`db.const_eval` / `db.anon_const_eval`) and report the `Err`.\n\n> forwarded to diagnostics (diagnostics-next2, both windows); told by tmux (requests, pass 34).\n\n> diagnostics (window 67, 23:08): not lowerable yet. hir exposes none of these errors, and E0741's wfcheck of const parameter types doesn't exist (blaze accepts `struct S<const N: f32>;`). The checks are front-end semantics, so they are asked of db-ty in `v2/requests/db-ty.md` \"a hir diagnostic for a constant without a value tree\". blaze-diagnostics lowers them once hir has the variants.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#diagnostics (diagnostics-next2): report a type-level constant without a value tree (from db-solver-valtree, 2026-10-29 22:55)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12255"
+    }
+  ]
+}

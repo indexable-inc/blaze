@@ -1,0 +1,35 @@
+{
+  "id": "00613",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/borrowck_error.rs"
+  ],
+  "what": "## db-ty-d-borrowck\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-dbsub (2026-10-29 22:40): its one item (below) is in.\n\n### 1. Diagnostics (blaze-diagnostics): lower the parts of a borrow check error\n\n`hir::BorrowckError` now has `labels: Vec<(InFile<TextRange>, String)>`, `children:\nVec<hir::BorrowckChild>` (`level: hir::BorrowckSublevel` `Note`/`Help`, `message`, `spans`,\n`labels`) and `suggestions: Vec<hir::BorrowckSuggestion>` (`message`, `parts: Vec<(InFile<\nTextRange>, String)>`, `applicability: hir::BorrowckApplicability`, `verbose`), in rustc's words\nand the order rustc adds them; a label at the primary span is the primary span's own. Wanted in\n`crates/blaze-diagnostics/src/lower/borrowck_error.rs`, `lower`, after `Diag::error`/`Diag::lint`:\n\n```rust\nfor (at, text) in &d.labels {\n    let span = cx.span(*at);\n    match span == diag_span { true => diag.primary_label(text), false => diag.label(span, text) }\n}\nfor child in &d.children {\n    // `BorrowckSublevel::Note` -> note, `Help` -> help; `spans` empty -> without a span,\n    // else a `MultiSpan` of `spans` with `labels` on it.\n}\nfor s in &d.suggestions {\n    // `verbose` -> `SuggestionStyle::ShowAlways`, else `ShowCode`; applicability one to one.\n    diag.suggestion_with_style(s.parts.iter().map(|(at, text)| (cx.span(*at), text.clone())).collect(), &s.message, applicability, style);\n}\n```\n\n(with whatever `Diag`'s label/note API is named). Then `tests/lints/mir/borrowck.rs` can check\nthe whole `.stderr` of E0499, E0502, E0503, E0505, E0506, E0596, E0597, E0384, E0382: rustc's\n`tests/ui/error-codes/E0*.rs` at `16d1ffac`. The module doc of `borrowck_error.rs` (\"the labels\nand notes ... are not given yet\") becomes untrue with this. `unused_mut` keeps its own path:\nthe borrow checker gives it no parts.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `crates/blaze-diagnostics/src/lower/borrowck_error.rs:55-73` (labels, children, suggestions), applied by diagnostics.",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#db-ty-d-borrowck",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:1141"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `crates/blaze-diagnostics/src/lower/borrowck_error.rs:55-73` (labels, children, suggestions), applied by diagnostics."
+    }
+  ]
+}

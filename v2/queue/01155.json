@@ -1,0 +1,35 @@
+{
+  "id": "01155",
+  "from_lane": "speed",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "Andrew 15:56 bench (cargo signature/generic/newfn off the splice path). In v2, `codegen::link` (codegen.rs:771-798) gives blaze-link every static as removed AND added on every build (`statics: built.statics.iter().collect()`, `removed_statics: std::mem::take(&mut linked.statics)`). blaze-link's `Change` is a delta: `Stage::apply` unmakes each removed static (marking its symbol changed) and `add_static` makes a fresh piece, so every build places every static anew, at a new address, and relocates and rewrites every function that refers to one: close to a full link on every edit (body edits too), and the moved statics eat the reserved room until a stage fails with `... link the image from scratch`. Fix: pass only statics that are new or differ. Exact edit: (1) `Linked.statics` (codegen.rs:563) becomes `Vec<(ItemKey, ContentId, ContentId)>` (item, instance, hash of the whole definition). (2) Replace lines 771-772 with:\n    // Each static by what it is and a hash of its definition: one put again unchanged is\n    // neither removed nor placed again, which would move it and rewrite every referrer.\n    let mut scratch = Vec::new();\n    let mut statics: Vec<(ItemKey, ContentId, ContentId)> = Vec::with_capacity(built.statics.len());\n    for it in &built.statics {\n        scratch.clear();\n        blaze_protocol::cbor::append(&mut scratch, it).map_err(|error| format!(\"the static {:?}: {error}\", it.item))?;\n        statics.push((it.item, it.instance, ContentId::of(\"blaze v2 link static 1\", &scratch)));\n    }\n    statics.sort_unstable();\n    let (mut gone_statics, mut new_statics) = (Vec::new(), Vec::new());\n    diff(&linked.statics, &statics, &mut gone_statics, &mut new_statics);\n(3) In the `Change` literal, `statics: built.statics.iter().filter(|it| new_statics.binary_search_by(|n| (n.0, n.1).cmp(&(it.item, it.instance))).is_ok()).collect(),` and `removed_statics: gone_statics.iter().map(|it| (it.0, it.1)).collect(),`, and drop the comment 'A static's value is not in its key: every static is put again.' (4) `linked.statics = statics;` stays. A static whose definition changed is in both lists (old hash gone, new added): removed then made, as now. Relocations name targets by symbol, so an unchanged static whose target function moved is still rewritten by blaze-link's referrer pass. Assumes (item, instance) is unique in `built.statics`. Test: link the same `built` twice into one kept image; the second `Change` has empty `statics` and `removed_statics`, and the second stage writes no static piece (blaze-link `Stage::statics` count 0). blaze-protocol and blaze-ids are already dependencies. Unbuilt; Andrew's 15:21 rule, the coordinator builds.",
+  "state": "applied",
+  "created": "2026-10-30T23:03:23Z",
+  "updated": "2026-10-30T23:07:13Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:03:23Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:07:12Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:07:13Z",
+      "by": "speed",
+      "action": "done",
+      "note": "crates/blaze-cargo/src/serve/unit/codegen.rs static_rows: statics diffed by (item, instance, CBOR hash of the Static); only new or changed ones are put, gone ones removed; test codegen/tests.rs a_static_linked_again_unchanged_is_neither_gone_nor_new"
+    }
+  ]
+}

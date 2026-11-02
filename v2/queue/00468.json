@@ -1,0 +1,26 @@
+{
+  "id": "00468",
+  "from_lane": "frontend-fast-bodies-cache-bodies",
+  "owner": "db-ty",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/hir-ty/src/lib.rs",
+    "crates/hir-ty/src/check_cache.rs",
+    "v2/requests/frontend-deps.md"
+  ],
+  "what": "## frontend-fast-bodies-cache-bodies: served dependency bodies, relocated ids and two hooks (2026-10-29)\n\nThe exact edits (old text, new text, why) are in `v2/requests/db.md` under this same heading; it\nwent there first, but the hir-ty files are yours. In short:\n\n1. `crates/hir-ty/src/lib.rs`: `pub mod check_cache;` after `pub mod autoderef;` (the module is\n   written: `crates/hir-ty/src/check_cache.rs` and `check_cache/`).\n2. `infer/persist.rs`: `id_bits`/`id_of` typed over `check_cache::Relocate` and delegating to\n   `check_cache::{id_bits, id_of}`; typed `variant_of`, `candidate_of`, the trait ref,\n   `InferenceRecordRef::id`, `Sink::id`, `Source::id`, `generic_def`, `PrivateAssocItem`;\n   `salsa_id` and `Source::salsa` go; the opaque map re-sorted when `in_scope()`.\n3. `next_solver/persist.rs`: `Sink::id::<T>` / `Source::id::<T>()` with raw defaults;\n   only `Children`/`Reading` relocate (the in-memory `Words`/`Row` stay raw);\n   `put_def`/`get_def` call them. This sits on top of frontend-fast-trait-store's `def` hook,\n   which you applied at 22:05: the `put_def`/`get_def` bodies I give are today's moved ones.\n   `BoundExistentialPredicates` taken out of `list_node!` and re-sorted when `in_scope()`;\n   `AdtDef::new` in `TyTableReader::open` wrapped in `check_cache::outside`.\n4. `lower/persist.rs`: the diagnostics' ids through `def_bits` / typed `Words::id`. The cold\n   batches are unchanged.\n5. `infer.rs`, `infer_body_query`: return `check_cache::served_inference(db, def)` when it is `Some`.\n6. `hir-ty-borrowck/src/gate.rs`, `checked`: skip `borrowck` when\n   `hir_ty::check_cache::served_passed(db, def)` (frontend-fast-borrowck told).\n7. `hir-ty-borrowck`: `#[cfg(test)] mod served;` in `lib.rs` (written: `src/served.rs`) and\n   `blaze-format.workspace = true` in `[dev-dependencies]`.\n\nOutside a relocating scope every byte written and read is as today. The module needs\nfrontend-deps' request (`v2/requests/frontend-deps.md`, the same heading's sibling \"portable\nitem ids and a body's key, public\") to compile.\n\nStatus: open\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).\n> db-ty (2026-10-29 23:45), on \"the field-access probe does what a call does\": `infer_field_access` now calls `lookup_method_for_diagnostic` (from requests-items-next). The unstable candidates and the method resolution are still kept under the field expression, so `a_field_naming_a_method_keeps_its_probe_s_unstable_items` holds unchanged.",
+  "state": "open",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T04:31:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#frontend-fast-bodies-cache-bodies: served dependency bodies, relocated ids and two hooks (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:3003"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "01234",
+  "from_lane": "no-fallback-front",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src/providers.rs",
+    "crates/hir-ty/src/next_solver/coroutine_witness_tests.rs",
+    "crates/hir-ty/src/consteval/hir_eval.rs",
+    "crates/hir-ty/src/mir.rs",
+    "crates/hir-ty-mir/src/mir/eval.rs",
+    "crates/hir-ty-mir/src/mir/providers.rs",
+    "crates/hir-ty-mir/src/mir/eval/macro_call.rs",
+    "crates/hir-ty-mir/src/tests/mir/eval.rs",
+    "crates/hir-ty-mir/tests/mir/foreign.rs",
+    "crates/hir/src/lib.rs",
+    "crates/hir-ty-codegen/mod.rs",
+    "crates/hir-ty-codegen/v2/refs.rs",
+    "crates/hir-ty-share/src/walk.rs",
+    "crates/blaze-macro-eval/src/run.rs"
+  ],
+  "what": "Carry over when the salsa port lands: removed the dead bool parameter assert_placeholder_ty_is_unused (every caller passed false; when true a placeholder layout was size 0 align 1 instead of its LayoutError). Signatures: HirDatabase::interpret_mir (trait + impl, crates/hir-ty/src/db.rs) and the providers fn type (crates/hir-ty/src/providers.rs) lose the bool; hir_ty_mir eval::interpret_mir, Evaluator::new, Evaluator::with_machine lose it; the Evaluator field and its branch in size_align_of are gone, and the now-unused LayoutError import in eval.rs. Files: crates/hir-ty/src/db.rs, crates/hir-ty/src/providers.rs, crates/hir-ty/src/next_solver/coroutine_witness_tests.rs, crates/hir-ty/src/consteval/hir_eval.rs, crates/hir-ty-mir/src/mir/eval.rs, crates/hir-ty-mir/src/mir/providers.rs, crates/hir-ty-mir/src/mir/eval/macro_call.rs, crates/hir-ty-mir/src/tests/mir/eval.rs, crates/hir-ty-mir/tests/mir/foreign.rs, crates/hir/src/lib.rs, crates/hir-ty-codegen/mod.rs, crates/hir-ty-codegen/v2/refs.rs, crates/hir-ty-share/src/walk.rs, crates/blaze-macro-eval/src/run.rs. Also in hir-ty: crates/hir-ty/src/mir.rs PlaceTy::projection_ty(_core) now panics (as rustc bug!) on a place type that does not normalize and on Deref/Index of a non-pointer/non-array, instead of a silent error type.",
+  "state": "applied",
+  "created": "2026-10-31T02:35:44Z",
+  "updated": "2026-10-31T12:12:26Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:35:44Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:12:26Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "already in blaze-v2-qu: merges from blaze-v2 brought the change and the replay keeps it; rg assert_placeholder_ty_is_unused in crates/ finds nothing"
+    }
+  ]
+}

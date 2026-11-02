@@ -5,28 +5,32 @@
 //! `map_unwrap_or_default.rs`, and their dispatch in `methods/mod.rs`, at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
-use syntax::{AstNode, TextRange, ast};
+use syntax::{TextRange, view as ast};
+
+use ast::AstNode as _;
 
 use super::utils::{self, MethodCall};
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "map_unwrap_or";
+const LINT: super::Implemented = super::Implemented::MapUnwrapOr;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) || cx.expansion.is_some() {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT)
+        || cx.expansion().is_some()
+        || !matches!(utils::method_name(expr), Some("unwrap_or" | "unwrap_or_default"))
+    {
         return;
     }
-    let Some(MethodCall { name, receiver: recv, args, .. }) = utils::method_call(cx, expr) else {
-        return;
-    };
-    let Some(map) = utils::method_call(cx, &recv) else { return };
-    let [map_arg] = &map.args[..] else { return };
+    let Some(outer) = utils::method_call(cx, expr) else { return };
+    let recv = outer.receiver;
+    let Some(map) = utils::method_call(cx, recv) else { return };
+    let [map_arg] = *map.args() else { return };
     if map.name != "map" {
         return;
     }
-    match (name.as_str(), &args[..]) {
-        ("unwrap_or", [unwrap_arg]) => unwrap_or(cx, expr, &recv, &map, map_arg, unwrap_arg),
-        ("unwrap_or_default", []) => unwrap_or_default(cx, expr, &recv, &map),
+    match (outer.name, outer.args()) {
+        ("unwrap_or", &[unwrap_arg]) => unwrap_or(cx, expr, recv, map, map_arg, unwrap_arg),
+        ("unwrap_or_default", []) => unwrap_or_default(cx, expr, recv, map),
         _ => {}
     }
 }
@@ -38,15 +42,15 @@ enum Suggested {
     Other,
 }
 
-fn unwrap_or(
-    cx: &mut Cx<'_, '_, '_>,
-    expr: &ast::Expr,
-    unwrap_recv: &ast::Expr,
-    map: &MethodCall,
-    map_arg: &ast::Expr,
-    unwrap_arg: &ast::Expr,
+fn unwrap_or<'t>(
+    cx: &mut Cx<'_, 't>,
+    expr: ast::Expr<'t>,
+    unwrap_recv: ast::Expr<'t>,
+    map: MethodCall<'t>,
+    map_arg: ast::Expr<'t>,
+    unwrap_arg: ast::Expr<'t>,
 ) {
-    let Some(recv_ty) = cx.ty(&map.receiver) else { return };
+    let Some(recv_ty) = cx.ty(map.receiver) else { return };
     let kind = match utils::option_or_result(cx, &recv_ty) {
         Some("Option") => "Option",
         Some("Result") if cx.conf().meets(msrvs::RESULT_MAP_OR) => "Result",
@@ -117,15 +121,20 @@ fn unwrap_or(
 }
 
 /// Whether `arg`'s type before adjustments is not its type after them.
-fn adjusted(cx: &Cx<'_, '_, '_>, arg: &ast::Expr) -> bool {
-    let Some(info) = cx.sema().type_of_expr(arg) else { return false };
-    info.adjusted.is_some_and(|it| it != info.original)
+fn adjusted<'t>(cx: &Cx<'_, 't>, arg: ast::Expr<'t>) -> bool {
+    let Some(original) = cx.ty(arg) else { return false };
+    cx.adjusted_ty(arg).is_some_and(|it| it != original)
 }
 
 /// Whether a local that `unwrap_arg` moves is used ahead of it in its body: `map_or` would
 /// move it first.
-fn moved_is_used_before(cx: &Cx<'_, '_, '_>, expr: &ast::Expr, unwrap_arg: &ast::Expr) -> bool {
-    let locals = utils::locals_in(cx, unwrap_arg.syntax());
+fn moved_is_used_before<'t>(
+    cx: &Cx<'_, 't>,
+    expr: ast::Expr<'t>,
+    unwrap_arg: ast::Expr<'t>,
+) -> bool {
+    let mut locals = Vec::new();
+    utils::locals_in(cx, unwrap_arg.syntax(), &mut locals);
     if locals.is_empty() {
         return false;
     }
@@ -135,20 +144,20 @@ fn moved_is_used_before(cx: &Cx<'_, '_, '_>, expr: &ast::Expr, unwrap_arg: &ast:
         let before = cx
             .range(path.syntax())
             .is_some_and(|it| (it.start(), it.end()) < (unwrap_at.start(), unwrap_at.end()));
-        before && utils::local_of(cx, &path).is_some_and(|it| locals.contains(&it))
+        before && utils::local_of(cx, path).is_some_and(|it| locals.contains(&it))
     })
 }
 
-fn unwrap_or_default(
-    cx: &mut Cx<'_, '_, '_>,
-    expr: &ast::Expr,
-    recv: &ast::Expr,
-    map: &MethodCall,
+fn unwrap_or_default<'t>(
+    cx: &mut Cx<'_, 't>,
+    expr: ast::Expr<'t>,
+    recv: ast::Expr<'t>,
+    map: MethodCall<'t>,
 ) {
     if !cx.conf().meets(msrvs::MAP_OR_DEFAULT) {
         return;
     }
-    let Some(recv_ty) = cx.ty(&map.receiver) else { return };
+    let Some(recv_ty) = cx.ty(map.receiver) else { return };
     let Some(kind) = utils::option_or_result(cx, &recv_ty) else { return };
     // `manual_is_variant_and` says more of an `Option<bool>` or `Result<bool, _>`.
     if cx.ty(expr).is_some_and(|it| it.is_bool()) {

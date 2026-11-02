@@ -1,0 +1,39 @@
+{
+  "id": "00720",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/cargo.md",
+    "crates/blaze-units/src/load",
+    "crates/blaze-tree/src/query.rs",
+    "v2/requests/db-salsa.md",
+    "docs/v2/plan/lanes/cargo/speed-of-light.md"
+  ],
+  "what": "## 21. From lane cargo (to the coordinator, 2026-10-29 19:30): request 1 is what the lane's \"Done when\" waits on\n\n`docs/v2/plan/lanes/cargo.md`'s \"Done when\" has the workspace load as queries and a report\nsaying `STATUS: DONE`. The load is written and cannot be finished until request 1 (and its\naddenda 5, 14 and 19) is granted: `crates/blaze-units/src/load/` and `crates/blaze-tree/src/query.rs`\ncall `blaze_manifest::files::Files`, `Config::load_with`, `Context::with_files`,\n`Workspace.offline_flag`, `Config::cli_unstable`, `Dependency.artifact`, the public\n`Serialized*` fields and `blaze_metadata` on `blaze_units::Read`, which lane cargo writes once\nthe five crates are its. decisions.md (\"Everything is ours at every level\", \"Finished code only\")\nsupports the grant; lane cargo can't report DONE without it.\n\nAlso done in lane cargo's own paths after the plan's reorganization: the git fetch takes no\nlock and writes nothing in the user's `$CARGO_HOME` (`serve/fetch/git.rs`, decisions.md \"no build\nlock\"); child cargo-sync makes `load-cargo` and `serve/` share the front end's database by\nreference (decisions.md, `v2/requests/db-salsa.md`'s load-cargo and blaze-cargo items); child\ncargo-sol writes `docs/v2/plan/lanes/cargo/speed-of-light.md`.\n\n> forwarded to the coordinator: granting the five cargo crates is its decision, not requests' (listed in requests' report).",
+  "state": "refused",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:33:38Z",
+  "taken_by": "coord-apply-docs",
+  "why": "Already done: request 1 (00708) is granted; crates.md gives lane cargo blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry and blaze-source (building.md now says so too), so lane cargo writes Files, Config::load_with, Context::with_files and the rest itself.",
+  "source": "v2/requests/cargo.md#21. From lane cargo (to the coordinator, 2026-10-29 19:30): request 1 is what the lane's \"Done when\" waits on",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2334"
+    },
+    {
+      "at": "2026-10-30T08:33:38Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:38Z",
+      "by": "coord-apply-docs",
+      "action": "refuse",
+      "note": "Already done: request 1 (00708) is granted; crates.md gives lane cargo blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry and blaze-source (building.md now says so too), so lane cargo writes Files, Config::load_with, Context::with_files and the rest itself."
+    }
+  ]
+}

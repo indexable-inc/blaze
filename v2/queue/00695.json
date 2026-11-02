@@ -1,0 +1,30 @@
+{
+  "id": "00695",
+  "from_lane": "fastcompile",
+  "owner": "fastcompile-inproc",
+  "paths": [
+    "crates/blaze-inproc/src/ask.rs",
+    "docs/v2/plan/lanes/fastcompile/lazy.md"
+  ],
+  "what": "## fastcompile-sol-lazy 1: fastcompile-inproc: a bounded spin before an asker or the reader sleeps (`crates/blaze-inproc/src/ask.rs` `request`, `Reader::recv`)\n\nWhat:\n\n1. In `ask::request`, before each `sys::wait_answer`, spin on `answered(words, index,\n   generation)` (with `std::hint::spin_loop`) for up to about one wake-up, 3 µs, and sleep only\n   if no answer came. This is the competitive bound: spinning costs at most what the sleep and\n   wake would. It stays async-signal-safe: loads and a clock read (`clock_gettime` is on the\n   signal-safe list), no lock.\n2. In `Reader::recv`, before `bells.wait_ring`, rescan the slots for `ASKED` (as `take` does)\n   for up to 50 µs after the last frame it returned, then sleep on the doorbell. While the\n   reader spins, the asker's `ring` is still sent; `wait_ring` drains the bytes when the\n   reader next sleeps, as now.\n\nWhy: a first call that misses waits on two cross-process wake-ups, about 3 µs each\n(`docs/v2/plan/lanes/fastcompile/lazy.md#speed-of-light`, \"A first call\"). With a memo hit,\nthose 6 µs are 80% of the bound. When a burst of first calls comes from one thread, with\nprefetched callees answered at the reader, each ask finds the reader and the asker asleep\nagain. With both spins in place, the bound per first call drops from \\(6.3\\ \\mu s + T_C\\) to\nabout \\(0.5\\ \\mu s + T_C\\), and blaze-lazy's own part (its worker spins already) is ready for\nit. The asker spin costs the program's thread nothing it could otherwise use, since the\nthread is blocked on its first call; the reader's spin costs one daemon core for 50 µs after\na burst.\n\nThe model (`ask/model.rs`) is unaffected: a spin is reads of the same words before the same\ncompare-then-sleep.\n\nStatus: open\n\n> done: (fastcompile-inproc-exec, 2026-10-29; nothing built or run, per the brief)\n> 1: `request` sleeps only after `answered_within(.., ASKER_SPIN)` (3 µs of `answered` and\n> `spin_loop`, timed by `Instant`, which is `clock_gettime` or `QueryPerformanceCounter`), so\n> it stays lock-free and signal-safe. 2: `Reader` keeps `last`, when it last returned an ask,\n> and rescans with `take` until `READER_SPIN` (50 µs) has passed, then calls `wait_ring`. Rings\n> sent meanwhile are drained by the next `wait_ring` (Unix reads up to 256 bytes a call; the\n> Windows event stays set). One consequence: an asker whose blocking `send` finds the socket's\n> buffer full waits until the reader next sleeps, at most 50 µs after the last ask was taken;\n> its ask is already `ASKED`, so it is taken meanwhile. The model is unchanged. Linux test:\n> `an_asker_spins_about_one_wake_up_and_no_longer` (the spin ends at the bound unanswered, and\n> at once when answered). `inproc.md` \"The asks\" describes both spins. There is no reader-spin\n> test, because one would depend on timing.\n\n> forwarded to fastcompile-inproc (fastcompile-inproc-exec-next2); told by tmux (requests, pass 33).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T14:11:42Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sol-lazy 1: fastcompile-inproc: a bounded spin before an asker or the reader sleeps (`crates/blaze-inproc/src/ask.rs` `request`, `Reader::recv`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3401"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "done by fastcompile-inproc-exec in blaze-inproc ask.rs: asker spins up to 3us, Reader::recv rescans 50us"
+    }
+  ]
+}

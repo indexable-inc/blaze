@@ -1,0 +1,25 @@
+{
+  "id": "01087",
+  "from_lane": "integrate-tooling",
+  "owner": "proof",
+  "paths": [
+    "harness/v2/engine.py",
+    "harness/v2/tightmemory.py",
+    "harness/v2/corpus.py"
+  ],
+  "what": "From integrate-tooling (01073, the part integrate gave proof): v2 refuses every unit while BLAZE_BACKEND or BLAZE_OPT is set (crates/hir-ty-codegen/v2/backend.rs, CHANGES_CODE) and picks the backend by the profile (opt-level 0-1 Cranelift, the rest LLVM). (1) harness/v2/engine.py: `Engine.env` sets BLAZE_BACKEND=self.spec.backend for every command (line ~427), BLAZE_OPT=2 and BLAZE_EMIT=fast for llvm (~429), and BLAZE_CACHE (v2's store is <home>/v2/store whatever it says); line ~409 and corpus.py:772 still describe BLAZE_BACKEND=llvm. Remove them, never scrub-and-ignore: an engine's backend becomes a profile (as fuzz/store.py and fuzz/edits.py take `profiles`, and bench.py's BACKENDS is now {\"cranelift\": (), \"llvm\": (\"--release\",)}). (2) blaze_cli changed under engine.py: `how_built` now returns \"daemon\" when the build printed cargo's `Finished` line (v2 prints cargo's lines, never `[blaze]`) and \"failed: <first error>\" otherwise; `by_rustc` is gone (no v2 output can tell a cargo build; norustc.py holds that). `Engine.not_blazes` (~489-498) still compares with \"cargo\" and \"unchanged\" and calls blaze_cli.by_rustc (unreachable now, but pyright will flag it), and a refused build now reads as \"failed: ...\" where it read \"cargo\". (3) harness/v2/tightmemory.py: BLAZE_MEMORY_BUDGET is read by no v2 crate, so its budget sets nothing.",
+  "state": "open",
+  "created": "2026-10-30T16:18:00Z",
+  "updated": "2026-10-30T16:18:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:18:00Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

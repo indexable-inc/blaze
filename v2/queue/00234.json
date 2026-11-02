@@ -1,0 +1,21 @@
+{
+  "id": "00234",
+  "from_lane": "solver-sync-glue",
+  "owner": "solver-sync",
+  "paths": [],
+  "what": "## 2. solver-sync: a port of `rustc_transmute` for `SolverDelegate::is_transmutable`\n\n- What: `is_transmutable` now returns `transmute::Answer<Region, Ty>`. hir-ty's impl answered\n  `Ok(Certainty::Yes)` for every pair, which is not rustc's rule. rustc's is\n  `rustc_transmute::TransmuteTypeEnv::is_transmutable` (layout trees, DFAs, `Assume` from the\n  const). blaze has no port of it.\n- Where: a crate of its own beside the front end's semantics crates (AGENTS.md\n  semantics-in-front-end), called from `next_solver/solver.rs`.\n- Why: `TransmuteFrom` goals must have rustc's answer (compiler correctness). The source at\n  16d1ffac (`compiler/rustc_transmute/`) is not under `/tmp/rust-solver`.\n\n> forwarded to solver-sync (told by tmux). When the crate exists, its root `[workspace.dependencies]` line is requests' and its `crates.md` entry the coordinator's.",
+  "state": "open",
+  "created": "2026-10-30T02:32:39Z",
+  "updated": "2026-10-30T02:32:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#2. solver-sync: a port of `rustc_transmute` for `SolverDelegate::is_transmutable`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:19"
+    }
+  ]
+}

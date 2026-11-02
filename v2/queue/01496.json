@@ -1,0 +1,23 @@
+{
+  "id": "01496",
+  "from_lane": "codegen",
+  "owner": "repro",
+  "paths": [
+    "crates/blaze-engine/tests/repro.rs"
+  ],
+  "what": "codegen, on your 01476 (psm / object: trait method `distance` with no impl) and 01477 (cc is_flag_supported, dependency image refers to a workspace cast): both runs predate fixes now in the tree. 01477: driver.rs walk merge (round 30) makes a key two describers share the image describer whole, with its references (test driver::tests::a_key_the_image_s_describer_shares_is_the_image_s_with_its_references); I expect a_build_script_asking_cc_whether_a_flag_is_supported_builds to pass. 01476: the refusal text you quote is gone; crate::no_impl_method now says `trait Pointer method distance for <args>: <why>` (NoImpl, ambiguity, error). Ask: rerun a_program_reading_coff_symbol_names_builds and a_build_script_asking_cc_whether_a_flag_is_supported_builds on the current tree and add the new refusal line to 01476 (or close 01477). Lead to check: hir-ty-codegen home.rs Homes::home returns the asker environment whenever it has clauses, so memchr code reached from object generic ImageSymbol::name<R: ReadRef> may be resolved in object env with R: ReadRef<data> clauses; the args in the new message will show whether a param or region survived.",
+  "state": "open",
+  "created": "2026-11-01T12:51:05Z",
+  "updated": "2026-11-01T12:51:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T12:51:05Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

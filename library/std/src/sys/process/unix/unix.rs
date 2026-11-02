@@ -60,6 +60,10 @@ impl Command {
         const CLOEXEC_MSG_FOOTER: [u8; 4] = *b"NOEX";
 
         let envp = self.capture_env();
+        // blaze: the child is given `environ` whole.
+        if envp.is_none() {
+            sys::env::walked();
+        }
 
         if self.saw_nul() {
             return Err(io::const_error!(
@@ -228,6 +232,10 @@ impl Command {
 
     pub fn exec(&mut self, default: Stdio) -> io::Error {
         let envp = self.capture_env();
+        // blaze: the program is given `environ` whole.
+        if envp.is_none() {
+            sys::env::walked();
+        }
 
         if self.saw_nul() {
             return io::const_error!(ErrorKind::InvalidInput, "nul byte found in provided data");

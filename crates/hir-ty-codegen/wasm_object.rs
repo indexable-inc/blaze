@@ -12,11 +12,16 @@
 //! hand because relocations are offsets into them, and the reloc sections because it has no
 //! encoder for them.
 
+#![forbid(unsafe_code)]
+
+use std::borrow::Cow;
+
+use blaze_hash::HashMap;
 use cranelift_object::object::{
     self, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionIndex, SectionKind,
     SymbolIndex, SymbolKind,
 };
-use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use wasm_encoder::{
     CustomSection, Encode, EntityType, FunctionSection, GlobalType, ImportSection, MemoryType,
     Module, RawSection, RefType, SectionId, TableType, TypeSection, ValType,
@@ -96,7 +101,7 @@ struct Defined {
 #[derive(Default)]
 struct Writer {
     types: Vec<WasmSignature>,
-    type_of: FxHashMap<WasmSignature, u32>,
+    type_of: HashMap<WasmSignature, u32>,
     symbols: Vec<u8>,
     symbol_count: u32,
     code: Vec<u8>,
@@ -115,6 +120,7 @@ const IMPORT: &str = "blaze.import.";
 /// refers to the import as what is compiled anew does. Named for its module too, as rustc
 /// mangles the name of one: two modules may have imports of the same name.
 pub(super) fn import_symbol(module: &str, field: &str) -> String {
+    // alloc: the symbol's name, which the caller in `mod.rs` declares
     format!("{IMPORT}{}.{module}{field}", module.len())
 }
 
@@ -130,9 +136,10 @@ fn import_of(symbol: &str) -> Option<(&str, &str)> {
 /// joins the ones of every object.
 pub(super) fn from_elf(
     elf: &[u8],
-    signatures: &FxHashMap<String, WasmSignature>,
+    signatures: &HashMap<String, WasmSignature>,
     custom: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
+    // alloc: the error's message
     let file = object::File::parse(elf).map_err(|e| format!("wasm object: {e}"))?;
     let mut writer = Writer::default();
 
@@ -171,19 +178,23 @@ pub(super) fn from_elf(
     // An undefined symbol of an ELF object has no kind: it is a function when the code
     // generator declared one of its name. The ones nothing refers to are left out, as the
     // linker would ask for them.
-    let referred: rustc_hash::FxHashSet<SymbolIndex> = file
+    let referred: blaze_hash::HashSet<SymbolIndex> = file
         .sections()
         .flat_map(|section| section.relocations())
         .filter_map(|(_, reloc)| match reloc.target() {
             RelocationTarget::Symbol(symbol) => Some(symbol),
             _ => None,
         })
+        // alloc: once per object, the set of the symbols relocations name
         .collect();
-    let mut symbol_of: FxHashMap<SymbolIndex, (u32, bool)> = FxHashMap::default();
+    let mut symbol_of: HashMap<SymbolIndex, (u32, bool)> = HashMap::default();
     let mut imported = 0u32;
+    // alloc: once per object, its functions
     let mut functions = Vec::new();
+    // alloc: once per object, its pieces of data
     let mut datas = Vec::new();
     for symbol in file.symbols() {
+        // alloc: the error's message
         let name = symbol.name().map_err(|e| format!("wasm object: {e}"))?;
         match (symbol.kind(), symbol.section_index()) {
             (SymbolKind::Text, Some(_)) => functions.push(symbol),
@@ -220,20 +231,23 @@ pub(super) fn from_elf(
     }
 
     let section_data = |index: SectionIndex| {
+        // alloc: the error's message
         let section = file.section_by_index(index).map_err(|e| format!("wasm object: {e}"))?;
+        // alloc: the error's message
         let data = section.data().map_err(|e| format!("wasm object: {e}"))?;
         Ok::<_, String>((section, data))
     };
 
-    let mut defined = Vec::new();
+    let mut defined = Vec::with_capacity(functions.len() + datas.len());
     let mut function_types = FunctionSection::new();
-    let mut fixups = Vec::new();
     (functions.len() as u32).encode(&mut writer.code);
     for (at, symbol) in functions.iter().enumerate() {
+        // alloc: the error's message
         let name = symbol.name().map_err(|e| format!("wasm object: {e}"))?;
         let section = symbol.section_index().expect("a defined symbol");
         let (_, data) = section_data(section)?;
         let range = symbol.address() as usize..(symbol.address() + symbol.size()) as usize;
+        // alloc: the error's message
         let bytes = data.get(range).ok_or_else(|| format!("wasm object: `{name}` out of range"))?;
         let (function, skip) = WasmFunction::decode(bytes)?;
         function_types.function(writer.ty(&function.signature));
@@ -242,7 +256,7 @@ pub(super) fn from_elf(
         writer.code.extend(&function.body);
         for &(offset, ty) in &function.type_fixups {
             let ty = writer.ty(&function.types[ty as usize]);
-            fixups.push(Reloc {
+            writer.fixup(Reloc {
                 ty: RelocType::TypeIndexLeb,
                 offset: start + offset,
                 index: ty,
@@ -250,7 +264,7 @@ pub(super) fn from_elf(
             });
         }
         for &offset in &function.stack_pointer_fixups {
-            fixups.push(Reloc {
+            writer.fixup(Reloc {
                 ty: RelocType::GlobalIndexLeb,
                 offset: start + offset,
                 index: stack_pointer,
@@ -273,19 +287,13 @@ pub(super) fn from_elf(
             is_function: true,
         });
     }
-    // What the linker fills in has a value until then: the index in this object.
-    for fixup in fixups {
-        let place = &mut writer.code[fixup.offset as usize..][..INDEX_LEN];
-        let value = if fixup.ty == RelocType::TypeIndexLeb { fixup.index } else { 0 };
-        write_padded(place, value);
-        writer.code_relocs.push(fixup);
-    }
 
     // Each piece of data is a segment of its own, at an address of its own, so that the
     // linker drops the ones nothing refers to.
     (datas.len() as u32).encode(&mut writer.data);
     let mut address = 0u32;
     for symbol in &datas {
+        // alloc: the error's message
         let name = symbol.name().map_err(|e| format!("wasm object: {e}"))?;
         let section_index = symbol.section_index().expect("a defined symbol");
         let (section, data) = section_data(section_index)?;
@@ -294,25 +302,28 @@ pub(super) fn from_elf(
             section.kind(),
             SectionKind::UninitializedData | SectionKind::UninitializedTls
         );
+        // `None` for `size` zeros.
         let bytes = if uninitialized {
-            std::borrow::Cow::Owned(vec![0; size])
+            None
         } else {
             let start = (symbol.address() - section.address()) as usize;
             let bytes = data
                 .get(start..start + size)
+                // alloc: the error's message
                 .ok_or_else(|| format!("wasm object: `{name}` out of range"))?;
-            std::borrow::Cow::Borrowed(bytes)
+            Some(bytes)
         };
         // Writable data that is all zeros, with no address written into it, is `.bss` as LLVM
         // makes it: the linker leaves such segments out of the module, memory being zeros.
         let zeroed = uninitialized
             || section.kind() == SectionKind::Data
                 && section.relocations().next().is_none()
-                && bytes.iter().all(|&b| b == 0);
+                && bytes.is_some_and(|bytes| bytes.iter().all(|&b| b == 0));
         // Each piece of data is in a section of its own (`per_data_object_section`), which is
         // aligned as the code generator asked. Its size says nothing: four bytes of a field of
         // a value aligned to 64 are aligned to 64.
         if section.address() != symbol.address() || section.size() > symbol.size() {
+            // alloc: the error's message
             return Err(format!("wasm object: `{name}` shares its section"));
         }
         let align = section.align().max(1);
@@ -324,19 +335,25 @@ pub(super) fn from_elf(
         writer.data.push(0x0b);
         (size as u32).encode(&mut writer.data);
         let start = writer.data.len() as u32;
-        writer.data.extend(&*bytes);
+        match bytes {
+            Some(bytes) => writer.data.extend_from_slice(bytes),
+            None => writer.data.resize(writer.data.len() + size, 0),
+        }
         address += size as u32;
 
         // The messages of the stand-ins keep their section's name, which the linker merges
         // them by into one segment of its own that the module names.
         let (_, stand_ins) = super::stand_in_section(::object::BinaryFormat::Wasm);
-        let segment_name = match section.kind() {
-            _ if section.name() == Ok(stand_ins) => stand_ins.to_owned(),
-            _ if zeroed => format!(".bss.{name}"),
-            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => format!(".rodata.{name}"),
-            _ => format!(".data.{name}"),
+        let (prefix, segment_name) = match section.kind() {
+            _ if section.name() == Ok(stand_ins) => (stand_ins, ""),
+            _ if zeroed => (".bss.", name),
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => (".rodata.", name),
+            _ => (".data.", name),
         };
-        segment_name.encode(&mut writer.segments);
+        // The name as `str` encodes it: its length, then its bytes.
+        (prefix.len() + segment_name.len()).encode(&mut writer.segments);
+        writer.segments.extend_from_slice(prefix.as_bytes());
+        writer.segments.extend_from_slice(segment_name.as_bytes());
         align.trailing_zeros().encode(&mut writer.segments);
         0u32.encode(&mut writer.segments);
         let segment = writer.segment_count;
@@ -360,7 +377,7 @@ pub(super) fn from_elf(
         });
     }
 
-    defined.sort_by_key(|it| (it.section.0, it.address));
+    blaze_ids::radix::sort_by_key(&mut defined, |it| blaze_ids::radix::pack_64(it.section.0 as u64, it.address));
     let containing = |section: SectionIndex, address: u64| {
         let after =
             defined.partition_point(|it| (it.section.0, it.address) <= (section.0, address));
@@ -377,9 +394,11 @@ pub(super) fn from_elf(
                 continue;
             };
             let RelocationTarget::Symbol(target) = reloc.target() else {
+                // alloc: the error's message
                 return Err("wasm object: relocation against no symbol".to_owned());
             };
             let target_symbol =
+                // alloc: the error's message
                 file.symbol_by_index(target).map_err(|e| format!("wasm object: {e}"))?;
             let mut addend = reloc.addend();
             // A relocation against a section is against what is at the addend in it.
@@ -393,6 +412,7 @@ pub(super) fn from_elf(
             } else {
                 *symbol_of
                     .get(&target)
+                    // alloc: the error's message
                     .ok_or_else(|| format!("wasm object: relocation against {target_symbol:?}"))?
             };
             let in_code = place.is_function;
@@ -405,10 +425,12 @@ pub(super) fn from_elf(
                 (false, false) => RelocType::MemoryAddrI32,
             };
             if is_function && addend != 0 {
+                // alloc: the error's message
                 return Err("wasm object: an address inside a function".to_owned());
             }
             let within = (offset - place.address) as u32;
             let Some(within) = within.checked_sub(place.skip) else {
+                // alloc: the error's message
                 return Err("wasm object: relocation in the header of a function".to_owned());
             };
             let reloc =
@@ -417,14 +439,15 @@ pub(super) fn from_elf(
         }
     }
 
-    let mut sections: Vec<(&str, Vec<u8>)> = Vec::new();
+    let mut sections: SmallVec<[(&str, Cow<'_, [u8]>); 4]> = SmallVec::new();
     for (name, bytes) in custom {
         if matches!(name.as_str(), "linking" | "name") || name.starts_with("reloc.") {
+            // alloc: the error's message
             return Err(format!("wasm object: a custom section may not be named `{name}`"));
         }
         match sections.iter_mut().find(|(it, _)| it == name) {
-            Some((_, contents)) => contents.extend(bytes),
-            None => sections.push((name, bytes.clone())),
+            Some((_, contents)) => contents.to_mut().extend(bytes),
+            None => sections.push((name, Cow::Borrowed(&bytes[..]))),
         }
     }
     Ok(writer.finish(imports, function_types, &sections))
@@ -434,28 +457,8 @@ pub(super) fn from_elf(
 /// values of its crates), which says what its code may use as LLVM's does: the linker joins
 /// those of every object, and wasm-bindgen reads `reference-types` off the program's.
 pub(super) fn target_features(enabled: impl IntoIterator<Item = String>) -> (String, Vec<u8>) {
-    /// The features LLVM's wasm target knows, of the names rustc gives them too.
-    const KNOWN: &[&str] = &[
-        "atomics",
-        "bulk-memory",
-        "bulk-memory-opt",
-        "call-indirect-overlong",
-        "exception-handling",
-        "extended-const",
-        "fp16",
-        "gc",
-        "multimemory",
-        "multivalue",
-        "mutable-globals",
-        "nontrapping-fptoint",
-        "reference-types",
-        "relaxed-simd",
-        "sign-ext",
-        "simd128",
-        "tail-call",
-        "wide-arithmetic",
-    ];
-    let mut features = std::collections::BTreeSet::new();
+    // One bit per known feature, written in `KNOWN_FEATURES`' order: its names' byte order.
+    let mut features = 0u32;
     for feature in enabled {
         let implied = match feature.as_str() {
             "bulk-memory" => Some("bulk-memory-opt"),
@@ -463,18 +466,60 @@ pub(super) fn target_features(enabled: impl IntoIterator<Item = String>) -> (Str
             "relaxed-simd" => Some("simd128"),
             _ => None,
         };
-        features.extend(implied.map(str::to_owned));
-        features.insert(feature);
+        for name in std::iter::once(feature.as_str()).chain(implied) {
+            if let Some(at) = KNOWN_FEATURES.iter().position(|it| *it == name) {
+                features |= 1 << at;
+            }
+        }
     }
-    features.retain(|it| KNOWN.contains(&it.as_str()));
+    // alloc: once per object, the section's few bytes, which it returns
     let mut contents = Vec::new();
-    (features.len() as u32).encode(&mut contents);
-    for feature in &features {
-        contents.push(b'+');
-        feature.as_str().encode(&mut contents);
+    features.count_ones().encode(&mut contents);
+    for (at, &name) in KNOWN_FEATURES.iter().enumerate() {
+        if features >> at & 1 != 0 {
+            contents.push(b'+');
+            name.encode(&mut contents);
+        }
     }
+    // alloc: once per object, the section's name, which the caller in `mod.rs` keeps
     ("target_features".to_owned(), contents)
 }
+
+/// The features LLVM's wasm target knows, of the names rustc gives them too, sorted by bytes.
+const KNOWN_FEATURES: &[&str] = &[
+    "atomics",
+    "bulk-memory",
+    "bulk-memory-opt",
+    "call-indirect-overlong",
+    "exception-handling",
+    "extended-const",
+    "fp16",
+    "gc",
+    "multimemory",
+    "multivalue",
+    "mutable-globals",
+    "nontrapping-fptoint",
+    "reference-types",
+    "relaxed-simd",
+    "sign-ext",
+    "simd128",
+    "tail-call",
+    "wide-arithmetic",
+];
+
+const _: () = {
+    assert!(KNOWN_FEATURES.len() <= 32);
+    let mut at = 1;
+    while at < KNOWN_FEATURES.len() {
+        let (a, b) = (KNOWN_FEATURES[at - 1].as_bytes(), KNOWN_FEATURES[at].as_bytes());
+        let mut byte = 0;
+        while byte < a.len() && byte < b.len() && a[byte] == b[byte] {
+            byte += 1;
+        }
+        assert!(if byte < a.len() && byte < b.len() { a[byte] < b[byte] } else { a.len() < b.len() });
+        at += 1;
+    }
+};
 
 impl Writer {
     fn ty(&mut self, signature: &WasmSignature) -> u32 {
@@ -482,9 +527,20 @@ impl Writer {
             return index;
         }
         let index = self.types.len() as u32;
+        // clone: once per distinct signature of the object, which the type section keeps
         self.types.push(signature.clone());
+        // clone: as above, the key its index is found by
         self.type_of.insert(signature.clone(), index);
         index
+    }
+
+    /// Adds a relocation of the code section over an index already in place. What the linker
+    /// fills in has a value until then: the index in this object.
+    fn fixup(&mut self, fixup: Reloc) {
+        let place = &mut self.code[fixup.offset as usize..][..INDEX_LEN];
+        let value = if fixup.ty == RelocType::TypeIndexLeb { fixup.index } else { 0 };
+        place.copy_from_slice(&blaze_format::leb::padded_u32(value));
+        self.code_relocs.push(fixup);
     }
 
     /// Adds a symbol and gives its index. `rest` writes what follows the flags.
@@ -500,20 +556,23 @@ impl Writer {
         mut self,
         imports: ImportSection,
         functions: FunctionSection,
-        custom: &[(&str, Vec<u8>)],
+        custom: &[(&str, Cow<'_, [u8]>)],
     ) -> Vec<u8> {
         let mut types = TypeSection::new();
         for signature in &self.types {
-            let values = |types: &[super::wasm::WasmType]| {
-                types.iter().map(|&it| ValType::from(it)).collect::<Vec<_>>()
-            };
-            types.ty().function(values(&signature.params), values(&signature.results));
+            types.ty().function(
+                signature.params.iter().map(|&it| ValType::from(it)),
+                signature.results.iter().map(|&it| ValType::from(it)),
+            );
         }
 
-        let mut linking = Vec::new();
+        // A LEB128 of a `u32` is at most five bytes: the version, then each subsection's id,
+        // size, count and entries.
+        let mut linking =
+            Vec::with_capacity(5 + 2 * (1 + 5 + 5) + self.symbols.len() + self.segments.len());
         LINKING_VERSION.encode(&mut linking);
         let mut subsection = |id: Subsection, count: u32, entries: &[u8]| {
-            let mut contents = Vec::new();
+            let mut contents = Vec::with_capacity(5 + entries.len());
             count.encode(&mut contents);
             contents.extend(entries);
             linking.push(id as u8);
@@ -526,8 +585,9 @@ impl Writer {
         const CODE_SECTION: u32 = 3;
         const DATA_SECTION: u32 = 4;
         let relocs = |section: u32, relocs: &mut Vec<Reloc>| {
-            relocs.sort_by_key(|it| it.offset);
-            let mut contents = Vec::new();
+            blaze_ids::radix::sort_by_key(&mut relocs[..], |it| it.offset);
+            // The section and the count, then each a type byte and up to three LEB128s.
+            let mut contents = Vec::with_capacity(10 + relocs.len() * 16);
             section.encode(&mut contents);
             (relocs.len() as u32).encode(&mut contents);
             for reloc in relocs.iter() {
@@ -587,11 +647,48 @@ fn flags(symbol: &object::Symbol<'_, '_>) -> u32 {
     flags
 }
 
-/// Writes `value` as a LEB128 that fills `place`.
-fn write_padded(place: &mut [u8], mut value: u32) {
-    let last = place.len() - 1;
-    for (at, byte) in place.iter_mut().enumerate() {
-        *byte = (value & 0x7f) as u8 | if at == last { 0 } else { 0x80 };
-        value >>= 7;
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// `target_features` as it was over a set of names: the bytes the bitset must write.
+    fn reference(enabled: Vec<String>) -> (String, Vec<u8>) {
+        let mut features = BTreeSet::new();
+        for feature in enabled {
+            let implied = match feature.as_str() {
+                "bulk-memory" => Some("bulk-memory-opt"),
+                "reference-types" => Some("call-indirect-overlong"),
+                "relaxed-simd" => Some("simd128"),
+                _ => None,
+            };
+            features.extend(implied.map(str::to_owned));
+            features.insert(feature);
+        }
+        features.retain(|it| KNOWN_FEATURES.contains(&it.as_str()));
+        let mut contents = Vec::new();
+        (features.len() as u32).encode(&mut contents);
+        for feature in &features {
+            contents.push(b'+');
+            feature.as_str().encode(&mut contents);
+        }
+        ("target_features".to_owned(), contents)
+    }
+
+    #[test]
+    fn the_bitset_writes_the_bytes_the_set_did() {
+        let names: Vec<&str> =
+            KNOWN_FEATURES.iter().copied().chain(["sse2", "", "simd", "bulk-memory-opt2"]).collect();
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+        for _ in 0..2_000 {
+            let len = rng.index(12);
+            let enabled: Vec<String> =
+                (0..len).map(|_| names[rng.index(names.len())].to_owned()).collect();
+            assert_eq!(target_features(enabled.clone()), reference(enabled.clone()), "{enabled:?}");
+        }
+        assert_eq!(target_features(Vec::new()), reference(Vec::new()));
+        let all: Vec<String> = names.iter().map(|it| (*it).to_owned()).collect();
+        assert_eq!(target_features(all.clone()), reference(all));
     }
 }

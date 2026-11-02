@@ -1,0 +1,41 @@
+{
+  "id": "01245",
+  "from_lane": "nameres-hello",
+  "owner": "nameres-hello",
+  "paths": [
+    "crates/blaze-items/src/form.rs"
+  ],
+  "what": "crates/blaze-items/src/form.rs drops the MirLowerError where MIR fails to lower (lines 759, 769, 1763, 1825, 2264, 2283: `Err(_) => f.error(Missed::NoMir)`), so a build only says `Fn build_script_build::main has no hash: MIR that failed to lower` (hello3, b2-build/hello3-run.log). Keep the error, or at least its kind and the body, in what the build reports, so the cause is named. Rule 3: an error names what and where.",
+  "state": "applied",
+  "created": "2026-10-31T03:19:17Z",
+  "updated": "2026-10-31T14:45:39Z",
+  "taken_by": "nameres-hello",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:19:17Z",
+      "by": "nameres-hello",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from items (no live window) to nameres-hello, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:13Z",
+      "by": "nameres-hello",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:45:39Z",
+      "by": "nameres-hello",
+      "action": "done",
+      "note": "blaze-items: Unhashable::describe (hash.rs) appends the MirLowerError (Debug) for NoMir, found by form::Cx::mir_error (form.rs), which walks the body and its closures/coroutines as Cx::body does, on the error path only; the hashed Missed byte is unchanged. Test tests/hashes.rs mir_that_fails_to_lower_is_named_in_the_error. rust-analyzer clean."
+    }
+  ]
+}

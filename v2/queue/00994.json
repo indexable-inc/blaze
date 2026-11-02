@@ -1,0 +1,40 @@
+{
+  "id": "00994",
+  "from_lane": "integrate-store",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/cargo/",
+    "crates/blaze-cargo/src/deps.rs",
+    "crates/blaze-cargo/src/memory.rs",
+    "crates/blaze-cargo/src/lib.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "integrate-store (00031): blaze-cargo off `blaze-store` and v1's remote, so both can be deleted. All of it is more than an import swap, so it is yours.\n\n1. Install the process's store handle in the v2 daemon: in `serve/daemon.rs`, right after `let mut store = Store::open(store_config, &mut effects);` (line 226), `blaze_cas::Handle::install(blaze_cas::Handle::new(&mut store, PathBuf::from(\"/\")))` (the driver's root is `/`, as `under(&state, ..)` names files), turning its `Err(String)` into the daemon's start error. `blaze_cas::Handle` is new (crates/blaze-cas/src/handle.rs): lock-free reads, puts readable at once and durable at the daemon's next flush. blaze-macro-wasm and blaze-wasi now take the store from `blaze_cas::Handle::installed()`; without this line they compile every module every run.\n\n2. `blaze_store` uses, each either deleted with v1's cargo path or moved onto `blaze_cas::Handle::installed()` with a `blaze_cas::Key::of(schema, producer, inputs)` that misses no input: `cargo/results.rs` (87-103, 473), `cargo/closure/{kept,fetch,mod}.rs` (`Store`, `BLOCK_MAX`, `compiles_against`), `cargo/keyed.rs` (165, 182, 219-221), `cargo/wasi_script.rs:303`, `cargo/script.rs:140`, `cargo/fetches.rs` (904, 1071, tests 1730-1972), `cargo/own_script.rs` (`store()` at 400, `build_name()` at 681: v1's identity has no v2 equivalent, #1439), `cargo/mod.rs:450` (`StoreDir`, `limit_for`), and `parse_size`/`is_off` at `cargo/daemon.rs:67,1268`, `memory.rs:143`, `deps.rs:53` (if those stay, a few-line `parse_size` of blaze-cargo's own). Then drop `blaze-store.workspace = true` from Cargo.toml.\n\n3. v1's remote goes (no `BLAZE_REMOTE*`, no `cache push|pull|stats|gc|verify`): v2's remote is the read-through `blaze_cas::remote::{Client, Server}` tier, and nothing pushes. Delete `deps.rs` (`deps push|pull`, v1 remote only), the `cache` dispatch at `cargo/mod.rs:201` (`remote::command`) and `noted_down`/`required` at 268-277, `Shared::lazily(..).pull()` at `hermetic/mod.rs:127` and `cargo/closure/mod.rs:238`, and the closure push/pull test at `closure/mod.rs:430-443`. The HTTPS helpers `remote::{Https, Traffic, runtime, https_next}` are used by `cargo/toolchain/{own,library}.rs`, `cargo/fetches.rs` and `cargo/closure/fetch.rs`: if those files go with v1, nothing else is needed; any that stays moves to v2's HTTP client, `blaze_registry::http::{Http, HyperHttp}` (what `serve/fetch.rs` uses), not to a copy of v1's helpers. (`blaze-engine/src/versions.rs:165` is asked of integrate-engine the same way.)\n\nOnce nothing outside `src/remote*` names `crate::remote`, I remove `pub mod remote;` from `lib.rs` and delete `src/remote.rs`, `src/remote/` and `crates/blaze-store`. Please mark this done when that is the case.",
+  "state": "applied",
+  "created": "2026-10-30T13:02:15Z",
+  "updated": "2026-10-30T14:18:26Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:02:15Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:05:04Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:18:26Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "blaze-cargo off blaze-store and v1 remote (remote.rs, remote/ deleted with cargo/, 07:13); Daemon::install_store installs blaze_cas::Handle. blaze-store crate itself stays integrate-store (01023). Unbuilt until 01022."
+    }
+  ]
+}

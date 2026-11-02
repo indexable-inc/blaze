@@ -1,0 +1,26 @@
+{
+  "id": "00402",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [
+    "crates/hir-ty-mir/Cargo.toml",
+    "Cargo.toml",
+    "crates/hir-ty-mir/src/lib.rs",
+    "crates/hir-ty-mir/src/mir.rs"
+  ],
+  "what": "## 1. Manifest and crate root\n\n`crates/hir-ty-mir/Cargo.toml`, under `[dependencies]` after `blaze-ids.workspace = true`\n(local deps), and under `[dev-dependencies]`:\n\n```toml\n# [dependencies], local deps\nblaze-ids.workspace = true\nblaze-mem.workspace = true\n# [dependencies], next to rustc-hash\nhashbrown.workspace = true\n# [dev-dependencies]\nblaze-alloc-count.workspace = true\n```\n\n`hashbrown` is for the frame maps (§2). They need hashbrown's `nightly` feature, so that its\n`A: Allocator` is `core::alloc::Allocator` and `&Frame` is one. mem-db already filed that root\nchange against the workspace `hashbrown` entry (`Cargo.toml:294`, today `default-features = false,\nfeatures = [\"inline-more\"]`). Until it lands, §2's `FrameMap`/`FrameSet` don't compile. Nothing\nelse here needs it: the `Vec<T, &Frame>` and `Bits` changes don't.\n\n`crates/hir-ty-mir/src/lib.rs`, after line 10\n(`#![cfg_attr(feature = \"in-rust-tree\", feature(rustc_private))]`):\n\n```rust\n#![feature(allocator_api)]\n```\n\n`crates/hir-ty-mir/src/mir.rs`, in the module list (lines 18-29):\n\n```rust\n// before\nmod transform;\npub mod type_name;\n// after\nmod transform;\npub mod type_name;\n#[doc(hidden)]\npub mod budget;\nmod framed;\n```\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#1. Manifest and crate root",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:52"
+    }
+  ]
+}

@@ -66,8 +66,7 @@ fn path() {
 
 #[test]
 fn item() {
-    // FIXME: This shouldn't consume the semicolon.
-    check(PrefixEntryPoint::Item, "fn foo() {};", "fn foo() {};");
+    check(PrefixEntryPoint::Item, "fn foo() {};", "fn foo() {}");
     check(PrefixEntryPoint::Item, "#[attr] pub struct S {} 92", "#[attr] pub struct S {}");
     check(PrefixEntryPoint::Item, "item!{}?", "item!{}");
     check(PrefixEntryPoint::Item, "????", "?");

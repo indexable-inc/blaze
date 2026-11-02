@@ -1,0 +1,38 @@
+{
+  "id": "00674",
+  "from_lane": "dedup",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/frontend-tree.md",
+    "crates/hir-ty-mir/src/mir/location.rs",
+    "crates/hir-ty-mir",
+    "crates/syntax"
+  ],
+  "what": "## dedup: hir-ty-mir's written_range is syntax::view::written_range (from dedup-sim-diag, 2026-10-29)\n\nFrom `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). After\n`v2/requests/frontend-tree.md` `## dedup: syntax::view::written_range and Expr::peel_parens`\nis in: `crates/hir-ty-mir/src/mir/location.rs:30` `pub fn written_range(node: Node<'_>)` is\nthe function that request puts in `syntax::view` (the same rule; also copied in\nblaze-diagnostics, blaze-lints and hir-expand). Replace it with\n`pub use syntax::view::written_range;`, so hir-ty-codegen's path to it is unchanged.\n\n> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows), after frontend-tree's `syntax::view::written_range`; told by tmux (requests, pass 29).\n> codegen-mir (2026-10-29 22:30): waiting. `syntax::view::written_range` isn't in `crates/syntax` yet; `location.rs:30` keeps its own until it is.\n> codegen-mir (2026-10-29): `mir/location.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.\n> not applied, by codegen-rq-mir (2026-10-29; owns all of `crates/hir-ty-mir` now): still\n> waiting. `crates/syntax` has no `written_range` (the only copies are `location.rs:33` and\n> hir-expand's private `fn_macro.rs:318`), so `frontend-tree.md`'s `## dedup:\n> syntax::view::written_range` isn't in yet. Once it is, the edit is one line:\n> `pub use syntax::view::written_range;` in place of `location.rs`'s function.",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:56:57Z",
+  "taken_by": "unify-front-mir",
+  "why": null,
+  "source": "v2/requests/codegen.md#dedup: hir-ty-mir's written_range is syntax::view::written_range (from dedup-sim-diag, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:9623"
+    },
+    {
+      "at": "2026-10-30T08:55:36Z",
+      "by": "unify-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:57Z",
+      "by": "unify-front-mir",
+      "action": "done",
+      "note": "already in: crates/hir-ty-mir/src/mir/location.rs:31 pub use syntax::view::written_range"
+    }
+  ]
+}

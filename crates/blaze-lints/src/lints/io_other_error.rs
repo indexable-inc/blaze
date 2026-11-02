@@ -5,41 +5,43 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
 use hir::{AsAssocItem as _, PathResolution};
-use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasArgList as _},
-};
+use syntax::{TextRange, view as ast};
+
+use ast::{AstNode as _, HasArgList as _};
 
 use super::utils;
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "io_other_error";
+const LINT: super::Implemented = super::Implemented::IoOtherError;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     if !cx.on(LINT) {
         return;
     }
     let ast::Expr::CallExpr(call) = expr else { return };
     let Some(ast::Expr::PathExpr(callee)) = call.expr() else { return };
     let Some(path) = callee.path() else { return };
-    // `Type::new`, as rustc's type-relative path.
-    if path.qualifier().is_none() {
+    // `Type::new`, as rustc's type-relative path: an associated function is named as declared.
+    let Some(segment) = path.segment().and_then(|it| it.name_ref()) else { return };
+    if path.qualifier().is_none() || !matches!(segment.text(), "new" | "r#new") {
         return;
     }
     let Some(arg_list) = call.arg_list() else { return };
-    let [error_kind, error] = &arg_list.args().collect::<Vec<_>>()[..] else { return };
+    let mut args = arg_list.args();
+    let (Some(error_kind), Some(error), None) = (args.next(), args.next(), args.next()) else {
+        return;
+    };
     let (Some(whole), Some(kind_range), Some(error_range)) =
         (cx.range(call.syntax()), cx.range(error_kind.syntax()), cx.range(error.syntax()))
     else {
         return;
     };
-    if !is_io_error_new(cx, &path) || !is_other_kind(cx, &utils::expr_or_init(cx, error_kind)) {
+    if !is_io_error_new(cx, path) || !is_other_kind(cx, utils::expr_or_init(cx, error_kind)) {
         return;
     }
     if !cx.conf().meets(msrvs::IO_ERROR_OTHER) {
         return;
     }
-    let Some(segment) = path.segment().and_then(|it| it.name_ref()) else { return };
     let Some(segment) = cx.range(segment.syntax()) else { return };
     let parts = vec![
         (cx.span(segment), "other".to_owned()),
@@ -54,11 +56,9 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
         );
 }
 
-fn is_io_error_new(cx: &Cx<'_, '_, '_>, path: &ast::Path) -> bool {
+fn is_io_error_new<'t>(cx: &Cx<'_, 't>, path: ast::Path<'t>) -> bool {
     let db = cx.db();
-    let Some(PathResolution::Def(hir::ModuleDef::Function(function))) =
-        cx.sema().resolve_path(path)
-    else {
+    let Some(PathResolution::Def(hir::ModuleDef::Function(function))) = cx.path(path) else {
         return false;
     };
     if function.name(db).as_str() != "new" {
@@ -72,7 +72,7 @@ fn is_io_error_new(cx: &Cx<'_, '_, '_>, path: &ast::Path) -> bool {
 }
 
 /// `expr` is a path ending `ErrorKind::Other`, `std::io::ErrorKind` named in it.
-fn is_other_kind(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> bool {
+fn is_other_kind<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
     let ast::Expr::PathExpr(path) = expr else { return false };
     let Some(path) = path.path() else { return false };
     let Some(qualifier) = path.qualifier() else { return false };
@@ -83,7 +83,7 @@ fn is_other_kind(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> bool {
         return false;
     };
     matches!(
-        cx.sema().resolve_path(&qualifier),
+        cx.path(qualifier),
         Some(PathResolution::Def(hir::ModuleDef::Adt(it))) if it == kind
     )
 }

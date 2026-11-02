@@ -3,8 +3,6 @@
 import { moduleOf } from "./names.js";
 import { HOW_COMPILED, HOW_UNIT, HOW_UNCHANGED, HOW_STORED } from "./snapshot.js";
 
-const HOW_OF = { Compiled: HOW_COMPILED, Unit: HOW_UNIT, Unchanged: HOW_UNCHANGED, Stored: HOW_STORED };
-
 function grow(a, n) {
   if (n <= a.length) return a;
   const b = new a.constructor(Math.max(n, a.length * 2));
@@ -21,13 +19,17 @@ export class Model {
     this.crates = snap.crates.slice();
     this.crateIndex = new Map(this.crates.map((c, i) => [c, i]));
     this.n = snap.n;
-    this.key = snap.key;
+    this.keyHi = snap.keyHi;
+    this.keyLo = snap.keyLo;
     this.krate = snap.krate;
     this.how = snap.how;
     this.ns = snap.ns;
     this.nodeBuild = snap.nodeBuild;
     this.names = snap.names;
-    this.byKey = snap.byKey;
+    this.keys = snap.keys;
+    // How many functions are each `how`, kept as they change: the status line reads it every frame.
+    this.howCount = [0, 0, 0, 0];
+    for (let i = 0; i < this.n; i++) this.howCount[this.how[i]]++;
     this.group = new Uint32Array(this.n);
     this.modules = [];
     this.moduleCrate = [];
@@ -86,64 +88,85 @@ export class Model {
     return true;
   }
 
-  addNode(key, krate, name) {
+  // A new function, its `how` not yet said (and not counted until it is).
+  addNode(hi, lo, krate, name) {
     const i = this.n++;
-    this.key = grow(this.key, this.n);
+    this.keyHi = grow(this.keyHi, this.n);
+    this.keyLo = grow(this.keyLo, this.n);
     this.krate = grow(this.krate, this.n);
     this.how = grow(this.how, this.n);
     this.ns = grow(this.ns, this.n);
     this.nodeBuild = grow(this.nodeBuild, this.n);
     this.group = grow(this.group, this.n);
-    this.key[i] = key;
+    this.keyHi[i] = hi;
+    this.keyLo[i] = lo;
     this.krate[i] = krate;
     this.names[i] = name;
     this.group[i] = this.moduleFor(name, krate);
     this.out.push([]);
     this.inn.push([]);
-    this.byKey.set(key, i);
+    this.keys.set(hi, lo, i);
     return i;
   }
 
-  // Merges one Functions record. Returns the nodes it names, the ones it added and whether calls were added.
+  // Merges one Functions record, its functions as columns (records.js FnColumns). Returns the
+  // nodes it names, the ones it added and whether calls were added.
   mergeFns(object, fns, build) {
     let obj = this.objects.get(object);
     if (!obj) {
       obj = { ids: new Map(), pending: new Map() };
       this.objects.set(object, obj);
     }
-    const touched = [];
+    const n = fns.n;
+    const touched = new Uint32Array(n);
     const added = [];
     let newEdges = 0;
-    for (const f of fns) {
-      const key = BigInt(f.key);
-      let i = this.byKey.get(key);
-      const krate = this.crateFor(f.krate);
-      if (i === undefined) {
-        i = this.addNode(key, krate, f.name);
+    // The record's crates as the model's, each looked up once.
+    const crateOf = new Int32Array(fns.crates.length).fill(-1);
+    for (let k = 0; k < n; k++) {
+      const c = fns.krate[k];
+      if (crateOf[c] < 0) crateOf[c] = this.crateFor(fns.crates[c]);
+      const krate = crateOf[c];
+      const name = fns.name[k];
+      let i = this.keys.get(fns.keyHi[k], fns.keyLo[k]);
+      let was = -1;
+      if (i < 0) {
+        i = this.addNode(fns.keyHi[k], fns.keyLo[k], krate, name);
         added.push(i);
-      } else if (this.names[i] !== f.name || this.krate[i] !== krate) {
-        this.names[i] = f.name;
-        this.krate[i] = krate;
-        this.group[i] = this.moduleFor(f.name, krate);
+      } else {
+        was = this.how[i];
+        if (this.names[i] !== name || this.krate[i] !== krate) {
+          this.names[i] = name;
+          this.krate[i] = krate;
+          this.group[i] = this.moduleFor(name, krate);
+        }
       }
-      this.how[i] = HOW_OF[f.how.type];
-      this.ns[i] = f.how.type === "Compiled" ? f.how.ns : 0;
+      const how = fns.how[k];
+      if (was !== how) {
+        if (was >= 0) this.howCount[was]--;
+        this.howCount[how]++;
+      }
+      this.how[i] = how;
+      this.ns[i] = fns.ns[k];
       this.nodeBuild[i] = build;
-      if (obj.ids.has(f.id) && obj.ids.get(f.id) !== i) {
-        throw new Error(`Functions of object ${object}: id ${f.id} is said for two functions`);
+      const id = fns.id[k];
+      const known = obj.ids.get(id);
+      if (known !== undefined && known !== i) {
+        throw new Error(`Functions of object ${object}: id ${id} is said for two functions`);
       }
-      obj.ids.set(f.id, i);
-      touched.push(i);
-      const waiting = obj.pending.get(f.id);
+      obj.ids.set(id, i);
+      touched[k] = i;
+      const waiting = obj.pending.get(id);
       if (waiting) {
         for (const from of waiting) if (this.addEdge(from, i)) newEdges++;
         this.unresolvedCalls -= waiting.length;
-        obj.pending.delete(f.id);
+        obj.pending.delete(id);
       }
     }
-    for (let k = 0; k < fns.length; k++) {
+    for (let k = 0; k < n; k++) {
       const from = touched[k];
-      for (const id of fns[k].calls) {
+      for (let c = fns.callsAt[k]; c < fns.callsAt[k + 1]; c++) {
+        const id = fns.calls[c];
         const to = obj.ids.get(id);
         if (to !== undefined) {
           if (this.addEdge(from, to)) newEdges++;
@@ -159,8 +182,7 @@ export class Model {
   }
 
   counts() {
-    const c = [0, 0, 0, 0];
-    for (let i = 0; i < this.n; i++) c[this.how[i]]++;
+    const c = this.howCount;
     return { compiled: c[HOW_COMPILED], unit: c[HOW_UNIT], unchanged: c[HOW_UNCHANGED], stored: c[HOW_STORED] };
   }
 

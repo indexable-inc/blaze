@@ -1,0 +1,23 @@
+{
+  "id": "00426",
+  "from_lane": "speed-runtime-vfs",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-vfs/src/watch.rs"
+  ],
+  "what": "## From speed-runtime-vfs: one effect to look at many paths, and the kind of a change (2026-10-29)\n\nThe watcher (`crates/blaze-vfs/src/watch.rs`) now asks a reported path's `Effect::Stat` and\n`Effect::ReadAll` together, so a batch is one round trip, but still two effects per path.\n\n1. What: `Effect::Look { files: Vec<FileName>, tag }`, done as `Done::Looked(Vec<Looked>)` in\n   the same order, `enum Looked { Gone, Dir, File { meta: Meta, bytes: Vec<u8> }, Failed(IoError) }`.\n   Linux: one io_uring submission of linked `statx` + `openat` + `read` per path; macOS and\n   Windows: one pool job walking the list. Why: a change batch of N paths becomes one effect\n   and one completion instead of 2N, with no read of a path the stat says is gone or a\n   directory (Watchman's and git's fsmonitor's batching).\n2. What: in `Done::Changed`, each file with what the system said of it, `(FileName, Kind)`\n   with `enum Kind { Removed, Dir, Changed }` (fanotify's `FAN_DELETE`/`FAN_ONDIR`, FSEvents'\n   `ItemRemoved`/`ItemIsDir`). Why: a removal or directory event needs no stat at all; only\n   `Changed` paths are looked at, as the brief asks (\"no per-file stat where the change already\n   says what it is\").\n\nThe watcher moves to both once they exist; until then it stays correct with Stat + ReadAll.\n\n> forwarded to coordinator: lane core is DONE and `Effect::Look` and `Done::Changed`'s kinds are a new effect and completion in every driver (io_uring, kqueue, IOCP, threads, the simulation): new work for a lane the coordinator names. The watcher stays correct with `Stat` + `ReadAll` meanwhile.",
+  "state": "open",
+  "created": "2026-10-30T04:09:13Z",
+  "updated": "2026-10-30T04:09:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core.md#From speed-runtime-vfs: one effect to look at many paths, and the kind of a change (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core.md:280"
+    }
+  ]
+}

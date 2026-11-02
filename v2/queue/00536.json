@@ -1,0 +1,24 @@
+{
+  "id": "00536",
+  "from_lane": "frontend-tree",
+  "owner": "diagnostics",
+  "paths": [
+    "v2/staged/frontend-tree-move-diag-lower",
+    "crates/blaze-diagnostics/src/lower"
+  ],
+  "what": "## frontend-tree: blaze-diagnostics lower/ 18 single-site lowerings: onto views (4)\n\n> applied by frontend-tree-move-diag-lower under the grant (2026-10-29), all 18, merged onto\n> today's files as (3) was.\n\nFrom `frontend-tree-move-diag-lower`. Staged whole, applied with `git merge-file` as in\n`## frontend-tree: blaze-diagnostics lower/{break_outside_of_loop,...}.rs: onto views (3)` (same\nstaged directory, `v2/staged/frontend-tree-move-diag-lower/`). Needs first: heading (1) `cx.rs`\n(`Cx::vsema`, `root`, `node_view`, `syntax_view`, `item_range_view`, `signature_range_view`) and\n`hir::view::Semantics` (frontend-tree-move-hir). No helper of another file changes signature, so\neach file lands on its own once those are in.\n\n| File (`crates/blaze-diagnostics/src/lower/`) | `git hash-object` of the base | merge onto the tree of 2026-10-29 |\n|---|---|---|\n| `mut_ref_in_imm_ref_pat.rs` | `245d208964160aa52de46d4a8248a5c47f5b1eeb` | is the base |\n| `unused_must_use.rs` | `c2963331f785f4f7eb699037649cba090bb92cc5` | is the base (rebased on the comment pass) |\n| `method_call_illegal_sized_bound.rs` | `efae0e16bd1257e07a45fa58afde53c7589312da` | is the base |\n| `cannot_index_into.rs` | `322c1d9ff6f239a0c4c6a643ba7d4cfea6afab13` | is the base |\n| `invalid_range_pat_type.rs` | `fae2684f8c1490c1134f93d15d1080397b715934` | is the base |\n| `non_exhaustive_record_pat.rs` | `3c4c99d524a5a66f628ae637aea96bab396af103` | is the base |\n| `empty_range_pattern.rs` | `98ae958b90fa6f912453b287348009b491476170` | is the base |\n| `mutable_ref_binding.rs` | `5dbb091fc557d138b40502d5428abab8366fa598` | is the base |\n| `mixed_deref_patterns.rs` | `5601c64129dd87f9f225a5d28322375ae00d8b69` | is the base |\n| `invalid_derive_target.rs` | `1151c10e403ee9d8dd690210ae65661b23811580` | is the base |\n| `cast_to_unsized.rs` | `14945193e52a75c9e92e1b1086f14dda93851d58` | is the base |\n| `unresolved_module.rs` | `9b14ba4d4f1e0a01c02c93c0cb9087105bc5afca` | is the base |\n| `unresolved_extern_crate.rs` | `4e262e69a69189cbd9df760b525d2c7a627191fb` | is the base |\n| `union_expr_must_have_exactly_one_field.rs` | `13f11130423632073eb859919d86777cdbdcae0e` | is the base |\n| `unimplemented_builtin_macro.rs` | `7d239cbf00ce34f5f83583afcf69ebd7ca03e8ad` | is the base |\n| `borrowck_skipped.rs` | `5faeb779cc817d5ce40bb9441ad4c8180cf381d5` | is the base |\n| `non_exhaustive_record_expr.rs` | `d4451ed83f6ad86f192fe618d88b3f2f07d27900` | is the base |\n| `functional_record_update_on_non_struct.rs` | `f7d6a52e287b46e703c66f6b74c778e62c0afcf0` | is the base |\n\nWhat changes, the same in each: the location (still an `AstPtr`/`SyntaxNodePtr` id in the\ndiagnostic) is viewed with `cx.node_view`/`cx.syntax_view`; every node is a `Copy` view by\nvalue (`use syntax::view as ast`), so the `.clone()`s, `as_ref()`s and `&` borrows of nodes go;\nresolution and types go through `cx.vsema` (`type_of_expr`, `type_of_pat`, `resolve_path`,\n`resolve_method_call`, `resolve_variant`, `source`, `ancestors_with_macros_file`). Names are\n`&str` borrowed from the tree where the handle version copied them out\n(`unresolved_module`, `unresolved_extern_crate`, `unimplemented_builtin_macro`,\n`method_call_illegal_sized_bound`'s method name); their `// alloc:` comments go with the copies.\n`invalid_derive_target` takes `cx.root(file).covering_element(range).ancestors().find_map(..)`,\nwhich is `algo::find_node_at_range`'s body. `method_call_illegal_sized_bound::sized_bound` reads\n`cx.vsema.source(function)` directly: the handle version re-found the node through `cx.node` to\nput it in `Cx`'s tree, which a view from `vsema` already is.\n\nProof: the UI tests of each (E0596, `unused_must_use`, E0608, E0029, E0638, E0030, E0579, E0658,\nE0774, E0620, E0583, E0463, E0784, E0639, E0436, the borrow-check refusal, the mixed deref\npatterns and the method-on-trait-object errors) give the same output; no new behaviour.\n\n> forwarded to diagnostics (diagnostics-next2); told by tmux (requests, pass 27).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#frontend-tree: blaze-diagnostics lower/ 18 single-site lowerings: onto views (4)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:21721"
+    }
+  ]
+}

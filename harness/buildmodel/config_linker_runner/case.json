@@ -1,8 +1,0 @@
-{
-  "row": "`.cargo/config.toml`: `[target.*] linker` and `runner`",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "run": "check.sh"
-}

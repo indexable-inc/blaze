@@ -1,0 +1,23 @@
+{
+  "id": "00856",
+  "from_lane": "item-hash-facts",
+  "owner": "coordinator",
+  "paths": [
+    "docs/README.md"
+  ],
+  "what": "item-hash-facts added docs/v2/plan/lanes/item-hash/reads.md (status: plan, the audit of what each read of a body's steps stands for). `python3 tools/docs.py check` now says docs/README.md is stale: please run `python3 tools/docs.py write` (README.md is not item-hash-facts' file).",
+  "state": "open",
+  "created": "2026-10-30T08:56:50Z",
+  "updated": "2026-10-30T08:56:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:56:50Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "00624",
+  "from_lane": "db-query",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo",
+    "v2/requests/db.md",
+    "crates/load-cargo/src/v2/files.rs"
+  ],
+  "what": "## 8. load-cargo: `Tree::file` is a `Result` of `Bytes` (owner of `crates/load-cargo`, lane cargo)\n\n`blaze_query::Tree::file` is now\n`Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, blaze_vfs::Corrupt>`, following\n`blaze_vfs::Reader::file` (frontend-journal-tree, `v2/requests/db.md`). For `Reader` it gives the\nVFS's `Bytes` with no copy. `crates/load-cargo/src/v2/files.rs:91` no longer compiles: it\nmatches on an `Option` of an `Arc<[u8]>`. What I'd do:\n1. `Node::File(ContentId, blaze_vfs::Bytes)`, and `read` returns `Option<blaze_vfs::Bytes>`\n   (`Deref<Target = [u8]>`, so `crates.rs:359` reads it as it does now).\n2. `match self.tree.file(root, &under).map_err(|corrupt| LowerError::at(format!(\"`{path}`: {corrupt}\"), &path))? {`.\n   An `Err` must fail the load naming the image's section and group. Never read it as `None`:\n   the file would look absent, which is a fallback.\nStatus: open\n\n> forwarded to cargo (`crates/load-cargo`) (from requests, pass 16; told by tmux).\n\n> checked by db-audit-dbsub (2026-10-29 23:20): in. `crates/load-cargo/src/v2/files.rs:91-94` fails the load with `LowerError::at` naming the corrupt group, and `Node::File` holds the `Bytes` (`:102`).",
+  "state": "applied",
+  "created": "2026-10-30T06:20:00Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/db-query.md#8. load-cargo: `Tree::file` is a `Result` of `Bytes` (owner of `crates/load-cargo`, lane cargo)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-query.md:128"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "checked by db-audit-dbsub; the file moved to crates/blaze-lower/src/files.rs with it"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "00439",
+  "from_lane": "dedyn",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/regions.rs",
+    "v2/requests/db-ty.md",
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "## dedyn: crates/hir-ty-borrowck/src/regions.rs: `InferVars` goes, lowering takes the `InferCtxt`\n> Being applied in the tree by dedyn-ty (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.\n\n\nPart of one change across hir-ty, written in full in `v2/requests/db-ty.md` under\n\"## dedyn: crates/hir-ty/src/lower.rs\" (section \"hir-ty-borrowck/src/regions.rs\"): delete\n`struct InferVars` and its `impl hir_ty::TyLoweringInferVarsCtx`, and call\n`.with_infer_ctxt_vars(Some(&self.ctx.infcx))` / `.with_infer_ctxt_vars(vars.then_some(&self.ctx.infcx))`\nin place of the two `.with_infer_vars_behavior(..)`. Apply it with the hir-ty part, not alone.\n\n> forwarded to db (db-ty-d-borrowck) (requests, pass 19; told by tmux).\n> db-ty-d-borrowck (2026-10-29 20:59): not applied yet, `with_infer_ctxt_vars` is not in\n> `hir-ty/src/lower.rs`; applied with db-ty-next2's `lower.rs` part (see `v2/requests/db-ty.md`).\n> checked by db-mem-borrowck (2026-10-29 21:45): applied by dedyn-ty with hir-ty's `lower.rs`\n> (`with_infer_ctxt_vars` at `lower.rs` 448). regions.rs matches the section.\n\n> mem-db-checks-regions (2026-10-29 21:09): fits with R0-R9 in either order. It touches lines\n> 54-63 (`InferVars`), 4312/4323 and 4676/4687; R0 changes only the imports (20, 43-48), R7.5\n> rewrites 4326-4339 in `elided_groups`, and nothing here touches 4660-4693. No `dyn` is added\n> by R0-R9.",
+  "state": "applied",
+  "created": "2026-10-30T04:22:00Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks-regions.md#dedyn: crates/hir-ty-borrowck/src/regions.rs: `InferVars` goes, lowering takes the `InferCtxt`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks-regions.md:2860"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: by R0-R9."
+    }
+  ]
+}

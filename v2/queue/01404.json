@@ -1,0 +1,31 @@
+{
+  "id": "01404",
+  "from_lane": "observe",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-profile/Cargo.toml"
+  ],
+  "what": "observe: Tracy as an opt-in feature of blaze-profile (Andrew, 2026-10-31: \"let's use tracy\").\n\n1. Root Cargo.toml [workspace.dependencies], next to `tracing`:\n\n# Tracy, only under blaze-profile's feature `tracy` (off by default). The fork\n# indexable-inc/tracing-tracy is upstream tracing-tracy 0.12.0 / tracy-client 0.19.0, which\n# bundle Tracy v0.14.1, plus fibers without tokio (indexable-inc/tracing-tracy#1). The viewer,\n# tracy-capture and tracy-csvexport must be v0.14.1 too (nix/tracy.nix).\ntracing-tracy = { git = \"https://github.com/indexable-inc/tracing-tracy\", rev = \"88fa6543ee7acb04ef4109635c73af247e4f6702\", default-features = false }\n\n2. In the same change, crates/blaze-profile/Cargo.toml (my file; you have my leave). Under [dependencies]:\ntracing-subscriber = { workspace = true, optional = true }\ntracing-tracy = { workspace = true, optional = true, features = [\"enable\", \"ondemand\", \"fibers\", \"only-localhost\", \"system-tracing\", \"context-switch-tracing\", \"sampling\", \"code-transfer\", \"broadcast\", \"callstack-inlines\", \"wait-stacks\"] }\nand before [lints]:\n[features]\n# Every span, plot, build and task also sent to Tracy (docs/profiling.md). Off by default.\ntracy = [\"dep:tracing-tracy\", \"dep:tracing-subscriber\"]\ncrash-handler is left out on purpose: it installs signal handlers that fight blaze's. The code that uses these, crates/blaze-profile/src/tracy.rs, is already in the tree behind cfg(feature = \"tracy\"); tracy-client comes through tracing-tracy's re-export, so it needs no line of its own.\n\n3. Cargo.lock regenerated.\n\nA decision before you apply this: indexable-inc/tracing-tracy is a PRIVATE repo. Cargo resolves optional deps too, so every lock resolution and every CI checkout fetches it even with the feature off. CI and every machine then need read access to it, or the repo has to be made public (it is MIT/Apache upstream code plus our fiber change). If neither is acceptable, refuse this with that reason and I will re-plan; I will not quietly swap in crates.io upstream, which lacks the fibers. Also keep the rev reachable: merge PR #1 with a merge commit, not a squash, or keep its branch.\n\n4. Also yours, and stale: the root comment above `tracing` says the trace recorder lives in crates/blaze-cargo/src/trace.rs. That file is gone; blaze's one subscriber is blaze_profile::install (crates/blaze-profile/src/lib.rs).\n\nCheck: blaze build -p blaze-profile, the same with --features tracy, and blaze test -p blaze-profile.",
+  "state": "refused",
+  "created": "2026-11-01T01:19:26Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:19:26Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

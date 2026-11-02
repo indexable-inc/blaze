@@ -1,0 +1,23 @@
+{
+  "id": "00116",
+  "from_lane": "diagnostics-items",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/syntax/early/macros/matchers/follow.rs"
+  ],
+  "what": "## 3. The follow-set errors of `macro_rules!` matchers (`diagnostics-lints-syntax-early`: `crates/blaze-diagnostics/src/lints/syntax/early/macros/matchers/follow.rs`)\n\nWhat: give rustc's hard errors of `check_matcher_core` (`compiler/rustc_expand/src/mbe/\nmacro_rules.rs`): \"`$x:expr` is followed by `y`, which is not allowed for `expr` fragments\" with\nits label and \"allowed there are: ...\" note, the `$x:pat` / `|` note, and the rest, as `Found`s at\n`Phase::Resolve`, either from that module or as a `pub(crate)` function of a definition that\n`crate::checks::macros` (mine) calls for each `macro_rules!` with `lower::macro_def_error::check`.\nWhy: `follow.rs` already ports FIRST/FOLLOW and `check_matcher_core`, but only for\n`rust_2021_incompatible_or_patterns`; mbe checks no follow set, and `macro_def_error` does not\nport it, so a matcher rustc refuses is accepted by blaze (superset-of-rust: accepting what rustc\nrejects is a bug). One port of the sets, not two.\n\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:06:02Z",
+  "updated": "2026-10-30T01:06:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items.md#3. The follow-set errors of `macro_rules!` matchers (`diagnostics-lints-syntax-early`: `crates/blaze-diagnostics/src/lints/syntax/early/macros/matchers/follow.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items.md:33"
+    }
+  ]
+}

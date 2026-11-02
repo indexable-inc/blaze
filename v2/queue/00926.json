@@ -1,0 +1,23 @@
+{
+  "id": "00926",
+  "from_lane": "speed-sol2-format",
+  "owner": "fix-names",
+  "paths": [
+    "crates/parser/src/syntax_kind/keywords.rs"
+  ],
+  "what": "Contextual keywords by a window probe, as strict ones are. `to_input` (crates/parser/src/shortcuts.rs, push_input) calls `SyntaxKind::from_contextual_keyword` on every identifier, about 30% of tokens. `keywords::contextual` filters by length (3 to 15, which most identifiers pass) and then probes `CONTEXTUAL_TABLE` (blaze_phf: byte loop, three multiplies, bucket and pilot loads, byte compare), about 50 instructions, against an input bound of about 6 a token plus about 12 an identifier. A probe like `strict_by_window` (one or two 8-byte windows of the identifier, a multiplier found at compile time, one slot load and a compare) would make it about 15 to 20. Counted by speed-sol2-format, 2026-10-30, not measured. Add `contextual_by_window` (or a `from_contextual_keyword_in(text, start, len, edition)` reading the file text in place) for push_input, with the `tables_give_what_the_match_gave` check for it; tell speed-sol2-format or lane format and push_input will call it.",
+  "state": "open",
+  "created": "2026-10-30T09:51:07Z",
+  "updated": "2026-10-30T09:51:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:51:07Z",
+      "by": "speed-sol2-format",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1017,10 +1017,10 @@ pub trait Trait {
         "#,
         expect![[r#"
             crate
-            - ASSOC_CONST : _
-            - AssocType : _
-            - MACRO_CONST : _
-            - method : _
+            - ASSOC_CONST : value (import)
+            - AssocType : type (import)
+            - MACRO_CONST : value (import)
+            - method : value (import)
         "#]],
     );
     check(
@@ -1041,6 +1041,10 @@ pub trait Trait {
         "#,
         expect![[r#"
             crate
+            - ASSOC_CONST : value (glob)
+            - AssocType : type (glob)
+            - MACRO_CONST : value (glob)
+            - method : value (glob)
         "#]],
     );
 }

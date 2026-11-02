@@ -1,7 +1,8 @@
 # blaze-gateway API v0 (slice 1 of docs/remote-cache.md)
 
-The contract between `blaze`'s `Place::Gateway` client (crates/blaze-cargo/src/remote/gateway.rs)
-and the Worker in this directory. v0 serves today's remote layout (packs/, keys/, units/,
+The contract between blaze v1's `Place::Gateway` client (`crates/blaze-cargo/src/remote/gateway.rs`,
+deleted from the tree on 2026-10-30; the pinned v1 release in `.github/blaze-version` still uses it in
+CI until that pin moves to a v2 release) and the Worker in this directory. v0 serves today's remote layout (packs/, keys/, units/,
 manifests/, deps/) per tenant. Slice 3 adds `/has`, `/get`, `/put` beside it (API.md).
 
 Base address of a tenant: `https://<gateway>/t/<tenant>/v3`. The client is given that base
@@ -13,7 +14,7 @@ puts objects at `<base>/<name>`.
 Allowed `<name>`s (anything else is the same 404 as an absent object):
 
 - `packs/<h>.pack`, `keys/<h>`, `index/<h>`, `units/<h>`: content-addressed, `<h>` = lowercase hex SHA-256 of the body.
-  `index/<h>` is a run or a shard of a project's key index (`crates/blaze-store/src/remote_index.rs`).
+  `index/<h>` is a run or a shard of a project's key index (v1's `crates/blaze-store/src/remote_index.rs`, deleted 2026-10-30).
 - `packs/<h>.pack.zst`: `<h>` names the uncompressed pack; the body's own SHA-256 is sent as
   `x-blaze-sha256` on PUT, checked, stored, and returned on GET/HEAD as `x-blaze-sha256`.
 - `manifests/<project>`, `deps/<project>`: mutable lists (a project's key index is the list

@@ -3,10 +3,7 @@
 //!
 //! A symbol is its interned text; two symbols are equal when their text is.
 
-use std::collections::HashSet;
 use std::fmt;
-
-use parking_lot::Mutex;
 
 use super::edition::{Edition, session_edition};
 use super::{DUMMY_SP, Span};
@@ -14,18 +11,9 @@ use super::{DUMMY_SP, Span};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Symbol(&'static str);
 
-static INTERNER: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-
 impl Symbol {
     pub fn intern(s: &str) -> Symbol {
-        let mut interner = INTERNER.lock();
-        let set = interner.get_or_insert_with(HashSet::new);
-        if let Some(&s) = set.get(s) {
-            return Symbol(s);
-        }
-        let s: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        set.insert(s);
-        Symbol(s)
+        Symbol(intern::Symbol::intern(s).as_str())
     }
 
     pub const fn new_static(s: &'static str) -> Symbol {

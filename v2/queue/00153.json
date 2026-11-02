@@ -1,0 +1,21 @@
+{
+  "id": "00153",
+  "from_lane": "diagnostics-items-ast",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-ast: `Walk::place` visible to the checks (`lints/syntax.rs`)\n\nWhat: make `Walk::place(&self, cx, at: InFile<SyntaxNodePtr>, pass: Pass)` `pub(crate)`.\nWhy: `checks/ast_validation.rs`' `Out::finish` sorts its errors with it, so they come where\nrustc's validator walks to their node (an item's own checks, then what is in it; the errors\ngiven on leaving an `impl Trait` after what is in it), the order the early lints already use.\n\n> for: diagnostics-items (owner of `lints/syntax.rs`: diagnostics-lints-syntax-early).\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:52:14Z",
+  "updated": "2026-10-30T01:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-ast.md#diagnostics-items-ast: `Walk::place` visible to the checks (`lints/syntax.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-ast.md:3"
+    }
+  ]
+}

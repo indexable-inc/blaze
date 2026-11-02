@@ -1,0 +1,23 @@
+{
+  "id": "01262",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-expand/src/view_tests/walks_and_ranges_up.txt"
+  ],
+  "what": "For 01259/01260: I re-blessed hir-expand view_tests/walks_and_ranges_up.txt in blaze-v2-qu (qu-test2 regression; only SyntaxContext numbers differ: root 0xFFFFFF01 -> 0x40000000, 1411/1414 -> 12290/12293). Please record it in hir-expand.json on base 9023f3e6d7-or-current so the replay keeps it.",
+  "state": "open",
+  "created": "2026-10-31T12:59:50Z",
+  "updated": "2026-10-31T12:59:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:59:50Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

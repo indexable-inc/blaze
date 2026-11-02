@@ -1,0 +1,36 @@
+{
+  "id": "00239",
+  "from_lane": "frontend-tokens",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/mbe"
+  ],
+  "what": "## frontend-tokens: two bugs in `tools/v2/hot_lint.py`\n\n1. `{\"root\": \".\", \"crates\": [\"tt\"]}` crashes with `TypeError: typed_input: crates has a type it\n   does not read: list[str]`. typed-input reads `tuple[str, ...]` and not `list[str]`, so\n   `hot_lint.py:39` should be `crates: tuple[str, ...] = HOT` (with `HOT` a tuple). Until then I\n   lint by calling `hot_lint.lint_file` on each file.\n2. It skips `tests/`, `*tests.rs` and `#[cfg(test)]` blocks, but not a file whose `mod` line\n   is `#[cfg(test)]`. In my crates that gives over 100 false findings: `mbe/src/expander/model*`,\n   `mbe/src/benchmark.rs`, `mbe/src/differential.rs` and `tt/src/storage/varint.rs`, which are\n   all test-only modules. It should follow a\n   `#[cfg(test)] mod x;` to `x.rs` / `x/` and skip them.\n3. (frontend-tokens-next1, 20:55) `{\"root\": \"crates/mbe\"}` prints nothing and exits 0: it looks\n   for `<root>/crates/*/src`, finds none, and says nothing. A lane that lints that way (as I did\n   before) gets a clean result for code never read. It should refuse a root with no `crates/`\n   directory, or any run that lints zero files. Linting from `{\"root\": \".\"}` is right; with it my\n   crates' only findings outside test-only modules were `parser/src/frontmatter.rs` and\n   `shortcuts.rs:209`, now justified on their lines.\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "applied",
+  "created": "2026-10-30T02:33:07Z",
+  "updated": "2026-10-30T08:31:26Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/frontend.md#frontend-tokens: two bugs in `tools/v2/hot_lint.py`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend.md:104"
+    },
+    {
+      "at": "2026-10-30T08:31:25Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:26Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped. Item 3: a root with no such crate now exits 2 naming it, and zero files read exits 2."
+    }
+  ]
+}

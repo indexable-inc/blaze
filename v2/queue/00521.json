@@ -1,0 +1,26 @@
+{
+  "id": "00521",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/hir-ty",
+    "docs/v2/plan/lanes/diagnostics/speed-of-light.md",
+    "crates/blaze-diagnostics/src/lints/bodies/calls/statements.rs",
+    "crates/blaze-diagnostics/src/lints/bodies/calls/desugar.rs"
+  ],
+  "what": "## diagnostics-lints-names-dead: value-path resolutions recorded by inference (crates/hir-ty `infer.rs`)\n\nWhat: `InferenceResult` records what each value path in a body resolved to, keyed by\n`ExprOrPatId`, as it already records `variant_resolution_for_expr_or_pat` and\n`assoc_resolutions_for_expr_or_pat`. It would cover a path expression or path pattern that\nresolved to a function, static, constant, const parameter, unit or tuple struct, or local\nbinding (`ValueNs`). Ideally it is a dense column rather than a hash map. Why: rustc's\n`MarkSymbolVisitor` reads `qpath_res` and never resolves again. The dead-code pass now walks\nbodies over the store (`lints/names/dead/mark/body.rs`) and reads every other resolution from\ninference. Value paths it must still resolve itself: `update_to_inner_scope` and\n`resolve_path_in_value_ns_fully` for each path, about 13 ms of its 20 ms on a 100,000-line\ncrate (`docs/v2/plan/lanes/diagnostics/speed-of-light.md`). Inference already resolves each\nof these paths to type it, so recording the result costs one store per path. Any other pass\nthat maps a body path back to a definition would read the same column. `Walk::resolve`\nalready tries what inference recorded first, so with this column the dead-code side gains one\nmore read.\n\nStatus: open\n\n### crates/blaze-diagnostics/src/lints/bodies/calls/statements.rs  (3)\n- ~L65  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'db Statement> {`  ->  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {` (its body `Expr::Block { statements, .. } => statements.get(index),` is unchanged)\n- ~L76  `Statement::Expr { expr, has_semi: true } => Some(*expr),`  ->  `Statement::Expr { expr, has_semi: true } => Some(expr),`\n- ~L193  `Some(Local { pat: *pat, init: *initializer, typed: type_ref.is_some(), assign: None })`  ->  `Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })`\n\n> forwarded to diagnostics (told by tmux).\n\n### crates/blaze-diagnostics/src/lints/bodies/calls/desugar.rs  (1)\n- ~L54  `    let Expr::Block { statements: [], tail: Some(next), .. } = store.expr(body) else { return None };`  ->  `    let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };\\n    if !statements.is_empty() {\\n        return None;\\n    }`\n\nStatus: open\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: value-path resolutions recorded by inference (crates/hir-ty `infer.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:3030"
+    }
+  ]
+}

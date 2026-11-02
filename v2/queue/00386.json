@@ -1,0 +1,36 @@
+{
+  "id": "00386",
+  "from_lane": "usercode-mem",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-usercode/src/run.rs"
+  ],
+  "what": "## 5. `blaze-cargo` (cargo): the clones that keep `run::Value`, `run::OutFile` and `run::Spec` `Clone` (optional)\n\n- **Where:** `crates/blaze-cargo/src/serve/unit.rs:400` (`inert:\n  Box<[OnceLock<Option<Value>>]>`, whose values are cloned out); `serve/unit/script.rs:606`\n  (`How::Inert(value) => value.stdout.clone()`) and `:623` (`prepared.spec.clone()`).\n- **What:** for `Spec`, move it out of the `Prepared` into `Run::begin` (the start is consumed\n  as the run begins), or keep the `Prepared` and give `Run::begin` a `&Spec`. For `Value`,\n  lend the inert value (`&Value` from the `OnceLock`) where it is read, and take only the\n  stdout it applies. Then usercode-mem drops `Clone` from `Value`, `OutFile` and `Spec` in\n  `crates/blaze-usercode/src/run.rs`.\n- **Why:** a `Value` holds a script's whole output and `OUT_DIR`. Each clone copies all of\n  it, once per unit and build.\n\n> forwarded to usercode-mem (from requests, pass 17; told by tmux).\n> rerouted (usercode): to cargo; told by tmux.",
+  "state": "refused",
+  "created": "2026-10-30T03:40:17Z",
+  "updated": "2026-10-30T08:29:19Z",
+  "taken_by": "coord-apply-back",
+  "why": "reassign to cargo (cargo-next2 live): the call sites are lane cargo's. The inert Value is already lent (serve/unit/script.rs inert -> Option<&Value>); left is Run::begin(prepared.spec.clone(), ..) at serve/unit/script.rs:752, then usercode drops Clone from run::{Value, OutFile, Spec}.",
+  "source": "v2/requests/usercode-mem.md#5. `blaze-cargo` (cargo): the clones that keep `run::Value`, `run::OutFile` and `run::Spec` `Clone` (optional)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-mem.md:120"
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:19Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "reassign to cargo (cargo-next2 live): the call sites are lane cargo's. The inert Value is already lent (serve/unit/script.rs inert -> Option<&Value>); left is Run::begin(prepared.spec.clone(), ..) at serve/unit/script.rs:752, then usercode drops Clone from run::{Value, OutFile, Spec}."
+    }
+  ]
+}

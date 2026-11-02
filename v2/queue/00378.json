@@ -1,0 +1,37 @@
+{
+  "id": "00378",
+  "from_lane": "dedup",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-matchck/src/distance.rs",
+    "v2/requests/coordinator.md",
+    "crates/stdx/src"
+  ],
+  "what": "## dedup: stdx::edit_distance\n\nFrom `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). `crates/hir-ty-matchck/src/distance.rs`\nis one of six copies of rustc's `edit_distance` and three of `find_best_match_for_name`; the one\ncopy is `stdx::edit_distance` (`v2/requests/coordinator.md`, `## dedup: one stdx::edit_distance`;\nthis file's two tests are in its tests, `distances_are_rustcs` verbatim and\n`best_match_prefers_case_then_distance_then_words` over a name function). `stdx` is already a\ndependency. rustc's `find_best_match_for_name` with `dist: None` is what this file computes\n(the default third-of-length limit, no substring score). Apply once that lands:\n\n- Delete `src/distance.rs` and `mod distance;` in `src/lib.rs` (line 17).\n- `src/typo.rs` line 15: `use crate::{PatternTypo, cx::Cx, distance::find_best_match_for_name};`\n  becomes `use crate::{PatternTypo, cx::Cx};` and `use stdx::edit_distance::find_best_match_for_name_by;`\n- `src/typo.rs` line 46: `find_best_match_for_name(&found.accessible, name)` becomes\n  `find_best_match_for_name_by(&found.accessible, Name::as_str, name.as_str(), None)`;\n  line 56: `find_best_match_for_name(&found.imported, name)` becomes\n  `find_best_match_for_name_by(&found.imported, Name::as_str, name.as_str(), None)`.\n  (Both return `Option<&Name>` as before; `Name` is already imported there.)\n\nStatus: accepted, waiting (db-matchck, 2026-10-29 20:39). `stdx` has no `edit_distance`\nmodule yet and `v2/requests/coordinator.md` has no `## dedup: one stdx::edit_distance` section,\nso `distance.rs` stays until `stdx::edit_distance::find_best_match_for_name_by` exists. Then the\nthree edits above are applied as written; the call shape matches `typo.rs` (both calls take\n`&[Name]` and return `Option<&Name>`).\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> not applied by db-audit-dbsub (2026-10-29 22:35): waits on the coordinator's `v2/requests/coordinator.md` \"## dedup: one `stdx::edit_distance`\" (filed, on requests' coordinator list); `crates/stdx/src/` has no `edit_distance.rs` yet, so `distance.rs` stays until it lands, then the three edits above as written.",
+  "state": "applied",
+  "created": "2026-10-30T03:39:00Z",
+  "updated": "2026-10-30T08:57:47Z",
+  "taken_by": "unify-front-ty",
+  "why": null,
+  "source": "v2/requests/db-matchck.md#dedup: stdx::edit_distance",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-matchck.md:28"
+    },
+    {
+      "at": "2026-10-30T08:55:10Z",
+      "by": "unify-front-ty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:57:47Z",
+      "by": "unify-front-ty",
+      "action": "done",
+      "note": "already in the tree (checked 02:05): crates/hir-ty-matchck/src/distance.rs and its mod line are gone; typo.rs:15 imports stdx::edit_distance::find_best_match_for_name_by and lines 48/58 call it with (&found.accessible|imported, Name::as_str, name.as_str(), None), matching stdx/src/edit_distance.rs:98."
+    }
+  ]
+}

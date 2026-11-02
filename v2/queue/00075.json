@@ -1,0 +1,36 @@
+{
+  "id": "00075",
+  "from_lane": "db-ty-db",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/evict.rs",
+    "crates/hir/src/tests.rs"
+  ],
+  "what": "## 4. db-ty-hir: drop const eval results after a store; a fixture test\n\n- `crates/hir/src/evict.rs` `drop_after_store`: also call `hir_ty::evict::drop_all_const_eval(db)`\n  (named constants, anonymous constants, statics; all now `lru = 0`), or\n  `hir_ty::evict::drop_statics(db, statics)` for the statics a build stored. The values come\n  back on demand and backdate by fingerprint. `hir_ty::evict::drop_all(db)` drops inference and\n  const eval together.\n- A fixture test in `crates/hir/src/tests.rs` (hir-ty has no test database) for the record form\n  of constants with types in their memory map:\n\n  ```rust\n  #[test]\n  fn allocations_read_back_as_written() {\n      let (db, file) = TestDB::with_single_file(\n          r#\"\n  trait T { fn f(&self) -> u8; }\n  impl T for u8 { fn f(&self) -> u8 { *self } }\n  const S: &str = \"text\";\n  const D: &dyn T = &7u8;\n  const P: (&[u16], u8) = (&[1, 2, 3], 4);\n  \"#,\n      );\n      // For each of S, D, P: `let value = db.const_eval(id, GenericArgs::empty(), None).unwrap();`\n      // then\n      //   let interner = DbInterner::new_no_crate(&db);\n      //   let mut out = blaze_format::Writer::new(<AllocationRec as blaze_format::Record>::SCHEMA);\n      //   let mut tys = TyTableWriter::new(interner);\n      //   let at = hir_ty::consteval::write_allocation(&mut out, &mut tys, value);\n      //   let table = tys.write(&mut out);\n      //   let root = out.push(&Root { allocation: Rel::between(..., at), table });\n      //   ... open, TyTableReader::open(interner, &buffer, table), read_allocation(...)\n      //   assert_eq!(read_back, value);\n  }\n  ```\n\n  where `Root` is a test record holding a `Rel<AllocationRec>` and the table's `u64`. `D` checks\n  a vtable type, `S` and `P` pieces of memory.\n\n> forwarded to db: inside lane db. `crates/hir/src/evict.rs` already calls `drop_all_const_eval`; the fixture test in `crates/hir/src/tests.rs` is db-ty-hir's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/evict.rs:29` (`drop_all_const_eval`, hir-ty's through hir-ide's `pub use hir_ty::*`) and `crates/hir/src/tests.rs:899` (`allocations_read_back_as_written`).",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#4. db-ty-hir: drop const eval results after a store; a fixture test",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:43"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/evict.rs:29` (`drop_all_const_eval`, hir-ty's through hir-ide's `pub use hir_ty::*`) and `crates/hir/src/tests.rs:899` (`allocations_read_back_as_written`)."
+    }
+  ]
+}

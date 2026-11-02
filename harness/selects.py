@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""selects.py: blaze runs no build script and no proc macro that cargo would not have.
+"""selects.py: blaze runs no build script and no proc macro the selection does not need.
 
-A build script and a proc macro are programs of the checkout, and they run with the rights
-of the user under cargo and under blaze alike. What blaze must not do is run one cargo
-would have left alone: the script of a dev-dependency or of another member of the
-workspace for a build of one program, or a proc macro only the tests use.
+A build script and a proc macro are programs of the checkout. What blaze must not do is run
+one the build asked for does not need: the script of a dev-dependency or of another member
+of the workspace for a build of one program, or a proc macro only the tests use.
 
-Every script and macro of the workspace here writes a line when it runs. The same
-selection is given to cargo and to blaze, each on a copy of the workspace nothing was
-built in, and every line blaze's build wrote has to be one cargo's wrote.
+Every script and macro of the workspace here writes a line when it runs. Each selection is
+given to blaze (`blaze build` or `blaze test --no-run`) on a copy of the workspace nothing was
+built in, in an empty home, and every line blaze's build wrote has to be one of the selection's
+(`SELECTIONS`).
 
     python3 selects.py
 """
-import os, shutil, subprocess, sys
+import os, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import scratch
-from difftest import BLAZE, sysroot_rlibs
+from rebuild import Project, scratch
 
 MARK = '''
 fn mark(what: &str) {
@@ -25,17 +24,21 @@ fn mark(what: &str) {
     let to = concat!(env!("CARGO_MANIFEST_DIR"), "/../ran");
     let mut ran = std::fs::OpenOptions::new().create(true).append(true).open(to).unwrap();
     // One write of the whole line: `writeln!` writes the text and the newline apart, and
-    // the scripts cargo runs at once would put theirs between.
+    // the scripts run at once would put theirs between.
     ran.write_all(format!("{what}\n").as_bytes()).unwrap();
 }
 '''
 PACKAGE = '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n'
 
-# What cargo is asked for, and the same said to blaze.
+SCRIPT, MACRO = "build script of %s", "proc macro of devmacro"
+# What blaze is asked for, and every script and macro the selection needs, which are all it
+# may run: a program needs the scripts of what it depends on, its tests those of its
+# dev-dependencies and the macro they call too, the workspace every member's script and no
+# macro, as nothing it builds calls one.
 SELECTIONS = [
-    ("one program", ["build", "-p", "app"], ["--package", "app"]),
-    ("its tests", ["test", "--no-run", "-p", "app"], ["--package", "app", "--unit-test"]),
-    ("the workspace", ["build", "--workspace"], ["--workspace"]),
+    ("one program", "build", ["--package", "app"], {SCRIPT % "dep"}),
+    ("its tests", "test", ["--package", "app", "--no-run"], {SCRIPT % "dep", SCRIPT % "devdep", MACRO}),
+    ("the workspace", "build", ["--workspace"], {SCRIPT % "dep", SCRIPT % "devdep", SCRIPT % "other"}),
 ]
 
 
@@ -83,33 +86,29 @@ def fresh(work, name):
     return ws
 
 
-def by_cargo(work, args):
-    ws = fresh(work, "cargo")
-    done = subprocess.run(["cargo", *args], cwd=ws, capture_output=True, text=True)
-    if done.returncode != 0:
-        raise SystemExit(f"cargo {' '.join(args)} failed:\n{done.stderr[-2000:]}")
-    return ran(ws)
-
-
-def by_blaze(work, args):
+def by_blaze(work, command, args):
     ws = fresh(work, "blaze")
-    symbols = [x for rlib in sysroot_rlibs() for x in ("--symbols", rlib)]
-    done = subprocess.run([BLAZE, ws, "--crate", "dep", "--crate", "app", "--out", os.path.join(work, "app.o"),
-                           *args, *symbols], capture_output=True, text=True)
-    if done.returncode != 0:
-        raise SystemExit(f"blaze {' '.join(args)} failed:\n{done.stderr[-2000:]}")
+    home = os.path.join(work, "home")
+    shutil.rmtree(home, ignore_errors=True)
+    project = Project(ws, work, home=home)
+    try:
+        done = project.build("app", *args, command=command)
+    finally:
+        project.stop()
+    if done.status != 0:
+        raise SystemExit(f"blaze {command} {' '.join(args)} failed:\n{done.said[-2000:]}")
     return ran(ws)
 
 
 def main():
     work = scratch("blaze-selects-")
     wrong = 0
-    for what, cargo_args, blaze_args in SELECTIONS:
-        cargos, blazes = by_cargo(work, cargo_args), by_blaze(work, blaze_args)
-        more = sorted(blazes - cargos)
+    for what, command, blaze_args, needed in SELECTIONS:
+        blazes = by_blaze(work, command, blaze_args)
+        more = sorted(blazes - needed)
         wrong += bool(more)
-        print(f"  {what}: cargo ran {len(cargos)} ({', '.join(sorted(cargos))}); blaze ran {len(blazes)}"
-              + (f", WRONG: cargo did not run {', '.join(more)}" if more else ", none that cargo did not"))
+        print(f"  {what}: {len(needed)} needed ({', '.join(sorted(needed))}); blaze ran {len(blazes)}"
+              + (f", WRONG: not needed {', '.join(more)}" if more else ", none not needed"))
     shutil.rmtree(work, ignore_errors=True)
     if wrong:
         raise SystemExit(f"selects: {wrong} of {len(SELECTIONS)} selections WRONG")

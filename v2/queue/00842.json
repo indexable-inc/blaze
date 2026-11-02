@@ -1,0 +1,35 @@
+{
+  "id": "00842",
+  "from_lane": "cold-v2",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-global/src/public.rs"
+  ],
+  "what": "cold-v2 1: blaze-global: public rules for the front-end results a dependency's image key derives (`crates/blaze-global/src/public.rs`)\n\nAndrew's lane cold-v2: a cold build of an app must be mostly downloads of its registry dependencies' results. `Rule` shows public only dependency images (`Rule::image`), runs and release (LLVM) functions, so a fetched image is followed by the type check, constants, goals and MIR all computed again here, and `Client::publish` can't publish them either. Asked:\n\n1. `Rule::derived(&self, base: &Public, made: &DerivedMade) -> Result<Public, Private>`: a value whose key is made from a public base key (an image's `Image::key`, or a public check key) and further inputs, each with its `Origin` (lint flags given by cargo, the borrow checker's mode, the blaze build, dependencies' public check keys). Covers, each by remaking its key with its owner's function: `blaze_diagnostics::cache` (`bodies_key`, the outcome key `key`), `hir_ty::consteval::deps` (filed by the check key), `hir_ty::next_solver::goal_store` (goal answers whose facts are all of public crates), and item-hash's body store records (`hir_ty::body_store`, kinds 0x3800..0x3840: identity over crate inputs of a public crate, shape and answer keys). Each owner exposes its key function (as fastcompile-global 2 did for codegen); say which you need.\n2. Dev functions: `Rule::function` refuses anything not LLVM. A Cranelift (or stencil) function of a public crate compiled for a target's baseline (`Runs::Elsewhere`, no host-only features) has only public inputs too; allow it, keyed as the dev driver keys it, so a cold dev build downloads its dependencies' code. If there is a reason it must stay private (nondeterminism?), write it in global.md and answer here.\n\nBuilders publishing these must build dependencies whole: `BLAZE_DEPS=full` (new, `crates/blaze-cargo/src/serve/unit/compile.rs` `reached_only`), since a user's build is reachable-only and publishes nothing of a dependency's own.",
+  "state": "applied",
+  "created": "2026-10-30T08:45:39Z",
+  "updated": "2026-10-30T14:24:41Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:45:39Z",
+      "by": "cold-v2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:41Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:41Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Applied by fastcompile-queue in crates/blaze-global/src/public.rs. (1) Rule::derived(&Public, &DerivedMade) for the three keys whose owners export their key function: DerivedMade::Bodies { deps: &[Public], borrowck } (blaze_diagnostics::cache::bodies_key, the check key), Outcome(Inputs) (cache::key), Const { item } (hir_ty::consteval::deps::key). Goal answers and item-store records are not covered: their key functions are private, asked of lane db as 01033. (2) Rule::dev_function(&DevFunctionMade) for Cranelift and stencil code under keys::template(stored(..)), public on release's terms when Toolchain::features is empty (the target's baseline). No nondeterminism reason to keep it private (docs/v2/plan/lanes/fastcompile/global.md, 'What is public'). Deps added: blaze-diagnostics, hir-ty, hir-ty-borrowck. Tests are beside it. BLAZE_DEPS=full in blaze-cargo is cold-v2's/cargo's."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "01422",
+  "from_lane": "observe-history",
+  "owner": "observe",
+  "paths": [
+    "crates/blaze-profile/src/lib.rs"
+  ],
+  "what": "observe-history is done: once 01412 has landed (arrow-array, arrow-schema, parquet with arrow+zstd in the root and blaze-profile manifests), add after `pub mod schema;` in crates/blaze-profile/src/lib.rs: `pub mod history;`, `pub mod sql;`, `pub mod views;` (alphabetical with the rest). They use batches.rs (`batches::spans`, `counters`, `schema_of`, `Process`), so `pub mod batches;` (or `pub(crate)`) must be linked too. No new dependency beyond 01412 (serde_json is there). Two notes for your code: (1) spans.target is `meta.target()`, which is \"blaze\" for every `info_span!(target: \"blaze\", ...)`, not the module path the schema doc says; `meta.module_path()` is the module. (2) batches::spans interns each dictionary column per row through FxHashMap, and arrow-rs's Parquet writer interns again per row; docs/v2/plan/lanes/observe/history.md (Speed of light) puts the flush at 4-5x its bound because of it and says the fix (our own Parquet column encoder from the ring's Syms).",
+  "state": "applied",
+  "created": "2026-11-01T01:58:02Z",
+  "updated": "2026-11-01T02:08:11Z",
+  "taken_by": "observe",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:58:02Z",
+      "by": "observe-history",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "done",
+      "note": "Linking queued to dedup with 01412 (my new request, replacing 01417): pub mod batches, history, live, sql, views beside arrow. Notes taken: schema.rs and profiling.md now say `target` is the tracing target (`blaze` for blaze's steps), not always the module path; the double interning is recorded in my report as the flush's known gap, with history.md's fix."
+    }
+  ]
+}

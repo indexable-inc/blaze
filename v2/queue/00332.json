@@ -1,0 +1,35 @@
+{
+  "id": "00332",
+  "from_lane": "mem-db-infer-ctx",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/columns.rs"
+  ],
+  "what": "## What these files allocate, in short\n\n| temporary | made | before | after |\n|---|---|---|---|\n| the dense tables (`type_of_expr`, `type_of_pat`, `type_of_binding`, `type_of_type_placeholder`, `method_resolutions`, `field_resolutions`, `binding_modes`, the variant and assoc maps) | per body, grown per node | `ArenaMap` (global `Vec<Option<V>>`, about 10 doublings each) | `DenseMap<'f, K, V>` (frame `Vec<Option<V>>`); the four node-indexed ones made once at the body's node count |\n| the CSR tables (`expr_adjustments`, `assignment_coercions`, `pat_adjustments`) | per body | `CsrBuilder` (2 global `Vec`s each) | `CsrBuilder<'f, ..>` on 2 frame `Vec`s; `expr_adjustments`' ranges made once at the expression count |\n| the growing sets (`nodes_with_type_mismatches`, `skipped_ref_pats`, `coercion_casts`, `closures_without_expectation`) | per body | `IdxSet` (global `Vec<u64>`), then `shrink_to_fit` (a realloc each) | `FrameIdxSet<'f, K>`/`FrameExprOrPatSet<'f>`; `freeze` copies the words once, at their length |\n| the hash side tables (`type_of_opaque`, `asm_sym_tys`, `closures_data`) | per body | `FxHashMap` | `FrameMap<'f, K, V>` (`hashbrown` in the frame) |\n| `from_entries`' temporaries (`dense`, `by_ty`, `tys`, `words`, `ranks`, `rows`, `fields`, `ends`, the CSR compaction slots) | per column per body | global, grown, then `into_boxed_slice` (a shrink realloc each) | frame where temporary (`by_ty`, `tys`, CSR slots); each owned column made once at its exact length, counted first |\n| `SortedMap::from_entries` | per side table per body | `collect` + stable `sort_by` (its scratch buffer is a global allocation past 20 entries) | frame `Vec` + `sort_unstable_by` (keys are distinct, so the order is the same), copied once at its length |\n| `CsrBuilder::values_mut`'s live ranges | per CSR table at write-back | `collect` + `radix::sort_copy_by_key` (2 global) | frame `Vec` + `sort_unstable_by_key` (starts of non-empty lists are distinct) |\n| context temporaries (`unreachable`, `breakables`, `deferred_cast_checks`, `deferred_call_resolutions`, `defined_anon_consts`, `diagnostics`) | per body | global `Vec`/`ThinVec` | frame `Vec`s |\n| `vars_emitted_type_must_be_known_for`, write-back's span set | per body (error path) | `FxHashSet` | `FrameSet<'f, _>` |\n| `tuple_field_accesses_rev` | per body | `IndexSet<Tys>` (global `Vec` + table) | `TupleFieldTypes<'db, 'f>`: frame `Vec<Tys>` + `FrameMap<Tys, u32>` (R3) |\n| `traits_in_scope` and the block-traits cache | per body, per block module with `use Trait` | `FxHashSet<TraitId>` from `Resolver::traits_in_scope` (about 7 doublings) and an `Rc<FxHashSet>` | `FrameSet<'f, TraitId>` filled by `traits_in_scope_into`; the cache is a `Cell<(Option<ModuleId>, Option<&'f FrameSet<'f, TraitId>>)>`, one frame set per block module with `use Trait` |\n| `InferenceTable::diverging_type_vars`, fallback's `diverging_roots` | per body | `VarSet` (global `Vec<u64>`) | `VarSet` on `scratch::lend_u64s()` (the table has no `'f`, R2) |\n| fallback's `unresolved_variables` and `diverging_fallback` | per body with unsolved variables | `Vec<Ty>` (`collect`), `FxHashMap` | frame `Vec` at exact length, `FrameMap` |\n| write-back's `goals` | per resolved value | `vec![]` (empty unless normalization returns goals, which it then dropped) | gone: the goals are dropped where they are returned |\n| write-back's `diagnostics`/`unresolved_vars` | per body (error path) | `ThinVec`, `shrink_to_fit` | frame `Vec`s; the result's `Box` made once from them |\n| `resolve_projections_within`'s `traits` | per path resolution with a projection | `collect` into `Vec<TraitRef>` | one pass, no list |\n| persist encode (`InferenceRecord::of`, `Sink`) | per record | 3 global `Vec`s grown, `Sink`'s 2 `Vec`s | the thread's `scratch` buffers (`u64`, `u32`, `u8`: warm across records), each array copied once at its length |\n| persist decode (`decode`, `Source`) | per record | `collect::<Result<..>>` per column (grows, then shrinks) | `exact`/`Source::list`: one allocation of the column's length; temporaries (`buffer`, `Source::tys`' lists, the closure decoder's) in the frame of the task `to_result` opens |\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:44): a summary of C, A, U, E and P below, each settled in its own section (columns `crates/hir-ty/src/infer/columns.rs`, context `infer.rs`, persist `infer/persist.rs:1064`).",
+  "state": "applied",
+  "created": "2026-10-30T03:32:35Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-ctx.md#What these files allocate, in short",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-ctx.md:17"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:44): a summary of C, A, U, E and P below, each settled in its own section (columns `crates/hir-ty/src/infer/columns.rs`, context `infer.rs`, persist `infer/persist.rs:1064`)."
+    }
+  ]
+}

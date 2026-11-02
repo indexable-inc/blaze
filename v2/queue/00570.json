@@ -1,0 +1,35 @@
+{
+  "id": "00570",
+  "from_lane": "db-expand",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/scope.rs"
+  ],
+  "what": "## db-expand: a binding's hygiene in `ExprScopes` (format, `crates/hir-def/src/expr_store/scope.rs`)\n\nWhat: `ScopeEntry::hygiene` public, or `ExprScopes::resolve_local(scope, name, hygiene) ->\nOption<BindingId>`. This is item 1 of diagnostics' \"the per-item diagnostic item is in use;\nthree more for speed\". Why: `util::path_value` builds a `Resolver` for every one-segment path\na local shares a name with, because only the hygiene tells the binding from an item.\n\n> forwarded to format: `expr_store/` is format's.",
+  "state": "applied",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T10:03:58Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand: a binding's hygiene in `ExprScopes` (format, `crates/hir-def/src/expr_store/scope.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:386"
+    },
+    {
+      "at": "2026-10-30T10:03:58Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:03:58Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "ScopeEntry::hygiene is pub (crates/hir-def/src/expr_store/scope.rs, speed-sol2-format 2026-10-30; HygieneId is pub in expr_store.rs). With entries(scope) and scope_chain, util::path_value can pick the binding whose hygiene matches without a Resolver. Not compiled (this lane runs no builds)."
+    }
+  ]
+}

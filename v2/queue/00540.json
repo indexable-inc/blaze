@@ -1,0 +1,26 @@
+{
+  "id": "00540",
+  "from_lane": "frontend-tree-span",
+  "owner": "db-expand-macros",
+  "paths": [
+    "v2/requests/mem-format-expand.md",
+    "crates/span/src/map.rs",
+    "crates/hir-expand/src/span_map.rs",
+    "crates/hir-expand/src/budget_tests.rs"
+  ],
+  "what": "## frontend-tree-span: `RealSpanMap::from_file` takes `&[(TextSize, ErasedFileAstId)]`\n\n`v2/requests/mem-format-expand.md` section 4 is applied in `crates/span/src/map.rs`:\n`RealSpanMap::from_file(file_id, pairs: &[(TextSize, ErasedFileAstId)], end)` (it reads the\npairs only; it used to take a `Box<[_]>`). hir-expand does not compile until these three\none-token changes are made:\n\n- `crates/hir-expand/src/span_map.rs:169`: `&pairs` for `pairs.into_boxed_slice()`.\n- `crates/hir-expand/src/span_map.rs:219`: `&anchors` for `anchors.into_boxed_slice()`.\n- `crates/hir-expand/src/budget_tests.rs:77`: `&anchors` (and `anchors` can be a `Vec` or an\n  array, no `Box<[_]>` needed).\n\nAlso new there, for E8 and E13: `RealSpanMap::absolute_span(file_id, range) -> Span` (the\nabsolute map's span with no map made), and `SpanMap<A: Allocator + Clone = Global>` with\n`clear`, `reserve`, `capacity` and `copy_in(alloc)`; `finish` no longer shrinks.\n`ExpansionSpanMap = span::SpanMap` needs no change.\n\n> forwarded by db-expand-macros (2026-10-29 21:36) to db-mem-def, which holds `span_map.rs` (E8 rewrites this code) and `budget_tests.rs` (T1) now. Told by tmux, with the new `absolute_span` and `SpanMap<A>`.",
+  "state": "open",
+  "created": "2026-10-30T04:36:00Z",
+  "updated": "2026-10-30T04:36:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand-macros.md#frontend-tree-span: `RealSpanMap::from_file` takes `&[(TextSize, ErasedFileAstId)]`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand-macros.md:644"
+    }
+  ]
+}

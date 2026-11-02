@@ -1,0 +1,24 @@
+{
+  "id": "01348",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "docs/cargo.md"
+  ],
+  "what": "Two edits outside lane cargo's paths (from integrate-load's 01025): (1) root Cargo.toml:265-266 says blaze's one release subscriber is `crates/blaze-cargo/src/trace.rs`, which is deleted; v2's is blaze-profile's `Recorder`, installed by `blaze_profile::install` (crates/blaze-profile/src/lib.rs:221) from `blaze_cargo::cli::main`. Reword to: \"blaze's one subscriber there, blaze-profile's recorder (crates/blaze-profile/src/lib.rs), takes INFO and above.\" (2) docs/cargo.md needs a v2 pass beyond integrate-load's fixes: the client's commands now also include `toolchain` and `doc` and `pack` (crates/blaze-cargo/src/cli.rs HELP is the list), a local registry's .crate is read in place (serve/fetch.rs), a package whose rust-version is newer than blaze's Rust is refused unless --ignore-rust-version, -vv shows dependencies' warnings (capped at warn), the sandbox keys per 01342. Lane cargo will review the text if asked.",
+  "state": "open",
+  "created": "2026-10-31T20:50:57Z",
+  "updated": "2026-10-31T20:50:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:50:57Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

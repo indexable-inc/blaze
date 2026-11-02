@@ -54,13 +54,25 @@ impl std::error::Error for ManifestDiagnostic {}
 /// An error as cargo prints it to stderr: the diagnostic if there is one, else `error:` and
 /// each cause under `Caused by:`.
 pub fn report(err: &anyhow::Error, cwd: &Path) -> String {
+    match err.downcast_ref::<ManifestDiagnostic>() {
+        Some(diagnostic) => diagnostic.render(cwd),
+        // alloc: an error's text, once, at the edge
+        None => format!("error: {}", rendered(err, cwd)),
+    }
+}
+
+/// An error as cargo writes it after `error:`: the diagnostic if there is one, else each
+/// cause under `Caused by:`.
+pub fn rendered(err: &anyhow::Error, cwd: &Path) -> String {
     if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
         return diagnostic.render(cwd);
     }
     let mut chain = err.chain();
-    let mut out = format!("error: {}", chain.next().unwrap());
+    // alloc: an error's text, once, at the edge
+    let mut out = chain.next().unwrap().to_string();
     for cause in chain {
         out.push_str("\n\nCaused by:");
+        // alloc: each cause's text, on the error path
         for line in cause.to_string().lines() {
             out.push('\n');
             if !line.is_empty() {

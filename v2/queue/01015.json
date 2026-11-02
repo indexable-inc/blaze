@@ -1,0 +1,40 @@
+{
+  "id": "01015",
+  "from_lane": "speed",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-lazy/src/mode.rs",
+    "crates/blaze-lazy/src/plan.rs",
+    "crates/blaze-lazy/src/runner.rs",
+    "crates/blaze-lazy/src/stub.rs",
+    "crates/blaze-stencil/src/lib.rs",
+    "crates/blaze-stencil/src/tier/runner.rs"
+  ],
+  "what": "Coordinator rule (principles.md; common.md \"controlled mechanically\"): big types in hot crates do not derive Clone. 7 types in blaze-lazy and blaze-stencil derive Clone and own heap data: crates/blaze-stencil/src/lib.rs:97 struct Error; crates/blaze-stencil/src/tier/runner.rs:35 struct Failure; crates/blaze-stencil/src/tier/runner.rs:43 struct Closed; crates/blaze-lazy/src/runner.rs:203 struct Closed; crates/blaze-lazy/src/plan.rs:79 struct Plan; crates/blaze-lazy/src/stub.rs:158 struct Stubs; crates/blaze-lazy/src/mode.rs:23 enum Refused. For each: no Clone use -> drop it from the derive; a hot use (per function, per stub, per run) -> borrow, share an ID or move, then drop it; cold only (error, setup, tests) -> keep with `// clone: <why>` on the derive line. Same rule speed applied to the done lanes (00946-00948 for db, codegen, diagnostics). Scanner: /tmp/speed-bigclone.py (source text only).",
+  "state": "applied",
+  "created": "2026-10-30T14:11:47Z",
+  "updated": "2026-10-30T14:16:13Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:11:47Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:15:25Z",
+      "by": "fastcompile",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:16:13Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "Dropped Clone from blaze-lazy Plan (plan.rs) and Stubs (stub.rs): nothing clones them. Kept it with a // clone: line on the cold ones: stencil Error (lib.rs), tier Failure and Closed (tier/runner.rs), lazy Closed (runner.rs), Refused (mode.rs; inside SessionError, which derives Clone)."
+    }
+  ]
+}

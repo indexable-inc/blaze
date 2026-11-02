@@ -9,20 +9,20 @@ mod xml;
 #[derive(Debug, Default)]
 pub(crate) struct CheckstyleEmitter;
 
-impl Emitter for CheckstyleEmitter {
-    fn emit_header(&self, output: &mut dyn Write) -> Result<(), io::Error> {
+impl CheckstyleEmitter {
+    pub(crate) fn emit_header(&self, output: &mut impl Write) -> Result<(), io::Error> {
         writeln!(output, r#"<?xml version="1.0" encoding="utf-8"?>"#)?;
         write!(output, r#"<checkstyle version="4.3">"#)?;
         Ok(())
     }
 
-    fn emit_footer(&self, output: &mut dyn Write) -> Result<(), io::Error> {
+    pub(crate) fn emit_footer(&self, output: &mut impl Write) -> Result<(), io::Error> {
         writeln!(output, "</checkstyle>")
     }
 
-    fn emit_formatted_file(
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        output: &mut dyn Write,
+        output: &mut impl Write,
         FormattedFile {
             filename,
             original_text,

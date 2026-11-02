@@ -1,0 +1,8 @@
+# The clocks crate's tests under cargo-nextest.
+#
+# Its tests measure the machine's load, and several run children that keep
+# CPUs busy: run side by side (nextest's default), each sees the others'
+# children as other programs' load and fails (child::tests, October 26).
+# Each runs alone. The whole suite takes about 30 s so.
+[profile.default]
+test-threads = 1

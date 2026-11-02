@@ -41,7 +41,7 @@ def subcommand(args):
 def who(pc):
     """Who a parent's command line says it is."""
     first = pc.split(" ")[0]
-    if "rustc-wrapper" in pc or "blaze-rustc" in pc:
+    if "rustc-wrapper" in pc:
         return "wrapper"
     if first.endswith("/rustdoc") or first.endswith("/rustdoc.real"):
         return "rustdoc"
@@ -49,10 +49,10 @@ def who(pc):
         return "blaze as rustdoc"
     if "build-script" in first or "/build/" in first:
         return "build script"
-    if "blaze-engine cargo" in pc or first.endswith("/blaze") or first == "blaze":
-        return "client"
-    if "--socket" in pc or "--spare" in pc or "blaze-engine daemon" in pc:
+    if " serve" in pc and (first.endswith(("/blaze", "/blaze-engine")) or first in ("blaze", "blaze-engine")):
         return "worker"
+    if first.endswith("/blaze") or first == "blaze":
+        return "client"
     if "/blaze-engine " in pc or pc.startswith("blaze-engine"):
         return "blaze"
     if "cargo" in pc.split(" ")[0]:

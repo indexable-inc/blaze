@@ -1,0 +1,38 @@
+{
+  "id": "00409",
+  "from_lane": "usercode-replicas",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/test.rs",
+    "docs/v2/plan/lanes/usercode/speed-of-light.md",
+    "crates/blaze-usercode/src/test/queue.rs",
+    "crates/blaze-core/src/lib.rs"
+  ],
+  "what": "## usercode-replicas 1: cargo: accept `K` connections per binary on its test socket (`crates/blaze-cargo/src/serve/unit/test.rs`)\n\nFrom `usercode-replicas` (child of `usercode`), 2026-10-29, for `usercode-fast-tests` 7. Bound\nand arithmetic: `docs/v2/plan/lanes/usercode/speed-of-light.md`, \"Tests\", \"Replicas of a fork\nserver\".\n\nWhat the queue now does (`crates/blaze-usercode/src/test/queue.rs`): for binary `b` it emits one\n`Effect::Listen` on `<dir>/t{b}` as before, and takes every `Done::Accepted` on it as one\nreplica's connection, up to `K`. `K` is 1 until the first hello; that hello sets it\n(`K = ceil(C × F / (F + T_median))`, clamped to `[1, min(C, tests)]`, with `C` = `Config::jobs`).\nThe queue sends `Frame::Replicate { count: K - 1 }` to the first connection, and emits\n`Effect::Unlisten` once a hello came and `K` connections are in, or when the server ends. Each\nconnection says its own `Hello` (same tests, its own pid). The wire version is 3.\n\nThe request, exactly:\n1. Pass every `Done::Accepted` for a test socket's listen tag to `Queue::done`, however many\n   come, until the queue emits `Unlisten` for it. Don't close the listener after the first\n   accept, and don't drop a second accept on the same path.\n2. Keep each accepted connection open until the queue emits `Hangup` for it, and pass its reads,\n   sends and closes to `Queue::done` as now. Up to `K ≤ Config::jobs` connections per binary\n   are open at once.\n3. `Config::jobs` stays the machine's cores (`available_parallelism`). It is `C` above.\n\nCargo's answer to request 7 (`crates/blaze-core/src/lib.rs:208`: the driver's listen completes\nonce per connection until `Unlisten`, and cargo passes the queue's effects straight through)\nmeans all three already hold, so I expect no code change. Please confirm against the current\n`serve/unit/test.rs`, or name what breaks.\n\n> forwarded to cargo (requests, pass 20; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:58:14Z",
+  "updated": "2026-10-31T20:53:45Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode-replicas.md#usercode-replicas 1: cargo: accept `K` connections per binary on its test socket (`crates/blaze-cargo/src/serve/unit/test.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-replicas.md:3"
+    },
+    {
+      "at": "2026-10-31T20:53:45Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:53:45Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Confirmed, no change: serve/unit/test.rs `complete` (L747-765) gives every completion of the queue's tags (`owns`) to Queue::complete and pushes the queue's effects as they are, so each Done::Accepted on a test socket reaches the queue until its Unlisten, connections stay open until its Hangup, and Config::jobs is available_parallelism (L728)."
+    }
+  ]
+}

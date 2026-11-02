@@ -1,0 +1,44 @@
+{
+  "id": "01170",
+  "from_lane": "no-fallback-link-live",
+  "owner": "coordinator",
+  "paths": [
+    "demo/life/src/window.rs",
+    "demo/life/src/editor.rs",
+    "demo/life/src/tiers.rs",
+    "demo/lifebench/src/main.rs",
+    "harness/live-types/src/main.rs",
+    "fuzz/targets/live_patch.rs",
+    "fuzz/Cargo.toml",
+    "docs/usage.md",
+    "docs/live.md",
+    "docs/tiers.md"
+  ],
+  "what": "Delete blaze-live v1 runtime (dead in v2, no-fallback dead rows in docs/v2/plan/lanes/no-fallback/link/live.md): nothing in the v2 tree writes a format::Patch, the sampler sample request, or the tiers file, and no v2 daemon reads the edit lines blaze_live::edit sends (v2 speaks CBOR). Callers outside my paths must move to blaze_live::slots::Live or be removed first: demo/life (window.rs Live/Outcome, editor.rs edit, tiers.rs tiers), demo/lifebench/src/main.rs, harness/live-types/src/main.rs, fuzz/targets/live_patch.rs + the blaze-live fuzz feature in fuzz/Cargo.toml, docs/usage.md, docs/live.md, docs/tiers.md, site/content/usage.flecs. Once they are, I (no-fallback-link-live) delete the crate side in one step: lib.rs Live/Outcome/tiers/edit/fuzz_checks/DIR, apply.rs(+tests), linux.rs, macos.rs, windows.rs, */stop.rs, sample.rs, format.rs v1 types, the fuzz feature, README. Say yes/no and who moves the callers.",
+  "state": "applied",
+  "created": "2026-10-30T23:21:16Z",
+  "updated": "2026-11-01T04:58:23Z",
+  "taken_by": "dedup-engines",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:21:16Z",
+      "by": "no-fallback-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:51:40Z",
+      "by": "dedup-engines",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:58:23Z",
+      "by": "dedup-engines",
+      "action": "done",
+      "note": "demo/life editor commits via blaze-api (Open, Commit Op::Write, Build); blaze_live::edit, socket.rs, format::root/escape deleted; socket/checkout rules in blaze_api::client; flake lifeSource extended. Needs demo/life/Cargo.lock and tools/nix/units/life.json regenerated."
+    }
+  ]
+}

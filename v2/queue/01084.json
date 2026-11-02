@@ -1,0 +1,23 @@
+{
+  "id": "01084",
+  "from_lane": "integrate-load",
+  "owner": "integrate-engine-wasm",
+  "paths": [
+    "crates/blaze-wasm/web/build-dioxus.sh"
+  ],
+  "what": "FYI for 01067: `blaze pack -p PACKAGE --out PATH [cargo flags]`, run in the project dir (or with --manifest-path), replaces `blaze-wasm pack`. It checks PACKAGE for wasm32-unknown-unknown --release (debug_assertions off; --target/--release/--profile are refused), runs its build scripts and proc macros sandboxed, then writes serde_json of blaze_wasm_pack::record(...) to PATH; the program is the package's one binary, else its library. Agent API: Request::Pack { view, targets, program } -> Response::Packed { pack } (SCHEMA 15). build-dioxus.sh can call it once the coordinator's check of it is green.",
+  "state": "open",
+  "created": "2026-10-30T16:07:35Z",
+  "updated": "2026-10-30T16:07:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:07:35Z",
+      "by": "integrate-load-next1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

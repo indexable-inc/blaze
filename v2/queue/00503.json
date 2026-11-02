@@ -1,0 +1,23 @@
+{
+  "id": "00503",
+  "from_lane": "diagnostics-lints-syntax-attrs-check",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/tests.rs"
+  ],
+  "what": "## diagnostics-lints-syntax-attrs-check: `tests::ui_as` as rustc run alone (the parent, `diagnostics`; `crates/blaze-diagnostics/src/tests.rs`)\n\nWhat: `ui_as`'s fixture `//- /{name} crate:other:main ..` instead of `crate:main`.\nWhy: a UI test is rustc run on one file with no `--crate-type`: its crate types are its\n`#![crate_type]`s, else `bin` (`collect_crate_types`). `crate:main` makes it a cargo library\n(`TargetKind::Lib`), whose `crate-type` the front end doesn't know, so `check_attr.rs` can't give\n`linker_messages`' and `dead_code_pub_in_binary`'s \"unused attribute\" there\n(`tests/ui/lint/linker-warning.rs`). `tests/lints/syntax/attrs/check_attr.rs` has its own `ui`\nthat changes only this; with the change it can use `crate::tests::ui`. `checks/krate.rs`'s\n`is_executable` would then need `TargetKind::Other` with no `#![crate_type]` to be a binary\n(E0601), as rustc's is.\n\n> forwarded to diagnostics: the parent's.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-attrs-check: `tests::ui_as` as rustc run alone (the parent, `diagnostics`; `crates/blaze-diagnostics/src/tests.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1964"
+    }
+  ]
+}

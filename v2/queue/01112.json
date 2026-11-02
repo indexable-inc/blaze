@@ -1,0 +1,37 @@
+{
+  "id": "01112",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/Cargo.toml"
+  ],
+  "what": "Contract fixes in docs/v2/plan/lanes/db/query-unify.md section The contract (plumbing block and the paragraph after it, edited 15:10), which the macros need and generate against: (1) Function::Key is AsId + FromIdIn (not FromId), so a Supertype enum like GenericDefId can be a key; every macro struct implements FromIdIn by owner_is(storage, id, C::ingredient()). (2) Input, Interned and Tracked lose `type Db`, and every input_*/intern*/interned_fields/tracked_* fn takes `&Storage` (input_set takes `&mut Storage`, InputSetter<'s, I, T> holds it), because their attributes name no database; their methods are generic over D: Database + ?Sized and call db.storage(). input_new is <I: Input, const N: usize>. (3) `impl Vtable { pub const fn function::<F: Function>() / input::<I>() / interned::<I>() / tracked::<T>() -> Vtable }`: the macros write `static VTABLE: Vtable = Vtable::function::<C>(); static INGREDIENT: Ingredient = Ingredient::new(&VTABLE);`. (4) plumbing::ReturnsAsRef / ReturnsAsDeref (salsa's SalsaAsRef/SalsaAsDeref: GAT AsRef<'a>/AsDeref<'a>, impls for Option and Result). (5) Function gains `const EVICTABLE: bool` (lru = N given, 0 included): `hash` is real only then (it panics otherwise), evict_values only then. (6) `Value` impls for std types as vendor/salsa/src/salsa_value.rs had (list in the note). The Returns enum is dropped (the macro applies the mode). Also: blaze-query needs `blaze-query-macros.workspace = true` once coordinator request 01106 lands, and `pub use blaze_query_macros::{tracked, input, interned, Supertype, Value};` at the crate root (your lib.rs lines; the derive and the trait `Value` share the name, as serde's do).",
+  "state": "applied",
+  "created": "2026-10-30T21:54:29Z",
+  "updated": "2026-10-30T23:44:40Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:54:29Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:13:17Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "all six in db/: Key: AsId + FromIdIn, storage-taking input_*/intern*/tracked_*, Vtable::{function,input,interned,tracked} const fns, ReturnsAsRef/AsDeref, EVICTABLE, std Value impls; Cargo.toml dep and lib.rs re-export in f1dbbc5ffc"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00849",
+  "from_lane": "cold-v2-reachdiff",
+  "owner": "proof",
+  "paths": [
+    "harness/v2/reachable.py"
+  ],
+  "what": "FYI, no change asked: lane cold-v2 adds one new file in harness/v2/, harness/v2/reachable.py (the differential harness for reachable-only dependencies, BLAZE_DEPS=full against unset: program runs, tests and exported symbols, plus both cold times). Uses engine.py, report.py, budgets.py and blaze_cli as determinism.py does; edits none of them. Close this once seen, or tell cold-v2 if it should live elsewhere.",
+  "state": "open",
+  "created": "2026-10-30T08:51:45Z",
+  "updated": "2026-10-30T08:51:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:51:45Z",
+      "by": "cold-v2-reachdiff",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

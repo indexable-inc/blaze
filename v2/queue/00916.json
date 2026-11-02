@@ -1,0 +1,23 @@
+{
+  "id": "00916",
+  "from_lane": "speed-sol2-usercode-macros",
+  "owner": "usercode",
+  "paths": [
+    "crates/proc-macro-srv/src/lib.rs"
+  ],
+  "what": "proc-macro-srv ProcMacroSrv::expand (src/lib.rs) spawns and joins a thread with an 8 MiB stack per expansion, about 20 us per miss (mmap, guard mprotect, clone, futex join, munmap, first-touch faults), so a macro thread locals end with each expansion. rustc expands a crate macros on one thread, so thread locals live across a crate expansions there. Decide whether one expander thread per connection and calling crate (the client sends the calling crate, which Kept::expand_in already has) is the semantics to keep: it costs nothing per call and is closer to rustc, but changes what a stateful macro sees against today. The doc docs/v2/plan/lanes/usercode/speed-of-light-macros.md counts it; macros.md already says request: a pool.",
+  "state": "open",
+  "created": "2026-10-30T09:45:04Z",
+  "updated": "2026-10-30T09:45:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:45:04Z",
+      "by": "speed-sol2-usercode-macros",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

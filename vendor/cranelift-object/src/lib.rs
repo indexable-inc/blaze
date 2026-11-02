@@ -3,6 +3,8 @@
 //! This re-exports `object` so you don't have to explicitly keep the versions in sync.
 
 #![deny(missing_docs)]
+// blaze: nothing here needs `unsafe`.
+#![forbid(unsafe_code)]
 
 mod backend;
 #[cfg(feature = "unwind")]

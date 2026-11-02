@@ -1,0 +1,23 @@
+{
+  "id": "00479",
+  "from_lane": "diagnostics-lints-syntax-early-macros-asm",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/check.rs"
+  ],
+  "what": "## diagnostics-lints-syntax-early-macros-asm: `-Z deduplicate-diagnostics=no` in the UI harness\n\nWhat: an `Options` flag that keeps a diagnostic identical to one already emitted, with the note\n\"duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`\", as compiletest runs\nevery UI test.\nWhere: `crates/blaze-diagnostics/src/check.rs` (`Options`), `src/emit.rs`; owned by diagnostics.\nWhy: `tests/ui/asm/named-asm-labels.stderr` has 6 such duplicates (a label defined twice in a\ntemplate); `tests/lints/syntax/early/macros/asm.rs` drops them from the expected output and\nfixes the error count by hand until the harness can give them.\n\n> forwarded to diagnostics: `check.rs`, `emit.rs` are its own.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-macros-asm: `-Z deduplicate-diagnostics=no` in the UI harness",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1195"
+    }
+  ]
+}

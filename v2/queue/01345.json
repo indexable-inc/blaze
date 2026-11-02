@@ -1,0 +1,24 @@
+{
+  "id": "01345",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "docs/toolchain.md",
+    "docs/install.md"
+  ],
+  "what": "Two v2 gaps the docs name are closed (queue 01064, 01002): (1) every cargo command, and the new `blaze toolchain`, downloads blaze's own Rust once into ~/.blaze (BLAZE_HOME) unless rustup has it (crates/blaze-cargo/src/toolchain.rs ensure); install.sh:305's `blaze toolchain` works again and --no-toolchain's 'the first build downloads it' is true. (2) a unit whose package's rust-version is newer than blaze's Rust is refused as cargo refuses it (\"rustc X is not supported by the following package...\"), unless --ignore-rust-version (crates/blaze-units/src/load/units.rs); under -v a rust-toolchain file above the cwd is said to be ignored. docs/toolchain.md and docs/install.md:68 should drop those gaps.",
+  "state": "open",
+  "created": "2026-10-31T20:41:13Z",
+  "updated": "2026-10-31T20:41:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:41:13Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

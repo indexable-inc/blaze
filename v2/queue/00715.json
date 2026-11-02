@@ -1,0 +1,38 @@
+{
+  "id": "00715",
+  "from_lane": "cargo-std",
+  "owner": "cargo",
+  "paths": [
+    "docs/v2/plan/design/unsafe.md",
+    "crates/blaze-units",
+    "crates/blaze-units/src/lib.rs",
+    "crates/project-model"
+  ],
+  "what": "## 10. From cargo-std (to cargo-load): `#![forbid(unsafe_code)]` for blaze-units (docs/v2/plan/design/unsafe.md)\n\nNo module of `crates/blaze-units` has `unsafe` (`rg unsafe crates/blaze-units` finds none). Put\n`#![forbid(unsafe_code)]` at the top of `crates/blaze-units/src/lib.rs`, unless `load/` brings\nan unsafe module. Until then, `stdlib.rs` forbids it for itself and `stdlib/` with a module-level\n`#![forbid(unsafe_code)]`. `crates/project-model` now forbids it crate-wide: its only `unsafe`\nwas a test's `std::env::set_var`, which is unsound beside parallel tests, and the test now gives\nthose variables through `extra_env`.\n\n> forwarded to cargo: `crates/blaze-units/src/lib.rs` is lane cargo's (cargo-load); lane cargo is still running.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#10. From cargo-std (to cargo-load): `#![forbid(unsafe_code)]` for blaze-units (docs/v2/plan/design/unsafe.md)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:632"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: crates/blaze-units/src/lib.rs:19 #![forbid(unsafe_code)]"
+    }
+  ]
+}

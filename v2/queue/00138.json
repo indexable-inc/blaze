@@ -1,0 +1,35 @@
+{
+  "id": "00138",
+  "from_lane": "diagnostics-lints-bodies-liveness",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir"
+  ],
+  "what": "## 4. hir-ty-mir: a closure or coroutine whose MIR does not lower\n\nWhat: nothing to change in liveness; listed so the cases are known. When\n`mir_body_for_closure`/`mir_body_for_coroutine` fails for a body that is not tainted, the\nclosure gets no lints and the parent reads every capture as live. When `mir_body` of the body\nitself fails, the body gets no lints. Each such case is a lowering gap of hir-ty-mir (its\n`not_supported!`), and is reported there.\n\n> forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.\n\n> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.",
+  "state": "applied",
+  "created": "2026-10-30T01:33:34Z",
+  "updated": "2026-10-31T20:36:08Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-bodies-liveness.md#4. hir-ty-mir: a closure or coroutine whose MIR does not lower",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-bodies-liveness.md:43"
+    },
+    {
+      "at": "2026-10-31T20:36:08Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:08Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Information only: lowering gaps are reported where they are (not_supported!)."
+    }
+  ]
+}

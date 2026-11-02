@@ -1,0 +1,23 @@
+{
+  "id": "01357",
+  "from_lane": "tests-diag",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "minicore.rs:2264 declares `mod panicking` private, but core has `pub mod panicking` (library/core/src/lib.rs:305). panic_2021 (minicore.rs:2240) expands to `$crate::panicking::panic_fmt` etc. in the user crate, which cannot reach a private module of core: rustc would refuse it as well (tests/ui/hygiene/intercrate.rs: a decl_macro from another crate does not bypass privacy). Make it `pub mod panicking`, as in core. 5 blaze-diagnostics tests fail on it in round 14 with E0433 `cannot find panicking in $crate` at a `panic!()`: tests::bodies::calls::a_foreign_enum_with_a_non_exhaustive_variant_is_not_cast, tests::bodies::const_patterns::a_constant_of_a_type_without_partial_eq_is_not_a_pattern, tests::bodies::const_patterns::a_derive_whose_structural_impl_does_not_apply_is_not_structural, tests::items::impls::drop_of_an_instantiation_of_its_type, tests::lints::names::dead::basic. (Separately, rustc names a private module E0603 `module panicking is private`, not E0433; that wording is db resolution if it matters.)",
+  "state": "open",
+  "created": "2026-10-31T23:17:40Z",
+  "updated": "2026-10-31T23:17:40Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:17:40Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

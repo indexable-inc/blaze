@@ -1,0 +1,35 @@
+{
+  "id": "00342",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand"
+  ],
+  "what": "## M. What each memoized result is (contract 4)\n\nEvery memo below is owned (global allocator, lane mem's ruling) and built once at its exact\nlength from temporaries in the run's frame or the worker's scratch. None is a frame value.\n\n| query | memo | built from | growth it replaces | by |\n|---|---|---|---|---|\n| `parse_macro_expansion` | `Parse<SyntaxNode>` | the expansion tree (frame, E2) through the parser's events | none in hir-expand: the green tree is `syntax`'s (rowan's node cache), out of this slice | E2 |\n| `parse_macro_expansion` | `ExpansionSpanMap` (`ends`, `spans`, fragment columns) | the sink's columns in the worker's scratch, copied once at their length (`from_columns_in`) | `SpanMap::with_capacity(tokens)` sized by input tokens, then `finish`'s `shrink_to_fit` of `ends` and `spans` (a realloc each whenever punctuation glued) | F3 |\n| `macro_arg` | `tt::TopSubtree` (5 columns) | `TopSubtreeBuilder`, whose working vectors are the worker's `Scratch`; `finish` writes each column at its length | `nodes`, `spans` are exact today; `parts` and `wide` grow by doubling from empty and `symbols` is reserved at an upper bound, each then shrunk by `into_boxed_slice` | F9 |\n| `macro_arg` | `SyntaxFixupUndoInfo.original: Option<ThinVec<TopSubtree>>` | a frame vector of the replaced subtrees, drained once into `ThinVec::with_capacity(len)`; `None` when no fixup | `ThinVec::new()` grown by doubling, then `shrink_to_fit` | E3 |\n| `macro_arg` | `Span` | copied | none | — |\n| `expand_proc_macro` | `ExpandResult<tt::TopSubtree>` | the expander's result (user code at the edge); trees the native server builds go through `TopSubtreeBuilder` | as `macro_arg`'s tree | F9 |\n| `decl_macro_expander` | `DeclarativeMacroExpander { mac, transparency, edition }`; `mac.rules: Box<[Rule]>` | the definition's tree in the frame (E5); rules collected in a frame vector, boxed at their count | `rules: Vec::new()` pushed per rule, then `into_boxed_slice` (`mbe/src/lib.rs:175`, `:215`) | E5, F7 |\n| `ast_id_map` | `AstIdMap` (`entries: Box<[Entry]>`, its index) | `entries`, `found` and the next-index map in the frame; `Box::<[Entry]>::from(&entries[..])` | `vec![..]` grown by doubling, then `into_boxed_slice` (`span/src/ast_id.rs:1205`, `:1259`) | E6, F6 |\n| `real_span_map` | `RealSpanMap` (two columns) | `pairs` in the frame, sorted with the worker's scratch; `from_file` collects its columns from the slice at exact length | `vec![..]` grown by doubling and `into_boxed_slice` (a shrink) before `from_file` read it; the radix sort's global scratch | E8, F4 |\n| `syntax_error_ranges` | `Box<[TextRange]>` | an exact-size `map(..).collect()`, then `into_boxed_slice` (no realloc); sort scratch the worker's | the sort's global scratch (applied) | E7 |\n| `line_starts` | `Box<[u32]>` | newlines counted, then `Vec::with_capacity(lines + 1)` (applied) | `text.len() / 32 + 1` estimate: doubling past it, a shrink under it | E9 |\n| `proc_macro_span` | `Span` | copied | none | — |\n| `ProcMacros::get_for_crate` | `Option<Arc<CrateProcMacros>>` | an `Arc` clone of the input's value | none (a refcount bump) | — |\n| `may_have_session_macros` | `bool` | — | none | — |\n\nThe span maps an IDE downmap builds lazily (`by_anchor`, F2) belong to the memo they index and\nare built once at exact length, so they follow the same rule.\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:39): a table; each row is its E/F section's, settled there.",
+  "state": "applied",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#M. What each memoized result is (contract 4)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:837"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:39): a table; each row is its E/F section's, settled there."
+    }
+  ]
+}

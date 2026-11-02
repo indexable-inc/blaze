@@ -1,0 +1,64 @@
+# hegeltest-c 0.48.0 (libhegel, Hegel's native engine) from indexable-inc/hegel cae7cfa192, trimmed
+# for blaze: vendor/hegeltest/SOURCE.md.
+[package]
+name = "hegeltest-c"
+version = "0.48.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+description = "C-ABI bindings for Hegel's native engine."
+repository = "https://github.com/indexable-inc/hegel"
+homepage = "http://hegel.dev"
+readme = "README.md"
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lints.clippy]
+too_many_arguments = "allow"
+
+# blaze: an rlib only. hegeltest's `static-engine` links it like any Rust crate; nothing in blaze
+# loads the engine as a cdylib or links it from C.
+[lib]
+name = "hegel_c"
+crate-type = ["rlib"]
+
+[dependencies]
+rand = { version = "0.10", default-features = false }
+dashu-int = { version = "0.6.1", default-features = false }
+# blaze: upstream asks for 0.8; 0.9 keeps the two calls the engine makes
+# (`compress_to_vec_zlib`, `decompress_to_vec_zlib_with_limit`) and `with-alloc`.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+rustc-hash = { version = "2", default-features = false }
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
+libm = { version = "0.2", default-features = false }
+once_cell = { version = "1.21", default-features = false, features = ["alloc"] }
+# blaze: upstream asks for 1.1.6; the engine uses only `toml::de::{DeTable, DeValue, DeString}`
+# and `Spanned`, all in the 1.1.2 blaze's lock already has.
+toml = { version = "1.1.2", default-features = false, features = ["parse"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["alloc", "fs", "time", "rand", "stdio", "process", "thread"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }
+
+[features]
+default = ["std"]
+std = []
+runtime = []
+wasm-static = []
+__bench = []

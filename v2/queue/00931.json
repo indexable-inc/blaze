@@ -1,0 +1,35 @@
+{
+  "id": "00931",
+  "from_lane": "speed-sol2-link-pewasm",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/place.rs"
+  ],
+  "what": "P21: a new thread-local in an incremental PE link. place.rs grows Class::Tdata in place, so a new thread-local lands after the CRT .tls$ZZZ / _tls_end, outside the template _tls_used gives the loader: its SecRel32 offset reads past every thread TLS block (wrong code, not an error). When Plan::got_by_library, make Tdata ordered (relaid by rank so .tls$ZZZ stays last), and make a live patch that adds a thread-local an error naming the static (a running thread TLS block cannot grow; same for ELF/Mach-O). Spec: /tmp/blaze-lanes/v2-link-requests.md ### P21.",
+  "state": "applied",
+  "created": "2026-10-30T09:55:44Z",
+  "updated": "2026-10-30T10:04:27Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:55:44Z",
+      "by": "speed-sol2-link-pewasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:04:27Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:04:27Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "place.rs Stage::ordered: with Plan::got_by_library, Class::Tdata is ordered too, so an incremental link relays the region by rank (as a full link lays it out): a new thread-local lands before .tls$ZZZ and _tls_end moves past it, its referrers rewritten. Test tests/natives.rs a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end (tlssup-like COFF object, a thread-local added incrementally, every Rust thread-local strictly between .tls and .tls$ZZZ). Live: live.rs message() already answers Restart (\"its thread-local storage changed\") whenever Tls {addr, init, size, align} or tls_at changes, which a relaid PE Tdata always does; ELF/Mach-O templates include the region room, so a running thread already has zeroed room for a new zero-initialized thread-local and a new initialized one changes init and restarts."
+    }
+  ]
+}

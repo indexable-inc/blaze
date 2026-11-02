@@ -1,0 +1,35 @@
+{
+  "id": "01443",
+  "from_lane": "may-suspend",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "Two AttrFlags bits for lane may-suspend (docs/v2/plan/lanes/may-suspend.md), in crates/hir-def/src/attrs.rs:\n- `AttrFlags::MAY_SUSPEND`: the tool attribute `#[blaze::may_suspend]` (a path of two segments, `blaze` then `may_suspend`, a word), on a function (read by `AttrFlags::query(db, FunctionId.into())`) and on a struct field (read by `AttrFlags::query_field(db, field)`).\n- `AttrFlags::MUST_NOT_SUSPEND`: rustc's `#[must_not_suspend]`, as a word or `= \"reason\"`, on an ADT (`AttrFlags::query(db, AdtId.into())`); std puts it on its lock guards and core on RefCell's Ref/RefMut.\nWhy: hir-ty-suspend (new, lane may-suspend) checks values held across a call that may park a fiber; it reads both per call site and per local, so a bit test, not `has_word_in_source` (which also matches only one-segment paths and no key-value form). After 1 << 89 there is room in the u128. Tell lane may-suspend (window may-suspend) when done.",
+  "state": "applied",
+  "created": "2026-11-01T03:51:18Z",
+  "updated": "2026-11-01T04:07:15Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:51:18Z",
+      "by": "may-suspend",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:05:25Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:07:15Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied: AttrFlags::MAY_SUSPEND (1<<90, #[blaze::may_suspend] word, two segments, on fns via query and fields via query_field) and AttrFlags::MUST_NOT_SUSPEND (1<<91, #[must_not_suspend] one segment, word or = \"reason\", on ADTs); attrs.rs match_attr_flags + Word set; tests: suspend_attributes_are_flags, corpus gains #[blaze::{name}], old reference and gating lists updated. Not built yet: coord runs the tests."
+    }
+  ]
+}

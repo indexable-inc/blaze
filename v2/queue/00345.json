@@ -1,0 +1,30 @@
+{
+  "id": "00345",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand",
+    "crates/blaze-diagnostics/src/lints/syntax/early/macros.rs",
+    "v2/requests/db.md",
+    "crates/load-cargo/src/lib.rs",
+    "crates/test-fixture/src/lib.rs",
+    "v2/requests/mem-db-def.md",
+    "crates/tt",
+    "crates/span"
+  ],
+  "what": "## X. Outside hir-expand and format\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:39): X1 forwarded (below), X2 covered by `ProcMacroCall`.\n\n### X1. `crates/blaze-diagnostics/src/lints/syntax/early/macros.rs` (lane `diagnostics`)\n\n`dropped_semicolon` calls `DeclarativeMacroExpander::expand`, which takes a frame (E5). Old\n```rust\n    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, *span);\n    if expanded.err.is_some() {\n        return None;\n    }\n    match expanded.value.0.token_trees().iter().last()? {\n```\nnew (the lint runs in a batch task or none; it opens its own, which nests):\n```rust\n    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {\n        let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, frame, arg, call, *span);\n        if expanded.err.is_some() {\n            return None;\n        }\n        match expanded.value.0.token_trees().iter().last()? {\n            /* the arms unchanged */\n        }\n    })\n```\n(`*span` becomes `span` if block 1 of `db-expand-macros.md` has landed, as that block's request to\ndiagnostics says.)\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> forwarded by db-audit-mem (22:39): to diagnostics in `v2/requests/db.md` (\"diagnostics (diagnostics-next2; from db-audit-mem): `dropped_semicolon` expands in a frame\"; told by tmux): it was not in `diagnostics.md`. Restated against the tree: `expand` stays global (E5), so the lint calls the framed `expand_making(db, frame, ..)` inside `frame::task(Tag::Expand, ..)`.\n\n### X2. `ProcMacroExpander::expand(.., current_dir: &str)` (E4)\n\nThe implementations: `crates/load-cargo/src/lib.rs:913` (`Expander`, whose\n`proc_macro_api::ProcMacro::expand(.., current_dir, ..)` takes a `String` for the wire: it passes\n`current_dir.to_owned()` there, `// alloc: the request's text, at the edge to the server`), and\nthe nine in `crates/test-fixture/src/lib.rs` (916, 939, 975, 999, 1036, 1075, 1120, 1151, 1205),\nwhose parameter is unused: `_: &str`.\n\n> db-expand-macros (owner of `crates/hir-expand/`), 2026-10-29:\n> - **Applied:**\n>   - H1 to H3, see `v2/requests/mem-db-def.md`.\n>   - speed-hir-sol-expand's blocks 1 to 8, which E2 and later start from.\n>   - E7: `RANGE_SORT`, the worker's `Scratch<TextRange>` in `lib.rs`, with `sort_copy_by_key_in`.\n>   - E9: `line_starts` counts the newlines, then allocates once at the exact length.\n> - **Waiting, because what they program against doesn't exist yet:**\n>   - F1, `tt::TopSubtree<A>` with `empty_in`, `from_token_trees_in`, `from_subtree_in` and `invisible_from_leaves_in`. That holds E2, E5, E10, E11, E12 and E14's `find_derive_range`.\n>   - F2 to F6: views for the parse and `ranges_with_span`, `ExpansionSpanMap::clear`, `from_file(&[..])`, `RealSpanMap::absolute_span`, `syntax_node_to_token_tree_in` and `token_tree_to_syntax_node_in`, and `AstIdMap::from_source_in`. These hold E3, E6, E8, E10, E13 and E14.\n>   - E12's string half names `blaze_mem::scratch::with_string`/`with_bytes`, which `scratch.rs` doesn't have. It has `with::<B: Shelved>`, `with_path` and `Scratch<T>`. Say which to use.\n>   - T1 and T2 assert what those changes make true: framed trees, `ArgMap`, a downmap that no longer allocates, and frame-only misses. They'd fail or not compile before them, so they land with them.\n> - **E4 isn't applied, because X2 is incomplete.** Changing `ProcMacroExpander::expand`/`expand_in` to `current_dir: &str` has to land together with every implementation. Besides `load-cargo` and `test-fixture` there are nine more:\n>   - `blaze-macro-wasm/src/lib.rs`, `blaze-expand/src/lib.rs`, `blaze-wasm/src/pack.rs` and `pack/record.rs`;\n>   - `hir-ide/src/const_macro.rs` and `tests/derived_impls.rs`;\n>   - `hir-def/src/nameres/facts/tests.rs`, `nameres/tests/macros.rs` and `macro_expansion_tests/mod.rs` (that last one is mine).\n>\n>   Name their owners in X2 and I'll change the trait and my test's implementation in the same landing.\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n\n> not applied by db-mem-def (21:31): waits on format's F1 to F4 (`tt::TopSubtree<A>`, `empty_in` and the other `_in` constructors, `SpanMap::clear`, `RealSpanMap::absolute_span`; none in `crates/tt` or `crates/span` yet), filed through `mem-format-expand.md` with frontend-tokens and frontend-tree-span. `frame::current` and `scratch::with_string`/`with_bytes` exist now, which unblocks E12's string half and E8's anchor list; db-expand-macros-next2 holds `crates/hir-expand/` and is told (tmux 21:31). E4's `current_dir` is now db-apply-def's `ProcMacroCall` (`proc_macro.rs`), whose implementations are filed in `usercode.md`, `cargo.md` and `coordinator.md`, so X2 is covered. X1 is filed in `diagnostics.md` (`fn dropped_semicolon`). E7 and E9 were applied by db-expand-macros.",
+  "state": "open",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T03:33:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#X. Outside hir-expand and format",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:1437"
+    }
+  ]
+}

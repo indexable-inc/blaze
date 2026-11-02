@@ -8,37 +8,43 @@
 //! for a `Result` whose drop order could change, this port says nothing: those need clippy's
 //! eager-evaluation and drop-order analyses.
 
-use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasArgList as _, HasName as _},
-};
+use syntax::{TextRange, view as ast};
 
-use super::utils::{self, MethodCall};
+use ast::{AstNode as _, HasArgList as _, HasName as _};
+
+use super::utils;
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "unnecessary_map_or";
+const LINT: super::Implemented = super::Implemented::UnnecessaryMapOr;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) || cx.expansion.is_some() {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT) || cx.expansion().is_some() || utils::method_name(expr) != Some("map_or") {
         return;
     }
-    let Some(MethodCall { name, name_ref, receiver: recv, args }) = utils::method_call(cx, expr)
-    else {
-        return;
+    let Some(call) = utils::method_call(cx, expr) else { return };
+    let [def, map] = *call.args() else { return };
+    let def_bool = match def {
+        ast::Expr::Literal(literal) => match literal.kind() {
+            ast::LiteralKind::Bool(it) => Some(it),
+            _ => None,
+        },
+        _ => None,
     };
-    let [def, map] = &args[..] else { return };
-    if name != "map_or" {
+    // Only a `bool` literal default, or two different `bool` constants, can be linted.
+    if def_bool.is_none()
+        && bool_constant(def).zip(closure_bool_constant(map)).is_none_or(|(a, b)| a == b)
+    {
         return;
     }
-    let Some(recv_ty) = cx.adjusted_ty(&recv) else { return };
+    let (name_ref, recv) = (call.name_ref, call.receiver);
+    let Some(recv_ty) = cx.adjusted_ty(recv) else { return };
     let kind = utils::option_or_result(cx, &recv_ty);
-    if kind == Some("Result") && result_variant_query(cx, expr, &name_ref, def, map, &recv_ty) {
+    if kind == Some("Result") && result_variant_query(cx, expr, name_ref, def, map, &recv_ty) {
         return;
     }
-    let ast::Expr::Literal(literal) = def else { return };
-    let ast::LiteralKind::Bool(def_bool) = literal.kind() else { return };
+    let Some(def_bool) = def_bool else { return };
     let Some(kind) = kind else { return };
-    if is_comparison(cx, &recv, map, def_bool) {
+    if is_comparison(cx, recv, map, def_bool) {
         return;
     }
     let (Some(whole), Some(method), Some(def_range), Some(map_range)) = (
@@ -71,12 +77,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
 
 /// clippy's `check_result_variant_query`: `.map_or(a, |_| b)` with `a` and `b` different bool
 /// constants, which is `is_ok()` or `is_err()`. Says whether clippy would take it as one.
-fn result_variant_query(
-    cx: &mut Cx<'_, '_, '_>,
-    expr: &ast::Expr,
-    name_ref: &ast::NameRef,
-    def: &ast::Expr,
-    map: &ast::Expr,
+fn result_variant_query<'t>(
+    cx: &mut Cx<'_, 't>,
+    expr: ast::Expr<'t>,
+    name_ref: ast::NameRef<'t>,
+    def: ast::Expr<'t>,
+    map: ast::Expr<'t>,
     recv_ty: &hir::Type<'_>,
 ) -> bool {
     let Some(def_bool) = bool_constant(def) else { return false };
@@ -96,58 +102,58 @@ fn result_variant_query(
     };
     let suggested = if map_bool { "is_ok" } else { "is_err" };
     let call_span = cx.span(TextRange::new(method.start(), end.end()));
-    cx.lint(
-        LINT,
-        expr.syntax(),
-        cx.span(method),
-        format!("this `{}` can be simplified", name_ref.text()),
-    )
-    .suggestion(
-        call_span,
-        format!("use `{suggested}` instead"),
-        format!("{suggested}()"),
-        Applicability::MachineApplicable,
-    );
+    let span = cx.span(method);
+    cx.lint(LINT, expr.syntax(), span, format!("this `{}` can be simplified", name_ref.text()))
+        .suggestion(
+            call_span,
+            format!("use `{suggested}` instead"),
+            format!("{suggested}()"),
+            Applicability::MachineApplicable,
+        );
     true
 }
 
-fn bool_constant(expr: &ast::Expr) -> Option<bool> {
+fn bool_constant(expr: ast::Expr<'_>) -> Option<bool> {
     match expr {
         ast::Expr::Literal(literal) => match literal.kind() {
             ast::LiteralKind::Bool(it) => Some(it),
             _ => None,
         },
-        ast::Expr::ParenExpr(paren) => bool_constant(&paren.expr()?),
+        ast::Expr::ParenExpr(paren) => bool_constant(paren.expr()?),
         ast::Expr::BlockExpr(block)
             if block.statements().next().is_none() && block.modifier().is_none() =>
         {
-            bool_constant(&block.tail_expr()?)
+            bool_constant(block.tail_expr()?)
         }
         _ => None,
     }
 }
 
-fn closure_bool_constant(expr: &ast::Expr) -> Option<bool> {
+fn closure_bool_constant(expr: ast::Expr<'_>) -> Option<bool> {
     let ast::Expr::ClosureExpr(closure) = expr else { return None };
     if closure.param_list()?.params().count() != 1 {
         return None;
     }
-    bool_constant(&closure.body()?)
+    bool_constant(closure.body()?)
 }
 
 /// Whether clippy would suggest a comparison instead: `|x| x == y` with `false`, `|x| x != y`
 /// with `true`, one side the closure's parameter.
-fn is_comparison(cx: &Cx<'_, '_, '_>, recv: &ast::Expr, map: &ast::Expr, def_bool: bool) -> bool {
-    if cx.ty(recv) != cx.adjusted_ty(recv) {
-        return false;
-    }
+fn is_comparison<'t>(
+    cx: &Cx<'_, 't>,
+    recv: ast::Expr<'t>,
+    map: ast::Expr<'t>,
+    def_bool: bool,
+) -> bool {
     let ast::Expr::ClosureExpr(closure) = map else { return false };
     let Some(params) = closure.param_list() else { return false };
-    let [param] = &params.params().collect::<Vec<_>>()[..] else { return false };
+    let mut params = params.params();
+    let (Some(param), None) = (params.next(), params.next()) else { return false };
     let Some(ast::Pat::IdentPat(binding)) = param.pat() else { return false };
     let Some(name) = binding.name() else { return false };
+    let name = name.text();
     let Some(mut body) = closure.body() else { return false };
-    while let ast::Expr::BlockExpr(block) = &body
+    while let ast::Expr::BlockExpr(block) = body
         && block.statements().next().is_none()
         && block.modifier().is_none()
         && let Some(tail) = block.tail_expr()
@@ -162,21 +168,21 @@ fn is_comparison(cx: &Cx<'_, '_, '_>, recv: &ast::Expr, map: &ast::Expr, def_boo
         return false;
     }
     let (Some(lhs), Some(rhs)) = (bin.lhs(), bin.rhs()) else { return false };
-    let is_binding = |side: &ast::Expr| matches!(side, ast::Expr::PathExpr(path) if path.path().is_some_and(|it| it.as_single_name_ref().is_some_and(|it| it.text() == name.text())));
-    if is_binding(&lhs) == is_binding(&rhs) {
+    let is_binding = |side: ast::Expr<'_>| matches!(side, ast::Expr::PathExpr(path) if path.path().is_some_and(|it| it.as_single_name_ref().is_some_and(|it| it.text() == name)));
+    if is_binding(lhs) == is_binding(rhs) {
         return false;
     }
-    let other = if is_binding(&lhs) { &rhs } else { &lhs };
-    let uses_binding = other
-        .syntax()
-        .descendants()
-        .filter_map(ast::NameRef::cast)
-        .any(|it| it.text() == name.text());
+    let other = if is_binding(lhs) { rhs } else { lhs };
+    let uses_binding =
+        other.syntax().descendants().filter_map(ast::NameRef::cast).any(|it| it.text() == name);
     if !is_eager(other) || uses_binding {
         return false;
     }
+    if cx.ty(recv) != cx.adjusted_ty(recv) {
+        return false;
+    }
     let db = cx.db();
-    let (Some(l_ty), Some(r_ty), Some(recv_ty)) = (cx.ty(&lhs), cx.ty(&rhs), cx.adjusted_ty(recv))
+    let (Some(l_ty), Some(r_ty), Some(recv_ty)) = (cx.ty(lhs), cx.ty(rhs), cx.adjusted_ty(recv))
     else {
         return false;
     };
@@ -188,14 +194,14 @@ fn is_comparison(cx: &Cx<'_, '_, '_>, recv: &ast::Expr, map: &ast::Expr, def_boo
 
 /// An approximation of clippy's `switch_to_eager_eval`: what is as cheap evaluated early as
 /// late, and has no effects.
-fn is_eager(expr: &ast::Expr) -> bool {
+fn is_eager(expr: ast::Expr<'_>) -> bool {
     match expr {
         ast::Expr::Literal(_) | ast::Expr::PathExpr(_) => true,
-        ast::Expr::FieldExpr(field) => field.expr().is_some_and(|it| is_eager(&it)),
-        ast::Expr::RefExpr(it) => it.expr().is_some_and(|it| is_eager(&it)),
-        ast::Expr::ParenExpr(it) => it.expr().is_some_and(|it| is_eager(&it)),
+        ast::Expr::FieldExpr(field) => field.expr().is_some_and(is_eager),
+        ast::Expr::RefExpr(it) => it.expr().is_some_and(is_eager),
+        ast::Expr::ParenExpr(it) => it.expr().is_some_and(is_eager),
         ast::Expr::PrefixExpr(it) => {
-            it.op_kind() == Some(ast::UnaryOp::Neg) && it.expr().is_some_and(|it| is_eager(&it))
+            it.op_kind() == Some(ast::UnaryOp::Neg) && it.expr().is_some_and(is_eager)
         }
         _ => false,
     }

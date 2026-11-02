@@ -1,0 +1,37 @@
+{
+  "id": "01280",
+  "from_lane": "coordinator",
+  "owner": "dedup-next3",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-ids/Cargo.toml",
+    "vendor/blake3-servil"
+  ],
+  "what": "Vendor blake3-servil (johnservil/BLAKE3 rev c6bd679a0911cc233cb28297f2b25875381215a1, root Cargo.toml:193) as vendor/blake3-servil with a SOURCE.md, as vendor/sonic-rs and vendor/cranelift-codegen are, and point the workspace dependency at the path. tools/nix/unit_graph.py takes only registry and path sources and stops on it: \"step 'nix': unsupported source git+https://github.com/johnservil/BLAKE3?rev=c6bd679...\", so tools/nix/units/*.json can't be regenerated (01012) and nix-live's staleness gate can't pass.",
+  "state": "applied",
+  "created": "2026-10-31T14:20:57Z",
+  "updated": "2026-10-31T14:44:07Z",
+  "taken_by": "dedup",
+  "why": "01012: daemon.json still names salsa 256 times and Wasmtime/proc-macro-srv 522 times after the port and dedup-engines' removals. A git source also isn't something units.nix can fetch reproducibly without a hash.",
+  "source": "coordinator",
+  "history": [
+    {
+      "at": "2026-10-31T14:20:57Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Found running tools/nix/unit_graph.py for 01012 after round 7c."
+    },
+    {
+      "at": "2026-10-31T14:44:07Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:44:07Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "vendor/blake3-servil = commit c6bd679a09 copied unchanged from cargo checkout (include list + tests/clocks/test_vectors), SOURCE.md; root dep now path, vendor/blake3-servil in [workspace] exclude beside sonic-rs; Cargo.lock entry lost its git source line. No git source left in root Cargo.toml. Rerun unit_graph.py."
+    }
+  ]
+}

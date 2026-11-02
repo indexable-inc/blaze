@@ -7,9 +7,9 @@
 
 use std::fmt;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Crate, Db};
+use blaze_hash::HashSet;
 use intern::{Symbol, sym};
-use rustc_hash::FxHashSet;
 
 impl fmt::Debug for UnstableFeatures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,14 +41,16 @@ impl UnstableFeatures {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl UnstableFeatures {
     /// Query unstable features for a crate.
     ///
     /// This is also available as `DefMap::features()`. Use that if you have a DefMap available.
-    /// Otherwise, use this, to not draw a dependency to the def map.
-    #[salsa::tracked(returns(ref))]
-    pub fn query(db: &dyn SourceDatabase, krate: Crate) -> UnstableFeatures {
+    /// Otherwise, use this, to not draw a dependency to the def map. While the crate's own def
+    /// map is being built (a proc macro it calls), use [`UnstableFeatures::of_root`].
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
+        // clone: once per def-map change of the crate; the copy lets its readers backdate
         crate::crate_def_map(db, krate).features().clone()
     }
 }
@@ -57,7 +59,7 @@ macro_rules! define_unstable_features {
     ( $( $feature:ident, )* ) => {
         #[derive(Clone, Default)]
         pub struct UnstableFeatures {
-            all: FxHashSet<Symbol>,
+            all: HashSet<Symbol>,
 
             $( pub $feature: bool, )*
         }
@@ -89,6 +91,14 @@ define_unstable_features! {
     ref_pat_eat_one_layer_2024,
     ref_pat_eat_one_layer_2024_structural,
     deref_patterns,
+    never_patterns,
     mut_ref,
     type_changing_struct_update,
+    staged_api,
+    unsized_fn_params,
+    coroutine_clone,
+    gca_const_items,
+    generic_const_exprs,
+    sized_hierarchy,
+    forced_keywords,
 }

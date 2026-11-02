@@ -2,7 +2,7 @@
 //! items where rustdoc puts them, each signature as code pieces whose names link, the docs
 //! with their intra-doc links resolved, and the impls of every type and trait.
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 /// Every crate documented in one run.
 #[derive(Debug, Default)]
@@ -318,6 +318,22 @@ pub enum Piece {
     Comment(String),
 }
 
+impl Piece {
+    /// The piece's text, as [`Code::plain`] reads it.
+    fn plain(&self) -> &str {
+        match self {
+            Piece::Text(it)
+            | Piece::Keyword(it)
+            | Piece::Name(it, _)
+            | Piece::Plain(it)
+            | Piece::Lifetime(it)
+            | Piece::Attribute(it)
+            | Piece::Comment(it) => it,
+            Piece::Link { text, .. } => text,
+        }
+    }
+}
+
 impl Code {
     pub fn text(&mut self, text: impl AsRef<str>) -> &mut Self {
         let text = text.as_ref();
@@ -362,18 +378,37 @@ impl Code {
     pub fn plain(&self) -> String {
         let mut out = String::new();
         for piece in &self.0 {
-            match piece {
-                Piece::Text(it)
-                | Piece::Keyword(it)
-                | Piece::Name(it, _)
-                | Piece::Plain(it)
-                | Piece::Lifetime(it)
-                | Piece::Attribute(it)
-                | Piece::Comment(it) => out.push_str(it),
-                Piece::Link { text, .. } => out.push_str(text),
-            }
+            out.push_str(piece.plain());
         }
         out
+    }
+
+    /// `self.plain().cmp(&other.plain())`, with nothing allocated.
+    pub fn cmp_plain(&self, other: &Code) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let (mut a, mut b) = (self.0.iter(), other.0.iter());
+        let (mut x, mut y): (&[u8], &[u8]) = (&[], &[]);
+        loop {
+            while x.is_empty() {
+                let Some(it) = a.next() else { break };
+                x = it.plain().as_bytes();
+            }
+            while y.is_empty() {
+                let Some(it) = b.next() else { break };
+                y = it.plain().as_bytes();
+            }
+            match (x.is_empty(), y.is_empty()) {
+                (true, true) => return Ordering::Equal,
+                (true, false) => return Ordering::Less,
+                (false, true) => return Ordering::Greater,
+                (false, false) => {}
+            }
+            let n = x.len().min(y.len());
+            match x[..n].cmp(&y[..n]) {
+                Ordering::Equal => (x, y) = (&x[n..], &y[n..]),
+                unequal => return unequal,
+            }
+        }
     }
 
     /// Every target the code links to, as tests check them.
@@ -391,9 +426,9 @@ pub struct Doc {
     pub markdown: String,
     /// Keyed by the link's destination as the docs write it (`Foo::bar`, `crate::Baz`), or its
     /// text for a shortcut link (`[Foo]`).
-    pub links: FxHashMap<String, Target>,
+    pub links: HashMap<String, Target>,
     /// What a link whose text is the link itself shows instead: `[struct@Foo]` shows `Foo`.
-    pub texts: FxHashMap<String, String>,
+    pub texts: HashMap<String, String>,
 }
 
 impl Doc {
@@ -566,4 +601,35 @@ pub struct ImplDoc {
     pub negative: bool,
     /// An auto trait impl rustdoc works out rather than one written.
     pub synthetic: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Code, Piece};
+
+    #[test]
+    fn cmp_plain_is_the_order_of_plain() {
+        let code = |pieces: &[&str]| {
+            Code(pieces.iter().enumerate().map(|(at, it)| {
+                if at % 2 == 0 { Piece::Text((*it).to_owned()) } else { Piece::Keyword((*it).to_owned()) }
+            }).collect())
+        };
+        let all = [
+            code(&[]),
+            code(&[""]),
+            code(&["impl"]),
+            code(&["im", "pl"]),
+            code(&["impl", " Clone"]),
+            code(&["impl ", "Clone", " for"]),
+            code(&["impl", " Copy"]),
+            code(&["", "impl", "", " C"]),
+            code(&["impl Clon"]),
+            code(&["z"]),
+        ];
+        for a in &all {
+            for b in &all {
+                assert_eq!(a.cmp_plain(b), a.plain().cmp(&b.plain()), "{a:?} against {b:?}");
+            }
+        }
+    }
 }

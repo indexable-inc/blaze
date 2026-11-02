@@ -1,0 +1,24 @@
+{
+  "id": "01389",
+  "from_lane": "fix-diag-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer.rs",
+    "crates/hir-ty/src/tests/struct_paths.rs"
+  ],
+  "what": "## A struct literal whose path names a function (`fn g() {}  let _ = g {};`) reports \"type annotations needed: cannot satisfy `_ -> _`\" (E0284), not E0574 naming `g`\n\nrustc: E0574 \"expected struct, variant or union type, found function `g`\". blaze's E0284 never names `g` or says what is wrong. hir-ty has the diagnostic (`NotAStructPath { found: Def(StructPathDef::Function) }`, infer.rs:835/905), but only for patterns (tests/struct_paths.rs:50/168 `function_in_a_tuple_pattern`). The struct-literal path is resolved in the type namespace, where `g` is nothing. Like the value-namespace branch at infer.rs:3527-3537, which falls back to the type namespace, the type-namespace branch for a struct literal should look `g` up in the value namespace when the type namespace has nothing, and report `NotAStructPath(Def(Function | Const | Static | ..))` with an error type. The literal is then an error, with no ambiguity left. Add `fn function_literal() { let _ = f {}; }` to hir-ty tests/struct_paths.rs. Test: blaze-diagnostics tests::items::refused::a_struct_path_to_something_else.",
+  "state": "open",
+  "created": "2026-11-01T00:20:18Z",
+  "updated": "2026-11-01T00:20:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:20:18Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

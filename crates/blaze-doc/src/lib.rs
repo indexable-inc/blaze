@@ -22,15 +22,15 @@ mod source;
 mod tests;
 
 use hir::Crate;
-use ide_db::RootDatabase;
-use rustc_hash::FxHashSet;
+use base_db::Db;
+use blaze_hash::HashSet;
 
 pub use crate::places::Documented;
 
 /// Each crate's dependencies only its tests use (a workspace member's dev-dependencies), which
 /// rust-analyzer's crate graph gives the crate itself and `cargo doc` neither documents nor
 /// links: `(crate, dependency)`.
-pub type TestOnly = FxHashSet<(Crate, Crate)>;
+pub type TestOnly = HashSet<(Crate, Crate)>;
 
 /// A crate the user asked to document.
 #[derive(Debug, Clone, Copy)]
@@ -45,14 +45,14 @@ pub struct Asked {
 /// crates of one name keep the one asked for, else as `one_per_name` says, and a crate only
 /// one left out depends on is left out too.
 pub fn crates_to_document(
-    db: &RootDatabase,
+    db: &Db,
     asked: &[Asked],
     no_deps: bool,
     test_only: &TestOnly,
 ) -> Vec<Documented> {
     let mut out: Vec<Documented> = vec![];
-    let mut names = FxHashSet::default();
-    let mut seen = FxHashSet::default();
+    let mut names = HashSet::default();
+    let mut seen = HashSet::default();
     for it in asked {
         let name = crate_name(db, it.krate);
         if names.insert(name.clone()) {
@@ -66,7 +66,7 @@ pub fn crates_to_document(
     // Each crate reached, and whether a path to it leads through no proc macro: cargo builds
     // a proc macro and everything it depends on for the host, the rest for the target.
     let mut reached: Vec<(Crate, bool)> = vec![];
-    let mut walked = FxHashSet::default();
+    let mut walked = HashSet::default();
     let mut stack: Vec<(Crate, bool)> = asked.iter().map(|it| (it.krate, false)).collect();
     while let Some((krate, host)) = stack.pop() {
         for dep in krate.dependencies(db) {
@@ -97,7 +97,7 @@ pub fn crates_to_document(
         .filter(|it| !names.contains(&it.name))
         .collect();
     let kept = one_per_name(reached);
-    let keep: FxHashSet<Crate> = kept.iter().map(|it| it.krate).collect();
+    let keep: HashSet<Crate> = kept.iter().map(|it| it.krate).collect();
     let roots: Vec<Crate> = asked.iter().map(|it| it.krate).collect();
     let linked = still_reached(&roots, &keep, |krate| {
         krate
@@ -116,8 +116,8 @@ pub fn crates_to_document(
     out
 }
 
-fn is_proc_macro(db: &RootDatabase, krate: Crate) -> bool {
-    ide_db::base_db::Crate::from(krate).data(db).target_kind.is_proc_macro()
+fn is_proc_macro(db: &Db, krate: Crate) -> bool {
+    base_db::Crate::from(krate).data(db).target_kind.is_proc_macro()
 }
 
 /// A dependency `cargo doc` reached.
@@ -157,10 +157,10 @@ fn one_per_name<K>(reached: Vec<Reached<K>>) -> Vec<Reached<K>> {
 /// (`remove_duplicate_doc` in `src/cargo/ops/cargo_compile/mod.rs`, cargo 749d85d9fc).
 fn still_reached<K: Copy + Eq + std::hash::Hash>(
     roots: &[K],
-    kept: &FxHashSet<K>,
+    kept: &HashSet<K>,
     deps: impl Fn(K) -> Vec<K>,
-) -> FxHashSet<K> {
-    let mut out = FxHashSet::default();
+) -> HashSet<K> {
+    let mut out = HashSet::default();
     let mut stack = roots.to_vec();
     while let Some(it) = stack.pop() {
         for dep in deps(it) {
@@ -182,30 +182,29 @@ fn version_key(version: &str) -> (Vec<u64>, bool, String) {
 }
 
 /// The name code uses for a crate: its library name, `-` as `_`.
-pub fn crate_name(db: &RootDatabase, krate: Crate) -> String {
+pub fn crate_name(db: &Db, krate: Crate) -> String {
     krate
         .display_name(db)
         .map(|it| it.crate_name().to_string())
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn is_sysroot(db: &RootDatabase, krate: Crate) -> bool {
-    matches!(krate.origin(db), ide_db::base_db::CrateOrigin::Lang(_))
+fn is_sysroot(db: &Db, krate: Crate) -> bool {
+    matches!(krate.origin(db), base_db::CrateOrigin::Lang(_))
 }
 
 /// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents.
-pub fn set_cfg_doc(db: &mut RootDatabase, crates: &[Documented]) {
-    use ide_db::base_db::salsa::Setter as _;
+pub fn set_cfg_doc(db: &mut Db, crates: &[Documented]) {
     for documented in crates {
-        let krate: ide_db::base_db::Crate = documented.krate.into();
+        let krate: base_db::Crate = documented.krate.into();
         let mut cfg = krate.cfg_options(db).clone();
         cfg.insert_atom(intern::Symbol::intern("doc"));
-        krate.set_cfg_options(db).to(cfg);
+        krate.set_cfg_options(db, cfg);
     }
 }
 
 /// The documentation of `crates`, ready to write.
-pub fn model(db: &RootDatabase, crates: Vec<Documented>, test_only: TestOnly) -> model::Model {
+pub fn model(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> model::Model {
     let places = places::place(db, crates, test_only);
     collect::build(db, &places)
 }

@@ -1,0 +1,26 @@
+[package]
+name = "blaze-dbsp"
+description = "blaze v2's delta engine: Z-sets, sequence diffs, read indexes, arrangements, DRed closures, worklists and slice hashes for the views the write side maintains (docs/v2/plan/design/dbsp.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

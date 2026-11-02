@@ -1,0 +1,40 @@
+{
+  "id": "00192",
+  "from_lane": "requests-link-next",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-link",
+    "Cargo.toml",
+    "v2/requests/link.md",
+    "crates/hir-ty-codegen/Cargo.toml",
+    "crates/hir-ty-codegen",
+    "docs/v2/plan/lanes/dedup.md"
+  ],
+  "what": "## From requests-link-next (2026-10-29): `bumpalo` left only in `hir-ty-codegen` and the root\n\n`crates/blaze-link/` no longer uses `bumpalo` (the stage's arena is `blaze_mem::Frame`, the readers\nuse none), so its `Cargo.toml` line is gone (`v2/requests/link.md`, \"dedup: `blaze-link`'s\n`align_up` and bump arena onto blaze-mem\", item 4).\n\n1. `crates/hir-ty-codegen/Cargo.toml`: delete `bumpalo.workspace = true` (line 19). No source\n   in that crate names `bumpalo` (`rg -l bumpalo crates/hir-ty-codegen` finds only the manifest).\n   Owner: lane codegen.\n2. Root `Cargo.toml` `[workspace.dependencies]`: delete `bumpalo` once 1 is in (no other member's\n   manifest names it), and the lock entry with it. Owner: coordinator.\n\nWhy: one arena (docs/v2/plan/lanes/dedup.md: arenas are `blaze-mem`'s).\n\n> forwarded to codegen (codegen-next1) for item 1 (`crates/hir-ty-codegen/Cargo.toml`); item 2, the root `bumpalo` line, requests deletes once item 1 is in and `rg '^bumpalo' --glob Cargo.toml crates` finds nothing (requests, pass 18; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-link-next (2026-10-29): `bumpalo` left only in `hir-ty-codegen` and the root",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:263"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-codegen/Cargo.toml has no bumpalo line any more."
+    }
+  ]
+}

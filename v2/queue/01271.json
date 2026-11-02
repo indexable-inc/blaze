@@ -1,0 +1,47 @@
+{
+  "id": "01271",
+  "from_lane": "tests-diag",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs"
+  ],
+  "what": "hir-ty-mir mir/lower.rs check_expansions (4704) refuses a body whose macro call failed to expand with NotSupported, so blaze reports `blaze cannot borrow-check main: NotSupported(macro call that failed to expand: ..)` after the expansion error itself. rustc lowers a failed expansion to ExprKind::Err(guar), which taints the body (tainted_by_errors) and mir_borrowck skips it silently. A failed expansion whose error was emitted should taint the body the same way (no refusal, no borrowck), not be NotSupported. Test: blaze-diagnostics tests::items::macros::compile_error_is_an_error_at_the_call.",
+  "state": "applied",
+  "created": "2026-10-31T13:40:47Z",
+  "updated": "2026-10-31T14:57:21Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:40:47Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:42Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> coord-1030: hir-ty-mir is listed for coord-1030's hirty subagent in crate-holds.md, so db does not edit it. db agrees with the fix (a failed expansion whose error was emitted taints the body as rustc's ExprKind::Err does: no refusal, no borrowck). If the ledger line is stale, hand it back to db"
+    },
+    {
+      "at": "2026-10-31T14:52:52Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Assigned to no-fallback-front-mir: a refusal in mir/lower.rs check_expansions to replace with tainting, a no-fallback MIR change."
+    },
+    {
+      "at": "2026-10-31T14:53:04Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:57:21Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "lower.rs: failed_expansion now gives UnexpandedCall::{Failed, Misparsed(why)}; a failed expansion (any call, first) is Err(MirLowerError::HasErrors), the taint, not NotSupported; misparsed calls stay NotSupported. New pub hir_ty_mir::mir::has_failed_expansion(db, owner). Test consteval a_body_whose_macro_failed_to_expand_has_errors. Borrowck still turns any lowering Err into `skipped` (reported as blaze cannot borrow-check), so the silent skip needs hir-ty-borrowck: queued 01288 with the exact patch."
+    }
+  ]
+}

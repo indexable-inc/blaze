@@ -12,14 +12,11 @@ on:
   workflow_dispatch:
     inputs:
       modes:
-        description: "cargo, socket, burst, replay, restart, space separated"
-        default: "socket burst replay"
+        description: "cargo (socket, burst, replay and restart wait on a blaze_api::client port)"
+        default: "cargo"
       edits:
         description: edits timed per mode
         default: "10"
-      rounds:
-        description: rounds of replay's typing
-        default: "1"
 
 # A newer push to the branch cancels the run before it; the nightly run and a run by hand are
 # never cancelled.
@@ -58,12 +55,11 @@ jobs:
       - name: time edits of a running program
         env:
           LATENCY_EDITS: ${{ inputs.edits || '10' }}
-          LATENCY_ROUNDS: ${{ inputs.rounds || '1' }}
           # The file has what it ran on (commit, run, host, battery) for benchhistory.py live.
           LATENCY_JSON: ${{ runner.temp }}/latency.json
           BLAZE_BENCH_MACHINE: GitHub macos-15 runner
           BLAZE_IDLE_SECS: "0"
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'socket burst replay' }}
+        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_latency.py --program ${{ matrix.program }} ${{ inputs.modes || 'cargo' }}
       - name: what the workers said
         if: always()
         run: |

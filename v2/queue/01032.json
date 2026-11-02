@@ -1,0 +1,37 @@
+{
+  "id": "01032",
+  "from_lane": "fastcompile-premap-start",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-inproc/src/handshake.rs",
+    "crates/blaze-inproc/src/host.rs",
+    "crates/blaze-inproc/src/runtime.rs"
+  ],
+  "what": "fastcompile-premap-start 2: blaze-inproc: bind the dependency image's open cells in the start hook (`crates/blaze-inproc/src/{handshake,host,runtime}.rs`).\n\n`blaze_premap::start::plan(&view, names) -> Start { writes: Vec<Write { place, value, address }>, lookups: Vec<Lookup { place, name, addend, weak }> }` is all of premap's start that is left: every place is a linked address in one of the image's `Prot::Data` segments, which reach the run as `Access::Copy` fixed maps. The cells must be written after the fixed maps are mapped, before the hook says STARTED, and before any image code can run. The system loader can't write them: it runs before the hook maps the image.\n\n1. `Launch` (and the GRANT) carries the writes and lookups.\n2. The hook stores each write at `place + slide`. A write's `value` gets the slide added when `address` is true; a thread-pointer offset doesn't.\n3. The hook resolves each lookup in the process's global scope, which the system loader filled from the executable's libraries: `dlsym(RTLD_DEFAULT, name)` on Linux and macOS (the C name, so a leading `_` on Mach-O), or `GetProcAddress` over the process's modules on Windows. It stores the address plus `addend`. A weak lookup that finds nothing stores 0; a strong one fails the start (exit 127, naming the name), never a 0.\n4. The hook refuses a slide other than 0 while a fixed map is a dependency image, naming it: the image's other words are linked at its base until blaze-link lists them for rebasing (fastcompile-premap-start 1 item 3, to link). The GRANT can flag such maps.\n5. Each cell write goes into the run's private copy only, never into the memory object.\n\nWhy: these are the image's GOT cells and data pointers to names it does not define (a workspace `#[no_mangle]`, `__rg_alloc`, libc). Without them, image code calls through zero.",
+  "state": "applied",
+  "created": "2026-10-30T14:23:37Z",
+  "updated": "2026-10-30T14:37:47Z",
+  "taken_by": "fastcompile-queue-inproc",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:23:37Z",
+      "by": "fastcompile-premap-start",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:25:43Z",
+      "by": "fastcompile-queue-inproc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:37:47Z",
+      "by": "fastcompile-queue-inproc",
+      "action": "done",
+      "note": "crates/blaze-inproc: host::Launch gains writes: Vec<ImageWrite> and lookups: Vec<ImageLookup> (new pub types in lib.rs, mirroring blaze_premap::start::Write/Lookup; Mach-O names keep their leading _), and host::Program::command_with(command, forks, maps, writes, lookups) passes premap maps + Start through the real path. The GRANT (handshake.rs, VERSION 4) flags every fixed-map overlay as a dependency image (Overlay::image) and carries the writes and lookups (names pooled, counts checked against bytes left before allocating, MOST_BINDS/MOST_NAME caps); decode and the host both refuse any place not 8 bytes inside a flagged Access::Copy overlay (Grant::check_binds). The hook (runtime.rs open, new src/bind.rs) refuses a nonzero slide while a flagged map is granted (before mapping anything), then after sys::overlay and before STARTED stores each write at place+slide (+slide on value when address), resolves lookups via sys::Scope (dlsym(RTLD_DEFAULT) in sys/unix.rs with Mach-O _ stripped; GetProcAddress over K32EnumProcessModules in sys/windows.rs), stores addr+addend, 0 for a weak miss, and fails exit 127 naming every strong miss (never stores it). Stores are sys::store_private (unaligned) into the private copy. Tests in src/tests.rs. Not yet called: whoever holds premap::map::Memory + start::plan must call Program::command_with."
+    }
+  ]
+}

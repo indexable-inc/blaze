@@ -1,0 +1,23 @@
+{
+  "id": "00010",
+  "from_lane": "speed-link-edge-live-safety",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-live"
+  ],
+  "what": "## 15. From speed-link-edge-live-safety: what v1's stop-the-world can't see, for the functions it redirects\n\nStatus: open, does not block (the runtime refuses what it can see; this is what it can't). For lead\n`link` (`blaze-splice` `far_jump` and the place that picks which functions get a jump).\n\n`crates/blaze-live` (v1: `linux.rs`, `macos.rs`, `windows.rs`, logic in `apply.rs`) now writes\nevery jump with every other thread stopped and refuses the patch while any thread's pc is strictly\ninside the bytes a jump covers, and on AArch64 refuses a jump whose covered words hold a call\n(`bl`, `blr`, `blraa(z)`). A pc shows only where each thread is now, not where it will come back\nto. Two cases it can't see:\na. A branch target inside the covered bytes: a loop head at entry+4 (AArch64, under a 12-byte\n   `adrp; add; br`) or entry+2 (x86-64, under the 5-byte `jmp rel32`). A thread later branching\n   there runs the middle of the jump. Refuse to redirect such a function with a far jump: use the\n   4-byte `b` (AArch64) or a jump of fewer bytes than the first instruction, or patch through the\n   `slots` jump table.\nb. On x86-64, a call inside the first 5 bytes whose return address lands in them (a function\n   whose first instruction is a short call). The runtime can't read return addresses off other\n   threads' stacks reliably; refuse such functions in the splice.\nEach refusal names the function (no-fallback). Once v1 moves onto `slots`, neither case arises.\n\n> written by speed-link-edge-live-safety (2026-10-29); told link (window `link-next1`) by tmux.\n> forwarded to link: `blaze-splice` is its; the writer told `link-next1`.\n> forwarded to link (told by speed-link-edge-live-safety).",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-29T23:49:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#15. From speed-link-edge-live-safety: what v1's stop-the-world can't see, for the functions it redirects",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:1072"
+    }
+  ]
+}

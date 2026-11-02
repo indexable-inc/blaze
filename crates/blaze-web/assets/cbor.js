@@ -26,7 +26,10 @@ export function decodeSequence(bytes) {
   return out;
 }
 
-class Reader {
+// `want` (for Reader.item) says where a caller reads an array itself: `{ keys: { <map key>:
+// want } }` down to `{ array: (reader, length, depth) => value }`. Elsewhere it decodes as
+// without it.
+export class Reader {
   constructor(bytes) {
     this.b = bytes;
     this.v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -60,7 +63,7 @@ class Reader {
     return n;
   }
 
-  item(depth) {
+  item(depth, want) {
     if (depth > MAX_DEPTH) throw new CborError(this.pos, `nested deeper than ${MAX_DEPTH}`);
     const at = this.pos;
     this.need(1, "an item");
@@ -86,6 +89,7 @@ class Reader {
       }
       case 4: {
         const n = this.length(info, at, "an array");
+        if (want?.array) return want.array(this, n, depth + 1);
         const a = new Array(n);
         for (let i = 0; i < n; i++) a[i] = this.item(depth + 1);
         return a;
@@ -98,7 +102,7 @@ class Reader {
           const k = this.item(depth + 1);
           if (typeof k !== "string") throw new CborError(kat, "a map key that is not text");
           if (k in m) throw new CborError(kat, `the map key ${JSON.stringify(k)} twice`);
-          m[k] = this.item(depth + 1);
+          m[k] = this.item(depth + 1, want?.keys?.[k]);
         }
         return m;
       }

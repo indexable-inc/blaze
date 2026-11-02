@@ -6,14 +6,19 @@
 //! on every file of the workspace crate that happened to use it, and give it one cache entry
 //! per crate that does.
 
-use base_db::{Crate, FileId};
+#![forbid(unsafe_code)]
+
+use std::sync::LazyLock;
+
+use base_db::{Crate, Db, FileId};
+use blaze_hash::HashSet;
+use blaze_query::db::FromId as _;
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
-    inherent::{BoundExistentialPredicates as _, IntoKind, ParamEnv as _, SliceLike as _},
+    inherent::{BoundExistentialPredicates as _, IntoKind, SliceLike as _},
 };
-use salsa::plumbing::FromId as _;
+use smallvec::SmallVec;
 
 use hir_ty::{
     ImplTraitId, InferBodyId,
@@ -27,12 +32,12 @@ use super::{Instance, InstanceDef};
 
 /// The crates the name of an instance mentions.
 struct Mentions<'db> {
-    db: &'db dyn HirDatabase,
-    crates: FxHashSet<Crate>,
+    db: &'db Db,
+    crates: HashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
-    bodies: Vec<DefWithBodyId>,
+    bodies: SmallVec<[DefWithBodyId; 4]>,
     /// Of those, the ones it mentions a coroutine of, whose layout is of the whole body.
-    coroutines: Vec<DefWithBodyId>,
+    coroutines: SmallVec<[DefWithBodyId; 4]>,
     /// Whether an `impl Trait` is looked through to the type its body gives it, and a
     /// projection left as it is written, rather than either told apart as `opaque`.
     reveal: bool,
@@ -40,30 +45,30 @@ struct Mentions<'db> {
     revealing: u32,
     /// The bodies that give the `impl Trait`s it mentions their types, and those of the
     /// closures in those types: its name says none of what they wrote.
-    hidden: Vec<DefWithBodyId>,
+    hidden: SmallVec<[DefWithBodyId; 4]>,
     /// It mentions something whose crate we can't tell.
     opaque: bool,
     /// The types looked into so far. The type of a future holds those of the futures it
     /// awaits, each of which holds its own, so the same few are reached along very many ways.
-    seen: FxHashSet<Ty<'db>>,
+    seen: HashSet<Ty<'db>>,
 }
 
 impl<'db> Mentions<'db> {
-    fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db> {
+    fn of(db: &'db Db, instance: &Instance) -> Mentions<'db> {
         Mentions::looking(db, instance, false)
     }
 
-    fn looking(db: &'db dyn HirDatabase, instance: &Instance, reveal: bool) -> Mentions<'db> {
+    fn looking(db: &'db Db, instance: &Instance, reveal: bool) -> Mentions<'db> {
         let mut mentions = Mentions {
             db,
-            crates: FxHashSet::default(),
-            bodies: Vec::new(),
-            coroutines: Vec::new(),
+            crates: HashSet::default(),
+            bodies: SmallVec::new(),
+            coroutines: SmallVec::new(),
             reveal,
             revealing: 0,
-            hidden: Vec::new(),
+            hidden: SmallVec::new(),
             opaque: false,
-            seen: FxHashSet::default(),
+            seen: HashSet::default(),
         };
         match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
@@ -103,19 +108,9 @@ impl<'db> Mentions<'db> {
     }
 }
 
-/// The crates the name of an instance mentions, or `None` when one of them can't be told. Only
-/// a crate that depends on all of them can have compiled a copy of it.
-pub(super) fn mentioned_crates(
-    db: &dyn HirDatabase,
-    instance: &Instance,
-) -> Option<FxHashSet<Crate>> {
-    let mentions = Mentions::of(db, instance);
-    (!mentions.opaque).then_some(mentions.crates)
-}
-
 /// The function the code of an instance is written in: its own, or the one a closure or an
 /// `async` block is in. The symbol of every copy of the instance has its name.
-pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<FunctionId> {
+pub(super) fn written_in(db: &Db, instance: &Instance) -> Option<FunctionId> {
     let owner = match instance.def {
         InstanceDef::Fn(func) => return Some(func),
         InstanceDef::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
@@ -134,47 +129,8 @@ pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<Fu
     }
 }
 
-/// The files with the bodies an instance has the code of or mentions a type of: those of its
-/// function and of the closures, futures and functions it is instantiated with. `None` when
-/// that can't be told.
-pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[FileId]>> {
-    let mentions = Mentions::of(db, instance);
-    if mentions.opaque {
-        return None;
-    }
-    let mut files: Vec<FileId> = mentions.bodies.into_iter().map(|it| body_file(db, it)).collect();
-    files.sort_unstable();
-    files.dedup();
-    Some(files.into())
-}
-
-/// The bodies the code of an instance depends on beyond its name: the one it is written in,
-/// when it has one; those it mentions a coroutine of, whose layout is of the whole body; and
-/// those that give the `impl Trait`s it mentions their types, with the closures and coroutines
-/// in those. A closure or function its name mentions is in it whole, with what the closure
-/// captures. `None` when that can't be told.
-pub(super) fn bodies_of(
-    db: &dyn HirDatabase,
-    instance: &Instance,
-) -> Option<(Option<DefWithBodyId>, Vec<DefWithBodyId>)> {
-    let mut mentions = Mentions::looking(db, instance, true);
-    if mentions.opaque {
-        return None;
-    }
-    mentions.coroutines.append(&mut mentions.hidden);
-    let written = match instance.def {
-        InstanceDef::Fn(_)
-        | InstanceDef::VtableShim(_)
-        | InstanceDef::Closure(_)
-        | InstanceDef::Coroutine(_)
-        | InstanceDef::CoroutineByMove(_) => mentions.bodies.first().copied(),
-        _ => None,
-    };
-    Some((written, mentions.coroutines))
-}
-
 /// The file a body is written in, which for one a macro makes is where the macro is called.
-pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
+pub fn body_file(db: &Db, body: DefWithBodyId) -> FileId {
     let file = match body {
         DefWithBodyId::FunctionId(it) => it.lookup(db).id.file_id,
         DefWithBodyId::ConstId(it) => it.lookup(db).id.file_id,
@@ -226,7 +182,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                     self.crates.insert(principal.skip_binder().def_id.0.krate(self.db));
                 }
             }
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. })
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. })
                 if self.reveal =>
             {
                 let ImplTraitId::ReturnTypeImplTrait(of, _) = def_id.0.loc(self.db) else {
@@ -247,7 +203,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
                 self.revealing -= 1;
             }
             // What no `impl` gave a type is the type its name spells.
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) if self.reveal => {}
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) if self.reveal => {}
             TyKind::Alias(..) | TyKind::Foreign(..) => self.opaque = true,
             _ => {}
         }
@@ -255,12 +211,24 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
     }
 }
 
-/// Picks the crate each instance is compiled as.
-#[derive(Default)]
-pub(super) struct Homes {
-    /// What each crate can see: itself and the crates whose impls it knows.
-    sees: FxHashMap<Crate, FxHashSet<Crate>>,
+/// `BLAZE_NO_HOME`: every instance is compiled in the environment of the function that asks
+/// for it. Read once, as [`Homes::home`] is asked for each instance a function calls.
+static NO_HOME: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_NO_HOME").is_some());
+
+/// What `krate` can see: itself and the crates whose impls it knows ([`loaded_crates`]),
+/// sorted to be probed by binary search. One memo for every task that asks.
+#[blaze_query::tracked(returns(deref))]
+fn sees(db: &Db, krate: Crate) -> Box<[Crate]> {
+    // alloc: the memo's result, one exact block
+    let mut sees: Box<[Crate]> = loaded_crates(db, krate).into();
+    sees.sort_unstable();
+    sees
 }
+
+/// Picks the crate each instance is compiled as. It holds nothing: what a crate sees is the
+/// database's memo ([`sees`]).
+#[derive(Default)]
+pub(super) struct Homes;
 
 impl Homes {
     /// The environment to compile `instance` in when a function compiled in `asked` asks for
@@ -268,28 +236,27 @@ impl Homes {
     /// asking for the instance agrees on. Without such a crate, the asking one's.
     pub(super) fn home(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if std::env::var_os("BLAZE_NO_HOME").is_some()
-            || !asked.param_env(db).caller_bounds().is_empty()
+        if *NO_HOME || !asked.param_env(db).clauses().is_empty()
         {
+            // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();
         }
         let mentions = Mentions::of(db, instance);
         if mentions.opaque {
+            // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();
         }
         let home = mentions.crates.iter().copied().find(|&krate| {
-            let sees = self
-                .sees
-                .entry(krate)
-                .or_insert_with(|| loaded_crates(db, krate).iter().copied().collect());
-            mentions.crates.iter().all(|it| sees.contains(it))
+            let sees = sees(db, krate);
+            mentions.crates.iter().all(|it| sees.binary_search(it).is_ok())
         });
         match home {
             Some(krate) => ParamEnvAndCrate { krate, ..asked.as_ref(db) }.store(),
+            // clone: a refcount of the interned clauses; callers own the environment they get
             None => asked.clone(),
         }
     }

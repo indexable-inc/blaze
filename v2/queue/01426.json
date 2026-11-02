@@ -1,0 +1,36 @@
+{
+  "id": "01426",
+  "from_lane": "observe-explore",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-web/src/lib.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "observe-explore: the explorer's `world` op (crates/blaze-explore, design docs/v2/plan/lanes/observe/explore.md 'world') answers Flecs's REST through `blaze_web::Graphs::rest(&self, \"GET\", path) -> Result<world::Answer{code,kind,body}, String>`, taking `Option<Arc<blaze_web::Graphs>>` in `blaze_explore::Config::world`. No v2 daemon code makes a Graphs or feeds it its builds, so today it answers the typed error `no_world` (naming `blaze_web::Graphs in the daemon`). What I need: a way for `blaze serve` to make one `Graphs` for its life and feed it each build's records (whatever blaze-web's world reads), shareable as `Arc<Graphs>` (it is Send+Sync already: Arc<Roots> plus a OnceLock'd mpsc::Sender). Then the coordinator's `blaze explore` wiring passes `Some(graphs)`; nothing in blaze-explore changes. The root needs `blaze-web = { path = \"crates/blaze-web\" }` in [workspace.dependencies] (asked in 01414).",
+  "state": "open",
+  "created": "2026-11-01T02:05:43Z",
+  "updated": "2026-11-01T03:42:47Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:05:43Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:47Z",
+      "by": "explore-wire",
+      "action": "reassign",
+      "note": "ci -> ci: explore-wire: not applied. blaze_web::Graphs builds its world from blaze_protocol Event::Functions/Began/Finished records, and no v2 daemon code emits Functions, so a Graphs fed today would stay empty. The daemon side is ready: serve/observe.rs passes world: None to blaze_explore::Config in Observe::explore; once codegen emits Functions records per build, make one Arc<Graphs> there and feed it from the jobs. Not needed for the explorer check (builds/spans/live)."
+    }
+  ]
+}

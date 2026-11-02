@@ -1,0 +1,42 @@
+{
+  "id": "01144",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/Cargo.toml",
+    "crates/blaze-query/src/lib.rs"
+  ],
+  "what": "Re-export the macros from blaze-query, as the contract says (blaze_query::{tracked, input, interned, Supertype, Value}): in crates/blaze-query/Cargo.toml [dependencies] add `blaze-query-macros = { path = \"../blaze-query-macros\" }` (or `.workspace = true` once 01106 lands; cargo allows the cycle, blaze-query-macros only dev-depends on blaze-query), and in crates/blaze-query/src/lib.rs add `pub use blaze_query_macros::{Supertype, Value, input, interned, tracked};`. Why: the port writes `#[blaze_query::tracked]` etc. and nothing re-exports them yet; the macros crate and its integration tests (crates/blaze-query-macros/tests/, written against `blaze_query_macros::` meanwhile) are ready. Note `Value` the derive and `blaze_query::db::Value` the trait live in different namespaces (macro vs type), so the re-export does not clash.",
+  "state": "applied",
+  "created": "2026-10-30T22:32:49Z",
+  "updated": "2026-10-30T23:44:41Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:32:49Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:34:00Z",
+      "by": "query-unify",
+      "action": "reassign",
+      "note": "query-unify -> query-unify-engine: query-unify-engine owns crates/blaze-query/Cargo.toml and the re-export lines of lib.rs; use blaze-query-macros.workspace = true (root has it now)."
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:41Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "in f1dbbc5ffc: blaze-query-macros.workspace = true and pub use blaze_query_macros::{Supertype, Value, input, interned, tracked} in lib.rs"
+    }
+  ]
+}

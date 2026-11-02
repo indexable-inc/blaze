@@ -24,16 +24,16 @@
 use crate::{
     Span,
     next_solver::{
-        ArgOutlivesPredicate, Canonical, CanonicalVarValues, Const, DbInterner, GenericArg,
+        ArgOutlivesClause, Canonical, CanonicalVarValues, Const, DbInterner, GenericArg,
         OpaqueTypeKey, PlaceholderConst, PlaceholderRegion, PlaceholderType, Region, Ty, TyKind,
         infer::InferCtxt,
     },
 };
 use instantiate::CanonicalExt;
 use macros::{TypeFoldable, TypeVisitable};
-use rustc_index::IndexVec;
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{CanonicalVarKind, InferTy, TypeFoldable, UniverseIndex, inherent::Ty as _};
+use smallvec::SmallVec;
 
 pub mod canonicalizer;
 pub mod instantiate;
@@ -68,15 +68,16 @@ impl<'db> InferCtxt<'db> {
         //
         // Instantiate the root-universe content into the current universe,
         // and create fresh universes for the higher universes.
-        let universes: IndexVec<UniverseIndex, _> = std::iter::once(self.universe())
+        let universes: SmallVec<[UniverseIndex; 4]> = std::iter::once(self.universe())
             .chain((1..=canonical.max_universe.as_u32()).map(|_| self.create_next_universe()))
+            // alloc: inline up to 4 universes; queries rarely carry any but the root.
             .collect();
 
         let var_values = CanonicalVarValues::instantiate(
             self.interner,
             canonical.var_kinds,
             |var_values, info| {
-                self.instantiate_canonical_var(span, info, var_values, |ui| universes[ui])
+                self.instantiate_canonical_var(span, info, var_values, |ui| universes[ui.as_usize()])
             },
         );
         let result = canonical.instantiate(self.interner, &var_values);
@@ -159,7 +160,7 @@ pub struct QueryResponse<'db, R> {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct QueryRegionConstraints<'db> {
     pub outlives: Vec<QueryOutlivesConstraint<'db>>,
-    pub assumptions: Vec<ArgOutlivesPredicate<'db>>,
+    pub assumptions: Vec<ArgOutlivesClause<'db>>,
 }
 
-pub type QueryOutlivesConstraint<'tcx> = ArgOutlivesPredicate<'tcx>;
+pub type QueryOutlivesConstraint<'tcx> = ArgOutlivesClause<'tcx>;

@@ -6,13 +6,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, bail};
-use cargo_util_schemas::core::{GitReference, SourceKind};
-use url::Url;
 
 use super::{Config, SourceConfigDef, Value};
-use crate::source::{CRATES_IO_REGISTRY, SourceId, into_url};
-
-const CRATES_IO_HTTP_INDEX: &str = "sparse+https://index.crates.io/";
+use crate::files::Files;
+use crate::source::{self, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
 
 /// A `[source.<name>]` table, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +30,7 @@ pub enum Replacement {
     Registry(String),
 }
 
-impl Config {
+impl<F: Files> Config<F> {
     /// crates.io as cargo reaches it: its sparse index unless
     /// `registries.crates-io.protocol = "git"`.
     pub fn crates_io_maybe_sparse_http(&self) -> anyhow::Result<SourceId> {
@@ -48,12 +45,9 @@ impl Config {
         };
         if is_sparse {
             self.check_registry_index_not_set()?;
-            Ok(SourceId::for_alt_registry(
-                &CRATES_IO_HTTP_INDEX.parse().unwrap(),
-                CRATES_IO_REGISTRY,
-            ))
+            Ok(SourceId::crates_io_sparse())
         } else {
-            SourceId::crates_io(self)
+            source::crates_io(self)
         }
     }
 
@@ -62,7 +56,7 @@ impl Config {
         let mut map = BTreeMap::new();
         map.insert(
             CRATES_IO_REGISTRY.to_owned(),
-            SourceConfig { id: SourceId::crates_io(self)?, replace_with: None },
+            SourceConfig { id: source::crates_io(self)?, replace_with: None },
         );
         let sources: Option<BTreeMap<String, SourceConfigDef>> = self.get("source")?;
         for (name, def) in sources.into_iter().flatten() {
@@ -84,15 +78,13 @@ impl Config {
         let mut srcs = Vec::new();
         if let Some(registry) = &def.registry {
             let url = url(registry, &format!("source.{name}.registry"))?;
-            srcs.push(SourceId::for_alt_registry(&url, name));
+            srcs.push(SourceId::for_source_replacement_registry(&url, name)?);
         }
         if let Some(local_registry) = &def.local_registry {
-            let path = local_registry.resolve_path(self.cwd());
-            srcs.push(local_source(SourceKind::LocalRegistry, &path)?);
+            srcs.push(SourceId::for_local_registry(&local_registry.resolve_path(self.cwd()))?);
         }
         if let Some(directory) = &def.directory {
-            let path = directory.resolve_path(self.cwd());
-            srcs.push(local_source(SourceKind::Directory, &path)?);
+            srcs.push(SourceId::for_directory(&directory.resolve_path(self.cwd()))?);
         }
         if let Some(git) = &def.git {
             let url = url(git, &format!("source.{name}.git"))?;
@@ -102,7 +94,7 @@ impl Config {
                 (None, None, Some(r)) => GitReference::Rev(r.val),
                 (None, None, None) => GitReference::DefaultBranch,
             };
-            srcs.push(SourceId::for_git(&url, reference));
+            srcs.push(SourceId::for_git(&url, reference)?);
         } else {
             for (key, v) in [("branch", &def.branch), ("tag", &def.tag), ("rev", &def.rev)] {
                 if let Some(val) = v {
@@ -139,7 +131,7 @@ impl Config {
         let mut replaced = false;
         loop {
             let Some(cfg) = cfgs.get(name) else {
-                if SourceId::alt_registry(self, name).is_ok() {
+                if source::alt_registry(self, name).is_ok() {
                     return Ok(Replacement::Registry(name.to_owned()));
                 }
                 bail!(
@@ -164,10 +156,4 @@ impl Config {
             }
         }
     }
-}
-
-fn local_source(kind: SourceKind, path: &std::path::Path) -> anyhow::Result<SourceId> {
-    let url = Url::from_file_path(path)
-        .map_err(|()| anyhow::anyhow!("invalid path url `{}`", path.display()))?;
-    Ok(SourceId { kind, url, registry_key: None })
 }

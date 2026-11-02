@@ -1,0 +1,24 @@
+{
+  "id": "00102",
+  "from_lane": "safety",
+  "owner": "coordinator",
+  "paths": [
+    "docs/support.md",
+    "v2/requests/codegen.md"
+  ],
+  "what": "## 4. Coordinator: `docs/support.md`, once codegen's sanitizers land\n\nThe row at line ~345 refuses `sanitizer`, `sanitizer-recover`,\n`sanitizer-memory-track-origins` (and the CFI flags) because \"blaze's code generator does not\ninstrument\". When codegen's request (v2/requests/codegen.md, \"From safety\", item S2) lands,\n`-Zsanitizer=address`, `thread`, `memory` and `-Zsanitizer-recover`,\n`-Zsanitizer-memory-track-origins` and `-Csanitizer-coverage-*` move to supported; what is\nstill refused (CFI, KCFI, dataflow, if codegen doesn't do them) stays, with that reason.\n\n> forwarded to coordinator: `docs/support.md` is the coordinator's; it waits on codegen's S2.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#4. Coordinator: `docs/support.md`, once codegen's sanitizers land",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:53"
+    }
+  ]
+}

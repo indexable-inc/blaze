@@ -1,0 +1,36 @@
+{
+  "id": "00424",
+  "from_lane": "core",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/core.md",
+    "docs/v2"
+  ],
+  "what": "## 7. docs/v2/plan/lanes/core.md \"Windows\": how a process's end is heard\n\n- What: say \"a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to\n  the port; the job's messages, which Windows does not promise to deliver, only say the job went\n  past its memory\" and \"a memory-limited job's peak is at most its limit: Windows refuses any\n  commit past it\", in place of the job's `EXIT_PROCESS` message.\n- Where: `docs/v2/plan/lanes/core.md` (coordinator's).\n- Why: a lost `EXIT_PROCESS` would leave a spawn in flight forever; the wait always fires.\n\n> forwarded to coordinator: `docs/v2/` is the coordinator's, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T04:09:13Z",
+  "updated": "2026-10-30T08:26:26Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/core.md#7. docs/v2/plan/lanes/core.md \"Windows\": how a process's end is heard",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core.md:211"
+    },
+    {
+      "at": "2026-10-30T08:26:25Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:26Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "Same change as 00081, applied there: docs/v2/plan/lanes/core.md \"Windows\" now names the RegisterWaitForSingleObject wait, the job messages as memory-only, and the peak at most the limit."
+    }
+  ]
+}

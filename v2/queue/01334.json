@@ -1,0 +1,29 @@
+{
+  "id": "01334",
+  "from_lane": "tests-misc-front1",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-item-hash/Cargo.toml"
+  ],
+  "what": "Add `hir-ty-matchck.workspace = true` to [dependencies] of crates/blaze-item-hash/Cargo.toml (the workspace entry exists, root Cargo.toml:95). Why: hir-ty-borrowck now skips a body whose match check failed (lib.rs:383 `hir_ty_matchck::match_check(db, def).failed`), so every borrow check step reads match_check, which blaze-item-hash must classify (round 10: blaze-item-hash classify tests refuse (Borrowck, match_check), request 01331). The verdict depends on other items (matched enums, constants), so it is not covered by the body identity; it becomes a fact valued by `match_check(db, body).failed`, recomputed on reuse like the step facts, in blaze-item-hash values.rs, which needs this dependency. No cycle: hir-ty-matchck depends on hir-ty, not on blaze-item-hash.",
+  "state": "refused",
+  "created": "2026-10-31T18:21:38Z",
+  "updated": "2026-10-31T18:23:05Z",
+  "taken_by": null,
+  "why": "withdrawn by its sender: item-hash-facts already added hir-ty-matchck to crates/blaze-item-hash/Cargo.toml (and Cargo.lock) with the MatchCheck fact, uncommitted, for round 11",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:21:38Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:23:05Z",
+      "by": "tests-misc-front1",
+      "action": "refuse",
+      "note": "withdrawn by its sender: item-hash-facts already added hir-ty-matchck to crates/blaze-item-hash/Cargo.toml (and Cargo.lock) with the MatchCheck fact, uncommitted, for round 11"
+    }
+  ]
+}

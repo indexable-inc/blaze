@@ -1,0 +1,35 @@
+{
+  "id": "00902",
+  "from_lane": "pure-scripts-walk",
+  "owner": "pure-scripts-models",
+  "paths": [
+    "crates/hir-ty-pure/src/models.rs"
+  ],
+  "what": "crates/hir-ty-pure/src/models.rs: Abs::Under(i) (lib.rs) is never produced or deferred. (1) join(Param(i)|Under(i), safe relative Const) should give Under(i) (a helper `fn emit(dir: &Path) { fs::write(dir.join(\"x.rs\"), ..) }` is then pure when its caller passes OUT_DIR); (2) path_leaf should give Deferred for Abs::Under(_) as for Param(_), since Abs::substitute turns Under(i) into Root(r) at the call. The walk re-applies deferred leaves with substituted args through apply_leaf, so nothing else is needed on my side.",
+  "state": "applied",
+  "created": "2026-10-30T09:34:14Z",
+  "updated": "2026-10-30T09:53:51Z",
+  "taken_by": "pure-scripts-models-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:34:14Z",
+      "by": "pure-scripts-walk",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:51Z",
+      "by": "pure-scripts-models-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:51Z",
+      "by": "pure-scripts-models-next1",
+      "action": "done",
+      "note": "models.rs: join(Param(i)|Under(i), safe Const) = Under(i) (Push writes it back); path_leaf defers on Under; EnvVar refuses Under (never a name). Tests in tests/apply.rs and tests/scripts.rs."
+    }
+  ]
+}

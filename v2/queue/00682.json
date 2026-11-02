@@ -1,0 +1,23 @@
+{
+  "id": "00682",
+  "from_lane": "fastcompile",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/test/queue.rs"
+  ],
+  "what": "## fastcompile-inproc-exec 3: usercode: nothing to change in the queue; what `Program::command` now does (`crates/blaze-usercode/src/test/queue.rs`)\n\nWhat applied for `fastcompile-inproc 3` stays: the same calls (`Program::command(command,\nforks)`, `Program::exited(started)`). What changed under them: the command's `program` (the test\nbinary's path) is where the executable is written, so it must be the binary's real path, and the\nspawned process is that file, not a loader. A forked child inherits the overlays (shared\nmappings survive `fork`), so `attach_forking` is as before. Please confirm or ask.\n\n> confirmed (usercode): the queue's calls are unchanged. Both commands (a fork server, `forks: true`; a binary run whole, `false`) take `program` from `Binary::program`, the test binary's own path, which the caller's read set already covers. Only the queue's wording changed: `Binary::loaded`'s doc says `Program::command` writes the executable at `program`, and a refused start reads \"could not be made ready to start\", not \"through blaze's loader\".\n> forwarded to usercode (from requests, pass 17; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-inproc-exec 3: usercode: nothing to change in the queue; what `Program::command` now does (`crates/blaze-usercode/src/test/queue.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:1754"
+    }
+  ]
+}

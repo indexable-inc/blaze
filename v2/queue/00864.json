@@ -1,0 +1,35 @@
+{
+  "id": "00864",
+  "from_lane": "speed-sol-core",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/plane.rs"
+  ],
+  "what": "speed-sol-core (lane core's speed of light): the daemon's plane loop pays three shared atomic round trips and a channel block per task.\n\nWhere: crates/blaze-cargo/src/serve/plane.rs, `Threads::new` (lines ~219-220), `post_work` (~278-301), `Threads::post` (~304-313), and the two `batch.work.clone()` at ~604 and ~703.\n\nWhat it costs: per task posted, the loop thread does `batch.work.clone()` (Arc increment), `self.done_tx.clone()` (crossbeam Sender count increment), and `post_work` does `again = work.clone()` (another Arc increment); the worker drops all three (three decrements). Each of those six RMWs is on one of two lines every task shares (the `W` Arc's count, the channel's sender count), so on a 64-core build each is a cross-core miss: about 6 x 100 ns = 0.6 us of the loop thread and the workers per task. Against the warm-build bound in docs/v2/plan/lanes/core/speed-of-light.md (1,000,000 cache hits of 2 us on 64 cores: 31 ms, under 0.2 us of overhead a task), that alone is 3x the budget. Also `done` and `io` are `unbounded()` channels: crossbeam's list flavor allocates a 31-slot block every 31 sends, on the sender (a worker) and frees on the receiver.\n\nThe edit (what lane core's `exec::Scheduler` does, crates/blaze-graph/src/exec.rs `Ctx`/`drive`):\n1. Keep what every task of a `Threads` shares in one context made once and leaked, or owned by `Threads` and outliving its jobs: the `W` (instead of an `Arc<W>` per batch) and the `done` sender. Pass `&'static Ctx<W>` (a Copy reference) into `run`/`then`; `again` and the give-way re-post use the same reference; nothing is cloned per task. If `W` must stay per batch, hand the batch's work as an index into a table the context holds, not an Arc.\n2. `done`: `bounded(pool.workers() + io + 1)`: at most that many tasks run at once (`self.running`), each sends once, so the channel never fills and never allocates after creation. `io`: bounded likewise (at most `running` IO jobs queue).\n3. A test with blaze-alloc-count: once warm, a batch of N cached tasks through `Threads` allocates nothing per task (as blaze-graph's `a_warm_done_through_step_into_allocates_nothing`).\nSemantics unchanged: same tasks, same order of sends per worker, same results.",
+  "state": "applied",
+  "created": "2026-10-30T09:08:07Z",
+  "updated": "2026-10-31T20:46:39Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:08:07Z",
+      "by": "speed-sol-core",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:46:39Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:46:39Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "crates/blaze-cargo/src/serve/plane.rs: (1) the done Sender is one per Threads, leaked and passed as &'static (no clone or drop per task, IO jobs carry none); a work task's Arc<W> comes back with its result (run returns (measured, work)) so a re-post after giving way counts no reference: of the six RMWs per task, the batch's one clone (Plane::post/run's batch.work.clone()) and its drop remain. Removing those needs the batch's work as an index into a table the Threads owns, with batch lifetime tied to its last task; not done, as Plane::add/settled own batch removal and a stale index would be a use-after-free class bug: say if you want it. (2) done is bounded(io + work + 1): Threads::new(io, work) (serve.rs passes options.threads, the PlaneConfig's work), which the plane never exceeds (a task that gave way or yields stays counted). io stays unbounded: the loop sends to it, and a full bounded io queue would block the loop, which drains done; IO tasks are not the per-hit path. (3) not written: blaze_graph::pool::submit boxes each Job (pool.rs:627 Job::new), so a 0-allocation-per-task test through Threads would fail on core's pool, not this loop; that is lane core's."
+    }
+  ]
+}

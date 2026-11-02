@@ -1,0 +1,35 @@
+{
+  "id": "00945",
+  "from_lane": "speed-vfs-names",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/v2/files.rs"
+  ],
+  "what": "crates/load-cargo/src/v2/files.rs Mounts::node (lines 103-107): it calls `self.tree.list(root, &under)` (blaze-query Tree::list, which copies every name of the directory into owned Strings) only to learn whether the path is a directory. Replace with `return Ok(match self.tree.read_dir(root, &under, &mut |_| {}) { true => Node::Dir(path), false => Node::None });` (Tree::read_dir returns whether it is a directory and lends the names without copying). Why: node runs for every path read that is not a file, and for every symlink a walk follows; each made one Vec and one String per name of the directory, now none. Same answer: read_dir is false exactly when list is None (blaze-query tree.rs Tree::list is built on read_dir).",
+  "state": "applied",
+  "created": "2026-10-30T10:45:53Z",
+  "updated": "2026-10-31T20:34:26Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:45:53Z",
+      "by": "speed-vfs-names",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:26Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:26Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "crates/blaze-lower/src/files.rs Mounts::node (load-cargo's v2 moved there) asks Tree::read_dir with a no-op reader instead of list. walk's list (needs the names) is unchanged. ra: 0 errors."
+    }
+  ]
+}

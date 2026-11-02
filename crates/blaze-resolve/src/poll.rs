@@ -4,43 +4,41 @@
 
 use std::future::Future;
 use std::hash::Hash;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 
-use rustc_hash::FxHashMap;
-
-type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+use blaze_hash::HashMap;
 
 /// Caches and runs an async method from code that is not async, on one thread.
 ///
-/// The `self_parameter`, the key and successful results must be cheap to clone. At most one
-/// computation per key is in flight; a success is kept, an error is handed out once.
-pub(crate) struct LocalPollAdapter<'a, S, K, R> {
-    pool: Vec<LocalBoxFuture<'a, (K, R)>>,
-    cache: FxHashMap<K, Poll<R>>,
+/// `start` begins the work for a key: an `async fn` taking the `self_parameter` and the key
+/// and handing the key back with its result, so every piece of work is the one future type
+/// `Q`. The `self_parameter`, the key and successful results must be cheap to clone. At most
+/// one computation per key is in flight; a success is kept, an error is handed out once.
+pub(crate) struct LocalPollAdapter<S, K, R, Q> {
+    pool: Vec<Pin<Box<Q>>>,
+    cache: HashMap<K, Poll<R>>,
     self_parameter: S,
+    start: fn(S, K) -> Q,
 }
 
-impl<'a, S, K, V, E> LocalPollAdapter<'a, S, K, Result<V, E>>
+impl<S, K, V, E, Q> LocalPollAdapter<S, K, Result<V, E>, Q>
 where
-    S: Clone + Deref + 'a,
-    K: Clone + Hash + Eq + 'a,
+    S: Clone,
+    K: Clone + Hash + Eq,
     V: Clone,
+    Q: Future<Output = (K, Result<V, E>)>,
 {
-    pub(crate) fn new(self_parameter: S) -> Self {
-        Self { pool: Vec::new(), cache: FxHashMap::default(), self_parameter }
+    pub(crate) fn new(self_parameter: S, start: fn(S, K) -> Q) -> Self {
+        Self { pool: Vec::new(), cache: HashMap::default(), self_parameter, start }
     }
 
     /// The result for `key`, starting the work if needed. On [`Poll::Pending`], call
     /// [`LocalPollAdapter::wait`] and ask again. Work that finishes without waiting is not
     /// queued.
-    pub(crate) fn poll<F>(&mut self, f: F, key: K) -> Poll<Result<V, E>>
-    where
-        F: AsyncFn(&S::Target, &K) -> Result<V, E> + 'a,
-    {
+    pub(crate) fn poll(&mut self, key: K) -> Poll<Result<V, E>> {
         match self.cache.get(&key) {
             Some(Poll::Ready(Ok(v))) => return Poll::Ready(Ok(v.clone())),
             Some(Poll::Ready(Err(_))) => return self.cache.remove(&key).unwrap(),
@@ -48,14 +46,7 @@ where
             None => {}
         }
 
-        let mut future: LocalBoxFuture<'a, (K, Result<V, E>)> = {
-            let key = key.clone();
-            let self_parameter = self.self_parameter.clone();
-            Box::pin(async move {
-                let v = f(self_parameter.deref(), &key).await;
-                (key, v)
-            })
-        };
+        let mut future = Box::pin((self.start)(self.self_parameter.clone(), key.clone()));
 
         if let Poll::Ready((k, v)) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             if let Ok(success) = &v {
@@ -115,7 +106,7 @@ impl<T> PollExt<T> for Poll<T> {
 }
 
 /// Runs `future` to its end on this thread.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
@@ -163,20 +154,20 @@ pub(crate) mod tests {
     /// A future woken from another thread, as one waiting on a download is. Each poll leaves
     /// its waker for the thread, as a future must.
     fn woken_from_elsewhere() -> impl Future<Output = ()> {
-        let state = Arc::new(std::sync::Mutex::new((false, None::<Waker>)));
+        let state = Arc::new(parking_lot::Mutex::new((false, None::<Waker>)));
         let mut started = false;
         std::future::poll_fn(move |cx| {
-            let mut guard = state.lock().unwrap();
+            let mut guard = state.lock();
             if guard.0 {
                 return Poll::Ready(());
             }
             guard.1 = Some(cx.waker().clone());
             if !started {
                 started = true;
-                let state = state.clone();
+                let state = Arc::clone(&state);
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    let mut guard = state.lock().unwrap();
+                    blaze_spin::busy(std::time::Duration::from_millis(20));
+                    let mut guard = state.lock();
                     guard.0 = true;
                     guard.1.take().unwrap().wake();
                 });
@@ -201,17 +192,22 @@ pub(crate) mod tests {
         }
     }
 
-    struct PolledThing<'a> {
-        poller: LocalPollAdapter<'a, Rc<Thing>, i32, Result<i64, ()>>,
+    async fn start_widen(thing: Rc<Thing>, i: i32) -> (i32, Result<i64, ()>) {
+        let widened = thing.widen(&i).await;
+        (i, widened)
     }
 
-    impl PolledThing<'_> {
-        fn new() -> Self {
-            Self { poller: LocalPollAdapter::new(Rc::new(Thing {})) }
-        }
+    struct PolledThing<Q> {
+        poller: LocalPollAdapter<Rc<Thing>, i32, Result<i64, ()>, Q>,
+    }
 
+    fn polled_thing() -> PolledThing<impl Future<Output = (i32, Result<i64, ()>)>> {
+        PolledThing { poller: LocalPollAdapter::new(Rc::new(Thing {}), start_widen) }
+    }
+
+    impl<Q: Future<Output = (i32, Result<i64, ()>)>> PolledThing<Q> {
         fn widen(&mut self, i: &i32) -> Poll<Result<i64, ()>> {
-            self.poller.poll(Thing::widen, *i)
+            self.poller.poll(*i)
         }
 
         fn wait(&mut self) -> bool {
@@ -221,21 +217,21 @@ pub(crate) mod tests {
 
     #[test]
     fn immediate_success() {
-        let mut p = PolledThing::new();
+        let mut p = polled_thing();
         assert_eq!(p.widen(&2), Poll::Ready(Ok(2)));
         assert!(p.wait());
     }
 
     #[test]
     fn immediate_error() {
-        let mut p = PolledThing::new();
+        let mut p = polled_thing();
         assert_eq!(p.widen(&1), Poll::Ready(Err(())));
         assert!(p.wait());
     }
 
     #[test]
     fn deferred_error() {
-        let mut p = PolledThing::new();
+        let mut p = polled_thing();
         assert_eq!(p.widen(&101), Poll::Pending);
         assert!(!p.wait());
         assert_eq!(p.widen(&101), Poll::Ready(Err(())));
@@ -249,7 +245,7 @@ pub(crate) mod tests {
 
     #[test]
     fn deferred_success() {
-        let mut p = PolledThing::new();
+        let mut p = polled_thing();
         assert_eq!(p.widen(&50), Poll::Pending);
         assert!(!p.wait());
         assert_eq!(p.widen(&50), Poll::Ready(Ok(50)));
@@ -261,7 +257,7 @@ pub(crate) mod tests {
 
     #[test]
     fn waits_for_another_thread() {
-        let mut p = PolledThing::new();
+        let mut p = polled_thing();
         assert_eq!(p.widen(&2000), Poll::Pending);
         assert_eq!(p.widen(&50), Poll::Pending);
         assert_eq!(p.poller.pending_count(), 2);

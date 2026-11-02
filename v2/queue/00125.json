@@ -1,0 +1,36 @@
+{
+  "id": "00125",
+  "from_lane": "db-ty-infer",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/persist.rs",
+    "crates/hir-ty/src/next_solver/persist.rs"
+  ],
+  "what": "## 3. db-ty-types: `next_solver::persist::{TyTableWriter, TyTableReader}`, as the contract says\n\nWhat: the API of db-ty-shared.md rule 2, unchanged. `crates/hir-ty/src/infer/persist.rs` uses\n`TyTableWriter::new`, `.ty`, `.args`, `.write(&mut Writer) -> u64` and `TyTableReader::open`,\n`.ty`, `.args`, writing the table into a buffer of its own (schema\n`hir_ty::infer::persist::TyTable`) kept beside the columns as `u128`s, as\n`lower/persist.rs` does.\nWhere: `crates/hir-ty/src/next_solver/persist.rs` (new), `pub mod persist;` in `next_solver.rs`.\nWhy: nothing else in the record depends on the interners' dense indices.\n\n> forwarded to db: between lane db's children.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/persist.rs:1770` (`TyTableWriter::{new, ty, args, write}`) and `:1888` (`TyTableReader::{open, ty, args}`); `pub mod persist;` at `next_solver.rs:26`.",
+  "state": "applied",
+  "created": "2026-10-30T01:10:15Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-infer.md#3. db-ty-types: `next_solver::persist::{TyTableWriter, TyTableReader}`, as the contract says",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-infer.md:73"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/persist.rs:1770` (`TyTableWriter::{new, ty, args, write}`) and `:1888` (`TyTableReader::{open, ty, args}`); `pub mod persist;` at `next_solver.rs:26`."
+    }
+  ]
+}

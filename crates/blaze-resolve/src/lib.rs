@@ -20,13 +20,13 @@
 //! [`Resolve`] is a resolved graph, and [`lockfile`] reads and writes it as `Cargo.lock`.
 
 mod dependency;
-mod edit_distance;
 mod graph;
 pub mod lockfile;
 pub mod metadata;
 mod names;
 mod package_id;
 mod package_id_spec;
+mod persistent;
 mod poll;
 mod registry;
 mod resolve;
@@ -36,6 +36,7 @@ mod version;
 pub mod workspace_resolve;
 
 use blaze_source::{interning, source_id};
+use stdx::edit_distance::cargo as edit_distance;
 
 pub use blaze_source::{
     CRATES_IO_DOMAIN, CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, CanonicalUrl,
@@ -47,9 +48,12 @@ pub use graph::Graph;
 pub use names::{validate_feature_name, validate_package_name, validate_registry_name};
 pub use package_id::PackageId;
 pub use package_id_spec::PackageIdSpec;
-pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry};
+pub use poll::block_on;
+pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry, query_pinned};
 pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
-pub use summary::{FeatureMap, FeatureValue, MissingDependencyError, Summary};
+pub use summary::{
+    FeatureDep, FeatureMap, FeatureValue, MissingDependencyError, Summary, build_feature_map,
+};
 pub use version::{OptVersionReq, PartialVersion, RustVersion};
 
 pub use cargo_platform::{Cfg, Platform};

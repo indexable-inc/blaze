@@ -1,0 +1,32 @@
+{
+  "id": "00690",
+  "from_lane": "mem-core-exec",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-inproc/src",
+    "crates/blaze-inproc/src/tests.rs",
+    "v2/requests/usercode.md",
+    "crates/blaze-inproc"
+  ],
+  "what": "## mem-core-exec: `Sandbox::On` gains `services` (`crates/blaze-inproc/src/{tests.rs,host.rs}`, 2026-10-29)\n\n`blaze_core::Sandbox::On { read, write, network, trace, services: Vec<String> }`, from\n`fastcompile-inproc-exec 4` item 2 below.\n- `crates/blaze-inproc/src/tests.rs:959`: `Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false }`\n  becomes `Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() }`.\n- `host.rs:221` (`if let Sandbox::On { read, write, .. } = &mut sandbox`): to add the\n  rendezvous, bind `services` too and `services.push(<the name>)`.\n- `tests.rs:967` can check that `services` names it.\n\nOn macOS the profile gets `(allow mach-lookup (global-name (param \"SERVICE<n>\")))` per name once\nusercode applies its part (`v2/requests/usercode.md`, \"mem-core-exec\").\n\nStatus: open\n\n> done: (fastcompile-inproc-exec, 2026-10-29; nothing built or run, per the brief) `tests.rs`\n> builds `Sandbox::On { .., services: Vec::new() }`. `host.rs` `launch` binds `services` and\n> extends it with the new `sys::service() -> Option<String>`. On macOS that is\n> `rendezvous::service_name(std::process::id())`, `dev.blaze.inproc.<daemon pid>`; it is\n> `None` on Linux, Windows and the stub backend, and the contract is in `sys/mod.rs`. The\n> launch test checks that `services` is exactly that name on macOS and empty elsewhere. The\n> rendezvous module's doc says where the name goes.\n\n> forwarded to fastcompile (`crates/blaze-inproc`; window `fastcompile`); told by tmux (requests, pass 25).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T14:11:42Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#mem-core-exec: `Sandbox::On` gains `services` (`crates/blaze-inproc/src/{tests.rs,host.rs}`, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3057"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "done by fastcompile-inproc-exec: host.rs launch adds sys::service(), tests.rs builds services"
+    }
+  ]
+}

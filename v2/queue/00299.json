@@ -1,0 +1,35 @@
+{
+  "id": "00299",
+  "from_lane": "dedup",
+  "owner": "mem-backend-cas",
+  "paths": [
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "## dedup: blaze-cas's CRC32C onto blaze_ids::crc32c\n\nFrom `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`; the heading never reached this\nfile, the edit was sent by tmux). `crates/blaze-cas/src/lib.rs`: `mod crc;` became\n`use blaze_ids::crc32c as crc;`; `src/crc.rs` deleted. Its only callers use `crc::crc32c`, which\n`blaze_ids::crc32c` has with the same signature; `extend` and the test-only `paths` had no other\nusers.\n\nStatus: done by mem-backend-cas (2026-10-29).\n\n> forwarded to mem-backend-cas (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:11:32Z",
+  "updated": "2026-10-30T08:52:21Z",
+  "taken_by": "unify",
+  "why": null,
+  "source": "v2/requests/mem-backend-cas.md#dedup: blaze-cas's CRC32C onto blaze_ids::crc32c",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend-cas.md:19"
+    },
+    {
+      "at": "2026-10-30T08:52:21Z",
+      "by": "unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:52:21Z",
+      "by": "unify",
+      "action": "done",
+      "note": "already in the tree: blaze-cas lib.rs:34 is `use blaze_ids::crc32c as crc;`, src/crc.rs is gone (mem-backend-cas, 2026-10-29)"
+    }
+  ]
+}

@@ -25,7 +25,7 @@ pub(super) enum PlaceOp {
     Index,
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(super) fn try_overloaded_deref(
         &self,
         expr: ExprId,
@@ -63,10 +63,10 @@ impl<'db> InferenceContext<'db> {
         {
             self.write_expr_adj(
                 oprnd_expr,
-                Box::new([Adjustment {
+                &[Adjustment {
                     kind: Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Not)),
                     target: method.sig.inputs_and_output.inputs()[0].store(),
-                }]),
+                }],
             );
         } else {
             panic!("input to deref is not a ref?");
@@ -107,7 +107,7 @@ impl<'db> InferenceContext<'db> {
         expr: ExprId,
         base_expr: ExprId,
         index_expr: ExprId,
-        autoderef: &mut InferenceContextAutoderef<'_, 'db>,
+        autoderef: &mut InferenceContextAutoderef<'_, 'db, 'f>,
         index_ty: Ty<'db>,
     ) -> Option<(/*index type*/ Ty<'db>, /*element type*/ Ty<'db>)> {
         let ty = autoderef.final_ty();
@@ -151,7 +151,8 @@ impl<'db> InferenceContext<'db> {
                 debug!("try_index_step: success, using overloaded indexing");
                 let method = autoderef.ctx().table.register_infer_ok(result);
 
-                let infer_ok = autoderef.adjust_steps_as_infer_ok();
+                let frame = autoderef.ctx().frame;
+                let infer_ok = autoderef.adjust_steps_as_infer_ok(frame);
                 let mut adjustments = autoderef.ctx().table.register_infer_ok(infer_ok);
                 if let TyKind::Ref(region, _, Mutability::Not) =
                     method.sig.inputs_and_output.inputs()[0].kind()
@@ -170,7 +171,7 @@ impl<'db> InferenceContext<'db> {
                         target: method.sig.inputs_and_output.inputs()[0].store(),
                     });
                 }
-                autoderef.ctx().write_expr_adj(base_expr, adjustments.into_boxed_slice());
+                autoderef.ctx().write_expr_adj(base_expr, &adjustments);
 
                 autoderef.ctx().write_method_resolution(expr, method.def_id, method.args);
 
@@ -256,7 +257,7 @@ impl<'db> InferenceContext<'db> {
         index_expr: Option<ExprId>,
     ) {
         debug!("convert_place_op_to_mutable({:?}, {:?}, {:?})", op, expr, base_expr);
-        if !self.result.method_resolutions.contains_key(&expr) {
+        if !self.result.method_resolutions.contains_idx(expr) {
             debug!("convert_place_op_to_mutable - builtin, nothing to do");
             return;
         }

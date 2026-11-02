@@ -1,0 +1,35 @@
+{
+  "id": "00012",
+  "from_lane": "proof",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2"
+  ],
+  "what": "## 4. pyproject.toml: lint and type-check harness/v2\n\n- What: add `\"harness/v2\"` to both `include` lists (ruff and pyright),\n  `\"harness/v2/*.py\" = [\"E402\"]` beside the other per-file ignores (the scripts put\n  `harness/` on `sys.path` before importing `engine`, `report` and `blaze_cli`), and pyright\n  `extraPaths = [\"harness\", \"harness/v2\"]` so those sibling imports resolve.\n- Where: `pyproject.toml` (coordinator).\n- Why: the scripts are written pyright-strict; nothing checks them until they are included.\n\n> applied: by the coordinator: both `include` lists and the E402 ignore.\n> forwarded to coordinator: pyright's `extraPaths = [\"harness\", \"harness/v2\"]` is not in `pyproject.toml` (the coordinator's, not among the paths `requests` applies).",
+  "state": "applied",
+  "created": "2026-10-29T23:50:35Z",
+  "updated": "2026-10-30T08:25:26Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/proof.md#4. pyproject.toml: lint and type-check harness/v2",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/proof.md:65"
+    },
+    {
+      "at": "2026-10-30T08:25:26Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:26Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "pyproject.toml [tool.pyright]: extraPaths = [\"harness\", \"harness/v2\"]; the include lists and the harness/v2 E402 ignore were already in."
+    }
+  ]
+}

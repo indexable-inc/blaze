@@ -3,6 +3,7 @@
 
 use std::fmt::Write;
 
+use base_db::Db;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ItemContainerId,
     Lookup, ModuleDefId, ModuleIdLt,
@@ -33,85 +34,86 @@ use crate::{
 };
 
 /// `None` is a type whose rustc spelling this does not reproduce.
-pub fn rustc_type_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_type_name<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::TypeName);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What the symbol of `func` with `args` demangles to, which is how a backtrace names it.
 pub fn rustc_function_name<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     args: &[GenericArg<'db>],
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_function(db, &mut out, func, args)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The same of the closure or `async` block written at `expr` of `func`.
 pub fn rustc_closure_name<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     args: &[GenericArg<'db>],
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_closure(db, &mut out, func, args, expr, Named::Code)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What rustc writes after the path of the function a closure is written in: `::{closure#0}`,
 /// the closures it is in first.
 pub fn rustc_closure_suffix(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     expr: ExprId,
 ) -> Option<String> {
     let around = closures_around(db, owner, expr)?;
     let mut out = Spelled::new(Spelling::Symbol);
     out.closures(&around);
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The places rustc numbers a closure by, `n` of each `{closure#n}` from the one outermost in
 /// the body to the closure itself: what its `DefPath` adds to the function's.
 pub fn rustc_closure_places(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     expr: ExprId,
 ) -> Option<Vec<usize>> {
     let around = closures_around(db, owner, expr)?;
+    // alloc: the places, the caller's to keep
     (!around.is_empty()).then(|| around.iter().map(|&(place, _)| place).collect())
 }
 
 /// The path rustc tells a debugger the code of that closure or `async` block by.
 pub fn rustc_debug_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     args: &[GenericArg<'db>],
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
     write_closure(db, &mut out, func, args, expr, Named::Code)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The same of a type, as it stands among the generic arguments of a symbol.
-pub fn rustc_symbol_type<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_symbol_type<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What rustc calls a type where it tells a debugger of it: every generic argument that is
 /// not a lifetime, a closure `{closure_env#0}` and an `async fn` `{async_fn_env#0}` after
 /// what they are written in.
-pub fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_debug_name<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The path rustc tells a debugger a function by: the modules it is written in, then the
@@ -119,7 +121,7 @@ pub fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<St
 /// module, or the trait, and last the name with what the function and the `impl` are
 /// generic over.
 pub fn rustc_debug_function<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     args: &[GenericArg<'db>],
 ) -> Option<String> {
@@ -127,12 +129,28 @@ pub fn rustc_debug_function<'db>(
     write_container(db, &mut out, func, args)?;
     write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
     write_args(db, &mut out, args)?;
-    Some(out.text)
+    Some(out.into_name())
+}
+
+/// How a type with no parts is written, the same in every spelling of a type: `type_name`,
+/// symbols, debug info and the names [`crate`]'s users keep across runs. `None` for any
+/// other type.
+pub fn scalar_name(ty: Ty<'_>) -> Option<&'static str> {
+    Some(match ty.kind() {
+        TyKind::Bool => "bool",
+        TyKind::Char => "char",
+        TyKind::Str => "str",
+        TyKind::Never => "!",
+        TyKind::Int(it) => it.name_str(),
+        TyKind::Uint(it) => it.name_str(),
+        TyKind::Float(it) => it.name_str(),
+        _ => return None,
+    })
 }
 
 /// What a function is written in, as a debugger is told of it.
 fn write_container<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -163,7 +181,7 @@ fn write_container<'db>(
 /// The body a block is written in, and the module that body's owner is declared in: a
 /// function, constant or static of the module, or of an `impl` or a trait of it.
 pub fn block_owner<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     block: hir_def::BlockIdLt<'db>,
 ) -> Option<(DefWithBodyId, ModuleIdLt<'db>)> {
     let has = |def: DefWithBodyId| Body::of(db, def).blocks(db).any(|(id, _)| id == block);
@@ -202,7 +220,7 @@ pub fn block_owner<'db>(
 
 /// Whether `block` of `owner` is written in no closure or `async` block of it.
 pub fn is_outside_closures<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
     block: hir_def::BlockIdLt<'db>,
 ) -> bool {
@@ -225,15 +243,21 @@ enum Spelling {
     Debug,
 }
 
-/// A name being written.
+/// A name being written, into one of the thread's scratch strings.
 struct Spelled {
-    text: String,
+    text: blaze_mem::scratch::Lent<String>,
     spelling: Spelling,
 }
 
 impl Spelled {
     fn new(spelling: Spelling) -> Self {
-        Self { text: String::new(), spelling }
+        Self { text: blaze_mem::scratch::lend_string(), spelling }
+    }
+
+    /// The name written, allocated once at its length.
+    fn into_name(self) -> String {
+        // alloc: the name is the result
+        String::from(self.text.as_str())
     }
 
     fn push_str(&mut self, text: &str) {
@@ -296,7 +320,7 @@ impl Write for Spelled {
 }
 
 fn write_module<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     module: ModuleIdLt<'db>,
 ) -> Option<()> {
@@ -357,7 +381,7 @@ fn write_module<'db>(
 }
 
 fn write_list<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     tys: impl IntoIterator<Item = Ty<'db>>,
 ) -> Option<()> {
@@ -370,15 +394,12 @@ fn write_list<'db>(
     Some(())
 }
 
-fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
+fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
+    if let Some(name) = scalar_name(ty) {
+        out.push_str(name);
+        return Some(());
+    }
     match ty.kind() {
-        TyKind::Bool => out.push_str("bool"),
-        TyKind::Char => out.push_str("char"),
-        TyKind::Str => out.push_str("str"),
-        TyKind::Never => out.push('!'),
-        TyKind::Int(it) => out.push_str(it.name_str()),
-        TyKind::Uint(it) => out.push_str(it.name_str()),
-        TyKind::Float(it) => out.push_str(it.name_str()),
         TyKind::Ref(region, pointee, mutability) => {
             out.push('&');
             // To `type_name` a lifetime of a `for<'a>` is `'_`, and any other is not there.
@@ -433,20 +454,25 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             write_dyn_debug(db, out, bounds)?;
         }
         TyKind::Dynamic(bounds, _) => write_dyn(db, out, bounds)?,
-        TyKind::FnDef(def, args) => match def.0 {
-            CallableDefId::FunctionId(func) => write_function(db, out, func, args.as_slice())?,
-            _ if out.spelling == Spelling::Symbol => return None,
-            CallableDefId::StructId(it) => {
-                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), it.into(), args))?;
-                out.push_str("::{{constructor}}");
+        TyKind::FnDef(def, args) => {
+            let args = args.skip_binder();
+            match def.0 {
+                CallableDefId::FunctionId(func) => write_function(db, out, func, args.as_slice())?,
+                _ if out.spelling == Spelling::Symbol => return None,
+                CallableDefId::StructId(it) => {
+                    let ty = Ty::new_adt(DbInterner::new_no_crate(db), it.into(), args);
+                    write_ty(db, out, ty)?;
+                    out.push_str("::{{constructor}}");
+                }
+                CallableDefId::EnumVariantId(it) => {
+                    let parent = it.lookup(db).parent;
+                    let ty = Ty::new_adt(DbInterner::new_no_crate(db), parent.into(), args);
+                    write_ty(db, out, ty)?;
+                    let name = &parent.enum_variants(db).variant_name_by_id(it)?;
+                    write!(out, "::{}::{{{{constructor}}}}", name.as_str()).ok()?;
+                }
             }
-            CallableDefId::EnumVariantId(it) => {
-                let parent = it.lookup(db).parent;
-                write_ty(db, out, Ty::new_adt(DbInterner::new_no_crate(db), parent.into(), args))?;
-                let name = &parent.enum_variants(db).variant_name_by_id(it)?;
-                write!(out, "::{}::{{{{constructor}}}}", name.as_str()).ok()?;
-            }
-        },
+        }
         TyKind::Closure(id, args) => {
             let func = written_in(id.0.loc(db))?;
             write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
@@ -455,7 +481,7 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
             let func = written_in(id.0.loc(db))?;
             // The future of an `async` closure is named after how the closure was called.
             let is_block = matches!(
-                Body::of(db, func.0.into())[func.1],
+                Body::of(db, func.0.into()).expr(func.1),
                 Expr::Closure {
                     closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Block, .. },
                     ..
@@ -504,24 +530,27 @@ fn write_ty<'db>(db: &'db dyn HirDatabase, out: &mut Spelled, ty: Ty<'db>) -> Op
 /// A trait object: `dyn path::Trait<A, Assoc = B> + path::Auto`, a trait of the `Fn` family as
 /// `dyn path::Fn(A) -> B`, and the auto traits in the order of their paths.
 fn write_dyn<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     bounds: BoundExistentialPredicates<'db>,
 ) -> Option<()> {
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut parts = Vec::new();
     if let Some(principal) = bounds.principal() {
         let mut part = Spelled::new(out.spelling);
         let projections: Vec<_> =
+            // alloc: a trait object's projections; only on `dyn` types
             bounds.projection_bounds().into_iter().map(|it| it.skip_binder()).collect();
         write_principal(db, &mut part, principal.skip_binder(), &projections)?;
-        parts.push(part.text);
+        parts.push(part.into_name());
     }
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut autos = Vec::new();
     for auto in bounds.auto_traits() {
         let mut part = Spelled::new(out.spelling);
         write_module(db, &mut part, auto.0.module(db))?;
         write!(part, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
-        autos.push(part.text);
+        autos.push(part.into_name());
     }
     autos.sort();
     parts.extend(autos);
@@ -532,7 +561,7 @@ fn write_dyn<'db>(
 
 /// The trait a trait object is of, with what it says of the trait's associated types.
 fn write_principal<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     principal: ExistentialTraitRef<'db>,
     projections: &[ExistentialProjection<'db>],
@@ -564,6 +593,7 @@ fn write_principal<'db>(
             let mut inner = Spelled::new(out.spelling);
             write_args(db, &mut inner, args)?;
             let before =
+                // alloc: the text `type_name` returns is the result
                 inner.text.strip_suffix('>').map_or("<".to_owned(), |it| format!("{it}, "));
             let TermId::TypeAliasId(alias) = projection.def_id.0 else { return None };
             write!(out, "{before}{} = ", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
@@ -588,7 +618,7 @@ fn written_in(closure: InternedClosure<'_>) -> Option<(FunctionId, ExprId)> {
 /// `<A, B>`, or nothing for no arguments. `type_name` writes every lifetime as `'_`, and a
 /// symbol has none.
 fn write_args<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     args: &[GenericArg<'db>],
 ) -> Option<()> {
@@ -621,9 +651,12 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
     let rustc_type_ir::ValTreeKind::Leaf(leaf) = value.value.inner() else { return None };
     let leaf = *leaf;
     let unused = 128 - leaf.size().bits();
+    // alloc: the text `type_name` returns is the result
     let named = |name: &str, end: &str| Some(format!("{name}::{end}"));
     match value.ty.kind() {
+        // alloc: the text `type_name` returns is the result
         TyKind::Bool => Some(leaf.try_to_bool().ok()?.to_string()),
+        // alloc: the text `type_name` returns is the result
         TyKind::Char => Some(format!("{:?}", char::from_u32(leaf.to_uint_unchecked() as u32)?)),
         TyKind::Int(int) => {
             let name = match int {
@@ -637,6 +670,7 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
             match leaf.to_int_unchecked() {
                 it if it == i128::MIN >> unused => named(name, "MIN"),
                 it if it == i128::MAX >> unused => named(name, "MAX"),
+                // alloc: the text `type_name` returns is the result
                 it => Some(it.to_string()),
             }
         }
@@ -651,6 +685,7 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
             };
             match leaf.to_uint_unchecked() {
                 it if it == u128::MAX >> unused => named(name, "MAX"),
+                // alloc: the text `type_name` returns is the result
                 it => Some(it.to_string()),
             }
         }
@@ -660,7 +695,7 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
 
 /// The closure or `async` block written at `expr` of `func`.
 fn write_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -710,16 +745,17 @@ enum Named {
 /// `dyn Trait<A, Item=B> + Auto` as a debugger is told of it, in brackets after `dyn` when
 /// there is more than the trait.
 fn write_dyn_debug<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     bounds: crate::next_solver::BoundExistentialPredicates<'db>,
 ) -> Option<()> {
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut autos = Vec::new();
     for auto in bounds.auto_traits() {
         let mut name = Spelled::new(Spelling::Debug);
         write_module(db, &mut name, auto.0.module(db))?;
         write!(name, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
-        autos.push(name.text);
+        autos.push(name.into_name());
     }
     autos.sort_unstable();
     let principal = bounds.principal();
@@ -743,8 +779,9 @@ fn write_dyn_debug<'db>(
             write!(part, "{}=", TypeAliasSignature::of(db, alias).name.as_str()).ok()?;
             write_ty(db, &mut part, bound.term.as_type()?)?;
             inner = Some(match inner {
-                Some(inner) => format!("{inner}, {}", part.text),
-                None => part.text,
+                // alloc: the text `type_name` returns is the result
+                Some(inner) => format!("{inner}, {}", part.text.as_str()),
+                None => part.into_name(),
             });
         }
         if let Some(inner) = inner {
@@ -762,7 +799,7 @@ fn write_dyn_debug<'db>(
 }
 
 /// The module of the item rustc takes a type to be about, when it has one.
-fn characteristic_module<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<ModuleIdLt<'db>> {
+fn characteristic_module<'db>(db: &'db Db, ty: Ty<'db>) -> Option<ModuleIdLt<'db>> {
     match ty.kind() {
         TyKind::Adt(adt, _) => Some(adt.def_id().module(db)),
         TyKind::Dynamic(bounds, _) => Some(bounds.principal()?.skip_binder().def_id.0.module(db)),
@@ -777,7 +814,7 @@ fn characteristic_module<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<M
 }
 
 fn write_trait<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     trait_ref: TraitRef<'db>,
 ) -> Option<()> {
@@ -789,7 +826,7 @@ fn write_trait<'db>(
 
 /// The arguments of `def` that rustc writes: not the last ones that only repeat a default.
 fn without_defaults<'a, 'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
     mut args: &'a [GenericArg<'db>],
 ) -> &'a [GenericArg<'db>] {
@@ -809,7 +846,7 @@ fn without_defaults<'a, 'db>(
 /// the `impl` is in the module of neither the type nor the trait. A symbol has `path::f::<A>`,
 /// `<path::Type<T>>::f` and `<T as Trait>::f`.
 fn write_function<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: &mut Spelled,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -896,29 +933,35 @@ fn write_function<'db>(
 /// The closures and `async` blocks `target` is written in, outermost first and with `target`
 /// last when it is one: each by its place among those written in the one before it.
 fn closures_around(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     target: ExprId,
-) -> Option<Vec<(usize, ClosureKind)>> {
-    closures_around_query(db, owner, target).clone()
+) -> Option<&[(usize, ClosureKind)]> {
+    closures_around_query(db, owner, target).as_deref()
 }
 
-/// [`closures_around`], kept: it reads the source map, which changes with every edit above
-/// the body, and what it finds does not.
-#[salsa::tracked(returns(ref))]
+/// [`closures_around`], kept: it may read the source map, which changes with every edit above
+/// the body, and what it finds does not. The map orders closures by the macro calls they are
+/// in, so a body that called no macro is ordered without it, as every closure of it is in
+/// the same file.
+#[blaze_query::tracked(returns(ref))]
 fn closures_around_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     target: ExprId,
 ) -> Option<Vec<(usize, ClosureKind)>> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
+    let body = Body::of(db, owner);
+    // alloc: once per closure, in the query that keeps its result
     let mut around = Vec::new();
     if !find_closures(body, body.root_expr(), target, &mut around) {
         return None;
     }
-    let order = |closure: ExprId| MacroCalls::around(db, source_map, closure);
+    let expanded = !body.macro_calls().is_empty();
+    let order =
+        |closure: ExprId| MacroCalls::around(db, Body::unmoved_source_map(db, owner), closure);
     let mut inside = None;
     let places = around.iter().map(|&closure| {
+        // alloc: once per closure, in the query that keeps its result
         let mut beside = Vec::new();
         match inside.replace(closure) {
             Some(it) => {
@@ -927,16 +970,19 @@ fn closures_around_query(
             None => closures_in(body, body.root_expr(), &mut beside),
         }
         // Stable, so those of one expansion stay in the order they are written in.
-        beside.sort_by_cached_key(|&it| order(it));
-        let Expr::Closure { closure_kind, .. } = body[closure] else { return None };
+        if expanded && beside.len() > 1 {
+            beside.sort_by_cached_key(|&it| order(it));
+        }
+        let Expr::Closure { closure_kind, .. } = body.expr(closure) else { return None };
         Some((beside.iter().position(|&it| it == closure)?, closure_kind))
     });
+    // alloc: the result the query keeps
     places.collect()
 }
 
 /// The closures `target` is written in, looking for it from `at` down.
 fn find_closures(body: &Body, at: ExprId, target: ExprId, around: &mut Vec<ExprId>) -> bool {
-    let is_closure = matches!(body[at], Expr::Closure { .. });
+    let is_closure = matches!(body.expr(at), Expr::Closure { .. });
     if is_closure {
         around.push(at);
     }
@@ -954,7 +1000,7 @@ fn find_closures(body: &Body, at: ExprId, target: ExprId, around: &mut Vec<ExprI
 
 /// The closures from `at` down that are written in no other closure on the way.
 fn closures_in(body: &Body, at: ExprId, found: &mut Vec<ExprId>) {
-    match body[at] {
+    match body.expr(at) {
         Expr::Closure { .. } => found.push(at),
         _ => walk_outside_consts(body, at, |child| closures_in(body, child, found)),
     }
@@ -996,11 +1042,12 @@ fn walk_outside_consts(body: &Body, at: ExprId, callback: impl FnMut(ExprId)) {
 struct MacroCalls(Vec<u32>);
 
 impl MacroCalls {
-    fn around(db: &dyn HirDatabase, source_map: &BodySourceMap, expr: ExprId) -> Self {
+    fn around(db: &Db, source_map: &BodySourceMap, expr: ExprId) -> Self {
+        // alloc: a sort key, only in a body that called a macro, once per query run
         let mut calls = Vec::new();
         let mut file = source_map.expr_syntax(expr).ok().map(|it| it.file_id);
         while let Some(call) = file.and_then(|it| it.macro_file()) {
-            let node = call.call_node(db);
+            let node = call.call_node_view(db);
             calls.push(node.value.text_range().start().into());
             file = Some(node.file_id);
         }

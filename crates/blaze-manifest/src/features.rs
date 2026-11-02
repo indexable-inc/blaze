@@ -92,33 +92,7 @@ impl FromStr for Edition {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ResolveBehavior {
-    V1,
-    V2,
-    V3,
-}
-
-impl ResolveBehavior {
-    pub fn from_manifest(resolver: &str) -> anyhow::Result<ResolveBehavior> {
-        match resolver {
-            "1" => Ok(ResolveBehavior::V1),
-            "2" => Ok(ResolveBehavior::V2),
-            "3" => Ok(ResolveBehavior::V3),
-            s => bail!(
-                "`resolver` setting `{s}` is not valid, valid options are \"1\", \"2\" or \"3\""
-            ),
-        }
-    }
-
-    pub fn to_manifest(&self) -> &'static str {
-        match self {
-            ResolveBehavior::V1 => "1",
-            ResolveBehavior::V2 => "2",
-            ResolveBehavior::V3 => "3",
-        }
-    }
-}
+pub use blaze_resolve::resolver::ResolveBehavior;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {

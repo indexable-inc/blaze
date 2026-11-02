@@ -5,17 +5,19 @@
 //! counts to ([`now`], [`within`]), until it is dropped. Countings nest: what an inner one
 //! counts, the ones around it count too.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     marker::PhantomData,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
 use base_db::Crate;
-use rustc_hash::FxHashMap;
+use blaze_hash::SharedMap;
 
 /// The counts of one [`Counting`].
 #[derive(Default)]
@@ -25,10 +27,10 @@ pub struct Counted {
     /// Functions put through Cranelift, or through LLVM at level 1: what a build compiled
     /// rather than found.
     compiled: AtomicUsize,
-    /// Compile queries salsa ran rather than handed back, in all and by the crate each was
+    /// Compile queries the query engine ran rather than handed back, in all and by the crate each was
     /// for: what a build says of itself as it goes.
     compiles: AtomicUsize,
-    compiles_of: Mutex<FxHashMap<Crate, usize>>,
+    compiles_of: SharedMap<Crate, AtomicUsize>,
 }
 
 impl Counted {
@@ -44,8 +46,9 @@ impl Counted {
 
     /// Compile queries run, by the crate each was for.
     pub fn compiles_by_crate(&self) -> Vec<(Crate, usize)> {
-        let of = self.compiles_of.lock().unwrap_or_else(|e| e.into_inner());
-        of.iter().map(|(&krate, &count)| (krate, count)).collect()
+        let of = self.compiles_of.pin();
+        // alloc: once per build, for its report
+        of.iter().map(|(&krate, count)| (krate, count.load(Ordering::Relaxed))).collect()
     }
 }
 
@@ -62,7 +65,9 @@ pub struct Counting {
 
 impl Counting {
     pub fn start() -> Counting {
+        // alloc: once per build; the counts outlive it on the threads it hands them to
         let counted = Arc::new(Counted { around: now(), ..Counted::default() });
+        // clone: once per build, the same `Arc` held by this thread's slot as well
         let held = COUNTING.with(|it| it.replace(Some(counted.clone())));
         Counting { counted, held, on_this_thread: PhantomData }
     }
@@ -81,6 +86,7 @@ impl Drop for Counting {
 
 /// What counts this thread's compiles, for a thread that works for it to count into.
 pub fn now() -> Option<Arc<Counted>> {
+    // clone: once per build or per batch handed to another thread, which must own it
     COUNTING.with(|it| it.borrow().clone())
 }
 
@@ -100,10 +106,11 @@ pub fn within<T>(counted: Option<Arc<Counted>>, work: impl FnOnce() -> T) -> T {
 
 fn each(count: impl Fn(&Counted)) {
     COUNTING.with(|it| {
-        let mut at = it.borrow().clone();
+        let held = it.borrow();
+        let mut at = held.as_deref();
         while let Some(counted) = at {
-            count(&counted);
-            at = counted.around.clone();
+            count(counted);
+            at = counted.around.as_deref();
         }
     });
 }
@@ -113,11 +120,14 @@ pub(crate) fn compiled() {
     each(|it| _ = it.compiled.fetch_add(1, Ordering::Relaxed));
 }
 
-/// Salsa ran a compile query for `krate`.
+/// The query engine ran a compile query for `krate`.
 pub(crate) fn compiles(krate: Crate) {
     each(|it| {
         it.compiles.fetch_add(1, Ordering::Relaxed);
-        *it.compiles_of.lock().unwrap_or_else(|e| e.into_inner()).entry(krate).or_default() += 1;
+        it.compiles_of
+            .pin()
+            .get_or_insert_with(krate, AtomicUsize::default)
+            .fetch_add(1, Ordering::Relaxed);
     });
 }
 

@@ -1,0 +1,38 @@
+{
+  "id": "00298",
+  "from_lane": "mem-backend-cas",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.lock",
+    "docs/v2/plan/lanes/mem/backend-cas.md",
+    "crates/blaze-cas/Cargo.toml",
+    "crates/blaze-cas"
+  ],
+  "what": "## mem-backend-cas: `Cargo.lock` for blaze-cas's new dependencies\n\nFrom `mem-backend-cas` (report `/tmp/blaze-lanes/v2-mem-backend-cas.md`, design\n`docs/v2/plan/lanes/mem/backend-cas.md`). `crates/blaze-cas/Cargo.toml` now depends on\n`blaze-mem` and, for tests, `blaze-alloc-count`; both are workspace dependencies already. The\nlane may not run cargo, so `Cargo.lock` is not updated: its `blaze-cas` entry already lacks\n`blaze-reclaim`, `lz4_flex`, `rustc-hash` and `zstd`, so whoever next regenerates the lock file\npicks these up with them. Nothing else outside `crates/blaze-cas` changed.\n\nStatus: open, for whoever may run cargo (the next `Cargo.lock` regeneration). This lane may not\nrun cargo, and hand-editing the lock file is not safe: its `blaze-cas` entry is already missing\nfour other dependencies.\n\n> forwarded to mem-backend-cas (from requests, pass 16; told by tmux).\n\n> mem-backend-cas: cannot do here (needs cargo); left open for the next `Cargo.lock` regeneration, not for me.",
+  "state": "refused",
+  "created": "2026-10-30T03:11:32Z",
+  "updated": "2026-10-30T08:34:18Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "already done: Cargo.lock blaze-cas entry lists blaze-alloc-count, blaze-check, blaze-core, blaze-format, blaze-ids, blaze-mem, blaze-reclaim, blaze-v2-proof, lz4_flex, rustc-hash 2.1.2, serde and zstd, exactly crates/blaze-cas/Cargo.toml (refreshed with the v2 checkpoint).",
+  "source": "v2/requests/mem-backend-cas.md#mem-backend-cas: `Cargo.lock` for blaze-cas's new dependencies",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend-cas.md:2"
+    },
+    {
+      "at": "2026-10-30T08:34:18Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:34:18Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "already done: Cargo.lock blaze-cas entry lists blaze-alloc-count, blaze-check, blaze-core, blaze-format, blaze-ids, blaze-mem, blaze-reclaim, blaze-v2-proof, lz4_flex, rustc-hash 2.1.2, serde and zstd, exactly crates/blaze-cas/Cargo.toml (refreshed with the v2 checkpoint)."
+    }
+  ]
+}

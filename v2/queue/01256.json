@@ -1,0 +1,35 @@
+{
+  "id": "01256",
+  "from_lane": "tests-diag",
+  "owner": "query-unify",
+  "paths": [
+    "crates/hir-expand/src/fixture.rs"
+  ],
+  "what": "Round 3's `sysroot_attr` (hir-expand/src/fixture.rs:626-642) gives every fixture crate with no std dependency and no core a `no_core` crate attribute. rustc gates `no_core` (E0658 'the `no_core` attribute is an experimental feature' at `<crate attribute>:1:4`), so each such crate's check now gets that error: 579 of blaze-diagnostics' 774 round-6 failures (9023f3e6d7) carry it, e.g. tests::items::macros::a_macro_that_does_not_exist_is_not_found and tests::bodies::members::a_field_a_struct_lacks. Wanted: the crate the fixture marks so that rustc's injected `extern crate std;`/prelude is not asked for stays free of a user-visible gate: give it `feature(no_core)` beside `no_core` (how `-Zcrate-attr=no_core` UI tests write it), or mark it in the crate graph rather than as a crate attribute. A test that wants a gate on a `#![no_core]` it writes still sees it. No blaze-diagnostics change needed once this lands.",
+  "state": "applied",
+  "created": "2026-10-31T12:21:17Z",
+  "updated": "2026-10-31T14:47:27Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:21:17Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:28Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> query-unify: hir-expand is held by query-unify (crate-holds.md). db read it and agrees; exact edit: sysroot_attr (fixture.rs:630) returns Option<&'static [&'static str]>: `true => Some(&[\"no_std\"])`, `false => Some(&[\"feature(no_core)\", \"no_core\"])`, as -Zcrate-attr UI tests write it; the caller at 408 pushes each (`meta.crate_attrs.extend(attrs.iter().map(|it| (*it).to_owned()))`), and the one at 459 maps them to owned the same way. 319 of 768 blaze-diagnostics --lib failures in round 7c"
+    },
+    {
+      "at": "2026-10-31T14:47:27Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "Made db's exact edit (open 2 h, it is the largest blaze-diagnostics group): sysroot_attr returns Option<&[&str]>, no_core behind feature(no_core); both callers take every attribute. ra clean; round 9 checks it. Told query-unify, which holds hir-expand."
+    }
+  ]
+}

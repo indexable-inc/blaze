@@ -1,0 +1,42 @@
+{
+  "id": "00066",
+  "from_lane": "speed",
+  "owner": "format",
+  "paths": [
+    "crates/intern/Cargo.toml",
+    "crates/intern/src/symbol.rs",
+    "v2/requests/safety.md",
+    "crates/intern/src/sync.rs",
+    "docs/v2/plan/lanes/safety/model.md",
+    "v2/requests/format.md",
+    "docs/v2/plan/design/unsafe.md",
+    "crates/intern"
+  ],
+  "what": "## speed-span (2026-10-29)\n\n> forwarded to format: 1 is `crates/intern/Cargo.toml` (the root `blaze-check` entry is in now) and 2 is `crates/intern/src/symbol.rs`, both lane format's.\n\n### 1. Coordinator: `blaze-check` for `intern`'s model build\n\nWhat: once `blaze-check` is a workspace dependency (safety's M1 1, `v2/requests/safety.md`),\nappend to `crates/intern/Cargo.toml`:\n\n```toml\n[target.'cfg(blaze_check)'.dependencies]\nblaze-check.workspace = true\n```\n\nWhy: `crates/intern/src/sync.rs` switches `arena.rs`'s atomics and `Mutex` to the checker's under\n`cfg(blaze_check)`, and `arena.rs` has `model_racing_inserts_across_growth`\n(docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the root\nlacks stops the workspace loading. A normal build is unchanged without it.\n\n### 2. fix-orderkeys (or whoever holds `crates/intern/src/symbol.rs` last): unsafe.md splits\n\nThe safety-audit items for `symbol.rs` in `v2/requests/format.md` (\"From safety-audit\",\n\"intern\"), adapted to the file as it is now (`Text { key, str }`). Comments and block splits\nonly, no behavior change:\n\n- `unsafe impl Sync for Symbol {}`: its own comment above it:\n  `// SAFETY: As for `Send`: a `Symbol` is a shared reference to a `Text` that is never written again.`\n- `Symbol::intern`'s `insert` closure, the one `unsafe { .. }` of five operations: replace the\n  block (and the SAFETY comment above it) with\n\n  ```rust\n  // SAFETY: `to` is fresh memory of `layout`, and `bytes_at` is where `Layout::extend` put\n  // the bytes in it, so the pointer stays in the allocation.\n  let bytes = unsafe { to.as_ptr().add(bytes_at) };\n  // SAFETY: `bytes` has room for `s.len()` bytes (the array part of `layout`) and is fresh\n  // memory, so it cannot overlap `s`.\n  unsafe { bytes.copy_from_nonoverlapping(s.as_ptr(), s.len()) };\n  // SAFETY: The `s.len()` bytes at `bytes` were just written, and the arena never moves,\n  // writes or frees them, so they live for `'static`.\n  let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes, s.len()) };\n  // SAFETY: `bytes` is a copy of `s`, a `&str`, so it is UTF-8.\n  let str: &'static str = unsafe { std::str::from_utf8_unchecked(bytes) };\n  // SAFETY: `layout` starts with a `Text` (`Layout::new`), so `to` is aligned for it and has\n  // room, and nothing was there to drop.\n  unsafe { to.cast::<Text>().write(Text { key, str }) };\n  ```\n\nWhy: docs/v2/plan/design/unsafe.md; the workspace is about to deny\n`clippy::multiple_unsafe_ops_per_block` and `clippy::undocumented_unsafe_blocks`.\n`crates/intern` is speed-span's, but this file is being edited by the fix-* agents.",
+  "state": "applied",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T08:54:44Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed.md#speed-span (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:231"
+    },
+    {
+      "at": "2026-10-30T08:54:41Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:44Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-unsafe-front-intern (intern is speed-span DONE, format has no live window): crates/intern/Cargo.toml has [target.cfg(blaze_check).dependencies] blaze-check; symbol.rs item 2 is moot, Symbol is a u32 id into table::Table, one unsafe block with a SAFETY comment."
+    }
+  ]
+}

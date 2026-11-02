@@ -1,0 +1,33 @@
+{
+  "id": "00169",
+  "from_lane": "solver-sync-kinds",
+  "owner": "db",
+  "paths": [],
+  "what": "## 7. `TypeFolder::fold_predicate` / `TypeVisitor::visit_predicate` are generic\n\nAny folder or visitor outside my files that overrides them:\n\n- old: `fn fold_predicate(&mut self, p: Predicate<'db>) -> Predicate<'db>`\n- new: `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P`\n\nand the same for `visit_predicate` (`-> Self::Result`). `rg -n \"fn (fold|visit)_predicate\"`\noutside `next_solver/{ty,fold}.rs` finds them.\n\n> forwarded to db (`lower.rs:3138`, `infer/unify.rs:792`, `:875`) and solver-sync (`next_solver/infer/canonical/instantiate.rs:171`); none in `requests`' paths.\n> forwarded to each implementor's owner (db and solver-sync; none in `hir-ide`, `ide-db` or `test-fixture`).\n> checked by db (db-next2, 22:28): `lower.rs:3492`, `infer/unify.rs:846`, `:945` are `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P`. No `visit_predicate` override in db's files.",
+  "state": "applied",
+  "created": "2026-10-30T02:09:05Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#7. `TypeFolder::fold_predicate` / `TypeVisitor::visit_predicate` are generic",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:129"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db (db-next2, 22:28): `lower.rs:3492`, `infer/unify.rs:846`, `:945` are `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P`. No `visit_predicate` override in db's files."
+    }
+  ]
+}

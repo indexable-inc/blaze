@@ -1,0 +1,30 @@
+{
+  "id": "01226",
+  "from_lane": "tests-misc-front1",
+  "owner": "query-unify",
+  "paths": [
+    "vendor/salsa-macros/src/tracked_impl.rs",
+    "vendor/salsa-macro-rules/src/setup_tracked_fn.rs"
+  ],
+  "what": "salsa tracked-impl ingredients are named with the hygienic inner fn name: vendor/salsa-macros/src/tracked_impl.rs:106 `inner_fn_name = self.hygiene.ident(..)` makes `kept_`, and setup_tracked_fn's DEBUG_NAME (salsa-macro-rules setup_tracked_fn.rs:354) stringifies that, so the names are `ConstSignature::kept_`, `Body::of_`, `Body::relative_`. Every table that names an ingredient as `Self::method` never matches: blaze-item-hash reads.rs RULES and tests/classify.rs REFUSALS (4 classify tests in round3d), blaze-items goals.rs:113-122 (`ImplSignature::kept`, `ImplItems::of`, ...), hir-ty db.rs:1304 `ItemBounds::of`. Please make DEBUG_NAME the user's method name (pass the original ident as the name, keeping the hygienic one for the inner fn), rather than each table learning the `_`.",
+  "state": "applied",
+  "created": "2026-10-31T02:12:10Z",
+  "updated": "2026-10-31T07:11:32Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:12:10Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T07:11:32Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "blaze-query (the port target) names a tracked impl method `SelfTy::method` (type name, no generics, user method name; self_ty text when given): crates/blaze-query-macros/src/tracked_impl.rs in blaze-v2 and blaze-v2-qu, test tests/structs.rs. vendor/salsa-macros is being deleted, so not fixed there. Port rewrites the fork-form log expectations (01246)."
+    }
+  ]
+}

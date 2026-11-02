@@ -1,21 +1,193 @@
-use rustc_next_trait_solver::placeholder::BoundVarReplacer;
+use rustc_next_trait_solver::{
+    normalize::{NormalizationFolder, NormalizationWasAmbiguous},
+    placeholder::BoundVarReplacer,
+    solve::SolverDelegateEvalExt,
+};
 use rustc_type_ir::{
-    AliasRelationDirection, FallibleTypeFolder, Flags, Interner, TermKind, TypeFoldable,
-    TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    Flags, Interner, IsRigid, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    UniverseIndex,
     inherent::{IntoKind, Term as _},
+    solve::{Certainty, NoSolution},
 };
 
 use crate::next_solver::{
-    Binder, Const, ConstKind, DbInterner, Goal, ParamEnv, Predicate, PredicateKind, Term, Ty,
-    TyKind,
+    AliasTerm, Binder, Const, ConstKind, DbInterner, Goal, ParamEnv, Predicate, ProjectionClause,
+    SolverContext, Term, Ty, TyKind,
     fulfill::{FulfillmentCtxt, NextSolverError},
     infer::{
         InferCtxt,
         at::At,
-        traits::{Obligation, ObligationCause},
+        traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
     },
-    util::PlaceholderReplacer,
 };
+
+/// rustc's `normalize_with_universes`: every alias in `value` that is not rigid becomes a
+/// root `Projection` goal, evaluated at once. The goals that stay ambiguous come back as
+/// obligations; a goal with no solution is the error.
+fn normalize_with_universes<'db, T>(
+    at: At<'_, 'db>,
+    value: T,
+    universes: Vec<Option<UniverseIndex>>,
+) -> Result<(T, PredicateObligations<'db>), PredicateObligation<'db>>
+where
+    T: TypeFoldable<DbInterner<'db>>,
+{
+    let infcx = at.infcx;
+    let interner = infcx.interner;
+    let value = infcx.deeply_resolve_ignoring_regions(value);
+
+    if !interner.renormalize_rigid_aliases() && !value.has_non_rigid_aliases() {
+        return Ok((value, PredicateObligations::new()));
+    }
+
+    let delegate = <&SolverContext<'db>>::from(infcx);
+    let span = at.cause.span();
+    let mut stalled_goals = Vec::new(); // alloc: empty unless a normalization is ambiguous
+    let value = {
+        let mut folder = NormalizationFolder::new(infcx, universes, |alias_term: AliasTerm<'db>| {
+            let infer_term = infcx.next_term_var_of_alias_kind(alias_term, span);
+            let goal: Goal<'db, Predicate<'db>> = Goal::new(
+                interner,
+                at.param_env,
+                ProjectionClause { projection_term: alias_term, term: infer_term },
+            );
+            let result = match delegate.evaluate_root_goal(goal, span, None) {
+                Ok(result) => result,
+                Err(NoSolution) => {
+                    return Err(PredicateObligation::new(
+                        interner,
+                        *at.cause,
+                        goal.param_env,
+                        goal.predicate,
+                    ));
+                }
+            };
+            let normalized = infcx.deeply_resolve_ignoring_regions(infer_term);
+            let normalization_was_ambiguous = match result.certainty {
+                Certainty::Yes => NormalizationWasAmbiguous::No,
+                Certainty::Maybe(_) => {
+                    stalled_goals.push(result.goal);
+                    NormalizationWasAmbiguous::Yes
+                }
+            };
+            Ok((normalized, normalization_was_ambiguous))
+        });
+        value.try_fold_with(&mut folder)?
+    };
+    let obligations = stalled_goals
+        .into_iter()
+        .map(|goal| Obligation::new(interner, *at.cause, goal.param_env, goal.predicate))
+        .collect(); // alloc: empty unless a normalization is ambiguous
+    Ok((value, obligations))
+}
+
+/// rustc's `solve::normalize`: `value` normalized, ambiguity and errors deferred to
+/// fulfillment. Where an alias has no solution, every alias that is not rigid becomes an
+/// inference variable with its `Projection` goal, for fulfillment to report.
+pub(crate) fn normalize<'db, T>(at: At<'_, 'db>, value: T) -> (T, PredicateObligations<'db>)
+where
+    T: TypeFoldable<DbInterner<'db>> + Clone,
+{
+    match normalize_with_universes(at, value.clone(), Vec::new()) {
+        Ok(normalized) => normalized,
+        Err(_) => {
+            let mut replacer = ReplaceAliasWithInfer {
+                at,
+                obligations: PredicateObligations::new(),
+                // alloc: none until a binder is entered
+                universes: Vec::new(),
+            };
+            let value = at.infcx.deeply_resolve_ignoring_regions(value);
+            let value = value.fold_with(&mut replacer);
+            (value, replacer.obligations)
+        }
+    }
+}
+
+struct ReplaceAliasWithInfer<'me, 'db> {
+    at: At<'me, 'db>,
+    obligations: PredicateObligations<'db>,
+    universes: Vec<Option<UniverseIndex>>,
+}
+
+impl<'db> ReplaceAliasWithInfer<'_, 'db> {
+    fn term_to_infer(&mut self, alias_term: AliasTerm<'db>) -> Term<'db> {
+        let infcx = self.at.infcx;
+        let infer_term = infcx.next_term_var_of_alias_kind(alias_term, self.at.cause.span());
+        self.obligations.push(Obligation::new(
+            infcx.interner,
+            *self.at.cause,
+            self.at.param_env,
+            ProjectionClause { projection_term: alias_term, term: infer_term },
+        ));
+        infer_term
+    }
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for ReplaceAliasWithInfer<'_, 'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.at.infcx.interner
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        t: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.universes.push(None);
+        let t = t.super_fold_with(self);
+        self.universes.pop();
+        t
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if !self.cx().renormalize_rigid_aliases() && !ty.has_non_rigid_aliases() {
+            return ty;
+        }
+
+        let ty = ty.super_fold_with(self);
+        let TyKind::Alias(orig_is_rigid, alias) = ty.kind() else { return ty };
+        if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
+            return ty;
+        }
+
+        if ty.has_escaping_bound_vars() {
+            let (replaced, ..) =
+                BoundVarReplacer::replace_bound_vars(self.at.infcx, &mut self.universes, alias);
+            // Keep the higher-ranked alias in the folded value; the fresh term is only
+            // used to register its projection obligation.
+            let _ = self.term_to_infer(replaced.into());
+            ty
+        } else {
+            self.term_to_infer(alias.into()).expect_type()
+        }
+    }
+
+    fn fold_const(&mut self, ct: Const<'db>) -> Const<'db> {
+        if !self.cx().renormalize_rigid_aliases() && !ct.has_non_rigid_aliases() {
+            return ct;
+        }
+
+        let ct = ct.super_fold_with(self);
+        let ConstKind::Alias(orig_is_rigid, alias_const) = ct.kind() else { return ct };
+        if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
+            return ct;
+        }
+
+        if ct.has_escaping_bound_vars() {
+            let (replaced, ..) = BoundVarReplacer::replace_bound_vars(
+                self.at.infcx,
+                &mut self.universes,
+                alias_const,
+            );
+            // Keep the higher-ranked alias in the folded value; the fresh term is only
+            // used to register its projection obligation.
+            let _ = self.term_to_infer(replaced.into());
+            ct
+        } else {
+            self.term_to_infer(alias_const.into()).expect_const()
+        }
+    }
+}
 
 /// Deeply normalize all aliases in `value`. This does not handle inference and expects
 /// its input to be already fully resolved.
@@ -24,7 +196,7 @@ where
     T: TypeFoldable<DbInterner<'db>>,
 {
     assert!(!value.has_escaping_bound_vars());
-    deeply_normalize_with_skipped_universes(at, value, vec![])
+    deeply_normalize_with_skipped_universes(at, value, Vec::new()) // alloc: empty, no binder entered
 }
 
 /// Deeply normalize all aliases in `value`. This does not handle inference and expects
@@ -45,7 +217,7 @@ where
         deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
             at, value, universes,
         )?;
-    assert_eq!(coroutine_goals, vec![]);
+    assert!(coroutine_goals.is_empty(), "stalled coroutine goals: {coroutine_goals:?}");
 
     Ok(value)
 }
@@ -67,165 +239,29 @@ pub fn deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals<'db
 where
     T: TypeFoldable<DbInterner<'db>>,
 {
-    let fulfill_cx = FulfillmentCtxt::new(at.infcx);
-    let mut folder = NormalizationFolder {
-        at,
-        fulfill_cx,
-        depth: 0,
-        universes,
-        stalled_coroutine_goals: vec![],
-    };
-    let value = value.try_fold_with(&mut folder)?;
-    let errors = folder.fulfill_cx.evaluate_obligations_error_on_ambiguity(at.infcx);
-    if errors.is_empty() { Ok((value, folder.stalled_coroutine_goals)) } else { Err(errors) }
-}
+    let (value, obligations) = normalize_with_universes(at, value, universes)
+        .map_err(|obligation| vec![NextSolverError::TrueError(obligation)])?; // alloc: error path
 
-struct NormalizationFolder<'me, 'db> {
-    at: At<'me, 'db>,
-    fulfill_cx: FulfillmentCtxt<'db>,
-    depth: usize,
-    universes: Vec<Option<UniverseIndex>>,
-    stalled_coroutine_goals: Vec<Goal<'db, Predicate<'db>>>,
-}
+    let mut fulfill_cx = FulfillmentCtxt::new(at.infcx);
+    fulfill_cx.register_predicate_obligations(at.infcx, obligations);
 
-impl<'db> NormalizationFolder<'_, 'db> {
-    fn normalize_alias_term(
-        &mut self,
-        alias_term: Term<'db>,
-    ) -> Result<Term<'db>, Vec<NextSolverError<'db>>> {
-        let infcx = self.at.infcx;
-        let interner = infcx.interner;
-        let recursion_limit = interner.recursion_limit();
-
-        self.depth += 1;
-
-        let infer_term = infcx.next_term_var_of_kind(alias_term, self.at.cause.span());
-        let obligation = Obligation::new(
-            interner,
-            *self.at.cause,
-            self.at.param_env,
-            PredicateKind::AliasRelate(alias_term, infer_term, AliasRelationDirection::Equate),
-        );
-
-        if self.depth > recursion_limit {
-            //     let term = alias_term.to_alias_term().unwrap();
-            //     self.at.infcx.err_ctxt().report_overflow_error(
-            //         OverflowCause::DeeplyNormalize(term),
-            //         self.at.cause.span,
-            //         true,
-            //         |_| {},
-            //     );
-            return Err(vec![NextSolverError::Overflow(obligation)]);
-        }
-
-        self.fulfill_cx.register_predicate_obligation(infcx, obligation);
-        self.select_all_and_stall_coroutine_predicates()?;
-
-        // Alias is guaranteed to be fully structurally resolved,
-        // so we can super fold here.
-        let term = infcx.resolve_vars_if_possible(infer_term);
-        // super-folding the `term` will directly fold the `Ty` or `Const` so
-        // we have to match on the term and super-fold them manually.
-        let result = match term.kind() {
-            TermKind::Ty(ty) => ty.try_super_fold_with(self)?.into(),
-            TermKind::Const(ct) => ct.try_super_fold_with(self)?.into(),
-        };
-        self.depth -= 1;
-        Ok(result)
+    let errors = fulfill_cx.try_evaluate_obligations(at.infcx);
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
-    fn select_all_and_stall_coroutine_predicates(
-        &mut self,
-    ) -> Result<(), Vec<NextSolverError<'db>>> {
-        let errors = self.fulfill_cx.try_evaluate_obligations(self.at.infcx);
-        if !errors.is_empty() {
-            return Err(errors);
-        }
+    let stalled_coroutine_goals = fulfill_cx
+        .drain_stalled_obligations_for_coroutines(at.infcx)
+        .into_iter()
+        .map(|obl| obl.as_goal())
+        .collect(); // alloc: empty unless a goal is stalled on a coroutine
 
-        self.stalled_coroutine_goals.extend(
-            self.fulfill_cx
-                .drain_stalled_obligations_for_coroutines(self.at.infcx)
-                .into_iter()
-                .map(|obl| obl.as_goal()),
-        );
-
-        let errors = self.fulfill_cx.collect_remaining_errors(self.at.infcx);
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
-        Ok(())
-    }
-}
-
-impl<'db> FallibleTypeFolder<DbInterner<'db>> for NormalizationFolder<'_, 'db> {
-    type Error = Vec<NextSolverError<'db>>;
-
-    fn cx(&self) -> DbInterner<'db> {
-        self.at.infcx.interner
+    let errors = fulfill_cx.collect_remaining_errors(at.infcx);
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
-    fn try_fold_binder<T: TypeFoldable<DbInterner<'db>>>(
-        &mut self,
-        t: Binder<'db, T>,
-    ) -> Result<Binder<'db, T>, Self::Error> {
-        self.universes.push(None);
-        let t = t.try_super_fold_with(self)?;
-        self.universes.pop();
-        Ok(t)
-    }
-
-    fn try_fold_ty(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, Self::Error> {
-        let infcx = self.at.infcx;
-        debug_assert_eq!(ty, infcx.shallow_resolve(ty));
-        if !ty.has_aliases() {
-            return Ok(ty);
-        }
-
-        let TyKind::Alias(..) = ty.kind() else { return ty.try_super_fold_with(self) };
-
-        if ty.has_escaping_bound_vars() {
-            let (ty, mapped_regions, mapped_types, mapped_consts) =
-                BoundVarReplacer::replace_bound_vars(infcx, &mut self.universes, ty);
-            let result = self.normalize_alias_term(ty.into())?.expect_type();
-            Ok(PlaceholderReplacer::replace_placeholders(
-                infcx,
-                mapped_regions,
-                mapped_types,
-                mapped_consts,
-                &self.universes,
-                result,
-            ))
-        } else {
-            Ok(self.normalize_alias_term(ty.into())?.expect_type())
-        }
-    }
-
-    fn try_fold_const(&mut self, ct: Const<'db>) -> Result<Const<'db>, Self::Error> {
-        let infcx = self.at.infcx;
-        debug_assert_eq!(ct, infcx.shallow_resolve_const(ct));
-        if !ct.has_aliases() {
-            return Ok(ct);
-        }
-
-        let ConstKind::Unevaluated(..) = ct.kind() else { return ct.try_super_fold_with(self) };
-
-        if ct.has_escaping_bound_vars() {
-            let (ct, mapped_regions, mapped_types, mapped_consts) =
-                BoundVarReplacer::replace_bound_vars(infcx, &mut self.universes, ct);
-            let result = self.normalize_alias_term(ct.into())?.expect_const();
-            Ok(PlaceholderReplacer::replace_placeholders(
-                infcx,
-                mapped_regions,
-                mapped_types,
-                mapped_consts,
-                &self.universes,
-                result,
-            ))
-        } else {
-            Ok(self.normalize_alias_term(ct.into())?.expect_const())
-        }
-    }
+    Ok((value, stalled_coroutine_goals))
 }
 
 // Deeply normalize a value and return it
@@ -254,7 +290,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for DeeplyNormalizeForDiagnosticsFolder<'_
             deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
                 self.at,
                 ty,
-                vec![None; ty.outer_exclusive_binder().as_usize()],
+                vec![None; ty.outer_exclusive_binder().as_usize()], // alloc: diagnostics only
             )
         });
         match result {
@@ -269,7 +305,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for DeeplyNormalizeForDiagnosticsFolder<'_
             deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
                 self.at,
                 ct,
-                vec![None; ct.outer_exclusive_binder().as_usize()],
+                vec![None; ct.outer_exclusive_binder().as_usize()], // alloc: diagnostics only
             )
         });
         match result {

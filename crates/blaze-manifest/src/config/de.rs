@@ -4,23 +4,29 @@
 
 use std::vec;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::HashSet;
 use serde::de::{self, IntoDeserializer};
 
 use super::error::ConfigError;
 use super::key::{ArrayItemKeyPath, ConfigKey};
 use super::value;
 use super::{Config, ConfigValue as CV, Definition, Value};
+use crate::files::Files;
 
-#[derive(Clone)]
-pub(crate) struct Deserializer<'c> {
-    pub(crate) config: &'c Config,
+pub(crate) struct Deserializer<'c, F: Files> {
+    pub(crate) config: &'c Config<F>,
     /// The key being deserialized.
     pub(crate) key: ConfigKey,
     /// Whether a variable that starts with this key's can stand for a table under it: true for
     /// `CARGO_PROFILE_DEV_BUILD_OVERRIDE_*`, false for `CARGO_BUILD_TARGET`, which would
     /// otherwise take `CARGO_BUILD_TARGET_DIR` for one.
     pub(crate) env_prefix_ok: bool,
+}
+
+impl<F: Files> Clone for Deserializer<'_, F> {
+    fn clone(&self) -> Self {
+        Deserializer { config: self.config, key: self.key.clone(), env_prefix_ok: self.env_prefix_ok }
+    }
 }
 
 macro_rules! deserialize_method {
@@ -35,7 +41,7 @@ macro_rules! deserialize_method {
     };
 }
 
-impl<'de> de::Deserializer<'de> for Deserializer<'_> {
+impl<'de, F: Files> de::Deserializer<'de> for Deserializer<'_, F> {
     type Error = ConfigError;
 
     fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -169,8 +175,8 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_> {
     }
 }
 
-struct ConfigMapAccess<'c> {
-    de: Deserializer<'c>,
+struct ConfigMapAccess<'c, F: Files> {
+    de: Deserializer<'c, F>,
     fields: Vec<KeyKind>,
     field_index: usize,
 }
@@ -189,8 +195,8 @@ impl KeyKind {
     }
 }
 
-impl<'c> ConfigMapAccess<'c> {
-    fn new_map(de: Deserializer<'c>) -> Result<ConfigMapAccess<'c>, ConfigError> {
+impl<'c, F: Files> ConfigMapAccess<'c, F> {
+    fn new_map(de: Deserializer<'c, F>) -> Result<ConfigMapAccess<'c, F>, ConfigError> {
         let mut fields = Vec::new();
         if let Some(v) = de.config.get_table(&de.key)? {
             let mut keys: Vec<String> = v.val.into_keys().collect();
@@ -202,9 +208,9 @@ impl<'c> ConfigMapAccess<'c> {
     }
 
     fn new_struct(
-        de: Deserializer<'c>,
+        de: Deserializer<'c, F>,
         given_fields: &'static [&'static str],
-    ) -> Result<ConfigMapAccess<'c>, ConfigError> {
+    ) -> Result<ConfigMapAccess<'c, F>, ConfigError> {
         let table = de.config.get_table(&de.key)?;
         if let Some(v) = table.as_ref() {
             let mut unused: Vec<_> =
@@ -219,7 +225,7 @@ impl<'c> ConfigMapAccess<'c> {
             }
         }
 
-        let mut fields = FxHashSet::default();
+        let mut fields = HashSet::default();
         for field in given_fields {
             let mut field_key = de.key.clone();
             field_key.push(field);
@@ -244,7 +250,7 @@ impl<'c> ConfigMapAccess<'c> {
     }
 }
 
-impl<'de> de::MapAccess<'de> for ConfigMapAccess<'_> {
+impl<'de, F: Files> de::MapAccess<'de> for ConfigMapAccess<'_, F> {
     type Error = ConfigError;
 
     fn next_key_seed<K: de::DeserializeSeed<'de>>(
@@ -311,7 +317,7 @@ struct ConfigSeqAccess {
 }
 
 impl ConfigSeqAccess {
-    fn new(de: Deserializer<'_>) -> Result<ConfigSeqAccess, ConfigError> {
+    fn new<F: Files>(de: Deserializer<'_, F>) -> Result<ConfigSeqAccess, ConfigError> {
         let mut res = Vec::new();
         match de.config.get_cv(&de.key)? {
             Some(CV::List(val, _)) => res.extend(val),
@@ -342,15 +348,15 @@ impl<'de> de::SeqAccess<'de> for ConfigSeqAccess {
     }
 }
 
-enum ValueSource<'c, 'err> {
+enum ValueSource<'c, 'err, F: Files> {
     /// A value addressed by its key.
-    Deserializer { de: Deserializer<'c>, definition: Definition },
+    Deserializer { de: Deserializer<'c, F>, definition: Definition },
     /// A value inside an array, which no key addresses.
     ConfigValue { cv: CV, key_path: &'err mut ArrayItemKeyPath },
 }
 
-impl<'c> ValueSource<'c, '_> {
-    fn with_deserializer(de: Deserializer<'c>) -> Result<Self, ConfigError> {
+impl<'c, F: Files> ValueSource<'c, '_, F> {
+    fn with_deserializer(de: Deserializer<'c, F>) -> Result<Self, ConfigError> {
         let env = de.key.as_env_key();
         let env_def = Definition::Environment(env.to_owned());
         let definition = match (de.config.env(env).is_some(), de.config.get_cv(&de.key)?) {
@@ -369,13 +375,13 @@ impl<'c> ValueSource<'c, '_> {
     }
 }
 
-struct ValueDeserializer<'c, 'err> {
+struct ValueDeserializer<'c, 'err, F: Files> {
     hits: u32,
-    source: ValueSource<'c, 'err>,
+    source: ValueSource<'c, 'err, F>,
 }
 
-impl<'c, 'err> ValueDeserializer<'c, 'err> {
-    fn new(source: ValueSource<'c, 'err>) -> Self {
+impl<'c, 'err, F: Files> ValueDeserializer<'c, 'err, F> {
+    fn new(source: ValueSource<'c, 'err, F>) -> Self {
         Self { hits: 0, source }
     }
 
@@ -387,7 +393,7 @@ impl<'c, 'err> ValueDeserializer<'c, 'err> {
     }
 }
 
-impl<'de> de::MapAccess<'de> for ValueDeserializer<'_, '_> {
+impl<'de, F: Files> de::MapAccess<'de> for ValueDeserializer<'_, '_, F> {
     type Error = ConfigError;
 
     fn next_key_seed<K: de::DeserializeSeed<'de>>(
@@ -448,7 +454,11 @@ impl<'de> de::Deserializer<'de> for ArrayItemDeserializer<'_> {
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
         if name == value::NAME && fields == value::FIELDS {
-            let source = ValueSource::ConfigValue { cv: self.cv, key_path: self.key_path };
+            // `F` is the files of the other variant's deserializer; an array item has none.
+            let source = ValueSource::<'_, '_, crate::files::Disk>::ConfigValue {
+                cv: self.cv,
+                key_path: self.key_path,
+            };
             return visitor.visit_map(ValueDeserializer::new(source));
         }
         visitor.visit_map(ArrayItemMapAccess::with_struct(self.cv, fields, self.key_path))

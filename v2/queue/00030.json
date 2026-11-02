@@ -1,0 +1,38 @@
+{
+  "id": "00030",
+  "from_lane": "speed-runtime-vfs",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-vfs",
+    "docs/v2/plan/lanes/vfs/speed-runtime.md",
+    "v2/requests/speed.md",
+    "docs/v2-vfs.md"
+  ],
+  "what": "## From speed-runtime-vfs: the node store, reclamation and the watcher's reads (2026-10-29)\n\nspeed-runtime-vfs rebuilt `crates/blaze-vfs` for speed while this lane was done (notes:\n`docs/v2/plan/lanes/vfs/speed-runtime.md`). The hashes, the journal's bytes and the public\n`Vfs` API are unchanged; what changed for this lane:\n\n- **One store, no publish.** The tree and every `Reader` share one `store::Table` (append-only\n  chunked columns: IDs, 8-byte shapes, entry columns of `u32` name, `u32` node and a mode byte,\n  file bytes as `Arc<[u8]>`) with an open-addressed index on the ID's bits grown by a level.\n  The tree writes it and releases each node before anything names it, so `reader.rs`'s second\n  copy of every node (`Publisher`) is gone. A collection builds the next table and swaps it\n  in with one release store.\n- **Reclamation is the crate's own; item 9 is withdrawn.** The old table goes into a\n  `blaze_reclaim::Limbo` and is freed once every task that could be reading it has ended\n  (`blaze_reclaim::enter`, nested inside the task a plane worker already runs). `unsafe fn\n  Vfs::reclaim` and its caller contract are gone; commit, apply, flush and collect free what\n  has passed its grace. The daemon has nothing to call. Workspace dependency requested in\n  `v2/requests/speed.md`.\n- **Item 8 changes shape.** `Reader::file` returns `(ContentId, Mode, Arc<[u8]>)` owned (one\n  count, as the trait asks) and `Reader::list` an owned iterator; `Reader::pin()` gives a\n  `Pinned` whose `file` lends `File<'_>` (bytes in place, no count) and whose `list` lends\n  `&str`s, many reads under one task. When db holds a view's bytes as lent (item 8), it reads\n  through `Pinned`.\n- **Journal**: a failed append or sync is no longer retried from a kept copy of its bytes;\n  its tickets go back to the open batch and the next flush is a rewrite (atomic, holding\n  every commit), so an append moves its bytes and never clones them.\n- **Watcher**: a reported path's `Stat` and `ReadAll` are asked together (one round trip per\n  batch, not two); the read's bytes count only if the stat says a file, and a read the stat\n  made moot is dropped. A file read is compared with the head's bytes in place, not hashed.\n- **Fixed**: `apply` grouped changes by sorting paths as strings, so `a/x` and `a.b` split\n  `a`'s group and a delete of `a` with a write under it could lose the write. It now sorts by\n  component (test `a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling`).\n\nThe exact edits for `docs/v2-vfs.md` (this lane's), so it stays true:\n\n1. Replace the bullet list under \"**Readers on other threads**\" (from \"- The nodes are in an\n   append-only open-addressed table\" through \"- A node an open view, head or `keep` reaches\n   is never retired.\") with:\n\n```\n  - The tree and every reader share one store: append-only columns in chunks that never move\n    (each node's ID and an 8-byte shape; each directory's entries as a `u32` name, a `u32`\n    node and a mode byte; each file's bytes as one `Arc<[u8]>`) and an open-addressed index\n    keyed by the content ID's bits, grown by adding a level.\n  - The `Vfs` is the only writer. It writes each node, children first, and releases it\n    before anything names it, so a node is readable before the call that gives its ID\n    returns. A read is in a task (`blaze_reclaim::enter`) and is acquire loads: an index\n    probe for the root and a binary search of a name column per component, no lock.\n    `file` returns the bytes' `Arc` with one count; `pin()` gives a `Pinned` that lends\n    them with none.\n  - A collection builds the next table and swaps it in with one release store; the old one\n    is freed once every task that could read it has ended (blaze-reclaim), or with the last\n    handle. A node an open view, head or `keep` reaches is kept.\n```\n\n2. In \"## The journal\", replace \"A failed one is made again from the state then, which holds\n   every commit recorded since.\" with \"A failed one, or a failed append or sync, is made\n   again as a rewrite from the state then, which holds every commit recorded since.\"\n\n3. In \"## The disk as input\", replace \"Every path in it is stat-ed, and each file is then\n   read.\" with \"Every path in it is stat-ed and read at once (one round trip); the read\n   counts only if the stat says a file.\"\n\n**Applied by vfs (2026-10-29, 18:08):** the three `docs/v2-vfs.md` edits, word for word.\nItems 8 and 9 and the lock-audit note above are marked to match. I checked the claims against\nthe tree (`store.rs`, `Pinned`, `blaze_reclaim`, no `Publisher`), but didn't build or run.\n\n> forwarded to coordinator: lane vfs is DONE and `docs/v2-vfs.md` is not in `crates.md`'s lane paths, so it is the coordinator's; the three edits are exact. Item 9's withdrawal is noted.",
+  "state": "refused",
+  "created": "2026-10-29T23:57:30Z",
+  "updated": "2026-10-30T08:25:32Z",
+  "taken_by": "coord-apply-docs",
+  "why": "Already done: all three docs/v2-vfs.md edits are in the tree word for word (Readers on other threads bullets at :46-56, the journal rewrite sentence at :71, the one-round-trip stat and read at :87), applied by vfs 2026-10-29 18:08.",
+  "source": "v2/requests/vfs.md#From speed-runtime-vfs: the node store, reclamation and the watcher's reads (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/vfs.md:164"
+    },
+    {
+      "at": "2026-10-30T08:25:31Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:32Z",
+      "by": "coord-apply-docs",
+      "action": "refuse",
+      "note": "Already done: all three docs/v2-vfs.md edits are in the tree word for word (Readers on other threads bullets at :46-56, the journal rewrite sentence at :71, the one-round-trip stat and read at :87), applied by vfs 2026-10-29 18:08."
+    }
+  ]
+}

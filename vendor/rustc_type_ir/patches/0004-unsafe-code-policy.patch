@@ -1,0 +1,122 @@
+diff -ruN a/src/fold.rs b/src/fold.rs
+--- a/src/fold.rs
++++ b/src/fold.rs
+@@ -289,6 +289,10 @@
+     }
+ }
+ 
++/// Folds the `T` in `arc` in place when `arc` is its only owner, so a fold allocates no new
++/// `Arc` and clones nothing; `tests::fold_arc_matches_the_safe_fold` checks it against
++/// `Arc::new(fold(Arc::unwrap_or_clone(arc))?)`.
++#[allow(unsafe_code)]
+ fn fold_arc<T: Clone, E>(
+     mut arc: Arc<T>,
+     fold: impl FnOnce(T) -> Result<T, E>,
+@@ -296,6 +300,12 @@
+     // We merely want to replace the contained `T`, if at all possible,
+     // so that we don't needlessly allocate a new `Arc` or indeed clone
+     // the contained type.
++    // SAFETY: `Arc::make_mut` leaves `arc` the one owner of its `T`, so `get_mut` is `Some`.
++    // `ManuallyDrop<T>` is `repr(transparent)` over `T`, so the two `Arc` casts name one
++    // allocation of one layout. The `T` moved out by `ManuallyDrop::take` is replaced before
++    // the `Arc` is cast back. If `fold` fails or unwinds, the slot is never dropped as a `T`
++    // (it is a `ManuallyDrop`): the moved-out value is dropped once, by `fold`, and never
++    // twice.
+     unsafe {
+         // First step is to ensure that we have a unique reference to
+         // the contained type, which `Arc::make_mut` will accomplish (by
+@@ -914,5 +924,53 @@
+ 
+     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+         if self.mode.needs_change(&c) { c.super_fold_with(self) } else { c }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use super::fold_arc;
++
++    /// The safe fold `fold_arc` must give the same value as.
++    fn safe_fold<T: Clone, E>(arc: Arc<T>, fold: impl FnOnce(T) -> Result<T, E>) -> Result<Arc<T>, E> {
++        Ok(Arc::new(fold(Arc::unwrap_or_clone(arc))?))
++    }
++
++    fn double(values: Vec<u32>) -> Result<Vec<u32>, ()> {
++        Ok(values.into_iter().map(|it| it * 2).collect())
++    }
++
++    #[test]
++    fn fold_arc_matches_the_safe_fold() {
++        let unique = Arc::new(vec![1, 2, 3]);
++        let at = Arc::as_ptr(&unique);
++        let folded = fold_arc(unique, double).unwrap();
++        assert_eq!(folded, safe_fold(Arc::new(vec![1, 2, 3]), double).unwrap());
++        assert_eq!(Arc::as_ptr(&folded), at, "a unique `Arc` is folded in place");
++
++        let shared = Arc::new(vec![4, 5]);
++        let kept = Arc::clone(&shared);
++        let folded = fold_arc(shared, double).unwrap();
++        assert_eq!(folded, safe_fold(Arc::clone(&kept), double).unwrap());
++        assert_eq!(*kept, vec![4, 5], "a shared `Arc`'s other owners keep the old value");
++    }
++
++    #[test]
++    fn a_failed_fold_drops_the_value_once() {
++        struct Counted(Arc<()>);
++        impl Clone for Counted {
++            fn clone(&self) -> Counted {
++                Counted(Arc::clone(&self.0))
++            }
++        }
++        let alive = Arc::new(());
++        let result = fold_arc(Arc::new(Counted(Arc::clone(&alive))), |it| {
++            drop(it);
++            Err(())
++        });
++        assert!(result.is_err());
++        assert_eq!(Arc::strong_count(&alive), 1, "dropped by the fold, and not again");
+     }
+ }
+diff -ruN a/src/generic_visit.rs b/src/generic_visit.rs
+--- a/src/generic_visit.rs
++++ b/src/generic_visit.rs
+@@ -8,6 +8,11 @@
+ //!  - It **must visit** every field. This is why we don't have an attribute like `#[type_visitable(ignore)]`
+ //!    for this visit. The reason for this is soundness: rust-analyzer uses this visit to
+ //!    garbage collect types, so a missing field can mean a use after free
++// SAFETY: every `unsafe impl` below is for a container (a reference, a tuple, `Option`,
++// `Result`, a pointer, a collection, an array or a slice) and visits each value it holds, and
++// a map's or set's hasher, which is the trait's contract. `BuildHasherDefault` and
++// `PhantomData` hold no value, and `FnSigKind` is packed bits, so those visit nothing.
++#![allow(unsafe_code)]
+ 
+ use std::sync::Arc;
+ 
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -34,6 +34,10 @@
+     cfg_attr(not(bootstrap), deny(rustc::missing_generic_type_visitable_derive))
+ )]
+ // tidy-alphabetical-end
++// docs/v2/plan/design/unsafe.md: `unsafe` is allowed only at `fold::fold_arc`, the
++// `GenericTypeVisitable` impls of `generic_visit`, `TrivialTypeTraversalImpls!` and the
++// `GenericTypeVisitable` derive, each with its `SAFETY:` comment.
++#![deny(unsafe_code)]
+ 
+ extern crate self as rustc_type_ir;
+ 
+diff -ruN a/src/macros.rs b/src/macros.rs
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -34,6 +34,8 @@
+ 
+             // NOTE: this deliberately avoids adding an `I: Interner` generic, because that would
+             // allow creating a trivial impl for arena-allocating types, which would be incorrect.
++            // SAFETY: the types listed hold no arena-allocated data, so there is nothing to visit.
++            #[allow(unsafe_code)]
+             unsafe impl<V> $crate::GenericTypeVisitable<V> for $ty {
+                 fn generic_visit_with(&self, _visitor: &mut V) {}
+             }

@@ -4,13 +4,16 @@
 //! Follows clippy's `clippy_lints/src/crate_in_macro_def.rs` at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, ast, ast::HasAttrs as _};
+use syntax::{
+    NodeOrToken, SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _},
+};
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "crate_in_macro_def";
+const LINT: super::Implemented = super::Implemented::CrateInMacroDef;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, rules: &ast::MacroRules) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, rules: ast::MacroRules<'t>) {
     if !cx.on(LINT) || !cx.in_file() {
         return;
     }
@@ -35,13 +38,18 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, rules: &ast::MacroRules) {
 }
 
 /// clippy's `contains_unhygienic_crate_reference`: the first `crate` followed by `::` and not
-/// by `$`, in the trees of `tt` in order.
-fn unhygienic_crate(tt: &SyntaxNode) -> Option<TextRange> {
-    let trees: Vec<_> = tt.children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
-    let inner = trees.get(1..trees.len().saturating_sub(1)).unwrap_or_default();
+/// by `$`, in the trees of `tt` in order, between its delimiters.
+fn unhygienic_crate(tt: ast::Node<'_>) -> Option<TextRange> {
+    let mut trees = tt.children_with_tokens().filter(|it| !it.kind().is_trivia());
+    trees.next()?;
     let mut prev_is_dollar = false;
-    for (at, tree) in inner.iter().enumerate() {
-        if !prev_is_dollar && tree.kind() == SyntaxKind::CRATE_KW && path_sep_at(inner, at + 1) {
+    while let Some(tree) = trees.next() {
+        // The last tree is the closing delimiter.
+        if trees.clone().next().is_none() {
+            break;
+        }
+        if !prev_is_dollar && tree.kind() == SyntaxKind::CRATE_KW && path_sep_next(trees.clone())
+        {
             return Some(tree.text_range());
         }
         if let NodeOrToken::Node(node) = tree
@@ -54,9 +62,10 @@ fn unhygienic_crate(tt: &SyntaxNode) -> Option<TextRange> {
     None
 }
 
-/// Whether `::` starts at `trees[at]`, as one token or as two joined colons.
-fn path_sep_at(trees: &[NodeOrToken<SyntaxNode, syntax::SyntaxToken>], at: usize) -> bool {
-    match (trees.get(at), trees.get(at + 1)) {
+/// Whether `::` comes next in `rest`, as one token or as two joined colons. A closing
+/// delimiter is neither, so it needs no excluding.
+fn path_sep_next<'t>(mut rest: impl Iterator<Item = ast::Element<'t>>) -> bool {
+    match (rest.next(), rest.next()) {
         (Some(first), _) if first.kind() == SyntaxKind::COLON2 => true,
         (Some(NodeOrToken::Token(first)), Some(NodeOrToken::Token(second))) => {
             first.kind() == SyntaxKind::COLON

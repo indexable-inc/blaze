@@ -10,8 +10,9 @@ usage: tierbench.py [--seconds 25] [--from 15] [--rounds 1] [--together] [--only
 The builds, by NAME:
 
   cranelift  level 1: a daemon with BLAZE_TIER=off
-  llvm       every function by LLVM at -O3, nothing built in: a daemon with BLAZE_TIER=off,
-             BLAZE_BACKEND=llvm and BLAZE_OPT=3 (not one of the defaults)
+  llvm       every function by LLVM at -O3, nothing built in: a daemon with BLAZE_TIER=off and
+             the dev profile at opt-level 3 (CARGO_PROFILE_DEV_OPT_LEVEL=3), which v2 compiles
+             with LLVM
   level2     a daemon with BLAZE_TIER=2: LLVM -O3, no counting, no PGO
   level3     a daemon as it comes: level 2 counts, level 3 is compiled with what it counted
   checked    cargo, `-C opt-level=3 -C overflow-checks -C debug-assertions`: what the dev
@@ -87,7 +88,7 @@ async def main() -> None:
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=tiers.PIN)
-        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "BLAZE_BACKEND", "BLAZE_OPT", "RUSTFLAGS"):
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "RUSTFLAGS"):
             base.pop(name, None)
 
         binaries: dict[str, tuple[Path, dict[str, str]]] = {}
@@ -113,7 +114,7 @@ async def main() -> None:
             if name == "cranelift":
                 env["BLAZE_TIER"] = "off"
             elif name == "llvm":
-                env.update(BLAZE_TIER="off", BLAZE_BACKEND="llvm", BLAZE_OPT="3")
+                env.update(BLAZE_TIER="off", CARGO_PROFILE_DEV_OPT_LEVEL="3")
             elif name == "level2":
                 env["BLAZE_TIER"] = "2"
             await tiers.serve(project, env)

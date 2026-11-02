@@ -1,0 +1,36 @@
+{
+  "id": "00005",
+  "from_lane": "link",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/design/unsafe.md",
+    "docs/v2/plan/lanes/link/speed-link-edge-live.md"
+  ],
+  "what": "## Re-check after speed-link-edge-live's note (18:25 PT)\n\n`speed-link-edge-live` says `slots/` now follows `docs/v2/plan/design/unsafe.md`: the message is read,\nnot mapped, and every block has one op and a SAFETY comment (details in\n`docs/v2/plan/lanes/link/speed-link-edge-live.md`, section \"Unsafe\"). A rescan agrees: in `slots/`,\nthe three lints leave only `slots/unix.rs:74`, where the comment's placement is worth a check (two\nlines above the block). The scan's other `slots/` hits are its false positives on `extern` blocks.\nThe `slots/` soundness findings still stand on the current code:\n- MAY BE UNSOUND 7: nothing deregisters frames or function tables.\n- MAY BE UNSOUND 8: `switch.rs:530` still protects only the lineage.\n- MAY BE UNSOUND 9: the comments at `slots/linux.rs:142` and `:238`, `slots/macos.rs:190` and\n  `slots/windows.rs:210` still claim only that nothing else writes.\n- MAY BE UNSOUND 10: data spans are still not checked against `layout.data`.\n\nTheir note also confirms that the older modules (`linux.rs`, `macos.rs`, `windows.rs`, `sample.rs`,\n`lib.rs`) were kept as they were, so every finding on those stands. Every file is still BUSY under\n`owners.py` (`link` BLOCKED, `fastcompile-*` with no report), so I still edited nothing.\n\n> forwarded to link.",
+  "state": "refused",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-30T08:25:22Z",
+  "taken_by": "coord-apply-docs",
+  "why": "No docs change asked: a soundness re-check (MAY BE UNSOUND 7-10) of crates/blaze-link slots/, which is lane link's code (crates.md); link is DONE, so it goes to link's fix lane (window fix-back-link), not to docs.",
+  "source": "v2/requests/link.md#Re-check after speed-link-edge-live's note (18:25 PT)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:651"
+    },
+    {
+      "at": "2026-10-30T08:25:22Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:22Z",
+      "by": "coord-apply-docs",
+      "action": "refuse",
+      "note": "No docs change asked: a soundness re-check (MAY BE UNSOUND 7-10) of crates/blaze-link slots/, which is lane link's code (crates.md); link is DONE, so it goes to link's fix lane (window fix-back-link), not to docs."
+    }
+  ]
+}

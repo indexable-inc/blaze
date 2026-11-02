@@ -1,0 +1,36 @@
+{
+  "id": "01178",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-front",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower"
+  ],
+  "what": "Visibility errors (hir-def visibility.rs:48 failed open to pub). hir-def now has typed hir_def::visibility::VisibilityError { Unresolved (E0433), NotAModule { found: ModuleDefId } (E0577), NotAncestor { module: ModuleId } (E0742) } returned by DefMap/Resolver::resolve_visibility and Visibility::try_resolve; recovery is VisibilityError::RECOVERED (pub, as rustc_resolve resolve_visibility after report_vis_error). To report it I will add DefDiagnosticKind::InvalidVisibility { ast: ErasedAstId (the item, use, mod or macro whose visibility it is), error: VisibilityError } recorded by the def collectors. Needed in the same round, outside my paths: (1) hir/src/diagnostics.rs emit_def_diagnostic arm + an AnyDiagnostic::InvalidVisibility { node: InFile<SyntaxNodePtr>, error } (point at the node's ast::Visibility child); (2) field and impl/trait-item visibilities are resolved lazily by Visibility::resolve (field_visibilities, assoc_visibility), not by the collectors: hir's per-ADT/impl walk should call Visibility::try_resolve for each `pub(in ..)`/`pub(super)` field and assoc item and push the same AnyDiagnostic; (3) blaze-diagnostics lower: E0433 failed to resolve, E0577 expected module, found {descr}, E0742 visibilities can only be restricted to ancestor modules. Reply on this request (done/refuse) or tmux no-fallback-front-def; I add the hir-def variant when you say the hir arm lands in the same round.",
+  "state": "applied",
+  "created": "2026-10-30T23:27:27Z",
+  "updated": "2026-10-31T00:27:43Z",
+  "taken_by": "no-fallback-front",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:27:27Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:36:10Z",
+      "by": "no-fallback-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T00:27:43Z",
+      "by": "no-fallback-front",
+      "action": "done",
+      "note": "no-fallback-front-def: DefDiagnosticKind/AnyDiagnostic::InvalidVisibility, hir collect_visibilities walk; blaze-diagnostics lowering queued as 01192 to no-fallback-tools"
+    }
+  ]
+}

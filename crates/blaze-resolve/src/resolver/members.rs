@@ -9,7 +9,7 @@ use std::rc::Rc;
 use anyhow::bail;
 
 use super::features::CliFeatures;
-use super::{CargoResult, HashMap};
+use super::{CargoResult, HashMap, HashSet};
 use crate::dependency::Dependency;
 use crate::edit_distance::{closest_msg, edit_distance};
 use crate::interning::InternedString;
@@ -70,17 +70,18 @@ fn collect_matching_features(
     let summary_features = member.features();
 
     // Dependency name -> dependency
-    let dependencies: BTreeMap<InternedString, &Dependency> =
+    let dependencies: HashMap<InternedString, &Dependency> =
         member.dependencies().iter().map(|dep| (dep.name_in_toml(), dep)).collect();
 
     // Features that enable optional dependencies
-    let optional_dependency_names: BTreeSet<_> = dependencies
+    let optional_dependency_names: HashSet<_> = dependencies
         .iter()
         .filter(|(_, dep)| dep.is_optional())
         .map(|(name, _)| name)
         .copied()
         .collect();
 
+    // BTreeSet: becomes `CliFeatures::features`, which is hashed and compared.
     let mut features = BTreeSet::new();
 
     // Checks if a member contains the given feature.

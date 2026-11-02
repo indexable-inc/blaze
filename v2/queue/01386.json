@@ -1,0 +1,24 @@
+{
+  "id": "01386",
+  "from_lane": "codegen-names",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-share/src/code.rs",
+    "crates/hir-ty-share/src/tests/identity.rs"
+  ],
+  "what": "01351 second half, crates/hir-ty-share/src/code.rs (no owner in crates.md): binding names leave the code key. codegen-names already made v2/side.rs tell a local by its binding index (side VERSION 4, SIDE_DOMAIN side 4) and v2/backend.rs named fill it, so no codegen output holds a binding name now (the v2 link writes line rows only; the debug record writer of 01354 reads names from the db). Edit: in with_spans delete the line out.extend_from_slice(&names(db, body).0); delete fn names and NAMES_DOMAIN; bump CODE_DOMAIN to blaze v2 codegen code 2; module doc: drop the names of its bindings, which its debug info tells, and the coroutine identity sentence part their names. blaze-items form already leaves names out (binding ids are positions in the store), so a local rename then keeps Hashes::code. crates/hir-ty-share/src/tests/identity.rs a_coroutines_identity_holds_its_binding_names becomes a_coroutine_s_identity_is_kept_by_renaming_its_locals: after renaming one to uno, assert_eq!(after.0, before.0) (no cached output spells a local name, so a rename rebuilds nothing); drop the Old::Codegen/Share comparison there and the module doc sentence about it (rule 5, not parity with an old spelling). Independent of codegen-names edits in either order: both compile alone; before this the key only covers more. Then cargo test -p hir-ty-share and -p hir-ty-codegen v2::.",
+  "state": "open",
+  "created": "2026-11-01T00:18:23Z",
+  "updated": "2026-11-01T00:18:23Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:18:23Z",
+      "by": "codegen-names",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

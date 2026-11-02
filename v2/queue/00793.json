@@ -1,0 +1,35 @@
+{
+  "id": "00793",
+  "from_lane": "speed-unsafe-front-def",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs"
+  ],
+  "what": "crates/hir/src/lib.rs ~L706 (`impl From<ModuleIdLt<..>> for Module`): `Module { id: unsafe { id.to_static() } }` -> `Module { id: id.to_static() }` and drop its `// SAFETY:` comment. hir-def made `ModuleIdLt::to_static`/`to_db` and `BlockIdLt::to_static`/`BlockId::to_db` safe fns (salsa FromId/AsId; a stale id panics or reads a same-typed slot, never UB), so this block is now `unused_unsafe`.",
+  "state": "applied",
+  "created": "2026-10-30T08:03:18Z",
+  "updated": "2026-10-30T10:00:06Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:03:18Z",
+      "by": "speed-unsafe-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: crates/hir/src/lib.rs Module::nearest_non_block_module is `Module { id: id.to_static() }`, SAFETY comment dropped (to_static is a safe fn in hir-def lib.rs:697)"
+    }
+  ]
+}

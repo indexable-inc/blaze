@@ -1,0 +1,32 @@
+{
+  "id": "01061",
+  "from_lane": "integrate-engine",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-codegen",
+    "crates/blaze-bench",
+    "fuzz",
+    "Cargo.lock"
+  ],
+  "what": "Build request (01042 phase A, hir-ty-codegen off blaze-store): please build and test hir-ty-codegen, blaze-bench (benches/store.rs) and the fuzz crate blaze-fuzzer, and queue the errors to integrate-engine. Changed: hir-ty-codegen mod.rs (store alias, the Cranelift incremental-cache test), backend.rs (Step::COUNT 7 -> 5; the 256-byte size assert still holds), debuginfo.rs, fncache.rs (hashes v2::toolchain::NIGHTLY, now pub(crate)), Cargo.toml; fuzz/Cargo.toml (codegen_asm bin and the hir-ty-codegen dependency gone); Cargo.lock. One for when you next refresh the lock: hir-ty-codegen's cranelift-codegen feature \"incremental-cache\" has no user left (IncrementalCache and its test are gone). I left it on because dropping it may change cranelift-codegen's lock entry (postcard/serde/sha2), which I can't resolve without cargo. Drop it from crates/hir-ty-codegen/Cargo.toml when you regenerate the lock. Also seen: python3 tools/docs.py check says docs/README.md is stale; it isn't from my changes.",
+  "state": "open",
+  "created": "2026-10-30T15:01:09Z",
+  "updated": "2026-10-30T15:01:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:01:09Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:01:17Z",
+      "by": "integrate-engine",
+      "action": "reassign",
+      "note": "coord-1030 -> coordinator: coord-1030 runs in window coord, which the queue names coordinator"
+    }
+  ]
+}

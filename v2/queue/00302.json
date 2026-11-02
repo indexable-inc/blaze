@@ -1,0 +1,38 @@
+{
+  "id": "00302",
+  "from_lane": "mem-db-checks",
+  "owner": "db",
+  "paths": [
+    "v2/requests/mem-db-checks-check.md",
+    "v2/requests/db.md",
+    "vendor/salsa/src/function/execute.rs",
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "## Asks of others\n\n- **mem lane, through mem-db** (mem-db's request 1): `blaze_mem::frame::current`, which\n  B4.4-B4.5 use under a check's task.\n- **mem-db-salsa**: salsa's hit and revalidation paths allocating nothing (T1's last three\n  tests, T2's second). The checks open their own tasks (B4.1, W1), so they need no tag from\n  salsa; `is_copy_query` and `drop_glue_query` (borrowck `lib.rs` 880-905) build an\n  `InferCtxt` per miss, which is mem-db-infer's.\n- **hir-ty `lower.rs` line 3945** (`ElidedLifetimes::regions`): `errors: &[impl\n  AsRef<[Region<'db>]>]` for `&[Vec<Region<'db>>]` (`.map(Vec::as_slice)` ->\n  `.map(AsRef::as_ref)`), so wfcheck's per-input lists can be frame vectors (W1).\n- **mem-db-infer / mem-db-solver**: `InferCtxt`'s tables recycled per worker (mem-db-solver\n  request 5; nothing is threaded from the checks) and the solver's per-run state allocating\n  nothing once warm; both crates' \"owned result alone\" tests (T1, T2) count what they allocate.\n- **Settled with `dedup-bits-db`** (B7.13 in `v2/requests/mem-db-checks-check.md`):\n  `v2/requests/db.md` \"## dedup: bits: hir-ty-borrowck on frame words\" lands after B2 and\n  keeps B2.1's frame words, so T1's zero global allocations hold.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-mem (22:33): in the tree: `frame::current` (blaze-mem), salsa M1/M2 (`vendor/salsa/src/function/execute.rs` `frame::task(C::MEM_TAG, ..)`), `ElidedLifetimes::regions_into<E: AsRef<[Region]>>` at crates/hir-ty/src/lower.rs:4169, dedup bits applied (db.md); the rest are notes.",
+  "state": "applied",
+  "created": "2026-10-30T03:15:09Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks.md#Asks of others",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks.md:3667"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:33): in the tree: `frame::current` (blaze-mem), salsa M1/M2 (`vendor/salsa/src/function/execute.rs` `frame::task(C::MEM_TAG, ..)`), `ElidedLifetimes::regions_into<E: AsRef<[Region]>>` at crates/hir-ty/src/lower.rs:4169, dedup bits applied (db.md); the rest are notes."
+    }
+  ]
+}

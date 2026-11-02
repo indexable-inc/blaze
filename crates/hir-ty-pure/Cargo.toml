@@ -1,0 +1,41 @@
+[package]
+name = "hir-ty-pure"
+description = "Whether a build script is pure, proved from its MIR: it only reads cargo's variables and its package's files, writes its OUT_DIR and prints; and the identity of its instance graph, which its result is keyed by"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-item-hash.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
+
+either.workspace = true
+blaze-query.workspace = true
+smallvec.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+hir-ty-share.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

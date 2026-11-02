@@ -1,0 +1,51 @@
+{
+  "id": "00605",
+  "from_lane": "mem-db",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-query",
+    "vendor/salsa",
+    "v2/requests/mem-db-salsa.md",
+    "crates/hir-ty",
+    "v2/requests/mem-db-infer.md",
+    "crates/hir-ty/src/next_solver",
+    "vendor/rustc_type_ir",
+    "vendor/rustc_next_trait_solver",
+    "v2/requests/mem-db-solver.md",
+    "crates/base-db",
+    "crates/hir-expand",
+    "crates/hir",
+    "crates/hir-def",
+    "v2/requests/mem-db-def.md",
+    "crates/hir-ty-borrowck",
+    "crates/hir-ty-wfcheck",
+    "v2/requests/mem-db-checks.md"
+  ],
+  "what": "## Per crate: what moves onto blaze-mem, and the test that holds it\n\nThe index of every change, by crate and by the four parts of the brief: (1) query runs on\nframes, (2) tables on reserved regions, (3) the solver cache's generations, (4) per-call\nscratch. Each line names where the exact change is. \"Applied\" means the code is in the tree now;\neverything else waits on its owner.\n\n- **`crates/blaze-query/`** (lane db, `db-next3`).\n  1. Request 5 runs each query in `frame::task(info.tag, ..)` (`Query::TAG`, default `Query`).\n     Request 7 puts `collect`, `Store::sweep` and `Map::edit_all_with` in frame tasks, their\n     lists, sets and bitsets `Vec<_, &Frame>` and `hashbrown` sets in the frame. A run's value\n     is not a frame value: `run_query` writes it into the thread's kept buffer inside the task,\n     and the store copies it into a value segment (contract 4, request 8).\n  2. Request 8: `Rows` and `Generations` are on `Region`s tagged `Query` (applied, db-query's\n     request 3). Request 7 recycles the shards' outgrown tables by length. Left, by lane mem's\n     ruling: the value, edge and key segments.\n  4. Request 6 reuses closed views' states. Request 9 moves `add_memo`'s list onto\n     `scratch::with_u32s` and `learn_key`'s bytes onto `scratch::lend_bytes`.\n  - Tests: `a_warm_hit_allocates_nothing` (exists), `a_revalidation_that_changes_nothing_allocates_nothing`\n    (6), `a_warm_collection_allocates_nothing`, `a_settled_map_rehashes_without_allocating` (7),\n    `a_warm_miss_allocates_at_most_a_segment` (9), `a_run_is_a_frame_task_of_its_querys_tag` (5).\n- **`vendor/salsa*`** (lane db; `speed-salsa-next3` has the file). `v2/requests/mem-db-salsa.md`.\n  1. M1: `C::execute`, `cycle_initial` and `recover_from_cycle` run in\n     `frame::task(C::MEM_TAG, ..)`, with one task per fixpoint iteration. M2 adds the\n     `mem_tag` option. M3 keeps a run's edge fingerprints in a reused buffer and gives the memo\n     an exact copy. Memos stay owned; their slots are on `Region` in `table/memo.rs` (applied).\n  2. M5 moves the page list onto `Column<Page>` (`Query`) and the page slots onto region bump\n     arenas (`Query`, and `Intern` for interned values). M6 takes the graph's edge and node pages\n     from the kernel. What stays on the heap, and why, is M5's table.\n  4. M7 replaces the claim-free verify's spilling `SmallVec` with a reused per-thread stack.\n     Hits, claims, backdating and read recording already allocate nothing warm (speed-salsa S1 to S5).\n  - Tests (M8): `tests/alloc_budget.rs` holds a memo hit, a deep verify that changes nothing\n    and a warm re-check to 0. `tests/mem_frames.rs` checks tags, nested frames, fixpoint and\n    both cycle functions.\n- **`crates/hir-ty/`, not `next_solver/`** (lane db; appliers `db-mem-infer-a`, `db-mem-infer-b`).\n  `v2/requests/mem-db-infer.md` is the index, with one file per part (`-ctx`, `-expr`,\n  `-closure`, `-lower`, `-method`, `-eval`).\n  1. `InferenceContext<'db, 'f>` and the lowering contexts hold the run's `&'f Frame`, and\n     their worklists, tables' scratch and buffers are frame vectors and `FrameMap`/`FrameSet`.\n     `InferenceResult`, `ClosureData` and the impl tables are built once at their exact size.\n     Every tracked function gets `mem_tag` (`Infer`, and `Mir` for MIR queries).\n  4. Per-call buffers on lookup paths go through `scratch` (each part file lists its own).\n  - Tests: `tests/budget.rs` (a warm re-check of unchanged bodies is 0; a cold `infer` is held\n    to its result's own allocations; the frame's peak grows linearly with body size).\n- **`crates/hir-ty/src/next_solver/`, `vendor/rustc_type_ir`, `vendor/rustc_next_trait_solver`**\n  (solver-sync, and lane db for `infer/`, `fulfill.rs` and the glue). `v2/requests/mem-db-solver.md`.\n  1. This is the contract's one exception. A canonical goal makes a fresh `InferCtxt`, thousands\n     per `infer`, so its tables, canonicalizer state, search-graph storage and per-goal vectors\n     come from storage the worker keeps and recycles (requests 2, 3, 5 and 6), not from the\n     frame, which can't roll back.\n  2. Request 9 puts the interner's `mod table` columns and index on `Region`s tagged `Intern`.\n  3. Request 4 above (`tls_cache.rs`) takes generations from a `Pool` tagged `Infer` and retires\n     them through `pool::Limbo`. Its test `a_warm_replace_allocates_nothing` holds 3,968 warm\n     replaces to 0 allocations, and `a_miss_into_an_empty_slot_allocates_nothing` holds a miss\n     to 0.\n  - Tests (request 8): a global-cache hit, a cached canonical response and a warm re-solve, each 0.\n- **`crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/`** (lane db;\n  applier `db-mem-def`; `mem-db-def-collect.md` is frontend-nameres's). `v2/requests/mem-db-def.md`,\n  with `-expand`, `-hir`, `-items`, `-resolve` and `-collect`.\n  1. base-db's setters and `set_view_root` run in `frame::task(Tag::Parse, ..)` (B1, B2).\n     `run_all` takes a tag and frames each task (B5; applied at `db.rs:306`). The building\n     `DefMap`'s scopes live in the collection's frame, copied exact at `settle` (R10, Part H).\n     hir has no tracked functions, so `SymbolCollector` is framed by ide-db's queries.\n  2. B4 moves base-db's `Column` onto `AppendVec<AtomicU64>`, `Log` onto `blaze_mem::Column`\n     and `Table`'s levels onto `AppendVec<AtomicU32>`, all tagged `Query`. hir-def's interned\n     values move with salsa's `Intern` arena (salsa M5).\n  4. `run_on_pool` uses lent `u32` buffers (B5). `path_key` goes through `scratch::with_bytes`,\n     and the content hashes through a per-thread `Scratch<ContentId>` (B1).\n  - Tests: base-db's `budget_tests.rs` (`PER_CALL` 1, `PER_CHANGED_FILE` 2, deps memo hits 0,\n    `run_all` 0); hir-def's `alloc_budgets.rs`, T5 (a cold collection allocates the same\n    whatever the module's width) and T6.\n- **`crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/`** (applier `db-mem-borrowck`;\n  `frontend-fast-borrowck` applies its dataflow files itself). `v2/requests/mem-db-checks.md`,\n  with `-regions` and `-check`.\n  1. Every checker query opens `frame::task(Tag::Mir, ..)` (wfcheck: `Infer`), with one nested\n     task per body. The bitsets, relations, dataflow and CFG are frame values, and\n     `DropConstraint` and `InferredOutlives` are exact-size. Partly applied: `mem.rs`,\n     `bitset.rs`, `cfg.rs`, `dataflow.rs`, `rows.rs` and wfcheck's `lib.rs`/`outlives.rs` open\n     tasks now.\n  4. Table S lists every per-call buffer and the reused one replacing it.\n  - Tests: `src/budget.rs` in each crate. A clean or erroring body allocates its owned result\n    alone; asking again is 0, so is the check after an edit to another file, and so is a\n    passing `gate::checked`.\n\nOpen with lane mem (`mem-next1`), each blocking only the code that calls it: request 2\n(`Pooled::into_raw`/`from_raw`, for request 4), 10 (nested tasks past `DEPTH` without a\nreservation each: until then, every query run nested more than 8 deep maps and unmaps a frame),\n11 (`Column::get_mut`, for salsa M5) and 12 (`Shelf` public, for the solver's shelves).\nRequest 1 (`frame::current`) is applied.\n\n> forwarded to each owner it names (db, solver-sync, frontend-nameres, frontend-fast-borrowck, mem); requests applied its ide-db line (mem-db-def-hir.md R11) (requests, pass 23).",
+  "state": "refused",
+  "created": "2026-10-30T05:39:35Z",
+  "updated": "2026-10-30T08:37:55Z",
+  "taken_by": "coord-apply-front",
+  "why": "an index, not a change: every item names its owner and its own request file (v2/requests/mem-db-*.md), all with live lanes: db (db-next8; blaze-query, salsa, hir-ty, base-db, hir-def, hir-expand, hir), solver-sync (next_solver, rustc_type_ir), frontend-nameres (frontend-nameres-next1, collect), frontend-fast-borrowck and db-mem-borrowck (hir-ty-borrowck, hir-ty-wfcheck), mem (mem-next1, requests 2/10/11/12). Nothing in it is the coordinator to apply.",
+  "source": "v2/requests/mem-db.md#Per crate: what moves onto blaze-mem, and the test that holds it",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db.md:1088"
+    },
+    {
+      "at": "2026-10-30T08:37:49Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:37:55Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "an index, not a change: every item names its owner and its own request file (v2/requests/mem-db-*.md), all with live lanes: db (db-next8; blaze-query, salsa, hir-ty, base-db, hir-def, hir-expand, hir), solver-sync (next_solver, rustc_type_ir), frontend-nameres (frontend-nameres-next1, collect), frontend-fast-borrowck and db-mem-borrowck (hir-ty-borrowck, hir-ty-wfcheck), mem (mem-next1, requests 2/10/11/12). Nothing in it is the coordinator to apply."
+    }
+  ]
+}

@@ -20,7 +20,7 @@ pub(crate) fn write_file<T>(
     filename: &FileName,
     formatted_text: &str,
     out: &mut T,
-    emitter: &mut dyn Emitter,
+    emitter: &mut Emitter,
     newline_style: NewlineStyle,
 ) -> Result<emitter::EmitterResult, io::Error>
 where

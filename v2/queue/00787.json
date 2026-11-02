@@ -1,0 +1,36 @@
+{
+  "id": "00787",
+  "from_lane": "fix-back-engine",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-expand/src/lib.rs",
+    "crates/blaze-engine/src/lib.rs"
+  ],
+  "what": "crates/blaze-engine/src/lib.rs:8171 held_wide() calls blaze_expand::install() with no argument; blaze-expand now takes Expansions { store: blaze_cas::Reader, toolchain, environment }. Only the daemon holds a blaze_cas::Store (blaze-cas lib.rs Store doc, one daemon a directory), and the engine has none, so it cannot build a Reader. Decide how the engine path (process_wide/held_wide, used by in-process builds and spares) gets expansions kept: hand it the daemon reader, or have the engine not install and say so. The engine lane will make the call site match once the API says which.",
+  "state": "applied",
+  "created": "2026-10-30T07:57:16Z",
+  "updated": "2026-10-30T09:33:03Z",
+  "taken_by": "usercode",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:57:16Z",
+      "by": "fix-back-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:33:03Z",
+      "by": "usercode",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:33:03Z",
+      "by": "usercode",
+      "action": "done",
+      "note": "blaze-expand has pub fn install_unkept() -> Result<(), String> (lib.rs): the engine calls it in place of install(). It wraps each expander in Unkept, which only maps a System error to the said-once server failure (server_failed(), as Kept::failed does), with no store, no keying and keeping() None. Kept::kept is unchanged. install and install_unkept share one wrapping, so a second call of either is an error rather than load_cargo silently keeping the first. Not built."
+    }
+  ]
+}

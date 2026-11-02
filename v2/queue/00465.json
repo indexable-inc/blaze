@@ -1,0 +1,36 @@
+{
+  "id": "00465",
+  "from_lane": "dedup",
+  "owner": "db-ty",
+  "paths": [
+    "crates/hir-ty/src/mir.rs",
+    "crates/hir-ty/src/providers.rs"
+  ],
+  "what": "## dedup: the MIR driver passes `optimize` its caller (from dedup-sim-front, 2026-10-29)\n\nAnswers codegen-mir's 22:15 note under \"## dedup: one driver under the 24 MIR queries\": the\ndriver derives the caller from the `MirOwner`, once, in hir-ty (which has both `MirOwner` and\n`InlinedBody`), rather than each table entry or caller working it out. Lands together with\ncodegen-inline's request 2 (`optimize` takes `caller: Option<InlinedBody<'db>>`;\n`~/restart-2026-10-28/briefs/v2/codegen-inline.requests.md`), since the table's type and\n`optimize::optimize`'s must match.\n\n1. `crates/hir-ty/src/mir.rs`, in `impl<'db> MirOwner<'db>`:\n\n```rust\n    /// The body inlining sees as the caller when this owner's MIR is optimized: a function or a\n    /// closure. A const, static or anon const body is evaluated by the interpreter, which does\n    /// not read `Inlined`, and a coroutine body inlines nothing (rustc's\n    /// `check_caller_mir_body`).\n    pub fn caller(self) -> Option<InlinedBody<'db>> {\n        match self {\n            MirOwner::Body(InferBodyId::DefWithBodyId(def)) => def.as_function().map(InlinedBody::Fn),\n            MirOwner::Body(InferBodyId::AnonConstId(_)) => None,\n            MirOwner::Closure(closure) => Some(InlinedBody::Closure(closure)),\n            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => None,\n        }\n    }\n```\n\n2. `crates/hir-ty/src/providers.rs`: `Mir::optimize`'s type becomes\n   `for<'db> fn(&'db Db, &MirBody<'db>, MirOptions, Option<InlinedBody<'db>>) -> Built<'db>`,\n   and `compute`'s `Optimized` arm calls `(mir.optimize)(db, runtime, options, owner.caller())`.\n   `compute_monomorphized` reads the generic optimized memo and does not call `optimize`, so it\n   is unchanged.\n\nThe other side, in hir-ty-mir (codegen-inline 2's `optimize.rs` signature, and `budget.rs`'s\npublic `optimize` taking and forwarding `caller` too), is codegen-mir's. The table entry\n`optimize: optimize::optimize` in hir-ty-mir's `providers.rs` stays as written. The four\ncallers in codegen-inline 2's list are gone now that the driver is in: `owner.caller()` is that\nlist.\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 31).",
+  "state": "applied",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T08:55:29Z",
+  "taken_by": "unify-front-ty",
+  "why": null,
+  "source": "v2/requests/db-ty.md#dedup: the MIR driver passes `optimize` its caller (from dedup-sim-front, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:2601"
+    },
+    {
+      "at": "2026-10-30T08:55:10Z",
+      "by": "unify-front-ty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:29Z",
+      "by": "unify-front-ty",
+      "action": "done",
+      "note": "already in the tree (checked 01:58): crates/hir-ty/src/mir.rs MirOwner::caller (2547, InferBodyId::as_function -> InlinedBody::Fn, Closure -> Some, coroutines -> None); crates/hir-ty/src/providers.rs Mir::optimize is for<db> fn(&Db, &MirBody, MirOptions, Option<InlinedBody>) -> Built (47-48) and compute Optimized arm calls (mir.optimize)(db, runtime, options, owner.caller()) (218). hir-ty-mir side (optimize.rs/budget.rs signatures) is codegen-mir s."
+    }
+  ]
+}

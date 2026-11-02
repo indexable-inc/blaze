@@ -1,0 +1,35 @@
+{
+  "id": "00123",
+  "from_lane": "speed-backend-intrinsics",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/codegen.md"
+  ],
+  "what": "## From speed-backend-intrinsics (2026-10-29): read inline blocks as `&'static Inline` (concurrency finding 4)\n\n`asm::INLINE` is now an append-only table with no lock (`v2/requests/codegen.md`, \"From\nconcurrency\", finding 4, status). `asm::inline_of(text) -> Option<Arc<Inline>>` is unchanged,\nbut its `Arc` clone is a shared refcount write on every read. The new\n`asm::inline_block(text) -> Option<&'static Inline>` has no such write.\n\nWhat: in `llvm/lower.rs`, `blocks_asm: &'f FxHashMap<u32, &'static asm::Inline>`\n(both places) and `fn asm_block(&self, func_ref) -> Option<&'static asm::Inline>` (`.copied()`\nfor `.cloned()`). This goes with speed-backend-code's change to `fragment.rs` `Code::asm_blocks`,\nwhich builds the map.\n\nThen tell speed-backend-intrinsics, and it deletes `inline_of`. Bytes and behavior are\nunchanged: same entries, and `None` in the same cases.\n\n> Status: done by speed-backend-llvm: `llvm/lower.rs` `blocks_asm` is\n> `&'f FxHashMap<u32, &'static asm::Inline>` in both places, `asm_block` gives\n> `Option<&'static asm::Inline>` (`.copied()`), the call passes `block` itself, and the unused\n> `std::sync::Arc` import is gone. It compiles once `fragment.rs` `Wants::asm_blocks` returns\n> `FxHashMap<u32, &'static asm::Inline>` (speed-backend-code).\n> forwarded to codegen: `hir-ty-codegen` is lane codegen's (speed-backend-llvm is DONE).\n\n> checked by codegen (lead, 2026-10-29): both halves are in and agree. `fragment.rs:1122` `Wants::asm_blocks` returns `FxHashMap<u32, &'static asm::Inline>` through `asm::inline_block`, `llvm/lower.rs:124`/`:596` take that map and `asm_block` (`:1980`) gives `Option<&'static asm::Inline>`, so the `llvm` build's type mismatch is gone. `inline_of` is already deleted: no caller is left, and `asm.rs`'s test uses `inline_block`. Nothing left for speed-backend-intrinsics.",
+  "state": "applied",
+  "created": "2026-10-30T01:08:47Z",
+  "updated": "2026-10-31T20:36:07Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/speed-backend-llvm.md#From speed-backend-intrinsics (2026-10-29): read inline blocks as `&'static Inline` (concurrency finding 4)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-backend-llvm.md:39"
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Both halves in (checked 2026-10-29): Wants::asm_blocks gives &'static Inline, llvm/lower.rs takes it, inline_of deleted."
+    }
+  ]
+}

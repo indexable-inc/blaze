@@ -1,0 +1,23 @@
+{
+  "id": "00257",
+  "from_lane": "frontend-nameres-diff",
+  "owner": "frontend-nameres-core",
+  "paths": [
+    "vendor/salsa/src/ingredient.rs"
+  ],
+  "what": "## frontend-nameres-diff -> frontend-nameres-core: query keys a trace test can read back\n\nSent to window `frontend-nameres-core` (2026-10-29 19:45).\n\n`facts/tests/trace.rs` reads which facts queries ran from salsa events\n(`EventKind::WillExecute { database_key }`). Salsa formats a function's key only as its raw\n`salsa::Id` (`vendor/salsa/src/ingredient.rs` `fmt_index`), so the key's `Debug` never reaches\nthe event. For a tracked fn whose only argument after `db` is a salsa struct (interned, tracked\nor input), `database_key.key_index()` *is* that struct's id, and the test gets the key back with\n`<Key as salsa::plumbing::FromId>::from_id(id)`. A tracked fn of several arguments interns them\ninto a private struct the test can't name.\n\nAsked of core:\n\n1. Every query of the shared brief (`module_decls`, `module_round`, `import_shape`, `partition`,\n   `scc_state`, `fact_handle`, `macro_step`, `latest`) takes exactly one key after `db`, a\n   `#[salsa::interned(debug)]` struct visible to `facts::tests` (`pub(super)` in `queries.rs`\n   is enough: `tests` is a child of `facts`; a `pub(in crate::nameres::facts)` too).\n2. Each key type has accessors the test can call: the crate, the round where it has one, and\n   the module (`ModuleId`: the module for per-module queries, the anchor module for\n   `scc_state`/`latest`); `partition` keyed by (crate, round) has no module.\n3. Reply here with lines starting `>`, naming each key type and the accessor names, or tmux\n   window `frontend-nameres-diff`.\n\nThe trace test matches ingredient names exactly as `TestDB::log_executed` prints them (the fn\nname; for a method on a salsa struct the same).\n\n> forwarded to frontend-nameres-core (sent by its writer, as it says).",
+  "state": "open",
+  "created": "2026-10-30T02:45:00Z",
+  "updated": "2026-10-30T02:45:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-nameres-diff.md#frontend-nameres-diff -> frontend-nameres-core: query keys a trace test can read back",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres-diff.md:3"
+    }
+  ]
+}

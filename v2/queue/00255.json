@@ -1,0 +1,24 @@
+{
+  "id": "00255",
+  "from_lane": "db-unsafeck",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/missing_unsafe.rs",
+    "crates/ide-diagnostics/src/handlers/missing_unsafe.rs"
+  ],
+  "what": "## 3. diagnostics: `MissingUnsafe` and the new reasons\n\n`hir::MissingUnsafe` is now:\n\n```rust\npub struct MissingUnsafe {\n    pub node: InFile<ExprOrPatPtr>,\n    pub lint: UnsafeLint,      // HardError | UnsafeOpInUnsafeFn | DeprecatedSafe2024\n    pub reason: UnsafetyReason,\n    pub first: bool,           // rustc's `suggest_unsafe_block`: the first lint of its body or closure\n    pub in_unsafe_fn: bool,    // in an `unsafe fn` body, outside a block\n}\n```\n\n`UnsafetyReason` (a `u8` enum, `hir_ty_unsafeck::UnsafetyReason` re-exported by `hir`) has\nthese variants beyond the six that `crates/blaze-diagnostics/src/lower/missing_unsafe.rs`\n`Op::of` matches, each with rustc's `UnsafeOpKind` message:\n- `UseOfUnsafeField`: \"use of unsafe field\";\n- `InitializingTypeWithUnsafeField`: \"initializing type with an unsafe field\";\n- `CallDropExplicitly`: `Drop::drop` or `Drop::pin_drop` called by path where type checking\n  did not already refuse it, with the wording of rustc's\n  `tests/ui/pin-ergonomics/pinned-drop-unsafety-check.stderr`;\n- `InitializingTypeWith`: \"initializing type with `rustc_layout_scalar_valid_range` attr\";\n- `MutationOfLayoutConstrainedField`: \"mutation of layout constrained field\";\n- `BorrowOfLayoutConstrainedField`: \"borrow of layout constrained field with interior\n  mutability\".\n\nWhat: `Op::of` covers them. `first` replaces the `get_unsafe_ops` scan, so the lowering no\nlonger needs to be O(ops²). `crates/ide-diagnostics/src/handlers/missing_unsafe.rs`\n`display_unsafety_reason` is exhaustive over the same enum and needs the same arms while that\ncrate exists. Told in tmux window `diagnostics`.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:41:34Z",
+  "updated": "2026-10-30T02:41:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-unsafeck.md#3. diagnostics: `MissingUnsafe` and the new reasons",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-unsafeck.md:33"
+    }
+  ]
+}

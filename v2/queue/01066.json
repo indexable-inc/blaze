@@ -1,0 +1,31 @@
+{
+  "id": "01066",
+  "from_lane": "integrate-engine-wasm",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/hir-ty-codegen/v2/backend.rs",
+    "crates/hir-ty-codegen/v2/convert.rs",
+    "crates/blaze-wasm"
+  ],
+  "what": "(1) Unblocks 01042: nothing in crates/blaze-wasm names v1 CodegenUnit, Roots, Rejections, CodegenError, SymbolResolver, exported_symbol/link_name or hir_ty_codegen::wasm any more; it builds through blaze_codegen::driver::Build::run_with_statics over HirFrontend (roots Shared, Mode::Live, Panic::Abort, O0) and links the Built itself (crates/blaze-wasm/src/link.rs). It still uses hir-ty-codegen feature \"wasm\" (Target::host wasm32, Calls::Table, 32-bit pointers). (2) v2 refuses wasm32, so blaze-wasm cannot build a program until these land: v2/backend.rs:114 check_built (\"wasm: v2 builds in the bodies wasm-bindgen needs built in...\") and v2/convert.rs:207 word() (\"wasm: v2 has no relocations of wasm data yet\"). blaze-wasm needs, for target wasm32-unknown-unknown: each CompiledFunction code = blaze_codegen::wasm::Code header (ty, types, type_fixups, stack_pointer places, imports for extern fns keyed by symbol with module env unless #[link(wasm_import_module)], export) + body; relocs WasmFunction (direct call, 5-byte padded LEB function index), WasmTable (function pointer, table slot), WasmMemory (data/static/position address, i32); members reached through Target::Function (Mode::Live); Target::Position as a pointer to a 16-byte align-4 Location (file ptr @0, file len @4, line @8, col @12).",
+  "state": "taken",
+  "created": "2026-10-30T15:13:37Z",
+  "updated": "2026-10-30T15:52:46Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:13:37Z",
+      "by": "integrate-engine-wasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:52:46Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00843",
+  "from_lane": "cold-v2",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/roots/kept.rs"
+  ],
+  "what": "cold-v2 2: codegen: the kept roots miss rustc's other extern indicators (`crates/hir-ty-codegen/v2/roots/kept.rs`, `keeps_function`/`keeps_static`)\n\nLane cold-v2 made dependency library units compile no roots of their own (std and lint-capped packages, unless `BLAZE_DEPS=full`): a program's walk from `HirFrontend::roots` compiles what it reaches, so those roots must be as complete as rustc's collector's. `kept` keeps `#[no_mangle]`, `#[export_name]`, `LINKED_BY_NAME`, the panic handler, the personality and `#[used]`/exported statics. rustc's `has_custom_linkage` (rustc_passes/src/reachable.rs) also counts `contains_extern_indicator`'s `#[linkage = ..]` other than `internal` (feature `linkage`), and `EXTERNALLY_IMPLEMENTABLE_ITEM` (EII, `#[eii]` implementations), for functions and statics. Asked: keep both in `keeps_function` and `keeps_static`, with a test in `roots/tests.rs` per attribute. This predates cold-v2's change (no library unit kept them either), but reachable-only makes the roots the only place a function can come from.",
+  "state": "applied",
+  "created": "2026-10-30T08:45:50Z",
+  "updated": "2026-10-31T20:39:26Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:45:50Z",
+      "by": "cold-v2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:39:26Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:39:26Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "v2/roots/kept.rs: keeps_function and keeps_static keep an item whose #[linkage] is other than internal (custom_linkage, through AttrFlags::linkage). Test an_executable_keeps_what_has_a_linkage_of_its_own in roots/tests.rs. EII: hir-def has no EII attribute yet; asked of db (the flag), and codegen keeps it beside custom_linkage once it is there."
+    }
+  ]
+}

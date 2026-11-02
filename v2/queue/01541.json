@@ -1,0 +1,30 @@
+{
+  "id": "01541",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "docs/cargo.md"
+  ],
+  "what": "cargo: llvm-sys's build script is refused in the self-build because its LLVM lib dir is not in `build-script-link-dirs`. cargo has added (unbuilt, rust-analyzer clean) `${NAME}/rest` entries in `build-script-link-dirs`:\n- The load (blaze-units load/sandbox.rs) keeps such an entry as written and refuses it unless `build-script-env` lists NAME.\n- The daemon (blaze-cargo directives::link_dirs, called from serve/unit/script.rs) expands it from the environment the script ran with. An unset NAME, or a value that is not an absolute path, fails the script's unit and names the variable.\n\nTwo edits outside cargo's paths:\n\n1. Root Cargo.toml, in the existing [workspace.metadata.blaze.sandbox] table, beside `build-script-env = [\"LLVM_SYS_231_PREFIX\"]`, add:\n   build-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\"]\n\n2. docs/cargo.md, in the sandbox section (~line 415): after the line `build-script-link-dirs = [\"/opt/vendor/lib\"]                 # rustc-link-search may name`, add the line\n   build-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\"]      # or under a variable the script is given\n   (as an alternative form, or merge both into one list). Then add this sentence after the code block: \"An entry that starts `${NAME}` is under the variable's value in the environment the script runs in, for a library whose place differs by machine; `build-script-env` must list `NAME`, and a script run where it is unset, or is no absolute path, fails naming it.\" The paragraph's claim that `build-script-env` \"does nothing else\" then needs \"beyond naming the variables `build-script-link-dirs` may use\".",
+  "state": "applied",
+  "created": "2026-11-01T23:31:02Z",
+  "updated": "2026-11-02T00:54:31Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T23:31:02Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T00:54:31Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "part 2 done: docs/cargo.md sandbox example lists \"${LLVM_SYS_231_PREFIX}/lib\", the ${NAME} sentence, and build-script-env names the variables link dirs may use; part 1 (root Cargo.toml line) withdrawn by cargo: point devenv LLVM_SYS_231_PREFIX at /usr/local/lib/blaze-llvm/<triple> instead"
+    }
+  ]
+}

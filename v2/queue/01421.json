@@ -1,0 +1,36 @@
+{
+  "id": "01421",
+  "from_lane": "observe-history",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve/heads.rs"
+  ],
+  "what": "observe step 3 (history): the daemon keeps the Parquet history. Design: one thread `blaze-history` started by `serve` owns `blaze_profile::history::History::open(&history::dir_in(&state), history::CAP_BYTES)?` (an open error fails `blaze serve`, no fallback) and a channel of `enum ToHistory { Ended(BuildRow), Flush(Option<u64>) }`; it loops on `recv_timeout(history::EVERY)` (5 s), calling `history.flush(None)` on a timeout while a session runs, `history.build_ended(row)` then `history.flush(Some(row.build_id))` on Ended. That keeps the flush's I/O off the daemon loop (sans-IO) and off the workers. A `HistoryError` is logged with `tracing::error!` naming the file and also surfaced in `blaze daemon status` (not swallowed). Call sites: (a) crates/blaze-cargo/src/serve/heads.rs `answer()` (where `Response::Done { ok }` is pushed: the build request ends) or its caller in daemon.rs: send `ToHistory::Ended(BuildRow { build_id, commit (git HEAD of the workspace when a checkout), workspace, command (the request's command line), started_ns: blaze_profile::clock::mono_ns() taken when the request was taken, dur_ns: Some(now - started), started_unix_ns, outcome: Outcome::Ok/Failed/Cancelled/Stalled, hits/misses/joined from the plane's counts (the same as blaze_profile::Built) })`. build_id must equal the u32 the plane passes to `blaze_profile::flight::building` for that request's tasks, so spans and builds join. (b) the timer is the thread's own recv_timeout; `Daemon::turn` (daemon.rs ~750) need not change. Types: crates/blaze-profile/src/history.rs (BuildRow, Outcome, History, EVERY, CAP_BYTES, dir_in).",
+  "state": "applied",
+  "created": "2026-11-01T01:58:02Z",
+  "updated": "2026-11-01T03:42:36Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:58:02Z",
+      "by": "observe-history",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:36Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "serve/observe.rs keep_history: thread blaze-history owns History::open(state); the daemon numbers plane requests from next_build (Plane::number_from), sends a BuildRow per finished build (job.rs Job::row, commit read from .git), flushes every history::EVERY and at exit; an error shows in blaze daemon status as history: ...."
+    }
+  ]
+}

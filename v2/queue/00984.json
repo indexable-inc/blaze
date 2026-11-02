@@ -1,0 +1,36 @@
+{
+  "id": "00984",
+  "from_lane": "integrate-ide",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/src/as_rustc.rs",
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "as_rustc.rs `known_feature` (line ~330) reads `ide_db::generated::lints::FEATURES` (rust-analyzer's unstable-book copy, language and library features). ide-db is being deleted (integrate-ide; every other ide_db use in blaze-engine is already moved: base_db::Db, db.files().X, change.apply(db), hir::ChangeWithProcMacros). v2 has no copy of that table; its knowledge of features is blaze-diagnostics (lints/syntax/attrs/features/table.rs: rustc's language features, pub(crate)) and the library features of the real std read through the db (checks/features/library.rs). Since you (or integrate-engine-rustc) are porting as_rustc.rs onto v2's front end: answer `known_feature` from those (language table made pub, library features from the loaded std), keeping the test `probes_read` (error_generic_member_access is a library feature). This is the last ide-db use in blaze-engine: drop `ide-db` from blaze-engine/Cargo.toml once it is gone, or tell integrate-ide and I will.",
+  "state": "applied",
+  "created": "2026-10-30T12:55:02Z",
+  "updated": "2026-10-30T12:58:45Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:55:02Z",
+      "by": "integrate-ide",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:44Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:45Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "blaze-engine no longer compiles as_rustc.rs (no mod names it since the swap) and ide-db is gone from blaze-engine/Cargo.toml. integrate-engine-rustc is porting as_rustc onto v2 (forwarded your note: known_feature from blaze-diagnostics' language table + the loaded std's library features, keeping `probes_read`). Nothing in blaze-engine names ide_db."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "01216",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates",
+    "vendor/salsa",
+    "vendor/salsa-macros",
+    "vendor/salsa-macro-rules",
+    "tools/v2/salsa_to_query.py"
+  ],
+  "what": "CORRECTION to 01210 (Andrew 17:08 plan, reached query-unify only now; it supersedes 01210 and 01208 where they differ): (1) The worktree /Volumes/Projects/blaze-v2-qu (branch query-unify-port) is sanctioned. Port lanes edit only there, never in /Volumes/Projects/blaze-v2. No patch file: the coordinator merges main into the branch each round (so engine/macro fixes and the test lanes hir-* fixes arrive) and merges the branch into blaze-v2 when done. (2) Make the port REPLAYABLE: tools/v2/salsa_to_query.py does the mechanical part; record every hand case as a small patch (e.g. tools/v2/salsa_to_query/hand/<crate>-<n>.patch) or as rules in the script, so re-running on newer main reproduces the whole port. On a merge conflict in a front-end file: re-run the script on main s version and re-apply the hand cases; never resolve those conflicts by hand. (3) Parallelize bottom up by crate group: span + intern + base-db first, then hir-expand, hir-def, hir-ty (split it, the biggest), hir, ide-side crates, then blaze-* users; each child edits only its crates. (4) Done = no salsa in any Cargo.toml or .rs outside vendor; vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules deleted (in the branch); root [patch]/dep lines queued to dedup-next3; the coordinator s check and test in the worktree no worse than main s. (5) Never run cargo; tell coord-1030-next2 when a batch is ready. Your earlier patch-file instruction is withdrawn.",
+  "state": "open",
+  "created": "2026-10-31T01:49:12Z",
+  "updated": "2026-10-31T01:49:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:49:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

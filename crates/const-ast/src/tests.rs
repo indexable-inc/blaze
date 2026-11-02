@@ -24,6 +24,7 @@ use syntax::{
 use crate::*;
 
 /// A [`Tree`]'s arrays, made from a flat tree of `syntax`.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Arrays {
     kinds: Vec<u16>,
     ends: Vec<u32>,
@@ -32,23 +33,36 @@ pub(crate) struct Arrays {
 }
 
 impl Arrays {
-    /// The arrays of `tree`, whose text is leaked to give `texts` a lifetime.
+    /// The arrays of `tree` with its lazy nodes' parts in their places (parsing them), so an
+    /// outline's arrays are a full parse's. Its text is leaked to give `texts` a lifetime.
     pub(crate) fn of(tree: &FlatTree) -> Arrays {
         let text: &'static str = String::from(tree.text()).leak();
         let mut arrays =
             Arrays { kinds: Vec::new(), ends: Vec::new(), spans: Vec::new(), texts: Vec::new() };
-        for at in 0..tree.len() {
-            let token = tree.is_token(at);
-            arrays.kinds.push(tree.kind(at).0 | if token { TOKEN } else { 0 });
-            arrays.ends.push(tree.end(at));
-            arrays.spans.push(if token { at } else { NO_SPAN });
-            let range = tree.range(at);
-            arrays.texts.push(match token {
-                true => &text[usize::from(range.start())..usize::from(range.end())],
-                false => "",
-            });
-        }
+        arrays.push(tree, text, 0);
         arrays
+    }
+
+    /// Pushes element `at` of `tree` and its subtree, the element numbers counted in the
+    /// arrays.
+    fn push(&mut self, tree: &FlatTree, text: &'static str, at: u32) {
+        if tree.is_lazy(at) {
+            return self.push(tree.part(at), text, 0);
+        }
+        let index = self.kinds.len();
+        let token = tree.is_token(at);
+        self.kinds.push(tree.kind(at).0 | if token { TOKEN } else { 0 });
+        self.ends.push(0);
+        self.spans.push(if token { index as u32 } else { NO_SPAN });
+        let range = tree.range(at);
+        self.texts.push(match token {
+            true => &text[usize::from(range.start())..usize::from(range.end())],
+            false => "",
+        });
+        for child in tree.children_with_tokens(at) {
+            self.push(tree, text, child);
+        }
+        self.ends[index] = self.kinds.len() as u32;
     }
 
     pub(crate) fn tree(&self) -> Tree<'_> {
@@ -567,11 +581,11 @@ fn rust_files(dir: &FsPath, out: &mut Vec<PathBuf>) {
 }
 
 /// Real crates: the standard library's `core` and `alloc` (every kind of item, attribute and
-/// generic there is), salsa (derives and macro-heavy code) and this crate.
+/// generic there is), the query engine (derives and generic code) and this crate.
 fn corpus() -> Vec<PathBuf> {
     let root = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for dir in ["library/core/src", "library/alloc/src", "vendor/salsa/src", "crates/const-ast/src"]
+    for dir in ["library/core/src", "library/alloc/src", "crates/blaze-query/src", "crates/const-ast/src"]
     {
         rust_files(&root.join(dir), &mut files);
     }
@@ -612,11 +626,30 @@ fn the_views_are_syntax_asts() {
 }
 
 #[test]
+fn an_outline_has_the_arrays_of_a_full_parse() {
+    let mut lazies = 0usize;
+    for file in corpus() {
+        let text: Arc<str> = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{}: {e}", file.display()))
+            .into();
+        let full = AstFile::parse_shared(text.clone(), Edition::CURRENT);
+        let outline = AstFile::parse_outline(text, Edition::CURRENT);
+        let tree = outline.root().shared_file();
+        let unparsed = tree.lazies().filter(|&at| !tree.is_parsed(at)).count();
+        assert_eq!(unparsed, tree.lazies().count(), "{}: bodies parsed early", file.display());
+        lazies += unparsed;
+        let full = full.root().shared_file();
+        assert!(Arrays::of(tree) == Arrays::of(full), "{}", file.display());
+    }
+    assert!(lazies > 1000, "the corpus's outlines have {lazies} lazy bodies");
+}
+
+#[test]
 fn a_derive_reads_a_struct() {
     let text =
         "#[derive(Debug)] // a comment\npub struct A<'a, T: Copy = u8> { x: &'a T, y: [u8; 4] }";
-    let root = AstFile::parse(text, Edition::CURRENT).syntax_node().to_flat();
-    let arrays = Arrays::of(&flat(&root));
+    let parse = AstFile::parse(text, Edition::CURRENT);
+    let arrays = Arrays::of(parse.root().shared_file());
     let tree = arrays.tree();
     let strukt = tree.item().and_then(|it| it.as_struct()).expect("a struct");
     assert!(strukt.name().is_some_and(|it| it.is("A")));

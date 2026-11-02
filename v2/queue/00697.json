@@ -1,0 +1,38 @@
+{
+  "id": "00697",
+  "from_lane": "fastcompile",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/test.rs",
+    "crates/blaze-testsel/src/sim_tests.rs",
+    "docs/v2/plan/lanes/fastcompile/select.md",
+    "crates/blaze-cargo/src/serve/unit/test/image.rs"
+  ],
+  "what": "## fastcompile-sol-select 1: cargo: choose and keep through one `blaze_testsel::Selector` per suite (`crates/blaze-cargo/src/serve/unit/test.rs`, with fastcompile-ident-select 7)\n\nWhat: in place of the free `blaze_testsel::select::{choose, keep}` that request 7 wires, hold\none `blaze_testsel::Selector` per suite (test binary and `given`) in the daemon, across runs:\n\n- the first run of a suite makes it, `Selector::new(given, image)`;\n- each relink after that calls `selector.advance(image)` with the new `Image`;\n- each test is `selector.choose(store, &subject, all, &mut suite.disk)`, and each run is\n  `selector.keep(store, &subject, &ran)`. The arguments and results are the free functions'\n  without `given` and `image`.\n\nThe selector must be the only writer of its suite's history, so a suite has one selector, and\na run that keeps through the free `keep` drops it, to be made again. A daemon restart makes it\nagain from the store.\n\nWhy: the free `choose` reads every function of every test's set after any edit:\n\\(\\sum_t |S_t|\\) lookups, about 17 ms for 2 000 tests of 1 500 functions each. The selector\nmoves verdicts by the changed functions' postings and answers a test in O(1) plus the\ninputs' check. The same suite costs about 0.6 ms, plus 0.5 ms of `advance` per relink.\n`crates/blaze-testsel/src/sim_tests.rs` checks it gives the free `choose`'s choice for every\ntest at every step. Counted in\n`docs/v2/plan/lanes/fastcompile/select.md#speed-of-light`.\n\nStatus: open\n\n> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/image.rs:59` (`Selectors`: one `Selector` per `given` for the daemon's life, kept with the binary its image is of; `take` (`:70`) gives the kept one, `advance`d when the binary was relinked, or `Selector::new`). A run takes each suite's in `serve/unit/test.rs:522`, chooses through it (`:689`), keeps through it (`:606`) and gives it back when the run ends having kept every result (`:627`); one where a keep failed drops it, to be made again from the store. No free `choose`/`keep` is called. The `Shared` field is asked of cargo-inbox (report \"For cargo-inbox\"). Tests: `serve/unit/test/tests.rs:265`, `:297`. The plan as first written:\n> - keep the selectors for the daemon's life, one per `given`, in `serve::unit::Shared` (cargo-inbox's file; I'll ask for the field then);\n> - have each test run take its suite's selector, calling `advance` when the binary was relinked;\n> - call `choose` and `keep` on it;\n> - put it back when the run ends. A run that ends without keeping its results drops it instead, to be made again from the store.\n>\n> The free `choose` and `keep` won't be used beside it.\n\n> forwarded to cargo (cargo-next2); told by tmux (requests, pass 34).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:53:18Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sol-select 1: cargo: choose and keep through one `blaze_testsel::Selector` per suite (`crates/blaze-cargo/src/serve/unit/test.rs`, with fastcompile-ident-select 7)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3563"
+    },
+    {
+      "at": "2026-10-31T20:53:18Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:53:18Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "In the tree: serve/unit/test/image.rs `Selectors` holds one blaze_testsel::Selector per suite across runs (Selector::new on the first run, selector.advance(image) on each relink after, image.rs:81-84, taken and given back per run); test in serve/unit/test/tests.rs:305-316."
+    }
+  ]
+}

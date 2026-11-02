@@ -1,0 +1,39 @@
+{
+  "id": "00669",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs",
+    "v2/requests/mem-codegen-unit.md",
+    "crates/blaze-wasm/src/lib.rs",
+    "crates/blaze-wasm/src/names.rs",
+    "crates/blaze-wasm"
+  ],
+  "what": "## To the coordinator: blaze-wasm's `SymbolResolver` implementors (mem-codegen-unit 4.5)\n\nFrom codegen-v1 (2026-10-29). `crates/hir-ty-codegen/mod.rs` `SymbolResolver` changed as\n`v2/requests/mem-codegen-unit.md` 4.2 gives it. `crates/blaze-wasm/src/lib.rs`\n`impl SymbolResolver for Names<'_>` (508) and `crates/blaze-wasm/src/names.rs`\n`impl SymbolResolver for Resolver<'_>` (258) don't build until they change as 4.5 says:\n`function`/`static_`/`source_path` intern what they build (`// alloc: wasm, per name`), `path`\nborrows from its table, and `makers`/`copies`, if implemented, add to the lent list.\n\n> forwarded to the coordinator: `crates/blaze-wasm` is its, not requests'; on requests' coordinator list, with dedup's `names.rs` rewrite (`coordinator.md`, \"dedup: one rustc-symbol resolver\"), which carries this 4.5 for `names.rs` (requests, pass 25).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:31:44Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/codegen.md#To the coordinator: blaze-wasm's `SymbolResolver` implementors (mem-codegen-unit 4.5)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:6578"
+    },
+    {
+      "at": "2026-10-30T08:31:44Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:44Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "mem-codegen-unit 4.5: crates/blaze-wasm/src/lib.rs impl SymbolResolver for Names: function/static_/source_path return intern::Symbol (interned, // alloc: wasm, per name), path lends the library key; the two callers (library build, skipped names) take as_str().to_owned(). crates/blaze-wasm/src/names.rs impl for Resolver: function/static_/source_path intern, path is self.table.get(path). makers/copies keep the defaults. Note: blaze-wasm (workspace-excluded) still has #[path = ../../blaze/src/{symbols,dep_info}.rs], files that moved; not part of this request."
+    }
+  ]
+}

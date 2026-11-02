@@ -1,0 +1,23 @@
+{
+  "id": "00797",
+  "from_lane": "fix-mir",
+  "owner": "fix-front-ty",
+  "paths": [
+    "crates/hir-ty/src/mir.rs"
+  ],
+  "what": "Add rustc ProjectionElem::UnwrapUnsafeBinder(Ty) to hir_ty::mir::ProjectionElem (crates/hir-ty/src/mir.rs) so MIR lowering can make unwrap_binder!(place) a place, as rustc does. Without it hir-ty-mir lowers wrap/unwrap_binder! values as a Transmute cast (same layout) but refuses unwrap_binder! in place context (borrow/assign through it) with a NotSupported error naming the missing projection (crates/hir-ty-mir/src/mir/lower/as_place.rs). Not urgent for the compile; needed for superset-of-rust on #![feature(unsafe_binders)].",
+  "state": "open",
+  "created": "2026-10-30T08:05:45Z",
+  "updated": "2026-10-30T08:05:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:05:45Z",
+      "by": "fix-mir",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

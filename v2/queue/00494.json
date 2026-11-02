@@ -1,0 +1,23 @@
+{
+  "id": "00494",
+  "from_lane": "diagnostics-lints-syntax-attrs-check",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/model.rs"
+  ],
+  "what": "## diagnostics-lints-syntax-attrs-check: a lint with an error code (the parent, `diagnostics`; `crates/blaze-diagnostics/src/model.rs`, `emit/`)\n\nWhat: a way for a lint's diagnostic to carry rustc's error code as well as its lint name, e.g.\n`Diag::lint_code(lint, code, message, span)` or a field `Diag::error_code: Option<String>`\nbeside `Code::Lint`. The emitter then writes `error[E0566]: ..` / `warning[E0566]: ..`, the JSON\n`code` is `E0566` (rustc's `DiagnosticCode` takes `diag.code` before the lint name), and the code\ncounts in \"Some errors have detailed explanations: ..\" and \"For more information about an error,\ntry `rustc --explain E0566`\".\nWhere: `crates/blaze-diagnostics/src/model.rs` (`Diag`), `emit/` (human and JSON).\nWhy: `conflicting_repr_hints` (`check_attr.rs`'s `check_repr`, rustc's `ReprConflictingLint` is\n`#[diag(.., code = E0566)]`) prints `error[E0566]: conflicting representation hints`;\n`tests/lints/syntax/attrs/check_attr.rs` `conflicting_repr_hints` (rustc's\n`tests/ui/repr/conflicting-repr-hints.stderr`) expects it. `unsafe_op_in_unsafe_fn` (E0133) is\nthe same case. Once it exists, `lints/syntax/attrs/check_attr.rs`'s `repr` sets E0566 (one line).\n\n> forwarded to diagnostics: the parent's.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-attrs-check: a lint with an error code (the parent, `diagnostics`; `crates/blaze-diagnostics/src/model.rs`, `emit/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1678"
+    }
+  ]
+}

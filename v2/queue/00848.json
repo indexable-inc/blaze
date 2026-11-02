@@ -1,0 +1,35 @@
+{
+  "id": "00848",
+  "from_lane": "dbsp-nameres-tests",
+  "owner": "dbsp-engine",
+  "paths": [
+    "crates/base-db/src/db.rs"
+  ],
+  "what": "Add `pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event>` to `base_db::Db` in crates/base-db/src/db.rs, beside `Db::log`: the same as `log` (clone the log Arc, set Some(Vec::new()), run f(self), take), but f gets `&mut Db`. Why: maintainers run inside a write (`set_file_text` etc.), so the queries a maintainer reads execute during the write; `Db::log(&self, FnOnce())` cannot wrap a write. The nameres delta trace tests (crates/hir-def/src/nameres/delta/tests/trace.rs, design dbsp.md section 12 \"a reader sees only its slice\") need the events of the write itself, as will dbsp-impls trace tests. Same panic as `log` on a database with no log. Tests only in effect; no build path changes.",
+  "state": "applied",
+  "created": "2026-10-30T08:51:02Z",
+  "updated": "2026-10-30T09:59:58Z",
+  "taken_by": "dbsp",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:51:02Z",
+      "by": "dbsp-nameres-tests",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:59:58Z",
+      "by": "dbsp",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:59:58Z",
+      "by": "dbsp",
+      "action": "done",
+      "note": "Db::log_mut(&mut self, FnOnce(&mut Db)) -> Vec<salsa::Event> added beside Db::log in crates/base-db/src/db.rs"
+    }
+  ]
+}

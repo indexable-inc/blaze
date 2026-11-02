@@ -1,0 +1,33 @@
+{
+  "id": "01111",
+  "from_lane": "query-unify",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-query",
+    "crates/blaze-query-macros",
+    "crates/blaze-bench/benches/query_hit.rs",
+    "crates/blaze-bench/Cargo.toml",
+    "tools/v2/salsa_to_query.py"
+  ],
+  "what": "query-unify (Andrew 14:22: front end off salsa onto blaze-query) asks to hold, so nobody else edits them: (1) now: crates/blaze-query (db already stays off it, 01105), new crate crates/blaze-query-macros, and crates/blaze-bench/benches/query_hit.rs plus its [[bench]] and dev-dependency lines in crates/blaze-bench/Cargo.toml (the fork must be measured before deletion). Children: query-unify-engine (blaze-query/src/db), query-unify-macros (blaze-query-macros), query-unify-bench (the bench), query-unify-port (tools/v2/salsa_to_query.py now; crate ports later). (2) Later, when engine+macros check, I will ask for span, intern, base-db, hir-expand, hir-def, hir-ty, hir-ty-*, blaze-items, blaze-item-hash, hir-firewall, hir and the rest, held together in one window because an id type of base-db is a key of hir-def queries. Also still open: 01106 (workspace deps for blaze-query-macros, syn, quote, proc-macro2).",
+  "state": "applied",
+  "created": "2026-10-30T21:46:11Z",
+  "updated": "2026-10-30T22:21:39Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:46:11Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:39Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "Held for query-unify: crates/blaze-query, crates/blaze-query-macros, crates/blaze-bench/benches/query_hit.rs and its Cargo.toml lines, tools/v2/salsa_to_query.py (ledger /tmp/blaze-lanes/crate-holds.md). The front-end crates as one hold: ask when engine+macros check; hir-def is under my test-fix subagent until its tests check."
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 
 use hir_def::hir::{
     Array, AsmOperand, BinaryOp, BindingAnnotation, Expr, ExprId, Pat, PatId, RecordSpread,
-    Statement, UnaryOp,
+    Statement, UnaryOp, UnsafeBinderCastKind,
 };
 use rustc_ast_ir::Mutability;
 
@@ -13,7 +13,7 @@ use crate::{
     lower::lower_mutability,
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn infer_mut_body(&mut self, body_expr: ExprId) {
         self.infer_mut_expr(body_expr, Mutability::Not);
     }
@@ -60,7 +60,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn infer_mut_expr_without_adjust(&mut self, tgt_expr: ExprId, mutability: Mutability) {
-        match &self.store[tgt_expr] {
+        match self.store.expr(tgt_expr) {
             Expr::Missing => (),
             Expr::InlineAsm(e) => {
                 // An output is a place written, as rustc's `check_expr_asm_operand` checks it
@@ -85,7 +85,7 @@ impl<'db> InferenceContext<'db> {
                 });
             }
             Expr::OffsetOf(_) => (),
-            &Expr::If { condition, then_branch, else_branch } => {
+            Expr::If { condition, then_branch, else_branch } => {
                 self.infer_mut_expr(condition, Mutability::Not);
                 self.infer_mut_expr(then_branch, Mutability::Not);
                 if let Some(else_branch) = else_branch {
@@ -93,37 +93,37 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Const(id) => {
-                self.infer_mut_expr(*id, Mutability::Not);
+                self.infer_mut_expr(id, Mutability::Not);
             }
-            Expr::Let { pat, expr } => self.infer_mut_expr(*expr, self.pat_bound_mutability(*pat)),
+            Expr::Let { pat, expr } => self.infer_mut_expr(expr, self.pat_bound_mutability(pat)),
             Expr::Block { id: _, statements, tail, label: _, unsafe_: _ } => {
                 for st in statements.iter() {
                     match st {
                         Statement::Let { pat, type_ref: _, initializer, else_branch, .. } => {
                             if let Some(i) = initializer {
-                                self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));
+                                self.infer_mut_expr(i, self.pat_bound_mutability(pat));
                             }
                             if let Some(e) = else_branch {
-                                self.infer_mut_expr(*e, Mutability::Not);
+                                self.infer_mut_expr(e, Mutability::Not);
                             }
                         }
                         Statement::Expr { expr, has_semi: _ } => {
-                            self.infer_mut_expr(*expr, Mutability::Not);
+                            self.infer_mut_expr(expr, Mutability::Not);
                         }
                         Statement::Item(_) => (),
                     }
                 }
                 if let Some(tail) = tail {
-                    self.infer_mut_expr(*tail, Mutability::Not);
+                    self.infer_mut_expr(tail, Mutability::Not);
                 }
             }
             Expr::MethodCall { receiver: it, method_name: _, args, generic_args: _ }
             | Expr::Call { callee: it, args } => {
-                self.infer_mut_not_expr_iter(args.iter().copied().chain(Some(*it)));
+                self.infer_mut_not_expr_iter(args.iter().copied().chain(Some(it)));
             }
             Expr::Match { expr, arms } => {
                 let m = self.pat_iter_bound_mutability(arms.iter().map(|it| it.pat));
-                self.infer_mut_expr(*expr, m);
+                self.infer_mut_expr(expr, m);
                 for arm in arms.iter() {
                     self.infer_mut_expr(arm.expr, Mutability::Not);
                     if let Some(g) = arm.guard {
@@ -135,20 +135,20 @@ impl<'db> InferenceContext<'db> {
             | Expr::Yeet { expr }
             | Expr::Return { expr }
             | Expr::Break { expr, label: _ } => {
-                if let &Some(expr) = expr {
+                if let Some(expr) = expr {
                     self.infer_mut_expr(expr, Mutability::Not);
                 }
             }
             Expr::Become { expr } => {
-                self.infer_mut_expr(*expr, Mutability::Not);
+                self.infer_mut_expr(expr, Mutability::Not);
             }
             Expr::RecordLit { path: _, fields, spread, .. } => {
                 self.infer_mut_not_expr_iter(fields.iter().map(|it| it.expr));
-                if let RecordSpread::Expr(expr) = *spread {
+                if let RecordSpread::Expr(expr) = spread {
                     self.infer_mut_expr(expr, Mutability::Not);
                 }
             }
-            &Expr::Index { base, index } => {
+            Expr::Index { base, index } => {
                 if mutability == Mutability::Mut {
                     self.convert_place_op_to_mutable(PlaceOp::Index, tgt_expr, base, Some(index));
                 }
@@ -157,29 +157,31 @@ impl<'db> InferenceContext<'db> {
             }
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
                 if mutability == Mutability::Mut {
-                    self.convert_place_op_to_mutable(PlaceOp::Deref, tgt_expr, *expr, None);
+                    self.convert_place_op_to_mutable(PlaceOp::Deref, tgt_expr, expr, None);
                 }
-                self.infer_mut_expr(*expr, mutability);
+                self.infer_mut_expr(expr, mutability);
             }
-            Expr::Field { expr, name: _ } => {
-                self.infer_mut_expr(*expr, mutability);
+            Expr::Field { expr, name: _ }
+            | Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr, ty: _ } => {
+                self.infer_mut_expr(expr, mutability);
             }
-            Expr::UnaryOp { expr, op: _ }
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Wrap, expr, ty: _ }
+            | Expr::UnaryOp { expr, op: _ }
             | Expr::Await { expr }
             | Expr::Loop { body: expr, label: _, source: _ }
             | Expr::Cast { expr, type_ref: _ } => {
-                self.infer_mut_expr(*expr, Mutability::Not);
+                self.infer_mut_expr(expr, Mutability::Not);
             }
             Expr::Ref { expr, rawness: _, mutability } => {
-                let mutability = lower_mutability(*mutability);
-                self.infer_mut_expr(*expr, mutability);
+                let mutability = lower_mutability(mutability);
+                self.infer_mut_expr(expr, mutability);
             }
             Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::Assignment { .. }) } => {
-                self.infer_mut_expr(*lhs, Mutability::Mut);
-                self.infer_mut_expr(*rhs, Mutability::Not);
+                self.infer_mut_expr(lhs, Mutability::Mut);
+                self.infer_mut_expr(rhs, Mutability::Not);
             }
-            &Expr::Assignment { target, value } => {
-                self.store.walk_pats(target, &mut |pat| match self.store[pat] {
+            Expr::Assignment { target, value } => {
+                self.store.walk_pats(target, &mut |pat| match self.store.pat(pat) {
                     Pat::Expr(expr) => self.infer_mut_expr(expr, Mutability::Mut),
                     _ => {}
                 });
@@ -187,11 +189,11 @@ impl<'db> InferenceContext<'db> {
             }
             Expr::Array(Array::Repeat { initializer: lhs, repeat: rhs })
             | Expr::BinaryOp { lhs, rhs, op: _ } => {
-                self.infer_mut_expr(*lhs, Mutability::Not);
-                self.infer_mut_expr(*rhs, Mutability::Not);
+                self.infer_mut_expr(lhs, Mutability::Not);
+                self.infer_mut_expr(rhs, Mutability::Not);
             }
             Expr::Closure { body, .. } => {
-                self.infer_mut_expr(*body, Mutability::Not);
+                self.infer_mut_expr(body, Mutability::Not);
             }
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
                 self.infer_mut_not_expr_iter(exprs.iter().copied());

@@ -1,0 +1,30 @@
+{
+  "id": "00933",
+  "from_lane": "speed-sol2-link-pewasm",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/dwarf.rs",
+    "crates/blaze-link/src/model.rs"
+  ],
+  "what": "PW1: DWARF of a wasm module. wasm/module.rs check() refuses every Placed::debug section because the core DWARF addresses code by function index (Plan::indexed_code), while wasm DWARF addresses code by its code-section offset (wasm-ld, tool-conventions Debugging.md). So every wasm link with Output::debug = Lines (cargo dev profile) is an error that rustc+wasm-ld builds. Proposal: for indexed code the core asks the writer for each function code-section offset (Writer::code_offset(placed, index) -> u64, or offsets returned by a pass before synthesize) and writes DW_AT_low_pc and line-table addresses as those; the wasm writer then emits Placed::debug as .debug_* custom sections (I do that side). Spec: /tmp/blaze-lanes/v2-link-requests.md PW1.",
+  "state": "open",
+  "created": "2026-10-30T09:55:44Z",
+  "updated": "2026-10-30T10:04:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:55:44Z",
+      "by": "speed-sol2-link-pewasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:04:39Z",
+      "by": "speed-sol2-link",
+      "action": "reassign",
+      "note": "speed-sol2-link -> link: A missing feature (wasm DWARF addressed by code-section offset: every wasm link with Debug::Lines is an error rustc+wasm-ld builds), not a speed gap: it needs a Writer interface for code offsets and a dwarf.rs addressing mode, which is lane link work, not this speed round."
+    }
+  ]
+}

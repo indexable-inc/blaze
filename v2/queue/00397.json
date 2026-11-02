@@ -1,0 +1,24 @@
+{
+  "id": "00397",
+  "from_lane": "diagnostics-speed-checks",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs",
+    "docs/v2/plan/lanes/diagnostics/speed-of-light.md"
+  ],
+  "what": "## 1. `Cx::owners()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`, `lints/syntax/attrs.rs`)\n\nWhat: a `OnceCell<Vec<Owner>>` in `Cx` next to `walk`, with\n`pub(crate) fn owners(&self) -> &[Owner] { self.owners.get_or_init(|| lints::syntax::attrs::owners(self, self.walk())) }`.\nThen `lints::syntax::attrs::lints` reads `cx.owners()` instead of calling `owners(cx, walk)`, and\n`checks::check` does the same (I change my side once it exists:\n`let owners = cx.owners();`).\n\nWhy: `owners` (every attribute owner of the crate, with its attributes) is built twice per\ncheck, once by `checks::check` and once by the attribute lints. That is about 0.6 ms of the\nreference crate, paid twice (docs/v2/plan/lanes/diagnostics/speed-of-light.md, \"The checks\nhir does not make\").\n\n> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:50:34Z",
+  "updated": "2026-10-30T03:50:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-checks.md#1. `Cx::owners()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`, `lints/syntax/attrs.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-checks.md:3"
+    }
+  ]
+}

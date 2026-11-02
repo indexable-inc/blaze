@@ -1,0 +1,38 @@
+{
+  "id": "00317",
+  "from_lane": "dedup",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-format/src/leb.rs",
+    "v2/requests/mem-backend-link.md",
+    "crates/blaze-ids/src/rng.rs",
+    "crates/blaze-inproc/Cargo.toml"
+  ],
+  "what": "## dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`\n\nFrom `dedup-codec-leb` (report `/tmp/blaze-lanes/v2-dedup-codec-leb.md`). The one LEB128 is\n`crates/blaze-format/src/leb.rs`; its API is listed in `v2/requests/mem-backend-link.md` under\nthe same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src/rng.rs`).\n\n`blaze-inproc` links into the run process with no dependency, so only its tests move:\n\n- `crates/blaze-inproc/Cargo.toml`: add\n  ```toml\n  [dev-dependencies]\n  blaze-format.workspace = true\n  blaze-ids.workspace = true\n  ```\n- `src/load/macho/tests.rs`: delete `fn uleb`, `fn sleb` (the writers) and add\n  `use blaze_format::leb::{write_i64 as sleb, write_u64 as uleb};`. Delete `struct Rng` and its\n  `impl`, add `use blaze_ids::rng::SplitMix64 as Rng;`, and replace `Rng(x)` with\n  `Rng::new(x)`, `rng.next()` with `rng.next_u64()` (`below` is the same: 0 for 0).\n- `src/load/elf/tests.rs` `mutated_images_are_errors_or_loads_never_panics`: the xorshift\n  closure becomes\n  `let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d); let mut next = move || rng.next_u64();`.\n- `src/load/pe/tests.rs`: delete `fn rng`; `let mut state = 0x9e37_79b9_7f4a_7c15;` becomes\n  `let mut state = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);` and each\n  `rng(&mut state)` becomes `state.next_u64()`.\n- `src/load/macho/fixup.rs`: `Cursor::uleb`/`Cursor::sleb` stay, a copy on purpose; add above\n  `fn uleb`:\n  ```rust\n      // LEB128 as `blaze_format::leb::read_u64`/`read_i64` read it, copied on purpose: the run\n      // process links this crate with no dependency, and `blaze-format` would bring zstd and\n      // serde into it.\n  ```\n\n> forwarded to fastcompile (fastcompile-inproc-exec-next2) (from requests, pass 16; told by tmux).\n\n> moot (fastcompile-inproc-exec): `src/load/` and its tests are deleted (the loader is gone), so\n> there is no LEB128 copy left to move. One xorshift was left, in `src/alloc.rs`'s\n> `matches_a_sorted_free_list`; it now draws from `blaze_ids::rng::SplitMix64`\n> (`one_in`/`below`/`index`), so every test RNG in the crate is that one (dev-dependency\n> `blaze-ids`); `blaze-format` is not needed. Done, not built.",
+  "state": "applied",
+  "created": "2026-10-30T03:23:40Z",
+  "updated": "2026-10-30T08:53:23Z",
+  "taken_by": "unify-link",
+  "why": null,
+  "source": "v2/requests/fastcompile-inproc-exec-next2.md#dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-inproc-exec-next2.md:2"
+    },
+    {
+      "at": "2026-10-30T08:53:21Z",
+      "by": "unify-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:53:23Z",
+      "by": "unify-link",
+      "action": "done",
+      "note": "already done by fastcompile-inproc-exec (src/load/ deleted; alloc.rs test RNG on SplitMix64); verified, nothing left."
+    }
+  ]
+}

@@ -13,26 +13,31 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
 either.workspace = true
 arrayvec.workspace = true
 itertools.workspace = true
-serde_json.workspace = true
 smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
 la-arena.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 
 rustc_type_ir.workspace = true
 
 # local deps
 base-db.workspace = true
+blaze-hashcons.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-hir-ide.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
 hir-ty-borrowck.workspace = true
+hir-ty-matchck.workspace = true
+hir-ty-unsafeck.workspace = true
 hir-ty-wfcheck.workspace = true
 intern.workspace = true
 stdx.workspace = true
@@ -41,15 +46,13 @@ tt.workspace = true
 span.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-format.workspace = true
 expect-test.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-tree.workspace = true
 
-# local deps
-test-utils.workspace = true
-test-fixture.workspace = true
-syntax-bridge.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]

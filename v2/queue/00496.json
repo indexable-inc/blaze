@@ -1,0 +1,36 @@
+{
+  "id": "00496",
+  "from_lane": "diagnostics-items-generics",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "## diagnostics-items-generics: `MissingLifetime` and `ElisionFailure` kept apart (crates/hir)\n\nWhat: `hir::MissingLifetime` gets a field saying which of hir-ty's two it is (or two structs).\nWhy: rustc gives E0106 for both but builds them differently (an elision failure in a return\ntype is grouped with the signature's others and gets the \"borrowed value\" help; a missing\nlifetime in a struct field is not). `lower/missing_lifetime.rs` tells them apart from the\nsyntax (a return type or not), which is exact for what hir-ty reports today but not a contract.\n\n> forwarded to db: `crates/hir/` is lane db's.\n> checked by db-audit-other (22:38): in the tree at `crates/hir/src/diagnostics.rs:1110-1117`. `hir::MissingLifetime::kind: MissingLifetimeKind` is `Missing` or `ElisionFailure` (and `MissingLifetimes` at `:1122` has the same `kind`).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-items-generics: `MissingLifetime` and `ElisionFailure` kept apart (crates/hir)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1799"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:38): in the tree at `crates/hir/src/diagnostics.rs:1110-1117`. `hir::MissingLifetime::kind: MissingLifetimeKind` is `Missing` or `ElisionFailure` (and `MissingLifetimes` at `:1122` has the same `kind`)."
+    }
+  ]
+}

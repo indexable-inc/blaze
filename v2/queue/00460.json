@@ -1,0 +1,37 @@
+{
+  "id": "00460",
+  "from_lane": "db-ty",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir",
+    "crates/blaze-codegen",
+    "crates/hir/src/evict.rs"
+  ],
+  "what": "## 4. Codegen (`crates/hir-ty-mir`, `crates/blaze-codegen`)\n\n- A build's codegen takes `hir_ty_borrowck::CheckedMir` (made only from `checked(db, def)?.mir(db,\n  db.mir_body(..))`), and the live-patch path `UncheckedMir` (from `speculate(def).0.mir(..)`).\n  A build that takes compiled code from the store needs a `Checked` of its owner too: otherwise\n  code the live path made before its check finished can reach a build output. Shims with no user\n  body (drop glue, vtables, `FnPtr` shims) are outside the gate.\n- Keep `crates/hir/src/evict.rs`'s `drop_mir` list in step with the `#[salsa::tracked]` MIR\n  queries of `hir_ty_mir::mir` (23 today), and drop `compiled_instance`/`inlinable` results the\n  same way after a store.\n\n> forwarded to codegen",
+  "state": "applied",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/db-ty.md#4. Codegen (`crates/hir-ty-mir`, `crates/blaze-codegen`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:45"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Holds by the unit's check, not by type: blaze-cargo serve/unit/checks.rs runs the borrow check of every body beside codegen (Phase::Bodies), BodyChecks::stopped stops codegen and its output is dropped when the check fails, so no build output holds code whose check failed. The evict list (hir/src/evict.rs) is db's; the MIR memos are hir-ty providers.rs's, all lru = 0."
+    }
+  ]
+}

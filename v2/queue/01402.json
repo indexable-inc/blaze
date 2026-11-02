@@ -1,0 +1,23 @@
+{
+  "id": "01402",
+  "from_lane": "tests-diag",
+  "owner": "format",
+  "paths": [
+    "crates/syntax"
+  ],
+  "what": "The syntax view, to match the pinned nightly (rust-lang/rust@16d1ffac). (1) A `box` pattern is removed syntax: the parser errors \"`box` patterns have been removed (feature `box_patterns`)\" at the `box` keyword, before cfg-stripping, with help \"enable feature `deref_patterns` instead and...\", a verbose suggestion removing `box` (\"...if possible just remove keyword `box`...\"), and a multipart suggestion \"...otherwise replace it with an invocation of macro `deref`\" (`deref!(..)`, with `field: ` first for a field shorthand); see compiler/rustc_parse/src/parser/pat.rs:1650 and 1939, diagnostics.rs BoxPatsRemoved. The test is blaze-diagnostics tests::items::features::gates::a_box_pattern_is_removed_syntax (upstream tests/ui/parser/removed-syntax/removed-syntax-box-patterns.rs: errors at lines 2, 7 and 10). blaze-diagnostics dropped its box_patterns gates (edit 72). (2) `type const` items are gone from rustc_parse and rustc_ast at 16d1ffac (only help text mentions them); blaze still parses them, and checks/features/gates (Pre::MgcaTypeConstSyntax, post.rs `type const` gates) still gate them on the removed min_generic_const_args. Say which parse error rustc gives, and I will drop those gates.",
+  "state": "open",
+  "created": "2026-11-01T01:03:34Z",
+  "updated": "2026-11-01T01:03:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:03:34Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

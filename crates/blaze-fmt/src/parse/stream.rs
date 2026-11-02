@@ -9,7 +9,8 @@
 use std::rc::Rc;
 
 use parser::{PrefixEntryPoint, Step, TopEntryPoint};
-use syntax::{AstNode, LexedStr, SyntaxNode, SyntaxTreeBuilder};
+use syntax::view::{self as ra, AstNode};
+use syntax::{LexedStr, Parse, SyntaxTreeBuilder};
 
 use crate::ast::token::{NonterminalKind, NtExprKind, Token, TokenKind};
 use crate::ast::tokenstream::{TokenStream, TokenTree};
@@ -215,13 +216,13 @@ impl<'a> Parser<'a> {
         self.fragment(
             PrefixEntryPoint::Expr,
             TopEntryPoint::Expr,
-            |lower, root| syntax::ast::Expr::cast(root.clone()).map(|e| lower.expr(&e)),
+            |lower, root| ra::Expr::cast(root).map(|e| lower.expr(e)),
         )
     }
 
     pub(crate) fn parse_ty(&mut self) -> PResult<Box<ast::Ty>> {
         self.fragment(PrefixEntryPoint::Ty, TopEntryPoint::Type, |lower, root| {
-            syntax::ast::Type::cast(root.clone()).map(|t| lower.ty(&t))
+            ra::Type::cast(root).map(|t| lower.ty(t))
         })
     }
 
@@ -233,7 +234,7 @@ impl<'a> Parser<'a> {
         self.fragment(
             PrefixEntryPoint::Pat,
             TopEntryPoint::Pattern,
-            |lower, root| syntax::ast::Pat::cast(root.clone()).map(|p| lower.pat_val(&p)),
+            |lower, root| ra::Pat::cast(root).map(|p| lower.pat_val(p)),
         )
     }
 
@@ -249,12 +250,9 @@ impl<'a> Parser<'a> {
             PrefixEntryPoint::Item,
             TopEntryPoint::MacroItems,
             |lower, root| {
-                let items: Vec<_> = root
-                    .children()
-                    .filter_map(syntax::ast::Item::cast)
-                    .collect();
-                match items.as_slice() {
-                    [item] => Some(lower.item(item)),
+                let mut items = root.children().filter_map(ra::Item::cast);
+                match (items.next(), items.next()) {
+                    (Some(item), None) => Some(lower.item(item)),
                     _ => None,
                 }
             },
@@ -267,7 +265,7 @@ impl<'a> Parser<'a> {
         &mut self,
         prefix: PrefixEntryPoint,
         top: TopEntryPoint,
-        lower: impl FnOnce(&Lower<'_>, &SyntaxNode) -> Option<T>,
+        lower: impl FnOnce(&Lower<'_>, ra::Node<'_>) -> Option<T>,
     ) -> PResult<T> {
         if self.token.kind == TokenKind::Eof {
             return Err(self.err("expected a fragment, found the end"));
@@ -319,13 +317,14 @@ impl<'a> Parser<'a> {
         };
         let k = self.pos + k;
 
-        let root = parse_ra(&text[..frag_end], ra_edition, top)
+        let parse = parse_ra(&text[..frag_end], ra_edition, top)
             .map_err(|_| self.err("a fragment rust-analyzer could not reparse"))?;
+        let root = parse.root();
         if root.kind() == syntax::SyntaxKind::ERROR {
             return Err(self.err("a fragment rust-analyzer could not reparse"));
         }
         let lowering = Lower::new(lo, edition, &self.delims);
-        let value = lower(&lowering, &root);
+        let value = lower(&lowering, root);
         if let Err(unsupported) = lowering.finish() {
             let _ = unsupported;
             return Err(self.err("a fragment blaze fmt cannot lower yet"));
@@ -524,17 +523,18 @@ fn flatten(stream: &TokenStream, out: &mut Vec<Token>) {
     }
 }
 
-/// rust-analyzer's tree of `text` parsed from `entry`, or the first error its lexer or parser
-/// reports, with its offset in `text`. Its validation pass is not run: what that flags (`self`
-/// inside a path, inner attributes on a block in expression position) rustc's parser accepts.
+/// rust-analyzer's tree of `text` parsed from `entry`, to be walked through [`Parse::root`], or
+/// the first error its lexer or parser reports, with its offset in `text`. Its validation pass is
+/// not run: what that flags (`self` inside a path, inner attributes on a block in expression
+/// position) rustc's parser accepts.
 pub(crate) fn parse_ra(
     text: &str,
     edition: syntax::Edition,
     entry: TopEntryPoint,
-) -> Result<SyntaxNode, (usize, String)> {
+) -> Result<Parse<ra::Untyped>, (usize, String)> {
     let lexed = LexedStr::new(edition, text);
     if let Some((i, msg)) = lexed.errors().next() {
-        return Err((lexed.text_range(i).start, msg.to_owned()));
+        return Err((lexed.text_range(i).start, msg.to_owned())); // alloc: the one error, reported
     }
     let output = entry.parse(&lexed.to_input(edition));
     let mut builder = SyntaxTreeBuilder::default();
@@ -544,11 +544,11 @@ pub(crate) fn parse_ra(
         parser::StrStep::Enter { kind } => builder.start_node(kind),
         parser::StrStep::Exit => builder.finish_node(),
         parser::StrStep::Error { msg, pos } => {
-            error.get_or_insert_with(|| (pos, msg.to_owned()));
+            error.get_or_insert_with(|| (pos, msg.to_owned())); // alloc: the first error, reported
         }
     });
     match error {
         Some(error) => Err(error),
-        None => Ok(builder.finish().syntax_node()),
+        None => Ok(builder.finish_view()),
     }
 }

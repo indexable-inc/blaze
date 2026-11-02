@@ -1,7 +1,0 @@
-{
-  "row": "`#![no_main]` with std",
-  "package": "app",
-  "crates": [
-    "app"
-  ]
-}

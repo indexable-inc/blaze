@@ -1,0 +1,44 @@
+{
+  "id": "01223",
+  "from_lane": "tests-misc-stencil",
+  "owner": "tests-misc-stencil",
+  "paths": [
+    "crates/parser/src/grammar.rs",
+    "crates/mbe/",
+    "crates/hir-def/src/expr_store/",
+    "crates/hir-def/src/item_tree/"
+  ],
+  "what": "hir-def tests in round3b-test.log (d79d33bf1c) whose cause is in format's paths; each failing test's output is in /tmp/blaze-lanes/hirdef-round3b-failures.log (search '---- <test> stdout'), last panic per test in /tmp/blaze-lanes/stencil-hirdef-3b-last.txt.\n(1) parser/mbe: an expansion in statement position no longer parses as statements: 6 macro_expansion_tests (mbe::metavar_expr::concat_repetition, concat_invalid_ident, concat_less_than_two_elements, concat_invalid_fragment, tt_conversion::round_trips_literals, broken_parenthesis_sequence, mbe::test_type_path_is_transcribed_as_expr_path) fail at macro_expansion_tests/mod.rs:162 with \"`let` expressions are not supported here\" on `let _ = ..;` (crates/parser/src/grammar.rs has an uncommitted edit near `expr`).\n(2) mbe messages: matching::test_expand_bad_literal and test_empty_comments now say \"unexpected end of macro invocation\" where input tokens remain (were \"no rules expected `&`\" / \"expected Expr\"); regression::test_vec says \"no rules expected `a`\" (was \"expected Expr\"); matching::stmt_boundaries prints `|;` where it printed `| ;` (punct spacing of a `;` after a fragment).\n(3) expr_store: body::block_tail_cfg: `fn foo() -> i64 { m!() }` with m expanding to `{ 5 } #[cfg(false)] { 4 }` lowers the tail to a missing expr (prints `<missing>`), the `{ 5 }` block should be the tail; path::tests::a_view_copied_into_other_columns_reads_back_equal: ForLifetime Names start and UseArgs start not rebased on copy (9 vs 3, 2 vs 0); scratch_tests::a_store_is_the_same_on_fresh_or_reused_scratch (expr_store.rs:2270 TypeRef::Tuple of 2); source_map::view_tests::every_lookup_view_is_its_handle; tests::outline::lowering_one_fn_parses_only_its_own_body (\"the anchor of `S::with` is the `impl`\").\n(4) item_tree: items::tests an_edit_of_one_item_lowers_it_alone, a_big_item_keeps_its_tree_across_an_edit_elsewhere, an_edit_hashes_only_the_items_it_touched, an_edit_reads_ids_only_for_the_items_it_touched, a_renumbered_id_reads_the_item_holding_it, trees_asked_again_allocate_nothing (1 alloc, budget 0), random_edits_assemble_to_a_fresh_whole_tree (base-db reparse.rs:283 errors differ); persist::tests::a_corrupted_token_tree_is_refused.\nTest-side fixes I made (tests-misc-stencil, uncommitted): item_tree/tests.rs crate_attrs_with_disabled_cfg_in_source now expects rustc's order (crate-attrs appended, a false cfg stops), expr_store/tests/body.rs Idx::<Expr<'_>>, body/block.rs salsa ids, mbe.rs syntax-context ids.",
+  "state": "applied",
+  "created": "2026-10-31T02:08:47Z",
+  "updated": "2026-10-31T23:46:37Z",
+  "taken_by": "tests-misc-stencil",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:08:47Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to tests-misc-stencil, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:19Z",
+      "by": "tests-misc-stencil",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:46:37Z",
+      "by": "tests-misc-stencil",
+      "action": "done",
+      "note": "Fixed here: item_tree::tests x6 and items x6 (counted from before the write; top_key; root anchor by id), view_tests (walks the expansion files), outline (attributed impl), eager_concat_bytes_panic (the more useful message), a_fragments_node_maps_up_to_its_metavariable (checks that it maps to the metavariable, `$s` or `s`). Routed: test_vec and test_expand_bad_literal to format 01359 (fragment-parse errors point at the wrong token), stmt_boundaries to format 01360 (stringify! is runtime behavior; check the nightly), the builtin derive spans to db-expand-derive 01361, broken_parenthesis 01289 db, nameres 01309/01329 db."
+    }
+  ]
+}

@@ -1,11 +1,11 @@
 //! Things related to opaques in the next-trait-solver.
 
-use intern::{Interned, InternedRef, impl_internable};
-use macros::GenericTypeVisitable;
+use std::{marker::PhantomData, num::NonZeroU32};
+
 use rustc_ast_ir::try_visit;
 use rustc_type_ir::inherent::SliceLike;
 
-use crate::next_solver::{impl_foldable_for_interned_slice, interned_slice};
+use crate::next_solver::{impl_foldable_for_interned_slice, interned_slice, interner::table};
 
 use super::{DbInterner, SolverDefId, Ty};
 
@@ -35,40 +35,40 @@ interned_slice!(
 );
 impl_foldable_for_interned_slice!(SolverDefIds);
 
+/// Every interned [`ExternalConstraints`], kept whole: it derefs to its data.
+static EXTERNAL_CONSTRAINTS: table::Values<ExternalConstraintsData<'static>> =
+    table::Values::new("external constraints");
+table::erase!(ExternalConstraintsData);
+
+/// Solver constraints: their row in [`EXTERNAL_CONSTRAINTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct ExternalConstraints<'db> {
-    interned: InternedRef<'db, ExternalConstraintsInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub(super) struct ExternalConstraintsInterned(ExternalConstraintsData<'static>);
-
-impl_internable!(gc; ExternalConstraintsInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<ExternalConstraints<'static>>();
-};
+const _: () = assert!(size_of::<Option<ExternalConstraints<'static>>>() == 4);
 
 impl<'db> ExternalConstraints<'db> {
     #[inline]
     pub fn new(_interner: DbInterner<'db>, data: ExternalConstraintsData<'db>) -> Self {
-        let data = unsafe {
-            std::mem::transmute::<ExternalConstraintsData<'db>, ExternalConstraintsData<'static>>(
-                data,
-            )
-        };
-        Self { interned: Interned::new_gc(ExternalConstraintsInterned(data)) }
+        ExternalConstraints { index: EXTERNAL_CONSTRAINTS.intern(data), _db: PhantomData }
     }
 
     #[inline]
     pub fn inner(&self) -> &ExternalConstraintsData<'db> {
-        let inner = &self.interned.0;
-        unsafe {
-            std::mem::transmute::<&ExternalConstraintsData<'static>, &ExternalConstraintsData<'db>>(
-                inner,
-            )
-        }
+        EXTERNAL_CONSTRAINTS.get(self.index)
+    }
+
+    /// Whether there are no constraints, which every fold maps to the same value: most
+    /// responses.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        let data = self.inner();
+        data.region_constraints.is_empty()
+            && data.opaque_types.is_empty()
+            && data.normalization_nested_goals.is_empty()
     }
 }
 
@@ -102,36 +102,48 @@ impl<'db> rustc_type_ir::TypeFoldable<DbInterner<'db>> for ExternalConstraints<'
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
+        if self.is_empty() {
+            return Ok(self);
+        }
         Ok(ExternalConstraints::new(
             folder.cx(),
             ExternalConstraintsData {
+                // clone: folding takes the fields owned; only a response with constraints gets here.
                 region_constraints: self.region_constraints.clone().try_fold_with(folder)?,
                 opaque_types: self
                     .opaque_types
                     .iter()
                     .cloned()
                     .map(|opaque| opaque.try_fold_with(folder))
+                    // alloc: the folded copy of a non-empty list, interned below.
                     .collect::<Result<_, F::Error>>()?,
                 normalization_nested_goals: self
                     .normalization_nested_goals
+                    // clone: as above.
                     .clone()
                     .try_fold_with(folder)?,
             },
         ))
     }
     fn fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
+        if self.is_empty() {
+            return self;
+        }
         ExternalConstraints::new(
             folder.cx(),
             ExternalConstraintsData {
+                // clone: folding takes the fields owned; only a response with constraints gets here.
                 region_constraints: self.region_constraints.clone().fold_with(folder),
                 opaque_types: self
                     .opaque_types
                     .iter()
                     .cloned()
                     .map(|opaque| opaque.fold_with(folder))
+                    // alloc: the folded copy of a non-empty list, interned below.
                     .collect(),
                 normalization_nested_goals: self
                     .normalization_nested_goals
+                    // clone: as above.
                     .clone()
                     .fold_with(folder),
             },

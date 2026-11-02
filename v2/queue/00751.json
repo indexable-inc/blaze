@@ -1,0 +1,36 @@
+{
+  "id": "00751",
+  "from_lane": "solver-sync-glue",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir-ty/src/lib.rs"
+  ],
+  "what": "## 6. lane db: install `blaze-alloc-count` in hir-ty's tests\n\n- `crates/hir-ty/Cargo.toml` `[dev-dependencies]`: `blaze-alloc-count.workspace = true`.\n- `crates/hir-ty/src/lib.rs`: `#[cfg(test)] #[global_allocator] static ALLOC:\n  blaze_alloc_count::Counting = blaze_alloc_count::Counting;`.\n- `tls_cache.rs`'s budget tests (a hit allocates nothing; a miss into an empty slot allocates\n  its generation alone) and `infer/relate/generalize.rs:776` call it already.\n\n> forwarded to db (window `db-next2`, told by tmux).\n\n> checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:65` (`blaze-alloc-count` dev-dependency) and `crates/hir-ty/src/lib.rs:60` (`#[global_allocator]`).",
+  "state": "applied",
+  "created": "2026-10-30T06:45:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#6. lane db: install `blaze-alloc-count` in hir-ty's tests",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:92"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:65` (`blaze-alloc-count` dev-dependency) and `crates/hir-ty/src/lib.rs:60` (`#[global_allocator]`)."
+    }
+  ]
+}

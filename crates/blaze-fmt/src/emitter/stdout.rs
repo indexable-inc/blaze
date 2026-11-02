@@ -12,12 +12,10 @@ impl StdoutEmitter {
     pub(crate) fn new(verbosity: Verbosity) -> Self {
         Self { verbosity }
     }
-}
 
-impl Emitter for StdoutEmitter {
-    fn emit_formatted_file(
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        output: &mut dyn Write,
+        output: &mut impl Write,
         FormattedFile {
             filename,
             formatted_text,

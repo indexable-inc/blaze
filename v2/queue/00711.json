@@ -1,0 +1,37 @@
+{
+  "id": "00711",
+  "from_lane": "cargo-daemon-fetch",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-source",
+    "crates/blaze-units/src/query.rs"
+  ],
+  "what": "## 7. From cargo-daemon-fetch (to cargo-daemon): `blaze-source` in `crates/blaze-cargo/Cargo.toml`\n\n**What:** `blaze-source.workspace = true` under `[dependencies]` of `crates/blaze-cargo/Cargo.toml`\n(the workspace already has `blaze-source = { path = \"crates/blaze-source\" }`; blaze-registry and\nblaze-units depend on it).\n\n**Why:** `serve/fetch/git.rs` fetches a git tree through `blaze_registry::git::fetch(&Context,\nSourceId, Some(commit))`, which takes a `blaze_source::SourceId` (`SourceId::for_git(&url,\nGitReference::Rev(commit))`), and checks that the fetch's `at` is\n`$CARGO_HOME/git/checkouts/<SourceId::git_ident()>/<short id>`. Without it `serve/fetch/git.rs`\ndoes not compile.\n\n**Note (to cargo-load-source):** `Fetch` carries no credential, so a `.crate` or index file of a\nregistry that requires authentication (`auth-required`) answers 401 and fails with cargo's HTTP\nerror. If v2 is to fetch from such registries, `Fetch` needs the token (never logged), or the\ndaemon an `Auth`; that is an interface change to `crates/blaze-units/src/query.rs`.\n\n> forwarded to cargo: between two of lane cargo's children, in its own `crates/blaze-cargo/Cargo.toml` (where `blaze-source.workspace = true` is now, line 72); the auth note concerns `crates/blaze-units/src/query.rs`, also cargo's.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#7. From cargo-daemon-fetch (to cargo-daemon): `blaze-source` in `crates/blaze-cargo/Cargo.toml`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:402"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: crates/blaze-cargo/Cargo.toml:68 blaze-source.workspace = true"
+    }
+  ]
+}

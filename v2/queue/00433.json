@@ -1,0 +1,24 @@
+{
+  "id": "00433",
+  "from_lane": "usercode-fast-tests",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/index.rs",
+    "docs/v2/plan/lanes/usercode/tests.md"
+  ],
+  "what": "## usercode-fast-tests 1: usercode: `index::search` for any store (`crates/blaze-usercode/src/index.rs`)\n\n`test::select::find` checks a test's kept pass the slow way: it decodes each shape into a\n`Shape` and builds a whole `Traced` of its values (`Shape::values`) to hash its result key,\nfor every test, skipped or not. `index::search` does the same check in place (`keyed`: the\nshape read borrowed, each input hashed into the key as it is asked, no `Traced`), but it is\nprivate, and `find`/`find_held` take a `Reader` or a `Store`, where selection has a\n`&dyn Passes`.\n\nWhat: make `search` `pub(crate)`, as it is:\n\n```rust\npub(crate) fn search<'s, I: Inputs>(\n    get: impl Fn(&Key) -> Result<Option<&'s [u8]>, Corrupt>,\n    run: &RunKey,\n    inputs: &mut I,\n) -> Result<Found<'s>, FindError<I::Error>>\n```\n\nThen `test/select.rs`'s `find` becomes `index::search(|key| store.get(key), run, inputs)`,\nwith `Found::Hit { value, .. }` a pass when `value == PASS` (otherwise `NotOurs`),\n`FindError::NotAShape` as `NotOurs`, and one difference to note: where `Shape::values`\nhashes a directory that is no longer one, `keyed` says no result can match (`None`), which\n`search` reads as a miss of that shape. A miss either way: the test runs.\n\nWhy: the speed pass (`docs/v2/plan/lanes/usercode/tests.md`, Selection): a skipped test\nshould cost its gets and its hashes, not a `Traced` built and dropped.\n\n> applied (usercode): `index::search` is `pub(crate)`; `test::select::find` calls it as written above.\n\n> forwarded to usercode (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:21:53Z",
+  "updated": "2026-10-30T04:21:53Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-fast-tests.md#usercode-fast-tests 1: usercode: `index::search` for any store (`crates/blaze-usercode/src/index.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-tests.md:3"
+    }
+  ]
+}

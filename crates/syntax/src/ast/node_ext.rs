@@ -68,6 +68,15 @@ impl ast::Abi {
 
 impl ast::HasModuleItem for ast::StmtList {}
 
+impl ast::Fn {
+    /// Whether an outline (`SourceFile::parse_outline`) left the body unparsed: a lazy node,
+    /// whose part is parsed the first time a cursor walks into it (or was already). Never parses.
+    pub fn body_is_lazy(&self) -> bool {
+        let Some(body) = self.body() else { return false };
+        body.syntax().flat().is_some_and(|(tree, at)| tree.is_lazy(at))
+    }
+}
+
 impl ast::BlockExpr {
     // FIXME: remove all these methods, they belong to ast::StmtList
     pub fn statements(&self) -> impl Iterator<Item = ast::Stmt> {

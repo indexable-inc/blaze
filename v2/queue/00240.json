@@ -1,0 +1,37 @@
+{
+  "id": "00240",
+  "from_lane": "frontend-db",
+  "owner": "fastcompile",
+  "paths": [
+    "tools/v2/concrete_db.py",
+    "Cargo.toml",
+    "v2/requests/frontend-db-edge.md"
+  ],
+  "what": "## frontend-db: the concrete `Db` in the coordinator's other crates (2026-10-29)\n\n`blaze-intent`, `blaze-wasm`, `blaze-doc` and `blaze-lints` are the coordinator's (crates.md,\n\"every other path\"). Run `tools/v2/concrete_db.py` on them (dry run: 18, 7, 1 and 3 sites),\nthen fix what it prints:\n- `blaze-intent/src/tests/db.rs`: `type TestDB = base_db::Db;` with its helpers in a\n  crate-private trait implemented for `Db`. The `hir::impl_hir_database!` line (L149) becomes\n  `use hir as _;`.\n- `blaze-wasm/src/pack.rs:166` and `pack/record.rs:95`: drop the `as &dyn ..` casts.\n- `blaze-wasm/Cargo.toml` and `blaze-lints/Cargo.toml`: `base-db.workspace = true`.\n\nStatus: open\n\n> applied by frontend-db-edge (blaze-wasm, blaze-doc, blaze-lints): tool run on blaze-wasm (7)\n> and blaze-doc (1); the two \"left\" casts are `as &dyn Any` in `eq_dyn`, not databases.\n> blaze-wasm's `Cargo.toml` gains `base-db` (a path dependency: it is a workspace of its own).\n> blaze-lints has no `dyn` database and already depends on base-db; its `RootDatabase` uses are\n> lane lints' rewrite (told). `RootDatabase` itself: `v2/requests/frontend-db-edge.md`.\n\n> applied by frontend-db-hir (blaze-intent): the tool run, `tests/db.rs` is `type TestDB = base_db::Db;` with `use hir as _;` (it had no helpers), `Semantics::new_dyn` -> `Semantics::new`, `Semantics<'_, Db>` -> `Semantics<'_>`. blaze-wasm, blaze-doc and blaze-lints are frontend-db-edge's.\n\n> forwarded to fastcompile (`blaze-intent`, its crate; told) and the coordinator (`blaze-wasm`, `blaze-doc`, `blaze-lints`: \"every other path\", not requests'; on requests' coordinator list), each once db's section 3 lands.",
+  "state": "applied",
+  "created": "2026-10-30T02:33:07Z",
+  "updated": "2026-10-30T14:24:29Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/frontend.md#frontend-db: the concrete `Db` in the coordinator's other crates (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend.md:173"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "blaze-intent part in the tree: crates/blaze-intent/src/tests/db.rs is type TestDB = base_db::Db; no dyn database is left in crates/blaze-intent/src (applied by frontend-db-hir). blaze-wasm, blaze-doc and blaze-lints were frontend-db-edge's, applied."
+    }
+  ]
+}

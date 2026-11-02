@@ -1,0 +1,29 @@
+{
+  "id": "00587",
+  "from_lane": "requests-api",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-testsel/src/api.rs"
+  ],
+  "what": "## 4. To lane fastcompile (`crates/blaze-testsel/src/api.rs`)\n\n`result(binary, name, cached)` (39) takes `executable: u32` and sets `executable` and `outside:\nfalse`. The test at 86 sets `outside: false, executable: 0`. Why: two new `TestResult` fields.\n\n> forwarded to fastcompile (window `fastcompile`); told by tmux (requests, pass 30).",
+  "state": "applied",
+  "created": "2026-10-30T05:22:53Z",
+  "updated": "2026-10-30T14:11:42Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/requests-api.md#4. To lane fastcompile (`crates/blaze-testsel/src/api.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-api.md:181"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "already in: blaze-testsel api.rs result(binary, executable, name, cached) sets executable and outside: false"
+    }
+  ]
+}

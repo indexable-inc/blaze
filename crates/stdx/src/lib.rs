@@ -7,18 +7,16 @@ use std::{cmp::Ordering, ops, time::Instant};
 
 mod macros;
 
-pub mod anymap;
 pub mod assert;
-pub mod non_empty_vec;
+pub mod edit_distance;
+pub mod lend;
+pub mod list;
 pub mod panic_context;
-pub mod process;
-pub mod rand;
 pub mod tempfile;
-pub mod thread;
 pub mod time;
-pub mod variance;
 
 pub use itertools;
+pub use lend::lend;
 
 #[inline(always)]
 pub const fn is_ci() -> bool {
@@ -29,10 +27,79 @@ pub const fn is_ci() -> bool {
 /// as rustc's `ensure_sufficient_stack` does: that of `rustc_type_ir` does nothing outside
 /// rustc. What recurses once per level of what it walks, the trait solver or the lowering of
 /// an expression, goes as deep as the source does, and an unoptimized build overflows a 2 MB
-/// thread long before rustc's 5,204-arm `else if` is through.
+/// thread long before rustc's 5,204-arm `else if` is through. Unoptimized, a query's frames
+/// between two checks (a fetch through blaze-query into the solver) take more than 100 KiB,
+/// so a debug build keeps 1 MiB left and grows by 8 MiB.
+///
+/// On a fiber, stacker's own limit is wrong: it keeps one per thread, from the thread's stack,
+/// so the fiber's limit is kept here instead ([`set_fiber_stack_limit`], set by the fiber
+/// driver at each job start and carried across a switch).
 #[cfg(not(target_family = "wasm"))]
 pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
-    stacker::maybe_grow(100 * 1024, 1024 * 1024, f)
+    const RED_ZONE: usize = if cfg!(debug_assertions) { 1024 * 1024 } else { 100 * 1024 };
+    const SEGMENT: usize = if cfg!(debug_assertions) { 8 * 1024 * 1024 } else { 1024 * 1024 };
+    let limit = fiber_stack_limit();
+    if limit == 0 {
+        return stacker::maybe_grow(RED_ZONE, SEGMENT, f);
+    }
+    if stack_pointer().saturating_sub(limit) >= RED_ZONE {
+        return f();
+    }
+    stacker::grow(SEGMENT, || {
+        // Inside `grow` stacker's limit is the new segment's, so its remaining stack is right.
+        let remaining = stacker::remaining_stack().expect("stacker knows the segment it made");
+        let _outer = FiberLimit::set(stack_pointer() - remaining);
+        f()
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+thread_local! {
+    static FIBER_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The lowest usable address of the fiber stack this thread runs now; 0 on the thread's own
+/// stack. `inline(never)`: a job can resume on another thread after a wait, and an inlined
+/// thread-local's address could be kept across it.
+#[cfg(not(target_family = "wasm"))]
+#[inline(never)]
+pub fn fiber_stack_limit() -> usize {
+    FIBER_STACK_LIMIT.get()
+}
+
+/// Sets [`fiber_stack_limit`]; `inline(never)` for the same reason.
+#[cfg(not(target_family = "wasm"))]
+#[inline(never)]
+pub fn set_fiber_stack_limit(limit: usize) {
+    FIBER_STACK_LIMIT.set(limit);
+}
+
+/// The fiber limit for a grown segment, put back to the outer one when the segment's call
+/// ends, by return or by unwind.
+#[cfg(not(target_family = "wasm"))]
+struct FiberLimit(usize);
+
+#[cfg(not(target_family = "wasm"))]
+impl FiberLimit {
+    fn set(limit: usize) -> FiberLimit {
+        let outer = fiber_stack_limit();
+        set_fiber_stack_limit(limit);
+        FiberLimit(outer)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for FiberLimit {
+    fn drop(&mut self) {
+        set_fiber_stack_limit(self.0);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+fn stack_pointer() -> usize {
+    let here = 0u8;
+    std::ptr::addr_of!(here).addr()
 }
 
 #[cfg(target_family = "wasm")]
@@ -44,25 +111,21 @@ pub fn hash_once<Hasher: std::hash::Hasher + Default>(thing: impl std::hash::Has
     std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<Hasher>::default(), thing)
 }
 
+/// The text a panic was raised with, as `catch_unwind` or a joined thread hands its payload:
+/// `panic!`'s `&'static str` or formatted `String`. `None` for any other payload.
+// dyn: a panic's payload, read once per panic caught
+pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    match payload.downcast_ref::<&'static str>() {
+        Some(text) => Some(text),
+        None => payload.downcast_ref::<String>().map(String::as_str),
+    }
+}
+
 #[must_use]
 #[expect(clippy::print_stderr, reason = "only visible to developers")]
 pub fn timeit(label: &'static str) -> impl Drop {
     let start = Instant::now();
     defer(move || eprintln!("{}: {:.2}", label, start.elapsed().as_nanos()))
-}
-
-/// Prints backtrace to stderr, useful for debugging.
-#[expect(clippy::print_stderr, reason = "only visible to developers")]
-pub fn print_backtrace() {
-    #[cfg(feature = "backtrace")]
-    eprintln!("{:?}", backtrace::Backtrace::new());
-
-    #[cfg(not(feature = "backtrace"))]
-    eprintln!(
-        r#"Enable the backtrace feature.
-Uncomment `default = [ "backtrace" ]` in `crates/stdx/Cargo.toml`.
-"#
-    );
 }
 
 pub trait TupleExt {
@@ -384,6 +447,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn on_a_fiber_near_its_limit_the_stack_grows_and_the_limit_comes_back() {
+        // A fiber with almost no stack left, as the driver would set it at a job start.
+        let fake = stack_pointer() - 4096;
+        set_fiber_stack_limit(fake);
+        let inside = ensure_sufficient_stack(fiber_stack_limit);
+        assert_ne!(inside, fake, "the call ran on the fiber's stack instead of a new segment");
+        assert_ne!(inside, 0);
+        assert_eq!(fiber_stack_limit(), fake);
+        let unwound = std::panic::catch_unwind(|| ensure_sufficient_stack(|| panic!("in a segment")));
+        assert!(unwound.is_err());
+        assert_eq!(fiber_stack_limit(), fake, "an unwind left the segment's limit behind");
+        set_fiber_stack_limit(0);
+    }
+
+    #[test]
     fn test_trim_indent() {
         assert_eq!(trim_indent(""), "");
         assert_eq!(
@@ -475,5 +553,26 @@ mod tests {
         test_replace("a.b.c", '.', "😀😀", "a😀😀b😀😀c");
         test_replace(".a.b.c.", '.', "()", "()a()b()c()");
         test_replace(".a.b.c.", '.', "", "abc");
+    }
+
+    #[test]
+    fn panic_text_is_the_copies_it_replaced() {
+        // blaze-engine's and hir-ty-codegen's copy, which looked for a `String` first.
+        fn kept(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
+            panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied())
+        }
+        let payloads: [Box<dyn std::any::Any + Send>; 6] = [
+            Box::new("static text"),
+            Box::new(String::from("formatted 7")),
+            Box::new(String::new()),
+            Box::new(7u32),
+            Box::new(Box::new("boxed") as Box<dyn std::any::Any + Send>),
+            Box::new(()),
+        ];
+        for payload in &payloads {
+            assert_eq!(panic_text(&**payload), kept(&**payload));
+        }
+        let caught = std::panic::catch_unwind(|| -> u8 { panic!("caught {}", 7) }).unwrap_err();
+        assert_eq!(panic_text(&*caught), Some("caught 7"));
     }
 }

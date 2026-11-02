@@ -1,15 +1,16 @@
 //! Type cast logic. Basically coercion + additional casts.
 
+use base_db::Db;
 use hir_def::{
-    AdtId,
+    AdtId, TraitId, TypeParamId,
     hir::ExprId,
     signatures::{TraitFlags, TraitSignature},
 };
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    InferTy, TypeVisitableExt, UintTy, elaborate,
+    InferTy, RegionKind, TypeVisitableExt, UintTy,
     error::TypeError,
+    fold_regions,
     inherent::{BoundExistentialPredicates as _, IntoKind, Ty as _},
 };
 use stdx::never;
@@ -17,10 +18,11 @@ use stdx::never;
 use crate::{
     InferenceDiagnostic,
     db::HirDatabase,
+    drop::destructor,
     infer::{AllowTwoPhase, InferenceContext, expr::ExprIsRead},
     next_solver::{
-        BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, Ty, TyKind,
-        infer::traits::ObligationCause,
+        AliasTy, BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, RegionExt,
+        TraitIdWrapper, Ty, TyKind, infer::traits::ObligationCause,
     },
 };
 
@@ -44,7 +46,7 @@ pub enum CastTy<'db> {
 }
 
 impl<'db> CastTy<'db> {
-    pub fn from_ty(db: &dyn HirDatabase, t: Ty<'db>) -> Option<Self> {
+    pub fn from_ty(db: &Db, t: Ty<'db>) -> Option<Self> {
         match t.kind() {
             TyKind::Bool => Some(Self::Int(Int::Bool)),
             TyKind::Char => Some(Self::Int(Int::Char)),
@@ -67,7 +69,7 @@ impl<'db> CastTy<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum CastError {
     Unknown,
     CastToBool,
@@ -82,12 +84,68 @@ pub enum CastError {
     NeedViaInt,
     NonScalar,
     PtrPtrAddingAutoTraits,
-    // We don't want to report errors with unknown types currently.
-    // UnknownCastPtrKind,
-    // UnknownExprPtrKind,
+    /// E0641: the pointee of the type cast to is not known, so neither is its metadata.
+    UnknownCastPtrKind,
+    /// E0641: the pointee of the expression's type is not known.
+    UnknownExprPtrKind,
+    /// A field-less enum with a `Drop` impl cast to an integer.
+    CastEnumDrop,
+    /// E0606 of an enum from another crate with a `#[non_exhaustive]` variant.
+    ForeignNonExhaustiveAdt,
 }
 
-impl CastError {
+/// rustc's `PointerKind` of a pointee, as the report of a refused cast reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CastPointerKind {
+    Thin,
+    /// A trait object, with its principal trait if it has one.
+    VTable(Option<TraitId>),
+    Length,
+    /// The metadata of a projection or opaque type.
+    OfAlias,
+    /// The metadata of a type parameter.
+    OfParam(TypeParamId),
+}
+
+/// The pointer kinds of a pointer cast rustc refuses, where its check found them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CastPointers {
+    /// The kind of the expression's pointee; `None` when it is not known or was not looked at.
+    pub expr: Option<CastPointerKind>,
+    /// The kind of the pointee of the type cast to, likewise.
+    pub cast: Option<CastPointerKind>,
+    /// Of `PtrPtrAddingAutoTraits`: the auto traits the target `dyn` adds, in its order.
+    pub added_auto_traits: Box<[TraitId]>,
+}
+
+/// A cast rustc refuses: the error and the pointer kinds its report reads.
+#[derive(Debug)]
+struct CastFailure {
+    error: CastError,
+    pointers: Option<Box<CastPointers>>,
+}
+
+impl From<CastError> for CastFailure {
+    fn from(error: CastError) -> Self {
+        Self { error, pointers: None }
+    }
+}
+
+impl CastFailure {
+    fn with_kinds(
+        error: CastError,
+        expr: Option<&PointerKind<'_>>,
+        cast: Option<&PointerKind<'_>>,
+    ) -> Self {
+        // alloc: once per refused pointer cast
+        let pointers = Box::new(CastPointers {
+            expr: expr.and_then(PointerKind::stored),
+            cast: cast.and_then(PointerKind::stored),
+            added_auto_traits: Box::new([]), // alloc: empty
+        });
+        Self { error, pointers: Some(pointers) }
+    }
+
     fn into_diagnostic<'db>(
         self,
         expr: ExprId,
@@ -96,9 +154,10 @@ impl CastError {
     ) -> InferenceDiagnostic {
         InferenceDiagnostic::InvalidCast {
             expr,
-            error: self,
+            error: self.error,
             expr_ty: expr_ty.store(),
             cast_ty: cast_ty.store(),
+            pointers: self.pointers,
         }
     }
 }
@@ -123,13 +182,26 @@ impl<'db> CastCheck<'db> {
 
     pub(super) fn check(
         &mut self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
     ) -> Result<(), InferenceDiagnostic> {
-        self.expr_ty =
-            ctx.table.try_structurally_resolve_type(self.source_expr.into(), self.expr_ty);
+        self.expr_ty = ctx.structurally_resolve_type(self.source_expr.into(), self.expr_ty);
         self.cast_ty = ctx.table.try_structurally_resolve_type(self.expr.into(), self.cast_ty);
+        if self.cast_ty.is_ty_var() {
+            self.cast_ty = ctx.type_must_be_known_at_this_point(self.expr.into(), self.cast_ty);
+        }
 
-        // This should always come first so that we apply the coercion, which impacts infer vars.
+        if !ctx.table.type_is_sized_modulo_regions(self.cast_ty) && !self.cast_ty.has_infer_types()
+        {
+            return Err(InferenceDiagnostic::CastToUnsized {
+                expr: self.expr,
+                cast_ty: self.cast_ty.store(),
+            });
+        }
+
+        if self.expr_ty.references_non_lt_error() || self.cast_ty.references_non_lt_error() {
+            return Ok(());
+        }
+
         if ctx
             .coerce(
                 self.source_expr,
@@ -148,22 +220,10 @@ impl<'db> CastCheck<'db> {
             return Ok(());
         }
 
-        if self.expr_ty.references_non_lt_error() || self.cast_ty.references_non_lt_error() {
-            return Ok(());
-        }
-
-        if !self.cast_ty.has_infer_types() && !ctx.table.type_is_sized_modulo_regions(self.cast_ty)
-        {
-            return Err(InferenceDiagnostic::CastToUnsized {
-                expr: self.expr,
-                cast_ty: self.cast_ty.store(),
-            });
-        }
-
         self.do_check(ctx).map_err(|e| e.into_diagnostic(self.expr, self.expr_ty, self.cast_ty))
     }
 
-    fn do_check(&self, ctx: &mut InferenceContext<'db>) -> Result<(), CastError> {
+    fn do_check(&self, ctx: &mut InferenceContext<'db, '_>) -> Result<(), CastFailure> {
         let (t_from, t_cast) =
             match (CastTy::from_ty(ctx.db, self.expr_ty), CastTy::from_ty(ctx.db, self.cast_ty)) {
                 (Some(t_from), Some(t_cast)) => (t_from, t_cast),
@@ -181,10 +241,10 @@ impl<'db> CastCheck<'db> {
                         ) {
                             Ok(_) => {}
                             Err(TypeError::IntrinsicCast) => {
-                                return Err(CastError::IllegalCast);
+                                return Err(CastError::IllegalCast.into());
                             }
                             Err(_) => {
-                                return Err(CastError::NonScalar);
+                                return Err(CastError::NonScalar.into());
                             }
                         }
 
@@ -197,48 +257,59 @@ impl<'db> CastCheck<'db> {
                                 | TyKind::Uint(_)
                                 | TyKind::Float(_)
                                 | TyKind::Infer(InferTy::IntVar(_) | InferTy::FloatVar(_)) => {
-                                    Err(CastError::NeedDeref)
+                                    Err(CastError::NeedDeref.into())
                                 }
 
-                                _ => Err(CastError::NeedViaPtr),
+                                _ => Err(CastError::NeedViaPtr.into()),
                             },
                             // array-ptr-cast
                             CastTy::Ptr(t, m) => {
                                 let t =
                                     ctx.table.try_structurally_resolve_type(self.expr.into(), t);
                                 if !ctx.table.type_is_sized_modulo_regions(t) {
-                                    return Err(CastError::IllegalCast);
+                                    return Err(CastError::IllegalCast.into());
                                 }
                                 self.check_ref_cast(ctx, inner_ty, mutbl, t, m)
+                                    .map_err(CastFailure::from)
                             }
-                            _ => Err(CastError::NonScalar),
+                            _ => Err(CastError::NonScalar.into()),
                         };
                     }
-                    _ => return Err(CastError::NonScalar),
+                    _ => return Err(CastError::NonScalar.into()),
                 },
-                _ => return Err(CastError::NonScalar),
+                _ => return Err(CastError::NonScalar.into()),
             };
 
-        // rustc checks whether the `expr_ty` is foreign adt with `non_exhaustive` sym
+        if let Some((AdtId::EnumId(id), _)) = self.expr_ty.as_adt()
+            && id
+                .enum_variants(ctx.db)
+                .variants
+                .values()
+                .any(|&(variant, _)| ctx.has_applicable_non_exhaustive(variant.into()))
+        {
+            return Err(CastError::ForeignNonExhaustiveAdt.into());
+        }
 
         match (t_from, t_cast) {
             // These types have invariants! can't cast into them.
-            (_, CastTy::Int(Int::CEnum) | CastTy::FnPtr) => Err(CastError::NonScalar),
+            (_, CastTy::Int(Int::CEnum) | CastTy::FnPtr) => Err(CastError::NonScalar.into()),
 
             // * -> Bool
-            (_, CastTy::Int(Int::Bool)) => Err(CastError::CastToBool),
+            (_, CastTy::Int(Int::Bool)) => Err(CastError::CastToBool.into()),
 
             // * -> Char
             (CastTy::Int(Int::U(UintTy::U8)), CastTy::Int(Int::Char)) => Ok(()), // u8-char-cast
-            (_, CastTy::Int(Int::Char)) => Err(CastError::CastToChar),
+            (_, CastTy::Int(Int::Char)) => Err(CastError::CastToChar.into()),
 
             // prim -> float,ptr
             (CastTy::Int(Int::Bool | Int::CEnum | Int::Char), CastTy::Float) => {
-                Err(CastError::NeedViaInt)
+                Err(CastError::NeedViaInt.into())
             }
 
             (CastTy::Int(Int::Bool | Int::CEnum | Int::Char) | CastTy::Float, CastTy::Ptr(..))
-            | (CastTy::Ptr(..) | CastTy::FnPtr, CastTy::Float) => Err(CastError::IllegalCast),
+            | (CastTy::Ptr(..) | CastTy::FnPtr, CastTy::Float) => {
+                Err(CastError::IllegalCast.into())
+            }
 
             // ptr -> ptr
             (CastTy::Ptr(src, _), CastTy::Ptr(dst, _)) => self.check_ptr_ptr_cast(ctx, src, dst), // ptr-ptr-cast
@@ -253,8 +324,15 @@ impl<'db> CastCheck<'db> {
             // fn-ptr-cast
             (CastTy::FnPtr, CastTy::Ptr(dst, _)) => self.check_fptr_ptr_cast(ctx, dst),
 
+            // enum -> int
+            (CastTy::Int(Int::CEnum), CastTy::Int(_)) => match self.expr_ty.as_adt() {
+                Some((adt, _)) if destructor(ctx.db, adt).is_some() => {
+                    Err(CastError::CastEnumDrop.into())
+                }
+                _ => Ok(()),
+            },
+
             // prim -> prim
-            (CastTy::Int(Int::CEnum), CastTy::Int(_)) => Ok(()),
             (CastTy::Int(Int::Char | Int::Bool), CastTy::Int(_)) => Ok(()),
             (CastTy::Int(_) | CastTy::Float, CastTy::Int(_) | CastTy::Float) => Ok(()),
         }
@@ -262,7 +340,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_ref_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         t_expr: Ty<'db>,
         m_expr: Mutability,
         t_cast: Ty<'db>,
@@ -291,7 +369,7 @@ impl<'db> CastCheck<'db> {
                 .is_ok()
             {
             } else {
-                never!(
+                unreachable!(
                     "could not cast from reference to array to pointer to array ({:?} to {:?})",
                     self.expr_ty,
                     array_ptr_type
@@ -308,28 +386,48 @@ impl<'db> CastCheck<'db> {
 
     fn check_ptr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         src: Ty<'db>,
         dst: Ty<'db>,
-    ) -> Result<(), CastError> {
+    ) -> Result<(), CastFailure> {
         let src_kind = pointer_kind(self.expr, src, ctx).map_err(|_| CastError::Unknown)?;
         let dst_kind = pointer_kind(self.expr, dst, ctx).map_err(|_| CastError::Unknown)?;
+        if matches!(src_kind, Some(PointerKind::Error))
+            || matches!(dst_kind, Some(PointerKind::Error))
+        {
+            return Ok(());
+        }
 
-        match (src_kind, dst_kind) {
-            (Some(PointerKind::Error), _) | (_, Some(PointerKind::Error)) => Ok(()),
+        let Some(dst_kind) = dst_kind else {
+            return Err(CastFailure::with_kinds(
+                CastError::UnknownCastPtrKind,
+                src_kind.as_ref(),
+                None,
+            ));
+        };
 
-            // (_, None) => Err(CastError::UnknownCastPtrKind),
-            // (None, _) => Err(CastError::UnknownExprPtrKind),
-            (_, None) | (None, _) => Ok(()),
+        // Cast to thin pointer is OK
+        if dst_kind == PointerKind::Thin {
+            return Ok(());
+        }
 
-            // Cast to thin pointer is OK
-            (_, Some(PointerKind::Thin)) => Ok(()),
+        // Not `UnknownExprPtrKind`: rustc's E0641 names the cast's side here too.
+        let Some(src_kind) = src_kind else {
+            return Err(CastFailure::with_kinds(
+                CastError::UnknownCastPtrKind,
+                None,
+                Some(&dst_kind),
+            ));
+        };
+        let failure =
+            |error| CastFailure::with_kinds(error, Some(&src_kind), Some(&dst_kind));
 
+        match (&src_kind, &dst_kind) {
             // thin -> fat? report invalid cast (don't complain about vtable kinds)
-            (Some(PointerKind::Thin), _) => Err(CastError::SizedUnsizedCast),
+            (PointerKind::Thin, _) => Err(failure(CastError::SizedUnsizedCast)),
 
             // trait object -> trait object? need to do additional checks
-            (Some(PointerKind::VTable(src_tty)), Some(PointerKind::VTable(dst_tty))) => {
+            (PointerKind::VTable(src_tty), PointerKind::VTable(dst_tty)) => {
                 match (src_tty.principal_def_id(), dst_tty.principal_def_id()) {
                     // A<dyn Src<...> + SrcAuto> -> B<dyn Dst<...> + DstAuto>. need to make sure
                     // - `Src` and `Dst` traits are the same
@@ -381,31 +479,37 @@ impl<'db> CastCheck<'db> {
                             .map(|infer_ok| ctx.table.register_infer_ok(infer_ok))
                             .is_err()
                         {
-                            return Err(CastError::DifferingKinds);
+                            return Err(failure(CastError::DifferingKinds));
                         }
 
                         // Check that `SrcAuto` (+auto traits implied by `Src`) is a superset of `DstAuto`.
                         // Emit an FCW otherwise.
-                        let src_auto: FxHashSet<_> = src_tty
+                        let mut src_auto = Vec::new_in(ctx.frame);
+                        src_auto.extend(src_tty.auto_traits().into_iter().chain(
+                            crate::utils::all_super_traits(ctx.db, src_principal.0)
+                                .iter()
+                                .filter(|&&trait_| {
+                                    TraitSignature::of(ctx.db, trait_)
+                                        .flags
+                                        .contains(TraitFlags::AUTO)
+                                })
+                                .map(|&trait_| TraitIdWrapper(trait_)),
+                        ));
+
+                        let mut added = dst_tty
                             .auto_traits()
                             .into_iter()
-                            .chain(
-                                elaborate::supertrait_def_ids(ctx.interner(), src_principal)
-                                    .filter(|trait_| {
-                                        TraitSignature::of(ctx.db, trait_.0)
-                                            .flags
-                                            .contains(TraitFlags::AUTO)
-                                    }),
-                            )
-                            .collect();
+                            .filter(|trait_| !src_auto.contains(trait_))
+                            .map(|trait_| trait_.0)
+                            .peekable();
 
-                        let added = dst_tty
-                            .auto_traits()
-                            .into_iter()
-                            .any(|trait_| !src_auto.contains(&trait_));
-
-                        if added {
-                            return Err(CastError::PtrPtrAddingAutoTraits);
+                        if added.peek().is_some() {
+                            let mut failure = failure(CastError::PtrPtrAddingAutoTraits);
+                            if let Some(pointers) = &mut failure.pointers {
+                                // alloc: error path, a refused cast's diagnostic
+                                pointers.added_auto_traits = added.collect();
+                            }
+                            return Err(failure);
                         }
 
                         Ok(())
@@ -443,60 +547,62 @@ impl<'db> CastCheck<'db> {
                     // that the principal of the vtable in the pointer metadata exactly matches
                     // the principal of the pointee type, where "no principal" is also considered
                     // a kind of principal.
-                    (Some(_), None) => Err(CastError::DifferingKinds),
+                    (Some(_), None) => Err(failure(CastError::DifferingKinds)),
 
                     // dyn Auto -> dyn Trait? not ok.
-                    (None, Some(_)) => Err(CastError::DifferingKinds),
+                    (None, Some(_)) => Err(failure(CastError::DifferingKinds)),
                 }
             }
 
             // fat -> fat? metadata kinds must match
-            (Some(src_kind), Some(dst_kind)) if src_kind == dst_kind => Ok(()),
-            (_, _) => Err(CastError::DifferingKinds),
+            (src_kind, dst_kind) if src_kind == dst_kind => Ok(()),
+            (_, _) => Err(failure(CastError::DifferingKinds)),
         }
     }
 
     fn check_ptr_addr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         expr_ty: Ty<'db>,
-    ) -> Result<(), CastError> {
+    ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, expr_ty, ctx).map_err(|_| CastError::Unknown)? {
-            // None => Err(CastError::UnknownExprPtrKind),
-            None => Ok(()),
+            None => Err(CastError::UnknownExprPtrKind.into()),
             Some(PointerKind::Error) => Ok(()),
             Some(PointerKind::Thin) => Ok(()),
-            _ => Err(CastError::NeedViaThinPtr),
+            Some(kind) => {
+                Err(CastFailure::with_kinds(CastError::NeedViaThinPtr, Some(&kind), None))
+            }
         }
     }
 
     fn check_addr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         cast_ty: Ty<'db>,
-    ) -> Result<(), CastError> {
+    ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, cast_ty, ctx).map_err(|_| CastError::Unknown)? {
-            // None => Err(CastError::UnknownCastPtrKind),
-            None => Ok(()),
+            None => Err(CastError::UnknownCastPtrKind.into()),
             Some(PointerKind::Error) => Ok(()),
             Some(PointerKind::Thin) => Ok(()),
-            Some(PointerKind::VTable(_)) => Err(CastError::IntToWideCast),
-            Some(PointerKind::Length) => Err(CastError::IntToWideCast),
-            Some(PointerKind::OfAlias | PointerKind::OfParam(_)) => Err(CastError::IntToWideCast),
+            Some(
+                kind @ (PointerKind::VTable(_)
+                | PointerKind::Length
+                | PointerKind::OfAlias(_)
+                | PointerKind::OfParam(_)),
+            ) => Err(CastFailure::with_kinds(CastError::IntToWideCast, None, Some(&kind))),
         }
     }
 
     fn check_fptr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         cast_ty: Ty<'db>,
-    ) -> Result<(), CastError> {
+    ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, cast_ty, ctx).map_err(|_| CastError::Unknown)? {
-            // None => Err(CastError::UnknownCastPtrKind),
-            None => Ok(()),
+            None => Err(CastError::UnknownCastPtrKind.into()),
             Some(PointerKind::Error) => Ok(()),
             Some(PointerKind::Thin) => Ok(()),
-            _ => Err(CastError::IllegalCast),
+            Some(kind) => Err(CastFailure::with_kinds(CastError::IllegalCast, None, Some(&kind))),
         }
     }
 }
@@ -512,19 +618,39 @@ enum PointerKind<'db> {
     VTable(BoundExistentialPredicates<'db>),
     /// Slice
     Length,
-    /// The unsize info of this projection or opaque type
-    OfAlias,
+    /// The unsize info of this projection or opaque type, its free regions erased: two
+    /// pointers to the same alias have the same metadata.
+    OfAlias(AliasTy<'db>),
     /// The unsize info of this parameter
     OfParam(ParamTy),
+    /// A type with an error in it: rustc reports nothing more.
     Error,
+}
+
+impl PointerKind<'_> {
+    fn stored(&self) -> Option<CastPointerKind> {
+        Some(match self {
+            PointerKind::Thin => CastPointerKind::Thin,
+            PointerKind::VTable(tty) => {
+                CastPointerKind::VTable(tty.principal_def_id().map(|it| it.0))
+            }
+            PointerKind::Length => CastPointerKind::Length,
+            PointerKind::OfAlias(_) => CastPointerKind::OfAlias,
+            PointerKind::OfParam(param) => CastPointerKind::OfParam(param.id),
+            PointerKind::Error => return None,
+        })
+    }
 }
 
 fn pointer_kind<'db>(
     expr: ExprId,
     ty: Ty<'db>,
-    ctx: &mut InferenceContext<'db>,
+    ctx: &mut InferenceContext<'db, '_>,
 ) -> Result<Option<PointerKind<'db>>, ()> {
     let ty = ctx.table.try_structurally_resolve_type(expr.into(), ty);
+    if ty.references_non_lt_error() {
+        return Ok(Some(PointerKind::Error));
+    }
 
     if ctx.table.type_is_sized_modulo_regions(ty) {
         return Ok(Some(PointerKind::Thin));
@@ -556,7 +682,14 @@ fn pointer_kind<'db>(
             Some(ty) => pointer_kind(expr, ty, ctx),
         },
         TyKind::Foreign(_) => Ok(Some(PointerKind::Thin)),
-        TyKind::Alias(..) => Ok(Some(PointerKind::OfAlias)),
+        TyKind::Alias(_, alias) => {
+            let interner = ctx.interner();
+            let alias = fold_regions(interner, alias, |region, _| match region.kind() {
+                RegionKind::ReBound(..) => region,
+                _ => Region::new_erased(interner),
+            });
+            Ok(Some(PointerKind::OfAlias(alias)))
+        }
         TyKind::Error(_) => Ok(Some(PointerKind::Error)),
         TyKind::Param(idx) => Ok(Some(PointerKind::OfParam(idx))),
         TyKind::Bound(..) | TyKind::Placeholder(..) | TyKind::Infer(..) => Ok(None),

@@ -11,18 +11,18 @@ The first build of a daemon is its own, with nothing of rustc's (docs/no-rustc.m
            told ahead of cargo's stored, keyed by the same toolchain
   again    the same once more, with the store holding all of that: what the issue is for
 After each, a body edit and its undoing, which the daemon is to patch, and the program's output,
-which has to be cargo's. For each step: the command's seconds, the wait until ready, the most
+which has to be what blaze from nothing (`blaze_cli.Scratch`) prints. For each step: the command's seconds, the wait until ready, the most
 memory held, what the worker compiled and timed, and what it took from the store: functions
 found and added, frozen crates served and written (all it said is in `WORK/said-STEP.txt`, and
 for the edit and its undoing in `WORK/said-STEP-edit.txt` and `-back.txt`). It fails when a
-step's output is not cargo's, or when the restart took nothing from the store the warm step
+step's output is not the one from nothing, or when the restart took nothing from the store the warm step
 filled.
 Writes the steps as JSON on stdout's last line. The projects are bench.py's, fetched as it fetches them.
 """
 import json, os, re, shutil, sys
 
 import bench, blaze_cli, memory
-from blaze_cli import Side, fetch, program_output, wait_warm
+from blaze_cli import Scratch, Side, fetch, program_output, wait_warm
 
 
 def from_store(said):
@@ -43,24 +43,25 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     source = fetch(name, spec)
-    store = os.path.join(work, "store")
     build, run = spec.get("build", []), spec.get("run")
     edit = spec["edits"]["body"]
 
-    def checkout(label):
+    def checkout(label, seed=None):
+        """A copy of the project with a home of its own, whose store is a copy of `seed`'s."""
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(blaze_cli.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
-        env.update(BLAZE_CACHE=store, BLAZE_STATS="1")
+        home = os.path.join(work, f"home-{label}")
+        if seed is not None:
+            shutil.copytree(os.path.join(seed.env["BLAZE_HOME"], "v2", "store"), os.path.join(home, "v2", "store"), symlinks=True)
+        env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
+        env.update(BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 
-    reference = checkout("reference")
-    reference.env.pop("BLAZE_CACHE")
-    plain = Side(reference.ws, reference.env, False)
-    _, ran = plain.cargo("build", *build)
-    assert ran.returncode == 0, ran.stderr[-3000:]
-    expected = program_output(plain.cargo("run", *build, "--", *run)[1]) if run is not None else None
+    expected = None
+    if run is not None:
+        scratch = checkout("scratch")
+        expected = program_output(Scratch(scratch.ws, scratch.env).cargo("run", *build, "--", *run)[1])
 
     steps = []
 
@@ -102,7 +103,7 @@ def main():
     first = checkout("first")
     step("first", first)
     first.cargo("stop")
-    second = checkout("second")
+    second = checkout("second", seed=first)
     step("warm", second)
     second.cargo("stop")
     step("restart", second)

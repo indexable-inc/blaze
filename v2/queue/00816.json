@@ -1,0 +1,46 @@
+{
+  "id": "00816",
+  "from_lane": "speed-unsafe-front-intern",
+  "owner": "coordinator",
+  "paths": [
+    "crates/proc-macro-srv-cli/src/main_loop.rs",
+    "crates/blaze-macro-eval/src/server.rs",
+    "crates/proc-macro-srv/src/wire.rs",
+    "crates/proc-macro-srv/src/tests/utils.rs",
+    "crates/proc-macro-api/src/wire.rs",
+    "crates/proc-macro-api/src/legacy_protocol/msg.rs",
+    "crates/proc-macro-api/src/legacy_protocol/msg/flat.rs",
+    "crates/load-cargo/src/lib.rs",
+    "crates/blaze-macro-wasm/src/lib.rs",
+    "crates/blaze-expand/src/bridge/spans.rs",
+    "crates/blaze-expand/src/native/proc_macro/lib.rs",
+    "crates/blaze-expand/src/native/host.rs"
+  ],
+  "what": "span::SyntaxContext::from_u32 is a safe fn now (queue 00792). Each `unsafe { SyntaxContext::from_u32(..) }` in these files is an unused_unsafe warning: drop the `unsafe { }` and its SAFETY comment (keep a plain comment where it says where the bytes are trusted), then drop any #[allow(unsafe_code)] that only covered it. Sites: proc-macro-srv-cli main_loop.rs:666; blaze-macro-eval server.rs:187; proc-macro-srv wire.rs:276,284, tests/utils.rs:18; proc-macro-api wire.rs:529,550, legacy_protocol/msg.rs:219, msg/flat.rs:1215; load-cargo lib.rs:1026,1076; blaze-macro-wasm lib.rs:472; blaze-expand bridge/spans.rs:84, native/proc_macro/lib.rs:470, native/host.rs:49. Route each to its owning lane.",
+  "state": "applied",
+  "created": "2026-10-30T08:21:59Z",
+  "updated": "2026-10-30T08:46:10Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:21:59Z",
+      "by": "speed-unsafe-front-intern",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:46:09Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:46:10Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "unsafe {} and SAFETY comments around the now-safe SyntaxContext::from_u32 gone everywhere: coord-apply-front did proc-macro-srv-cli, proc-macro-srv, proc-macro-api, load-cargo; coord-apply did blaze-macro-eval server.rs (and its #[allow(unsafe_code)]), blaze-macro-wasm lib.rs, blaze-expand bridge/spans.rs, native/proc_macro/lib.rs, native/host.rs, each keeping a plain comment on where the value is trusted."
+    }
+  ]
+}

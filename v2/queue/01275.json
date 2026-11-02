@@ -1,0 +1,27 @@
+{
+  "id": "01275",
+  "from_lane": "query-unify",
+  "owner": "coordinator",
+  "paths": [
+    "README.md",
+    "site/content/site.flecs",
+    "site/content/refs.flecs",
+    "harness/unnamedcrates.py",
+    "vendor/rustc_type_ir/src/interner.rs"
+  ],
+  "what": "After the port merge (04cca11739) blaze includes no salsa code, so two public credits are untrue: README.md:142 (salsa, the incremental engine underneath) and site/content/site.flecs:52 thanks list (whose code blaze includes) plus its ref site/content/refs.flecs:52. Drop salsa from both, or credit it as the design blaze_query::db replaced. Comments that still say salsa: harness/unnamedcrates.py:6 (salsa constructors) and vendor/rustc_type_ir/src/interner.rs:40 (interning through the salsa database, now blaze_query::db).",
+  "state": "open",
+  "created": "2026-10-31T13:46:56Z",
+  "updated": "2026-10-31T13:46:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:46:56Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

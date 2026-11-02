@@ -6,16 +6,15 @@ use std::str::{self, FromStr};
 
 use parser::Edition;
 
-use crate::{AstNode, SourceFile, TextRange, validation};
+use crate::{Parse, SourceFile, TextRange, validation};
 
-fn check_file_invariants(file: &SourceFile) {
-    let root = file.syntax();
-    validation::validate_block_structure(root);
+fn check_file_invariants(file: &Parse<SourceFile>) {
+    validation::validate_block_structure(file.root());
 }
 
 pub fn check_parser(text: &str) {
     let file = SourceFile::parse(text, Edition::CURRENT);
-    check_file_invariants(&file.tree());
+    check_file_invariants(&file);
 }
 
 #[derive(Debug, Clone)]
@@ -50,16 +49,14 @@ impl CheckReparse {
     pub fn run(&self) {
         let parse = SourceFile::parse(&self.text, Edition::CURRENT);
         let new_parse = parse.reparse(self.delete, &self.insert, Edition::CURRENT);
-        check_file_invariants(&new_parse.tree());
-        assert_eq!(&new_parse.tree().syntax().text().to_string(), &self.edited_text);
+        check_file_invariants(&new_parse);
+        assert_eq!(new_parse.root().text(), self.edited_text);
         let full_reparse = SourceFile::parse(&self.edited_text, Edition::CURRENT);
-        for (a, b) in
-            new_parse.tree().syntax().descendants().zip(full_reparse.tree().syntax().descendants())
-        {
+        for (a, b) in new_parse.root().descendants().zip(full_reparse.root().descendants()) {
             if (a.kind(), a.text_range()) != (b.kind(), b.text_range()) {
-                eprint!("original:\n{:#?}", parse.tree().syntax());
-                eprint!("reparsed:\n{:#?}", new_parse.tree().syntax());
-                eprint!("full reparse:\n{:#?}", full_reparse.tree().syntax());
+                eprint!("original:\n{:#?}", parse.root());
+                eprint!("reparsed:\n{:#?}", new_parse.root());
+                eprint!("full reparse:\n{:#?}", full_reparse.root());
                 assert_eq!(
                     format!("{a:?}"),
                     format!("{b:?}"),
@@ -67,6 +64,11 @@ impl CheckReparse {
                 );
             }
         }
+        assert_eq!(
+            new_parse.root().descendants().count(),
+            full_reparse.root().descendants().count(),
+            "the reparse and the full parse have as many nodes"
+        );
         // FIXME
         // assert_eq!(new_file.errors(), full_reparse.errors());
     }

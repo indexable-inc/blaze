@@ -1,0 +1,23 @@
+{
+  "id": "00098",
+  "from_lane": "diagnostics-items-resolve",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs"
+  ],
+  "what": "## 2. Run `macro_def_error::check` on every local `macro_rules!` (diagnostics-items)\n\nWhere: `crates/blaze-diagnostics/src/lower/mod.rs` or the items checks.\n\nWhat: call `lower::macro_def_error::check(cx, InFile<&ast::Macro>)` for each local `macro_rules!`\nthat hir does not report a `MacroDefError` for (or for all of them, and have\n`AnyDiagnostic::MacroDefError` lower to nothing).\n\nRun it from a salsa-tracked query keyed by the definition's `AstId`, so an unchanged definition\nis never read again and a cache hit allocates nothing; `check` itself is one allocation-free\npass over the definition's tokens when there is no error.\n\nWhy: mbe accepts definitions rustc refuses: no rules at all (`macro_rules! f {}`), an invalid\nfragment specifier (`$x:id`), duplicate bindings, empty repetitions; hir only reports what mbe\nrefuses, so those give no error today.\n\n> forwarded to diagnostics: its own.",
+  "state": "open",
+  "created": "2026-10-30T01:04:03Z",
+  "updated": "2026-10-30T01:04:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-resolve.md#2. Run `macro_def_error::check` on every local `macro_rules!` (diagnostics-items)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-resolve.md:25"
+    }
+  ]
+}

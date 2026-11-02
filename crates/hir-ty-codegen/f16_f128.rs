@@ -16,6 +16,10 @@
 //! Only the targets this was compared with rustc on take them ([`soft_floats`]); others
 //! refuse them, as before.
 
+#![forbid(unsafe_code)]
+
+use hir_ty::TargetFeature;
+
 use super::*;
 
 /// Whether `ty` is a float this module lowers.
@@ -24,11 +28,17 @@ pub(super) fn soft(ty: Type) -> bool {
 }
 
 /// Whether the target's `f16` and `f128` are lowered here: AArch64 and x86-64 with the
-/// System V convention, where every lowering below was checked against rustc's. Apple's
-/// AArch64 convention has no `f128` in Cranelift.
+/// System V convention, where every lowering below was checked against rustc's, and Apple's
+/// AArch64. Apple's convention passes both as AAPCS64 does, `f16` in an `h` and `f128` in a
+/// `q` register, which Cranelift's `apple_aarch64` does under `enable_llvm_abi_extensions`;
+/// LLVM's calls for them are AArch64's, `long double`'s `fmodl` among them though Apple's
+/// `long double` is an `f64`, which is why std's `f128` math is off there.
 pub(super) fn soft_floats(target: &Target) -> bool {
-    matches!(target.arch, Arch::Aarch64 | Arch::X86_64)
-        && target.call_conv == isa::CallConv::SystemV
+    match (target.arch, target.call_conv) {
+        (Arch::Aarch64, isa::CallConv::SystemV | isa::CallConv::AppleAarch64) => true,
+        (Arch::X86_64, isa::CallConv::SystemV) => true,
+        _ => false,
+    }
 }
 
 /// The bits of the `f128` that is exactly `-magnitude` or `magnitude`, which has at most 113
@@ -78,12 +88,12 @@ impl<'db> FunctionCx<'_, 'db> {
     /// LLVM then works on an `f16` with: in its own register, rounded once, a signalling NaN
     /// of either operand taking precedence over a quiet one.
     pub(super) fn half_precision(&self) -> bool {
-        self.cg.target.arch == Arch::Aarch64 && self.function_enables("fp16")
+        self.cg.target.arch == Arch::Aarch64 && self.function_enables(TargetFeature::FP16)
     }
 
     /// Whether the function being compiled enables the target feature `feature`, itself or by
     /// one that implies it.
-    pub(super) fn function_enables(&self, feature: &str) -> bool {
+    pub(super) fn function_enables(&self, feature: TargetFeature) -> bool {
         self.body
             .and_then(|it| it.owner.as_function())
             .is_some_and(|func| hir_ty::TargetFeatures::from_fn(self.cg.db, func).enables(feature))
@@ -109,14 +119,14 @@ impl<'db> FunctionCx<'_, 'db> {
     /// Whether the function being compiled is x86-64's with AVX512-FP16, whose instructions
     /// LLVM works on an `f16` with there.
     fn x86_half_precision(&self) -> bool {
-        self.x86() && self.function_enables("avx512fp16")
+        self.x86() && self.function_enables(TargetFeature::AVX512FP16)
     }
 
     /// Refuses an `f16` converted in a function with F16C (which AVX-512 implies): x86-64's
     /// LLVM converts it there by `vcvtph2ps` and `vcvtps2ph`, and works on it by AVX512-FP16's
     /// instructions where it has those, not by compiler-builtins.
     fn x86_soft_half(&self) -> Result<()> {
-        if self.function_enables("f16c") {
+        if self.function_enables(TargetFeature::F16C) {
             return Err(CodegenError::Unsupported(
                 "f16 in a function with F16C, which LLVM converts by its instructions".into(),
             ));
@@ -149,11 +159,11 @@ impl<'db> FunctionCx<'_, 'db> {
         self.builtin(name, &[from], types::F16, &[value])
     }
 
-    /// The C function of `f128` named `base` with C's suffix of it: `fmodl` where `long
-    /// double` is it (AArch64), `fmodf128` on x86-64, whose `long double` is x87's.
-    fn quad_libcall(&mut self, base: &str, args: &[Value]) -> Result<Value> {
-        let suffix = if self.x86() { "f128" } else { "l" };
-        self.float_libcall(&format!("{base}{suffix}"), types::F128, args)
+    /// The C function of `f128`, named with C's suffix of it: `[fmodf128, fmodl]` is `fmodl`
+    /// where `long double` is it (AArch64), `fmodf128` on x86-64, whose `long double` is x87's.
+    fn quad_libcall(&mut self, [f128, l]: [&str; 2], args: &[Value]) -> Result<Value> {
+        let name = if self.x86() { f128 } else { l };
+        self.float_libcall(name, types::F128, args)
     }
 
     fn bits_of(&mut self, value: Value) -> Value {
@@ -218,20 +228,20 @@ impl<'db> FunctionCx<'_, 'db> {
     /// An operator of two `f16`s or two `f128`s.
     pub(super) fn soft_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::F16 {
-            let mnemonic = match op {
-                BinOp::Add => Some("fadd"),
-                BinOp::Sub => Some("fsub"),
-                BinOp::Mul => Some("fmul"),
-                BinOp::Div => Some("fdiv"),
+            // AArch64's, then AVX512-FP16's, operands in order: the first one's NaN where both
+            // are.
+            let instruction = match op {
+                BinOp::Add => Some(["fadd h0, h0, h1", "vaddsh xmm0, xmm0, xmm1"]),
+                BinOp::Sub => Some(["fsub h0, h0, h1", "vsubsh xmm0, xmm0, xmm1"]),
+                BinOp::Mul => Some(["fmul h0, h0, h1", "vmulsh xmm0, xmm0, xmm1"]),
+                BinOp::Div => Some(["fdiv h0, h0, h1", "vdivsh xmm0, xmm0, xmm1"]),
                 _ => None,
             };
-            if let Some(mnemonic) = mnemonic.filter(|_| self.half_precision()) {
-                return Ok(self.half_instruction(&format!("{mnemonic} h0, h0, h1"), &[l, r]));
+            if let Some([aarch64, _]) = instruction.filter(|_| self.half_precision()) {
+                return Ok(self.half_instruction(aarch64, &[l, r]));
             }
-            // AVX512-FP16's, operands in order: the first one's NaN where both are.
-            if let Some(mnemonic) = mnemonic.filter(|_| self.x86_half_precision()) {
-                let op = &mnemonic[1..];
-                return Ok(self.half_instruction(&format!("v{op}sh xmm0, xmm0, xmm1"), &[l, r]));
+            if let Some([_, x86]) = instruction.filter(|_| self.x86_half_precision()) {
+                return Ok(self.half_instruction(x86, &[l, r]));
             }
             let (l, r) = (self.widen_half(l, types::F32)?, self.widen_half(r, types::F32)?);
             let value = self.float_binary_op(op, l, r)?;
@@ -245,7 +255,7 @@ impl<'db> FunctionCx<'_, 'db> {
             BinOp::Sub => ("__subtf3", None),
             BinOp::Mul => ("__multf3", None),
             BinOp::Div => ("__divtf3", None),
-            BinOp::Rem => return self.quad_libcall("fmod", &[l, r]),
+            BinOp::Rem => return self.quad_libcall(["fmodf128", "fmodl"], &[l, r]),
             // Each comparison of compiler-builtins answers so that NaN makes it false.
             BinOp::Eq => ("__eqtf2", Some(IntCC::Equal)),
             BinOp::Ne => ("__netf2", Some(IntCC::NotEqual)),
@@ -253,6 +263,7 @@ impl<'db> FunctionCx<'_, 'db> {
             BinOp::Le => ("__letf2", Some(IntCC::SignedLessThanOrEqual)),
             BinOp::Gt => ("__gttf2", Some(IntCC::SignedGreaterThan)),
             BinOp::Ge => ("__getf2", Some(IntCC::SignedGreaterThanOrEqual)),
+            // alloc: the error's message
             _ => return Err(CodegenError::Unsupported(format!("float operator {op:?}"))),
         };
         let quads = [types::F128; 2];
@@ -332,6 +343,7 @@ impl<'db> FunctionCx<'_, 'db> {
             (types::F128, _) => self.quad_to_int(value, to)?,
             (_, types::F128) => self.int_to_quad(value, from)?,
             _ => {
+                // alloc: the error's message
                 let why = format!("cast from {} to {}", from.ty, to.ty);
                 return Err(CodegenError::Unsupported(why));
             }
@@ -393,47 +405,54 @@ impl<'db> FunctionCx<'_, 'db> {
 
     /// `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `round_ties_even` or `round` of an `f16` or an
     /// `f128`.
-    pub(super) fn soft_unary(&mut self, op: &str, value: Value) -> Result<Value> {
+    pub(super) fn soft_unary(&mut self, intrinsic: Intrinsic, value: Value) -> Result<Value> {
         let ty = self.builder.func.dfg.value_type(value);
-        if op == "fabs" {
+        if intrinsic == Intrinsic::Fabs {
             return Ok(self.soft_abs(value));
         }
         if ty == types::F16 && self.half_precision() {
-            let mnemonic = match op {
-                "sqrt" => "fsqrt",
-                "floor" => "frintm",
-                "ceil" => "frintp",
-                "trunc" => "frintz",
+            let instruction = match intrinsic {
+                Intrinsic::Sqrt => "fsqrt h0, h0",
+                Intrinsic::Floor => "frintm h0, h0",
+                Intrinsic::Ceil => "frintp h0, h0",
+                Intrinsic::Trunc => "frintz h0, h0",
                 // `rint`, in the mode a Rust program runs in, to even.
-                "round_ties_even" => "frintx",
-                _ => "frinta",
+                Intrinsic::RoundTiesEven => "frintx h0, h0",
+                _ => "frinta h0, h0",
             };
-            return Ok(self.half_instruction(&format!("{mnemonic} h0, h0"), &[value]));
+            return Ok(self.half_instruction(instruction, &[value]));
         }
         if ty == types::F16 {
             let wide = self.widen_half(value, types::F32)?;
-            let value = match op {
-                "sqrt" => self.builder.ins().sqrt(wide),
+            let value = match intrinsic {
+                Intrinsic::Sqrt => self.builder.ins().sqrt(wide),
                 // x86-64 without SSE4.1 has no instruction for them: LLVM calls libm.
-                "floor" if self.x86() => self.float_libcall("floorf", types::F32, &[wide])?,
-                "ceil" if self.x86() => self.float_libcall("ceilf", types::F32, &[wide])?,
-                "trunc" if self.x86() => self.float_libcall("truncf", types::F32, &[wide])?,
-                "round_ties_even" if self.x86() => {
+                Intrinsic::Floor if self.x86() => {
+                    self.float_libcall("floorf", types::F32, &[wide])?
+                }
+                Intrinsic::Ceil if self.x86() => self.float_libcall("ceilf", types::F32, &[wide])?,
+                Intrinsic::Trunc if self.x86() => {
+                    self.float_libcall("truncf", types::F32, &[wide])?
+                }
+                Intrinsic::RoundTiesEven if self.x86() => {
                     self.float_libcall("rintf", types::F32, &[wide])?
                 }
-                "floor" => self.builder.ins().floor(wide),
-                "ceil" => self.builder.ins().ceil(wide),
-                "trunc" => self.builder.ins().trunc(wide),
-                "round_ties_even" => self.builder.ins().nearest(wide),
+                Intrinsic::Floor => self.builder.ins().floor(wide),
+                Intrinsic::Ceil => self.builder.ins().ceil(wide),
+                Intrinsic::Trunc => self.builder.ins().trunc(wide),
+                Intrinsic::RoundTiesEven => self.builder.ins().nearest(wide),
                 _ => self.float_libcall("roundf", types::F32, &[wide])?,
             };
             return self.narrow_to_half(value);
         }
-        let libm = match op {
-            "sqrt" | "floor" | "ceil" | "trunc" => op,
+        let libm = match intrinsic {
+            Intrinsic::Sqrt => ["sqrtf128", "sqrtl"],
+            Intrinsic::Floor => ["floorf128", "floorl"],
+            Intrinsic::Ceil => ["ceilf128", "ceill"],
+            Intrinsic::Trunc => ["truncf128", "truncl"],
             // In the rounding mode a Rust program runs in, ties to even.
-            "round_ties_even" => "rint",
-            _ => "round",
+            Intrinsic::RoundTiesEven => ["rintf128", "rintl"],
+            _ => ["roundf128", "roundl"],
         };
         self.quad_libcall(libm, &[value])
     }
@@ -441,7 +460,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// `fma`, which LLVM does for an `f16` in `f64`, where the product is exact.
     pub(super) fn soft_fma(&mut self, a: Value, b: Value, c: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(a) == types::F128 {
-            return self.quad_libcall("fma", &[a, b, c]);
+            return self.quad_libcall(["fmaf128", "fmal"], &[a, b, c]);
         }
         if self.half_precision() {
             return Ok(self.half_instruction("fmadd h0, h0, h1, h2", &[a, b, c]));
@@ -496,7 +515,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let bfloat = |scalar: &rustc_abi::Scalar| {
             matches!(scalar.primitive(), Primitive::Float(rustc_abi::Float::F16B))
         };
-        let mut held = FxHashSet::default();
+        let mut held = HashSet::default();
         for (local, data) in body.locals.iter() {
             // A local without a layout is refused where it is compiled, for that.
             let Ok(layout) = self.layout(data.ty.as_ref()) else {
@@ -522,7 +541,7 @@ impl<'db> FunctionCx<'_, 'db> {
         if held.is_empty() {
             return Ok(());
         }
-        let mut predecessors: FxHashMap<BasicBlockId, usize> = FxHashMap::default();
+        let mut predecessors: HashMap<BasicBlockId, usize> = HashMap::default();
         for (_, block) in body.basic_blocks.iter() {
             if let Some(terminator) = &block.terminator {
                 for to in terminator.kind.successors().into_iter().chain(terminator.kind.unwind()) {
@@ -530,7 +549,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
         }
-        let mut follows: FxHashMap<BasicBlockId, BasicBlockId> = FxHashMap::default();
+        let mut follows: HashMap<BasicBlockId, BasicBlockId> = HashMap::default();
         for (id, block) in body.basic_blocks.iter() {
             let next = match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Goto { target })
@@ -550,9 +569,11 @@ impl<'db> FunctionCx<'_, 'db> {
             }
             id
         };
-        let mut made_in: FxHashMap<LocalId, BasicBlockId> = FxHashMap::default();
+        let mut made_in: HashMap<LocalId, BasicBlockId> = HashMap::default();
+        // alloc: only an x86-64 body with an `f16b` local; one list reused across its blocks
+        let mut mentioned = Vec::new();
         for (id, block) in body.basic_blocks.iter() {
-            let mut mentioned = Vec::new();
+            mentioned.clear();
             for statement in &block.statements {
                 MirBody::visit_statement_places(&statement.kind, &mut |it| {
                     mentioned.push(it.local)
@@ -567,7 +588,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
             let run = first(id);
-            for local in mentioned.into_iter().filter(|it| held.contains(it)) {
+            for &local in mentioned.iter().filter(|it| held.contains(*it)) {
                 if *made_in.entry(local).or_insert(run) != run {
                     return Err(CodegenError::Unsupported(
                         "f16b held across blocks on x86-64, which LLVM rounds there by \

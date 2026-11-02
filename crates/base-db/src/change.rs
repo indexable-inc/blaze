@@ -3,14 +3,13 @@
 
 use std::fmt;
 
-use rustc_hash::FxHashSet;
-use salsa::{Durability, Setter as _};
+use blaze_hash::HashSet;
+use blaze_query::db::{Durability, Setter as _};
 use triomphe::Arc;
-use vfs::FileId;
+use crate::FileId;
 
 use crate::{
-    CrateGraphBuilder, CratesIdMap, LibraryRoots, LocalRoots, SourceDatabase, SourceRoot,
-    SourceRootId,
+    CrateGraphBuilder, CratesIdMap, Db, LibraryRoots, LocalRoots, SourceRoot, SourceRootId,
 };
 
 /// Encapsulate a bunch of raw `.set` calls on the database.
@@ -49,12 +48,11 @@ impl FileChange {
     pub fn set_crate_graph(&mut self, graph: CrateGraphBuilder) {
         self.crate_graph = Some(graph);
     }
-
-    pub fn apply(self, db: &mut dyn SourceDatabase) -> Option<CratesIdMap> {
+    pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
         let _p = tracing::info_span!("FileChange::apply").entered();
         if let Some(roots) = self.roots {
-            let mut local_roots = FxHashSet::default();
-            let mut library_roots = FxHashSet::default();
+            let mut local_roots = HashSet::default();
+            let mut library_roots = HashSet::default();
             for (idx, root) in roots.into_iter().enumerate() {
                 let root_id = SourceRootId(idx as u32);
                 if root.is_library {
@@ -67,6 +65,7 @@ impl FileChange {
                     db.set_file_source_root_with_durability(file_id, root_id, durability);
                 }
 
+                // alloc: one per source root a change sets (setup).
                 db.set_source_root_with_durability(root_id, Arc::new(root), durability);
             }
             LocalRoots::get(db).set_roots(db).to(local_roots);
@@ -77,7 +76,7 @@ impl FileChange {
             let source_root_id = db.file_source_root(file_id);
             let source_root = db.source_root(source_root_id.source_root_id(db));
 
-            let durability = file_text_durability(&source_root.source_root(db));
+            let durability = file_text_durability(source_root.source_root_ref(db));
             // XXX: can't actually remove the file, just reset the text
             let text = text.unwrap_or_default();
             db.set_file_text_with_durability(file_id, &text, durability)

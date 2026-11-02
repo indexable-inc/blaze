@@ -9,7 +9,7 @@
 //! written.
 
 use anyhow::{Context as _, Result, anyhow};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use tracing::{debug, trace};
 use url::Url;
 
@@ -68,7 +68,7 @@ pub type PatchDependency<'a> = (&'a Patch, Option<LockedPatchDependency>);
 /// has a `PackageId` for which package it represents as well as a list of
 /// `PackageId` for the resolved dependencies. The hash map is otherwise
 /// structured though for easy access throughout this registry.
-type LockedMap = FxHashMap<
+type LockedMap = HashMap<
     // The first level of key-ing done in this hash map is the source that
     // dependencies come from, identified by a `SourceId`.
     // The next level is keyed by the name of the package...
@@ -91,7 +91,7 @@ pub struct PackageRegistry<R> {
     ///
     /// These are available for `query` after calling [`PackageRegistry::lock_patches`],
     /// which `lock`s them all to specific versions.
-    patches: FxHashMap<CanonicalUrl, Vec<Summary>>,
+    patches: HashMap<CanonicalUrl, Vec<Summary>>,
     /// Whether patches are locked. That is, they are available to resolution.
     ///
     /// See [`PackageRegistry::lock_patches`] and [`PackageRegistry::patch`] for more.
@@ -104,24 +104,24 @@ pub struct PackageRegistry<R> {
     ///
     /// This is constructed during calls to [`PackageRegistry::patch`],
     /// along with the `patches` field, thoough these entries never get locked.
-    patches_available: FxHashMap<CanonicalUrl, Vec<PackageId>>,
+    patches_available: HashMap<CanonicalUrl, Vec<PackageId>>,
 }
 
 impl<R: Registry> PackageRegistry<R> {
     pub fn new(sources: R) -> PackageRegistry<R> {
         PackageRegistry {
             sources,
-            locked: FxHashMap::default(),
-            patches: FxHashMap::default(),
+            locked: HashMap::default(),
+            patches: HashMap::default(),
             patches_locked: false,
-            patches_available: FxHashMap::default(),
+            patches_available: HashMap::default(),
         }
     }
 
     /// remove all residual state from previous lock files.
     pub fn clear_lock(&mut self) {
         trace!("clear_lock");
-        self.locked = FxHashMap::default();
+        self.locked = HashMap::default();
     }
 
     /// Registers one "locked package" to the registry, for guiding the
@@ -212,7 +212,7 @@ impl<R: Registry> PackageRegistry<R> {
             unlocked_summaries.push(summary);
         }
 
-        let mut name_and_version = FxHashSet::default();
+        let mut name_and_version = HashSet::default();
         for summary in unlocked_summaries.iter() {
             let name = summary.package_id().name();
             let version = summary.package_id().version();
@@ -281,7 +281,7 @@ impl<R: Registry> PackageRegistry<R> {
     ///
     /// These patches are mainly collected from [`patch`](Self::patch).
     /// They might not be the same as patches actually used during dependency resolving.
-    pub fn patches(&self) -> &FxHashMap<CanonicalUrl, Vec<Summary>> {
+    pub fn patches(&self) -> &HashMap<CanonicalUrl, Vec<Summary>> {
         &self.patches
     }
 
@@ -296,7 +296,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         assert!(self.patches_locked);
 
@@ -377,7 +377,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
 /// See [`PackageRegistry::lock`].
 fn lock(
     locked: &LockedMap,
-    patches: &FxHashMap<CanonicalUrl, Vec<PackageId>>,
+    patches: &HashMap<CanonicalUrl, Vec<PackageId>>,
     summary: Summary,
 ) -> Summary {
     let pair = locked
@@ -587,7 +587,7 @@ pub struct Workspace<'a> {
     /// Every package with a path source the workspace can reach (its members, their path
     /// dependencies and those of `[patch]` and `[replace]`), by source: cargo reads their
     /// manifests to tell what changed since the previous resolve.
-    pub path_packages: &'a FxHashMap<SourceId, Summary>,
+    pub path_packages: &'a HashMap<SourceId, Summary>,
     /// The root manifest's `[patch]`, by the URL patched.
     pub patch: &'a [(Url, Vec<Patch>)],
     /// The root manifest's `[replace]`.
@@ -602,6 +602,9 @@ pub struct Workspace<'a> {
     pub rust_versions: Option<Vec<PartialVersion>>,
     /// The encoding of a new lock file, from the members' lowest `rust-version`.
     pub resolve_version: ResolveVersion,
+    /// `--offline`, `--frozen`, or `net.offline` as `--offline`: a failed resolve then says
+    /// offline mode may be why.
+    pub offline_flag: Option<&'a str>,
 }
 
 impl Workspace<'_> {
@@ -609,10 +612,6 @@ impl Workspace<'_> {
         self.members.members.iter().any(|m| m.package_id() == id)
     }
 }
-
-/// Filters the package ids of a previous resolve to keep locked (all but those
-/// `cargo update` names).
-pub type Keep<'a> = &'a dyn Fn(&PackageId) -> bool;
 
 /// The two resolves cargo makes of a workspace (`resolve_ws_with_opts`, without
 /// `--ignore-lock`): first every member with all its features and dev-dependencies, the
@@ -632,7 +631,6 @@ pub fn resolve_ws<R: Registry>(
         &CliFeatures::new_all(true),
         HasDevUnits::Yes,
         lock,
-        None,
         &[],
         true,
     )?;
@@ -642,7 +640,6 @@ pub fn resolve_ws<R: Registry>(
         cli_features,
         has_dev_units,
         Some(&resolve),
-        None,
         specs,
         false,
     )?;
@@ -650,12 +647,10 @@ pub fn resolve_ws<R: Registry>(
 }
 
 /// Resolves all dependencies for a package using an optional previous instance
-/// of resolve to guide the resolution process.
-///
-/// This also takes an optional filter `keep_previous`, which informs the `registry`
-/// which package ID should be locked to the previous instance of resolve
-/// (often used in pairings with updates). See comments in [`register_previous_locks`]
-/// for scenarios that might override this.
+/// of resolve to guide the resolution process. Every package of the previous
+/// resolve is kept locked to it, but for those [`register_previous_locks`] and
+/// [`register_patch_entries`] find changed (cargo's `keep_previous` without
+/// `cargo update`).
 ///
 /// The previous resolve normally comes from a lock file. This function does not
 /// read or write lock files from the filesystem.
@@ -672,13 +667,9 @@ pub fn resolve_with_previous<R: Registry>(
     cli_features: &CliFeatures,
     has_dev_units: HasDevUnits,
     previous: Option<&Resolve>,
-    keep_previous: Option<Keep<'_>>,
     specs: &[PackageIdSpec],
     register_patches: bool,
 ) -> Result<Resolve> {
-    // Try to keep all from previous resolve if no instruction given.
-    let keep_previous = keep_previous.unwrap_or(&|_| true);
-
     // While registering patches, we will record preferences for particular versions
     // of various packages.
     let mut version_prefs = VersionPreferences::default();
@@ -688,13 +679,13 @@ pub fn resolve_with_previous<R: Registry>(
     }
 
     let avoid_patch_ids = if register_patches {
-        register_patch_entries(registry, ws, previous, &mut version_prefs, keep_previous)?
+        register_patch_entries(registry, ws, previous, &mut version_prefs)?
     } else {
-        FxHashSet::default()
+        HashSet::default()
     };
 
-    // Refine `keep` with patches that should avoid locking.
-    let keep = |p: &PackageId| keep_previous(p) && !avoid_patch_ids.contains(p);
+    // Keep all of the previous resolve but the patches that should avoid locking.
+    let keep = |p: &PackageId| !avoid_patch_ids.contains(p);
 
     let dev_deps = ws.require_optional_deps || has_dev_units == HasDevUnits::Yes;
 
@@ -734,7 +725,7 @@ pub fn resolve_with_previous<R: Registry>(
         &*registry,
         &version_prefs,
         ws.resolve_version,
-        &ResolveSettings::default(),
+        &ResolveSettings { offline_flag: ws.offline_flag, ..ResolveSettings::default() },
     )?;
 
     let patches = registry.patches().values().flat_map(|v| v.iter());
@@ -766,7 +757,7 @@ fn register_previous_locks<R: Registry>(
     ws: &Workspace<'_>,
     registry: &mut PackageRegistry<R>,
     resolve: &Resolve,
-    keep: Keep<'_>,
+    keep: &impl Fn(&PackageId) -> bool,
     dev_deps: bool,
 ) {
     let path_pkg = |id: SourceId| {
@@ -798,7 +789,7 @@ fn register_previous_locks<R: Registry>(
     // however, nothing else in the dependency graph depends on `log` and the
     // newer version of `serde` requires a new version of `log` it'll get pulled
     // in (as we didn't accidentally lock it to an old version).
-    let mut avoid_locking = FxHashSet::default();
+    let mut avoid_locking = HashSet::default();
     for node in resolve.iter() {
         if !keep(&node) {
             add_deps(resolve, node, &mut avoid_locking);
@@ -838,7 +829,7 @@ fn register_previous_locks<R: Registry>(
     // come up first before newer version, if newer version are available.
     {
         let mut path_deps: Vec<&Summary> = ws.members.members.to_vec();
-        let mut visited = FxHashSet::default();
+        let mut visited = HashSet::default();
         while let Some(member) = path_deps.pop() {
             if !visited.insert(member.package_id()) {
                 continue;
@@ -939,7 +930,7 @@ fn register_previous_locks<R: Registry>(
     }
 
     /// Recursively add `node` and all its transitive dependencies to `set`.
-    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut FxHashSet<PackageId>) {
+    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut HashSet<PackageId>) {
         if !set.insert(node) {
             return;
         }
@@ -975,9 +966,8 @@ fn register_patch_entries<R: Registry>(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
     version_prefs: &mut VersionPreferences,
-    keep_previous: Keep<'_>,
-) -> Result<FxHashSet<PackageId>> {
-    let mut avoid_patch_ids = FxHashSet::default();
+) -> Result<HashSet<PackageId>> {
+    let mut avoid_patch_ids = HashSet::default();
     for (url, patches) in ws.patch.iter() {
         for patch in patches {
             version_prefs.prefer_dependency(patch.dep.clone());
@@ -1000,12 +990,7 @@ fn register_patch_entries<R: Registry>(
         let mut registrations = Vec::new();
         for patch in patches {
             let dep = &patch.dep;
-            let candidates = || {
-                previous
-                    .iter()
-                    .chain(previous.unused_patches().iter().cloned())
-                    .filter(&keep_previous)
-            };
+            let candidates = || previous.iter().chain(previous.unused_patches().iter().cloned());
 
             let lock = match candidates().find(|id| dep.matches_id(*id)) {
                 // If we found an exactly matching candidate in our list of
@@ -1086,7 +1071,7 @@ fn register_patch_entries<R: Registry>(
 fn lock_replacements(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
-    keep: Keep<'_>,
+    keep: &impl Fn(&PackageId) -> bool,
 ) -> Vec<(PackageIdSpec, Dependency)> {
     match previous {
         Some(r) => ws

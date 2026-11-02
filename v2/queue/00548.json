@@ -1,0 +1,30 @@
+{
+  "id": "00548",
+  "from_lane": "usercode",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-testsel/src/select/tests.rs",
+    "crates/blaze-testsel"
+  ],
+  "what": "## 9. fastcompile: `Inputs::env_all` lends the environment (`crates/blaze-testsel/src/select/tests.rs`)\n\nWhat: `blaze_usercode::trace::Inputs::env_all` is now `fn env_all(&mut self) -> &[(OsString, OsString)]`,\nsorted by name, each name once. `World`'s impl becomes:\n\n```rust\nfn env_all(&mut self) -> &[(OsString, OsString)] {\n    self.env.sort();\n    &self.env\n}\n```\n\nWhy: a cache check of a run that read the whole environment (every traced run today, request\n6) copied it per check. `index::find` now hashes a shape's inputs straight into the result key\nand allocates nothing on a hit. Also `index::Found::Hit` is `{ key, value }` (no `traced`) and\n`RunKey::DOMAIN` is \"blaze v2 run traced 2\", if blaze-testsel's tests name either.\n\n> forwarded to fastcompile: `crates/blaze-testsel/` is its (told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T14:11:42Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/usercode.md#9. fastcompile: `Inputs::env_all` lends the environment (`crates/blaze-testsel/src/select/tests.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:685"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "applied by coord-apply-back: select/tests.rs World implements the current trace::Inputs (env/env_all lent)"
+    }
+  ]
+}

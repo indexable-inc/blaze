@@ -1,0 +1,26 @@
+{
+  "id": "00594",
+  "from_lane": "requests-goal-reads",
+  "owner": "db-ty",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src/method_resolution.rs",
+    "docs/v2/plan/lanes/frontend/fast-trait-store.md"
+  ],
+  "what": "## requests-goal-reads, for db-ty (`crates/hir-ty/src/next_solver/interner.rs`, `crates/hir-ty/src/db.rs`): the solver reads `relevant_impls` (2026-10-29)\n\n**What.** `crates/hir-ty/src/method_resolution.rs` now has `relevant_impls(db, RelevantImplsKey)`\n(tracked, `returns(ref)`), keyed by one interned\n`RelevantImplsKey { krate: Crate, trait_: TraitId, self_ty: Option<SelfTyKey<'db>> }`. It returns\n`RelevantImpls`, with `all()`, `for_self_ty()` and `blanket()`: exactly the impls\n`DbInterner::for_each_relevant_impl` finds today for one simplified self type, in its order (crate\nand dependency impls, then the block impls not seen, then `for_each_blanket_impl`'s blanket\nimpls), and with `self_ty: None` the blanket impls alone (`for_self_ty()` empty). A test,\n`method_resolution/relevant_tests.rs`, compares it with today's walk, copied verbatim.\n\n1. In `interner.rs`, `for_each_relevant_impl`: drop the closure `consider_impls_for_simplified_type`\n   and read the query instead.\n\n   ```rust\n   let trait_def_id = trait_ref.def_id;\n   let self_ty = trait_ref.self_ty();\n   let krate = self.krate.expect(\"trait solving requires setting `DbInterner::krate`\");\n   let relevant = |simp: SimplifiedType<'db>| {\n       let key = RelevantImplsKey::new(self.db, krate, trait_def_id.0, Some(SelfTyKey(simp)));\n       relevant_impls(self.db, key)\n   };\n   match self_ty.kind() {\n       TyKind::Bool\n       | /* ...the same rigid arms as today... */\n       | TyKind::UnsafeBinder(_) => {\n           let simp =\n               fast_reject::simplify_type(self, self_ty, fast_reject::TreatParams::AsRigid)\n                   .unwrap();\n           // The blanket impls are among them: no second read.\n           for &impl_ in relevant(simp).all() {\n               try_visit!(f(impl_));\n           }\n           return R::output();\n       }\n       TyKind::Infer(InferTy::IntVar(_)) => {\n           // ...`possible_integers` as today...\n           for simp in possible_integers {\n               for &impl_ in relevant(simp).for_self_ty() {\n                   try_visit!(f(impl_));\n               }\n           }\n       }\n       TyKind::Infer(InferTy::FloatVar(_)) => {\n           // ...`possible_floats` as today...\n           for simp in possible_floats {\n               for &impl_ in relevant(simp).for_self_ty() {\n                   try_visit!(f(impl_));\n               }\n           }\n       }\n       // the alias/placeholder/error, coroutine-witness and panicking arms as today\n   }\n   self.for_each_blanket_impl(trait_def_id, f)\n   ```\n\n2. `for_each_blanket_impl`:\n\n   ```rust\n   let Some(krate) = self.krate else {\n       return R::output();\n   };\n   let key = RelevantImplsKey::new(self.db, krate, trait_def_id.0, None);\n   for &impl_ in relevant_impls(self.db, key).blanket() {\n       try_visit!(f(impl_));\n   }\n   R::output()\n   ```\n\n   The import `method_resolution::{SelfTyKey, TraitImpls}` becomes\n   `method_resolution::{RelevantImplsKey, SelfTyKey, relevant_impls}`. `TraitImpls` and the\n   `AdtId` arms used only by the old closure may become unused there.\n\n3. In `db.rs` `kinds`, four new names, or `every_query_has_a_kind` fails:\n   - in \"Method resolution, impls, coherence, specialization\":\n     `RELEVANT_IMPLS = 0x247b, \"relevant_impls\";` and `MAY_SPECIALIZE = 0x247c, \"may_specialize\";`\n     (`specialization.rs`: the feature check `specializes` and `specialized_ancestor` read, now\n     keyed by the impl);\n   - in \"Interned ids\": `RELEVANT_IMPLS_KEY = 0x25f5, \"RelevantImplsKey\";` and\n     `IMPL_PAIR = 0x25f6, \"ImplPair\";` (`specializes_query`'s key, `specialization.rs`).\n\n**Why.** The solver reads `TraitImpls::in_crate_and_deps_for_trait_and_self_ty` (three\narguments), `TraitImpls::for_block` (a whole block's table) and\n`TraitImpls::blanket_in_crate_and_deps` (two arguments). None of these reads names one trait and\none self type that a fact could stand for, so the persistent goal cache keeps every goal that\nselects among impls out of the store (docs/v2/plan/lanes/frontend/fast-trait-store.md 3.4, row 1).\nA read of `relevant_impls` decodes to `(crate, trait, self type)`, and blaze-items'\n`fact_of_read` maps it to `Fact::Implements { trait_, self_ty }`; with no self type, it maps to\n`Implements` for the self type that only blanket impls unify with. The answers stay the same: the\nquery is the walk the solver did, moved into one memo.\n\n> forwarded to db-ty (db-ty-next2, told by requests-goal-reads) (requests, pass 31).",
+  "state": "open",
+  "created": "2026-10-30T05:27:30Z",
+  "updated": "2026-10-30T05:27:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-goal-reads.md#requests-goal-reads, for db-ty (`crates/hir-ty/src/next_solver/interner.rs`, `crates/hir-ty/src/db.rs`): the solver reads `relevant_impls` (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-goal-reads.md:3"
+    }
+  ]
+}

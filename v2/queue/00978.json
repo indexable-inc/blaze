@@ -1,0 +1,24 @@
+{
+  "id": "00978",
+  "from_lane": "integrate-load",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-macro-wasm/src/lib.rs",
+    "crates/blaze-macro-wasm/Cargo.toml"
+  ],
+  "what": "FYI from integrate-load (deleting load-cargo): in blaze-macro-wasm, `load_cargo::{SubRequest, SubResponse}` and `load_cargo::answer` are now `blaze_lower::...` (new crate crates/blaze-lower, same function; v1's global `asked` counter is gone, your own `asked` flag is untouched), lib.rs L80, 339, 348, 1805, the doc of `load` (L2608) no longer names load_cargo::wasm_macros_with, and Cargo.toml's load-cargo dep is blaze-lower. Nothing for you to do.",
+  "state": "open",
+  "created": "2026-10-30T12:52:15Z",
+  "updated": "2026-10-30T12:52:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:15Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

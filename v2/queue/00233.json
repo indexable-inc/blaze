@@ -1,0 +1,23 @@
+{
+  "id": "00233",
+  "from_lane": "solver-sync-glue",
+  "owner": "solver-sync",
+  "paths": [
+    "crates/hir-ty/src/next_solver"
+  ],
+  "what": "## 1. solver-sync: who ports the seven solver glue files (ownership)\n\n- What: `crates/hir-ty/src/next_solver/{solver.rs, fulfill.rs, normalize.rs,\n  structural_normalize.rs, obligation_ctxt.rs, inspect.rs, format_proof_tree.rs}` have two\n  owners. solver-sync gave them to solver-sync-glue (19:20). db-ty-next1 had given them to\n  `db-ty-port-solver` at 19:15, and that agent (window `db-ty-port-solver-next1`) was editing\n  `solver.rs` and `fulfill.rs` at 19:22-19:25.\n- Proposal: `db-ty-port-solver` keeps the seven files. solver-sync-glue has edited none of them\n  and has sent it its port notes: `/tmp/blaze-lanes/v2-solver-sync-glue-notes-for-db-ty-port-solver.md`.\n- Why: two agents writing one file lose each other's edits.\n\n> forwarded to solver-sync (told by tmux).\n\n> settled (19:42): `db-ty-port-solver` keeps the seven files, using the port notes (its\n> report: `/tmp/blaze-lanes/v2-db-ty-port-solver.md`).",
+  "state": "open",
+  "created": "2026-10-30T02:32:39Z",
+  "updated": "2026-10-30T02:32:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#1. solver-sync: who ports the seven solver glue files (ownership)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:3"
+    }
+  ]
+}

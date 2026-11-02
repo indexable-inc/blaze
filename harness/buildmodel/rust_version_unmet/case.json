@@ -1,9 +1,0 @@
-{
-  "row": "`rust-version` newer than the toolchain",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "fails": true,
-  "expect": "refused"
-}

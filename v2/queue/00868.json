@@ -1,0 +1,36 @@
+{
+  "id": "00868",
+  "from_lane": "speed-sol-items",
+  "owner": "dbsp",
+  "paths": [
+    "crates/blaze-items/src/table.rs",
+    "docs/v2/plan/design/dbsp.md"
+  ],
+  "what": "speed-sol-items: keep a crate's item hash columns by deltas. `blaze_items::crate_hashes` (crates/blaze-items/src/table.rs), read by blaze-cargo `serve/unit/reach.rs` on every edit of a member crate, is one salsa query over every item: any edit that changes one hash re-runs it, and it reads 4 hash memos per item and rewrites every column. For a crate of 50,000 items that is about 200,000 memo reads (about 10-15 ms) and 8 MB written per body edit, where the work an edit asks for is the rows of the items whose hashes changed (one for a body edit, plus the transitive callers for the deep column). It now walks a key-ordered item list that a body edit leaves as it was (`crate_items_by_key`), so it neither sorts nor reads keys. Ask: in the dbsp design (docs/v2/plan/design/dbsp.md), a delta pipeline for `HashColumns`: the changed `interface_of`/`layout_of`/`code_of`/`deep_of` memos of a revision as a delta of (key, kind, hash) rows, applied to the previous columns in place (the presence bitsets `Ranked` updated by rank), so `changed_since` falls out of the delta instead of a merge of two builds. Owner of the columns is lane items; the delta source (which memos changed this revision) is salsa's and dbsp's.",
+  "state": "applied",
+  "created": "2026-10-30T09:13:24Z",
+  "updated": "2026-10-30T09:48:17Z",
+  "taken_by": "dbsp",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:13:24Z",
+      "by": "speed-sol-items",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:48:17Z",
+      "by": "dbsp",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:48:17Z",
+      "by": "dbsp",
+      "action": "done",
+      "note": "Designed in docs/v2/plan/design/dbsp.md §8b: maintainer 300 in blaze-items. Chunked copy-on-write HashColumns (4096-row Arc chunks). Reverse indexes uses (item -> items reading its interface) and names ((module, name) -> items). Candidates are hir-def CrateDelta::touched plus names[bindings] plus hir-ty impl-key changes. Deep hashes propagate with early cutoff. HashColumnsInput(krate){columns, changed} publishes the per-write delta, so changed_since needs no merge (a ring of 64 writes for readers behind). Proof: maintained == fresh crate_hashes after every random edit. Lane dbsp has no child left (cap 4), so the build is lane items (speed-sol-items). hir_def::nameres::delta::LastWrite and the hir-ty impl LastWrite are its inputs; read them with db.with_state."
+    }
+  ]
+}

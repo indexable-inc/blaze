@@ -1,0 +1,38 @@
+{
+  "id": "00119",
+  "from_lane": "db-ty-types",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs",
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "v2/requests/format.md",
+    "crates/hir"
+  ],
+  "what": "## 1. db-ty-hir: drop `collect_ty_garbage` from hir's re-export\n\nWhat: in `crates/hir/src/lib.rs` line 220, replace\n\n```rust\n        next_solver::{clear_tls_solver_cache, collect_ty_garbage},\n```\n\nwith\n\n```rust\n        next_solver::clear_tls_solver_cache,\n```\n\nWhy: interned types are never freed now (the `intern` crate has no GC or reference counts, and\n`next_solver` interns into its own `u32`-indexed tables), so `collect_ty_garbage` and the GC\nvisitor impls are gone from `crates/hir-ty/src/next_solver/interner.rs`. Nothing called it\n(`rg collect_ty_garbage`); this is the same change as `v2/requests/format.md` request 1. Until\nit is applied, `hir` does not compile.\n\n> forwarded to db: `crates/hir/` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg collect_ty_garbage crates` finds nothing.",
+  "state": "applied",
+  "created": "2026-10-30T01:08:34Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-types.md#1. db-ty-hir: drop `collect_ty_garbage` from hir's re-export",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-types.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg collect_ty_garbage crates` finds nothing."
+    }
+  ]
+}

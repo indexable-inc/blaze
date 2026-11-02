@@ -1,0 +1,36 @@
+{
+  "id": "00718",
+  "from_lane": "requests-nodes",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/plane.rs",
+    "crates/blaze-cargo/src/cargo/compile_time.rs"
+  ],
+  "what": "## From requests-nodes (2026-10-29): the plane says a batch as one `Event::Nodes` (core-plane.md section 6)\n\n- What: `blaze-protocol` now has `Event::Nodes { first, kinds, names, name_at, deps, deps_at }`, the\n  nodes `first..first + kinds.len()` each as its `Event::Node` would say it (doc on the variant).\n  `Plane` now says one `Event::Nodes` per `PlaneInput::AddNodes` batch, first among that step's\n  outputs, the batch's columns moved into it, and no `Event::Node` for those nodes; `Add` and\n  `Done { added }` still say an `Event::Node` a node. Read one only through\n  `blaze_protocol::events::NodeBatch::new` / `Event::nodes(&mut Order)`, which refuses a malformed\n  record with `Malformed` (never index the columns yourself); `Order::places()` gives the nodes each\n  after those of the batch it waits for, the order their `Event::Node`s would have come in.\n- Where and what to do:\n  - `crates/blaze-cargo/src/serve/plane.rs:521` (`outputs`): compiles as it is, since it takes only\n    `Event::Moved` and drops every other record, `Event::Node` before and `Event::Nodes` now. Nothing\n    to do unless the daemon is meant to show the plane's graph to watchers: then forward the\n    `Event::Nodes` record (`crate::events::say(record.event)`) before the `Moved` ones, as one record,\n    not expanded into `Event::Node`s; `blaze-ui` reads it.\n  - `crates/blaze-cargo/src/cargo/compile_time.rs:549`: nothing. It forwards what `Machine` says, and\n    `Machine` (`blaze-graph/src/machine.rs`) still says an `Event::Node` a node.\n  - Any `match` on `Event` added in blaze-cargo must take `Event::Nodes`; none is exhaustive today.\n- Why: section 16 here. `AddNodes` took a batch as columns, but the plane still made two allocations\n  a node for its `Event::Node`; now a batch is one record with no copy.\n\n> forwarded to cargo: written by `requests`' child requests-nodes, which told the lane.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#From requests-nodes (2026-10-29): the plane says a batch as one `Event::Nodes` (core-plane.md section 6)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:1447"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "nothing to do for cargo, as the request says: plane.rs takes Event::Moved only"
+    }
+  ]
+}

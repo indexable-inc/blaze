@@ -13,7 +13,10 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
+smallvec.workspace = true
+blaze-mem.workspace = true
+hashbrown.workspace = true
 
 # local deps
 syntax.workspace = true
@@ -24,11 +27,15 @@ span.workspace = true
 intern.workspace = true
 
 [dev-dependencies]
-expect-test = "1.5.1"
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+expect-test.workspace = true
 test-utils.workspace = true
 
 [features]
 in-rust-tree = ["parser/in-rust-tree", "tt/in-rust-tree", "syntax/in-rust-tree"]
+# The conversions the build no longer runs, as references for other crates' tests.
+reference = []
 
 [lints]
 workspace = true

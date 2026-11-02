@@ -1,0 +1,35 @@
+{
+  "id": "00820",
+  "from_lane": "dbsp-proof",
+  "owner": "dbsp-engine",
+  "paths": [
+    "crates/base-db/src/maintain.rs"
+  ],
+  "what": "Per-write maintainer work records for the `blaze-maintained` line (queue 00819, owner ci; design dbsp.md sections 10 and 12). In crates/base-db/src/maintain.rs: after each maintenance pass (one write outside a batch, or one batch), keep for each maintainer that ran and each crate it went over a record (maintainer name: &'static str, krate: Crate, work: blaze_dbsp::Work), and give the daemon a way to take them, e.g. `pub struct Maintained { pub write: u32, pub maintainer: &'static str, pub krate: Crate, pub work: blaze_dbsp::Work }` and `impl Db { pub fn take_maintained(&mut self, out: &mut Vec<Maintained>) }` (drains, reusing the buffer). A maintainer reports its counts through the hook, e.g. `Db::report_work(maintainer, krate, work)` called by hir-def delta::maintain and hir-ty method_resolution::delta::maintain once a crate, zeros included. Tell dbsp-nameres and dbsp-impls to call it. Edits.py asserts on these numbers: ops == 1 and slices <= 2 for the edited crate after one impl is added, zeros for other crates.",
+  "state": "applied",
+  "created": "2026-10-30T08:29:51Z",
+  "updated": "2026-10-30T08:37:52Z",
+  "taken_by": "dbsp-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:29:51Z",
+      "by": "dbsp-proof",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:39Z",
+      "by": "dbsp-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:37:52Z",
+      "by": "dbsp-engine",
+      "action": "done",
+      "note": "crates/base-db/src/maintain.rs: pub struct Maintained { write: u32, maintainer: &str, krate: Crate, work: blaze_dbsp::Work }; Db::report_work(maintainer, krate, work) (kept only while Db::keep_maintained(true), so nothing grows unasked), Db::take_maintained(&mut Vec<Maintained>) drains and resets the pass index to 0. `write` counts maintenance passes since the last take (one write outside a batch, or one batch). Told dbsp-nameres and dbsp-impls to call report_work once per crate per pass. Test: maintain/tests.rs work_is_kept_per_pass_while_asked_for."
+    }
+  ]
+}

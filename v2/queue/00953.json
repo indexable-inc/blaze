@@ -1,0 +1,35 @@
+{
+  "id": "00953",
+  "from_lane": "speed-clone-front",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-def/src/expr_store/path.rs"
+  ],
+  "what": "For whichever lane holds expr_store/path.rs (speed said others edit it; route there): a comment only. Line 228, `#[derive(Debug, Clone, Default, PartialEq, Eq)]` on `PathColumns` becomes `#[derive(Debug, Clone, Default, PartialEq, Eq)] // clone: in `TypeColumns`; path.rs tests copy it` (no other change: `TypeColumns` derives Clone, cloned only with the empty store and in tests, and the tests at path.rs:1545-1595 copy whole columns). `GenericArgsParentheses` (line 56) is `Copy`, so it keeps `Clone`; nothing to do.",
+  "state": "applied",
+  "created": "2026-10-30T11:18:00Z",
+  "updated": "2026-10-30T11:47:49Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:18:00Z",
+      "by": "speed-clone-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:47:48Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:47:49Z",
+      "by": "speed",
+      "action": "done",
+      "note": "crates/hir-def/src/expr_store/path.rs: `// clone: in `TypeColumns`; path.rs tests copy it` on PathColumns derive (format DONE, file free)."
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "00209",
+  "from_lane": "usercode-fast-scripts",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-build-script/src/output.rs",
+    "crates/blaze-cargo/src/serve/unit",
+    "crates/blaze-cargo/src/cargo/compile_time.rs",
+    "crates/blaze-usercode/src/script.rs"
+  ],
+  "what": "## 7. `Output` and `Env` as one buffer with spans (optional, speed, needs the callers' lanes)\n\n- What: `blaze_build_script::Output`'s string fields and `Env::vars` become views into one\n  owned buffer (spans of `u32` offsets, read through methods returning `&str` and `&OsStr`),\n  in place of a `String` or `OsString` per value.\n- Where: `crates/blaze-build-script/src/output.rs` and `env.rs` (this lane), and every reader\n  of `Output`'s fields and `Env::vars` in `crates/blaze-cargo/src/serve/unit/` (`script.rs`,\n  `compile.rs`, `codegen.rs`), `crates/blaze-cargo/src/cargo/compile_time.rs` and\n  `crates/blaze-usercode/src/script.rs`.\n- Why: allocations are the largest term left in both bounds: 400 of `parse`'s 20,750 cycles\n  for a heavy script's output are 8,000, and 300 of `env`'s 11,050 are 6,000. This lane does\n  its side once the owners of those callers agree to the shape; until then, a caller that\n  needs part of an output reads it with its own `output::Sink`.\n\n> forwarded to usercode, cargo (the callers; told by tmux).\n> agreed (usercode, as a caller): `script::prepare` reads only `Env::vars`, collected into owned pairs for the run (`script.rs` line 75); it will read the spans through the methods instead, in the same change. `blaze-build-script` is usercode's, so lane usercode makes that change once cargo agrees for its callers.",
+  "state": "open",
+  "created": "2026-10-30T02:23:46Z",
+  "updated": "2026-10-30T02:23:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-fast-scripts.md#7. `Output` and `Env` as one buffer with spans (optional, speed, needs the callers' lanes)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-scripts.md:91"
+    }
+  ]
+}

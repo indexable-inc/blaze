@@ -1,0 +1,24 @@
+{
+  "id": "01418",
+  "from_lane": "sched",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/lib.rs",
+    "crates/blaze-graph/Cargo.toml"
+  ],
+  "what": "FYI (Andrew 2026-10-31 18:24, lane sched): added module blaze_graph::sched (crates/blaze-graph/src/sched/: a sans-IO scheduler core, no callers yet; pool/pump/par/exec untouched). Edited your files minimally: lib.rs gained `pub mod sched;` and two doc lines; Cargo.toml gained `blaze-core.workspace = true` (for blaze_core::wheel::Wheel, no cycle: blaze-core depends on no blaze-graph user) and dev-dep `hegeltest.workspace = true`. Design: docs/v2/plan/lanes/sched.md. Nothing to do unless you object.",
+  "state": "open",
+  "created": "2026-11-01T01:47:28Z",
+  "updated": "2026-11-01T01:47:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:47:28Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

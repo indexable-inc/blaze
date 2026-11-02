@@ -105,6 +105,10 @@ mod ok {
         run_and_expect_no_errors("test_data/parser/inline/ok/cfg_key_value_pred.rs");
     }
     #[test]
+    fn cfg_literal_pred() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/cfg_literal_pred.rs");
+    }
+    #[test]
     fn cfg_meta() { run_and_expect_no_errors("test_data/parser/inline/ok/cfg_meta.rs"); }
     #[test]
     fn cfg_pred_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/cfg_pred_pat.rs"); }
@@ -275,6 +279,14 @@ mod ok {
         run_and_expect_no_errors("test_data/parser/inline/ok/fn_pointer_param_ident_path.rs");
     }
     #[test]
+    fn fn_pointer_param_pat() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/fn_pointer_param_pat.rs");
+    }
+    #[test]
+    fn fn_pointer_self_param() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/fn_pointer_self_param.rs");
+    }
+    #[test]
     fn fn_pointer_type() {
         run_and_expect_no_errors("test_data/parser/inline/ok/fn_pointer_type.rs");
     }
@@ -349,6 +361,8 @@ mod ok {
     fn guard_let_struct() {
         run_and_expect_no_errors("test_data/parser/inline/ok/guard_let_struct.rs");
     }
+    #[test]
+    fn guard_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/guard_pat.rs"); }
     #[test]
     fn half_open_range_pat() {
         run_and_expect_no_errors("test_data/parser/inline/ok/half_open_range_pat.rs");
@@ -480,6 +494,10 @@ mod ok {
     #[test]
     fn mod_item_curly() {
         run_and_expect_no_errors("test_data/parser/inline/ok/mod_item_curly.rs");
+    }
+    #[test]
+    fn negative_trait_bound() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/negative_trait_bound.rs");
     }
     #[test]
     fn never_type() { run_and_expect_no_errors("test_data/parser/inline/ok/never_type.rs"); }
@@ -617,6 +635,8 @@ mod ok {
     fn ref_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/ref_expr.rs"); }
     #[test]
     fn ref_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/ref_pat.rs"); }
+    #[test]
+    fn ref_pat_pin() { run_and_expect_no_errors("test_data/parser/inline/ok/ref_pat_pin.rs"); }
     #[test]
     fn reference_type() {
         run_and_expect_no_errors("test_data/parser/inline/ok/reference_type.rs");
@@ -779,6 +799,16 @@ mod ok {
     #[test]
     fn unit_type() { run_and_expect_no_errors("test_data/parser/inline/ok/unit_type.rs"); }
     #[test]
+    fn unsafe_binder_cast() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_binder_cast.rs");
+    }
+    #[test]
+    fn unsafe_binder_type() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_binder_type.rs");
+    }
+    #[test]
+    fn unsafe_mod() { run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_mod.rs"); }
+    #[test]
     fn use_item() { run_and_expect_no_errors("test_data/parser/inline/ok/use_item.rs"); }
     #[test]
     fn use_tree() { run_and_expect_no_errors("test_data/parser/inline/ok/use_tree.rs"); }
@@ -823,6 +853,10 @@ mod ok {
 }
 mod err {
     use crate::tests::*;
+    #[test]
+    fn ambiguous_range_pat() {
+        run_and_expect_errors("test_data/parser/inline/err/ambiguous_range_pat.rs");
+    }
     #[test]
     fn angled_path_without_qual() {
         run_and_expect_errors("test_data/parser/inline/err/angled_path_without_qual.rs");
@@ -878,12 +912,20 @@ mod err {
         run_and_expect_errors("test_data/parser/inline/err/enum_variant_attrs_without_variant.rs");
     }
     #[test]
+    fn fn_pointer_param_ref_mut_pat() {
+        run_and_expect_errors("test_data/parser/inline/err/fn_pointer_param_ref_mut_pat.rs");
+    }
+    #[test]
     fn fn_pointer_type_missing_fn() {
         run_and_expect_errors("test_data/parser/inline/err/fn_pointer_type_missing_fn.rs");
     }
     #[test]
     fn fn_ret_recovery() {
         run_and_expect_errors("test_data/parser/inline/err/fn_ret_recovery.rs");
+    }
+    #[test]
+    fn for_type_unsafe_binder() {
+        run_and_expect_errors("test_data/parser/inline/err/for_type_unsafe_binder.rs");
     }
     #[test]
     fn function_ret_type_missing_arrow() {
@@ -971,6 +1013,10 @@ mod err {
     #[test]
     fn pointer_type_no_mutability() {
         run_and_expect_errors("test_data/parser/inline/err/pointer_type_no_mutability.rs");
+    }
+    #[test]
+    fn polarity_and_modifiers_trait_bound() {
+        run_and_expect_errors("test_data/parser/inline/err/polarity_and_modifiers_trait_bound.rs");
     }
     #[test]
     fn postfix_dot_expr_ambiguity() {

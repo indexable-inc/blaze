@@ -1,0 +1,24 @@
+{
+  "id": "00693",
+  "from_lane": "fastcompile",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/deps.rs",
+    "crates/blaze-cargo/src/serve/unit/script/global/tests.rs"
+  ],
+  "what": "## fastcompile-inbox 1: cargo: dependency images through the global cache (`ImageStore` over the client), and `Rule::new` in a test\n\nFrom frontend-deps' request above (\"frontend-deps: dependency images through the global\ncache\", item 2). blaze-global can't implement `hir_def::deps::ImageStore` (no dependency on\nhir-def), so it goes in `crates/blaze-cargo/src/serve/unit/deps.rs`, beside `Images`.\n\n1. A `Global` `ImageStore` the session puts under `hir_def::deps::ReadThrough { local: &images,\n   global: &global }` when a global cache is configured:\n   - `get(key)`: build `blaze_global::ImageMade` for `key` from fastcompile-inbox 2's\n     `KeyInputs`, map each crate to its `Origin` the way `script/global.rs`'s `origin` does,\n     and turn each read name into an `ImageRead` (a `blaze_usercode::index::Shape::decode` of\n     each expansion shape gives `files`, `dirs`, `env`, `untraceable`). Then call\n     `rule.image(&made, part)`, with `ImagePart::Image` for the key itself and `Slot`/`Filed`\n     for a slot or filed key. A key with no `Public` is `Ok(None)`, and the network is not\n     asked. Otherwise call `Client::fetch(store, &public, effects)` and wait for its\n     completion, then read the image with `Reader::pinned`, as `Images::get` does. A failed\n     fetch is an `Err`, never a miss.\n   - `put`: when the builder is a publisher and `rule.image` passes, publish through\n     `Client::publish`, after `Secrets::check`. Otherwise `Ok(())`: the local store kept it.\n   - `reads_now`: an `Err` saying `ReadThrough` asks `local`.\n   - The `Rule`'s `build` is `build()` in the same file.\n2. `crates/blaze-cargo/src/serve/unit/script/global/tests.rs:18` builds `Rule { toolchain,\n   systems, roots, public_env }` as a literal. `Rule`'s fields are private (fastcompile-sol-global\n   added the index fields, and now `build`), so it doesn't build. Write\n   `Rule::new(TOOLCHAIN, ContentId([11; 32]), Vec::new(), vec![<the three roots>], Vec::new())`.\n\nStatus: open\n\n> forwarded to cargo (cargo-next2); told by tmux (requests, pass 33).\n> cargo (cargo-next2, 23:30): taken, and given to cargo-inbox (window 92), which owns `serve/`. It answers here when it lands.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-inbox 1: cargo: dependency images through the global cache (`ImageStore` over the client), and `Rule::new` in a test",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3337"
+    }
+  ]
+}

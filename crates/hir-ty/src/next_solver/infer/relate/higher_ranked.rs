@@ -1,11 +1,13 @@
 //! Helper routines for higher-ranked things. See the `doc` module at
 //! the end of the file for details.
 
-use rustc_type_ir::TypeFoldable;
+use rustc_type_ir::{TypeFoldable, TypeVisitableExt, UniverseIndex};
 use tracing::{debug, instrument};
 
-use crate::next_solver::fold::FnMutDelegate;
+use crate::next_solver::fold::BoundVarReplacerDelegate;
 use crate::next_solver::infer::InferCtxt;
+use crate::next_solver::infer::relate::RelateResult;
+use crate::next_solver::infer::snapshot::CombinedSnapshot;
 use crate::next_solver::{
     Binder, BoundConst, BoundRegion, BoundTy, Const, DbInterner, PlaceholderConst,
     PlaceholderRegion, PlaceholderType, Region, Ty,
@@ -26,25 +28,16 @@ impl<'db> InferCtxt<'db> {
     #[instrument(level = "debug", skip(self), ret)]
     pub fn enter_forall_and_leak_universe<T>(&self, binder: Binder<'db, T>) -> T
     where
-        T: TypeFoldable<DbInterner<'db>> + Clone,
+        T: TypeFoldable<DbInterner<'db>>,
     {
-        if let Some(inner) = binder.clone().no_bound_vars() {
-            return inner;
+        // Inlined `no_bound_vars`.
+        if !binder.as_ref().skip_binder().has_escaping_bound_vars() {
+            return binder.skip_binder();
         }
 
         let next_universe = self.create_next_universe();
 
-        let delegate = FnMutDelegate {
-            regions: &mut |br: BoundRegion<'db>| {
-                Region::new_placeholder(self.interner, PlaceholderRegion::new(next_universe, br))
-            },
-            types: &mut |bound_ty: BoundTy<'db>| {
-                Ty::new_placeholder(self.interner, PlaceholderType::new(next_universe, bound_ty))
-            },
-            consts: &mut |bound: BoundConst<'db>| {
-                Const::new_placeholder(self.interner, PlaceholderConst::new(next_universe, bound))
-            },
-        };
+        let delegate = ToPlaceholders { interner: self.interner, universe: next_universe };
 
         debug!(?next_universe);
         self.interner.replace_bound_vars_uncached(binder, delegate)
@@ -64,7 +57,7 @@ impl<'db> InferCtxt<'db> {
     #[instrument(level = "debug", skip(self, f))]
     pub fn enter_forall<T, U>(&self, forall: Binder<'db, T>, f: impl FnOnce(T) -> U) -> U
     where
-        T: TypeFoldable<DbInterner<'db>> + Clone,
+        T: TypeFoldable<DbInterner<'db>>,
     {
         // FIXME: currently we do nothing to prevent placeholders with the new universe being
         // used after exiting `f`. For example region subtyping can result in outlives constraints
@@ -73,5 +66,46 @@ impl<'db> InferCtxt<'db> {
         let value = self.enter_forall_and_leak_universe(forall);
         debug!(?value);
         f(value)
+    }
+
+    /// See [`RegionConstraintCollector::leak_check`]. We only check placeholder leaking into
+    /// `outer_universe`, i.e. placeholders which cannot be named by that universe.
+    ///
+    /// [`RegionConstraintCollector::leak_check`]: crate::next_solver::infer::region_constraints::RegionConstraintCollector::leak_check
+    pub fn leak_check(
+        &self,
+        outer_universe: UniverseIndex,
+        only_consider_snapshot: Option<&CombinedSnapshot>,
+    ) -> RelateResult<'db, ()> {
+        let max_universe = self.universe();
+        self.inner.borrow_mut().unwrap_region_constraints().leak_check(
+            self.interner,
+            outer_universe,
+            max_universe,
+            only_consider_snapshot,
+        )
+    }
+}
+
+/// Replaces each bound variable with a placeholder in `universe`, by static dispatch.
+struct ToPlaceholders<'db> {
+    interner: DbInterner<'db>,
+    universe: UniverseIndex,
+}
+
+impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToPlaceholders<'db> {
+    #[inline]
+    fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
+        Region::new_placeholder(self.interner, PlaceholderRegion::new(self.universe, br))
+    }
+
+    #[inline]
+    fn replace_ty(&mut self, bound_ty: BoundTy<'db>) -> Ty<'db> {
+        Ty::new_placeholder(self.interner, PlaceholderType::new(self.universe, bound_ty))
+    }
+
+    #[inline]
+    fn replace_const(&mut self, bound: BoundConst<'db>) -> Const<'db> {
+        Const::new_placeholder(self.interner, PlaceholderConst::new(self.universe, bound))
     }
 }

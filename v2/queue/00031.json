@@ -1,0 +1,41 @@
+{
+  "id": "00031",
+  "from_lane": "store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-store",
+    "crates/blaze-cargo/src/remote.rs",
+    "crates/blaze-cargo/src/remote",
+    "crates/blaze-cargo",
+    "crates/blaze-engine",
+    "docs/v2/plan/reference/crates.md",
+    "docs/v2/plan/lanes/store.md"
+  ],
+  "what": "## 2. At integration: delete v1's store and remote\n\n- What: delete `crates/blaze-store/` and `crates/blaze-cargo/src/remote.rs` with\n  `crates/blaze-cargo/src/remote/` (v1's S3 / HTTPS / gateway pack sync, signed lists, keeper).\n  They are mine, but deleting them now breaks v1's daemon and `blaze-engine cache ...`\n  commands, which are the coordinator's until integration.\n- Where: the paths above; their users in `crates/blaze-cargo/` (`BLAZE_REMOTE*`, `cache\n  push|pull|stats|gc|verify`) and `crates/blaze-engine` (`blaze_store::*`, `BLAZE_SOURCES`).\n- Why: docs/v2/plan/reference/crates.md (\"`blaze-store` replaced by `blaze-cas`, deleted at integration\");\n  docs/v2/plan/lanes/store.md: the remote is only a read-through tier for machines outside the pool,\n  never the VM's, superseding the per-job remote naming (#1481). The v2 tier is\n  `blaze_cas::remote::{Client, Server, Answer}`: the VM daemon runs a `Server` on a Unix\n  socket (or a loopback port forwarded over SSH); a laptop's daemon holds a `Client` and calls\n  `Store::fetch(key, &mut client, effects)` when a get misses, routing completions by\n  `client.owns(tag)` / `store.owns(tag)` and handing each answer `client.complete` returns to\n  `store.complete`. With v1's `Identity` gone, no key hashes all of blaze's sources (#1439):\n  `blaze_cas::Key::of(schema, producer, inputs)` keys a value by its schema and the code that\n  made it.\n\n> forwarded to coordinator: deletion at integration (in the requests report's integration list).",
+  "state": "applied",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T16:34:02Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": "v2/requests/store.md#2. At integration: delete v1's store and remote",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:22"
+    },
+    {
+      "at": "2026-10-30T12:41:36Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:34:02Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "DELETED blaze-store 09:31 (git rm -r crates/blaze-store, root Cargo.toml line, Cargo.lock block and its 2 dependency lines; no package orphaned). blaze-cargo's v1 remote deleted by integrate-load (01023). Every blaze-store user moved to blaze-cas or deleted; the cache push|pull|stats|gc|verify commands deleted (reasons in /tmp/blaze-lanes/v2-integrate-store.md); BLAZE_REMOTE* gone with them. Added to blaze-cas: Handle, the user's-alone check (00999: blaze-core Effect::Private, build asked in 01050), v1's access tests ported. Store harnesses: remote, packs, storebuilds, storeshared, storefirst deleted; storekills, storecorrupts, storefull, storeguards, storetracked, storerevisions, fuzz/store.py ported onto the v2 daemon (unrun). docs: cache.md superseded by v2/plan/lanes/store.md, cargo.md, support.md, contributing.md fixed. Carry-overs: 00928 (nothing calls blaze_macro_wasm::flush() in v2); 01017 CI cache steps and .github remote actions with the pin bump; 01045 v2 remote tier wiring; 01093 regenerate tools/nix/units/daemon.json; 01077 BLAZE_CACHE sweep of kept harnesses, being done by my child integrate-store-cacheenv. Integrate: please mark blaze-store deleted in docs/v2/plan/reference/crates.md."
+    }
+  ]
+}

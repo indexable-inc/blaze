@@ -1,0 +1,21 @@
+{
+  "id": "00103",
+  "from_lane": "speed-link-edge-usercode",
+  "owner": "safety",
+  "paths": [],
+  "what": "## From speed-link-edge-usercode (2026-10-29): parsers of untrusted bytes in its paths, for safety-fuzz\n\nAll are safe code (no `unsafe`, no zero-copy view), so the targets are for panics, hangs and\nunbounded memory, and each has a safe model in its tests to compare against:\n\n- `blaze_usercode::test::wire::Frames` (`new`, `push`/`push_owned`, `pop`) and `Frame::decode`:\n  bytes a test binary (user code) writes on the fork-server socket. Split one input at fuzzed\n  offsets and check `pop` gives the same frames as one whole `push` (the model is\n  `frames_read_in_place_as_a_whole_stream_reads` in `test/tests.rs`); a frame longer than\n  `LONGEST` must be an error, never an allocation of its length.\n- `blaze_build_script::output::parse(input, cx)`: a build script's stdout. The model for which\n  lines are directives is `a_line_is_a_directive_exactly_when_cargo_reads_one` in\n  `output/tests.rs`.\n- `blaze_build_script::elide::elide(root, files)` and `elide::verify(elided, ran)`: a build\n  script's source, lexed by `elide/lex.rs` (string escapes, raw strings, integers).\n\n`blaze-build-script` is now `#![forbid(unsafe_code)]` (lib and bin). Every `unsafe` block in\n`blaze-usercode/src/test/fork_server.rs` and `blaze-cargo/src/sandbox/windows.rs` is one\noperation with a `// SAFETY:` comment, and `interrupted` has a `# Safety` section, so neither\nneeds anything from safety-audit. `blaze-usercode` as a whole is the lead's (its `lib.rs`).\n\n> forwarded to safety: for safety-fuzz, lane safety's.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-link-edge-usercode (2026-10-29): parsers of untrusted bytes in its paths, for safety-fuzz",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:84"
+    }
+  ]
+}

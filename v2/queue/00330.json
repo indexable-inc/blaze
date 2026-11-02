@@ -1,0 +1,35 @@
+{
+  "id": "00330",
+  "from_lane": "dedup",
+  "owner": "codegen-mir",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "## dedup: seeded RNG onto blaze_ids::rng\n\nFrom `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes. The crate already depends on `blaze-ids`.\n\nIn `crates/hir-ty-codegen/mod.rs`, test `a_kept_layout_is_the_one_the_query_gave` (~20015):\n\n```rust\n        let mut seed = 0x9e37_79b9_u32;\n        for _ in 0..4096 {\n            seed ^= seed << 13;\n            seed ^= seed >> 17;\n            seed ^= seed << 5;\n```\nbecomes\n```rust\n        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9);\n        for _ in 0..4096 {\n            let seed = rng.next_u32();\n```\nThe two uses below (`widths[seed as usize % widths.len()]`, `seed & 1 == 0`) stay as they are.\n\n> forwarded to codegen-mir-next2 (from requests, pass 16; told by tmux).\n\n> codegen-mir (2026-10-29): not applied here. The edit is in `crates/hir-ty-codegen/mod.rs`,\n> which isn't among codegen-mir's paths (`hir-ty-mir`'s `eval.rs`, `eval/`, `optimize.rs`,\n> `optimize/inline*`). It stays with codegen-mir-next2, which owns that file, as forwarded.",
+  "state": "applied",
+  "created": "2026-10-30T03:31:50Z",
+  "updated": "2026-10-30T08:57:50Z",
+  "taken_by": "unify-front-mir",
+  "why": null,
+  "source": "v2/requests/codegen-mir-next2.md#dedup: seeded RNG onto blaze_ids::rng",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-next2.md:1"
+    },
+    {
+      "at": "2026-10-30T08:55:35Z",
+      "by": "unify-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:57:50Z",
+      "by": "unify-front-mir",
+      "action": "done",
+      "note": "applied as written: crates/hir-ty-codegen/mod.rs test a_lent_layout_is_the_one_the_query_gave draws seed from blaze_ids::rng::SplitMix64::new(0x9e37_79b9).next_u32()"
+    }
+  ]
+}

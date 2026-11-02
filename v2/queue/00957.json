@@ -1,0 +1,23 @@
+{
+  "id": "00957",
+  "from_lane": "item-hash",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen"
+  ],
+  "what": "Andrew (via coordinator): the front end semantic hash is now Unison-style anonymous (no local/param/generic/item names, no positions; docs/v2/plan/design/item-hash.md 3.3, 3.7). Names and locations reaching the output stay exactly rustc: debuginfo variable names, symbol names, panic Location / line!/column!/file! / #[track_caller] constants. Please key those in codegen by the new presentation hash (blaze_item_hash::presentation(db, def), being added by item-hash-facts) separately from the code hash, so a rename or move reruns only that layer (debuginfo, symbols, location constants), never MIR codegen of the body, and the binary is byte-identical to a fresh build. Check whether any codegen cache key (dev template, code hash) currently includes debuginfo names or line numbers; split them out. item-hash-mir is making MIR records hold location constants as slots filled from the current db on decode.",
+  "state": "open",
+  "created": "2026-10-30T12:04:22Z",
+  "updated": "2026-10-30T12:04:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:04:22Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

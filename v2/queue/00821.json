@@ -1,0 +1,38 @@
+{
+  "id": "00821",
+  "from_lane": "graph",
+  "owner": "sol-salsa",
+  "paths": [
+    "vendor/salsa/src/zalsa_local.rs",
+    "vendor/salsa/src/ingredient.rs",
+    "vendor/salsa/src/graph.rs",
+    "vendor/salsa/src/graph/nodes.rs"
+  ],
+  "what": "For the graph at rest (docs/v2/plan/lanes/db/graph.md section 3): (1) a frozen variant of the query origin in zalsa_local.rs whose edges are read through graph::frozen::Overlay (node -> FrozenGraph::edges) instead of an EdgeSpan, so a restart maps the image; (2) an Ingredient hook enumerating each live function memo as (node, edge words) so graph::frozen::write can take a Source over the live Graph; (3) at Graph::compact, apply graph::order::dfs_preorder to the live columns (node keys, key table, colors, MemoHeader.node, task node caches, bloom column words via bloom::renumber_word) so deep verify reads colors in walk order.",
+  "state": "applied",
+  "created": "2026-10-30T08:30:13Z",
+  "updated": "2026-10-30T09:08:51Z",
+  "taken_by": "sol-salsa",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:30:13Z",
+      "by": "graph",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:50:20Z",
+      "by": "sol-salsa",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:08:51Z",
+      "by": "sol-salsa",
+      "action": "done",
+      "note": "Items 2 and 3 written blind by sol-salsa-order (/tmp/blaze-lanes/v2-sol-salsa-order.md). Item 2: Ingredient::memo_edges and graph::LiveEdges, also a frozen::Source, with Zalsa::freeze_graph. Item 3: Graph::compact_renumbered, called from Zalsa::compact_edges_if_worth_it, renames nodes, the key table, colors, edge words, MemoHeader.node and the bloom column (Closures::renumber); node caches drop by the Nodes epoch. Tests: tests/walk_order.rs plus unit tests. Bench: benches/verify_order.rs. Item 1, the frozen query origin, is parked until frontend-image restores memos onto frozen nodes."
+    }
+  ]
+}

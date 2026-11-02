@@ -1,0 +1,35 @@
+{
+  "id": "00070",
+  "from_lane": "speed-hir-sol-defs",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## speed-hir-sol-defs: `tools/v2/hot_lint.py` skips the files of a module declared `#[cfg(test)]`\n\nWhat: hot_lint skips `#[cfg(test)]` items inside a file, and files named `tests.rs`/`*tests.rs`\nor under a `tests/` directory, but not the file of a module its parent declares\n`#[cfg(test)] mod x;`. hir-def has two: `macro_expansion_tests/` (43 findings, most inside fixture\nstrings, where a justify comment would change the test's input and the spans its expectations\nprint) and `test_db.rs` (7). Other crates have the same shape (`rg -U '#\\[cfg\\(test\\)\\]\\s*mod \\w+;'`).\n\nWhere: `tools/v2/hot_lint.py`.\n- After `EXEMPT = ..`:\n  ```python\n  TEST_MOD = re.compile(r\"#\\[cfg\\(test\\)\\]\\s*(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+(\\w+)\\s*;\")\n\n\n  def declared_test_modules(src: Path) -> list[Path]:\n      \"\"\"The file and directory of each module a file of `src` declares `#[cfg(test)] mod x;`.\"\"\"\n      out: list[Path] = []\n      for path in src.rglob(\"*.rs\"):\n          text = path.read_text(errors=\"ignore\")\n          base = path.parent if path.name in (\"lib.rs\", \"main.rs\", \"mod.rs\") else path.with_suffix(\"\")\n          for m in TEST_MOD.finditer(text):\n              out.extend((base / f\"{m.group(1)}.rs\", base / m.group(1)))\n      return out\n  ```\n- In `main`, after `found: list[str] = []`: `test_mods = declared_test_modules(src)`, and the\n  skip becomes\n  ```python\n            if \"tests\" in path.parts or name.endswith(\"tests.rs\") or name == \"tests.rs\":\n                continue\n            if any(path == m or m in path.parents for m in test_mods):\n                continue\n  ```\n- The docstring's \"Test code (..)\" sentence gains \"and the files of a module declared\n  `#[cfg(test)] mod x;`\".\n\nA `#[path = ..]` on such a declaration is not followed (none in the hot crates today).\nWhy: the brief's rule is \"tests count as the edge\"; this makes the lint see it without\ncomments inside test fixtures.\n\n> forwarded to the coordinator (`tools/`) (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T08:31:23Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/speed.md#speed-hir-sol-defs: `tools/v2/hot_lint.py` skips the files of a module declared `#[cfg(test)]`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:384"
+    },
+    {
+      "at": "2026-10-30T08:31:23Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:23Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

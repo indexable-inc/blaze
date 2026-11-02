@@ -1,0 +1,36 @@
+{
+  "id": "00673",
+  "from_lane": "frontend-tree",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/outline.rs",
+    "crates/blaze-engine"
+  ],
+  "what": "## frontend-tree: blaze-engine outline.rs: an allocation budget (11)\n\n> applied by codegen-rq-engine-views (2026-10-29), uncompiled: `an_outline_is_hashed_with_no_allocation` after `copies` in `outline.rs`'s tests, as written. I checked that it holds: `SourceFile::parse` is a full parse, so no lazy part is parsed during the walk; `PreorderWithTokens` and `Descendants` are stack-free; `simple_name` gives `&str`; the crate's test allocator is `blaze_alloc_count::Counting` (`lib.rs:60`). The text has no `MACRO_CALL` below an item and no body with items, so `skeleton_of` gives `Some` of the same hash.\nFrom frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16 (\"hot paths get a `blaze-alloc-count` budget test\"). After (1): `hash_outside_bodies` and `skeleton_of` of a parsed file allocate nothing, held by `blaze_alloc_count::assert_at_most(0, ..)` as `memo.rs` holds a memo hit (`blaze-alloc-count` is already a dev-dependency, and the crate's test allocator counts). Needs nothing first.\n\n### 1. `crates/blaze-engine/src/outline.rs` (lines 1009-1011 now)\n\nWhy: the budget test, beside the outline's other tests.\n\nOld:\n\n```rust\n    fn copies(text: &str) -> Copied {\n        copied_in(SourceFile::parse(text, Edition::CURRENT).root())\n    }\n```\n\nNew:\n\n```rust\n    fn copies(text: &str) -> Copied {\n        copied_in(SourceFile::parse(text, Edition::CURRENT).root())\n    }\n\n    /// An outline's hash and a file's skeleton walk the tree's arrays and allocate nothing.\n    #[test]\n    fn an_outline_is_hashed_with_no_allocation() {\n        let text = \"mod m { fn f<T>(x: T) { let _ = || 1; } }\\n#[derive(Debug)]\\nstruct S;\\n\\\n                    impl S { fn g(&self) -> u8 { 2 } }\\nmacro_rules! m { () => {} }\\n\";\n        let parse = SourceFile::parse(text, Edition::CURRENT);\n        let none = FxHashSet::<TextRange>::default();\n        let (hash, skeleton) = blaze_alloc_count::assert_at_most(0, \"an outline's hash\", || {\n            (hash_outside_bodies(parse.root(), &none, &none), skeleton_of(parse.root()))\n        });\n        assert_eq!(hash.1, 0);\n        assert_eq!(skeleton, Some(hash.0));\n    }\n```\n\n> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:30:07Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/codegen.md#frontend-tree: blaze-engine outline.rs: an allocation budget (11)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:8823"
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

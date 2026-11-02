@@ -1,9 +1,0 @@
-{
-  "row": "feature unification across members, one package built (`-p app`)",
-  "package": "app",
-  "crates": [
-    "app",
-    "shared"
-  ],
-  "cargo": []
-}

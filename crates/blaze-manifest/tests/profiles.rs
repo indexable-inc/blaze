@@ -1,14 +1,14 @@
 //! Each tree of `tests/profile-fixtures` with the unit graph cargo 1.99 printed for each run
-//! (`expected.json`, written by `harness/resolve.py --fixtures` with the runs of the case's
-//! `case.json` after its `PROFILE_RUNS`): the profile blaze-manifest computes for every unit,
+//! (`expected.json`, recorded once with the runs of the case's `case.json` after its
+//! `PROFILE_RUNS`, and kept as blaze's own expected output): the profile blaze-manifest computes for every unit,
 //! the warnings about profiles and the error when cargo refused the profiles, against cargo's.
 
 // `expected.json` is what cargo printed on Linux: its unit graph names Linux paths, put in a
 // JSON text as they are, which a Windows path's `\` is not.
 #![cfg(unix)]
-#![allow(dead_code, reason = "the example's module, of which the test uses `main`")]
+#![allow(dead_code, reason = "the walk module, of which the test uses `main`")]
 
-#[path = "../examples/profiles/walk.rs"]
+#[path = "support/profiles_walk.rs"]
 mod walk;
 
 use std::path::Path;
@@ -29,7 +29,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The error of `stderr` as `harness/resolve.py`'s `error_text` takes it.
+/// The error of `stderr`, as `expected.json` records it.
 fn error_text(stderr: &str) -> String {
     let lines: Vec<&str> = stderr.lines().collect();
     let start = lines.iter().position(|l| l.starts_with("error")).unwrap_or(lines.len());
@@ -41,7 +41,7 @@ fn error_text(stderr: &str) -> String {
         .join("\n")
 }
 
-/// A warning less the manifest it is about, as `harness/resolve.py`'s `profile_warnings` takes it.
+/// A warning less the manifest it is about, as `expected.json` records it.
 fn message(line: &str) -> &str {
     let rest = &line["warning: ".len()..];
     match rest.split_once(": ") {

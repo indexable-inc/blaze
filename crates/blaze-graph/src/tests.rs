@@ -1,11 +1,10 @@
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use blaze_hash::{HashMap, HashSet};
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use expect_test::{expect, expect_file};
-use rustc_hash::{FxHashMap, FxHashSet};
+use parking_lot::Mutex;
 
 use crate::{
     exec::{Did, drive},
@@ -23,6 +22,8 @@ fn spec(id: u32, kind: NodeKind, deps: &[u32], pool: Pool, cost: u64) -> Spec {
         deps: deps.iter().map(|&it| NodeId(it)).collect(),
         pool,
         cost,
+        key: None,
+        memory: 0,
     }
 }
 
@@ -294,23 +295,13 @@ fn inputs_it_cannot_take_are_refused_and_change_nothing() {
     assert_eq!(machine.step(done(4, 2, Outcome::Built)).err(), Some(Error::Over));
 }
 
-/// A small generator, so the simulation needs no dependency and every seed is the same run.
-struct Lcg(u64);
-
-impl Lcg {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (self.0 >> 33) % n.max(1)
-    }
-}
-
 /// Random graphs finished in a random order: no node runs before what it waits for is done,
 /// no pool runs more than its threads, every node settles, and the critical path is a chain
 /// of nodes that each waited for the one before.
 #[test]
 fn random_builds_keep_the_rules() {
     for seed in 0..300u64 {
-        let mut random = Lcg(seed);
+        let mut random = SplitMix64::new(seed);
         let nodes = 1 + random.below(40) as u32;
         let config = Config {
             io: 1 + random.below(3) as usize,
@@ -319,7 +310,7 @@ fn random_builds_keep_the_rules() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: FxHashSet<u32> = (0..random.below(4))
+            let deps: HashSet<u32> = (0..random.below(4))
                 .filter(|_| id > 0)
                 .map(|_| random.below(id.into()) as u32)
                 .collect();
@@ -328,17 +319,17 @@ fn random_builds_keep_the_rules() {
             let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
             specs.push(spec(id, NodeKind::Names, &deps, pool, random.below(10)));
         }
-        let deps_of: FxHashMap<u32, Vec<u32>> =
+        let deps_of: HashMap<u32, Vec<u32>> =
             specs.iter().map(|it| (it.id.0, it.deps.iter().map(|it| it.0).collect())).collect();
-        let pool_of: FxHashMap<u32, Pool> = specs.iter().map(|it| (it.id.0, it.pool)).collect();
+        let pool_of: HashMap<u32, Pool> = specs.iter().map(|it| (it.id.0, it.pool)).collect();
         let mut machine = Machine::new(config).unwrap();
         let mut running: Vec<u32> = Vec::new();
         let mut finished = None;
-        let mut states: FxHashMap<u32, NodeState> = FxHashMap::default();
+        let mut states: HashMap<u32, NodeState> = HashMap::default();
         let mut critical = Vec::new();
         let take = |outputs: Vec<Output>,
                     running: &mut Vec<u32>,
-                    states: &mut FxHashMap<u32, NodeState>,
+                    states: &mut HashMap<u32, NodeState>,
                     finished: &mut Option<bool>,
                     critical: &mut Vec<u32>| {
             for output in outputs {
@@ -401,6 +392,105 @@ fn random_builds_keep_the_rules() {
     }
 }
 
+/// `step_into` appends exactly what `step` returns, refusals and the end included, over random
+/// builds finished in a random order.
+#[test]
+fn step_into_gives_what_step_gives() {
+    for seed in 0..200u64 {
+        let mut random = SplitMix64::new(seed);
+        let nodes = 1 + random.below(40) as u32;
+        let config = Config {
+            io: 1 + random.below(3) as usize,
+            work: 1 + random.below(4) as usize,
+            keep_going: random.below(2) == 0,
+        };
+        let mut specs = Vec::new();
+        for id in 0..nodes {
+            let deps: HashSet<u32> = (0..random.below(4))
+                .filter(|_| id > 0)
+                .map(|_| random.below(id.into()) as u32)
+                .collect();
+            let mut deps: Vec<u32> = deps.into_iter().collect();
+            deps.sort();
+            let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
+            specs.push(spec(id, NodeKind::Names, &deps, pool, random.below(10)));
+        }
+        let mut by_step = Machine::new(config).unwrap();
+        let mut by_into = Machine::new(config).unwrap();
+        // An output left in the buffer from before: `step_into` appends after it.
+        let mut out = vec![Output::Finished { ok: true }];
+        let mut machines = (&mut by_step, &mut by_into);
+        let added = both(seed, &mut machines, Input::Add { at_ns: 0, nodes: specs }, &mut out);
+        let mut running = runs(&added);
+        running.extend(runs(&both(seed, &mut machines, Input::Close { at_ns: 0 }, &mut out)));
+        let mut at = 0;
+        while !machines.1.is_over() {
+            assert!(!running.is_empty(), "seed {seed}: nothing runs and the build is not over");
+            at += 1 + random.below(5);
+            both(seed, &mut machines, done(at, u32::MAX, Outcome::Built), &mut out);
+            let id = running.swap_remove(random.below(running.len() as u64) as usize);
+            let outcome = match random.below(12) {
+                0 => Outcome::Failed { why: "no".to_owned() },
+                1 => Outcome::Cached { remote: false },
+                _ => Outcome::Built,
+            };
+            running.extend(runs(&both(seed, &mut machines, done(at, id, outcome), &mut out)));
+        }
+        assert!(machines.0.is_over(), "seed {seed}");
+        both(seed, &mut machines, Input::Close { at_ns: at }, &mut out);
+        assert_eq!(out, [Output::Finished { ok: true }], "seed {seed}");
+    }
+
+    /// `input` to both machines, the first by `step` and the second by `step_into` after what
+    /// `out` holds: the same outputs, or the same refusal with nothing appended. The outputs.
+    fn both(
+        seed: u64,
+        (by_step, by_into): &mut (&mut Machine, &mut Machine),
+        input: Input,
+        out: &mut Vec<Output>,
+    ) -> Vec<Output> {
+        let expected = by_step.step(input.clone());
+        let kept = out.len();
+        let got = by_into.step_into(input, out).map(|()| out[kept..].to_vec());
+        assert_eq!(got, expected, "seed {seed}");
+        assert!(got.is_ok() || out.len() == kept, "seed {seed}: a refused input appends nothing");
+        out.truncate(kept);
+        expected.unwrap_or_default()
+    }
+}
+
+/// Once the machine and the caller's buffer have grown, a `Done` that starts the next node of
+/// a chain calls the global allocator zero times.
+#[test]
+fn a_warm_done_through_step_into_allocates_nothing() {
+    assert!(blaze_alloc_count::installed(), "the tests count allocations");
+    let config = Config { io: 1, work: 1, keep_going: false };
+    let mut machine = Machine::new(config).unwrap();
+    let specs =
+        (0..300u32).map(|id| work(id, &[id.wrapping_sub(1)][..usize::from(id > 0)], 1)).collect();
+    let mut out = Vec::new();
+    machine.step_into(Input::Add { at_ns: 0, nodes: specs }, &mut out).unwrap();
+    machine.step_into(Input::Close { at_ns: 0 }, &mut out).unwrap();
+    let mut next = |id: u32, out: &mut Vec<Output>| {
+        out.clear();
+        machine.step_into(done(u64::from(id) + 1, id, Outcome::Built), out).unwrap();
+        let ran = out.iter().find_map(|it| match it {
+            Output::Run { id, .. } => Some(id.0),
+            _ => None,
+        });
+        assert_eq!(ran, Some(id + 1));
+    };
+    for id in 0..100 {
+        next(id, &mut out);
+    }
+    let inputs: Vec<u32> = (100..200).collect();
+    blaze_alloc_count::assert_at_most(0, "a warm `Done` through `step_into`", || {
+        for &id in &inputs {
+            next(id, &mut out);
+        }
+    });
+}
+
 #[test]
 fn the_executor_runs_every_ready_node_at_once() {
     // Four nodes that each wait until all four run: they finish only if they run together.
@@ -441,7 +531,7 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
             &mut machine,
             vec![spec(0, NodeKind::Manifest, &[], Pool::Io, 1)],
             &|id| {
-                ran.lock().unwrap().push(id.0);
+                ran.lock().push(id.0);
                 match id.0 {
                     0 => Did {
                         outcome: Outcome::Built,
@@ -459,7 +549,7 @@ fn the_executor_adds_what_work_finds_and_fails_on_a_panic() {
     let panic = drove.err().expect("the work's panic reaches the caller");
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"no def map"));
     assert!(matches!(records.last().map(|it| &it.event), Some(Event::Critical { .. })));
-    let mut ran = ran.into_inner().unwrap();
+    let mut ran = ran.into_inner();
     ran.sort();
     assert_eq!(ran, [0, 1, 2]);
     assert_eq!(

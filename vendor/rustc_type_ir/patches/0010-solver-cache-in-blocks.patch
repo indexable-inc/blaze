@@ -1,0 +1,169 @@
+diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
+--- a/src/search_graph/global_cache.rs
++++ b/src/search_graph/global_cache.rs
+@@ -1,7 +1,10 @@
+ use std::hash::{BuildHasher, Hash};
++use std::sync::OnceLock;
+ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+-use std::sync::{Mutex, OnceLock, PoisonError};
+ 
++use blaze_mem::Tag;
++use blaze_mem::blocks::Slice;
++use blaze_mem::lock::SpinLock;
+ use derive_where::derive_where;
+ use rustc_hash::FxBuildHasher;
+ 
+@@ -40,6 +43,10 @@
+ /// level and values never move, so a reader never waits on a writer. Writers to one goal take
+ /// one of `writers`, by goal, only to publish its row.
+ ///
++/// Its tables are blocks of `blaze_mem` ([`table`]), and its locks never allocate: a cache made
++/// per interner costs the global allocator nothing, and the blocks of one dropped (its
++/// interner's generation evicted) are the next one's.
++///
+ /// `success` holds a goal's latest result whose computation never hit the recursion limit;
+ /// `with_overflow` the results which hit it, newest first, each with the depth it was computed
+ /// with.
+@@ -73,7 +80,7 @@
+     next_nested: AtomicU64,
+     /// By goal: held while publishing one of its rows, with the row and nested-goal indices
+     /// its holder hands out.
+-    writers: OnceLock<Box<[Writer]>>,
++    writers: OnceLock<Slice<Writer>>,
+     /// What a row without nested goals has.
+     no_nested_goals: NestedGoals<X>,
+ }
+@@ -115,11 +122,8 @@
+         let goal = self.goals.intern(input);
+         let index = self.results.intern(result);
+         let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
+-        let writers = self.writers.get_or_init(|| (0..shard_count()).map(|_| Writer::new()).collect());
+-        let mut claimed = writers[goal as usize & (writers.len() - 1)]
+-            .0
+-            .lock()
+-            .unwrap_or_else(PoisonError::into_inner);
++        let writers = self.writers.get_or_init(|| table(shard_count(), |_| Writer::new()));
++        let mut claimed = writers[goal as usize & (writers.len() - 1)].0.lock();
+         let column = if encountered_overflow { &self.with_overflow } else { &self.success };
+         let head = column.get_or_init(goal, || AtomicU32::new(0));
+         let latest = head.load(Ordering::Acquire);
+@@ -237,9 +241,16 @@
+ const CHUNKS: usize = 27;
+ 
+ struct Chunked<T> {
+-    chunks: [OnceLock<Box<[T]>>; CHUNKS],
++    chunks: [OnceLock<Slice<T>>; CHUNKS],
+ }
+ 
++/// `len` values, the one at `at` made by `make(at)`, in a block of `blaze_mem` given back when
++/// it drops. Memory the system will not give stops the solver with what it wanted.
++fn table<T>(len: usize, make: impl FnMut(usize) -> T) -> Slice<T> {
++    Slice::new_with(len, Tag::Infer, make)
++        .unwrap_or_else(|error| panic!("the trait solver's cache: {error}"))
++}
++
+ fn chunk_of(raw: u32) -> (usize, usize) {
+     let biased = raw as usize / FIRST + 1;
+     let chunk = (usize::BITS - 1 - biased.leading_zeros()) as usize;
+@@ -260,7 +271,7 @@
+     /// Makes `raw`'s chunk, every entry `empty()`, if it has none.
+     fn get_or_init(&self, raw: u32, empty: impl Fn() -> T) -> &T {
+         let (chunk, at) = chunk_of(raw);
+-        &self.chunks[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| empty()).collect())[at]
++        &self.chunks[chunk].get_or_init(|| table(FIRST << chunk, |_| empty()))[at]
+     }
+ }
+ 
+@@ -301,11 +312,11 @@
+ 
+ /// One cache line pair each, so writers under neighbouring locks don't share a line.
+ #[repr(align(128))]
+-struct Writer(Mutex<Claims>);
++struct Writer(SpinLock<Claims>);
+ 
+ impl Writer {
+     fn new() -> Writer {
+-        Writer(Mutex::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
++        Writer(SpinLock::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
+     }
+ }
+ 
+@@ -337,24 +348,24 @@
+     values: Chunked<OnceLock<(u64, T)>>,
+     /// The first index no shard has claimed.
+     next: AtomicU64,
+-    shards: OnceLock<Box<[Shard]>>,
++    shards: OnceLock<Slice<Shard>>,
+ }
+ 
+ #[repr(align(128))]
+ struct Shard {
+     /// Held only to look again and insert.
+-    lock: Mutex<Claimed>,
++    lock: SpinLock<Claimed>,
+     /// How many values the shard has, written under `lock`.
+     len: AtomicU32,
+     /// Which of `tables` is the one in use.
+     level: AtomicUsize,
+-    tables: [OnceLock<Box<[AtomicU32]>>; TABLES],
++    tables: [OnceLock<Slice<AtomicU32>>; TABLES],
+ }
+ 
+ impl Shard {
+     fn new() -> Shard {
+         Shard {
+-            lock: Mutex::new(Claimed::EMPTY),
++            lock: SpinLock::new(Claimed::EMPTY),
+             len: AtomicU32::new(0),
+             level: AtomicUsize::new(0),
+             tables: [const { OnceLock::new() }; TABLES],
+@@ -362,7 +373,7 @@
+     }
+ 
+     fn table(&self, level: usize) -> &[AtomicU32] {
+-        self.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU32::new(0)).collect())
++        self.tables[level].get_or_init(|| table(TABLE << level, |_| AtomicU32::new(0)))
+     }
+ }
+ 
+@@ -393,7 +404,7 @@
+         {
+             return found;
+         }
+-        let mut claimed = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
++        let mut claimed = shard.lock.lock();
+         let mut level = shard.level.load(Ordering::Acquire);
+         if let Ok(found) = self.probe(shard.table(level), hash, &value) {
+             return found;
+@@ -417,7 +428,7 @@
+     }
+ 
+     fn shard(&self, hash: u64) -> &Shard {
+-        let shards = self.shards.get_or_init(|| (0..shard_count()).map(|_| Shard::new()).collect());
++        let shards = self.shards.get_or_init(|| table(shard_count(), |_| Shard::new()));
+         &shards[(hash >> 48) as usize & (shards.len() - 1)]
+     }
+ 
+@@ -494,6 +505,22 @@
+         sorted.dedup();
+         assert_eq!(sorted.len(), indices.len());
+         assert_eq!(interned.find(&1), None);
++    }
++
++    /// A table made fresh, filled through growth and dropped, after one like it, allocates
++    /// nothing: its chunks, shards and probe tables are recycled blocks and its locks never
++    /// allocate.
++    #[test]
++    fn a_fresh_table_after_a_dropped_one_allocates_nothing() {
++        let fill = || {
++            let interned = Interned::<u64>::new();
++            for it in 0..3000u64 {
++                interned.intern(it * 31);
++            }
++            assert_eq!(interned.find(&(2999 * 31)).map(|index| *interned.get(index)), Some(2999 * 31));
++        };
++        fill();
++        blaze_alloc_count::assert_at_most(0, "a fresh solver cache table", fill);
+     }
+ 
+     #[test]

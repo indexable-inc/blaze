@@ -1,0 +1,21 @@
+{
+  "id": "00513",
+  "from_lane": "diagnostics-lints-bodies",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-bodies: whether rustc would codegen, for the drop-elaborated lints (the parent, `diagnostics-lints`, `lints.rs`; `diagnostics` for `Options` and the UI harness)\n\nrustc runs `mir_drops_elaborated_and_const_checked` (drop recursion in `unconditional_recursion`,\nthen `KnownPanicsLint`: `arithmetic_overflow`, `unconditional_panic`) only when it codegens\n(`tcx.sess.opts.output_types.should_codegen()`) or the body is in a const context. `blaze check`\nis rustc's `--emit=metadata` and `blaze build` codegens, so the same crate lints differently, as\nunder rustc. `lints/bodies.rs` takes it as `before_abort(cx, codegen: bool)`. What:\n1. `lints.rs:48`: `bodies::before_abort(cx, <codegen>)` (it passes only `cx` today, which does\n   not compile).\n2. `Options { codegen: bool, .. }` (or wherever the command is known), true for `blaze build`/`test`/`run`,\n   false for `blaze check`.\n3. The UI harness (`tests.rs`, `compiletest`): `codegen` true for a test marked `//@ build-pass`,\n   `build-fail`, `run-pass` or `run-fail`, false otherwise (compiletest's `--emit=metadata` for\n   check modes). `tests/ui/lint/lint-unconditional-drop-recursion.rs` (`//@ build-fail`) and the\n   known-panics tests need it.\n\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies: whether rustc would codegen, for the drop-elaborated lints (the parent, `diagnostics-lints`, `lints.rs`; `diagnostics` for `Options` and the UI harness)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2490"
+    }
+  ]
+}

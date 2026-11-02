@@ -1,0 +1,46 @@
+{
+  "id": "00232",
+  "from_lane": "solver-sync-kinds",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty",
+    "crates/hir-ty-mir",
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-ty/src/lower/batch.rs",
+    "crates/hir-ty/src/lower/persist.rs",
+    "crates/hir-ty/src/consteval.rs",
+    "crates/hir-ty/src/opaques.rs",
+    "crates/hir-ty/src/builtin_derive.rs",
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty/src/next_solver/util.rs",
+    "v2/requests/items.md",
+    "v2/requests/codegen.md"
+  ],
+  "what": "## 8. Every `StoredEarlyBinder::bind` call site (added 2026-10-29 19:30)\n\nOwners (solver-sync, 19:45): \"solver-sync-callers\" below only means that child traced the site.\nThe code is lane db's (`crates/hir-ty` outside `next_solver/`, window `db-next2`), except\n`crates/hir-ty-mir` (codegen, window `codegen-next1`) and `next_solver/util.rs`\n(solver-sync-interner, done).\n\n`StoredEarlyBinder::bind(value)` is now `StoredEarlyBinder::bind(interner, value)` (see 5). At\neach site below:\n\n- old: `StoredEarlyBinder::bind(<value>)`\n- new: `StoredEarlyBinder::bind(<interner>, <value>)`\n\nwith `<interner>` as listed: `interner` is a binding already in scope; `ctx.interner` is the\n`TyLoweringContext`'s public field (read it before `ctx` moves into `from_ctx`, which argument\norder already does); `DbInterner::new_no_crate(db)` where only `db` is in scope (at\n`lower.rs:2214`, `:2278` and `batch.rs:333`, which already build one for `Ty::new_error`, bind\nit to `let interner` first and use it for both).\n\n- `crates/hir-ty/src/lower.rs:865`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:1660`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:1920`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2077`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2108`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2177`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2194`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2214`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2270`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2278`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2507`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2508`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:2903`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:3398`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:3519`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:3654`: `ctx.interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:3732`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower.rs:4097`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/lower/batch.rs:333`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/lower/batch.rs:373`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/lower/persist.rs:585`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower/persist.rs:588`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower/persist.rs:610`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower/persist.rs:633`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/lower/persist.rs:663`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/consteval.rs:388`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/opaques.rs:151`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/opaques.rs:193`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/opaques.rs:214`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/opaques.rs:222`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/builtin_derive.rs:206`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/builtin_derive.rs:228`: `interner` — solver-sync-callers\n- `crates/hir-ty/src/builtin_derive.rs:337`: `interner` — solver-sync-callers\n- `crates/hir-ty-mir/src/mir/lower.rs:4405`: `DbInterner::new_no_crate(db)` — solver-sync-callers\n- `crates/hir-ty/src/next_solver/util.rs:553`, `:577`: `interner` — solver-sync-interner (told).\n\nDifferent constructor:\n\n- `crates/hir-ty/src/lower.rs:2692`, `:2761` — solver-sync-callers:\n  - old: `StoredEarlyBinder::bind((assoc_type, args.store()))`\n  - new: `StoredEarlyBinder::bind_assoc_ty(interner, assoc_type, args.store())`\n- No interner exists at these three; their values have no rigid alias by construction (empty\n  clauses, or clauses read out of an `EarlyBinder`), so they use\n  `StoredEarlyBinder::bind_no_rigid_aliases(value)` (rustc's `EarlyBinder::bind_no_rigid_aliases`,\n  debug assert) — solver-sync-callers:\n  - `crates/hir-ty/src/lower.rs:3200` (`generic_predicates_cycle_result`, `_db`):\n    old `StoredEarlyBinder::bind(Clauses::empty().store())`,\n    new `StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store())`.\n  - `crates/hir-ty/src/lower.rs:3209` (`GenericPredicates::empty`, a `'static` with no db):\n    old `StoredEarlyBinder::bind(Clauses::default().store())`,\n    new `StoredEarlyBinder::bind_no_rigid_aliases(Clauses::default().store())`.\n  - `crates/hir-ty/src/builtin_derive.rs:246` (`explicit_own_predicates`, takes an\n    `EarlyBinder`): old `StoredEarlyBinder::bind(`, new `StoredEarlyBinder::bind_no_rigid_aliases(`.\n\nEvery type bound here is `TypeFoldable`/`TypeVisitable`: `StoredTy`, `StoredGenericArg`,\n`StoredConst` (`impl_foldable_for_stored_type!`), `StoredClauses` (`predicate.rs:283`),\n`StoredPolyFnSig` (binder.rs, by hand), `StoredTraitRef` (binder.rs, `#[derive(TypeVisitable,\nTypeFoldable)]`); the `(TypeAliasId, StoredGenericArgs)` pair goes through `bind_assoc_ty`.\n\n> forwarded to db (`crates/hir-ty` outside `next_solver/`) and codegen (`crates/hir-ty-mir`), as it says.\n> checked by db (db-next2, 2026-10-29 22:31): a scan of every `StoredEarlyBinder::bind(` in hir-ty, hir, borrowck and hir-ty-mir, multi-line calls included, finds one-argument calls only in items' `opaques.rs:159,200,221,230` (asked in `v2/requests/items.md`) and codegen's `hir-ty-mir/src/mir/lower.rs:4652` (asked in `v2/requests/codegen.md`). db's sites are all ported.",
+  "state": "applied",
+  "created": "2026-10-30T02:30:00Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#8. Every `StoredEarlyBinder::bind` call site (added 2026-10-29 19:30)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:143"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db (db-next2, 2026-10-29 22:31): a scan of every `StoredEarlyBinder::bind(` in hir-ty, hir, borrowck and hir-ty-mir, multi-line calls included, finds one-argument calls only in items' `opaques.rs:159,200,221,230` (asked in `v2/requests/items.md`) and codegen's `hir-ty-mir/src/mir/lower.rs:4652` (asked in `v2/requests/codegen.md`). db's sites are all ported."
+    }
+  ]
+}

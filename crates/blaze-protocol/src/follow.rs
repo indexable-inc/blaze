@@ -14,6 +14,7 @@ use crate::events::Record;
 
 /// The file the process `pid` that listens at `socket` says what it does in.
 pub fn beside(socket: &Path, pid: u32) -> PathBuf {
+    // alloc: once per process, at start.
     socket.with_file_name(format!("events.{pid}"))
 }
 
@@ -52,8 +53,10 @@ pub fn now_ns() -> u64 {
 #[derive(Default)]
 pub struct Follow {
     path: Option<PathBuf>,
+    /// `path`, open at `at`, from one read to the next: opened once, not once a read.
+    file: Option<File>,
     at: u64,
-    /// Bytes read of a frame not written in full yet.
+    /// Bytes read of a frame not written in full yet, kept from one read to the next.
     partial: Vec<u8>,
 }
 
@@ -62,38 +65,72 @@ impl Follow {
     /// was for the commands before.
     pub fn from_now(dir: &Path) -> Follow {
         let (path, at) = written_in(dir).map_or((None, 0), |(path, len)| (Some(path), len));
-        Follow { path, at, partial: Vec::new() }
+        Follow { path, at, ..Follow::default() }
     }
 
     /// The records written to `path`, which is `len` long, since the last read, and why each
     /// frame that is not a record is not. A file other than the last is read from its start,
     /// as a process started in another's place.
     pub fn read(&mut self, path: &Path, len: u64) -> Vec<Result<Record, crate::cbor::Error>> {
+        // alloc: the records are handed out; `read_into` fills a list the caller keeps.
+        let mut records = Vec::new();
+        self.read_into(path, len, &mut records);
+        records
+    }
+
+    /// [`Follow::read`] onto the end of `records`, a list the caller keeps.
+    pub fn read_into(
+        &mut self,
+        path: &Path,
+        len: u64,
+        records: &mut Vec<Result<Record, crate::cbor::Error>>,
+    ) {
         if self.path.as_deref() != Some(path) {
+            // alloc: once per file followed, a process started in another's place.
             self.path = Some(path.to_owned());
+            self.file = None;
             self.at = 0;
             self.partial.clear();
         }
         if len <= self.at {
-            return Vec::new();
+            return;
         }
-        let Ok(mut file) = File::open(path) else { return Vec::new() };
-        if file.seek(SeekFrom::Start(self.at)).is_err() {
-            return Vec::new();
+        let kept = self.partial.len();
+        // A file kept open that reads nothing when `path` says there is more is one deleted
+        // and made again at the path: it is opened again, once.
+        for fresh in [self.file.is_none(), true] {
+            if fresh {
+                self.file = None;
+                let Ok(mut file) = File::open(path) else { return };
+                if file.seek(SeekFrom::Start(self.at)).is_err() {
+                    return;
+                }
+                self.file = Some(file);
+            }
+            let Some(file) = &mut self.file else { return };
+            match file.read_to_end(&mut self.partial) {
+                Ok(0) if !fresh => continue,
+                Ok(read) => {
+                    self.at += read as u64;
+                    break;
+                }
+                Err(_) => {
+                    // Opened again at `at` next time, nothing of this read taken.
+                    self.file = None;
+                    self.partial.truncate(kept);
+                    return;
+                }
+            }
         }
-        let mut bytes = std::mem::take(&mut self.partial);
-        let Ok(read) = file.read_to_end(&mut bytes) else { return Vec::new() };
-        self.at += read as u64;
-        let mut records = Vec::new();
-        let mut rest = &bytes[..];
+        let mut rest = &self.partial[..];
         while rest.len() >= 4 {
             let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
             let Some(item) = rest.get(4..4 + len) else { break };
             records.push(crate::cbor::from_slice::<Record>(item));
             rest = &rest[4 + len..];
         }
-        self.partial = rest.to_vec();
-        records
+        let used = self.partial.len() - rest.len();
+        self.partial.drain(..used);
     }
 }
 
@@ -134,6 +171,43 @@ mod tests {
         let other = dir.join("events.2");
         std::fs::write(&other, &before).unwrap();
         assert_eq!(follow.read(&other, len(&other)).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The records written since the last read, read into a kept list from the file kept open,
+    /// allocate nothing; a file made again at the path is read from where the last one was.
+    #[test]
+    fn a_warm_read_allocates_nothing() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("blaze-events-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.1");
+        let record = crate::events::Record { at_ns: 5, event: Event::Ended { step: Step::Codegen, of: None } };
+        let mut ended = Vec::new();
+        crate::write_frame(&mut ended, &crate::cbor::to_vec(&record).unwrap()).unwrap();
+        std::fs::write(&path, &ended).unwrap();
+        let len = |path: &std::path::Path| std::fs::metadata(path).unwrap().len();
+        let mut follow = super::Follow::default();
+        let mut records = Vec::with_capacity(16);
+        follow.read_into(&path, len(&path), &mut records);
+        assert_eq!(records.len(), 1, "a new file is read from its start");
+        follow.partial.reserve(4096);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for _ in 0..8 {
+            file.write_all(&ended).unwrap();
+            let len = len(&path);
+            records.clear();
+            blaze_alloc_count::assert_at_most(0, "a warm read of the records written since", || {
+                follow.read_into(&path, len, &mut records)
+            });
+            assert!(matches!(records[..], [Ok(ref it)] if *it == record));
+        }
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, ended.repeat(12)).unwrap();
+        records.clear();
+        follow.read_into(&path, len(&path), &mut records);
+        assert_eq!(records.len(), 3, "read on from the ninth frame, as a file opened again is");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

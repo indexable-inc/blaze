@@ -1,0 +1,33 @@
+{
+  "id": "00369",
+  "from_lane": "fastcompile-stencil-diff-clif-simd",
+  "owner": "fastcompile",
+  "paths": [],
+  "what": "## 2. Two lanes own the same eight files\n\n- What: my brief (`briefs/v2/fastcompile-stencil-diff-clif-simd.md`) still gives me all 16\n  `simd-*.clif` files, but `fastcompile-stencil-diff-clif-simd2` was split off with\n  `simd-shuffle`, `simd-splat`, `simd-swizzle`, `simd-valltrue`, `simd-vanytrue`,\n  `simd-vhighbits`, `simd-widen` and `simd-extra`, and has already overwritten my\n  `simd-shuffle.clif`.\n- What I did: stopped writing those eight; they are `simd2`'s. My drafts of seven of them\n  (all but shuffle, which `simd2` replaced) are in\n  `/tmp/blaze-lanes/v2-fastcompile-stencil-diff-clif-simd-drafts/` for `simd2` to take from\n  or discard; the copies in the worktree will be overwritten as `simd2` reaches them.\n- Ask: correct my brief's ownership list to the first eight files, so the next reader of it\n  doesn't take the other eight back.\n\n> forwarded to fastcompile (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:38:07Z",
+  "updated": "2026-10-30T14:24:30Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/fastcompile-stencil-diff-clif-simd.md#2. Two lanes own the same eight files",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-stencil-diff-clif-simd.md:37"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:30Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "In the tree: ~/restart-2026-10-28/briefs/v2/fastcompile-stencil-diff-clif-simd.md now owns exactly the first eight simd-*.clif files (lines 4-9) and names the other eight as fastcompile-stencil-diff-clif-simd2's."
+    }
+  ]
+}

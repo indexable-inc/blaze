@@ -1,0 +1,37 @@
+{
+  "id": "01192",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/unresolved_import.rs",
+    "crates/blaze-diagnostics/src/lower/invalid_visibility.rs"
+  ],
+  "what": "01178 lowering: hir now has AnyDiagnostic::InvalidVisibility (E0433/E0577/E0742/2018 relative path); lower/mod.rs match is exhaustive so this must land this round. Exact code to apply as written (mod.rs 2 lines, unresolved_import.rs names_to_string pub(super) + visibility_segments + visibility_path_error, new lower/invalid_visibility.rs): /tmp/blaze-lanes/01178-blaze-diagnostics.md",
+  "state": "applied",
+  "created": "2026-10-31T00:01:05Z",
+  "updated": "2026-10-31T01:28:45Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:01:05Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "lower/invalid_visibility.rs, unresolved_import.rs helpers, lower/missing_prelude.rs + arms, as written; tests a_visibility_that_names_no_ancestor_module, a_crate_without_its_prelude_crate_is_e0463 (uncompiled)"
+    }
+  ]
+}

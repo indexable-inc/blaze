@@ -1,0 +1,23 @@
+{
+  "id": "00938",
+  "from_lane": "db",
+  "owner": "pure-scripts-models",
+  "paths": [
+    "crates/hir-ty-pure/src/tests.rs"
+  ],
+  "what": "hir-ty-pure: walk.rs, values.rs and identity.rs compile (check27 has no hir-ty-pure error; check26's one, values.rs:495, was fixed before it). lib.rs already has `mod identity; mod values; mod walk;` and `pub use walk::{main_of, script_purity};`. You can re-add `mod scripts;` in src/tests.rs; tests/scripts.rs is on disk.",
+  "state": "open",
+  "created": "2026-10-30T10:20:42Z",
+  "updated": "2026-10-30T10:20:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:20:42Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

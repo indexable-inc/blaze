@@ -197,25 +197,49 @@ fn type_bound(p: &mut Parser<'_>) -> bool {
     true
 }
 
+/// rustc's `parse_trait_bound_modifiers` and the path after them. The modifiers' names are
+/// rustc's `as_str`, for its `PolarityAndModifiers` error.
 fn path_type_bound(p: &mut Parser<'_>) -> Result<(), ()> {
-    if p.eat(T![~]) {
+    let constness = if p.eat(T![~]) {
         p.expect(T![const]);
+        "[const]"
     } else if p.eat(T!['[']) {
         // test maybe_const_trait_bound
         // const fn foo(_: impl [const] Trait) {}
         p.expect(T![const]);
         p.expect(T![']']);
-    } else {
+        "[const]"
+    } else if p.eat(T![const]) {
         // test const_trait_bound
         // const fn foo(_: impl const Trait) {}
-        p.eat(T![const]);
-    }
+        "const"
+    } else {
+        ""
+    };
     // test async_trait_bound
     // fn async_foo(_: impl async Fn(&i32)) {}
-    p.eat(T![async]);
+    let asyncness = if p.eat(T![async]) { "async" } else { "" };
     // test question_for_type_trait_bound
     // fn f<T>() where T: for<> ?Sized {}
-    p.eat(T![?]);
+
+    // test negative_trait_bound
+    // fn f<T: !Copy>() where T: ?Sized + !Send {}
+    let polarity = if p.eat(T![?]) {
+        "?"
+    } else if p.eat(T![!]) {
+        "!"
+    } else {
+        ""
+    };
+    // test_err polarity_and_modifiers_trait_bound
+    // fn f<T: const ?Sized, U: [const] async !Trait, V: async ?Sized>() {}
+    if !polarity.is_empty() && !(constness.is_empty() && asyncness.is_empty()) {
+        let glue = if !constness.is_empty() && !asyncness.is_empty() { " " } else { "" };
+        // alloc: error path only, rustc's formatted `PolarityAndModifiers` message
+        p.error(format!(
+            "`{constness}{glue}{asyncness}` trait not allowed with `{polarity}` trait polarity modifier"
+        ));
+    }
 
     // test_err invalid_question_for_type_trait_bound
     // fn f<T>() where T: ?for<> Sized {}

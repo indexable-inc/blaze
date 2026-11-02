@@ -1,19 +1,4 @@
 {
- "corpus": {
-  "apply_ms": 0.70425,
-  "cargo_ms": 152.18544006347656,
-  "codegen_ms": 23.0,
-  "cold": {
-   "codegen_ms": 2900.0,
-   "load_ms": 264.1
-  },
-  "compiled": 65,
-  "first_edit_ms": 57.9,
-  "functions": 88,
-  "link_ms": 27.65,
-  "rss_mb": 533,
-  "total_ms": 52.05
- },
  "httparse": {
   "apply_ms": 1.9,
   "cargo_ms": 404.60026264190674,

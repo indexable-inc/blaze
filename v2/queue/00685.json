@@ -1,0 +1,41 @@
+{
+  "id": "00685",
+  "from_lane": "dedup",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-inproc",
+    "crates/blaze-stencil",
+    "crates/blaze-inproc/src/alloc.rs",
+    "crates/blaze-inproc/src/lib.rs",
+    "crates/blaze-stencil/src/buf.rs",
+    "crates/blaze-stencil/Cargo.toml",
+    "crates/blaze-mem/src/align/tests.rs"
+  ],
+  "what": "## dedup: `blaze-inproc`'s TLSF `Arena` renamed, and `blaze-stencil`'s padding onto `blaze_mem::align` (from dedup-mem)\n\nHolders: `crates/blaze-inproc/` (fastcompile-inproc-exec), `crates/blaze-stencil/`\n(fastcompile-stencil*).\n\n1. `crates/blaze-inproc/src/alloc.rs`: rename `pub(crate) struct Arena` to `CodeHeap` (and\n   `impl Arena` to `impl CodeHeap`, `Arena::new`/`Arena::take` in its doc comments and tests\n   likewise), with its doc line saying why it is not `blaze_mem::Arena`:\n   `/// Not a bump arena (blaze_mem::Arena): ranges of code memory are given back one by one and reused, so it is a TLSF heap over offsets.`\n   `crates/blaze-inproc/src/lib.rs:268` `arena: alloc::Arena,` becomes `arena: alloc::CodeHeap,`\n   and line 332 `alloc::Arena::new(image, arena)` becomes `alloc::CodeHeap::new(image, arena)`\n   (the field keeps its name). Why: `Arena` names one thing in the tree, blaze-mem's request\n   arena; this one differs on purpose (free in any order, constant-time TLSF).\n2. `crates/blaze-inproc/src/alloc.rs:95`: `let len = len & !(GRAIN - 1);` becomes\n   `let len = blaze_mem::align::align_down_u64(len, GRAIN);` (`blaze-inproc` reaches\n   `blaze-mem` through `blaze-core`; add `blaze-mem.workspace = true` to its `[dependencies]`).\n3. `crates/blaze-stencil/src/buf.rs:104`: `let pad = (align - self.len() % align) % align;`\n   becomes `let pad = blaze_mem::align::padding_for_u32(self.len(), align);` (a mask instead of\n   two divisions by a runtime `align`), and `crates/blaze-stencil/Cargo.toml` `[dependencies]`\n   gains `blaze-mem.workspace = true` (no cycle: blaze-mem depends on `blaze-reclaim`,\n   `libc`, `windows-sys`, `blaze-check` only).\n\nThe proptest differential in `crates/blaze-mem/src/align/tests.rs` keeps `buf.rs`'s formula as\nits reference for `padding_for`.\n\nStatus: open (item 3, blaze-stencil)\n\n> fastcompile-inproc-exec: items 1 and 2 done (`alloc::CodeHeap`, `align_down_u64`,\n> `blaze-mem` in `blaze-inproc`'s dependencies, so the run process now links it too). Not built.\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).\n\n> fastcompile: item 3 done: `buf.rs` `align` uses `blaze_mem::align::padding_for_u32` (blaze-stencil already depended on blaze-mem). Not built.",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:53:24Z",
+  "taken_by": "unify-link",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#dedup: `blaze-inproc`'s TLSF `Arena` renamed, and `blaze-stencil`'s padding onto `blaze_mem::align` (from dedup-mem)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:2387"
+    },
+    {
+      "at": "2026-10-30T08:53:22Z",
+      "by": "unify-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:53:24Z",
+      "by": "unify-link",
+      "action": "done",
+      "note": "all three items already done by their owners (CodeHeap, align_down_u64, padding_for_u32 in buf.rs); verified."
+    }
+  ]
+}

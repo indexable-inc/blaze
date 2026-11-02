@@ -1,0 +1,35 @@
+{
+  "id": "01287",
+  "from_lane": "builder-2",
+  "owner": "no-fallback-link-cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve.rs"
+  ],
+  "what": "When the daemon panics while serving a build, the blaze client exits 101 and prints nothing (hello6: the panic was only in b2-home-6/v2/serve.log). Print the daemon's panic message and where (or the path of serve.log with its last lines) before exiting, as an error naming the request.",
+  "state": "applied",
+  "created": "2026-10-31T14:40:10Z",
+  "updated": "2026-10-31T14:47:15Z",
+  "taken_by": "cargo",
+  "why": "Part 3 of 01268. no-fallback: a failure must stop with an error naming what and where, not a bare exit code.",
+  "source": "coordinator",
+  "history": [
+    {
+      "at": "2026-10-31T14:40:10Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Split from 01268 (builder-2 hello6)."
+    },
+    {
+      "at": "2026-10-31T14:40:42Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:47:15Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "a task panic is plane::Panic (message, thread and file:line:col from a hook serve installs); a units-stage panic fails the job with an ApiError naming the unit (job.rs panicked); other stages already carry it as why. Edits only: plane.rs, job.rs, serve.rs; test in plane.rs."
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use blaze_hash::HashMap;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
@@ -18,7 +19,6 @@ use blaze_resolve::{
     Dependency, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform, Resolve,
     ResolveVersion, SourceId, Summary,
 };
-use rustc_hash::FxHashMap;
 use url::Url;
 
 fn path_source(dir: &str) -> SourceId {
@@ -66,7 +66,7 @@ fn resolve(
     patch: &[(Url, Vec<Patch>)],
     lock: Option<&str>,
 ) -> Resolve {
-    let path_packages: FxHashMap<SourceId, Summary> = members
+    let path_packages: HashMap<SourceId, Summary> = members
         .iter()
         .copied()
         .chain(packages)
@@ -92,6 +92,7 @@ fn resolve(
         version_ordering: VersionOrdering::MaximumVersionsFirst,
         rust_versions: None,
         resolve_version: ResolveVersion::default(),
+        offline_flag: None,
     };
     let registry: MemRegistry = members.iter().copied().chain(packages).cloned().collect();
     let specs: Vec<PackageIdSpec> = members.iter().map(|m| m.package_id().to_spec()).collect();

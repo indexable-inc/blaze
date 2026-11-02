@@ -30,7 +30,7 @@ parent is the snapshot before it: the branch upstream/library on origin is upstr
 library, one commit a nightly, and the base of every merge.
 
 The JSON is inline, a file's path, or `-` for stdin. Downloads are kept in ~/.cache/blaze-library.
-Python 3.11+, stdlib and git.
+Python 3.11+, stdlib, git and b3sum (BLAKE3's tool, for library/DIGEST).
 """
 import hashlib, io, json, os, re, shutil, stat, subprocess, sys, tarfile, tempfile, tomllib, typing
 import urllib.error, urllib.request
@@ -132,6 +132,21 @@ class Upstream:
         return Upstream(lines["nightly"], lines["commit"], lines["rustc"], url, sha256)
 
 
+# UPSTREAM from this line on is blaze's list of its changes to library/, kept through every rewrite.
+NOTES = "# blaze's changes to library/"
+
+
+def write_upstream(upstream):
+    """UPSTREAM for `upstream`, with the notes of the file it replaces."""
+    notes = ""
+    if os.path.isfile(UPSTREAM):
+        old = open(UPSTREAM).read()
+        at = old.find("\n" + NOTES)
+        if at >= 0:
+            notes = "#\n" + old[at + 1:]
+    open(UPSTREAM, "w").write(upstream.text() + notes)
+
+
 def of_nightly(date):
     """The standard library of the nightly of `date`, from its channel manifest."""
     manifest = tomllib.loads(get(f"{DIST}/{date}/channel-rust-nightly.toml").decode())
@@ -197,17 +212,52 @@ def files(root):
     return found
 
 
+def b3sum(args, data=None):
+    """`b3sum`'s output for `args`, BLAKE3's own tool (SIMD, threads): blaze's hashes of its own
+    data are BLAKE3, and Python's hashlib has none."""
+    if shutil.which("b3sum") is None:
+        sys.exit("library.py: no `b3sum` on PATH: library/DIGEST is a BLAKE3 hash, which b3sum "
+                 "(the `b3sum` package of nixpkgs, Homebrew and Debian) computes")
+    done = subprocess.run(["b3sum", "--no-names", *args], input=data, capture_output=True)
+    if done.returncode:
+        sys.exit(f"library.py: b3sum {' '.join(args[:3])}...: {done.stderr.decode()}")
+    return done.stdout.decode().split()
+
+
+def b3_of_files(paths):
+    """The BLAKE3 hash, in hex, of each file of `paths`, in their order: 512 files a process."""
+    hashes = []
+    for at in range(0, len(paths), 512):
+        batch = paths[at:at + 512]
+        got = b3sum(["--", *batch])
+        if len(got) != len(batch):
+            sys.exit(f"library.py: b3sum gave {len(got)} hashes for {len(batch)} files")
+        hashes += got
+    return hashes
+
+
 def digest_of(root):
-    """The digest of the library at `root`: the sha256 of a line per file and link under it but
-    DIGEST, in the order of their paths' bytes, each `<kind> <sha256 of its bytes, or of where a
-    link points> <path>`, kind `file` or `link` (as crates/blaze-cargo's toolchain/library.rs
+    """The digest of the library at `root`: the BLAKE3 hash of a line per file and link under it
+    but DIGEST, in the order of their paths' bytes, each `<kind> <BLAKE3 of its bytes, or of where
+    a link points> <path>`, kind `file` or `link` (as crates/blaze-cargo's toolchain/library.rs
     computes it). Whether a file is executable is not in it: Windows does not say."""
+    found = []
+    for dir, subdirs, names in os.walk(root):
+        for name in names + [d for d in subdirs if os.path.islink(os.path.join(dir, d))]:
+            full = os.path.join(dir, name)
+            path = os.path.relpath(full, root).replace(os.sep, "/")
+            if path != "DIGEST":
+                found.append((path.encode(), path, full))
+    found.sort()
+    plain = [full for _, _, full in found if not os.path.islink(full)]
+    hashes = dict(zip(plain, b3_of_files(plain)))
     lines = []
-    for path, (kind, data) in sorted(files(root).items(), key=lambda it: it[0].encode()):
-        if path != "DIGEST":
-            kind = "link" if kind == "link" else "file"
-            lines.append(f"{kind} {hashlib.sha256(data).hexdigest()} {path}\n")
-    return hashlib.sha256("".join(lines).encode()).hexdigest()
+    for _, path, full in found:
+        if os.path.islink(full):
+            lines.append(f"link {b3sum([], os.readlink(full).encode())[0]} {path}\n")
+        else:
+            lines.append(f"file {hashes[full]} {path}\n")
+    return b3sum([], "".join(lines).encode())[0]
 
 
 def write_digest():
@@ -232,7 +282,7 @@ def do_import(args):
         shutil.move(fresh, LIBRARY)
     for name, data in kept.items():
         open(os.path.join(LIBRARY, name), "wb").write(data)
-    open(UPSTREAM, "w").write(upstream.text())
+    write_upstream(upstream)
     digest = write_digest()
     print(f"library/ is the standard library of {upstream.nightly} (rust-lang/rust {upstream.commit[:9]}), digest {digest[:12]}")
 
@@ -321,7 +371,7 @@ def do_merge(args):
     new = of_nightly(args.date or pinned_date())
     if new.commit == old.commit:
         print(f"library/ is already {new.nightly}'s ({new.commit[:9]})")
-        open(UPSTREAM, "w").write(new.text())
+        write_upstream(new)
         snapshot(new)
         write_digest()
         return
@@ -340,7 +390,7 @@ def do_merge(args):
                 f"changes to the standard library in: {', '.join(conflicted) or '(see below)'}. "
                 f"Resolve the conflict markers there, `git add` them and finish the bump; upstream's whole "
                 f"change is `git diff {base[:12]} {theirs[:12]}`. git apply said:\n{applied.stderr.decode()[-3000:]}")
-    open(UPSTREAM, "w").write(new.text())
+    write_upstream(new)
     write_digest()
     print(f"library/ merged {old.nightly} ({old.commit[:9]}) -> {new.nightly} ({new.commit[:9]}); "
           f"upstream/library is {theirs[:12]}: `git push origin upstream/library`")

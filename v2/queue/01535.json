@@ -1,0 +1,36 @@
+{
+  "id": "01535",
+  "from_lane": "no-fallback-front",
+  "owner": "tests-diag",
+  "paths": [
+    "crates/blaze-diagnostics/src/checks/names.rs",
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "False E0433 in the clippy baseline (clippy-baseline-1310.log:3968): blaze-core threads.rs:394, a record field `/// doc` + `#[cfg(target_os = \"linux\")] spare: Vec<Arc<linux::Control>>` checked on macOS, beside a same-named `#[cfg(target_os = \"macos\")] spare` twin. hir-def is right: lower_fields drops the field (InactiveCode), and `mod linux` is correctly out, hence the E0433. The error comes from blaze-diagnostics checks/names.rs walk(), which walks signature syntax and skips a subtree only when Cx::cfg_enabled(node) (cx.rs:191) says so: cfg_enabled returns true unless the node first child is an ATTR, then reads expand_cfg_attr_view. Only this field fails in the log, and it is the one with a doc comment before its #[cfg] and a twin of the same name; check how view syntax places a doc comment before an attribute in a RECORD_FIELD (first_child) and whether the twin confuses the signature walk. A test: struct S { /// doc\n #[cfg(any())] f: missing::T, f: u8 } gives no E0433. Fix the walk to use the cfg result hir-def already computed (the InactiveCode set) rather than a second evaluation. Please route to the blaze-diagnostics names owner. Not seen under blaze build likely because its blaze-core check was cached; the clippy unit key differs, so it ran fresh.",
+  "state": "applied",
+  "created": "2026-11-01T21:16:51Z",
+  "updated": "2026-11-01T22:59:33Z",
+  "taken_by": "tests-diag",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T21:16:51Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T22:57:34Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coord-1030 -> tests-diag: blaze-diagnostics checks/names.rs walk() re-evaluates cfg on a doc-commented #[cfg] field (blaze-core threads.rs:394); tests-diag owns blaze-diagnostics"
+    },
+    {
+      "at": "2026-11-01T22:59:33Z",
+      "by": "tests-diag",
+      "action": "done",
+      "note": "blaze-diagnostics cx.rs cfg_enabled: the fast path took a node whose first child is not an ATTR as having no attribute, but in view syntax a doc comment is a DOC_COMMENT node of its own, so a /// before #[cfg] skipped the cfg (the twin plays no part). Now it tests view::AnyAttr::can_cast, as hir-def expr_store/lower.rs:4419 does. Test: tests::items::names::a_field_a_cfg_removes_after_its_doc_comment_is_not_resolved. Unbuilt."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "id": "01102",
+  "from_lane": "coord-1030",
+  "owner": "no-fallback-link-cargo-units",
+  "paths": [
+    "crates/blaze-units/"
+  ],
+  "what": "Main #1519 (dep-keys: a dependency is named by what it is built with: features, build-script cfgs, env vars and files it read) was in the deleted blaze-engine content.rs. Audit that v2 unit keys (blaze-units) and item hashes cover a dependency features, build-script cfgs/env/written files; harness/depkeys.py (merged) tests it. Also #1546 (a late include! of a proc macro OUT_DIR file must not restart warm builds) should be moot in v2; verify.",
+  "state": "applied",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-31T14:44:48Z",
+  "taken_by": "no-fallback-link-cargo-units",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from cargo (no live window) to no-fallback-link-cargo-units, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:13Z",
+      "by": "no-fallback-link-cargo-units",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:44:48Z",
+      "by": "no-fallback-link-cargo-units",
+      "action": "done",
+      "note": "Audited, no gap, no edit. Record key (blaze-cargo serve/unit/compile.rs work_out_key) = blaze-lower Lowered::identity (lib.rs identity_of: Crate::content [base-db input.rs content_of: cfg_options incl. feature cfgs and applied rustc-cfgs, Env incl. applied rustc-env and OUT_DIR], the source root content [trie of (path, file content id); Lowered::ran puts the run OUT_DIR files into the package source root], process env, each dep identity) + CBOR of Unit (features) + plan + run env. A dependent therefore gets a new key when a dep feature/cfg/env/generated file changes. Item hashes: blaze-item-hash crate_inputs -> blaze-items key::crate_key hashes every cfg atom; env!/include!/include_str!/include_bytes! expand to literals of the real values/bytes (hir-expand builtin/fn_macro.rs:1198-1350), hashed with each body own HIR. Script reads: blaze_usercode run key traces them, so a changed read reruns the script and its output feeds the above. #1546 moot in v2: a run OUT_DIR is applied by UnitWriter::apply only when no task reads the front end (Arc::get_mut, waits, never cancels), and graph::Waits holds a unit identity until every run of its closure is applied; no settle/interrupt/touch-all path exists in serve/ or blaze-lower. harness/depkeys.py is the end-to-end test; coordinator runs it."
+    }
+  ]
+}

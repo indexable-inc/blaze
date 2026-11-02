@@ -1,0 +1,25 @@
+[package]
+name = "blaze-hash"
+description = "blaze v2's in-memory hashing: maps and sets on foldhash with a fixed seed, and the identity hasher for keys that are hashes already"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+foldhash.workspace = true
+papaya.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+{
+  "id": "01478",
+  "from_lane": "repro",
+  "owner": "tests-diag",
+  "paths": [
+    "crates/blaze-diagnostics/src/checks/names"
+  ],
+  "what": "The names check of a local (path) crate resolves paths in cfg-disabled code: an enum variant and a macro match arm under #[cfg(feature = \"big\")] that is off give E0433 cannot find module `big` (vendored object 0.39.1 as a path crate: 104 E0433 in read/any.rs on its #[cfg(feature = \"elf\")] variants). Registry crates are not name-checked, so they pass. Test: blaze-engine tests/repro.rs a_crate_with_cfg_disabled_variants_builds (std-only, expects 1). Same check as the macro-file Self E0411 you hold.",
+  "state": "applied",
+  "created": "2026-11-01T07:56:52Z",
+  "updated": "2026-11-01T08:18:38Z",
+  "taken_by": "tests-diag",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:56:52Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T08:15:03Z",
+      "by": "tests-diag",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T08:18:38Z",
+      "by": "tests-diag",
+      "action": "done",
+      "note": "Unbuilt. blaze-diagnostics checks/names.rs walk skips any subtree its cfgs remove (variant, field, param, generic param) via new Cx::cfg_enabled (cx.rs), which replaces the three copies in conflicts.rs, dead/defs.rs and names/items/walk.rs. Test tests::items::names::a_signatures_parts_its_cfgs_remove_are_not_resolved. The match-arm case is in a body: hir-def lower.rs:1804 already drops cfg-off arms, so the variant was the whole cause. Should make blaze-engine repro a_crate_with_cfg_disabled_variants_builds pass."
+    }
+  ]
+}

@@ -18,7 +18,7 @@ nightly = []
 randomize = []
 
 [dependencies]
-bitflags = "2.4.1"
-rustc_hashes = { version = "0.166.0", package = "ra-ap-rustc_hashes" }
-rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
-tracing = "0.1"
+bitflags.workspace = true
+rustc_hashes.workspace = true
+rustc_index.workspace = true
+tracing = { workspace = true, features = ["default"] }

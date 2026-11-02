@@ -16,15 +16,6 @@ pub(crate) enum Attr {
     Bold,
 }
 
-pub(crate) trait Terminal: Write {
-    type Output: Write;
-
-    fn fg(&mut self, color: color::Color) -> io::Result<()>;
-    fn reset(&mut self) -> io::Result<()>;
-    fn supports_color(&self) -> bool;
-    fn supports_attr(&self, attr: Attr) -> bool;
-}
-
 pub(crate) struct AnsiTerminal<T: Write> {
     out: T,
 }
@@ -39,22 +30,20 @@ impl<T: Write> Write for AnsiTerminal<T> {
     }
 }
 
-impl<T: Write> Terminal for AnsiTerminal<T> {
-    type Output = T;
-
-    fn fg(&mut self, color: color::Color) -> io::Result<()> {
+impl<T: Write> AnsiTerminal<T> {
+    pub(crate) fn fg(&mut self, color: color::Color) -> io::Result<()> {
         write!(self.out, "\x1b[3{color}m")
     }
 
-    fn reset(&mut self) -> io::Result<()> {
+    pub(crate) fn reset(&mut self) -> io::Result<()> {
         write!(self.out, "\x1b[0m")
     }
 
-    fn supports_color(&self) -> bool {
+    pub(crate) fn supports_color(&self) -> bool {
         true
     }
 
-    fn supports_attr(&self, attr: Attr) -> bool {
+    pub(crate) fn supports_attr(&self, attr: Attr) -> bool {
         match attr {
             Attr::Bold => true,
         }
@@ -65,14 +54,28 @@ fn colour_allowed() -> bool {
     std::env::var_os("TERM").is_some_and(|term| term != "dumb")
 }
 
-pub(crate) fn stdout() -> Option<Box<dyn Terminal<Output = io::Stdout>>> {
+pub(crate) fn stdout() -> Option<AnsiTerminal<io::Stdout>> {
     let out = io::stdout();
-    (colour_allowed() && out.is_terminal())
-        .then(|| Box::new(AnsiTerminal { out }) as Box<dyn Terminal<Output = io::Stdout>>)
+    (colour_allowed() && out.is_terminal()).then(|| AnsiTerminal { out })
 }
 
-pub(crate) fn stderr() -> Option<Box<dyn Terminal<Output = io::Stderr>>> {
+pub(crate) fn stderr() -> Option<AnsiTerminal<io::Stderr>> {
     let out = io::stderr();
-    (colour_allowed() && out.is_terminal())
-        .then(|| Box::new(AnsiTerminal { out }) as Box<dyn Terminal<Output = io::Stderr>>)
+    (colour_allowed() && out.is_terminal()).then(|| AnsiTerminal { out })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colours_are_ansi_escapes_around_the_text() {
+        let mut t = AnsiTerminal { out: Vec::new() };
+        assert!(t.supports_color() && t.supports_attr(Attr::Bold));
+        t.fg(color::GREEN).unwrap();
+        write!(t, "+a").unwrap();
+        t.reset().unwrap();
+        t.fg(color::RED).unwrap();
+        assert_eq!(t.out, b"\x1b[32m+a\x1b[0m\x1b[31m");
+    }
 }

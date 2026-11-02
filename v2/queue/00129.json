@@ -1,0 +1,21 @@
+{
+  "id": "00129",
+  "from_lane": "usercode-concurrency",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## 5. core-plane: park a task that waits on another's work\n\nTwo waits remain blocking a worker, as no task can park on the plane yet:\n\n- `blaze-macro-wasm`: a module that keeps state between calls runs one expansion at a time\n  per `(database, crate)`, in order; a second waits on a `Condvar` until the first gives the\n  session back. No lock is held while one runs.\n- `proc-macro-api`: an expansion waits for its server's reply on the connection it claimed\n  (and its sub-requests are answered on the same thread).\n\nWhen the plane can park a task on an event and resume it, both become parks.\n\n> forwarded to coordinator: core-plane is DONE and this is new plane work for a lane the coordinator names (in its list in `/tmp/blaze-lanes/v2-requests.md`).",
+  "state": "open",
+  "created": "2026-10-30T01:14:30Z",
+  "updated": "2026-10-30T01:14:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-concurrency.md#5. core-plane: park a task that waits on another's work",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-concurrency.md:101"
+    }
+  ]
+}

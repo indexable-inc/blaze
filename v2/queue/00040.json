@@ -1,0 +1,35 @@
+{
+  "id": "00040",
+  "from_lane": "items-form",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/mir.rs"
+  ],
+  "what": "## items-form: `VTableMap::tys` (`crates/hir-ty/src/mir.rs`)\n\nApplied by speed-types (2026-10-29). `form.rs` `Cx::allocation` now reads `map.vtable.tys()`;\nthe `facts.rs` half of speed-types' note below is items-facts'.\n\nWhat: a public iterator over a vtable map's types in id order:\n\n```rust\nimpl<'db> VTableMap<'db> {\n    /// The types of the vtables, in the order of their ids.\n    pub fn tys(&self) -> impl ExactSizeIterator<Item = Ty<'db>> + '_ {\n        self.id_to_ty.iter().copied()\n    }\n}\n```\n\nWhy: `form.rs` (`Cx::allocation`) spells a constant's vtables. `OFFSET` and `id_to_ty` are\nprivate, so it finds the first id `ty(id)` accepts by counting up from 0 and then reads on\nuntil one fails. That is correct but leans on how ids are laid out, and it costs about 1000\nfailed `ty` calls (each building a `MirEvalError`) per constant that holds a vtable, in every\nform that spells one. With `tys` it is one line and no wasted work. Read-only, no behavior\nchange.\n\n> forwarded to db: `crates/hir-ty/src/mir.rs` is db's (db-ty).\n> checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/mir.rs:2172` (`VTableMap::tys`), as speed-types' line above says.",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T09:56:49Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/items.md#items-form: `VTableMap::tys` (`crates/hir-ty/src/mir.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:34"
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:39): in the tree at `crates/hir-ty/src/mir.rs:2172` (`VTableMap::tys`), as speed-types' line above says."
+    }
+  ]
+}

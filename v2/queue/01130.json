@@ -1,0 +1,35 @@
+{
+  "id": "01130",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R12 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md) (macros): `#[derive(blaze_query::Value)]` needs the fork's field helper `#[salsa_value(unsafe(prove(P: Value)))]` as `#[value(unsafe(prove(..)))]`: hir-ty method_resolution.rs:1339,1536,1793 (SimplifiedType<'db> fields).",
+  "state": "applied",
+  "created": "2026-10-30T21:59:11Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:11Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: #[value(unsafe(prove(..)))] already there."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00634",
+  "from_lane": "dedup",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/mir/held.rs"
+  ],
+  "what": "## dedup: bits: hir-ty `mir/held.rs` off `rustc_index::DenseBitSet` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)\n\nFrom `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.\n\nWhy: `held.rs`'s `Set` is a local analysis set, not a type of a rustc interface, so it is the one\nbit set `blaze_ids::bits::BitSet` (the `DenseBitSet`s that stay in hir-ty are\n`UnsizingParams`, rustc_type_ir's `Interner::UnsizingParams` target, and `layout.rs`'s\n`BitMatrix`, the argument of rustc_abi's `layout_of_coroutine`). Same members and results:\nevery set of one analysis is made with the same size, so equality (`live_in[..] != state`) is\nunchanged. One check is weaker: `DenseBitSet::insert` asserts the bit is below the domain size,\n`BitSet::insert` only below the word capacity (the next multiple of 64); every index here is a\nlocal of the body, below `count`. `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n\n### `crates/hir-ty/src/mir/held.rs`\n\nBefore:\n\n```rust\nuse rustc_index::bit_set::DenseBitSet;\nuse smallvec::SmallVec;\n```\n\nAfter:\n\n```rust\nuse blaze_ids::bits::BitSet;\nuse smallvec::SmallVec;\n```\n\nBefore:\n\n```rust\ntype Set = DenseBitSet<usize>;\n```\n\nAfter:\n\n```rust\ntype Set = BitSet;\n```\n\nRenames, every occurrence in the file (tests included):\n\n- `Set::new_empty(` becomes `Set::new(` (18 places);\n- `Set::new_filled(` becomes `Set::filled(` (1 place, `always_storage_live`);\n- `.union(` becomes `.union_with(` (8 places: lines about 231, 244, 362, 425, 432, 438, 541,\n  653; every one is on a `Set`, and line 362's `changed |= known.union_with(new)` keeps its\n  `bool`);\n- `.intersect(` becomes `.intersect_with(` (4 places: about 232, 534, 647, 651).\n\nIn the tests' `model`, before:\n\n```rust\n        let count = held.domain_size();\n```\n\nAfter (`together` is indexed by locals, all below it):\n\n```rust\n        let count = held.capacity();\n```\n\n`insert`, `remove`, `contains`, `clear`, `clone_from`, `clone`, `iter` and `!=` keep their\nmeaning.\n\nStatus: open\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> not applied by db-mem-infer-b-eval (21:17): overtaken. mem-db-infer-eval.md H1 (applied) makes `held.rs`'s `Set` a frame-slice set of its own (`Set<'f>(&'f mut [u64])`), so the file no longer uses `DenseBitSet` (only its tests, as the reference model); a `BitSet` would put each set's words back on the global heap.\n> not applied by db-audit-dbmd-e (22:32): overtaken, confirmed: `crates/hir-ty/src/mir/held.rs:96` is `struct Set<'f>(&'f mut [u64])` on frame words; `DenseBitSet` is left only in the tests' reference model (`:802-908`).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:57:33Z",
+  "taken_by": "unify-front-ty",
+  "why": null,
+  "source": "v2/requests/db.md#dedup: bits: hir-ty `mir/held.rs` off `rustc_index::DenseBitSet` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:6436"
+    },
+    {
+      "at": "2026-10-30T08:55:10Z",
+      "by": "unify-front-ty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:57:33Z",
+      "by": "unify-front-ty",
+      "action": "done",
+      "note": "applied adapted: held.rs had since moved to a frame-slice Set<f>(&mut [u64]) of its own (a second copy of the bit-set ops). It is now type Set<f> = blaze_ids::bits::BitSliceMut<f> (the shared Bits over frame words, so no heap per set); frame constructors empty_in/filled_in/copy_in; local bits() iterator, fill_to and the Set impl/PartialEq deleted (Ones::new, insert_range, Bits PartialEq); union->union_with, intersect->intersect_with; tests keep DenseBitSet as the reference model."
+    }
+  ]
+}

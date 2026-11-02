@@ -36,7 +36,7 @@
         # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
         # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
         # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
-        # crates/hir-ty-codegen/build.rs links it statically and refuses any other. Its tools were
+        # vendor/llvm-sys links it statically, and its build script (pin.rs) refuses any other. Its tools were
         # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
         # store's libc.
         llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);
@@ -58,7 +58,7 @@
         # The Python workspace uses Nix's pinned interpreter on NixOS, where uv's downloaded
         # interpreters cannot run. uv itself comes from the same flake.lock as the toolchain.
         scripts = {
-          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs ];
+          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs pkgs.b3sum ];
           UV_PYTHON = "${pkgs.python313}/bin/python3";
           UV_PYTHON_DOWNLOADS = "never";
         };
@@ -143,19 +143,27 @@
             mkdir -p $out/bin $out/share/blaze
             cp shipped/* $out/bin/
             # The standard library's source, which blaze finds above its programs
-            # (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+            # (crates/blaze-cargo/src/toolchain/library.rs).
             cp -r library $out/share/blaze/library
             runHook postInstall
           '';
         });
-        # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
+        # `nix run .#duckdb`: the DuckDB `blaze debug sql`, `blaze explain` and the explorer run,
+        # nixpkgs' at the locked rev, parquet built in, so nothing downloads. Pinned: a nixpkgs
+        # bump that changes it stops here, a visible change.
+        duckdb =
+          assert pkgs.duckdb.version == "1.5.5";
+          pkgs.duckdb;
+        # What `nix profile install` puts on PATH: the same binaries, with the toolchain, and
+        # BLAZE_DUCKDB naming that DuckDB (blaze never looks for one on PATH).
         daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta.mainProgram = "blaze";
         } ''
           mkdir -p $out/bin
           for bin in ${dist}/bin/*; do
-            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin
+            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin \
+              --set BLAZE_DUCKDB ${duckdb}/bin/duckdb
           done
         '';
         # `blaze` with the toolchain and the other programs first on PATH.
@@ -201,11 +209,40 @@
             --prefix LD_LIBRARY_PATH : ${libPath}
         '';
 
-        # The demo's own source (and the crate it links), copied to a writable directory at run
-        # time; its crates.io dependencies are vendored from Cargo.lock so that needs no network.
+        # The demo's own source and the crates it links (blaze-live, the run side of blaze-inproc
+        # it takes patches through, and blaze-api, which its editor sends edits to the daemon
+        # with), with the root manifest their `workspace = true` fields come from, copied to a
+        # writable directory at run time; its crates.io dependencies are vendored from Cargo.lock
+        # so that needs no network.
         lifeSource = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [ ./demo/life ./crates/blaze-live ];
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./demo/life
+            ./crates/blaze-api
+            ./crates/blaze-bytes
+            ./crates/blaze-check
+            ./crates/blaze-core
+            ./crates/blaze-format
+            ./crates/blaze-graph
+            ./crates/blaze-ids
+            ./crates/blaze-image
+            ./crates/blaze-inproc
+            ./crates/blaze-live
+            ./crates/blaze-mem
+            ./crates/blaze-phf
+            ./crates/blaze-protocol
+            ./crates/blaze-query
+            ./crates/blaze-query-macros
+            ./crates/blaze-radix
+            ./crates/blaze-reclaim
+            ./crates/blaze-rng
+            ./crates/blaze-sha256
+            ./crates/blaze-vfs
+            ./crates/intern
+            ./crates/stdx
+            ./vendor/blake3-servil
+          ];
         };
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };
         # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the
@@ -223,7 +260,7 @@
           # `blaze build` works. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          inherit dist daemon run life daemon-units life-bin;
+          inherit dist daemon run life daemon-units life-bin duckdb;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
@@ -241,6 +278,10 @@
           type = "app";
           program = "${run}/bin/blaze";
         };
+        apps.duckdb = {
+          type = "app";
+          program = "${duckdb}/bin/duckdb";
+        };
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
         # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
@@ -257,8 +298,8 @@
           # this the binary finds neither the store's glibc nor its libgcc_s when it runs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-Clinker-features=-lld";
         });
-        # What builds, runs and inspects wasm32 programs (harness/wasm32.py, the train's wasm32
-        # job): wasmtime for wasm32-wasip1 and `--invoke` of a library's exports,
+        # What builds, runs and inspects wasm32 programs: wasmtime for wasm32-wasip1 and
+        # `--invoke` of a library's exports,
         # wasm-tools where the harnesses read objects, wasm-bindgen and node for web guests. The
         # targets are rustup's: `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.
         devShells.wasm = pkgs.mkShell (llvmEnv // {
@@ -270,7 +311,7 @@
         devShells.bench = pkgs.mkShell bench;
         # Python-only work needs neither LLVM nor a Rust toolchain.
         devShells.scripts = pkgs.mkShell scripts;
-        # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
+        # What harness/bench.py measures bun in (bunprep.py, docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
         # and compiles its own library/), with rust-src, which bun's own build of its Rust
         # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and

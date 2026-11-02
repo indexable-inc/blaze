@@ -1,0 +1,37 @@
+{
+  "id": "00118",
+  "from_lane": "speed-link-edge-ci-web",
+  "owner": "coordinator",
+  "paths": [
+    "docs/web.md",
+    "crates/blaze-web/assets/records.js",
+    "crates/blaze-web/src/lib.rs"
+  ],
+  "what": "## 1. `docs/web.md`, \"The wire\", item 2: a frame of many records (coordinator)\n\nWhat: the websocket's record messages now hold every record the world's thread had at once, as a\nCBOR sequence (RFC 8742), not one record per message. The page reads either (`parseFrame` in\n`crates/blaze-web/assets/records.js`); a sender of one record per message (the bench's\n`screens.py`) still works.\n\nWhere: `docs/web.md`, the numbered list under \"The wire\". Replace item 2\n\n```\n2. Then the records of that workspace's last build (without its `Functions`, which the snapshot\n   has), and each record of every build from then on as it comes: one CBOR item of\n   [`Record`](../crates/blaze-protocol/src/events.rs) per message, in the deterministic\n   encoding of the socket, without the socket's length prefix.\n```\n\nwith\n\n```\n2. Then the records of that workspace's last build (without its `Functions`, which the snapshot\n   has), and each record of every build from then on as it comes, in frames: a message is a\n   CBOR sequence (RFC 8742) of one or more [`Record`](../crates/blaze-protocol/src/events.rs)s,\n   each in the deterministic encoding of the socket without its length prefix, as many as the\n   daemon had at once. Each is encoded once, whatever the number of pages.\n```\n\nand in item 3, \"and the first record of a whole object one in place of the record\" stays as it\nis. In \"Where it comes from\", the sentence \"Until then the daemon keeps no world, only the\nrecords it would be made from: …\" stays true; add after it: \"They are kept in one deflate\nstream per run of a build's records, on the page's thread, so a record costs the daemon one\nsend on a channel.\"\n\nWhy: `docs-say-what-they-are`; the change is in `crates/blaze-web/src/lib.rs` (`State::flush`).\n\n> forwarded to coordinator: `docs/web.md` is the coordinator's, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T01:06:28Z",
+  "updated": "2026-10-30T08:27:51Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/speed-link-edge-ci-web.md#1. `docs/web.md`, \"The wire\", item 2: a frame of many records (coordinator)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-link-edge-ci-web.md:3"
+    },
+    {
+      "at": "2026-10-30T08:27:51Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:27:51Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/web.md \"The wire\" item 2 replaced as asked (frames: a CBOR sequence, RFC 8742, encoded once for every page; matches State::flush in crates/blaze-web/src/lib.rs). In \"Where it comes from\" the added sentence is worded to kept.rs: runs of a build records on the page thread, each run Began and Functions records in one deflate stream (not every record), a record one channel send for the daemon."
+    }
+  ]
+}

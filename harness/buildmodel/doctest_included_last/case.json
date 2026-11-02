@@ -1,8 +1,0 @@
-{
-  "row": "doctests",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "doctests": true
-}

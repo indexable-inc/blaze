@@ -1,0 +1,25 @@
+{
+  "id": "00912",
+  "from_lane": "speed-sol2-store",
+  "owner": "store",
+  "paths": [
+    "crates/blaze-cas/src/table.rs",
+    "crates/blaze-cas/src/index.rs",
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "Two blaze-cas lookup and rebuild changes that need the model checker and a format change, from docs/v2/plan/lanes/store/speed-of-light.md (\"Lookups\", \"The index table and its rebuild\"). (1) crates/blaze-cas/src/table.rs: a delta slot becomes an AtomicU64 of a 32-bit key fingerprint and the value index (index_of + 1, 0 empty, a seal value kept), so a probe that misses the delta dereferences only on a fingerprint match; every index hit pays 6 to 21 ns of dereferences today, 3% to 10% of a hit. Rerun the model tests in model.rs against it. (2) crates/blaze-cas/src/lib.rs and index.rs: the whole index is rewritten every INDEX_AFTER (65,536) records, so a cold build of M records writes about M^2/131,072 entries of index (7.6x one write at 1M records, 30x at 4M). Replace it by a base table rewritten when the run reaches half of it plus a run table written per INDEX_AFTER records, a lookup probing the run then the base; keeps open's delta scan at INDEX_AFTER records. Format bump (FORMAT, INDEX_MAGIC), with a differential test that both layouts answer every lookup alike.",
+  "state": "open",
+  "created": "2026-10-30T09:41:24Z",
+  "updated": "2026-10-30T09:41:24Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:41:24Z",
+      "by": "speed-sol2-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

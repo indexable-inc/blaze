@@ -1,8 +1,0 @@
-{
-  "corpus": {"workspace": "corpus", "bin": "runner", "crates": ["cases"]},
-  "toy": {"workspace": "../demo", "bin": "app", "crates": ["hot"]},
-  "small-deps": {"workspace": "../demo/real", "bin": "real", "crates": ["semver", "itoa", "hex", "httparse", "heck"]},
-  "semver-tests": {"tests": "semver-1.0.28"},
-  "itoa-tests": {"tests": "itoa-1.0.18"},
-  "httparse-tests": {"tests": "httparse-1.10.1"}
-}

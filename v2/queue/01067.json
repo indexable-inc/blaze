@@ -1,0 +1,36 @@
+{
+  "id": "01067",
+  "from_lane": "integrate-engine-wasm",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/serve",
+    "crates/blaze-wasm/pack"
+  ],
+  "what": "Follow-up to 01058 (pack onto blaze_lower): a serve work kind / agent API request `pack` {project dir, program package, target wasm32-unknown-unknown, debug_assertions off} that plans with blaze_units, runs build scripts and proc macros sandboxed, lowers with blaze_lower, then calls blaze_wasm_pack::record(lowered.served_db(), lowered.krate(program unit), |db, crates| { for each crate crate_def_map(db, krate); infer every fn body of the program crate }) and returns serde_json::to_vec(&pack). record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -> Result<Pack, String> is in crates/blaze-wasm/pack (package blaze-wasm-pack; depends only on front-end crates, never on hir-ty-codegen, so no wasm feature unification). Plus a CLI client (`blaze pack <dir> <package> <out>`) replacing the removed `blaze-wasm pack`; crates/blaze-wasm/web/build-dioxus.sh stops until it exists. Needs coordinator to add blaze-wasm-pack = { path = \"crates/blaze-wasm/pack\" } to root [workspace.dependencies] (root members crates/* does not include it).",
+  "state": "applied",
+  "created": "2026-10-30T15:13:37Z",
+  "updated": "2026-10-30T16:07:35Z",
+  "taken_by": "integrate-load-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:13:37Z",
+      "by": "integrate-engine-wasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:53:08Z",
+      "by": "integrate-load-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:07:35Z",
+      "by": "integrate-load-next1",
+      "action": "done",
+      "note": "written, not yet built: Request::Pack/Response::Packed (SCHEMA 15), Work::Pack, serve Does::Pack + Jobs::pack (check build, then one answer task with the writer), serve/unit/pack.rs, `blaze pack -p PACKAGE --out PATH`; tests in serve/tests.rs, serve/job/tests.rs, serve/unit/tests.rs, cli/inspect/tests.rs, cli/args/tests.rs. Root workspace dep and check asked of the coordinator."
+    }
+  ]
+}

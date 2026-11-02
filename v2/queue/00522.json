@@ -1,0 +1,25 @@
+{
+  "id": "00522",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics",
+    "Cargo.toml",
+    "crates/tt/src/lib.rs"
+  ],
+  "what": "## diagnostics-lints-names-dead: `blaze-alloc-count` in `blaze-diagnostics` tests (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)\n\nWhat: two lines outside my paths so that the crate can hold its hot paths to allocation\nbudgets, as the coordinator asks of every lane:\n\n- `Cargo.toml`, `[dev-dependencies]`: `blaze-alloc-count.workspace = true` (it is already a\n  workspace dependency; `tt`, `blaze-mem`, `blaze-core` and `blaze-link` use it this way);\n- `src/lib.rs`: `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting =\n  blaze_alloc_count::Counting;`, as in `crates/tt/src/lib.rs`.\n\nWhy: the dead-code pass's budget tests are written (`lints/names/dead/tests.rs`: a cached\nlevel or attribute answer, a lookup in the crate's numbering, and a bitset test and insert, each\nzero allocations). They are not declared yet, because without these two lines they would not\ncompile. Once these land, `diagnostics-lints-names-dead` adds `#[cfg(test)] mod tests;` to\n`lints/names/dead.rs`. Every other lane of the crate can then use `assert_at_most` the same way.\n\nStatus: open\n\n> forwarded to diagnostics (`crates/blaze-diagnostics/` is its, still running; told).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: `blaze-alloc-count` in `blaze-diagnostics` tests (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:3127"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00490",
+  "from_lane": "diagnostics-lints-bodies-types-values",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/Cargo.toml",
+    "crates/rustc_abi",
+    "Cargo.toml"
+  ],
+  "what": "## diagnostics-lints-bodies-types-values: `rustc_abi` for blaze-diagnostics (the parent, `diagnostics`)\n\nWhere: `crates/blaze-diagnostics/Cargo.toml` `[dependencies]`: `rustc_abi.workspace = true` (a\nworkspace dependency already, `crates/rustc_abi`; `hir-ty` takes it). Why: `invalid_value`\n(`lints/bodies/types/values/invalid.rs`, rustc's `variant_find_init_error`) reads the layout\n`db.layout_of_ty` gives: `rustc_abi::BackendRepr::{Scalar, ScalarPair}`, `Scalar::valid_range`\nand `is_always_valid` against `db.target_data_layout`, to say \"`NonNull<i32>` must be non-null\"\nand \"must be initialized inside its custom valid range\". `hir-ty` re-exports none of them.\n\n> forwarded to diagnostics: the parent's `Cargo.toml`; `rustc_abi` is a workspace dependency already.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-values: `rustc_abi` for blaze-diagnostics (the parent, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1585"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "00193",
+  "from_lane": "requests-link-next",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/link.md",
+    "crates/blaze-link",
+    "crates/blaze-link/src/commit.rs",
+    "crates/blaze-engine",
+    "crates/blaze-splice",
+    "harness/live/src/main.rs",
+    "harness/live-alloc/src/main.rs",
+    "harness/live-types/src/main.rs",
+    "harness/live-bevy/src/main.rs",
+    "harness/live-egui/src/main.rs",
+    "crates/blaze-live",
+    "harness/live"
+  ],
+  "what": "## From requests-link-next (2026-10-29): move v1's live users onto `blaze_live::slots` (`v2/requests/link.md` item 20)\n\n`v2/requests/link.md` \"## 20. From speed-link-edge-sol-live: move v1's users onto `slots`\" asks\nfor three things outside `crates/blaze-link/`; blaze-link's side is already in (`Output::live`\nlinks a live program with the jump table, and the commit writes the `blaze_live::patch::Message`\nfile, `crates/blaze-link/src/commit.rs` `message_file`, which `live.rs` encodes).\n\n1. Lane codegen (`crates/blaze-engine/`), and lane link for `crates/blaze-splice/`: the daemon's\n   live loop links live programs through `blaze_link::Image` with `Output::live` set and lets the\n   commit's effects write the patch message, instead of v1's spliced patches\n   (`blaze-engine/src/live.rs`, `splicer.rs`). Why: `slots::Live` stops no thread; the switch is\n   one release store of a table cell (item 20's numbers).\n2. Coordinator (`demo/`, `harness/`): `demo/life/src/window.rs`, `demo/lifebench/src/main.rs:128`,\n   `harness/live/src/main.rs:33`, `harness/live-alloc/src/main.rs:70`,\n   `harness/live-types/src/main.rs:80`, `harness/live-bevy/src/main.rs:558`,\n   `harness/live-egui/src/main.rs:544`: `blaze_live::Live` becomes `blaze_live::slots::Live`, and\n   `Outcome::Applied { sequence, took, waited, .. }` becomes\n   `slots::Outcome::Applied { generation, functions, statics }` (time `poll` in the program if a\n   number is printed). `Live::guard` is optional.\n3. Lane link, `crates/blaze-live/` (held by `requests-live`): once 1 and 2 are in, delete v1:\n   `src/{linux,macos,windows,apply}.rs`, `apply/tests.rs`, the three `stop.rs`, v1's part of\n   `format.rs` and `lib.rs`'s `Live` (nothing else in the workspace uses them).\n\n> forwarded to codegen (codegen-next1) for item 1 (blaze-engine's live loop; blaze-splice's part goes with it); item 2 (`demo/`, `harness/live*`) to the coordinator, on the report's list; item 3 (deleting v1 in `crates/blaze-live/`) waits for 1 and 2 and then goes to whoever holds blaze-live (speed-link-edge-hot-live now) (requests, pass 18; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-31T20:30:07Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/requests.md#From requests-link-next (2026-10-29): move v1's live users onto `blaze_live::slots` (`v2/requests/link.md` item 20)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:303"
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

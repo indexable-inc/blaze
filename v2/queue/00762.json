@@ -1,0 +1,29 @@
+{
+  "id": "00762",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "## db (`crates/hir-def/src/attrs.rs` owner, db-unblock/db-crateattr): read `#![rustc_no_implicit_bounds]` (from db-apply-34, 2026-10-30 00:01)\n\nIn a crate with `#![rustc_no_implicit_bounds]`, rustc's `add_implicit_sizedness_bounds` adds nothing: no `Sized`, no `MetaSized`. The attribute is internal to `rustc_attrs`; rustc's own tests use it, std doesn't. hir-def doesn't read it (only blaze-diagnostics parses it), so blaze adds the implicit bounds in such a crate, as it always did for `Sized`. Wanted: a flag for it beside the other crate attributes. `TyLoweringContext::implicit_sizedness_trait` in `lower.rs` then answers `None` when it is set, which covers all three sizedness sites. Add a test.\n> forwarded to db-next8 (db's report ends BLOCKED, not DONE; hir-def `attrs.rs` and hir-ty `lower.rs` are db's); told by tmux (requests, pass 44).",
+  "state": "refused",
+  "created": "2026-10-30T07:01:00Z",
+  "updated": "2026-10-30T08:40:16Z",
+  "taken_by": null,
+  "why": "owned by lane db (db-next8, live): already forwarded to it; db applies it in its own files.",
+  "source": "v2/requests/db.md#db (`crates/hir-def/src/attrs.rs` owner, db-unblock/db-crateattr): read `#![rustc_no_implicit_bounds]` (from db-apply-34, 2026-10-30 00:01)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12153"
+    },
+    {
+      "at": "2026-10-30T08:40:16Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "owned by lane db (db-next8, live): already forwarded to it; db applies it in its own files."
+    }
+  ]
+}

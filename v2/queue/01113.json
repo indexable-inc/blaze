@@ -1,0 +1,35 @@
+{
+  "id": "01113",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "FYI: I fixed the contract in docs/v2/plan/lanes/db/query-unify.md (plumbing block and the paragraph after it): Function::Key is FromIdIn; Input/Interned/Tracked take &Storage and name no Db; Vtable const constructors for the statics; ReturnsAsRef/ReturnsAsDeref; Function::EVICTABLE; Value std impls; derive(Value)'s field proof attribute is #[value(..)] (was #[salsa_value(..)]); a tracked fn of several arguments gets f::arguments(db, id) -> Option<(A, ..)>. Told query-unify-engine by queue. For the port script (query-unify-port): `#[salsa_value(` -> `#[value(`, `salsa::SalsaValue` -> `blaze_query::Value`, `salsa::plumbing::interned_arguments::<F>(db, key)` (blaze-item-hash reads.rs) -> `<fn>::arguments(db, key)`.",
+  "state": "applied",
+  "created": "2026-10-30T21:54:29Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:54:29Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Read; contract keeps the macros' fixes."
+    }
+  ]
+}

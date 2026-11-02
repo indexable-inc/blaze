@@ -5,25 +5,28 @@
 //! (pedantic) is not ported, nor the `#[expect]` written on the inner `if` that clippy lets
 //! through; code handed to a macro is not linted here.
 
-use syntax::{AstNode, TextRange, TextSize, ast};
+use syntax::{
+    TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "collapsible_if";
+const LINT: super::Implemented = super::Implemented::CollapsibleIf;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::IfExpr<'t>) {
     if !cx.on(LINT) || !cx.in_file() || expr.else_branch().is_some() {
         return;
     }
     let (Some(check), Some(then)) = (expr.condition(), expr.then_branch()) else { return };
-    if !eligible(cx, &check) || then.label().is_some() || then.modifier().is_some() {
+    if !eligible(cx, check) || then.label().is_some() || then.modifier().is_some() {
         return;
     }
     let Some(stmts) = then.stmt_list() else { return };
-    let Some(inner) = expr_block(&stmts) else { return };
-    let ast::Expr::IfExpr(inner_if) = peel_parens(&inner) else { return };
+    let Some(inner) = expr_block(stmts) else { return };
+    let ast::Expr::IfExpr(inner_if) = inner.peel_parens() else { return };
     let Some(check_inner) = inner_if.condition() else { return };
-    if inner_if.else_branch().is_some() || !eligible(cx, &check_inner) {
+    if inner_if.else_branch().is_some() || !eligible(cx, check_inner) {
         return;
     }
     let (Some(open), Some(close)) = (stmts.l_curly_token(), stmts.r_curly_token()) else { return };
@@ -41,67 +44,81 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
     let open_range = with_leading_whitespace(text, open.text_range());
     let close_range = with_leading_whitespace(text, close.text_range());
     let inner_if_start = inner_if.syntax().text_range().start();
-    let mut parts = vec![
-        (cx.span(open_range), String::new()),
-        (cx.span(close_range), String::new()),
-        (cx.span(TextRange::at(inner_if_start, TextSize::from(2))), "&&".to_owned()),
-    ];
+    let mut parts = Vec::with_capacity(9);
+    parts.push((cx.span(open_range), String::new()));
+    parts.push((cx.span(close_range), String::new()));
+    parts.push((cx.span(TextRange::at(inner_if_start, TextSize::from(2))), "&&".to_owned()));
     if inner_if_start > inner_range.start() {
         parts.push((cx.span(TextRange::new(inner_range.start(), inner_if_start)), String::new()));
         let inner_if_end = inner_if.syntax().text_range().end();
         parts.push((cx.span(TextRange::new(inner_if_end, inner_range.end())), String::new()));
     }
-    parts.extend(parens_around(cx, &check));
-    parts.extend(parens_around(cx, &check_inner));
+    parens_around(cx, check, &mut parts);
+    parens_around(cx, check_inner, &mut parts);
     let span = cx.span(expr.syntax().text_range());
     cx.lint(LINT, inner_if.syntax(), span, "this `if` statement can be collapsed")
         .multipart_suggestion("collapse nested if block", parts, Applicability::MachineApplicable);
 }
 
 /// clippy's `eligible_condition`: not a `let`, unless `let` chains can be written.
-fn eligible(cx: &Cx<'_, '_, '_>, cond: &ast::Expr) -> bool {
+fn eligible(cx: &Cx<'_, '_>, cond: ast::Expr<'_>) -> bool {
     !matches!(cond, ast::Expr::LetExpr(_))
         || (cx.edition() >= span::Edition::Edition2024 && cx.conf().meets(msrvs::LET_CHAINS))
 }
 
 /// clippy's `expr_block`: the block's tail with no statements, or its one statement ended by
 /// `;` with no tail.
-fn expr_block(stmts: &ast::StmtList) -> Option<ast::Expr> {
-    let statements: Vec<ast::Stmt> = stmts.statements().collect();
-    match (&statements[..], stmts.tail_expr()) {
-        ([], tail) => tail,
-        ([ast::Stmt::ExprStmt(stmt)], None) if stmt.semicolon_token().is_some() => stmt.expr(),
+fn expr_block(stmts: ast::StmtList<'_>) -> Option<ast::Expr<'_>> {
+    let mut statements = stmts.statements();
+    let first = statements.next();
+    if statements.next().is_some() {
+        return None;
+    }
+    match (first, stmts.tail_expr()) {
+        (None, tail) => tail,
+        (Some(ast::Stmt::ExprStmt(stmt)), None) if stmt.semicolon_token().is_some() => stmt.expr(),
         _ => None,
     }
 }
 
-fn peel_parens(expr: &ast::Expr) -> ast::Expr {
-    let mut expr = expr.clone();
-    while let ast::Expr::ParenExpr(paren) = &expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}
-
 /// `(` and `)` around `expr` when it is an `||`, which `&&` would bind tighter than.
-fn parens_around(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> Vec<(crate::diag::Span, String)> {
-    let ast::Expr::BinExpr(bin) = peel_parens(expr) else { return Vec::new() };
+fn parens_around(
+    cx: &Cx<'_, '_>,
+    expr: ast::Expr<'_>,
+    parts: &mut Vec<(crate::diag::Span, String)>,
+) {
+    let ast::Expr::BinExpr(bin) = expr.peel_parens() else { return };
     if bin.op_kind() != Some(ast::BinaryOp::LogicOp(ast::LogicOp::Or)) {
-        return Vec::new();
+        return;
     }
     let range = expr.syntax().text_range();
-    vec![
-        (cx.span(TextRange::empty(range.start())), "(".to_owned()),
-        (cx.span(TextRange::empty(range.end())), ")".to_owned()),
-    ]
+    parts.push((cx.span(TextRange::empty(range.start())), "(".to_owned()));
+    parts.push((cx.span(TextRange::empty(range.end())), ")".to_owned()));
 }
 
-/// clippy's `span_contains_cfg`: `#[cfg` written in `text`.
-fn contains_cfg(text: &str) -> bool {
-    let squeezed: String = text.chars().filter(|it| !it.is_whitespace()).collect();
-    squeezed.contains("#[cfg(") || squeezed.contains("#![cfg(")
+/// clippy's `span_contains_cfg`: `#[cfg(` or `#![cfg(` written in `text`, whitespace between
+/// its characters ignored.
+pub(super) fn contains_cfg(text: &str) -> bool {
+    // Neither pattern has a proper prefix that is also its suffix, so a mismatch restarts at
+    // the character itself.
+    const PATTERNS: [&[u8]; 2] = [b"#[cfg(", b"#![cfg("];
+    if !text.contains('#') {
+        return false;
+    }
+    let mut matched = [0usize; PATTERNS.len()];
+    for c in text.chars().filter(|it| !it.is_whitespace()) {
+        for (pattern, at) in PATTERNS.iter().zip(&mut matched) {
+            *at = match () {
+                _ if char::from(pattern[*at]) == c => *at + 1,
+                _ if char::from(pattern[0]) == c => 1,
+                _ => 0,
+            };
+            if *at == pattern.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// clippy's `with_leading_whitespace`: `range` with the whitespace before it, unless that

@@ -2,9 +2,9 @@
 // one stack pointer, and every build's module instantiated over them.
 
 export class Program {
-  // `host` has the functions the program declares in `extern` blocks. `base` is the exports
-  // of a module the program is linked into, when there is one: the program then lives in
-  // that module's memory and table, and calls its functions by their symbols.
+  // `host` has the functions the program declares in `extern` blocks, which a module imports
+  // from `env` as rustc's would. `base` is the exports of a module whose memory, table and
+  // stack pointer the program lives in, when there is one.
   constructor(host, base = null) {
     this.base = base;
     this.memory = base?.memory ?? new WebAssembly.Memory({ initial: 32 });
@@ -20,8 +20,9 @@ export class Program {
       const at = a.findIndex((byte, index) => byte !== b[index]);
       return at < 0 ? 0 : a[at] - b[at];
     };
-    host = { memcmp: compare, bcmp: compare, ...host };
-    this.host = new Proxy(host, {
+    const own = { memory: this.memory, table: this.table, stack_pointer: this.stackPointer };
+    host = { memcmp: compare, bcmp: compare, ...host, ...own };
+    this.env = new Proxy(host, {
       get: (host, name) =>
         host[name] ??
         (() => {
@@ -29,6 +30,8 @@ export class Program {
         }),
       has: () => true,
     });
+    // A function of an earlier module that this one calls directly, by its slot.
+    this.slots = new Proxy({}, { get: (_, slot) => this.table.get(Number(slot)), has: () => true });
   }
 
   // Instantiates the module of one build. `report` is the build's JSON, parsed.
@@ -44,11 +47,7 @@ export class Program {
     if (this.stackPointer.value === 0) {
       this.stackPointer.value = report.stack_top;
     }
-    for (const [name, slot] of Object.entries(report.host ?? {})) {
-      this.table.set(slot, this.base[name]);
-    }
-    const env = { memory: this.memory, table: this.table, stack_pointer: this.stackPointer };
-    new WebAssembly.Instance(new WebAssembly.Module(module), { env, host: this.host });
+    new WebAssembly.Instance(new WebAssembly.Module(module), { env: this.env, slot: this.slots });
     Object.assign(this.exports, report.exports);
   }
 

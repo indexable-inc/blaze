@@ -1,0 +1,36 @@
+{
+  "id": "00550",
+  "from_lane": "usercode",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/test.rs",
+    "v2/requests/fastcompile.md"
+  ],
+  "what": "## 13. cargo: `queue::Binary` gains `loaded` (`crates/blaze-cargo/src/serve/unit/test.rs`)\n\nWhat: the `Binary { .. }` literal at `serve/unit/test.rs` (about line 406) gets `loaded: None`, or\n`loaded: Some(blaze_usercode::test::queue::Loaded(program))` once the daemon runs tests from\nblaze's loader (fastcompile-inproc 3, v2/requests/fastcompile.md).\n\nWhy: fastcompile-inproc 3. Without the field the crate does not compile.\n\n> forwarded to cargo (told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-31T20:29:29Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode.md#13. cargo: `queue::Binary` gains `loaded` (`crates/blaze-cargo/src/serve/unit/test.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:935"
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: serve/unit/test.rs:487-506 fills Binary.loaded from run::launch"
+    }
+  ]
+}

@@ -15,8 +15,8 @@ The code is `crates/hir-ty-mir/src/mir/transform.rs` and `transform/`.
 
 `MirBody::phase` is `MirPhase::Built` or `MirPhase::Runtime`.
 
-- **Built** is what lowering produces, and what every IDE feature reads (`mir_body`,
-  `monomorphized_mir_body`, diagnostics). A `Drop` there drops what the place holds *if* it
+- **Built** is what lowering produces, and what the checks read (`mir_body`,
+  `monomorphized_mir_body`: borrow checking, the const checker, diagnostics). A `Drop` there drops what the place holds *if* it
   holds anything. Calls and drops unwind into the scopes' unwind drop tree, as rustc's MIR
   building makes it. A statement can panic (`CheckedBinaryOp`, an `Index`), and
   `MirBody::panic_unwinds` says where to.
@@ -28,7 +28,7 @@ The code is `crates/hir-ty-mir/src/mir/transform.rs` and `transform/`.
     binary operation is the non-panicking `BinaryOp` (with `AddWithOverflow` and the like);
   - cleanup blocks end in `UnwindResume`.
 
-The runtime bodies are separate salsa queries, so the IDE never computes them:
+The runtime bodies are separate salsa queries, so the checks never compute them:
 `runtime_mir_body`, `runtime_mir_body_for_closure`, `runtime_mir_body_for_coroutine`,
 `runtime_mir_body_for_coroutine_by_move`, `runtime_promoted_mir_body` (the constant behind a
 promoted `&expr`), and the `monomorphized_runtime_mir_body*` variants
@@ -183,9 +183,6 @@ bounds check reading its length into a temporary where rustc uses the constant, 
 what a future keeps only where such a temporary lives across a yield, or a no-unwind call
 changes which unwind paths there are.
 
-blaze mixes futures by default now; `BLAZE_SPLIT_FUTURES=1` keeps a future and everything
-that makes, polls or drops it on one side, until mixing is verified (`harness/mixfutures`).
-
 ## What the consumers do with it
 
 **blaze codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly, and
@@ -222,8 +219,13 @@ body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and the
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
 them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
 `Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
-blaze picks the level from `BLAZE_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
-it from `set_interpreter_mir_opt_level`.
+The code generator takes rustc's level for each crate from the unit it compiles
+(`Build::options` in `crates/hir-ty-codegen/v2/build.rs`: `Debug` at `-Copt-level=0`,
+`Release` above it and for the library's crates, inlined where the unit inlines), with UB
+checks (`CheckAlignment`, `CheckNull`, `CheckEnums`) where rustc's `sess.ub_checks()` has them.
+`BLAZE_MIR_OPT` is not an override in v2: set, it stops a unit's build, since a unit's key has
+no part of it (`CHANGES_CODE` in `crates/hir-ty-codegen/v2/backend.rs`). The interpreter takes
+the level from `set_interpreter_mir_opt_level`.
 
 - Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage
   markers lowering gives parameters), `LowerSliceLenCalls`, `InstSimplify` (bool comparisons,
@@ -231,17 +233,19 @@ it from `set_interpreter_mir_opt_level`.
   duplicate switch targets), `RemoveStorageMarkers`, `RemoveUnneededDrops`, `SimplifyCfg`,
   `SimplifyConstCondition`, `SimplifyLocals`, `SingleUseConsts`, `RemoveNoopLandingPads`,
   `CopyProp`, `CriticalCallEdges`.
-- Level 2 adds `UnreachablePropagation` and both `DeadStoreElimination`s, and keeps storage
-  markers, as rustc does when LLVM gets lifetime markers.
-- Not ported: `passes_not_ported(level)` lists them. The large ones are the inliner, `GVN`,
-  `ReferencePropagation`, `ScalarReplacementOfAggregates`, `JumpThreading` and
-  `DestinationPropagation`, and the debug-build UB checks (`CheckAlignment`, `CheckNull`,
-  `CheckEnums`).
+- Level 2 adds `Inline` (`optimize/inline.rs`, where the unit inlines), `UnreachablePropagation`
+  and both `DeadStoreElimination`s.
+- Storage markers are kept at every level: the code generator gives its backend lifetimes, and
+  rustc runs `RemoveStorageMarkers` only where it gives none.
+- Not ported: `passes_not_ported(level)` lists them. At level 1 `ForceInline`, `RemoveZsts`
+  and `UnreachableEnumBranching`; at level 2 also `GVN`, `ReferencePropagation`,
+  `ScalarReplacementOfAggregates`, `JumpThreading`, `DestinationPropagation` and a few smaller
+  ones.
 
 Where a port differs from rustc:
 
-- Coroutine bodies are not optimized: `held.rs` computes a future's layout from the runtime
-  body, and the layout has to stay what rustc's is.
+- Coroutine bodies are not optimized, only given the UB checks: `held.rs` computes a future's
+  layout from the runtime body, and the layout has to stay what rustc's is.
 - Promoted locals, upvars, parameters, the return slot and every local a binding's debug info
   names are kept, as nothing here rewrites debug info the way rustc's `SimplifyLocals` does.
 - Dead-store elimination ends a local's life at a write only, not at its `StorageDead`. For MIR
@@ -251,8 +255,7 @@ Where a port differs from rustc:
   and terminators in range), which names the pass that broke it.
 
 The interpreter's tests run every program at all three levels and require the same output
-(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`). `harness/mirparity.py` in blaze
-compares the result with rustc's `-Zunpretty=mir`.
+(`hir-ty-mir/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`).
 
 ## Not done yet
 

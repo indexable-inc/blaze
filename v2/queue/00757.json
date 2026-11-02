@@ -1,0 +1,38 @@
+{
+  "id": "00757",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "crates/base-db",
+    "Cargo.toml",
+    "v2/requests/coordinator.md",
+    "v2/requests/cargo.md"
+  ],
+  "what": "## db (from diagnostics-levels, 2026-10-29 23:55): the lint command line as a `Crate` input, for the front-end `lint_level` query (codegen-rq-mir.md R5 item 1)\n\nWhat, in `crates/base-db` (yours):\n\n1. `Cargo.toml`: `blaze-lint-defs.workspace = true`. The new crate has no salsa and no syntax,\n   and depends only on `edition`, `blaze-ids`, `blaze-phf` and `serde`. It is requested from\n   the coordinator (`v2/requests/coordinator.md`, same heading).\n2. `input.rs`, a field of the `Crate` input after `attr_files`, set apart from `data` so that\n   only what reads it depends on it:\n\n   ```rust\n   /// The lint flags its compile is given: rustc's `-A`/`-W`/`--force-warn`/`-D`/`-F` in order\n   /// and `--cap-lints` (`blaze_lint_defs::LintOptions`, rustc_session's `lint_opts` and\n   /// `lint_cap`). Read only by `hir_lint_levels`' level queries.\n   #[default]\n   #[returns(ref)]\n   #[get(lint_options_field)]\n   #[set(set_lint_options_field)]\n   lint_options: blaze_lint_defs::LintOptions,\n   ```\n\n   with `pub fn lint_options<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) ->\n   &'db LintOptions` and `pub fn set_lint_options(self, db: &mut Db, options: LintOptions)`\n   (setting only that field, at the crate's durability). `LintOptions` derives `Clone, Debug,\n   Default, PartialEq, Eq, Hash`. `Default` is rustc's: no flags and no cap.\n3. The cache key. rustc tracks `lint_opts` and `lint_cap` as `[TRACKED_NO_CRATE_HASH]`:\n   changing them reruns what read them, but doesn't change the crate's hash. Salsa's\n   per-field revision gives the same thing in memory. A persisted result that read the field\n   (a const evaluation that stopped on `deny(long_running_const_eval)`, or a diagnostics check)\n   must still miss when it changes. If your persistence keys a memo by the fingerprints of the\n   inputs it read, leave it out of `Crate::content_of`. If it keys by the crate's content ID,\n   hash it into `content_of` (`content::len` and then each `(name, level)` and the cap), and\n   bump `Crate::DOMAIN`. You know which of the two holds; either is fine for the query.\n\nWhy: `hir_lint_levels::lint_level(db, owner, lint)` is what the const evaluator reads at step\n2,000,000 (R5). In rustc the level comes from the attributes *and* the command line, so the\ncommand line has to be readable from `&Db`. Today only blaze-diagnostics has it (its `Options`,\nfrom blaze-cargo's `lint_flags`). This is the same path `-Z crate-attr` already takes\n(`CrateData::crate_attrs` and `applied_crate_attr_files`). Who sets it: cargo, where it makes\nthe unit's crate (`v2/requests/cargo.md`, same heading).\n\nNothing in hir-def is needed beyond what exists: the query reads `crate_def_map` (with\n`modules_for_file`, `ModuleOrigin`), `ExpressionStore::with_source_map`, the item locs'\n`ast_id()`, `UnstableFeatures::query`, hir-expand's `expand_cfg_attr_view`, `MacroCallLoc::\nto_node_view` and `HirFileId::root`.\n\nStatus: open\n\n> forwarded to db-next8 (requests, pass 39: base-db is db's; item 1's `blaze-lint-defs.workspace` needs the root line, which requests adds once diagnostics writes the crate; told by tmux)",
+  "state": "refused",
+  "created": "2026-10-30T06:55:00Z",
+  "updated": "2026-10-30T08:39:18Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "reassign to db (live: db-next8): the coordinator part, the root `blaze-lint-defs` workspace dependency, is in (Cargo.toml line 130) and crates/blaze-lint-defs exists with LintOptions::parse. What is left is all crates/base-db (db per docs/v2/plan/reference/crates.md): `blaze-lint-defs.workspace = true` in base-db/Cargo.toml, the `lint_options` Crate input field with lint_options/set_lint_options, and the content_of/DOMAIN choice. `rg lint_options crates/base-db` is empty today.",
+  "source": "v2/requests/db.md#db (from diagnostics-levels, 2026-10-29 23:55): the lint command line as a `Crate` input, for the front-end `lint_level` query (codegen-rq-mir.md R5 item 1)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12721"
+    },
+    {
+      "at": "2026-10-30T08:39:18Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:18Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "reassign to db (live: db-next8): the coordinator part, the root `blaze-lint-defs` workspace dependency, is in (Cargo.toml line 130) and crates/blaze-lint-defs exists with LintOptions::parse. What is left is all crates/base-db (db per docs/v2/plan/reference/crates.md): `blaze-lint-defs.workspace = true` in base-db/Cargo.toml, the `lint_options` Crate input field with lint_options/set_lint_options, and the content_of/DOMAIN choice. `rg lint_options crates/base-db` is empty today."
+    }
+  ]
+}

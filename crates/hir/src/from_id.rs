@@ -9,7 +9,7 @@ use hir_def::{
     hir::{BindingId, LabelId},
     item_scope::ItemInNs as ItemInNsId,
 };
-use hir_ide::next_solver::AnyImplId;
+use hir_ty::next_solver::AnyImplId;
 use stdx::impl_from;
 
 use crate::{
@@ -43,7 +43,7 @@ from_id![
     (hir_def::StaticId, crate::Static),
     (hir_def::ConstId, crate::Const),
     (crate::AnyFunctionId, crate::Function),
-    (hir_ide::next_solver::AnyImplId, crate::Impl),
+    (hir_ty::next_solver::AnyImplId, crate::Impl),
     (hir_def::TypeOrConstParamId, crate::TypeOrConstParam),
     (hir_def::TypeParamId, crate::TypeParam),
     (hir_def::ConstParamId, crate::ConstParam),
@@ -51,6 +51,7 @@ from_id![
     (hir_def::MacroId, crate::Macro),
     (hir_def::ExternCrateId, crate::ExternCrateDecl),
     (hir_def::ExternBlockId, crate::ExternBlock),
+    (hir_def::UseId, crate::UseDecl),
 ];
 
 impl_from!(AdtId { StructId => Struct, UnionId => Union, EnumId => Enum } for Adt);

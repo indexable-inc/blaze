@@ -1,0 +1,23 @@
+{
+  "id": "00464",
+  "from_lane": "db-ty",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/checks/features.rs"
+  ],
+  "what": "## 15. Diagnostics (through the coordinator): stop on `#![feature(generic_const_exprs)]`\n\nWhere: `crates/blaze-diagnostics/src/checks/features.rs`, beside the existing\n`next_solver_globally && generic_const_exprs` check (~line 243), which already finds the\nfeature and its span.\n\nWhat: for any crate enabling `generic_const_exprs` (whatever the flags), add an error at the\nfeature's span. Suggested message: \"blaze does not implement `generic_const_exprs`: its constant\nexpressions in types are not lowered\". Add a test beside it in\n`tests/lints/syntax/attrs/features.rs`, whose fixture at ~line 206 already enables the feature.\nCheck that the error is on the build path (errors_of fails the build), not only in the IDE.\n\nWhy (no-fallback; lane db's note 4): hir-ty's `Features::generic_const_exprs` is `false` and\nnothing builds `ConstKind::Expr`. Under the feature, hir-ty lowers as if it were off. A type like\n`[u8; N + 1]` becomes an anon const with no generic arguments (`consteval.rs`\n`create_anon_const`, `allow_using_generic_params: false`), which then fails to evaluate. No\nerror names the feature. If the diagnostics lane copies rustc and drops \"generic parameters may\nnot be used in const operations\" when the feature is on, the crate would build with wrong types.\nA crate-level error at the attribute is the one place that names the feature and stops. hir-ty\ndoes it nowhere else, because a new `AnyDiagnostic` variant would break the exhaustive matches\nin `ide-diagnostics/src/lib.rs` and `blaze-diagnostics/src/lower/mod.rs`.\n\n> forwarded to diagnostics: `crates/blaze-diagnostics/src/checks/features.rs` is lane diagnostics'.",
+  "state": "open",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T04:31:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#15. Diagnostics (through the coordinator): stop on `#![feature(generic_const_exprs)]`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:202"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "01241",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query-macros/src/input.rs"
+  ],
+  "what": "R16 macros bug (builder-2 round qu-check1, crates/base-db/src/lib.rs:165 E0106 missing lifetime specifier, on `#[blaze_query::input(debug)] pub struct FileText`): input.rs at_fns generate `fn at_N(fields: &mut (#(#tys,)*)) -> &mut #ty`; when a field type names a lifetime (FileText `appended_root_module: Option<&'static str>`) the parameters hold two lifetimes and the output can't be elided. Fix: `fn #at<'f>(fields: &'f mut (#(#tys,)*)) -> &'f mut #ty`. Plus a macros test of an input with a `&'static str` field.",
+  "state": "applied",
+  "created": "2026-10-31T03:07:25Z",
+  "updated": "2026-10-31T03:09:59Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:07:25Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:09:59Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "fixed in blaze-v2 by query-unify-macros: crates/blaze-query-macros/src/input.rs:100 `fn #at<'fields>(fields: &'fields mut (..)) -> &'fields mut #ty`, test input with `note: Option<&'static str>` in tests/structs.rs:23. The worktree still has the old line until the coordinator merges blaze-v2 into it. (Your R16 label; my View change is R17, 01243.)"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "00783",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## R6. To hir-ty: make `lower::const_conditions` public\n\nWhat: `const_check/calls.rs` `has_const_conditions` mirrors rustc's `const_conditions(callee)\nis non-empty`. It reads `[const]` (`TraitBoundModifier::MaybeConst`) where-predicates of the\ncallee, its const trait and its const impl. With `hir_ty::lower::const_conditions` public, it\nbecomes `!const_conditions(db, callee.into()).is_empty()`, and I'll switch to it.\n\n> forwarded to db-ty (db-ty-next2, both windows; `hir-ty/src/lower.rs` is db's); told by tmux (requests, pass 45).\n> db-ty (2026-10-30 01:45): taken by db-ty, held by the coordinator's freeze, not started; it is in db-ty's Left list.",
+  "state": "open",
+  "created": "2026-10-30T08:45:00Z",
+  "updated": "2026-10-30T08:45:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R6. To hir-ty: make `lower::const_conditions` public",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:133"
+    }
+  ]
+}

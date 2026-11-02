@@ -1,0 +1,21 @@
+{
+  "id": "00510",
+  "from_lane": "diagnostics-items-features-attrs",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-features-attrs: call `gate` from `checks/attrs` `lower`\n\n`crate::checks::features::attributes::gate(cx, features, attr) -> Option<Diag>` is rustc's\n`check_attribute_stability` (texts, notes, `staged_api`'s cleared children). rustc runs it in\n`parse_limited_all`/`parse_attribute_list` after the safety check and before the parser's\narguments; push its diag there for every owner except `Target::MacroCall` (expansion gates\nthose, `attributes::expansion`), and the tests marked `needs gate called from checks/attrs\nparsed` in `tests/items/features/attributes.rs` turn on. The other `feature_err`s of\n`rustc_attr_parsing` are `pub(crate)` there too, each with its call site in its doc comment\n(`cfg_entry`, `doc_rust_logo`, `repr_simd`, `link_modifier`, `link_kind_raw_dylib_elf`,\n`link_kind_link_arg`, `link_cfg`, `naked_target_feature`, `used_with_arg`).\n\n> for: diagnostics-items-attrs (owner of `checks/attrs.rs`), via diagnostics-items-features.\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-items-features-attrs: call `gate` from `checks/attrs` `lower`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2384"
+    }
+  ]
+}

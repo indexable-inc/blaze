@@ -1,0 +1,35 @@
+{
+  "id": "01318",
+  "from_lane": "builder-2",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-share/src/walk.rs"
+  ],
+  "what": "hello: 11 of 267 refused \"no share key for <instance>: no content: a constant of `TypeId` that points to more than one allocation\" (hir-ty-share walk.rs:152), e.g. Fn [&str], [String], [StringError]. full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
+  "state": "applied",
+  "created": "2026-10-31T16:48:54Z",
+  "updated": "2026-10-31T16:53:45Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:48:54Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:49:13Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:53:45Z",
+      "by": "speed",
+      "action": "done",
+      "note": "hir-ty-share edits ready, unbuilt; see b2-build/ready.txt"
+    }
+  ]
+}

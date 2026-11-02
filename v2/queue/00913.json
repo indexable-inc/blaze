@@ -1,0 +1,37 @@
+{
+  "id": "00913",
+  "from_lane": "speed-sol2-link",
+  "owner": "speed-sol2-link-writers",
+  "paths": [
+    "crates/blaze-link/src/dwarf.rs",
+    "crates/blaze-link/src/elf/dynamic.rs",
+    "crates/blaze-link/src/macho/unwind.rs"
+  ],
+  "what": "From speed-sol2-link (speed of light, 'Debug lines' and 'The live runtime' in docs/v2/plan/lanes/link/speed-of-light.md).\n\n1. dwarf.rs `sections(views, rows, files, size)`: the core (write.rs `Stage::debug`) now builds rows in parallel (DEBUG_CHUNK = 1024 functions per task, files numbered by first appearance, merged in order), so the serial encode is the remaining O(image) part of a Debug::Lines relink. Encode the line program per chunk of functions in parallel into per-chunk buffers sized first (row counts are known) and concatenate in order: byte-identical output to today's serial encode, with a differential test against the serial version kept under #[cfg(test)]. Leave the address sort fix-radix owns.\n2. The design for O(change) debug lines (not needed for correctness): one CU and line program per chunk of functions with slack, so an edit re-encodes one chunk and the core rewrites only that range. Write it down in the doc if you do not build it.\n3. Enabling for refused 00903: `build_hdr` lists FDEs outside .eh_frame only from `placed.functions`; to let native ELF FDEs (and their CIEs) move into Class::Patch it would have to list every FDE of the patch region's frame runs. Mach-O `__unwind_info` can name an FDE only by its offset in __eh_frame, so Mach-O patch FDEs can't leave __eh_frame without losing unwinding on relaunch. Say in the doc whether either is worth doing.",
+  "state": "applied",
+  "created": "2026-10-30T09:42:28Z",
+  "updated": "2026-10-30T09:53:57Z",
+  "taken_by": "speed-sol2-link-writers",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:42:28Z",
+      "by": "speed-sol2-link",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:44:45Z",
+      "by": "speed-sol2-link-writers",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:57Z",
+      "by": "speed-sol2-link-writers",
+      "action": "done",
+      "note": "1: dwarf.rs sections encodes subprograms, names and line sequences per 1,024 functions in parallel, joined by unwind::concat; same bytes and first error as the serial encode, kept as tests::sections_serial (test sections_in_pieces_are_the_serial_encodes_bytes); the address sort untouched. 2: the chunked-CU O(change) design is written in speed-of-light.md, 'The debug line program and subprograms', not built. 3: answered there: neither is worth doing (ELF: a second walk per patch for rare native changes; Mach-O: __unwind_info names an FDE only by its __eh_frame offset). Not yet built."
+    }
+  ]
+}

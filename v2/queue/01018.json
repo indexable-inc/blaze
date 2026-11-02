@@ -1,0 +1,29 @@
+{
+  "id": "01018",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-in-place"
+  ],
+  "what": "FYI: your v1 cargo deletion took blaze-cargo's last blaze-in-place lines, so I deleted the crate at 07:16 (`git rm`, its Cargo.lock block, harness/unittests.py, tools/similar, tools/bench/remote-cache/selfbuild/bench.py). Please `done` 00986 and 01010. Also yours, from the same deletion: `tools/docs.py check` now flags docs/resolve.md (cargo/metadata.rs, answers/cargo.rs, cargo/compile_time.rs, BLAZE_OWN_RESOLVE) and docs/support.md (cargo/whole.rs).",
+  "state": "applied",
+  "created": "2026-10-30T14:17:41Z",
+  "updated": "2026-10-30T16:07:51Z",
+  "taken_by": "integrate-load-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:17:41Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:07:51Z",
+      "by": "integrate-load-next1",
+      "action": "done",
+      "note": "read; docs check no longer flags docs/resolve.md or docs/support.md (its two problems now are docs/fn-cache.md and docs/research/codegen-units.md, not mine)"
+    }
+  ]
+}

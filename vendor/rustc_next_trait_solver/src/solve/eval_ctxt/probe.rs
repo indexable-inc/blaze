@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::mem;
 
 use rustc_type_ir::search_graph::CandidateHeadUsages;
 use rustc_type_ir::solve::{
@@ -53,7 +54,9 @@ where
         self,
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
     ) -> Result<T, NoSolutionOrRerunNonErased> {
-        let nested_goals = self.ecx.nested_goals.clone();
+        let mut nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
+        // clone: a probe starts from its parent's goals; `GoalStalledOn` clones its lists.
+        nested_goals.extend(self.ecx.nested_goals.iter().cloned());
         self.enter_inner(f, nested_goals)
     }
 
@@ -61,7 +64,8 @@ where
         self,
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
     ) -> Result<T, NoSolutionOrRerunNonErased> {
-        self.enter_inner(f, Default::default())
+        let nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
+        self.enter_inner(f, nested_goals)
     }
 
     pub(in crate::solve) fn enter_inner(
@@ -71,7 +75,11 @@ where
     ) -> Result<T, NoSolutionOrRerunNonErased> {
         let ProbeCtxt { ecx: outer, probe_kind, _result } = self;
 
-        outer.opaque_accesses.should_bail()?;
+        if let Err(rerun) = outer.opaque_accesses.should_bail() {
+            // Back to the pool: dropped, each bail would leave the pool a warm list short.
+            outer.search_graph.scratch().give_nested_goals(propagated_nested_goals);
+            return Err(rerun.into());
+        }
 
         let delegate = outer.delegate;
         let max_input_universe = outer.max_input_universe;
@@ -95,13 +103,12 @@ where
             nested.inspect.probe_final_state(delegate, max_input_universe);
             r
         });
+        nested.search_graph.scratch().give_nested_goals(mem::take(&mut nested.nested_goals));
 
         outer.opaque_accesses.update(nested.opaque_accesses)?;
 
-        let r = match r.map_err_to_rerun()? {
-            Ok(i) => Ok(i),
-            Err(NoSolution) => Err(NoSolution),
-        };
+        // Unwrap is unreachable, we would have returned on the line above.
+        let r = r.map_err_to_rerun().unwrap();
 
         if !nested.inspect.is_noop() {
             let probe_kind = probe_kind(&r);

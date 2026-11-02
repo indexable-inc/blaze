@@ -1,0 +1,35 @@
+[package]
+name = "blaze-lower"
+description = "A build's units lowered into the front end: base-db's crate graph, source roots and files from blaze-units' unit graph, read through the view, and what a running proc macro asks of the database answered"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+toml.workspace = true
+triomphe.workspace = true
+
+base-db.workspace = true
+blaze-ids.workspace = true
+blaze-query.workspace = true
+blaze-units = { workspace = true, features = ["query"] }
+blaze-vfs.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty-mir.workspace = true
+intern.workspace = true
+proc-macro-api.workspace = true
+span.workspace = true
+
+[lints]
+workspace = true

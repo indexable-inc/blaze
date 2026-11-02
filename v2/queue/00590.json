@@ -1,0 +1,23 @@
+{
+  "id": "00590",
+  "from_lane": "frontend-tree",
+  "owner": "diagnostics-lints-names-hot-stability",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/names/stability/target.rs"
+  ],
+  "what": "## frontend-tree: blaze-diagnostics lints/names/stability/target.rs: onto views (1)\n\n> applied by frontend-tree-move-diag-lints-uses (2026-10-29 22:25), under the grant: all 3 hunks,\n> each as an exact edit on a fresh read (old text once). Not built; hot_lint finds nothing in\n> `lints/names/stability*`.\n\nFrom `frontend-tree-move-diag-lints-uses`. Lands with the `walk.rs` heading below, which passes\nthe node as a view. The same pointer (`view::ptr` is `SyntaxNodePtr::new` of a view) and ranges.\n\nFile: `crates/blaze-diagnostics/src/lints/names/stability/target.rs`.\n\nHunk 1:\n\n```rust\nuse syntax::{AstNode, SyntaxNode, SyntaxNodePtr, TextRange, ast};\n```\n\nbecomes\n\n```rust\nuse syntax::{\n    SyntaxNodePtr, TextRange,\n    view::{self as ast, AstNode as _, Node},\n};\n```\n\nHunk 2:\n\n```rust\n    pub(super) fn new(target: Target, on: InFile<&SyntaxNode>, meta: &ast::Meta, attr: &ast::Attr) -> Option<Attribute> {\n```\n\nbecomes\n\n```rust\n    pub(super) fn new(target: Target, on: InFile<Node<'_>>, meta: &ast::Meta<'_>, attr: &ast::Attr<'_>) -> Option<Attribute> {\n```\n\nHunk 3:\n\n```rust\n            on: on.map(SyntaxNodePtr::new),\n```\n\nbecomes\n\n```rust\n            on: on.map(ast::ptr),\n```\n\n> forwarded to diagnostics-lints-names-hot-stability (window of that name); told by tmux (requests, pass 26).",
+  "state": "open",
+  "created": "2026-10-30T05:25:00Z",
+  "updated": "2026-10-30T05:25:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-names-hot-stability.md#frontend-tree: blaze-diagnostics lints/names/stability/target.rs: onto views (1)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-names-hot-stability.md:381"
+    }
+  ]
+}

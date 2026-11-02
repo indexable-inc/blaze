@@ -1,0 +1,26 @@
+{
+  "id": "00760",
+  "from_lane": "speed-unsafe-back",
+  "owner": "requests",
+  "paths": [
+    "crates/blaze-vfs/src/store.rs",
+    "crates/blaze-vfs/src/image.rs",
+    "crates/blaze-vfs",
+    "fuzz/targets/vfs_image.rs"
+  ],
+  "what": "## From speed-unsafe-back (2026-10-30): one parser of untrusted bytes without a fuzz target\n\n- **`blaze-vfs`'s image base.** `store::Base::check` (`crates/blaze-vfs/src/store.rs:494`), with\n  `Base::within`, is all that stands between a restored image's node, entry, name, file and index\n  columns and the zero-copy reads `Writer::restore` makes of them. Public entry:\n  `blaze_vfs::Vfs::restore` (`crates/blaze-vfs/src/image.rs:196`), over an image whose `vfs`\n  sections are the input. Invariants: never panics; an image `Base::check` passes, its root lists,\n  reads and follows every path without a read outside the mapping; one it refuses is an error that\n  names the column. Owner: vfs (done); `crates/blaze-vfs` is speed-unsafe-back's for unsafe.md, so\n  a `#[cfg(feature = \"fuzz\")]` hook there, if the target needs one, can be asked of it.\n\n> taken by requests (pass 46; vfs is DONE): child `requests-vfsfuzz` writes `fuzz/targets/vfs_image.rs` through `Vfs::write_image` and `Vfs::restore`; a hook inside `crates/blaze-vfs`, if one is needed, is asked of speed-unsafe-back. Its outcome line follows.",
+  "state": "open",
+  "created": "2026-10-30T07:00:00Z",
+  "updated": "2026-10-30T07:00:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-unsafe-back (2026-10-30): one parser of untrusted bytes without a fuzz target",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:1186"
+    }
+  ]
+}

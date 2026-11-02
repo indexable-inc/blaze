@@ -1,0 +1,27 @@
+{
+  "id": "00025",
+  "from_lane": "format-grammar",
+  "owner": "frontend-tokens",
+  "paths": [
+    "crates/parser/src/parser.rs",
+    "docs/v2/plan/lanes/format/speed-of-light.md",
+    "fuzz/Cargo.toml",
+    "Cargo.toml",
+    "crates/parser"
+  ],
+  "what": "## format-grammar: the parser's speed of light (`crates/parser/src/parser.rs`, `input.rs`; to the lead)\n\nWhat, from \"The grammar: tokens to events\" in `docs/v2/plan/lanes/format/speed-of-light.md`:\n1. Move `Parser`'s step counter out of `nth` (a `Cell` load, compare, branch and store on\n   every kind test, and the store keeps the compiler from reusing a loaded kind) into the\n   places a stuck loop must pass: `start`, `error`, `err_recover`, a failed `expect`. Add a fuzz\n   target over the grammar's entry points that asserts every input finishes.\n2. Pad `Input::words` with 4 `EOF` words, so `kind`, `contextual_kind` and `is_joint` up to\n   `pos + 3` need no `get`. Store kinds `Input` knows are valid, so `kind` needs no\n   `SyntaxKind::from` range assert.\n3. Replace `Marker`'s `DropBomb` (a `Cow` message built per node) with a `bool` and a `Drop`\n   that asserts it.\n\nWhy: a kind test is about 12 instructions where the work needs 2, and the grammar makes about 8\nper token. These three take the parser from about 5× its bound to about 2.3×; the rest is the\ngrammar's structure (speed-syntax's postorder rewrite).\n4. Size `Parser::events` at about `3.25 * inp.len()` instead of `2 * inp.len()`: a token is one\n   `Token` event plus a `Start` and a `Finish` for each of its 1.05 nodes (counted from the test\n   trees), about 3.1 events. So every parse doubles the list once, copying it. With that sizing,\n   the budget in `tests/top_entries.rs`, `a_parse_allocates_its_buffers_not_per_token`, goes\n   from 6 to 5.\n5. Make `Parser::errors` (and `Output`'s error table) `Cow<'static, str>`. Most parser\n   messages are fixed text, but `error<T: Into<String>>` allocates each one. Syntax errors\n   are an error path (`// alloc:` justified in `grammar/`), but a file being edited is full of\n   them.\n\n> taken by requests (format is DONE): child `requests-parser`; the outcome follows.\n> applied by requests (child requests-parser): items 1-3. (1) The step counter is a plain u32 in Parser, checked in start, error (every failed expect and every err_recover path go through it), and the EOF branches of bump_any/bump_remap. Same PARSER_STEP_LIMIT and message, not in nth. Termination is a property test, not a fuzz target, because fuzz/Cargo.toml was being edited by another lane and blaze-fuzz has its own global allocator: tests.rs termination::every_entry_point_finishes_on_every_input runs every Top/Prefix entry point, outlines and Reparser::top_level_item over 2000 changed token sequences, with a deadline. (2) Input and frontend-tokens new parser::Tokens end in Tokens::PAD = 4 EOF words, and len() leaves them out. kind, contextual_kind and is_joint are a slice load, and kind is transmuted with no SyntaxKind::from assert; Tokens::new checks the pad and every kind field. No change in grammar/. (3) Marker is a u32 and a bool with its own Drop, same message, and drop_bomb is gone from Cargo.toml. Tests are beside the code (input.rs, parser.rs). Arithmetic is in docs/v2/plan/lanes/format/speed-of-light.md: about 2.5x the bound, from about 5x. Items 4 and 5 were not in this brief. Nothing built.\n> forwarded to frontend-tokens (items 4 and 5): `crates/parser/` is held by frontend-tokens, still running (design item 4), and item 4 also changes `tests/top_entries.rs`' budget. Items 1-3 were applied above. Told by tmux.\n> items 4 and 5 done by frontend-tokens: (4) events are sized at 3.25 a token (requests-parser's `lend_events`), and with the output words on a shelf too the budget in `src/tests/top_entries.rs` is 0 for a second parse, not 5; (5) `Parser::errors`, `event::process` and `Output`'s error table are `Cow<'static, str>`, `error` takes `Into<Cow<'static, str>>`, and `err_and_bump`, `err_recover`, `error_block`, `error_let_stmt` take `&'static str` (every caller passes a literal), so a fixed message allocates nothing. Nothing built.",
+  "state": "open",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-29T23:57:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/format.md#format-grammar: the parser's speed of light (`crates/parser/src/parser.rs`, `input.rs`; to the lead)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:1432"
+    }
+  ]
+}

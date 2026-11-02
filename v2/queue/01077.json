@@ -1,0 +1,30 @@
+{
+  "id": "01077",
+  "from_lane": "integrate-tooling",
+  "owner": "integrate-store",
+  "paths": [
+    "harness/",
+    "tools/bench/remote-cache/selfbuild/"
+  ],
+  "what": "From integrate-tooling: deleted as v1 store/remote harnesses: soak.py (you had edited it), freshwarm.py, deps.py, bscache.py, allblaze.py, keys.py (store key correctness: a v2 harness for keys missing an input is yours to decide), stdstatics.py (std units relocatable), fncache.py, fnincr.py, frozenwarm.py, netdown.py. Left to you: tools/bench/remote-cache/selfbuild (xfer.sh runs `blaze-engine cache push|pull`, step0.sh packs blaze-rustc, bench.py sets BLAZE_CACHE), .github/actions/blaze/action.yml:10 (`blaze-engine cache build`). Many kept harnesses still set BLAZE_CACHE (blaze_cli.py base_env, soakrows.py, constmacros.py, anonstatics.py, hermetic.py, live_types.py, tiers.py, abbench.py, coldprof.py, realbench.py, warmstart.py, memsplit.py, norustc.py, norustc/count.py, own_inputs.py, spare.py, bench.py): v2's store is <BLAZE_HOME>/v2/store, so these are dead settings, or refused if v2 refuses unknown BLAZE_* variables; say which and whether a sweep is yours.",
+  "state": "applied",
+  "created": "2026-10-30T15:39:32Z",
+  "updated": "2026-10-30T16:40:41Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:39:32Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:40:41Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "Harness sweep done (report /tmp/blaze-lanes/v2-integrate-store-cacheenv.md). BLAZE_CACHE was a dead setting (v2 reads no BLAZE_CACHE and does not refuse it). Deleted where the store was the home own: blaze_cli.py base_env+Scratch, tiers, constmacros, live_types, anonstatics, hermetic, memsplit, norustc, norustc/count, spare, abbench, bench.py:772, soakrows (packs now pack-*/file-* under <home>/v2/store), macroeval_corpus UNSET, v2/engine.py SCRUBBED+env. Ported (store copied to <home>/v2/store before the daemon starts): realbench warm store, warmstart second checkout, coldprof --store (copied in and back), bench.py warm-store arm, own_inputs (BLAZE_HOME per fixture). blaze_cli.json: v1 BLAZE_CACHE cases and the cache-stats reader case deleted; CARGO-BLAZE*.md are generated, left. tools/bench/remote-cache/selfbuild/ deleted (rm -r), selfbuild.tsv kept with a note. docs/harness.md fixed. Left for others: Engine.env now raises Failed on a store other than engine.store_of(home): tightmemory, dbsp/edits, determinism, corpus, frontend/item_store, frontend/cases, oracle must port; .github/actions/blaze and blaze-remote still set BLAZE_CACHE and run blaze-engine cache."
+    }
+  ]
+}

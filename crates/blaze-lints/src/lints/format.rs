@@ -4,10 +4,11 @@
 //! Follows `rustc_parse_format` and `rustc_builtin_macros/src/format.rs` at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0), for what the lints read.
 
-use hir::HasSource as _;
+use std::borrow::Cow;
+
 use syntax::{
-    AstNode, SyntaxNode, TextRange,
-    ast::{self, HasAttrs as _, HasName as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use crate::check::Cx;
@@ -44,40 +45,64 @@ pub(crate) enum Trait {
 
 /// What a placeholder or its width or precision takes: an argument by index into all the
 /// arguments written, or one captured from the scope by name.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Arg {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Arg<'a> {
     Index(usize),
-    Captured(String),
+    Captured(&'a str),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct Placeholder {
-    pub(crate) arg: Arg,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Placeholder<'a> {
+    pub(crate) arg: Arg<'a>,
     pub(crate) format_trait: Trait,
-    pub(crate) width: Option<Arg>,
-    pub(crate) precision: Option<Arg>,
+    pub(crate) width: Option<Arg<'a>>,
+    pub(crate) precision: Option<Arg<'a>>,
 }
 
 /// A format macro call written in the file: its name, its placeholders and the arguments it
 /// was handed, as its expansion has them.
-pub(crate) struct FormatCall {
-    pub(crate) name: String,
+pub(crate) struct FormatCall<'t> {
+    pub(crate) name: &'static str,
     /// Whether it is one of std's macros, not one marked `#[clippy::format_args]`.
     pub(crate) std: bool,
-    pub(crate) placeholders: Vec<Placeholder>,
-    pub(crate) args: Vec<ast::Expr>,
+    format_args: ast::FormatArgsExpr<'t>,
+    /// How many arguments it was handed, every one an expression.
+    pub(crate) arg_count: usize,
+    /// How many placeholders the template has, every one read.
+    pub(crate) placeholder_count: usize,
     /// The template, its escapes read.
-    pub(crate) template: String,
+    pub(crate) template: Cow<'t, str>,
     /// Where the template's literal is written.
     pub(crate) template_range: TextRange,
+}
+
+impl<'t> FormatCall<'t> {
+    /// The argument of index `index`, in the order written.
+    pub(crate) fn arg(&self, index: usize) -> Option<ast::Expr<'t>> {
+        self.format_args.args().nth(index)?.expr()
+    }
+
+    /// The placeholders of the template, in order.
+    pub(crate) fn placeholders(&self) -> Placeholders<'_, impl Fn(&str) -> Option<usize> + '_> {
+        let args = self.format_args;
+        Placeholders::new(&self.template, move |name: &str| named_index(args, name))
+    }
+}
+
+/// The index of the argument named `name`.
+fn named_index(format_args: ast::FormatArgsExpr<'_>, name: &str) -> Option<usize> {
+    format_args.args().position(|arg| arg.name().is_some_and(|it| it.text() == name))
 }
 
 /// `call` as a format macro call, if it is one of std's or one its definition marks
 /// `#[clippy::format_args]` (as `log`'s are), as clippy's `is_format_macro` has it, and its
 /// template is a string literal written in it.
-pub(crate) fn of(cx: &Cx<'_, '_, '_>, call: &ast::MacroCall) -> Option<FormatCall> {
+pub(crate) fn of<'t>(cx: &Cx<'_, 't>, call: ast::MacroCall<'t>) -> Option<FormatCall<'t>> {
     let (name, std) = match cx.std_macro(call) {
-        Some(name) => (MACROS.contains(&name.as_str()).then_some(name)?, true),
+        Some(name) => {
+            let name = name.as_str();
+            (MACROS.contains(&name).then_some(name)?, true)
+        }
         None => (marked_format_args(cx, call)?, false),
     };
     let input = cx.range(call.token_tree()?.syntax())?;
@@ -86,165 +111,199 @@ pub(crate) fn of(cx: &Cx<'_, '_, '_>, call: &ast::MacroCall) -> Option<FormatCal
     let template_range = cx.original_range(literal.syntax())?;
     let ast::LiteralKind::String(template) = literal.kind() else { return None };
     let template = template.value().ok()?;
-    let mut args = Vec::new();
-    let mut names = Vec::new();
+    let mut arg_count = 0;
     for arg in format_args.args() {
-        let expr = arg.expr()?;
-        if let Some(name) = arg.name() {
-            names.push((name.text().to_owned(), args.len()));
-        }
-        args.push(expr);
+        arg.expr()?;
+        arg_count += 1;
     }
-    let placeholders = parse(&template, &names)?;
+    let mut placeholders =
+        Placeholders::new(&template, |name: &str| named_index(format_args, name));
+    let placeholder_count = placeholders.by_ref().count();
+    if placeholders.failed {
+        return None;
+    }
     Some(FormatCall {
         name,
         std,
-        placeholders,
-        args,
-        template: template.into_owned(),
+        format_args,
+        arg_count,
+        placeholder_count,
+        template,
         template_range,
     })
 }
 
 /// The name of the macro `call` calls, if its definition has `#[clippy::format_args]`.
-fn marked_format_args(cx: &Cx<'_, '_, '_>, call: &ast::MacroCall) -> Option<String> {
-    let db = cx.db();
-    let mac = cx.sema().resolve_macro_call(call)?;
-    let source = mac.source(db)?.value;
+fn marked_format_args<'t>(cx: &Cx<'_, 't>, call: ast::MacroCall<'t>) -> Option<&'static str> {
+    let mac = cx.macro_def(call)?;
+    let source = cx.macro_source(mac)?;
     let marked = source
         .attrs()
         .any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "clippy::format_args"));
-    marked.then(|| mac.name(db).as_str().to_owned())
+    marked.then(|| mac.name(cx.db()).symbol().as_str())
 }
 
 /// The `format_args!` call `call` expands to, at some depth, whose template is written in
-/// `input`.
-fn format_args_in(
-    cx: &Cx<'_, '_, '_>,
-    call: &ast::MacroCall,
+/// `input`. The expansions are searched last found first, each to its end before the next.
+fn format_args_in<'t>(
+    cx: &Cx<'_, 't>,
+    call: ast::MacroCall<'t>,
     input: TextRange,
-) -> Option<ast::FormatArgsExpr> {
+) -> Option<ast::FormatArgsExpr<'t>> {
     const MOST: usize = 16;
-    let mut pending: Vec<SyntaxNode> = vec![cx.sema().expand_macro_call(call)?.value];
+    let mut pending: [Option<ast::Node<'t>>; MOST + 1] = [None; MOST + 1];
+    pending[0] = Some(cx.expand(call)?);
+    let mut len = 1;
     let mut expanded = 0;
-    while let Some(root) = pending.pop() {
+    while len > 0 {
+        len -= 1;
+        let Some(root) = pending[len].take() else { continue };
         for node in root.descendants() {
-            if let Some(format_args) = ast::FormatArgsExpr::cast(node.clone()) {
+            if let Some(format_args) = ast::FormatArgsExpr::cast(node) {
                 let written = format_args.template().and_then(|it| cx.original_range(it.syntax()));
                 if written.is_some_and(|it| input.contains_range(it)) {
                     return Some(format_args);
                 }
             } else if let Some(inner) = ast::MacroCall::cast(node)
                 && expanded < MOST
-                && let Some(expansion) = cx.sema().expand_macro_call(&inner)
+                && let Some(expansion) = cx.expand(inner)
             {
                 expanded += 1;
-                pending.push(expansion.value);
+                pending[len] = Some(expansion);
+                len += 1;
             }
         }
     }
     None
 }
 
-/// The placeholders of `template`, its named arguments `names` given with their indices;
-/// `None` if rustc would not read it.
-pub(crate) fn parse(template: &str, names: &[(String, usize)]) -> Option<Vec<Placeholder>> {
-    let mut parser = Parser { chars: template.chars().collect(), at: 0, next: 0, names };
-    let mut placeholders = Vec::new();
-    while let Some(c) = parser.bump() {
-        match c {
-            '{' if parser.eat('{') => {}
-            '{' => placeholders.push(parser.placeholder()?),
-            '}' if parser.eat('}') => {}
-            '}' => return None,
-            _ => {}
-        }
-    }
-    Some(placeholders)
+/// The placeholders of a template, read as rustc reads them; `named` gives the index of a
+/// named argument. Stops at the first rustc would not read, setting [`Placeholders::failed`].
+pub(crate) struct Placeholders<'a, F> {
+    parser: Parser<'a, F>,
+    pub(crate) failed: bool,
 }
 
-struct Parser<'a> {
-    chars: Vec<char>,
+impl<'a, F: Fn(&str) -> Option<usize>> Placeholders<'a, F> {
+    pub(crate) fn new(template: &'a str, named: F) -> Self {
+        Placeholders { parser: Parser { text: template, at: 0, next: 0, named }, failed: false }
+    }
+}
+
+impl<'a, F: Fn(&str) -> Option<usize>> Iterator for Placeholders<'a, F> {
+    type Item = Placeholder<'a>;
+
+    fn next(&mut self) -> Option<Placeholder<'a>> {
+        if self.failed {
+            return None;
+        }
+        let parser = &mut self.parser;
+        let found = loop {
+            let Some(c) = parser.bump() else { return None };
+            match c {
+                '{' if parser.eat('{') => {}
+                '{' => break parser.placeholder(),
+                '}' if parser.eat('}') => {}
+                '}' => break None,
+                _ => {}
+            }
+        };
+        self.failed = found.is_none();
+        found
+    }
+}
+
+/// The placeholders of `template`, its named arguments `names` given with their indices;
+/// `None` if rustc would not read it.
+#[cfg(test)]
+fn parse<'a>(template: &'a str, names: &[(&str, usize)]) -> Option<Vec<Placeholder<'a>>> {
+    let named = |name: &str| names.iter().find(|(it, _)| *it == name).map(|(_, index)| *index);
+    let mut placeholders = Placeholders::new(template, named);
+    let found: Vec<Placeholder<'a>> = placeholders.by_ref().collect();
+    (!placeholders.failed).then_some(found)
+}
+
+/// A reader of a template, by byte offset.
+struct Parser<'a, F> {
+    text: &'a str,
     at: usize,
     /// The index the next implicit argument takes.
     next: usize,
-    names: &'a [(String, usize)],
+    named: F,
 }
 
-impl Parser<'_> {
+impl<'a, F: Fn(&str) -> Option<usize>> Parser<'a, F> {
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.at).copied()
+        self.text[self.at..].chars().next()
     }
 
     fn peek_at(&self, ahead: usize) -> Option<char> {
-        self.chars.get(self.at + ahead).copied()
+        self.text[self.at..].chars().nth(ahead)
     }
 
     fn bump(&mut self) -> Option<char> {
         let c = self.peek()?;
-        self.at += 1;
+        self.at += c.len_utf8();
         Some(c)
     }
 
     fn eat(&mut self, c: char) -> bool {
         let eaten = self.peek() == Some(c);
         if eaten {
-            self.at += 1;
+            self.at += c.len_utf8();
         }
         eaten
     }
 
-    fn skip_whitespace(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.at += 1;
+    fn eat_while(&mut self, pred: impl Fn(char) -> bool) {
+        while let Some(c) = self.peek()
+            && pred(c)
+        {
+            self.at += c.len_utf8();
         }
     }
 
     fn integer(&mut self) -> Option<usize> {
         let start = self.at;
-        while self.peek().is_some_and(|it| it.is_ascii_digit()) {
-            self.at += 1;
-        }
-        (self.at > start)
-            .then(|| self.chars[start..self.at].iter().collect::<String>().parse().ok())?
+        self.eat_while(|it| it.is_ascii_digit());
+        (self.at > start).then(|| self.text[start..self.at].parse().ok())?
     }
 
-    fn word(&mut self) -> Option<String> {
+    fn word(&mut self) -> Option<&'a str> {
         let start = self.at;
         if !self.peek().is_some_and(|it| it == '_' || it.is_alphabetic()) {
             return None;
         }
-        while self.peek().is_some_and(|it| it == '_' || it.is_alphanumeric()) {
-            self.at += 1;
-        }
-        Some(self.chars[start..self.at].iter().collect())
+        self.eat_while(|it| it == '_' || it.is_alphanumeric());
+        Some(&self.text[start..self.at])
     }
 
-    fn named(&self, name: String) -> Arg {
-        match self.names.iter().find(|(it, _)| *it == name) {
-            Some((_, index)) => Arg::Index(*index),
+    fn named(&self, name: &'a str) -> Arg<'a> {
+        match (self.named)(name) {
+            Some(index) => Arg::Index(index),
             None => Arg::Captured(name),
         }
     }
 
     /// A placeholder, after its `{`.
-    fn placeholder(&mut self) -> Option<Placeholder> {
-        self.skip_whitespace();
+    fn placeholder(&mut self) -> Option<Placeholder<'a>> {
+        self.eat_while(char::is_whitespace);
         let explicit = if let Some(index) = self.integer() {
             Some(Arg::Index(index))
         } else {
             self.word().map(|it| self.named(it))
         };
-        self.skip_whitespace();
+        self.eat_while(char::is_whitespace);
         let mut width = None;
         let mut precision = None;
         let mut star = false;
         let mut format_trait = Trait::Display;
         if self.eat(':') {
             if self.peek_at(1).is_some_and(|it| matches!(it, '<' | '^' | '>')) {
-                self.at += 2;
+                self.bump();
+                self.bump();
             } else if self.peek().is_some_and(|it| matches!(it, '<' | '^' | '>')) {
-                self.at += 1;
+                self.bump();
             }
             if !self.eat('+') {
                 self.eat('-');
@@ -264,11 +323,8 @@ impl Parser<'_> {
                 }
             }
             let start = self.at;
-            while self.peek().is_some_and(|it| it != '}') {
-                self.at += 1;
-            }
-            let ty: String = self.chars[start..self.at].iter().collect();
-            format_trait = match ty.trim() {
+            self.eat_while(|it| it != '}');
+            format_trait = match self.text[start..self.at].trim() {
                 "" => Trait::Display,
                 "?" | "x?" | "X?" => Trait::Debug,
                 "x" | "X" | "o" | "b" | "e" | "E" | "p" => Trait::Other,
@@ -292,7 +348,7 @@ impl Parser<'_> {
 
     /// A width or precision: a number, or an argument followed by `$`. A literal number takes
     /// no argument.
-    fn count(&mut self) -> Option<Arg> {
+    fn count(&mut self) -> Option<Arg<'a>> {
         let start = self.at;
         if let Some(index) = self.integer() {
             if self.eat('$') {
@@ -314,7 +370,7 @@ impl Parser<'_> {
 mod tests {
     use super::{Arg, Placeholder, Trait, parse};
 
-    fn at(index: usize, format_trait: Trait) -> Placeholder {
+    fn at(index: usize, format_trait: Trait) -> Placeholder<'static> {
         Placeholder { arg: Arg::Index(index), format_trait, width: None, precision: None }
     }
 
@@ -325,11 +381,11 @@ mod tests {
             Some(vec![
                 at(0, Trait::Display),
                 at(1, Trait::Debug),
-                Placeholder { arg: Arg::Captured("x".into()), ..at(0, Trait::Display) },
+                Placeholder { arg: Arg::Captured("x"), ..at(0, Trait::Display) },
             ])
         );
         assert_eq!(
-            parse("{0:1$.2$} {:016x?} {:.*} {n:>w$}", &[("n".into(), 5)]),
+            parse("{0:1$.2$} {:016x?} {:.*} {n:>w$}", &[("n", 5)]),
             Some(vec![
                 Placeholder {
                     width: Some(Arg::Index(1)),
@@ -338,7 +394,7 @@ mod tests {
                 },
                 at(0, Trait::Debug),
                 Placeholder { precision: Some(Arg::Index(1)), ..at(2, Trait::Display) },
-                Placeholder { width: Some(Arg::Captured("w".into())), ..at(5, Trait::Display) },
+                Placeholder { width: Some(Arg::Captured("w")), ..at(5, Trait::Display) },
             ])
         );
         assert_eq!(
@@ -346,5 +402,17 @@ mod tests {
             Some(vec![at(0, Trait::Other), at(1, Trait::Other), at(2, Trait::Other),])
         );
         assert_eq!(parse("}", &[]), None);
+    }
+
+    #[test]
+    fn a_multibyte_fill_is_one_character() {
+        assert_eq!(
+            parse("{:é>5} {}", &[]),
+            Some(vec![at(0, Trait::Display), at(1, Trait::Display)])
+        );
+        assert_eq!(parse("{é}", &[]), Some(vec![Placeholder {
+            arg: Arg::Captured("é"),
+            ..at(0, Trait::Display)
+        }]));
     }
 }

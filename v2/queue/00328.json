@@ -1,0 +1,23 @@
+{
+  "id": "00328",
+  "from_lane": "mem-core-macos",
+  "owner": "mem-core-sim",
+  "paths": [
+    "crates/blaze-core/src/fsevents.rs"
+  ],
+  "what": "## mem-core-macos: threads.rs's macOS `Watching` onto `fsevents::Watch` (needed to build on macOS)\n\nFrom `mem-core-macos` (report `/tmp/blaze-lanes/v2-mem-core-macos.md`). `crates/blaze-core/src/fsevents.rs` no longer has `Stream` (`start`/`journal` taking a `Box<dyn Fn(Completion)>`, `stop(self)`). It has `Watch<S: Tell>`: made once (`Watch::new(sink)`: cookie directory, dispatch queue, buffers), started and stopped in place any number of times, and it must not move while a stream runs, which is why it is boxed below (`Watching` lives in an `FxHashMap` that moves its values). `Tell` is implemented for `std::sync::mpsc::Sender<Completion>` and `crossbeam_channel::Sender<Completion>`, so the sink is `finished` itself. `journal` hands its first batch to a closure just before the stream starts, so it is told before anything the stream tells, as before. Since checkpoint 80a00d68fc HEAD has the new fsevents.rs and the old threads.rs, so blaze-core does not build on macOS until this lands.\n\nReplace the `#[cfg(target_os = \"macos\")] struct Watching` and its `impl` (threads.rs, \"A watch of FSEvents', which calls back on a queue of its own.\") with:\n\n```rust\n/// A watch of FSEvents', which calls back on a queue of its own.\n#[cfg(target_os = \"macos\")]\nstruct Watching {\n    watch: std::sync::Mutex<Box<crate::fsevents::Watch<Sender<Completion>>>>,\n    tag: Tag,\n    finished: Sender<Completion>,\n}\n\n#[cfg(target_os = \"macos\")]\nimpl Watching {\n    fn start(\n        root: &Path,\n        dir: &crate::FileName,\n        tag: Tag,\n        finished: Sender<Completion>,\n    ) -> io::Result<Watching> {\n        // alloc: setup, once per watch; boxed so it stays where it is while its stream runs.\n        let mut watch = Box::new(crate::fsevents::Watch::new(finished.clone())?);\n        // SAFETY: boxed, the watch does not move until `stop` or its drop stops it.\n        unsafe { watch.start(root, dir.clone(), tag) }?;\n        Ok(Watching { watch: std::sync::Mutex::new(watch), tag, finished })\n    }\n\n    /// An [`Effect::Journal`]: FSEvents' stream from the event `since` names.\n    fn journal(\n        root: &Path,\n        dir: &crate::FileName,\n        since: crate::Cursor,\n        tag: Tag,\n        finished: Sender<Completion>,\n    ) -> io::Result<Watching> {\n        // alloc: setup, once per watch; boxed so it stays where it is while its stream runs.\n        let mut watch = Box::new(crate::fsevents::Watch::new(finished.clone())?);\n        // alloc: the batch's payload.\n        let first = |first| _ = finished.send(Completion { tag, done: Done::Journaled(Box::new(first)) });\n        // SAFETY: as in `start`.\n        unsafe { watch.journal(root, dir.clone(), since, tag, first) }?;\n        Ok(Watching { watch: std::sync::Mutex::new(watch), tag, finished })\n    }\n\n    fn stop(&self) {\n        let mut watch = self.watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);\n        if watch.is_running() {\n            let finished = &self.finished;\n            watch.stop(|flush| {\n                // alloc: an error path.\n                let why = IoError(\"the watch ended before the flush\".to_owned());\n                _ = finished.send(Completion { tag: flush, done: Done::Failed(why) });\n            });\n            _ = self.finished.send(Completion { tag: self.tag, done: Done::Unwatched });\n        }\n    }\n\n    /// Asks the stream for a flush `tag`, which it answers through `finished`.\n    fn flush(&self, tag: Tag, finished: &Sender<Completion>) {\n        let watch = self.watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);\n        if let Err(error) = watch.flush(tag) {\n            // alloc: an error path.\n            let why = IoError(format!(\"flushing the watch: {error}\"));\n            _ = finished.send(Completion { tag, done: Done::Failed(why) });\n        }\n    }\n\n    fn join(self) {}\n}\n```\n\nBehavior change: a flush still waiting when the watch stops is now told `Failed` (before, `Stream::stop` dropped it untold, leaving it in flight).\n\n> forwarded to mem-core-sim (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:28:52Z",
+  "updated": "2026-10-30T03:28:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-core-sim.md#mem-core-macos: threads.rs's macOS `Watching` onto `fsevents::Watch` (needed to build on macOS)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-core-sim.md:12"
+    }
+  ]
+}

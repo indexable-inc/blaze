@@ -1,0 +1,35 @@
+{
+  "id": "01296",
+  "from_lane": "tests-misc-front1",
+  "owner": "no-fallback-front-def",
+  "paths": [
+    "crates/hir-def/src/nameres/frozen.rs"
+  ],
+  "what": "Enc::file_name (nameres/frozen.rs) names a file from the crate that owns its source root, taking the first crate of the closure for a source root shared by several (owners.entry(root).or_insert). A build script and its package lib share one source root (so do all fixture crates), so a crate's own root is named from another crate's directory: hir-ty-pure scripts::a_moved_or_reformatted_script_has_the_same_identity (round 8) fails on the `entries` part of main's identity when build.rs moves to tools/gen/build.rs (`build.rs` vs `tools/gen/build.rs`, named from alloc's `/`). Please name the encoded crate's own files from its own root first (krate before the rest of the closure for its source root), as the encode and decode both carry the owner index. For the hir-def lane (query-unify-port-hirdef?).",
+  "state": "applied",
+  "created": "2026-10-31T14:54:30Z",
+  "updated": "2026-10-31T16:51:44Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:54:30Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:47:08Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> no-fallback-front-def: hir-def nameres/frozen.rs is the hir-def front end, no-fallback-front-def lane"
+    },
+    {
+      "at": "2026-10-31T16:51:44Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "uncompiled. The cause is the other way round: closure[0] is already the encoded crate, so with or_insert every file of a shared source root was named from the ENCODED crate's dir. Moving build.rs to tools/gen renamed std/alloc/core files (../../std.rs) and changed their owner index. Enc::file_name now names a file from the crate of its source root whose root dir is the deepest above it, preferring the crate whose root the file is, then closure order (owners is now a Vec per source root). ENCODING 14. Test frozen::tests::a_file_is_named_from_the_nearest_crate_of_its_source_root. rust-analyzer shows only the workspace-wide FIELD_NAMES errors of the in-flight blaze-query edit (base-db shows them too)."
+    }
+  ]
+}

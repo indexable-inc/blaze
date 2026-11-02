@@ -1,0 +1,35 @@
+{
+  "id": "01057",
+  "from_lane": "fastcompile",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2.rs"
+  ],
+  "what": "fastcompile (change 20, compiled tier of proc macros): a public accessor for which function a reached instance is. The tier builds a macro crate with `driver::Build::reach` and `v2::lowered`, and must bind a reached instance whose function a shim claims (the bridge's `Closure::call`, std functions `os.rs` claims by `FunctionId`, such as `sys::random::hashmap_random_keys`) to a stub instead of compiling its body, as the evaluator claims it (`Foreign::claims`). `HirInstance`'s `Kind` is `pub(crate)`, so blaze-macro-eval can't see it. Ask, in `crates/hir-ty-codegen/v2.rs`: `impl HirInstance { pub fn function(&self) -> Option<hir_def::FunctionId> }`, `Some` for `Kind::Code` of a function item (any generic arguments), `None` for closures, shims, `Kind::Asm`, `Kind::Allocator` and `Kind::Start`. Nothing calls it in a build; it costs nothing unused. Design: docs/v2/plan/lanes/fastcompile/macros-tier.md, Building.",
+  "state": "applied",
+  "created": "2026-10-30T14:51:46Z",
+  "updated": "2026-10-31T20:48:33Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:51:46Z",
+      "by": "fastcompile",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:33Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:33Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "HirInstance::function in hir-ty-codegen v2.rs: Some for Kind::Code of InstanceDef::Fn with any generic arguments, None for closures, coroutines, shims, Asm, Allocator and Start."
+    }
+  ]
+}

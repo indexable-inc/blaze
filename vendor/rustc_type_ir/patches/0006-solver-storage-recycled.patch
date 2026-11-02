@@ -1,0 +1,647 @@
+diff -ruN a/src/infer_ctxt.rs b/src/infer_ctxt.rs
+--- a/src/infer_ctxt.rs
++++ b/src/infer_ctxt.rs
+@@ -556,6 +556,15 @@
+         &self,
+         prev_entries: Self::OpaqueTypeStorageEntries,
+     ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
++    /// [`Self::clone_opaque_types_added_since`], appended to `into`: an implementation that
++    /// writes them there directly allocates nothing once `into` has room.
++    fn clone_opaque_types_added_since_into(
++        &self,
++        prev_entries: Self::OpaqueTypeStorageEntries,
++        into: &mut Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>,
++    ) {
++        into.extend(self.clone_opaque_types_added_since(prev_entries));
++    }
+     fn opaques_with_sub_unified_hidden_type(
+         &self,
+         ty: TyVid,
+diff -ruN a/src/interner.rs b/src/interner.rs
+--- a/src/interner.rs
++++ b/src/interner.rs
+@@ -161,6 +161,15 @@
+         data: ExternalConstraintsData<Self>,
+     ) -> Self::ExternalConstraints;
+ 
++    /// Interns external constraints given by reference: an implementation that finds them
++    /// interned already copies nothing. The default clones them into the owned form.
++    fn mk_external_constraints_ref(
++        self,
++        data: &ExternalConstraintsData<Self>,
++    ) -> Self::ExternalConstraints {
++        self.mk_external_constraints(data.clone())
++    }
++
+     type DepNodeIndex;
+     type Tracked<T: Debug + Clone>: Debug;
+     fn mk_tracked<T: Debug + Clone>(
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -41,6 +41,10 @@
+ 
+ extern crate self as rustc_type_ir;
+ 
++#[cfg(test)]
++#[global_allocator]
++static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
++
+ use std::fmt;
+ use std::hash::Hash;
+ 
+diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+--- a/src/search_graph/mod.rs
++++ b/src/search_graph/mod.rs
+@@ -13,17 +13,17 @@
+ //! behavior as long as the resulting behavior is still correct.
+ use std::cmp::Ordering;
+ use std::collections::hash_map::Entry;
+-use std::collections::{BTreeMap, btree_map};
+ use std::fmt::Debug;
+ use std::hash::Hash;
+-use std::iter;
+ use std::marker::PhantomData;
+ use std::ops::Sub;
++use std::{iter, mem};
+ 
+ use derive_where::derive_where;
+ #[cfg(feature = "nightly")]
+ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
+ use rustc_type_ir::data_structures::HashMap;
++use smallvec::SmallVec;
+ use tracing::{debug, instrument, trace};
+ 
+ mod stack;
+@@ -76,6 +76,8 @@
+ 
+ pub trait Delegate: Sized {
+     type Cx: Cx;
++    /// Per-worker temporaries the delegate keeps in the graph.
++    type Scratch: Default;
+     /// Whether to use the provisional cache. Set to `false` by a fuzzer when
+     /// validating the search graph.
+     const ENABLE_PROVISIONAL_CACHE: bool;
+@@ -252,26 +254,29 @@
+ 
+ #[derive(Debug, Default)]
+ pub struct CandidateHeadUsages {
+-    usages: Option<Box<HashMap<StackDepth, HeadUsages>>>,
++    /// Sorted by stack depth; a candidate under a cycle usually uses one or two heads.
++    usages: SmallVec<[(StackDepth, HeadUsages); 2]>,
+ }
+ impl CandidateHeadUsages {
+-    pub fn merge_usages(&mut self, other: CandidateHeadUsages) {
+-        if let Some(other_usages) = other.usages {
+-            if let Some(ref mut self_usages) = self.usages {
+-                // Each head is merged independently, so the final usage counts are the same
+-                // regardless of hash iteration order.
+-                #[allow(rustc::potential_query_instability)]
+-                for (head_index, head) in other_usages.into_iter() {
+-                    let HeadUsages { inductive, unknown, coinductive, forced_ambiguity } = head;
+-                    let self_usages = self_usages.entry(head_index).or_default();
+-                    self_usages.inductive += inductive;
+-                    self_usages.unknown += unknown;
+-                    self_usages.coinductive += coinductive;
+-                    self_usages.forced_ambiguity += forced_ambiguity;
+-                }
+-            } else {
+-                self.usages = Some(other_usages);
++    fn entry(&mut self, head_index: StackDepth) -> &mut HeadUsages {
++        let at = match self.usages.binary_search_by_key(&head_index, |&(k, _)| k) {
++            Ok(at) => at,
++            Err(at) => {
++                self.usages.insert(at, (head_index, HeadUsages::default()));
++                at
+             }
++        };
++        &mut self.usages[at].1
++    }
++
++    pub fn merge_usages(&mut self, other: CandidateHeadUsages) {
++        for (head_index, head) in other.usages {
++            let HeadUsages { inductive, unknown, coinductive, forced_ambiguity } = head;
++            let self_usages = self.entry(head_index);
++            self_usages.inductive += inductive;
++            self_usages.unknown += unknown;
++            self_usages.coinductive += coinductive;
++            self_usages.forced_ambiguity += forced_ambiguity;
+         }
+     }
+ }
+@@ -355,13 +360,14 @@
+     usages: HeadUsages,
+ }
+ 
+-/// All cycle heads a given goal depends on, ordered by their stack depth.
++/// All cycle heads a given goal depends on, ordered by their stack depth: a sorted vector, as a
++/// goal depends on few heads, so the common case allocates nothing.
+ ///
+ /// We also track all paths from this goal to that head. This is necessary
+ /// when rebasing provisional cache results.
+ #[derive(Clone, Debug, Default)]
+ struct CycleHeads {
+-    heads: BTreeMap<StackDepth, CycleHead>,
++    heads: SmallVec<[(StackDepth, CycleHead); 4]>,
+ }
+ 
+ impl CycleHeads {
+@@ -370,7 +376,7 @@
+     }
+ 
+     fn highest_cycle_head(&self) -> (StackDepth, CycleHead) {
+-        self.heads.last_key_value().map(|(k, v)| (*k, *v)).unwrap()
++        *self.heads.last().unwrap()
+     }
+ 
+     fn highest_cycle_head_index(&self) -> StackDepth {
+@@ -378,16 +384,15 @@
+     }
+ 
+     fn opt_highest_cycle_head_index(&self) -> Option<StackDepth> {
+-        self.heads.last_key_value().map(|(k, _)| *k)
++        self.heads.last().map(|&(k, _)| k)
+     }
+ 
+     fn opt_lowest_cycle_head_index(&self) -> Option<StackDepth> {
+-        self.heads.first_key_value().map(|(k, _)| *k)
++        self.heads.first().map(|&(k, _)| k)
+     }
+ 
+     fn remove_highest_cycle_head(&mut self) -> CycleHead {
+-        let last = self.heads.pop_last();
+-        last.unwrap().1
++        self.heads.pop().unwrap().1
+     }
+ 
+     fn insert(
+@@ -396,24 +401,26 @@
+         path_from_entry: impl Into<PathsToNested> + Copy,
+         usages: HeadUsages,
+     ) {
+-        match self.heads.entry(head_index) {
+-            btree_map::Entry::Vacant(entry) => {
+-                entry.insert(CycleHead { paths_to_head: path_from_entry.into(), usages });
+-            }
+-            btree_map::Entry::Occupied(entry) => {
+-                let head = entry.into_mut();
++        match self.heads.binary_search_by_key(&head_index, |&(k, _)| k) {
++            Ok(at) => {
++                let head = &mut self.heads[at].1;
+                 head.paths_to_head |= path_from_entry.into();
+                 head.usages.add_usages_from_nested(usages);
+             }
++            Err(at) => self.heads.insert(
++                at,
++                (head_index, CycleHead { paths_to_head: path_from_entry.into(), usages }),
++            ),
+         }
+     }
+ 
+     fn ignore_usages(&mut self, head_index: StackDepth, usages: HeadUsages) {
+-        self.heads.get_mut(&head_index).unwrap().usages.ignore_usages(usages)
++        let at = self.heads.binary_search_by_key(&head_index, |&(k, _)| k).unwrap();
++        self.heads[at].1.usages.ignore_usages(usages)
+     }
+ 
+     fn iter(&self) -> impl Iterator<Item = (StackDepth, CycleHead)> + '_ {
+-        self.heads.iter().map(|(k, v)| (*k, *v))
++        self.heads.iter().copied()
+     }
+ }
+ 
+@@ -643,10 +650,52 @@
+     /// global cache and track them locally instead. A provisional cache entry
+     /// is only valid until the result of one of its cycle heads changes.
+     provisional_cache: HashMap<X::Input, Vec<ProvisionalCacheEntry<X>>>,
++    /// Emptied lists of the provisional cache, reused for the next input that needs one.
++    spare_entries: Vec<Vec<ProvisionalCacheEntry<X>>>,
++    scratch: D::Scratch,
+ 
+     _marker: PhantomData<D>,
+ }
+ 
++/// What a search graph allocates, kept between root goals: emptied, with its capacity, when
++/// the graph ends, so the next root goal on this worker grows nothing it grew before.
++pub struct SearchGraphStorage<X: Cx, S> {
++    stack: Stack<X>,
++    provisional_cache: HashMap<X::Input, Vec<ProvisionalCacheEntry<X>>>,
++    /// Emptied lists of the provisional cache, reused for the next input that needs one.
++    spare_entries: Vec<Vec<ProvisionalCacheEntry<X>>>,
++    scratch: S,
++}
++
++impl<X: Cx, S: Default> Default for SearchGraphStorage<X, S> {
++    fn default() -> Self {
++        SearchGraphStorage {
++            stack: Default::default(),
++            provisional_cache: Default::default(),
++            spare_entries: Vec::new(),
++            scratch: S::default(),
++        }
++    }
++}
++
++impl<X: Cx, S> SearchGraphStorage<X, S> {
++    /// Bytes the graph's own buffers hold room for (not the scratch's): what a shelf keeps
++    /// the largest of.
++    pub fn held(&self) -> usize {
++        self.stack.capacity() * size_of::<StackEntry<X>>()
++            + self.provisional_cache.capacity()
++                * size_of::<(X::Input, Vec<ProvisionalCacheEntry<X>>)>()
++            + self.spare_entries.capacity() * size_of::<Vec<ProvisionalCacheEntry<X>>>()
++            + self.spare_entries.iter().map(|it| it.capacity()).sum::<usize>()
++                * size_of::<ProvisionalCacheEntry<X>>()
++    }
++
++    /// The delegate's scratch.
++    pub fn scratch(&self) -> &S {
++        &self.scratch
++    }
++}
++
+ /// While [`SearchGraph::update_parent_goal`] can be mostly shared between
+ /// ordinary nested goals/global cache hits and provisional cache hits,
+ /// using the provisional cache should not add any nested goals.
+@@ -664,14 +713,45 @@
+ 
+ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
+     pub fn new(root_depth: usize) -> SearchGraph<D> {
++        SearchGraph::new_in(root_depth, Default::default())
++    }
++
++    /// A graph over `storage`, which must be empty (as [`SearchGraph::into_storage`] leaves it).
++    pub fn new_in(
++        root_depth: usize,
++        storage: SearchGraphStorage<D::Cx, D::Scratch>,
++    ) -> SearchGraph<D> {
++        let SearchGraphStorage { stack, provisional_cache, spare_entries, scratch } = storage;
++        debug_assert!(stack.is_empty() && provisional_cache.is_empty());
+         Self {
+             root_depth: AvailableDepth(root_depth),
+-            stack: Default::default(),
+-            provisional_cache: Default::default(),
++            stack,
++            provisional_cache,
++            spare_entries,
++            scratch,
+             _marker: PhantomData,
+         }
+     }
+ 
++    /// Its storage, emptied with its capacity kept, for the next graph.
++    pub fn into_storage(self) -> SearchGraphStorage<D::Cx, D::Scratch> {
++        let SearchGraph { mut stack, mut provisional_cache, mut spare_entries, scratch, .. } =
++            self;
++        stack.clear();
++        // Every list is emptied, so the order they are kept in cannot be observed.
++        #[allow(rustc::potential_query_instability)]
++        spare_entries.extend(provisional_cache.drain().map(|(_, mut entries)| {
++            entries.clear();
++            entries
++        }));
++        SearchGraphStorage { stack, provisional_cache, spare_entries, scratch }
++    }
++
++    /// The delegate's scratch, kept with the graph.
++    pub fn scratch(&mut self) -> &mut D::Scratch {
++        &mut self.scratch
++    }
++
+     /// Lazily update the stack entry for the parent goal.
+     /// This behavior is shared between actually evaluating goals
+     /// and using existing global cache entries to make sure they
+@@ -691,12 +771,7 @@
+ 
+             for (head_index, head) in heads {
+                 if let Some(candidate_usages) = &mut parent.candidate_usages {
+-                    candidate_usages
+-                        .usages
+-                        .get_or_insert_default()
+-                        .entry(head_index)
+-                        .or_default()
+-                        .add_usages_from_nested(head.usages);
++                    candidate_usages.entry(head_index).add_usages_from_nested(head.usages);
+                 }
+                 match head_index.cmp(&parent_index) {
+                     Ordering::Less => parent.heads.insert(
+@@ -772,17 +847,17 @@
+     }
+ 
+     pub fn ignore_candidate_head_usages(&mut self, usages: CandidateHeadUsages) {
+-        if let Some(usages) = usages.usages {
+-            let (entry_index, entry) = self.stack.last_mut_with_index().unwrap();
+-            // Ignoring usages only mutates the state for the current `head_index`, so the
+-            // resulting per-head state is unchanged by iteration order.
+-            #[allow(rustc::potential_query_instability)]
+-            for (head_index, usages) in usages.into_iter() {
+-                if head_index == entry_index {
+-                    entry.usages.as_mut().unwrap().ignore_usages(usages);
+-                } else {
+-                    entry.heads.ignore_usages(head_index, usages);
+-                }
++        if usages.usages.is_empty() {
++            return;
++        }
++        let (entry_index, entry) = self.stack.last_mut_with_index().unwrap();
++        // Ignoring usages only mutates the state for the current `head_index`, so the
++        // resulting per-head state is unchanged by iteration order.
++        for (head_index, usages) in usages.usages {
++            if head_index == entry_index {
++                entry.usages.as_mut().unwrap().ignore_usages(usages);
++            } else {
++                entry.heads.ignore_usages(head_index, usages);
+             }
+         }
+     }
+@@ -925,7 +1000,11 @@
+             }
+         } else if D::ENABLE_PROVISIONAL_CACHE {
+             debug_assert!(validate_cache.is_none(), "unexpected non-root: {input:?}");
+-            let entry = self.provisional_cache.entry(input).or_default();
++            let spare = &mut self.spare_entries;
++            let entry = self
++                .provisional_cache
++                .entry(input)
++                .or_insert_with(|| spare.pop().unwrap_or_default());
+             let EvaluationResult {
+                 encountered_overflow,
+                 required_depth: _,
+@@ -976,13 +1055,18 @@
+         let rerun_index = self.stack.next_index();
+         // Each cached entry is filtered independently based on whether it depends on
+         // `rerun_index`, so bucket traversal order does not matter.
++        let spare = &mut self.spare_entries;
+         #[allow(rustc::potential_query_instability)]
+         self.provisional_cache.retain(|_, entries| {
+             entries.retain(|entry| {
+                 let (head_index, head) = entry.heads.highest_cycle_head();
+                 head_index != rerun_index || head.usages.is_empty()
+             });
+-            !entries.is_empty()
++            if entries.is_empty() {
++                spare.push(mem::take(entries));
++                return false;
++            }
++            true
+         });
+     }
+ }
+@@ -1032,6 +1116,7 @@
+         rebase_reason: RebaseReason<X>,
+     ) {
+         let popped_head_index = self.stack.next_index();
++        let spare = &mut self.spare_entries;
+         // Rebasing decisions depend only on each provisional entry and the current stack state,
+         // so traversing the cache in hash order cannot change the final cache contents.
+         #[allow(rustc::potential_query_instability)]
+@@ -1143,7 +1228,11 @@
+ 
+                 true
+             });
+-            !entries.is_empty()
++            if entries.is_empty() {
++                spare.push(mem::take(entries));
++                return false;
++            }
++            true
+         });
+     }
+ 
+@@ -1515,5 +1604,218 @@
+         debug!(?evaluation_result, "insert global cache");
+         let scope = cx.cache_scope(&dep_node);
+         cx.with_global_cache(scope, |cache| cache.insert(cx, input, evaluation_result, dep_node))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::convert::Infallible;
++
++    use super::*;
++
++    fn depth(at: usize) -> StackDepth {
++        StackDepth::from_usize(at)
++    }
++
++    fn usage(path: PathKind) -> HeadUsages {
++        let mut usages = HeadUsages::default();
++        usages.add_usage(path);
++        usages
++    }
++
++    #[test]
++    fn three_cycle_heads_keep_depth_order_without_allocating() {
++        blaze_alloc_count::assert_at_most(0, "three cycle heads", || {
++            let mut heads = CycleHeads::default();
++            for at in [5, 3, 1] {
++                heads.insert(depth(at), PathKind::Inductive, usage(PathKind::Inductive));
++            }
++            heads.insert(depth(3), PathKind::Coinductive, usage(PathKind::Coinductive));
++            assert!(heads.iter().map(|(at, _)| at).eq([depth(1), depth(3), depth(5)]));
++
++            let (_, merged) = heads.iter().nth(1).unwrap();
++            assert_eq!(merged.paths_to_head, PathsToNested::INDUCTIVE | PathsToNested::COINDUCTIVE);
++            assert_eq!(
++                merged.usages,
++                HeadUsages { inductive: 1, unknown: 0, coinductive: 1, forced_ambiguity: 0 }
++            );
++            heads.ignore_usages(depth(3), usage(PathKind::Inductive));
++            assert!(heads.iter().nth(1).unwrap().1.usages.is_single(PathKind::Coinductive));
++
++            assert_eq!(heads.opt_lowest_cycle_head_index(), Some(depth(1)));
++            assert_eq!(heads.highest_cycle_head().0, depth(5));
++            assert_eq!(heads.highest_cycle_head_index(), depth(5));
++            heads.remove_highest_cycle_head();
++            assert_eq!(heads.opt_highest_cycle_head_index(), Some(depth(3)));
++            heads.remove_highest_cycle_head();
++            heads.remove_highest_cycle_head();
++            assert!(heads.is_empty());
++            assert_eq!(heads.opt_highest_cycle_head_index(), None);
++        });
++    }
++
++    #[test]
++    fn merging_two_two_head_usages_allocates_nothing() {
++        blaze_alloc_count::assert_at_most(0, "merging candidate head usages", || {
++            let mut a = CandidateHeadUsages::default();
++            a.entry(depth(4)).add_usage(PathKind::Coinductive);
++            a.entry(depth(1)).add_usage(PathKind::Inductive);
++            let mut b = CandidateHeadUsages::default();
++            b.entry(depth(1)).add_usage(PathKind::Inductive);
++            b.entry(depth(4)).add_usage(PathKind::Unknown);
++            a.merge_usages(b);
++            assert!(a.usages.iter().map(|&(at, _)| at).eq([depth(1), depth(4)]));
++            assert_eq!(
++                a.usages[0].1,
++                HeadUsages { inductive: 2, unknown: 0, coinductive: 0, forced_ambiguity: 0 }
++            );
++            assert_eq!(
++                a.usages[1].1,
++                HeadUsages { inductive: 0, unknown: 1, coinductive: 1, forced_ambiguity: 0 }
++            );
++        });
++    }
++
++    /// Goals are indices into `NESTED`; a goal's result is the largest of its nested goals'.
++    /// Goals 0 to 3 form the cycle 0 -> 1 -> 2 -> 0 with 1 -> 3 beside it; 4 to 6 have none.
++    const NESTED: &[&[u32]] = &[&[1], &[2, 3], &[0], &[], &[5, 6], &[6], &[]];
++    const OVERFLOW: u32 = 2;
++
++    #[derive(Clone, Copy, Debug)]
++    struct TestCx;
++
++    thread_local! {
++        static CACHE: GlobalCache<TestCx> = const { GlobalCache::new() };
++    }
++
++    impl Cx for TestCx {
++        type Input = u32;
++        type Result = u32;
++        type AmbiguityKind = ();
++
++        type DepNodeIndex = ();
++        type Tracked<T: Debug + Clone> = T;
++        fn mk_tracked<T: Debug + Clone>(self, data: T, _: ()) -> T {
++            data
++        }
++        fn get_tracked<T: Debug + Clone>(self, tracked: &T) -> T {
++            tracked.clone()
++        }
++        fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, ()) {
++            (task(), ())
++        }
++        fn with_global_cache<R>(
++            self,
++            _: CacheScope,
++            f: impl FnOnce(&GlobalCache<Self>) -> R,
++        ) -> R {
++            CACHE.with(f)
++        }
++        fn cache_scope(self, _: &()) -> CacheScope {
++            CacheScope::Query
++        }
++        fn assert_evaluation_is_concurrent(&self) {}
++    }
++
++    struct TestDelegate;
++
++    impl Delegate for TestDelegate {
++        type Cx = TestCx;
++        type Scratch = Vec<u32>;
++        const ENABLE_PROVISIONAL_CACHE: bool = true;
++        type ValidationScope = Infallible;
++        fn enter_validation_scope(_: TestCx, _: u32) -> Option<Infallible> {
++            None
++        }
++
++        const FIXPOINT_STEP_LIMIT: usize = 8;
++
++        /// Not a no-op, so the graph neither reads nor writes the global cache: each run
++        /// computes every goal.
++        type ProofTreeBuilder = ();
++        fn inspect_is_noop(_: &mut ()) -> bool {
++            false
++        }
++
++        const DIVIDE_AVAILABLE_DEPTH_ON_OVERFLOW: usize = 4;
++
++        fn initial_provisional_result(_: TestCx, kind: PathKind, _: u32) -> u32 {
++            match kind {
++                PathKind::Coinductive => 0,
++                PathKind::Inductive | PathKind::Unknown | PathKind::ForcedAmbiguity => 1,
++            }
++        }
++        fn is_initial_provisional_result(result: u32) -> Option<PathKind> {
++            match result {
++                0 => Some(PathKind::Coinductive),
++                1 => Some(PathKind::Unknown),
++                _ => None,
++            }
++        }
++        fn stack_overflow_result(_: TestCx, _: u32) -> u32 {
++            OVERFLOW
++        }
++
++        const FIXPOINT_OVERFLOW_AMBIGUITY_KIND: () = ();
++        fn fixpoint_overflow_result(_: TestCx, _: u32) -> u32 {
++            OVERFLOW
++        }
++
++        fn is_ambiguous_result(result: u32) -> Option<()> {
++            (result == OVERFLOW).then_some(())
++        }
++
++        fn compute_goal(
++            search_graph: &mut SearchGraph<Self>,
++            cx: TestCx,
++            input: u32,
++            inspect: &mut (),
++        ) -> u32 {
++            let mut result = 0;
++            for &nested in NESTED[input as usize] {
++                result = result.max(search_graph.evaluate_goal(
++                    cx,
++                    nested,
++                    PathKind::Coinductive,
++                    LowerAvailableDepth::Yes,
++                    inspect,
++                ));
++            }
++            result
++        }
++    }
++
++    fn solve(graph: &mut SearchGraph<TestDelegate>, root: u32) -> u32 {
++        graph.evaluate_goal(TestCx, root, PathKind::Inductive, LowerAvailableDepth::Yes, &mut ())
++    }
++
++    #[test]
++    fn a_recycled_graph_holds_what_it_held_and_starts_empty() {
++        let mut graph = SearchGraph::<TestDelegate>::new(16);
++        assert_eq!(solve(&mut graph, 0), 0);
++        assert!(graph.is_empty());
++        graph.scratch().push(7);
++        let storage = graph.into_storage();
++        let held = storage.held();
++        assert!(held > 0);
++        assert_eq!(storage.scratch(), &[7]);
++
++        let mut graph = SearchGraph::<TestDelegate>::new_in(16, storage);
++        assert!(graph.is_empty());
++        assert_eq!(graph.debug_current_depth(), 0);
++        assert_eq!(solve(&mut graph, 0), 0);
++        assert!(graph.is_empty());
++        assert_eq!(graph.into_storage().held(), held);
++    }
++
++    #[test]
++    fn a_recycled_graph_solves_an_acyclic_goal_without_allocating() {
++        let mut graph = SearchGraph::<TestDelegate>::new(16);
++        assert_eq!(solve(&mut graph, 4), 0);
++        let mut graph = SearchGraph::<TestDelegate>::new_in(16, graph.into_storage());
++        blaze_alloc_count::assert_at_most(0, "a recycled search graph", || {
++            assert_eq!(solve(&mut graph, 4), 0);
++        });
++        assert!(graph.is_empty());
+     }
+ }
+diff -ruN a/src/search_graph/stack.rs b/src/search_graph/stack.rs
+--- a/src/search_graph/stack.rs
++++ b/src/search_graph/stack.rs
+@@ -85,6 +85,14 @@
+         self.entries.len()
+     }
+ 
++    pub(super) fn capacity(&self) -> usize {
++        self.entries.raw.capacity()
++    }
++
++    pub(super) fn clear(&mut self) {
++        self.entries.raw.clear()
++    }
++
+     pub(super) fn last(&self) -> Option<&StackEntry<X>> {
+         self.entries.raw.last()
+     }

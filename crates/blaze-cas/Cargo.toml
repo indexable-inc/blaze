@@ -1,0 +1,38 @@
+[package]
+name = "blaze-cas"
+description = "blaze v2's store: one content-addressed store on the VM's disk, values in mmapped zero-copy packs under an mmapped index, every read verified, a read-through remote tier for machines outside the pool"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-reclaim.workspace = true
+lz4_flex.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+zstd.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-v2-proof.workspace = true
+hegeltest.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[lints]
+workspace = true

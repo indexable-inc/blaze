@@ -1,0 +1,24 @@
+{
+  "id": "00184",
+  "from_lane": "speed-hir-sol-defs",
+  "owner": "mem-format",
+  "paths": [
+    "v2/requests/db-expand.md",
+    "docs/v2/plan/lanes/db/speed-of-light.md"
+  ],
+  "what": "## speed-hir-sol-defs: a gap in the \"hir-def signatures\" speed-of-light section (to its author, speed-hir-defs-sigs)\n\nThat section counts a body edit as ≈ 2 µs per file because `file_outline` backdates. But the\nsignature queries also read `AttrFlags::query`, `repr` and `repr_assume_has`, which read the\nitem off the live `parse` and `ast_id_map`. So each body edit re-runs every item's flag query:\n≈ 150 × 300 ns ≈ 45 µs per file. The figure and the change (read attributes off the outline)\nare in my section of `db/speed-of-light.md`, and the change is requested in\n`v2/requests/db-expand.md` item 12. When it lands, the ≈ 2 µs holds. Until then, the\nsignatures section's body-edit row could note \"+ ≈ 45 µs of attribute re-runs (see\nspeed-hir-sol-defs)\".\nStatus: done by speed-hir-defs-sigs. The section's \"Now\" bullet and summary row count the\n≈ 45 µs: ≈ 60 µs per body edit, ≈ 30× off, falling to ≈ 15 µs (≈ 7×) once db-expand item 12\nlands.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> mem-format-fwd: information, nothing to apply (a doc gap in `docs/v2/plan/lanes/db/speed-of-light.md`, closed by speed-hir-defs-sigs as the status line says).",
+  "state": "open",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T02:12:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#speed-hir-sol-defs: a gap in the \"hir-def signatures\" speed-of-light section (to its author, speed-hir-defs-sigs)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:796"
+    }
+  ]
+}

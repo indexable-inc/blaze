@@ -1,0 +1,37 @@
+{
+  "id": "00620",
+  "from_lane": "requests-format-next",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-fmt/src/parse/lower/expr.rs",
+    "crates/syntax/src/view/expr_ext.rs",
+    "crates/blaze-fmt"
+  ],
+  "what": "## 7. coordinator (`crates/blaze-fmt/src/parse/lower/expr.rs:274`): lower `UnsafeBinderCastExpr` as rustfmt's AST has it\n\nWhat: the view `Expr` (`ra::Expr`) gains `UnsafeBinderCastExpr`, so the exhaustive match in\n`Lowerer::expr` stops compiling. blaze-fmt's own AST already has\n`ExprKind::UnsafeBinderCast(UnsafeBinderCastKind, Box<Expr>, Option<Box<Ty>>)` and formats it\n(`expr.rs:434`, `utils.rs:587`), so lower it, after the `YieldExpr` arm:\n\n```rust\n            ra::Expr::UnsafeBinderCastExpr(c) => ast::ExprKind::UnsafeBinderCast(\n                if c.is_wrap() { ast::UnsafeBinderCastKind::Wrap } else { ast::UnsafeBinderCastKind::Unwrap },\n                self.opt_expr(c.expr(), span),\n                c.ty().map(|t| self.ty(t)),\n            ),\n```\n\nWhy: rustc_parse builds `ExprKind::UnsafeBinderCast(kind, expr, ty)` from `builtin # wrap_binder(e)`\n/ `builtin # unwrap_binder(e, T)`, and rustfmt prints it from that; putting it with the\n`unsupported` builtins would refuse a form rustfmt formats. The view accessors are\n`is_wrap()`, `expr()` and `ty()` (`crates/syntax/src/view/expr_ext.rs`, `view/generated/nodes.rs`).\n\n> forwarded to coordinator (requests, pass 38: `crates/blaze-fmt` is the coordinator's \"every other path\", not one of requests' paths; it lands with the view's `UnsafeBinderCastExpr`, which isn't generated yet; on the report's coordinator list)",
+  "state": "refused",
+  "created": "2026-10-30T05:58:18Z",
+  "updated": "2026-10-30T08:38:07Z",
+  "taken_by": "coord-apply-front",
+  "why": "already done: crates/blaze-fmt/src/parse/lower/expr.rs:258-264 lowers ra::Expr::UnsafeBinderCastExpr to ast::ExprKind::UnsafeBinderCast(Wrap|Unwrap by is_wrap(), opt_expr(c.expr()), c.ty().map(ty)); the view node exists (view/generated/nodes.rs:2026).",
+  "source": "v2/requests/requests-format-next.md#7. coordinator (`crates/blaze-fmt/src/parse/lower/expr.rs:274`): lower `UnsafeBinderCastExpr` as rustfmt's AST has it",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-format-next.md:168"
+    },
+    {
+      "at": "2026-10-30T08:38:03Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:38:07Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done: crates/blaze-fmt/src/parse/lower/expr.rs:258-264 lowers ra::Expr::UnsafeBinderCastExpr to ast::ExprKind::UnsafeBinderCast(Wrap|Unwrap by is_wrap(), opt_expr(c.expr()), c.ty().map(ty)); the view node exists (view/generated/nodes.rs:2026)."
+    }
+  ]
+}

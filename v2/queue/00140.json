@@ -1,0 +1,24 @@
+{
+  "id": "00140",
+  "from_lane": "diagnostics-items-features-gates",
+  "owner": "format",
+  "paths": [
+    "crates/parser",
+    "crates/syntax"
+  ],
+  "what": "## Parser / syntax (`crates/parser`, `crates/syntax`): gated syntax blaze cannot parse yet\n\nrustc parses each of these and gates it with E0658 (`compiler/rustc_parse`, gated in\n`compiler/rustc_ast_passes/src/feature_gate.rs::check_crate`). Today blaze's parser errors\ninstead, so `checks/features/gates/pre.rs` has no node to gate. Once the syntax tree has a node,\nadd its arm to `pre::gates_of` (and `post.rs` where `PostExpansionVisitor` also gates it).\n\n- `for await x in y` (async_for_loop)\n- `const { ... }` as an item (const_block_items)\n- contract attributes' `contract_requires`/`contract_ensures` (contracts_internals)\n- `x.use` and `use || ...` (ergonomic_clones)\n- `final fn` in traits (final_associated_functions)\n- `reuse path;` items (fn_delegation)\n- `pat if guard` in patterns (guard_patterns)\n- `move(expr)` (move_expr)\n- `mut ref x` / `mut ref mut x` bindings (mut_ref)\n- `&pin const T` / `&pin mut T`, `pin` receivers (pin_ergonomics)\n- `expr.match { ... }` (postfix_match)\n- `expr.yield` (yield_expr, postfix form)\n- `unsafe<'a> T` binder types (unsafe_binders)\n- attributes on where-clause predicates (where_clause_attrs)\n- `!Trait` bounds (negative_bounds)\n- `!` patterns and arms with no body (never_patterns)\n- `= value` defaults on tuple-struct fields and `unsafe` tuple fields (default_field_values,\n  unsafe_fields)\n\n> forwarded to format: `crates/parser` and `crates/syntax` are lane format's.",
+  "state": "open",
+  "created": "2026-10-30T01:39:25Z",
+  "updated": "2026-10-30T01:39:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-features-gates.md#Parser / syntax (`crates/parser`, `crates/syntax`): gated syntax blaze cannot parse yet",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-features-gates.md:3"
+    }
+  ]
+}

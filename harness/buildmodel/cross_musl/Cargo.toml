@@ -1,3 +1,0 @@
-[workspace]
-members = ["app", "on_gnu", "on_musl", "on_arm"]
-resolver = "2"

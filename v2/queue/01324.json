@@ -1,0 +1,23 @@
+{
+  "id": "01324",
+  "from_lane": "db",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs"
+  ],
+  "what": "lower_body (expr_store/lower.rs ~123) honours #[rust_analyzer::skip]: it lowers a written body to a Missing root with missing params. rustc ignores that tool attribute and compiles and checks the body, so this drops a body rustc builds (superset-of-rust). Lower the body regardless of the attribute. Until then hir-ty-borrowck check_def refuses such a body (skipped, Unsupported) rather than passing it: see hir-ty-borrowck missing_body_tests.rs a_written_body_lowered_to_nothing_is_refused, which flips to a_body_is_checked once fixed.",
+  "state": "open",
+  "created": "2026-10-31T16:52:55Z",
+  "updated": "2026-10-31T16:52:55Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:52:55Z",
+      "by": "db-next5",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

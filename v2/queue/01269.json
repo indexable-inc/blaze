@@ -1,0 +1,41 @@
+{
+  "id": "01269",
+  "from_lane": "tests-misc-stencil",
+  "owner": "fastcompile-premap-start",
+  "paths": [
+    "crates/blaze-mem/src/tag.rs"
+  ],
+  "what": "Round 7c (adc8bbbf04, /Volumes/Projects/.coord-1030/v2-build/round7c-test.log line 35145): blaze-premap tests::image_key_changes_with_every_instance panics at blaze-mem tag.rs:173:15 'attempt to add with overflow' in tag::add, from Region::publish (region.rs:279) <- Region::grow <- ensure <- chunks::carve <- chunks::take <- frame::Shelf::take_chunk (frame.rs:1002). `add` computes `live.fetch_add(b) + b` in checked arithmetic, so the overflow means `live` had already wrapped below zero: some `sub` (fetch_sub wraps silently) or `transfer` took more bytes off the tag than were ever added to it. The fix is in the accounting, finding the sub or transfer without a matching add, not a wrapping add that hides it. A debug assertion in `sub` that `live` does not go below zero (`fetch_sub` returning >= bytes) would name the path. Premap passed 23 of 24 tests; this test passed in round 6.",
+  "state": "applied",
+  "created": "2026-10-31T13:39:47Z",
+  "updated": "2026-10-31T14:44:38Z",
+  "taken_by": "fastcompile-premap-start",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:39:47Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from mem (no live window) to fastcompile-premap-start, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:16Z",
+      "by": "fastcompile-premap-start",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:44:38Z",
+      "by": "fastcompile-premap-start",
+      "action": "done",
+      "note": "Already fixed at HEAD by 7abbb7252c (round 8 checkpoint), after round 7c (adc8bbbf04) ran. Cause: Region::publish raised `committed` with fetch_max before tag::add, so a carve whose ensure saw the new length ran chunks::take transfer(Chunks -> Frames) before the bytes were counted; Chunks live wrapped below zero and the grower add overflowed at tag.rs:173. Now publish adds first, then compare_exchange publishes, and a loser subs its count back; regression test blaze-mem tests::a_region_counts_what_it_commits_before_another_thread_sees_it. Read the other Chunks paths (chunks take/give/give_all/give_cold/trim, frame Shelf take/give/drop, the tagged Treiber stack, LinkTable): every sub is ordered after its add. No edit; round 8 runs both blaze-mem test and premap image_key_changes_with_every_instance."
+    }
+  ]
+}

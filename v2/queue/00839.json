@@ -1,0 +1,36 @@
+{
+  "id": "00839",
+  "from_lane": "item-hash-identity",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/hash.rs",
+    "crates/blaze-items/src/form.rs"
+  ],
+  "what": "item-hash (blocking): a leak-free signature hash, `blaze_items::hash::signature_hash(db, ItemId) -> Result<InterfaceHash, Unhashable>` (tracked, SCCs as interface_of): the interface form with nothing a body leaks (form.rs: the const fn code form at :855, the const/static bodies at :1009/:1031, the opaque hidden types and their auto traits at :750/:1066, closure captures at :1419-1433 each write a fixed marker instead), every ref filled by its signature hash. Why: a body's identity is computed inside infer_body_query(def) (body_store lookup). interface_hash(owner) of an async/RPIT/const fn, a const, a static, or of the impl/trait/enum containing it, reads InferenceResult::of(def) itself: a salsa cycle infer(f) -> identity(f) -> interface(f) -> infer(f). The same holds for any same-crate item a body names whose interface reaches back (recursive const fns, a TAIT its defining body names) and for item-hash-facts' Signature fact values at lookup. Until this lands blaze_item_hash::identity hashes same-crate items by nothing and returns Err(Unidentified) for every body (no cache hit, no cycle); other crates' items use interface_hash (no cycle across the crate DAG).",
+  "state": "applied",
+  "created": "2026-10-30T08:42:18Z",
+  "updated": "2026-10-30T09:21:22Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:42:18Z",
+      "by": "item-hash-identity",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:13:51Z",
+      "by": "item-hash-identity",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:21:22Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "blaze_items::signature_hash and SignatureHash (lib.rs); hash.rs Graph::Signature (signature_form, signature_of, signature_unit, SIGNATURE_DOMAIN); form.rs Cx::leak_free and signature_ty_form, a LEAK marker at const fn, const, static and discriminant bodies, opaque hidden types and auto traits, closure captures, coroutine held locals. interface_hash and every other hash unchanged. Tests in tests/hashes.rs."
+    }
+  ]
+}

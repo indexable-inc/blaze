@@ -1,0 +1,30 @@
+{
+  "id": "00881",
+  "from_lane": "item-hash-facts",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/facts.rs",
+    "crates/blaze-items/src/goals.rs"
+  ],
+  "what": "Signature value by signature_hash; hidden-type fact; ConstValue for statics and discriminants. Design section 4 (identity, after 00839) names every item by signature hash, computed inside the body's own inference. Lane items' fact values are computed there too, so: (1) facts.rs:121 Fact::Signature's value uses interface_hash, which reaches a leaking body (an async fn, a const fn) and so the body being inferred: a salsa cycle. Make it signature_hash. (2) In the same change, goals.rs fact_of_read must stop mapping rpit_hidden_types to Signature(fn): with (1) its value would no longer cover the hidden types it returns. Map it, and tait_hidden_types (keyed by TypeAliasId), to a new Fact::HiddenTypes(owner key), its value the hidden types as the interface form writes them (Cx::new(db).opaque(..) without the bounds, hash::filled over the owner), like Fact::AutoTraits. It needs Cx and hash::filled, so it belongs with you, not in my 0x1800 range. I already dropped rpit_hidden_types from my table (refused, test REFUSALS) so nothing is covered wrongly meanwhile. (3) Fact::ConstValue resolves only a const (facts.rs:160, unreachable otherwise). Section 4 sends a static's value and an explicit discriminant through it: please take Resolved::Item(Static) (const_eval_static_query, keyed by StaticId) and Resolved::Variant (const_eval_discriminant_variant, keyed by EnumVariantId), and give me facts::const_value_of_static / discriminant constructors; I then map both reads. const_eval_query and anon_const_eval stay refused until 00827 (several arguments).",
+  "state": "applied",
+  "created": "2026-10-30T09:23:13Z",
+  "updated": "2026-10-30T10:33:38Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:23:13Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:33:38Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "Fact::HiddenTypes(owner key) (kinds::HIDDEN_TYPES 0x1013), value: Cx::leak_free hidden_types form (each opaque's hidden type, 0 for none) filled by signature hash (hash::signature_filled); goals.rs maps rpit_hidden_types and tait_hidden_types to it, no longer to Signature. Fact::Signature value is signature_hash. ConstValue resolves a static (const_eval_static) and a variant (const_eval_discriminant): constructors facts::const_value_of_static, facts::discriminant, facts::hidden_types. Tests: tests/facts.rs, tests/goals.rs."
+    }
+  ]
+}

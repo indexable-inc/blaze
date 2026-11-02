@@ -1,0 +1,24 @@
+{
+  "id": "00702",
+  "from_lane": "fastcompile",
+  "owner": "diagnostics-levels",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/levels.rs",
+    "crates/blaze-macro-eval/src/lex.rs"
+  ],
+  "what": "## fastcompile-macros 5: diagnostics: the level of a lexer lint at a crate's root, for a proc macro it calls (`crates/blaze-diagnostics/src/lints/levels.rs`)\n\nOwner: lane diagnostics (lints-syntax-early wrote `lints/syntax/early/lexer.rs`). Asked by\nfastcompile-macros (window `fastcompile-macros-next2`).\n\nWhat: a public function giving the level rustc's `buffer_lint` at `CRATE_NODE_ID` ends at for\n`text_direction_codepoint_in_comment` and `text_direction_codepoint_in_literal` in a crate:\nthe crate root's `#![allow/warn/deny/forbid]`, the crate's `-A/-W/-D/-F` and `--cap-lints`\n(cargo caps every registry dependency at `allow`), without the crate's def map (it is asked\nwhile the crate's proc macros expand, so the def map is being built; see\n\"fastcompile-macros 4\"). Say `pub fn root_level(db: &Db, krate: Crate, lint: &str) -> Level`\nwith `Level` public.\n\nWhy: rustc's lexer buffers both lints for the text a proc macro lexes through\n`TokenStream::from_str` (`rustc_parse::lexer`, `report_text_direction_codepoint`), deny by\ndefault. blaze's server (`crates/blaze-macro-eval/src/lex.rs` `Emitted::finish`) reports them\nas errors always, so an allowed or capped crate gets an error rustc does not give. With the\nlevel the server drops an allowed one, prints a warning one and errors only on deny or forbid.\n\nStatus: open\n\n> forwarded to diagnostics-levels (requests, pass 42: the root level belongs with `hir-lint-levels`/`blaze-lint-defs`, which it writes; told by tmux)",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-macros 5: diagnostics: the level of a lexer lint at a crate's root, for a proc macro it calls (`crates/blaze-diagnostics/src/lints/levels.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:4185"
+    }
+  ]
+}

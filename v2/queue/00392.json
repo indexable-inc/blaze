@@ -1,0 +1,23 @@
+{
+  "id": "00392",
+  "from_lane": "dedyn",
+  "owner": "diagnostics-speed-lints",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "## dedyn: cx.rs: keep `&dyn Files`, justified on the line\n\nFrom `dedyn-diag` (report `/tmp/blaze-lanes/v2-dedyn-diag.md`), 2026-10-29, based on the files\nas of 21:00.\n\n`Files::name` is called once per span built (`Cx::file_name`), and every call already returns a\nfresh `String`; the vtable call is noise beside that. It has three implementations (blaze-cargo's\n`Names`, `NoSpans` in `checks/features/library.rs`, the tests' `FxHashMap`), and making `Cx`\ngeneric over it would copy every pass of the crate per implementation. It stays, commented.\n\nIn `crates/blaze-diagnostics/src/cx.rs`, the field of `Cx`:\n\n```rust\n    files: &'a dyn Files,\n```\n\nbecomes\n\n```rust\n    files: &'a dyn Files, // dyn: called once per span named, beside the String it returns; a generic `Cx` would copy every pass\n```\n\nand the parameter of `Cx::new`:\n\n```rust\n        files: &'a dyn Files,\n```\n\nbecomes\n\n```rust\n        files: &'a dyn Files, // dyn: the caller's file names, read once per span named\n```\n\n> forwarded to diagnostics-speed-lints (window diagnostics-speed-lints-next1) (requests, pass 19; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:50:30Z",
+  "updated": "2026-10-30T03:50:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-lints.md#dedyn: cx.rs: keep `&dyn Files`, justified on the line",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-lints.md:3"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "01485",
+  "from_lane": "no-fallback-link-live",
+  "owner": "coordinator",
+  "paths": [
+    "harness/live_latency.py",
+    ".github/workflows/live-latency.yaml"
+  ],
+  "what": "## live_latency.py: port socket, burst, replay and restart to blaze_api::client\n\nAfter 01170 nothing reads `edit` lines on daemon.sock, so no-fallback-link-live deleted the edit-line client (ask_edit, the Winsock path, send_edit) and the four modes that used it. live_latency.py now refuses them by name, before building, saying they need a blaze_api::client (Open, Commit [Op::Write], Build) port. Only `cargo` (write the file, `blaze build`) remains, and live-latency.yaml's default is now `cargo`.\n\nTwo things are still missing:\n1. A stdlib-only Python client of blaze-api's CBOR frames for Open/Commit/Build, the requests demo/life/src/editor.rs `send` makes.\n2. New timing stamps. The breakdown (every mode, cargo included) and replay's patch matching read worker log lines `request: ... at_us=`, `live: edit SEQ ... at_us= took_us=`, `apply-us:`, `splice-us:`, `edit-to-binary:` and `link: ... spliced`. No Rust code in the tree prints them any more (`timeline-us:` survives in blaze-ui/src/api.rs). So cargo mode stops on its first edit with `timing: no request: or live: edit stamp in the worker log`: loud, but it times nothing.\n\nThe deleted modes are in git at 46a0d7a4c3:harness/live_latency.py (burst, replay with its per-program scripts, the restart session against cargo run).",
+  "state": "open",
+  "created": "2026-11-01T09:31:29Z",
+  "updated": "2026-11-01T09:31:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T09:31:29Z",
+      "by": "no-fallback-link-live",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -15,17 +15,13 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-rustc-hash.workspace = true
+blaze-hash.workspace = true
 blaze-manifest.workspace = true
-blaze-registry = { path = "../blaze-registry" }
-blaze-resolve = { path = "../blaze-resolve" }
+blaze-registry.workspace = true
+blaze-resolve.workspace = true
 blaze-units.workspace = true
-cargo-util-schemas = "=0.14.3"
-semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-toml.workspace = true
-url.workspace = true
 
 [lints]
 workspace = true

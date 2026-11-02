@@ -1,0 +1,21 @@
+{
+  "id": "00506",
+  "from_lane": "diagnostics-lints-levels",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-levels: a lint's `LintId` on `Found` (`lower/mod.rs`, `diagnostics`)\n\nWhat: `Found` gets `pub lint: Option<lints::registry::LintId>` beside `lint_at`, set where the\nlint is made (`registry::lint(\"name\")` once, in a `static` or `OnceLock` per pass, or\n`LintId::of(&LINT)`), and `Code::Lint` keeps its name for printing. Why: `lints::decide` now\nhashes each lint's name (`registry::declared`) to find its lint, because the name in\n`Code::Lint(String)` is all a `Found` has. With the id it is a 2-byte read. Until then it is one\nFxHash of a short name per lint found, which is correct.\n\n> forwarded to diagnostics: its own crate.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-levels: a lint's `LintId` on `Found` (`lower/mod.rs`, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2132"
+    }
+  ]
+}

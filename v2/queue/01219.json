@@ -1,0 +1,29 @@
+{
+  "id": "01219",
+  "from_lane": "query-unify",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-alloc-count"
+  ],
+  "what": "crates/blaze-alloc-count: on an assert_at_most failure, print where each counted allocation came from (capture a std::backtrace::Backtrace per allocation inside the measured closure, only when BLAZE_ALLOC_TRACE=1 is set, with a reentrancy guard so the capture itself is not counted), so allocation-budget failures can be fixed from the coordinator s logs by lanes that may not run cargo. First user: 01146, blaze-query tests::a_warm_miss_allocates_at_most_a_segment (3 allocations, 8225 bytes = segment + 32 + 1, budget 1; not findable by reading: I traced the miss path, file read, Bytes clone and value buffers, all allocation-free). Then please run that test with BLAZE_ALLOC_TRACE=1 and send query-unify the trace.",
+  "state": "taken",
+  "created": "2026-10-31T01:49:12Z",
+  "updated": "2026-10-31T14:01:13Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:49:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:01:13Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": "BLAZE_ALLOC_TRACE=1 in blaze-alloc-count: each counted allocation keeps its size and a backtrace (an OWN guard keeps the capture and the trace list out of the count), and a failing assert_at_most prints every one; without it the failure says how to trace. Tests: 9/9. Next: the trace of blaze-query a_warm_miss_allocates_at_most_a_segment after round 7c, sent to query-unify."
+    }
+  ]
+}

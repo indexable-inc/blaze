@@ -1,0 +1,10 @@
+crate root: FileId(EditionedFileId(Id(13312))) SourceFile SOURCE_FILE@0..321, 153 elements
+block: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@205..320, 47 elements
+block: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@229..318, 34 elements
+block: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@273..312, 12 elements
+file: FileId(EditionedFileId(Id(13315))) SourceFile SOURCE_FILE@0..74, 47 elements
+block: FileId(EditionedFileId(Id(13315))) BlockExpr BLOCK_EXPR@51..73, 12 elements
+inline: FileId(EditionedFileId(Id(13315))) Module MODULE@0..37, 23 elements
+inline: FileId(EditionedFileId(Id(13312))) Module MODULE@10..80, 35 elements
+block: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@46..78, 12 elements
+inline: MacroFile(MacroCallId(Id(27648))) Module MODULE@0..29, 14 elements

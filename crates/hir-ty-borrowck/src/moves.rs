@@ -7,34 +7,40 @@
 //! known only when the body runs, or inside a value whose type implements `Drop`, has none:
 //! it cannot be moved out of, and the nearest path above stands for it. A field of a union is
 //! the union.
+//!
+//! The paths are numbered in preorder, each local's tree in local order and a path's children
+//! in the order they were made, so a path and everything below it are one range of ids: a
+//! move or an init sets or clears a range of bits a word at a time, where rustc's
+//! `on_all_children_bits` walks the tree a bit at a time, and whether anything below a path is
+//! uninitialized is one scan of the words.
+//!
+//! The moves and inits come from the decode's columns ([`Decoded`]), point by point in reverse
+//! postorder, each point's moves before its `StorageDead` before its writes: the order rustc
+//! numbers its move outs in, which E0382's buffering keys on.
 
-use rustc_hash::FxHashMap;
+use std::{cell::RefCell, ops::Range};
+
 use rustc_type_ir::inherent::IntoKind;
-use smallvec::SmallVec;
 
 use hir_ty::{
     consteval::try_const_usize,
-    mir::{
-        AsmOperand, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-        StoredPlace, TerminatorKind,
-    },
+    mir::{BasicBlockId, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem},
     next_solver::TyKind,
 };
 
 use super::{
     Ctx,
-    bitset::BitSet,
+    bitset::{BitSet, Transfer, bits, filled_bits},
     cfg::{Cfg, Location, index},
+    dataflow::forward,
+    decode::{Decoded, MoveKind, Moved, NONE, WriteKind, Written, local, raw},
+    mem::{self, FMap, FVec, Frame, filled},
+    places::PlaceId,
+    relation::{Csr, Facts, Relation},
+    rows::{Edge, Effects, Rows},
 };
 
 pub(super) type Mpi = usize;
-
-pub(super) struct MovePath {
-    pub(super) local: LocalId,
-    pub(super) projection: Vec<PlaceElem>,
-    pub(super) parent: Option<Mpi>,
-    pub(super) children: Vec<Mpi>,
-}
 
 /// What a place is in terms of move paths.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,6 +54,20 @@ impl Lookup {
     pub(super) fn path(self) -> Mpi {
         match self {
             Lookup::Exact(it) | Lookup::Parent(it) => it,
+        }
+    }
+
+    fn pack(self) -> u32 {
+        match self {
+            Lookup::Exact(it) => (it as u32) << 1,
+            Lookup::Parent(it) => ((it as u32) << 1) | 1,
+        }
+    }
+
+    fn unpack(it: u32) -> Self {
+        match it & 1 {
+            0 => Lookup::Exact((it >> 1) as Mpi),
+            _ => Lookup::Parent((it >> 1) as Mpi),
         }
     }
 }
@@ -73,314 +93,502 @@ pub(super) struct Init {
     pub(super) kind: InitKind,
 }
 
-pub(super) struct MoveData {
-    pub(super) paths: Vec<MovePath>,
-    locals: Vec<Mpi>,
-    lookup: FxHashMap<(LocalId, Vec<PlaceElem>), Mpi>,
-    pub(super) moves: Vec<MoveOut>,
-    pub(super) inits: Vec<Init>,
-    pub(super) moves_at: FxHashMap<Location, SmallVec<[usize; 2]>>,
-    pub(super) inits_at: FxHashMap<Location, SmallVec<[usize; 2]>>,
-    /// The moves out of each path, by the index of the path.
-    pub(super) moves_of: Vec<Vec<usize>>,
-    /// The inits of each path.
-    pub(super) inits_of: Vec<Vec<usize>>,
+const _: () = assert!(size_of::<MoveOut>() <= 24);
+const _: () = assert!(size_of::<Init>() <= 40);
+
+/// The kinds of [`MoveData`]'s facts: the moves and the inits at a point, the moves of a path.
+const MOVE_AT: u8 = 0;
+const INIT_AT: u8 = 1;
+const MOVE_OF: u8 = 2;
+
+/// The move paths as columns by preorder id: 4 bytes of local, 4 of parent and 4 of subtree
+/// end per path, the projections one CSR. Finding a path's child is one hash probe.
+pub(super) struct MoveData<'f> {
+    local: FVec<'f, LocalId>,
+    parent: FVec<'f, u32>,
+    /// One past the last id below each path.
+    end: FVec<'f, u32>,
+    projections: Csr<'f, PlaceElem>,
+    /// Each local's path, by its index.
+    locals: &'f [u32],
+    /// The path below a path by one step.
+    steps: FMap<'f, (u32, PlaceElem), u32>,
+    /// What each place is, [`Lookup::pack`]ed, by [`PlaceId`]; [`NONE`] until asked.
+    lookups: RefCell<FVec<'f, u32>>,
+    pub(super) moves: FVec<'f, MoveOut>,
+    pub(super) inits: FVec<'f, Init>,
+    /// The moves and inits at each point and of each path, each in the order it was found.
+    facts: Relation<'f>,
+    /// By point, the local whose storage ends there; by block, where its call returns to and
+    /// whether it has a terminator: the decode's.
+    dead: &'f [u32],
+    returns: &'f [u32],
+    terminated: &'f [bool],
 }
 
-impl MoveData {
-    pub(super) fn gather<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, cfg: &Cfg) -> Self {
-        let mut data = MoveData {
-            paths: Vec::new(),
-            locals: Vec::new(),
-            lookup: FxHashMap::default(),
-            moves: Vec::new(),
-            inits: Vec::new(),
-            moves_at: FxHashMap::default(),
-            inits_at: FxHashMap::default(),
-            moves_of: Vec::new(),
-            inits_of: Vec::new(),
+/// The move paths while they are gathered: a tree linked by `u32` ids in the order the paths
+/// are made, the locals' first. Frozen into [`MoveData`]'s preorder columns at the end.
+struct Tree<'f> {
+    local: FVec<'f, LocalId>,
+    parent: FVec<'f, u32>,
+    depth: FVec<'f, u32>,
+    first_child: FVec<'f, u32>,
+    last_child: FVec<'f, u32>,
+    next_sibling: FVec<'f, u32>,
+    /// The step from its parent of each path but a local's, by id less the number of locals.
+    step: FVec<'f, PlaceElem>,
+    roots: usize,
+    steps: FMap<'f, (u32, PlaceElem), u32>,
+    /// What each place is, by [`PlaceId`], in the tree's ids.
+    lookups: FVec<'f, u32>,
+    moves: FVec<'f, MoveOut>,
+    inits: FVec<'f, Init>,
+}
+
+impl<'f> MoveData<'f> {
+    pub(super) fn gather<'db>(
+        ctx: &Ctx<'f, 'db>,
+        body: &MirBody<'db>,
+        cfg: &Cfg<'_>,
+        decoded: &Decoded<'f>,
+    ) -> Self {
+        let frame = ctx.frame;
+        let roots = body.locals.len();
+        let mut data = Tree {
+            local: Vec::with_capacity_in(roots * 2, frame),
+            parent: Vec::with_capacity_in(roots * 2, frame),
+            depth: Vec::with_capacity_in(roots * 2, frame),
+            first_child: Vec::with_capacity_in(roots * 2, frame),
+            last_child: Vec::with_capacity_in(roots * 2, frame),
+            next_sibling: Vec::with_capacity_in(roots * 2, frame),
+            step: Vec::with_capacity_in(roots, frame),
+            roots,
+            steps: mem::map(frame),
+            lookups: filled(frame, ctx.places.borrow().len(), NONE),
+            moves: Vec::with_capacity_in(cfg.points / 2, frame),
+            inits: Vec::with_capacity_in(cfg.points / 2, frame),
         };
         for (local, _) in body.locals.iter() {
-            let id = data.paths.len();
-            data.paths.push(MovePath {
-                local,
-                projection: Vec::new(),
-                parent: None,
-                children: Vec::new(),
-            });
-            data.lookup.insert((local, Vec::new()), id);
-            data.locals.push(id);
+            data.add(local, NONE, 0);
         }
         for &local in &body.param_locals {
-            let path = data.locals[local.into_raw().into_u32() as usize];
-            data.inits.push(Init { path, location: None, kind: InitKind::Deep });
+            data.inits.push(Init { path: raw(local), location: None, kind: InitKind::Deep });
         }
-        for &block in &cfg.order {
-            let data_block = &body.basic_blocks[block];
-            for (statement, it) in data_block.statements.iter().enumerate() {
-                let location = Location { block, statement };
-                let compares =
-                    matches!(&it.kind, StatementKind::Assign(_, rvalue) if super::compares(rvalue));
-                it.kind.for_each_operand(&mut |operand| {
-                    if !compares
-                        && let Some(place) = ctx.moved_place(body, operand)
-                        && !ctx.moves_out_of_guard(
-                            place.local,
-                            place.projection.as_slice(),
-                            operand.span().unwrap_or(it.span),
-                        )
-                    {
-                        data.gather_move(ctx, body, place, location);
-                    }
-                });
-                match &it.kind {
-                    StatementKind::Assign(place, rvalue) => {
-                        if let Rvalue::Discriminant(moved) = rvalue
-                            && ctx.cast_moves(body, moved, it.span)
-                        {
-                            data.gather_move(ctx, body, moved, location);
-                        }
-                        data.gather_init(ctx, body, place, location, InitKind::Deep)
-                    }
-                    StatementKind::StorageDead(local) => {
-                        if !body.param_locals.contains(local) {
-                            let path = data.locals[local.into_raw().into_u32() as usize];
-                            data.record_move(path, location);
-                        }
-                    }
-                    StatementKind::Deinit(place) => data.gather_move(ctx, body, place, location),
-                    StatementKind::InlineAsm(asm) => {
-                        for operand in &asm.operands {
-                            if let AsmOperand::Reg { output: Some(output), .. } = operand {
-                                data.gather_init(ctx, body, output, location, InitKind::Deep);
-                            }
-                        }
-                    }
-                    _ => (),
+        for &block in cfg.order.iter() {
+            let start = cfg.block_start(block);
+            for point in start..=cfg.block_end(body, block) {
+                let location = Location { block, statement: point - start };
+                for &moved in decoded.moves.of(point) {
+                    data.gather_move(ctx, decoded, moved, location);
                 }
-            }
-            let Some(terminator) = &data_block.terminator else { continue };
-            let location = Location { block, statement: data_block.statements.len() };
-            terminator.kind.for_each_operand(&mut |operand| {
-                if let Some(place) = ctx.moved_place(body, operand)
-                    && !ctx.moves_out_of_guard(
-                        place.local,
-                        place.projection.as_slice(),
-                        operand.span().unwrap_or(terminator.span),
-                    )
-                {
-                    data.gather_move(ctx, body, place, location);
+                let dead = decoded.dead[point];
+                if dead != NONE && !body.param_locals.contains(&local(dead)) {
+                    data.moves.push(MoveOut { path: dead as Mpi, location });
                 }
-            });
-            match &terminator.kind {
-                TerminatorKind::Drop { place, .. } => data.gather_move(ctx, body, place, location),
-                TerminatorKind::DropAndReplace { place, .. } => {
-                    data.gather_init(ctx, body, place, location, InitKind::Deep)
-                }
-                TerminatorKind::Call { destination, .. } => {
-                    data.gather_init(ctx, body, destination, location, InitKind::NonPanicPathOnly)
-                }
-                TerminatorKind::Yield { resume_arg, .. } => {
-                    data.gather_init(ctx, body, resume_arg, location, InitKind::Deep)
-                }
-                _ => (),
-            }
-        }
-        data.moves_of = vec![Vec::new(); data.paths.len()];
-        data.inits_of = vec![Vec::new(); data.paths.len()];
-        for (index, it) in data.moves.iter().enumerate() {
-            data.moves_of[it.path].push(index);
-        }
-        for (index, it) in data.inits.iter().enumerate() {
-            data.inits_of[it.path].push(index);
-        }
-        data
-    }
-
-    fn record_move(&mut self, path: Mpi, location: Location) {
-        self.moves_at.entry(location).or_default().push(self.moves.len());
-        self.moves.push(MoveOut { path, location });
-    }
-
-    fn gather_move<'db>(
-        &mut self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        place: &StoredPlace,
-        location: Location,
-    ) {
-        // A move of a subslice of an array moves each element of it.
-        if let Some((ProjectionElem::Subslice { from, to }, base)) =
-            place.projection.as_slice().split_last()
-            && let Lookup::Exact(array) = self.create_projection(ctx, body, place.local, base)
-            && let TyKind::Array(_, len) = ctx.place_ty(body, place.local, base).ty.kind()
-            && let Some(len) = try_const_usize(ctx.db, len)
-        {
-            for offset in *from..(len as u64).saturating_sub(*to) {
-                let path = self.child(
-                    array,
-                    place.local,
-                    ProjectionElem::ConstantIndex {
-                        offset,
-                        min_length: offset + 1,
-                        from_end: false,
-                    },
-                );
-                self.record_move(path, location);
-            }
-            return;
-        }
-        match self.create(ctx, body, place) {
-            Lookup::Exact(path) => self.record_move(path, location),
-            // A move out of a field of a union moves the union, as long as nothing else on the
-            // way makes it an error.
-            Lookup::Parent(path) => {
-                let projection = place.projection.as_slice();
-                let depth = self.paths[path].projection.len();
-                let base_ty = ctx.place_ty(body, place.local, &projection[..depth]).ty;
-                if matches!(projection[depth], ProjectionElem::Field(_))
-                    && matches!(base_ty.kind(), TyKind::Adt(def, _) if def.is_union())
-                    && projection[depth + 1..]
-                        .iter()
-                        .all(|it| matches!(it, ProjectionElem::Field(_)))
-                {
-                    self.record_move(path, location);
+                for &written in decoded.writes.of(point) {
+                    data.gather_init(ctx, decoded, written, location);
                 }
             }
         }
+        data.freeze(frame, cfg, decoded)
     }
 
-    fn child(&mut self, parent: Mpi, local: LocalId, step: PlaceElem) -> Mpi {
-        let mut key = self.paths[parent].projection.clone();
-        key.push(step);
-        if let Some(&it) = self.lookup.get(&(local, key.clone())) {
-            return it;
-        }
-        let id = self.paths.len();
-        self.paths.push(MovePath {
-            local,
-            projection: key.clone(),
-            parent: Some(parent),
-            children: Vec::new(),
-        });
-        self.paths[parent].children.push(id);
-        self.lookup.insert((local, key), id);
-        id
+    pub(super) fn len(&self) -> usize {
+        self.local.len()
     }
 
-    fn gather_init<'db>(
-        &mut self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        place: &StoredPlace,
-        location: Location,
-        kind: InitKind,
-    ) {
-        let lookup = self.create(ctx, body, place);
-        let path = match lookup {
-            Lookup::Exact(path) => path,
-            // Assigning a field of a union initializes the union.
-            Lookup::Parent(path) if self.is_union_field(ctx, body, place, path) => path,
-            Lookup::Parent(_) => return,
-        };
-        self.inits_at.entry(location).or_default().push(self.inits.len());
-        self.inits.push(Init { path, location: Some(location), kind });
+    pub(super) fn local(&self, path: Mpi) -> LocalId {
+        self.local[path]
     }
 
-    fn is_union_field<'db>(
-        &self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        place: &StoredPlace,
-        parent: Mpi,
-    ) -> bool {
-        let projection = place.projection.as_slice();
-        let depth = self.paths[parent].projection.len();
-        if projection.len() != depth + 1 || !matches!(projection[depth], ProjectionElem::Field(_)) {
-            return false;
-        }
-        let ty = ctx.place_ty(body, place.local, &projection[..depth]).ty;
-        matches!(ty.kind(), TyKind::Adt(def, _) if def.is_union())
+    pub(super) fn parent(&self, path: Mpi) -> Option<Mpi> {
+        let parent = self.parent[path];
+        (parent != NONE).then_some(parent as Mpi)
     }
 
-    /// The path of `place`, made if it can have one.
-    fn create<'db>(
-        &mut self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        place: &StoredPlace,
-    ) -> Lookup {
-        self.create_projection(ctx, body, place.local, place.projection.as_slice())
+    /// The projection of the place `path` is, from its local.
+    pub(super) fn projection(&self, path: Mpi) -> &[PlaceElem] {
+        self.projections.of(path)
     }
 
-    fn create_projection<'db>(
-        &mut self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        local: LocalId,
-        projection: &[PlaceElem],
-    ) -> Lookup {
-        let mut path = self.locals[local.into_raw().into_u32() as usize];
-        let mut ty = PlaceTy::from_ty(body.locals[local].ty.as_ref());
-        for elem in projection {
-            let Some(step) = ctx.trackable(ty, elem) else { return Lookup::Parent(path) };
-            path = self.child(path, local, step);
-            ty = ctx.project(ty, elem);
-        }
-        Lookup::Exact(path)
+    /// `path` and every path below it.
+    pub(super) fn subtree(&self, path: Mpi) -> Range<usize> {
+        path..self.end[path] as usize
+    }
+
+    /// The paths right below `path`, in the order they were made.
+    pub(super) fn children(&self, path: Mpi) -> impl Iterator<Item = Mpi> + '_ {
+        let end = self.end[path] as usize;
+        let mut at = path + 1;
+        std::iter::from_fn(move || {
+            (at < end).then(|| {
+                let child = at;
+                at = self.end[child] as usize;
+                child
+            })
+        })
+    }
+
+    /// The first path at or below `path`, in preorder, that is in `set`: rustc's
+    /// `find_in_move_path_or_its_descendants`.
+    pub(super) fn first_in(&self, path: Mpi, set: &BitSet<'_>) -> Option<Mpi> {
+        set.first_in(self.subtree(path))
+    }
+
+    pub(super) fn is_ancestor_or_self(&self, ancestor: Mpi, path: Mpi) -> bool {
+        self.subtree(ancestor).contains(&path)
+    }
+
+    /// The moves out at `point`, in the order they happen.
+    pub(super) fn moves_at(&self, point: usize) -> &'f [u32] {
+        self.facts.get(MOVE_AT, point)
+    }
+
+    /// The inits at `point`, in the order they happen.
+    pub(super) fn inits_at(&self, point: usize) -> &'f [u32] {
+        self.facts.get(INIT_AT, point)
+    }
+
+    /// The moves out of `path`.
+    pub(super) fn moves_of(&self, path: Mpi) -> &'f [u32] {
+        self.facts.get(MOVE_OF, path)
     }
 
     /// The path of `place` if it has been made, or the nearest one above it.
     pub(super) fn find<'db>(
         &self,
         ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
+        _body: &MirBody<'db>,
         local: LocalId,
         projection: &[PlaceElem],
     ) -> Lookup {
-        let mut path = self.locals[local.into_raw().into_u32() as usize];
-        let mut ty = PlaceTy::from_ty(body.locals[local].ty.as_ref());
-        for elem in projection {
-            let Some(step) = ctx.trackable(ty, elem) else { return Lookup::Parent(path) };
-            let mut key = self.paths[path].projection.clone();
-            key.push(step);
-            match self.lookup.get(&(local, key)) {
-                Some(&it) => path = it,
-                None => return Lookup::Parent(path),
-            }
-            ty = ctx.project(ty, elem);
+        self.find_place(ctx, ctx.place(local, projection))
+    }
+
+    fn find_place(&self, ctx: &Ctx<'_, '_>, place: PlaceId) -> Lookup {
+        if let Some(&known) = self.lookups.borrow().get(place as usize)
+            && known != NONE
+        {
+            return Lookup::unpack(known);
         }
-        Lookup::Exact(path)
+        let parent = ctx.places.borrow().parent(place);
+        let found = match parent {
+            None => Lookup::Exact(self.locals[place as usize] as Mpi),
+            Some(parent) => match self.find_place(ctx, parent) {
+                Lookup::Parent(path) => Lookup::Parent(path),
+                Lookup::Exact(path) => {
+                    match step_of(ctx, parent, place) {
+                        Some(step) => match self.steps.get(&(path as u32, step)) {
+                            Some(&child) => Lookup::Exact(child as Mpi),
+                            None => Lookup::Parent(path),
+                        },
+                        None => Lookup::Parent(path),
+                    }
+                }
+            },
+        };
+        let mut lookups = self.lookups.borrow_mut();
+        if lookups.len() <= place as usize {
+            lookups.resize(place as usize + 1, NONE);
+        }
+        lookups[place as usize] = found.pack();
+        found
     }
 
     pub(super) fn local_path(&self, local: LocalId) -> Mpi {
-        self.locals[local.into_raw().into_u32() as usize]
+        self.locals[raw(local)] as Mpi
+    }
+}
+
+/// The step of a move path from `parent` that `place`, one element below it, is, if it has
+/// one.
+fn step_of(ctx: &Ctx<'_, '_>, parent: PlaceId, place: PlaceId) -> Option<PlaceElem> {
+    let (ty, elem) = {
+        let places = ctx.places.borrow();
+        (places.ty(parent), places.elem(place).copied()?)
+    };
+    ctx.trackable(ty, &elem)
+}
+
+/// The length of the array `place` is, if it is one of a known length.
+fn array_len(ctx: &Ctx<'_, '_>, place: PlaceId) -> Option<u64> {
+    let ty = ctx.places.borrow().ty(place).ty;
+    match ty.kind() {
+        TyKind::Array(_, len) => try_const_usize(ctx.db, len).map(|it| it as u64),
+        _ => None,
+    }
+}
+
+/// The place `up` elements above `place`.
+fn ancestor(ctx: &Ctx<'_, '_>, mut place: PlaceId, up: usize) -> PlaceId {
+    let places = ctx.places.borrow();
+    for _ in 0..up {
+        match places.parent(place) {
+            Some(parent) => place = parent,
+            None => break,
+        }
+    }
+    place
+}
+
+impl<'f> Tree<'f> {
+    fn add(&mut self, local: LocalId, parent: u32, depth: u32) -> u32 {
+        let id = self.local.len() as u32;
+        self.local.push(local);
+        self.parent.push(parent);
+        self.depth.push(depth);
+        self.first_child.push(NONE);
+        self.last_child.push(NONE);
+        self.next_sibling.push(NONE);
+        if parent != NONE {
+            let parent = parent as usize;
+            match self.last_child[parent] {
+                NONE => self.first_child[parent] = id,
+                last => self.next_sibling[last as usize] = id,
+            }
+            self.last_child[parent] = id;
+        }
+        id
     }
 
-    /// `path` and every path below it.
-    pub(super) fn with_descendants(&self, path: Mpi, f: &mut impl FnMut(Mpi)) {
-        f(path);
-        for &child in &self.paths[path].children {
-            self.with_descendants(child, f);
+    fn gather_move(
+        &mut self,
+        ctx: &Ctx<'_, '_>,
+        decoded: &Decoded<'_>,
+        moved: Moved,
+        location: Location,
+    ) {
+        let place = moved.place;
+        let ty = ctx.places.borrow().ty(place).ty;
+        let local = decoded.local(place);
+        let projection = decoded.projection(place);
+        let moves = match moved.kind {
+            MoveKind::Operand => {
+                !ctx.is_copy(ty) && !ctx.moves_out_of_guard(local, projection, moved.span)
+            }
+            MoveKind::Cast => !ctx.is_copy(ty),
+            MoveKind::Always => true,
+        };
+        if !moves {
+            return;
+        }
+        let base = ctx.places.borrow().parent(place);
+        // A move of a subslice of an array moves each element of it.
+        if let Some(ProjectionElem::Subslice { from, to }) = projection.last()
+            && let Some(base) = base
+            && let Lookup::Exact(array) = self.create(ctx, base)
+            && let Some(len) = array_len(ctx, base)
+        {
+            for offset in *from..len.saturating_sub(*to) {
+                let path = self.child(
+                    array as u32,
+                    local,
+                    ProjectionElem::ConstantIndex {
+                        offset,
+                        min_length: offset + 1,
+                        from_end: false,
+                    },
+                );
+                self.moves.push(MoveOut { path: path as Mpi, location });
+            }
+            return;
+        }
+        match self.create(ctx, place) {
+            Lookup::Exact(path) => self.moves.push(MoveOut { path, location }),
+            // A move out of a field of a union moves the union, as long as nothing else on the
+            // way makes it an error.
+            Lookup::Parent(path) => {
+                let depth = self.depth[path] as usize;
+                let base = ancestor(ctx, place, projection.len() - depth);
+                let base_ty = ctx.places.borrow().ty(base).ty;
+                if matches!(projection[depth], ProjectionElem::Field(_))
+                    && matches!(base_ty.kind(), TyKind::Adt(def, _) if def.is_union())
+                    && projection[depth + 1..]
+                        .iter()
+                        .all(|it| matches!(it, ProjectionElem::Field(_)))
+                {
+                    self.moves.push(MoveOut { path, location });
+                }
+            }
         }
     }
 
-    pub(super) fn find_in_descendants(&self, path: Mpi, f: &impl Fn(Mpi) -> bool) -> Option<Mpi> {
-        if f(path) {
-            return Some(path);
+    fn child(&mut self, parent: u32, local: LocalId, step: PlaceElem) -> u32 {
+        if let Some(&it) = self.steps.get(&(parent, step)) {
+            return it;
         }
-        self.paths[path].children.iter().find_map(|&child| self.find_in_descendants(child, f))
+        let id = self.add(local, parent, self.depth[parent as usize] + 1);
+        self.step.push(step);
+        self.steps.insert((parent, step), id);
+        id
     }
 
-    pub(super) fn is_ancestor_or_self(&self, ancestor: Mpi, mut path: Mpi) -> bool {
-        loop {
-            if path == ancestor {
-                return true;
+    fn gather_init(
+        &mut self,
+        ctx: &Ctx<'_, '_>,
+        decoded: &Decoded<'_>,
+        written: Written,
+        location: Location,
+    ) {
+        let kind = match written.kind {
+            WriteKind::Call => InitKind::NonPanicPathOnly,
+            WriteKind::Assign | WriteKind::Asm | WriteKind::DropAndReplace | WriteKind::Yield => {
+                InitKind::Deep
             }
-            match self.paths[path].parent {
-                Some(parent) => path = parent,
-                None => return false,
+        };
+        let place = written.place;
+        let path = match self.create(ctx, place) {
+            Lookup::Exact(path) => path,
+            // Assigning a field of a union initializes the union.
+            Lookup::Parent(path) if self.is_union_field(ctx, decoded, place, path) => path,
+            Lookup::Parent(_) => return,
+        };
+        self.inits.push(Init { path, location: Some(location), kind });
+    }
+
+    fn is_union_field(
+        &self,
+        ctx: &Ctx<'_, '_>,
+        decoded: &Decoded<'_>,
+        place: PlaceId,
+        parent: Mpi,
+    ) -> bool {
+        let projection = decoded.projection(place);
+        let depth = self.depth[parent] as usize;
+        if projection.len() != depth + 1 || !matches!(projection[depth], ProjectionElem::Field(_)) {
+            return false;
+        }
+        let places = ctx.places.borrow();
+        let Some(base) = places.parent(place) else { return false };
+        matches!(places.ty(base).ty.kind(), TyKind::Adt(def, _) if def.is_union())
+    }
+
+    /// The path of `place`, made if it can have one: its parent's first, then the step down.
+    fn create(&mut self, ctx: &Ctx<'_, '_>, place: PlaceId) -> Lookup {
+        if let Some(&known) = self.lookups.get(place as usize)
+            && known != NONE
+        {
+            return Lookup::unpack(known);
+        }
+        let (parent, local) = {
+            let places = ctx.places.borrow();
+            (places.parent(place), places.local(place))
+        };
+        let found = match parent {
+            None => Lookup::Exact(place as Mpi),
+            Some(parent) => match self.create(ctx, parent) {
+                Lookup::Parent(path) => Lookup::Parent(path),
+                Lookup::Exact(path) => match step_of(ctx, parent, place) {
+                    Some(step) => Lookup::Exact(self.child(path as u32, local, step) as Mpi),
+                    None => Lookup::Parent(path),
+                },
+            },
+        };
+        if self.lookups.len() <= place as usize {
+            self.lookups.resize(place as usize + 1, NONE);
+        }
+        self.lookups[place as usize] = found.pack();
+        found
+    }
+
+    /// The paths renumbered in preorder, without a stack: down to the first child, else on
+    /// to the next sibling, else back up.
+    fn freeze(self, frame: &'f Frame, cfg: &Cfg<'_>, decoded: &Decoded<'f>) -> MoveData<'f> {
+        let count = self.local.len();
+        let mut order: FVec<'f, u32> = Vec::with_capacity_in(count, frame);
+        let mut renumbered = filled(frame, count, NONE);
+        for root in 0..self.roots {
+            let mut at = root;
+            'walk: loop {
+                renumbered[at] = order.len() as u32;
+                order.push(at as u32);
+                if self.first_child[at] != NONE {
+                    at = self.first_child[at] as usize;
+                    continue;
+                }
+                while at != root {
+                    if self.next_sibling[at] != NONE {
+                        at = self.next_sibling[at] as usize;
+                        continue 'walk;
+                    }
+                    at = self.parent[at] as usize;
+                }
+                break;
             }
+        }
+        let depths: usize = self.depth.iter().map(|&it| it as usize).sum();
+        let mut local = Vec::with_capacity_in(count, frame);
+        let mut parent = Vec::with_capacity_in(count, frame);
+        let mut end = mem::collect(frame, 1..=count as u32);
+        let mut projections = Csr::with_capacity(frame, count, depths);
+        for &old in &order {
+            let old = old as usize;
+            local.push(self.local[old]);
+            let up = self.parent[old];
+            if up == NONE {
+                parent.push(NONE);
+            } else {
+                let up = renumbered[up as usize];
+                parent.push(up);
+                projections.push_from(up as usize);
+                projections.push(self.step[old - self.roots]);
+            }
+            projections.end_node();
+        }
+        for path in (0..count).rev() {
+            if parent[path] != NONE {
+                let up = parent[path] as usize;
+                end[up] = end[up].max(end[path]);
+            }
+        }
+        let mut steps = mem::map(frame);
+        steps.reserve(count - self.roots);
+        for old in self.roots..count {
+            let up = renumbered[self.parent[old] as usize];
+            steps.insert((up, self.step[old - self.roots]), renumbered[old]);
+        }
+        let mut lookups = self.lookups;
+        for it in lookups.iter_mut().filter(|it| **it != NONE) {
+            let lookup = match Lookup::unpack(*it) {
+                Lookup::Exact(path) => Lookup::Exact(renumbered[path] as Mpi),
+                Lookup::Parent(path) => Lookup::Parent(renumbered[path] as Mpi),
+            };
+            *it = lookup.pack();
+        }
+        let mut moves = self.moves;
+        for it in moves.iter_mut() {
+            it.path = renumbered[it.path] as Mpi;
+        }
+        let mut inits = self.inits;
+        for it in inits.iter_mut() {
+            it.path = renumbered[it.path] as Mpi;
+        }
+        let mut facts = Facts::with_capacity(frame, moves.len() * 2 + inits.len());
+        for (index, it) in moves.iter().enumerate() {
+            facts.push(MOVE_AT, cfg.point(it.location), index);
+            facts.push(MOVE_OF, it.path, index);
+        }
+        for (index, it) in inits.iter().enumerate() {
+            if let Some(location) = it.location {
+                facts.push(INIT_AT, cfg.point(location), index);
+            }
+        }
+        let facts = facts.freeze(&[cfg.points, cfg.points, count]);
+        let renumbered: &'f [u32] = renumbered.leak();
+        MoveData {
+            local,
+            parent,
+            end,
+            projections,
+            locals: &renumbered[..self.roots],
+            steps,
+            lookups: RefCell::new(lookups),
+            moves,
+            inits,
+            facts,
+            dead: decoded.dead,
+            returns: decoded.returns,
+            terminated: decoded.terminated,
         }
     }
 }
@@ -428,127 +636,147 @@ impl<'db> Ctx<'_, 'db> {
 /// Which paths may be uninitialized at the start of each block: rustc's
 /// `MaybeUninitializedPlaces`. And per local, whether it may have been initialized since its
 /// storage last ended: `EverInitializedPlaces`, of whole locals.
-pub(super) struct InitFlow {
-    pub(super) uninit_entry: Vec<BitSet>,
-    pub(super) ever_entry: Vec<BitSet>,
+pub(super) struct InitFlow<'f> {
+    /// A row of move paths per block.
+    pub(super) uninit_entry: Rows<'f>,
+    /// A row of locals per block.
+    pub(super) ever_entry: Rows<'f>,
 }
 
-impl InitFlow {
-    pub(super) fn compute(body: &MirBody<'_>, cfg: &Cfg, moves: &MoveData) -> Self {
+impl<'f> InitFlow<'f> {
+    pub(super) fn compute(
+        frame: &'f Frame,
+        body: &MirBody<'_>,
+        cfg: &Cfg<'_>,
+        moves: &MoveData<'_>,
+    ) -> Self {
         let blocks = body.basic_blocks.len();
-        let paths = moves.paths.len();
+        let paths = moves.len();
         let locals = body.locals.len();
-        let mut uninit_entry = vec![BitSet::new(paths); blocks];
-        let mut ever_entry = vec![BitSet::new(locals); blocks];
-        let mut seen = vec![false; blocks];
-        {
-            let start = index(body.start_block);
-            let entry = &mut uninit_entry[start];
-            for path in 0..paths {
-                entry.insert(path);
+        let mut uninit = Effects::new(frame, blocks, paths);
+        let mut ever = Effects::new(frame, blocks, locals);
+        // A call's return: what its destination being initialized does on that edge only, a
+        // row per reachable call rather than per block.
+        let returns = |block: BasicBlockId| moves.returns[index(block)] != NONE;
+        let calls = cfg.order.iter().filter(|&&block| returns(block)).count();
+        let mut returned_uninit = Effects::new(frame, calls, paths);
+        let mut returned_ever = Effects::new(frame, calls, locals);
+        // Per block, its call's row.
+        let call_of: &'f mut [u32] = frame.alloc_slice_fill_with(blocks, |_| NONE);
+        let mut call = 0;
+        for &block in cfg.order.iter() {
+            let (start, end) = (cfg.block_start(block), cfg.block_end(body, block));
+            {
+                let (mut uninit, mut ever) = (uninit.row(index(block)), ever.row(index(block)));
+                for point in start..=end {
+                    apply_at(moves, point, &mut uninit, &mut ever);
+                }
             }
-            for init in moves.inits.iter().filter(|it| it.location.is_none()) {
-                moves.with_descendants(init.path, &mut |it| entry.remove(it));
-                ever_entry[start]
-                    .insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-            }
-            seen[start] = true;
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &block in &cfg.order {
-                if !seen[index(block)] {
-                    continue;
-                }
-                let mut uninit = uninit_entry[index(block)].clone();
-                let mut ever = ever_entry[index(block)].clone();
-                let data = &body.basic_blocks[block];
-                for statement in 0..=data.statements.len() {
-                    let location = Location { block, statement };
-                    apply(body, moves, location, &mut uninit, &mut ever);
-                }
-                let Some(terminator) = &data.terminator else { continue };
-                let returned = match &terminator.kind {
-                    TerminatorKind::Call { target: Some(target), .. } => Some(*target),
-                    _ => None,
-                };
-                for &target in &cfg.successors[index(block)] {
-                    let (mut uninit, mut ever) = (uninit.clone(), ever.clone());
-                    if Some(target) == returned {
-                        call_returned(
-                            moves,
-                            Location { block, statement: data.statements.len() },
-                            &mut uninit,
-                            &mut ever,
-                        );
-                    }
-                    let t = index(target);
-                    if !seen[t] {
-                        seen[t] = true;
-                        uninit_entry[t] = uninit;
-                        ever_entry[t] = ever;
-                        changed = true;
-                    } else {
-                        changed |= uninit_entry[t].union(&uninit);
-                        changed |= ever_entry[t].union(&ever);
-                    }
-                }
+            if returns(block) {
+                call_of[index(block)] = call as u32;
+                let (mut uninit, mut ever) = (returned_uninit.row(call), returned_ever.row(call));
+                call_returned(moves, end, &mut uninit, &mut ever);
+                call += 1;
             }
         }
+        let call_of: &[u32] = call_of;
+        let mut uninit_start = filled_bits(frame, paths);
+        let mut ever_start = bits(frame, locals);
+        for init in moves.inits.iter().filter(|it| it.location.is_none()) {
+            uninit_start.kill_range(moves.subtree(init.path));
+            ever_start.insert(raw(moves.local(init.path)));
+        }
+        let uninit_entry = forward(
+            frame,
+            cfg,
+            &uninit,
+            body.start_block,
+            uninit_start.words(),
+            edges(moves, call_of, &returned_uninit),
+        );
+        let ever_entry = forward(
+            frame,
+            cfg,
+            &ever,
+            body.start_block,
+            ever_start.words(),
+            edges(moves, call_of, &returned_ever),
+        );
         InitFlow { uninit_entry, ever_entry }
     }
 }
 
-/// The effect of the statement or terminator at `location` on what may be uninitialized and
-/// what has ever been initialized, the return of a call aside.
-pub(super) fn apply(
-    body: &MirBody<'_>,
-    moves: &MoveData,
-    location: Location,
-    uninit: &mut BitSet,
-    ever: &mut BitSet,
-) {
-    if let Some(at) = moves.moves_at.get(&location) {
-        for &index in at {
-            moves.with_descendants(moves.moves[index].path, &mut |it| {
-                uninit.insert(it);
-            });
+/// What crosses each edge: a call's return initializes its destination on the edge to where
+/// it returns (`returned`'s row `call_of[block]`), and a block with no terminator yet leads
+/// nowhere.
+fn edges<'e>(
+    moves: &'e MoveData<'_>,
+    call_of: &'e [u32],
+    returned: &'e Effects<'_>,
+) -> impl FnMut(BasicBlockId, BasicBlockId) -> Edge<'e> {
+    move |from, to| {
+        let at = index(from);
+        if !moves.terminated[at] {
+            Edge::Nothing
+        } else if call_of[at] != NONE && moves.returns[at] == index(to) as u32 {
+            returned.edge(call_of[at] as usize)
+        } else {
+            Edge::Same
         }
-    }
-    if let Some(at) = moves.inits_at.get(&location) {
-        for &index in at {
-            let init = moves.inits[index];
-            if init.kind == InitKind::Deep {
-                moves.with_descendants(init.path, &mut |it| uninit.remove(it));
-                if moves.paths[init.path].projection.is_empty() {
-                    ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-                }
-            }
-        }
-    }
-    let data = &body.basic_blocks[location.block];
-    if let Some(statement) = data.statements.get(location.statement)
-        && let StatementKind::StorageDead(local) = statement.kind
-    {
-        ever.remove(local.into_raw().into_u32() as usize);
     }
 }
 
-pub(super) fn call_returned(
-    moves: &MoveData,
+/// The effect of the statement or terminator at `location` on what may be uninitialized and
+/// what has ever been initialized, the return of a call aside: on the sets as the walk goes,
+/// or composed into a block's transfer function.
+pub(super) fn apply(
+    _body: &MirBody<'_>,
+    moves: &MoveData<'_>,
+    cfg: &Cfg<'_>,
     location: Location,
-    uninit: &mut BitSet,
-    ever: &mut BitSet,
+    uninit: &mut impl Transfer,
+    ever: &mut impl Transfer,
 ) {
-    if let Some(at) = moves.inits_at.get(&location) {
-        for &index in at {
-            let init = moves.inits[index];
-            if init.kind == InitKind::NonPanicPathOnly {
-                moves.with_descendants(init.path, &mut |it| uninit.remove(it));
-                if moves.paths[init.path].projection.is_empty() {
-                    ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-                }
+    apply_at(moves, cfg.point(location), uninit, ever);
+}
+
+fn apply_at(
+    moves: &MoveData<'_>,
+    point: usize,
+    uninit: &mut impl Transfer,
+    ever: &mut impl Transfer,
+) {
+    for &index in moves.moves_at(point) {
+        uninit.gen_range(moves.subtree(moves.moves[index as usize].path));
+    }
+    for &index in moves.inits_at(point) {
+        let init = moves.inits[index as usize];
+        if init.kind == InitKind::Deep {
+            uninit.kill_range(moves.subtree(init.path));
+            if moves.parent(init.path).is_none() {
+                ever.gen_(raw(moves.local(init.path)));
+            }
+        }
+    }
+    let dead = moves.dead[point];
+    if dead != NONE {
+        ever.kill(dead as usize);
+    }
+}
+
+/// What the call at `point` returning does: its destination is initialized.
+fn call_returned(
+    moves: &MoveData<'_>,
+    point: usize,
+    uninit: &mut impl Transfer,
+    ever: &mut impl Transfer,
+) {
+    for &index in moves.inits_at(point) {
+        let init = moves.inits[index as usize];
+        if init.kind == InitKind::NonPanicPathOnly {
+            uninit.kill_range(moves.subtree(init.path));
+            if moves.parent(init.path).is_none() {
+                ever.gen_(raw(moves.local(init.path)));
             }
         }
     }

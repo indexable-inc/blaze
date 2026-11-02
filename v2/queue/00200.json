@@ -1,0 +1,43 @@
+{
+  "id": "00200",
+  "from_lane": "frontend-journal-tree",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "docs/v2/plan/lanes/frontend/journal/tree.md",
+    "crates/blaze-vfs/Cargo.toml",
+    "crates/blaze-vfs/src/lib.rs",
+    "crates/blaze-vfs/src/tests.rs",
+    "crates/blaze-query/src/tree.rs",
+    "v2/requests/db.md",
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "v2/requests/cargo.md"
+  ],
+  "what": "## frontend-journal-tree: wire the image into blaze-vfs's `lib.rs`, `Cargo.toml` and `tests.rs` (2026-10-29)\n\nWhy: restore.md, \"The VFS tree itself is in the mapped image, not rebuilt from a journal read\nwhole\". The tree opens in place from the daemon's image: `store.rs` (a mapped base),\n`tree.rs`/`reader.rs`/`rebase.rs` (reads give `Result<_, Corrupt>`), `journal.rs` (a base\nrecord naming the image, then only the tail), and the new `image.rs` with `image/tests.rs`.\nThey are all written. They compile only with the edits below, which are in your paths. Notes:\n`docs/v2/plan/lanes/frontend/journal/tree.md`.\n\n> applied (see 1-3; 4 forwarded).\n\n### 1. `crates/blaze-vfs/Cargo.toml`, `[dependencies]` (alphabetical)\n\n```toml\nblaze-bytes.workspace = true\nblaze-format.workspace = true\nblaze-image.workspace = true\n```\n\nAll three are already workspace dependencies. `blaze-alloc-count` is already a dev-dependency.\n\n> applied (vfs is DONE; checked by requests): in the tree as written. `blaze-bytes`, `blaze-format`, `blaze-image` under `[dependencies]`.\n\n### 2. `crates/blaze-vfs/src/lib.rs`\n\na. The module list: add `mod image;` after `mod disk;`. Change `#[allow(unsafe_code)] mod text;`\nto `mod text;`, because its unsafe code moved to blaze-bytes. The doc line \"Unsafe code is\nonly in `store` and `text`\" then becomes \"Unsafe code is only in `store`\".\n\nb. The `pub use crate::{...}` list: `text::text_of,` becomes `text::{Text, TextFile, text_of},`,\nand add `image::{Bytes, ImageError, ImageMark, ImageUse},`. After the list, add\n`pub use blaze_image::Corrupt;`.\n\nc. `OpError`, a new last variant, and its `Display` arm:\n\n```rust\n    /// A file of the image the tree was restored from failed its page group's CRC32C: its\n    /// bytes are not read until the same bytes are written again ([`Vfs::corrupt`]).\n    Corrupt { section: u32, group: u32 },\n```\n\n```rust\n            OpError::Corrupt { section, group } => {\n                write!(f, \"page group {group} of image section {section:#x} is corrupt\")\n            }\n```\n\n(`From<Corrupt> for OpError` and `From<Corrupt> for CommitError` are in `image.rs`.)\n\nd. `Vfs::read` and `Vfs::follow`. A file of the image whose group is corrupt must be an error,\nnever `None`, because `None` would make the file look absent:\n\n```rust\n    /// The file at `path` in `view`; `Ok(None)` for none, or a directory. A file of the image\n    /// whose page group fails its check is `Err`.\n    pub fn read(&self, view: ViewId, path: &str) -> Result<Option<File<'_>>, Corrupt> {\n        let Some((node, mode)) = self.tree.entry(self.open_root(view), path) else {\n            return Ok(None);\n        };\n        Ok(self.tree.bytes(node)?.map(|bytes| File { id: self.tree.id(node), mode, bytes }))\n    }\n```\n\nIn `follow`, the last line becomes\n`Ok(self.tree.bytes(node)?.map(|bytes| File { id: self.tree.id(node), mode, bytes }))`\n(the `?` goes through `From<Corrupt> for OpError`).\n\ne. `Recovered`, a new last field (it stays `Default`; `ImageUse::None` is the default):\n\n```rust\n    /// What [`Vfs::restore`] did with the image it was given; `None` from [`Vfs::recover`].\n    pub image: ImageUse,\n```\n\n> applied (vfs is DONE; checked by requests): in the tree as written. `mod image;`, `mod text;` without the allow and the doc line, the exports and `pub use blaze_image::Corrupt;`, `OpError::Corrupt` with its arm, `read`/`follow` as `Result`, `Recovered.image`.\n\n### 3. `crates/blaze-vfs/src/tests.rs`\n\nNo test here builds an image, so each read that is now a `Result` gets `.unwrap()` straight\nafter the call, before any `.map`:\n- l.47 `tree.bytes(node).expect(\"a file\")` -> `tree.bytes(node).unwrap().expect(\"a file\")`\n- l.52 `tree.read(root, path).map(..)` -> `tree.read(root, path).unwrap().map(..)`\n- l.91 `assert_eq!(tree.read(root, \"src\"), None)` -> `assert_eq!(tree.read(root, \"src\"), Ok(None))`\n- l.326, 329, 330, 342, 358, 363, 378, 731, 742, 822, 869, 872: `vfs.read(..)` ->\n  `vfs.read(..).unwrap()` (so `.unwrap()` becomes `.unwrap().unwrap()`, and `None`\n  stays `None` after the first unwrap)\n- l.489, 732, 741, 745, 758, 781, 783, 785, 791, 792: `reader.file(..)` -> `reader.file(..).unwrap()`\n- l.650, 651, 694, 704: `pinned.file(..)` / `reader.pin().file(..)` -> the same with `.unwrap()`\n- l.949 `vfs.tree.read(base_node, &path)` -> `vfs.tree.read(base_node, &path).unwrap()`\n\n`watch.rs` already reads with `tree.bytes(it).ok().flatten()` (l.908). That is a fallback: a\ncorrupt file of the image reads as missing, and the watcher would then delete it from the head.\nIt should be `tree.bytes(it)` with the `Err` stopping the cookie, or handled as \"unreadable,\nrescan the path\". Which one is yours to choose. The scan writes the disk's bytes again, and\n`Tree::file` repairs the node from them.\n\n> applied (vfs is DONE; checked by requests): in the tree as written. Every listed read unwraps; `watch.rs` compares `matches!(tree.bytes(it), Ok(Some(have)) if ..)`, so a corrupt file is no longer read as missing. No caller of `Vfs::read`/`follow` outside blaze-vfs.\n\n### 4. Outside blaze-vfs (asked of their owners, for your information)\n\n- blaze-query's `Tree` for `blaze_vfs::Reader` (`crates/blaze-query/src/tree.rs:29-31`):\n  `v2/requests/db.md`, \"frontend-journal-tree: `Reader::file` is a `Result` of `Bytes`\".\n- The daemon (`crates/blaze-cargo/src/serve/daemon.rs`): `v2/requests/cargo.md`,\n  \"frontend-journal-tree: the VFS in the daemon's image\".\n\nStatus: open\n\n> applied (frontend-journal): items 1, 2 (a–e) and 3 as written. Cargo.toml has blaze-bytes,\n> blaze-format and blaze-image (manifest lint clean). lib.rs has `mod image;`, `mod text;`\n> without the allow, the exports, `pub use blaze_image::Corrupt;`, `OpError::Corrupt`,\n> `Vfs::read` returning `Result`, `follow` with `?`, and `Recovered.image`. tests.rs has\n> `.unwrap()` at every line listed, each checked against its text first. Nothing outside\n> blaze-vfs calls `Vfs::read`.\n> watch.rs: neither use reads a corrupt file as absent. At l.908 the disk's bytes were just read,\n> and a corrupt image blob compares unequal, so the disk's bytes are written and repair the node.\n> It is now an explicit `matches!(tree.bytes(it), Ok(Some(have)) if ..)` so this reads as\n> intended. At l.940, a corrupt source of a move goes to `again`, which rescans that path\n> (`Lost::Rescan`). No change in behaviour.\n> forwarded to db (`blaze-query/src/tree.rs`) and cargo (`serve/daemon.rs`), each told.",
+  "state": "applied",
+  "created": "2026-10-30T02:16:22Z",
+  "updated": "2026-10-30T10:06:32Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/frontend-journal.md#frontend-journal-tree: wire the image into blaze-vfs's `lib.rs`, `Cargo.toml` and `tests.rs` (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-journal.md:641"
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "db's part settled: blaze-query's Tree::file returns Result<Option<(ContentId, Mode, Bytes)>, Corrupt> and forwards to blaze_vfs::Reader::file (tree.rs:46-48). The daemon part is cargo's"
+    }
+  ]
+}

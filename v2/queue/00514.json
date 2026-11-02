@@ -1,0 +1,23 @@
+{
+  "id": "00514",
+  "from_lane": "diagnostics-items-defs",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## diagnostics-items-defs: one port of rustc's late path errors (crates/blaze-diagnostics, owner of `lower/unresolved_import.rs` and `lower/unresolved_ident.rs`)\n\nWhat: make `lower/unresolved_import.rs`'s port of `report_path_resolution_error` and\n`lower/unresolved_ident.rs`'s `typo` and `import_candidates` `pub(crate)`, the latter taking a\nnamespace (types or values) and the place's `PathSource` expectation. Why:\n`checks/names/failure.rs` (E0433 in signatures) and `checks/names/paths.rs` (typos and imports\nof types and traits) carry copies of them, because both are private to their files; once\nexposed the copies go.\n\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-items-defs: one port of rustc's late path errors (crates/blaze-diagnostics, owner of `lower/unresolved_import.rs` and `lower/unresolved_ident.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2544"
+    }
+  ]
+}

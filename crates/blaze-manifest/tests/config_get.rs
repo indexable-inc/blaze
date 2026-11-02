@@ -1,7 +1,7 @@
 //! Each tree of `tests/config-fixtures` read as `cargo -Zunstable-options config get` with the
-//! arguments of each run, against what cargo 1.99 printed (`expected.json`, written by
-//! `harness/resolve.py --fixtures` with the runs of the case's `case.json` after its
-//! `CONFIG_RUNS`).
+//! arguments of each run, against what cargo 1.99 printed (`expected.json`, recorded
+//! once with the runs of the case's `case.json` after its `CONFIG_RUNS`, and kept as blaze's own
+//! expected output).
 
 // `expected.json` is what cargo printed on Linux: `/` in the paths of the files it read and
 // POSIX shell quoting. On Windows cargo prints `\` there, which these were not recorded with.

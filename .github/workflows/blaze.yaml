@@ -6,24 +6,25 @@
 # docs/harness.md ("CI").
 #
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux x86-64,
+#       `blaze check --workspace` with the release on Linux x86-64 and macOS,
 #       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
-#       write the caches every other run reads. One runs at a time: the next push waits, and a
+#       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
 #       newer one replaces it, so each run ends and writes the caches as of its commit.
 #
 # A change runs the build and the unit tests only when it touches a file they read: the crates,
-# the vendored crates, the workspace's manifest, lock file, cargo config, .rustfmt.toml and
-# .clippy.toml, the pinned nightly (harness/toolchain), harness/unittests.py, the flake, the
-# release of blaze that builds blaze (.github/blaze-version, install.sh), and these workflows
-# and the actions they use; on a push to main, also the smoke corpus (harness/smoke.py,
-# harness/smoke/). .github/scripts/gate_changes.py has the list and why each path is on it. It
-# names what is code, so a new directory is not: any other change (documentation, the site,
-# benches, the other harnesses and workflows) runs the script checks alone, and a list of files
-# that cannot be had counts as code. `ci` is the one check that says whether everything that
-# ran passed: it is the check branch rules and the merge queue require. The queue tests each
-# pull request merged onto main and whatever is ahead of it, and main moves only to what it
-# tested.
+# the vendored crates, astlog (tools/astlog), the workspace's manifest, lock file, cargo
+# config, .rustfmt.toml and .clippy.toml, the pinned nightly (harness/toolchain),
+# harness/unittests.py, the flake, the release of blaze that builds blaze
+# (.github/blaze-version, install.sh), and these workflows and the actions they use; on a push
+# to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
+# .github/scripts/gate_changes.py has the list and why each path is on it. It names what is
+# code, so a new directory is not: any other change (documentation, the site, benches, the
+# other harnesses and workflows) runs the script checks alone, and a list of files that cannot
+# be had counts as code. `ci` is the one check that says whether everything that ran passed: it
+# is the check branch rules and the merge queue require. The queue tests each pull request
+# merged onto main and whatever is ahead of it, and main moves only to what it tested.
 name: blaze
 on:
   push:
@@ -112,8 +113,6 @@ jobs:
       platform: linux-x64
       os: ubuntu-24.04
       tier: ${{ needs.changes.outputs.tier }}
-      borrowck: true
-      pinned-ui: true
       smoke: true
 
   # On a push to main alone: their caches, for the train's runs and the next push's.
@@ -140,11 +139,41 @@ jobs:
       platform: macos-arm64
       os: macos-15
       tier: warm
-      pinned-ui: true
+
+  # The release .github/blaze-version names loads and checks blaze's whole workspace, as a
+  # contributor's `blaze check --workspace` does: 0.20261028.7 could not load it, and no job ran
+  # it. Installed and given the pinned LLVM (LLVM_SYS_231_PREFIX, which llvm-sys's build script
+  # reads) by .github/actions/blaze, with no Nix, as the build is. Its store's project is its
+  # own and nothing pushes it, so every run checks from cold; the pull needs no secret.
+  workspace-check:
+    name: blaze check --workspace, ${{ matrix.platform }}
+    needs: changes
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 120 || 90 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux x64, os: ubuntu-24.04 }
+          - { platform: macos arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/blaze
+        with:
+          job: check
+          llvm: true
+      - run: blaze check --workspace --message-format short
+      # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
+      # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
+      - run: blaze build -p astlog
+      - run: >-
+          PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py
+          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 
   ci:
     name: ci
-    needs: [changes, scripts, linux-x64, linux-arm64, macos]
+    needs: [changes, scripts, linux-x64, linux-arm64, macos, workspace-check]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -1,0 +1,35 @@
+{
+  "id": "01227",
+  "from_lane": "tests-misc-front2",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/eval.rs"
+  ],
+  "what": "Exact site for 01204's ProtectedDisabled (hir-ty-ub tests/ub pass_vec, pass_rc, pass_refcell, pass_cell_through_shared_references, pass_scoped_thread, panic_is_a_failure at round3d): exec_fn_def's frame path (eval.rs ~5103-5106) and the closure path (~4841-4843) call create_locals_for_body(mir_body, Some(destination)), so the callee's _0 IS the caller's destination, and then enter_frame(.., in_place_return=true) protects that same place (eval.rs ~1885-1888, machine.protect). The callee's own writes/reads of _0 then go through the caller's root tag, foreign to the strong protector: e.g. Vec::new writing its result disables protected tag <2>. rustc/Miri (rustc_const_eval interpret/call.rs:719-722 and :1170-1176 at 16d1ffac1): the return place is protected and uninit-written through a tag that is thrown away (Miri machine.rs protect_in_place_function_argument), the callee's _0 is its own local, and at return the frame is popped (before_stack_pop releases protectors) and only then _0 is copied into the destination. Fix in the evaluator: when protecting the return place, give _0 its own slot and copy it into destination after machine.ret(), not before. hir-ty-ub's checker (protect_place, pop_frame) matches Miri and needs no change. Other round3d hir-ty-ub failures for the evaluator: pass_box leaks the Box (drop glue of Box does not __rust_dealloc), alloc_deallocate_twice reports the evaluator's own '__rust_dealloc of a pointer that is not the start' before the checker's use-after-free, validity_zero_variant_enum gets 'Diverging function returned' before the checker's validity error, offset_out_of_bounds 'offset generic arg is not provided', 3 simd tests UnresolvedMethod('[overloaded index]'); data_race_*, threads_left, validity_invalid_bool_in_option print an empty 'found:' (likely the same ProtectedDisabled path first; recheck after the fix).",
+  "state": "applied",
+  "created": "2026-10-31T02:12:20Z",
+  "updated": "2026-10-31T14:02:38Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:12:20Z",
+      "by": "tests-misc-front2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:54:15Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:02:38Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "eval.rs: with M::CHECKS a called frame gets its own _0 (callee_locals); the destination is StackFrame::return_to, protected in enter_frame and copied into (copy_from_interval, machine-seen) in returned() after machine.ret and before free_stack, then typed. Tail calls return into return_to; TailReturned (shim wrote it) copies nothing. Without CHECKS _0 still aliases the destination. Also: deallocate of an unknown block lets machine.free name it first (alloc_deallocate_twice); a shim returning into a call with no target is typed first (validity_zero_variant_enum, size 0 included); offset reads Ptr/Delta from its operands, as rustc codegen (offset_out_of_bounds). pass_box and the 3 simd tests are the test programs: 01279. Uncompiled; ra clean. Recheck data_race_*, threads_left, validity_invalid_bool_in_option."
+    }
+  ]
+}

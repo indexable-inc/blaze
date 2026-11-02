@@ -1,0 +1,35 @@
+{
+  "id": "00575",
+  "from_lane": "db-expand-macros",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine"
+  ],
+  "what": "## db-expand-macros: whether `builtin-macro-error` fails a build (engine, `crates/blaze-engine`)\n\nWhat: decide whether `builtin-macro-error` joins the SURE list beside `builtin-derive-error`.\nWhy: every builtin-macro error is now one rustc gives as a hard error; derive errors keep the\nderive kind for this reason.\n\n> forwarded to codegen (`crates/blaze-engine`) (from requests, pass 16; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-31T20:30:08Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The SURE list it names is gone with it. Whether builtin-macro-error fails a build is blaze-diagnostics' (lane diagnostics).",
+  "source": "v2/requests/db-expand.md#db-expand-macros: whether `builtin-macro-error` fails a build (engine, `crates/blaze-engine`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:814"
+    },
+    {
+      "at": "2026-10-31T20:30:08Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:08Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The SURE list it names is gone with it. Whether builtin-macro-error fails a build is blaze-diagnostics' (lane diagnostics)."
+    }
+  ]
+}

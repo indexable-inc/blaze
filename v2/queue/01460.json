@@ -1,0 +1,41 @@
+{
+  "id": "01460",
+  "from_lane": "cargo",
+  "owner": "tests-store",
+  "paths": [
+    "crates/blaze-cas/src"
+  ],
+  "what": "For cargo's std-across-BLAZE_HOMEs item (queued just before this one): a blaze-cas store that several daemons on one machine open and write at once (today one process owns a store; `Config::layers` are read-only). Use: `<user cache>/blaze/std/<blaze build id>/store`, holding std units' records and artifacts. Needs (a) commits from two processes that never corrupt each other, e.g. appending packs and the index under an exclusive file lock held only for the commit, never for reads; (b) a get that misses in memory to see what another process committed since (re-read the index past the last offset seen) before answering none; (c) equal values written by two processes to be one entry. The same key always has the same bytes here (same build, same key), so it is first writer wins, never a conflict. A store it cannot lock or read is an error naming the path, never a fall back to the home's store. Test: two Store instances on one dir, interleaved commits, each sees the other's after a miss.",
+  "state": "applied",
+  "created": "2026-11-01T04:22:55Z",
+  "updated": "2026-11-01T04:36:30Z",
+  "taken_by": "tests-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:22:55Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:23:14Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> tests-store: the store lane owns blaze-cas; cargo 01459 waits on it"
+    },
+    {
+      "at": "2026-11-01T04:23:23Z",
+      "by": "tests-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:36:30Z",
+      "by": "tests-store",
+      "action": "done",
+      "note": "Store::open_shared(SharedConfig { root, writer, tags }) + look_again/looked in crates/blaze-cas/src/peers.rs; no lock: one dir per writer (w-<writer>) under root, the others read as layers re-read after a miss. Two writers putting one key before seeing each other each keep a copy (same bytes). Tests in tests.rs await the coordinator test run. docs/v2-store.md \"A shared store\"."
+    }
+  ]
+}

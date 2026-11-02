@@ -3,19 +3,21 @@
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 
-usage: tiers.py          (BLAZE_BIN names the blaze built; blaze and blaze-rustc
-                          are found next to it)
+usage: tiers.py          (BLAZE_BIN names the blaze built; blaze is found next
+                          to it)
 
-A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by cargo,
-then by a daemon. Three checks:
+A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by blaze
+from nothing (a home, store and target directory of its own, BLAZE_TIER=off), then by a
+daemon. Three checks:
 
 1. promotion: the running program's hot functions reach level 2 (LLVM -O3) and level 3
-   (LLVM -O3 + PGO), and what it prints is what cargo's build prints, generation for
+   (LLVM -O3 + PGO), and what it prints is what the build from nothing prints, generation for
    generation;
 2. an edit demotes: an edit of a promoted function that keeps what it does (`next_age`) is
-   applied as a patch at once, the function is back at level 1, and the output stays cargo's;
+   applied as a patch at once, the function is back at level 1, and the output stays the
+   same;
 3. BLAZE_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
-   function leaves level 1, and the output is cargo's.
+   function leaves level 1, and the output is the build from nothing's.
 
 Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
 """
@@ -130,12 +132,13 @@ async def finish(program: Program, tasks: list[asyncio.Task]) -> None:
     await asyncio.gather(*tasks)
 
 
-def same_as_cargo(step: str, ours: list[str], cargo: list[str]) -> None:
+def same_as_scratch(step: str, ours: list[str], scratch: list[str]) -> None:
     if not ours:
         raise StepError(f"{step}: the program printed no checksum")
-    if ours != cargo[: len(ours)]:
-        first = next(i for i, (a, b) in enumerate(zip(ours, cargo)) if a != b)
-        raise StepError(f"{step}: generation {100 * (first + 1)} differs from cargo's build:\n  ours  {ours[first]}\n  cargo {cargo[first]}")
+    if ours != scratch[: len(ours)]:
+        first = next(i for i, (a, b) in enumerate(zip(ours, scratch)) if a != b)
+        raise StepError(f"{step}: generation {100 * (first + 1)} differs from the build from nothing:\n"
+                        f"  ours          {ours[first]}\n  from nothing  {scratch[first]}")
 
 
 def live_dir(binary: Path) -> Path | None:
@@ -156,18 +159,19 @@ async def main() -> None:
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
-        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "BLAZE_BACKEND", "BLAZE_OPT"):
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER"):
             base.pop(name, None)
 
-        # What cargo's own build prints. The program never overflows, so its debug and
-        # release builds print the same; the release one gets as far as a tiered run does.
-        cargo_env = dict(base, CARGO_TARGET_DIR=str(work / "cargo"))
-        await run("cargo build", ["cargo", "build", "--locked", "--release"], project, cargo_env)
+        # What blaze's build from nothing prints, with nothing tiered: it runs a fixed number of
+        # generations, as many as a tiered run got to.
+        scratch_env = dict(base, CARGO_TARGET_DIR=str(work / "scratch"), BLAZE_HOME=str(work / "home-scratch"),
+                           BLAZE_TIER="off")
+        await build("build from nothing", project, scratch_env)
 
-        async def cargo(count: int) -> list[str]:
+        async def scratch(count: int) -> list[str]:
             proc = await asyncio.create_subprocess_exec(
-                str(work / "cargo" / "release" / "lifebench"), cwd=project,
-                env=dict(cargo_env, LIFE_GENERATIONS=str(100 * count), LIFE_SIZE=SIZE),
+                str(work / "scratch" / "debug" / "lifebench"), cwd=project,
+                env=dict(scratch_env, LIFE_GENERATIONS=str(100 * count), LIFE_SIZE=SIZE),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
             out, _ = await proc.communicate()
@@ -205,8 +209,8 @@ async def main() -> None:
         await program.wait_for("next_age hot again and promoted again", lambda levels: levels.get("next_age", 0) >= 2)
         print(f"promoted again once hot: {program.levels}")
         await finish(program, tasks)
-        same_as_cargo("output of the tiered program", program.checksums, await cargo(len(program.checksums)))
-        print(f"output: {len(program.checksums)} checksums, all cargo's")
+        same_as_scratch("output of the tiered program", program.checksums, await scratch(len(program.checksums)))
+        print(f"output: {len(program.checksums)} checksums, all the build from nothing's")
 
         # 3: BLAZE_TIER=off.
         source.write_text(text)
@@ -223,10 +227,10 @@ async def main() -> None:
         logs = "".join(p.read_text(errors="replace") for p in (work / "home-off").rglob("log"))
         if "tier: off" not in logs:
             raise StepError("BLAZE_TIER=off: the worker did not say tiering is off")
-        same_as_cargo("output with BLAZE_TIER=off", program.checksums, await cargo(len(program.checksums)))
-        print(f"BLAZE_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all cargo's")
+        same_as_scratch("output with BLAZE_TIER=off", program.checksums, await scratch(len(program.checksums)))
+        print(f"BLAZE_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all the build from nothing's")
     finally:
-        for home in ("home-tiered", "home-off"):
+        for home in ("home-scratch", "home-tiered", "home-off"):
             stop = dict(os.environ, BLAZE_HOME=str(work / home), PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
             try:
                 proc = await asyncio.create_subprocess_exec("blaze", "stop", env=stop, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)

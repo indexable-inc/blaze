@@ -1,0 +1,35 @@
+{
+  "id": "00159",
+  "from_lane": "dedup",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-inproc/src/fence.rs"
+  ],
+  "what": "## dedup: bits: blaze-inproc the fence table's used entries onto `blaze_ids::bits`\n\nFrom `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). `Fences::used`, a\n`[u64; ENTRIES / 64]` set with its scans by hand, becomes a `blaze_ids::bits::BitArray` (the\nsame 32 inline bytes); `high` stays beside it. `blaze-ids` is already a dependency of the crate.\nThe free entry found is the same (`first_absent`: the first word not all ones, its\n`trailing_ones`), and `high` after a clear is one past the largest entry still used, which is\nwhere the old walk down from `high` stopped since no entry at or past `high` is used. The\ncrate's own `Words` trait is not touched (only `BitArray` is imported).\n\n`crates/blaze-inproc/src/fence.rs`, imports, before / after:\n\n```rust\nuse std::sync::atomic::{AtomicU64, Ordering, fence};\n```\n\n```rust\nuse std::sync::atomic::{AtomicU64, Ordering, fence};\n\nuse blaze_ids::bits::BitArray;\n```\n\nThe field (line 121):\n\n```rust\n    used: [u64; ENTRIES / 64],\n```\n\n```rust\n    used: BitArray<{ ENTRIES / 64 }>,\n```\n\nIn `Fences::new` (line 131):\n\n```rust\n        Fences { words, used: [0; ENTRIES / 64], high: 0 }\n```\n\n```rust\n        Fences { words, used: Default::default(), high: 0 }\n```\n\nIn `Fences::post` (lines 145-148):\n\n```rust\n        let index = self.used.iter().enumerate().find_map(|(word, bits)| {\n            (*bits != u64::MAX).then(|| word * 64 + bits.trailing_ones() as usize)\n        })?;\n        self.used[index / 64] |= 1 << (index % 64);\n```\n\n```rust\n        let index = self.used.first_absent()?;\n        self.used.insert(index);\n```\n\nIn `Fences::clear` (lines 179-182):\n\n```rust\n        self.used[index / 64] &= !(1 << (index % 64));\n        while self.high > 0 && self.used[(self.high - 1) / 64] & (1 << ((self.high - 1) % 64)) == 0 {\n            self.high -= 1;\n        }\n```\n\n```rust\n        self.used.remove(index);\n        self.high = self.used.last().map_or(0, |it| it + 1);\n```\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T02:00:06Z",
+  "updated": "2026-10-30T08:53:23Z",
+  "taken_by": "unify-link",
+  "why": "fence.rs is in the run process build, and blaze-ids is now only a dev-dependency of blaze-inproc (the run process links the crate with blaze-mem and libc only). Moving Fences::used onto blaze_ids::bits::BitArray would put blake3, serde, smallvec and thin-vec into every run process for 32 bytes of bitset; kept as is on purpose, like the LEB128 in 00317.",
+  "source": "v2/requests/fastcompile-inproc.md#dedup: bits: blaze-inproc the fence table's used entries onto `blaze_ids::bits`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-inproc.md:38"
+    },
+    {
+      "at": "2026-10-30T08:53:20Z",
+      "by": "unify-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:53:23Z",
+      "by": "unify-link",
+      "action": "refuse",
+      "note": "fence.rs is in the run process build, and blaze-ids is now only a dev-dependency of blaze-inproc (the run process links the crate with blaze-mem and libc only). Moving Fences::used onto blaze_ids::bits::BitArray would put blake3, serde, smallvec and thin-vec into every run process for 32 bytes of bitset; kept as is on purpose, like the LEB128 in 00317."
+    }
+  ]
+}

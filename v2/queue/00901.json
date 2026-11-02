@@ -1,0 +1,35 @@
+{
+  "id": "00901",
+  "from_lane": "pure-scripts-walk",
+  "owner": "pure-scripts-models",
+  "paths": [
+    "crates/hir-ty-pure/src/tests/fixture.rs"
+  ],
+  "what": "crates/hir-ty-pure/src/tests/fixture.rs: script() must call blaze_item_hash::identity::set_build(&mut db, ContentId::default()) (or any fixed build id) before main_of: blaze_item_hash::identity::identity returns Err(\"no front-end build is set\") otherwise, and the walk then reports every script impure (its body has no identity), failing every pure test.",
+  "state": "applied",
+  "created": "2026-10-30T09:34:14Z",
+  "updated": "2026-10-30T09:53:51Z",
+  "taken_by": "pure-scripts-models-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:34:14Z",
+      "by": "pure-scripts-walk",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:51Z",
+      "by": "pure-scripts-models-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:51Z",
+      "by": "pure-scripts-models-next1",
+      "action": "done",
+      "note": "script() moved to tests/scripts.rs (staged unwired until walk lands); it calls blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32])) before main_of."
+    }
+  ]
+}

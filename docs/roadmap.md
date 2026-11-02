@@ -531,8 +531,8 @@ like a Unix socket or HTTP."
 [#278](https://github.com/indexable-inc/blaze/issues/278), P3. Andrew: "something LIKE clippy in
 this too."
 
-- **clippy can't be run**: it is a rustc driver, and blaze never runs rustc. `blaze clippy`
-  passes through to cargo today ([no-rustc.md](no-rustc.md)), which is one more such path.
+- **clippy can't be run**: it is a rustc driver, and blaze never runs rustc. `blaze check`
+  runs blaze-lints' port of clippy's lints and blaze's own instead (v2; there is no `blaze clippy`).
 - **Lints run in blaze's pipeline**, on its HIR, types and MIR, as part of the check, per function:
   an edit re-lints only the items the push reached, and the result is memoized like any other.
 - **What to port first.** clippy at `43c0efca14` has 840 lints, 498 of them on by default:

@@ -1,10 +1,9 @@
 //! Inference of binary and unary operators.
 
-use std::collections::hash_map;
-
 use hir_def::{FunctionId, GenericParamId, TraitId, hir::ExprId};
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
+use smallvec::SmallVec;
 use syntax::ast::{ArithOp, BinaryOp, UnaryOp};
 use tracing::debug;
 
@@ -12,6 +11,7 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, InferenceDiagnostic,
     infer::{AllowTwoPhase, AutoBorrowMutability, Expectation, InferenceContext, expr::ExprIsRead},
     method_resolution::{MethodCallee, TreatNotYetDefinedOpaques},
+    solver_errors::StoredGoal,
     next_solver::{
         GenericArgs, TraitRef, Ty, TyKind,
         fulfill::NextSolverError,
@@ -20,7 +20,12 @@ use crate::{
     },
 };
 
-impl<'db> InferenceContext<'db> {
+/// Why an operator's trait does not hold: the errors of its one obligation, at most one, kept
+/// inline because a lookup that fails is not an error until the operands turn out not to be
+/// builtin.
+type OpErrors<'db> = SmallVec<[NextSolverError<'db>; 1]>;
+
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Checks a `a <op>= b`
     pub(crate) fn infer_assign_op_expr(
         &mut self,
@@ -28,9 +33,15 @@ impl<'db> InferenceContext<'db> {
         op: ArithOp,
         lhs: ExprId,
         rhs: ExprId,
+        expected: &Expectation<'db>,
     ) -> Ty<'db> {
-        let (lhs_ty, rhs_ty, return_ty) =
-            self.infer_overloaded_binop(expr, lhs, rhs, BinaryOp::Assignment { op: Some(op) });
+        let (lhs_ty, rhs_ty, return_ty) = self.infer_overloaded_binop(
+            expr,
+            lhs,
+            rhs,
+            BinaryOp::Assignment { op: Some(op) },
+            expected,
+        );
 
         let category = BinOpCategory::from(op);
         let ty = if !lhs_ty.is_ty_var()
@@ -43,7 +54,7 @@ impl<'db> InferenceContext<'db> {
             return_ty
         };
 
-        self.check_lhs_assignable(lhs);
+        self.check_lhs_assignable(lhs, expr, Some(op));
 
         ty
     }
@@ -55,6 +66,7 @@ impl<'db> InferenceContext<'db> {
         op: BinaryOp,
         lhs_expr: ExprId,
         rhs_expr: ExprId,
+        expected: &Expectation<'db>,
     ) -> Ty<'db> {
         debug!(
             "check_binop(expr.hir_id={:?}, expr={:?}, op={:?}, lhs_expr={:?}, rhs_expr={:?})",
@@ -86,7 +98,7 @@ impl<'db> InferenceContext<'db> {
                 // overloaded. This is the way to be most flexible w/r/t
                 // types that get inferred.
                 let (lhs_ty, rhs_ty, return_ty) =
-                    self.infer_overloaded_binop(expr, lhs_expr, rhs_expr, op);
+                    self.infer_overloaded_binop(expr, lhs_expr, rhs_expr, op, expected);
 
                 // Supply type inference hints if relevant. Probably these
                 // hints should be enforced during select as part of the
@@ -161,6 +173,7 @@ impl<'db> InferenceContext<'db> {
         lhs_expr: ExprId,
         rhs_expr: ExprId,
         op: BinaryOp,
+        expected: &Expectation<'db>,
     ) -> (Ty<'db>, Ty<'db>, Ty<'db>) {
         debug!("infer_overloaded_binop(expr.hir_id={:?}, op={:?})", expr, op);
 
@@ -192,6 +205,8 @@ impl<'db> InferenceContext<'db> {
         // us do better coercions than we would be able to do otherwise,
         // particularly for things like `String + &String`.
         let rhs_ty_var = self.table.next_ty_var(rhs_expr.into());
+        // rustc's `ObligationCauseCode::BinOp { output_ty }` of the lookup.
+        let output = expected.only_has_type(&mut self.table);
         let result = self.lookup_op_method(
             expr,
             lhs_ty,
@@ -216,7 +231,7 @@ impl<'db> InferenceContext<'db> {
                         kind: Adjust::Borrow(AutoBorrow::Ref(mutbl)),
                         target: method.sig.inputs_and_output.inputs()[0].store(),
                     };
-                    self.write_expr_adj(lhs_expr, Box::new([autoref]));
+                    self.write_expr_adj(lhs_expr, &[autoref]);
                 }
                 if by_ref_binop
                     && let TyKind::Ref(_, _, mutbl) =
@@ -234,23 +249,13 @@ impl<'db> InferenceContext<'db> {
                     // some cases applied on the RHS, on top of which we need
                     // to autoref, which is not allowed by write_expr_adj.
                     // self.write_expr_adj(rhs_expr, Box::new([autoref]));
-                    match self.result.expr_adjustments.entry(rhs_expr) {
-                        hash_map::Entry::Occupied(mut entry) => {
-                            let mut adjustments = Vec::from(std::mem::take(entry.get_mut()));
-                            adjustments.reserve_exact(1);
-                            adjustments.push(autoref);
-                            entry.insert(adjustments.into_boxed_slice());
-                        }
-                        hash_map::Entry::Vacant(entry) => {
-                            entry.insert(Box::new([autoref]));
-                        }
-                    };
+                    self.result.expr_adjustments.push(rhs_expr, autoref);
                 }
                 self.write_method_resolution(expr, method.def_id, method.args);
 
                 method.sig.output()
             }
-            Err(_errors) => {
+            Err(errors) => {
                 // Core implements the operator's trait for every builtin operation on scalars.
                 let is_builtin = !lhs_ty.is_ty_var()
                     && !rhs_ty.is_ty_var()
@@ -270,6 +275,9 @@ impl<'db> InferenceContext<'db> {
                         op,
                         lhs: lhs_ty.store(),
                         rhs: rhs_ty.store(),
+                        at_error: self.types_at_error(lhs_ty, rhs_ty),
+                        unmet: self.unmet_goals(errors),
+                        output: output.map(|it| it.store()),
                     });
                 }
                 self.types.types.error
@@ -290,11 +298,25 @@ impl<'db> InferenceContext<'db> {
                 self.write_method_resolution(ex, method.def_id, method.args);
                 method.sig.output()
             }
-            Err(_errors) => {
+            Err(errors) => {
+                // Core implements the operator's trait for every builtin operation on scalars,
+                // and the caller types a builtin one as its operand.
+                let is_builtin = match op {
+                    UnaryOp::Neg => operand_ty.is_numeric(),
+                    UnaryOp::Not => operand_ty.is_integral() || operand_ty.is_bool(),
+                    UnaryOp::Deref => false,
+                };
+                if is_builtin {
+                    return self.types.types.error;
+                }
+                let unmet = self.unmet_goals(errors);
+                let at_error = self.ty_at_error(operand_ty);
                 self.push_diagnostic(InferenceDiagnostic::UnaryOperatorCannotBeApplied {
                     expr: ex,
                     op,
                     found: operand_ty.store(),
+                    at_error,
+                    unmet,
                 });
                 self.types.types.error
             }
@@ -307,10 +329,10 @@ impl<'db> InferenceContext<'db> {
         lhs_ty: Ty<'db>,
         opt_rhs: Option<(ExprId, Ty<'db>)>,
         (op_method, trait_did): (Option<FunctionId>, Option<TraitId>),
-    ) -> Result<MethodCallee<'db>, Vec<NextSolverError<'db>>> {
+    ) -> Result<MethodCallee<'db>, OpErrors<'db>> {
         let (Some(trait_did), Some(op_method)) = (trait_did, op_method) else {
             // Bail if the operator trait is not defined.
-            return Err(vec![]);
+            return Err(OpErrors::new());
         };
 
         debug!(
@@ -378,9 +400,24 @@ impl<'db> InferenceContext<'db> {
                 );
                 let mut ocx = ObligationCtxt::new(self.infcx());
                 ocx.register_obligation(obligation);
-                Err(ocx.evaluate_obligations_error_on_ambiguity())
+                let mut errors = OpErrors::new();
+                ocx.evaluate_obligations_error_on_ambiguity_with(&mut |error| errors.push(error));
+                Err(errors)
             }
         }
+    }
+
+    /// The goals of `errors` as rustc's `report_binop_fulfillment_errors` and `check_user_unop`
+    /// read them: each fulfillment error's leaf obligation, resolved.
+    fn unmet_goals(&self, errors: OpErrors<'db>) -> Vec<StoredGoal> {
+        let infcx = self.infcx();
+        errors
+            .into_iter()
+            .map(|error| {
+                let predicate = error.into_fulfillment_error(infcx).obligation.predicate;
+                StoredGoal::new(self.interner(), infcx.deeply_resolve_ignoring_regions(predicate))
+            })
+            .collect() // alloc: error path, the goals of an operator diagnostic
     }
 
     fn lang_item_for_bin_op(&self, op: BinaryOp) -> (Option<FunctionId>, Option<TraitId>) {

@@ -3,7 +3,7 @@
 
 Started by the `blaze-life` wrapper in flake.nix, which passes everything in BLAZE_LIFE_*:
 
-  SOURCE       store path holding demo/life and crates/blaze-live
+  SOURCE       store path holding demo/life, the crates it links and the root Cargo.toml
   VENDOR       vendored crates.io sources for demo/life's Cargo.lock
   DAEMON_BINS  bin/ of blaze and the programs it runs (the flake's `dist`)
   PREBUILT     the demo built per cargo unit, run where live edits are not supported
@@ -82,9 +82,7 @@ def child_env(target: Path) -> dict[str, str]:
 
 def prepare(work: Path) -> Path:
     """Copies the sources somewhere writable and points cargo at the vendored crates."""
-    source = Path(env("SOURCE"))
-    shutil.copytree(source / "crates" / "blaze-live", work / "crates" / "blaze-live")
-    shutil.copytree(source / "demo" / "life", work / "demo" / "life")
+    shutil.copytree(Path(env("SOURCE")), work, dirs_exist_ok=True)
     for path in [work, *work.rglob("*")]:
         path.chmod(path.stat().st_mode | 0o700)
     life = work / "demo" / "life"

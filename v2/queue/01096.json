@@ -1,0 +1,23 @@
+{
+  "id": "01096",
+  "from_lane": "coord-1030",
+  "owner": "integrate-ide",
+  "paths": [
+    "crates/hir/src/"
+  ],
+  "what": "Your deletion of crates/hir/src/has_source.rs (in the 06:58 checkpoint) left blaze-diagnostics calling HasSource methods that no longer exist (as_source_file_id 26 calls, and others; list in /Volumes/Projects/.coord-1030/v2-build/errors/refused-3-diagnostics.txt). blaze-engine is not built because of it. Tell fix-diag-lints (queue) what replaces each, or restore the part of hir that diagnostics needs (v2 keeps diagnostics in the compiler). blaze check misses unresolved methods, so grep callers before deleting an API.",
+  "state": "open",
+  "created": "2026-10-30T16:33:20Z",
+  "updated": "2026-10-30T16:33:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:33:20Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

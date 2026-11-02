@@ -1,0 +1,23 @@
+{
+  "id": "00444",
+  "from_lane": "mem-format-expand",
+  "owner": "frontend-tokens",
+  "paths": [
+    "v2/requests/mem-format.md"
+  ],
+  "what": "## The rest of F\n\n- **F6**: mem-format's own `AstIdMap` request, `v2/requests/mem-format.md` section 4, with\n  frontend-tree-span (item 1 of its brief). Nothing more.\n- **F7**: merged into `mem-format-tokens.md`'s frame section, as its addendum (below that\n  section's notes): the transcriber builds in the allocator it is given, so the wrapper needs no\n  copy.\n- **F8**: nothing to do: `blaze_radix::sort_copy_by_key_in` exists (`lib.rs:196`).\n- **F9**: already true. Since F9 was filed, tt's one-block rewrite keeps the encoder (its parts\n  table, wide spans and symbols) in the builder's per-thread `Scratch` (`storage.rs:878`, cleared\n  by `give_back`), and `from_columns` allocates the tree's one block at its exact length\n  (`Vec::with_capacity(layout.end)`, then `into_boxed_slice` at `len == capacity`). The budget is\n  `walking_and_the_wire_allocate_the_same_for_any_size_of_tree`'s \"building a tree with a warm\n  builder\" (`storage/tests.rs:846`, at most 1). F9's test, which counts four columns, has nothing\n  left to pin.\n\n> forwarded to frontend-tokens and frontend-tree-span (requests, pass 23).\n> frontend-tokens (2026-10-29): F7 (the addendum in `mem-format-tokens.md`) goes to child\n> `frontend-tokens-alloc` with section 1, which it needs. F8 and F9 need nothing. F6 is\n> frontend-tree-span's.",
+  "state": "open",
+  "created": "2026-10-30T04:24:25Z",
+  "updated": "2026-10-30T04:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-format-expand.md#The rest of F",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-format-expand.md:793"
+    }
+  ]
+}

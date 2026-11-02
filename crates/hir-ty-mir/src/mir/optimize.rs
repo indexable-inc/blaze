@@ -1,12 +1,23 @@
 //! rustc's MIR optimizations, run on a [`MirPhase::Runtime`] body as rustc's
-//! `run_optimization_passes` runs them on its runtime MIR (`rustc_mir_transform` at 1.99.0,
-//! `compiler/rustc_mir_transform/src/lib.rs`). They are optional: the IDE and the interpreter
-//! never ask for them, and the code generator asks only when told to (`BLAZE_MIR_OPT`).
+//! `run_optimization_passes` runs them on its runtime MIR (`rustc_mir_transform` at the pinned
+//! nightly, `compiler/rustc_mir_transform/src/lib.rs`). The IDE and the interpreter never ask
+//! for them. The code generator asks for each crate at the level rustc gives the crate's
+//! `opt-level`; `BLAZE_MIR_OPT` only overrides that level.
 //!
-//! The level is rustc's `-Zmir-opt-level`: [`MirOptLevel::Debug`] is what rustc runs at
-//! `opt-level=0` (its level 1) and [`MirOptLevel::Release`] what it runs otherwise (its
-//! level 2). Each pass is a port of rustc's pass of the same name; where it does less than
-//! rustc's, its module says what. Passes rustc runs at a level and these do not are listed in
+//! What they run with is a [`MirOptions`], which keys the queries:
+//! - `level` is rustc's `-Zmir-opt-level`: [`MirOptLevel::Debug`] is what rustc runs at
+//!   `opt-level=0` (its level 1) and [`MirOptLevel::Release`] what it runs otherwise (its
+//!   level 2).
+//! - `ub_checks` is rustc's `sess.ub_checks()` of the crate the body is of. With it,
+//!   `CheckAlignment`, `CheckNull` and `CheckEnums` add their checks at every level,
+//!   [`MirOptLevel::Off`] and coroutine bodies included, as rustc's do: they are part of what
+//!   UB checks mean, not optimizations.
+//! - `lifetime_markers` says the code generator gives its backend storage markers as
+//!   lifetimes; `RemoveStorageMarkers` runs only without them, as rustc's runs only where it
+//!   emits none (`!emit_lifetime_markers()`).
+//!
+//! Each pass is a port of rustc's pass of the same name; where it does less than rustc's, its
+//! module says what. Passes rustc runs at a level and these do not are listed in
 //! [`passes_not_ported`].
 //!
 //! The passes run on the generic body, as rustc's do, once per function: monomorphization
@@ -15,30 +26,33 @@
 //! [`MirPhase::Runtime`]: super::MirPhase::Runtime
 
 mod cfg;
+mod check_enums;
+mod check_pointers;
 mod copy_prop;
 mod dse;
+mod inline;
 mod inst_simplify;
 mod locals;
 
+use base_db::Db;
+use blaze_mem::{Frame, Tag, frame};
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
-use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
 use std::cell::Cell;
 
-use crate::{
-    InferBodyId,
-    db::{HirDatabase, InternedClosureId},
-    traits::StoredParamEnvAndCrate,
-};
+use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, OperandKind, PlaceElem,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
-    monomorphization::monomorphized, transform::Ctx,
+    BasicBlockId, InlinedBody, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions, MirOwner,
+    MirStage, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    budget::Pass,
+    framed::{Bits, bits_in, block_id, block_index, local_index},
+    transform::Ctx,
 };
+
+pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -48,19 +62,12 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     match level {
         MirOptLevel::Off => &[],
         MirOptLevel::Debug => &[
-            "CheckAlignment",
-            "CheckNull",
-            "CheckEnums",
             "ForceInline",
             "RemoveZsts",
             "UnreachableEnumBranching",
         ],
         MirOptLevel::Release => &[
-            "CheckAlignment",
-            "CheckNull",
-            "CheckEnums",
             "ForceInline",
-            "Inline",
             "RemoveZsts",
             "UnreachableEnumBranching",
             "ReferencePropagation",
@@ -76,129 +83,146 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     }
 }
 
-/// `body` after rustc's optimizations at `level`. Coroutine bodies are left as they are: what
-/// a future keeps across a yield is computed from the runtime body.
+/// `body` after rustc's optimizations with `options`. Of a coroutine body only the UB checks
+/// run: what a future keeps across a yield is computed from the runtime body, and the checks'
+/// temporaries live within one block.
+///
+/// A pass run only at [`MirOptLevel::Release`] never adds a call, constant, static, drop or
+/// vtable the body does not have at [`MirOptLevel::Debug`]: those passes only remove code or
+/// replace a local by another holding the same value. The one exception is `Inline`
+/// (`options.inline`, only at `Release`): an inlined callee brings what its own body
+/// references, which the `Debug` body reaches through the call, and lists the callee in
+/// `body.inlined.callees`. The code generator's walk of what a unit references reads `Debug`
+/// bodies for every level and relies on this; `tests/mir/references.rs` holds it.
 pub(super) fn optimize<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
-    level: MirOptLevel,
-) -> MirBody<'db> {
+    options: MirOptions,
+    caller: Option<InlinedBody<'db>>,
+) -> Result<'db, MirBody<'db>> {
+    // clone: the copy the query keeps, which the passes change in place
     let mut body = body.clone();
-    if level == MirOptLevel::Off || body.coroutine.is_some() {
-        return body;
+    let optimizing = options.level != MirOptLevel::Off && body.coroutine.is_none();
+    if !optimizing && !options.ub_checks {
+        return Ok(body);
     }
-    let ctx = Ctx::new(db, body.owner);
-    let release = level >= MirOptLevel::Release;
-    // Each pass, and in a debug build a check that it left a body the next can read.
+    frame::task(Tag::Mir, |outer| {
+        passes(&Ctx::new(db, body.owner, outer), &mut body, options, caller, optimizing)
+    })?;
+    Ok(body)
+}
+
+fn passes<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    options: MirOptions,
+    caller: Option<InlinedBody<'db>>,
+    optimizing: bool,
+) -> Result<'db, ()> {
+    let release = options.level >= MirOptLevel::Release;
+    // Each pass in a frame of its own, and in a debug build a check that it left a body the
+    // next can read.
     macro_rules! run {
-        ($pass:literal, $($run:tt)*) => {{
-            $($run)*;
-            #[cfg(debug_assertions)]
-            if let Err(error) = validate(&body) {
-                panic!("MIR of {:?} after {}: {error}", body.owner, $pass);
-            }
+        ($pass:literal, |$frame:ident| $run:expr) => {{
+            frame::task(Tag::Mir, |$frame| -> Result<'db, ()> {
+                $run;
+                #[cfg(debug_assertions)]
+                if let Err(error) = validate(body, $frame) {
+                    panic!("MIR of {:?} after {}: {error}", body.owner, $pass);
+                }
+                Ok(())
+            })?
         }};
     }
     // rustc's runtime cleanup, which its runtime MIR has had before any of these:
     // `CleanupPostBorrowck` and `SimplifyCfg-pre-optimizations`.
-    run!("CleanupPostBorrowck", cfg::cleanup_post_borrowck(&mut body));
-    run!("SimplifyCfg", cfg::simplify_cfg(&mut body));
-
-    run!("LowerSliceLenCalls", inst_simplify::lower_slice_len_calls(&ctx, &mut body));
-    run!("InstSimplify", inst_simplify::inst_simplify(&ctx, &mut body));
-    // rustc keeps storage markers only where it gives LLVM lifetimes: at `opt-level > 0`.
-    if !release {
-        run!("RemoveStorageMarkers", locals::remove_storage_markers(&mut body));
+    if optimizing {
+        run!("CleanupPostBorrowck", |frame| cfg::cleanup_post_borrowck(body, frame));
+        run!("SimplifyCfg", |frame| cfg::simplify_cfg(body, frame));
     }
-    run!("RemoveUnneededDrops", cfg::remove_unneeded_drops(&ctx, &mut body));
+    if options.ub_checks {
+        use check_pointers::{PointerCheck, check_pointers};
+        run!("CheckAlignment", |frame| check_pointers(ctx, body, PointerCheck::Alignment, frame)?);
+        run!("CheckNull", |frame| check_pointers(ctx, body, PointerCheck::Null, frame)?);
+        run!("CheckEnums", |frame| check_enums::check_enums(ctx, body, frame)?);
+    }
+    if !optimizing {
+        return Ok(());
+    }
+
+    run!("LowerSliceLenCalls", |frame| inst_simplify::lower_slice_len_calls(ctx, body, frame));
+    run!("InstSimplify", |frame| inst_simplify::inst_simplify(ctx, body, frame));
+    // `options.inline` is set only at `Release` (rustc's `Inline::is_enabled`).
+    if options.inline
+        && let Some(caller) = caller
+    {
+        run!("Inline", |frame| {
+            if inline::inline(ctx, body, caller, options) {
+                cfg::simplify_cfg(body, frame);
+            }
+        });
+    }
+    // rustc keeps storage markers only where it gives the backend lifetimes.
+    if !options.lifetime_markers {
+        run!("RemoveStorageMarkers", |frame| locals::remove_storage_markers(body, frame));
+    }
+    run!("RemoveUnneededDrops", |frame| cfg::remove_unneeded_drops(ctx, body, frame));
     if release {
-        run!("UnreachablePropagation", cfg::unreachable_propagation(&mut body));
+        run!("UnreachablePropagation", |frame| cfg::unreachable_propagation(body, frame));
     }
-    run!("SimplifyCfg", cfg::simplify_cfg(&mut body));
-    run!("InstSimplify", inst_simplify::inst_simplify(&ctx, &mut body));
-    run!("SimplifyConstCondition", cfg::simplify_const_condition(&mut body));
-    run!("SimplifyLocals", locals::simplify_locals(&mut body));
+    run!("SimplifyCfg", |frame| cfg::simplify_cfg(body, frame));
+    run!("InstSimplify", |frame| inst_simplify::inst_simplify(ctx, body, frame));
+    run!("SimplifyConstCondition", |frame| cfg::simplify_const_condition(body, frame));
+    run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
     if release {
-        run!("DeadStoreElimination", dse::dead_store_elimination(&mut body));
+        run!("DeadStoreElimination", |frame| dse::dead_store_elimination(body, frame));
     }
-    run!("SimplifyLocals", locals::simplify_locals(&mut body));
-    run!("SingleUseConsts", inst_simplify::single_use_consts(&mut body));
-    run!("SimplifyConstCondition", cfg::simplify_const_condition(&mut body));
-    run!("SimplifyConstCondition", cfg::simplify_const_condition(&mut body));
-    run!("RemoveNoopLandingPads", super::transform::remove_noop_landing_pads(&mut body));
-    run!("SimplifyCfg", cfg::simplify_cfg(&mut body));
-    run!("CopyProp", copy_prop::copy_prop(&ctx, &mut body, release));
+    run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
+    run!("SingleUseConsts", |frame| inst_simplify::single_use_consts(body, frame));
+    run!("SimplifyConstCondition", |frame| cfg::simplify_const_condition(body, frame));
+    run!("SimplifyConstCondition", |frame| cfg::simplify_const_condition(body, frame));
+    run!("RemoveNoopLandingPads", |frame| super::transform::remove_noop_landing_pads(body, frame));
+    run!("SimplifyCfg", |frame| cfg::simplify_cfg(body, frame));
+    run!("CopyProp", |frame| copy_prop::copy_prop(ctx, body, release, frame));
     if release {
-        run!("DeadStoreElimination", dse::dead_store_elimination(&mut body));
+        run!("DeadStoreElimination", |frame| dse::dead_store_elimination(body, frame));
     }
-    run!("SimplifyLocals", locals::simplify_locals(&mut body));
-    run!("CriticalCallEdges", cfg::critical_call_edges(&mut body));
-    body
+    run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
+    run!("CriticalCallEdges", |frame| cfg::critical_call_edges(body, frame));
+    Ok(())
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_cycle_result)]
-pub fn optimized_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
-    def: InferBodyId<'db>,
-    level: MirOptLevel,
-) -> Result<'db, MirBody<'db>> {
-    Ok(optimize(db, db.runtime_mir_body(def)?, level))
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_closure_cycle_result)]
-pub fn optimized_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
-    closure: InternedClosureId<'db>,
-    level: MirOptLevel,
-) -> Result<'db, MirBody<'db>> {
-    Ok(optimize(db, db.runtime_mir_body_for_closure(closure)?, level))
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_optimized_mir_body_cycle_result)]
-pub fn monomorphized_optimized_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
-    def: InferBodyId<'db>,
-    level: MirOptLevel,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body(def, level)?, &subst, &trait_env)
-}
-
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_optimized_mir_body_for_closure_cycle_result
-)]
-pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
-    closure: InternedClosureId<'db>,
-    level: MirOptLevel,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body_for_closure(closure, level)?, &subst, &trait_env)
-}
-
-fn monomorphized_optimized_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: MirOptLevel,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_optimized_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: MirOptLevel,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
+/// One of the optimizations alone in `frame`, or one of the runtime passes through
+/// [`super::transform::run_one`].
+pub(super) fn run_one<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    pass: Pass,
+    frame: &Frame,
+) -> Result<'db, ()> {
+    use check_pointers::PointerCheck;
+    match pass {
+        Pass::CleanupPostBorrowck => cfg::cleanup_post_borrowck(body, frame),
+        Pass::SimplifyCfg => cfg::simplify_cfg(body, frame),
+        Pass::RemoveStorageMarkers => locals::remove_storage_markers(body, frame),
+        Pass::RemoveUnneededDrops => cfg::remove_unneeded_drops(ctx, body, frame),
+        Pass::UnreachablePropagation => cfg::unreachable_propagation(body, frame),
+        Pass::InstSimplify => inst_simplify::inst_simplify(ctx, body, frame),
+        Pass::LowerSliceLenCalls => inst_simplify::lower_slice_len_calls(ctx, body, frame),
+        Pass::SimplifyConstCondition => cfg::simplify_const_condition(body, frame),
+        Pass::SimplifyLocals => locals::simplify_locals(body, frame),
+        Pass::SingleUseConsts => inst_simplify::single_use_consts(body, frame),
+        Pass::DeadStoreElimination => dse::dead_store_elimination(body, frame),
+        Pass::CopyProp => copy_prop::copy_prop(ctx, body, true, frame),
+        Pass::CriticalCallEdges => cfg::critical_call_edges(body, frame),
+        Pass::CheckAlignment => {
+            check_pointers::check_pointers(ctx, body, PointerCheck::Alignment, frame)?
+        }
+        Pass::CheckNull => check_pointers::check_pointers(ctx, body, PointerCheck::Null, frame)?,
+        Pass::CheckEnums => check_enums::check_enums(ctx, body, frame)?,
+        other => return super::transform::run_one(ctx, body, other, frame),
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -216,59 +240,31 @@ fn interpreter_level() -> MirOptLevel {
     INTERPRETER_LEVEL.with(Cell::get)
 }
 
-/// The body the interpreter runs of a function: the runtime body, or that body optimized at
-/// the level [`set_interpreter_mir_opt_level`] set.
+/// The body the interpreter runs of `owner`: the runtime body, or that body optimized at the
+/// level [`set_interpreter_mir_opt_level`] set.
 pub(super) fn interpreted_body<'db>(
-    db: &'db dyn HirDatabase,
-    def: InferBodyId<'db>,
+    db: &'db Db,
+    owner: MirOwner<'db>,
     subst: StoredGenericArgs,
     env: StoredParamEnvAndCrate,
 ) -> Result<'db, &'db MirBody<'db>> {
-    match interpreter_level() {
-        MirOptLevel::Off => db.monomorphized_runtime_mir_body(def, subst, env),
-        level => db.monomorphized_optimized_mir_body(def, level, subst, env),
-    }
-}
-
-pub(super) fn interpreted_closure_body<'db>(
-    db: &'db dyn HirDatabase,
-    closure: InternedClosureId<'db>,
-    subst: StoredGenericArgs,
-    env: StoredParamEnvAndCrate,
-) -> Result<'db, &'db MirBody<'db>> {
-    match interpreter_level() {
-        MirOptLevel::Off => db.monomorphized_runtime_mir_body_for_closure(closure, subst, env),
-        level => db.monomorphized_optimized_mir_body_for_closure(closure, level, subst, env),
-    }
-}
-
-fn optimized_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: MirOptLevel,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn optimized_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: MirOptLevel,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
+    let stage = match interpreter_level() {
+        MirOptLevel::Off => MirStage::Runtime,
+        level => MirStage::Optimized(MirOptions::at(level)),
+    };
+    db.monomorphized_mir(owner, stage, subst, env)
 }
 
 /// What every pass leaves: each local and block a body names is one it has, and each block
 /// ends in a terminator.
 #[cfg(debug_assertions)]
-fn validate(body: &MirBody<'_>) -> std::result::Result<(), String> {
+fn validate(body: &MirBody<'_>, frame: &Frame) -> std::result::Result<(), String> {
     let locals = body.locals.len();
     let blocks = body.basic_blocks.len();
     let mut error = None;
     visit_body(body, |local, _, at| {
         if local_index(local) >= locals && error.is_none() {
+            // alloc: only when a pass broke the body, which panics
             error = Some(format!(
                 "local _{} of {locals} in bb{}",
                 local_index(local),
@@ -282,26 +278,32 @@ fn validate(body: &MirBody<'_>) -> std::result::Result<(), String> {
     let named = body.param_locals.iter().chain(body.binding_locals.values());
     let named = named.chain(body.promoted_locals.iter().map(|it| &it.0));
     if let Some(local) = named.into_iter().find(|it| local_index(**it) >= locals) {
+        // alloc: error path
         return Err(format!(
             "parameter, binding or promoted local _{} of {locals}",
             local_index(*local)
         ));
     }
     if block_index(body.start_block) >= blocks {
+        // alloc: error path
         return Err("start block".to_owned());
     }
-    let reachable: rustc_hash::FxHashSet<BasicBlockId> =
-        reverse_postorder(body).into_iter().collect();
+    let mut reachable: Bits<'_> = bits_in(blocks, frame);
+    for block in reverse_postorder(body, frame) {
+        reachable.insert(block_index(block));
+    }
     for (id, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else {
-            if reachable.contains(&id) {
+            if reachable.contains(block_index(id)) {
+                // alloc: error path
                 return Err(format!("bb{} has no terminator", block_index(id)));
             }
             continue;
         };
         if let Some(target) =
-            successors(&terminator.kind).into_iter().find(|it| block_index(*it) >= blocks)
+            terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
         {
+            // alloc: error path
             return Err(format!(
                 "bb{} goes to bb{} of {blocks}",
                 block_index(id),
@@ -344,56 +346,41 @@ fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut BasicBlockId
         | TerminatorKind::Abort
         | TerminatorKind::Return
         | TerminatorKind::Unreachable
+        | TerminatorKind::TailCall { .. }
         | TerminatorKind::CoroutineDrop => (),
     }
 }
 
-fn successors(kind: &TerminatorKind) -> SmallVec<[BasicBlockId; 4]> {
-    let mut out = SmallVec::new();
-    match kind {
-        TerminatorKind::Goto { target } => out.push(*target),
-        TerminatorKind::SwitchInt { targets, .. } => out.extend_from_slice(targets.all_targets()),
-        TerminatorKind::Drop { target, unwind, .. }
-        | TerminatorKind::DropAndReplace { target, unwind, .. }
-        | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
-            out.push(*target);
-            out.extend(*unwind);
-        }
-        TerminatorKind::Call { target, cleanup, .. } => {
-            out.extend(*target);
-            out.extend(*cleanup);
-        }
-        TerminatorKind::Assert { target, cleanup, .. } => {
-            out.push(*target);
-            out.extend(*cleanup);
-        }
-        TerminatorKind::Yield { resume, drop, .. } => {
-            out.push(*resume);
-            out.extend(*drop);
-        }
-        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-            out.push(*real_target);
-            out.push(*imaginary_target);
-        }
-        TerminatorKind::UnwindResume
-        | TerminatorKind::Abort
-        | TerminatorKind::Return
-        | TerminatorKind::Unreachable
-        | TerminatorKind::CoroutineDrop => (),
+/// rustc's `fn_can_unwind` where panics unwind: whether a panic may unwind out of `func`
+/// rather than abort.
+pub(crate) fn fn_can_unwind(db: &Db, func: hir_def::FunctionId) -> bool {
+    !hir_def::attrs::AttrFlags::query(db, func.into())
+        .contains(hir_def::attrs::AttrFlags::RUSTC_NOUNWIND)
+        && abi_can_unwind(hir_def::signatures::FunctionSignature::of(db, func).abi)
+}
+
+/// Whether a function of `abi` may unwind: every Rust ABI, and the others' `-unwind` forms.
+pub(crate) fn abi_can_unwind(abi: rustc_abi::ExternAbi) -> bool {
+    use rustc_abi::ExternAbi;
+    match abi {
+        ExternAbi::Rust
+        | ExternAbi::RustCall
+        | ExternAbi::RustCold
+        | ExternAbi::RustInvalid
+        | ExternAbi::RustPreserveNone
+        | ExternAbi::RustTail => true,
+        ExternAbi::C { unwind }
+        | ExternAbi::System { unwind }
+        | ExternAbi::Aapcs { unwind }
+        | ExternAbi::Cdecl { unwind }
+        | ExternAbi::Stdcall { unwind }
+        | ExternAbi::Fastcall { unwind }
+        | ExternAbi::Thiscall { unwind }
+        | ExternAbi::Vectorcall { unwind }
+        | ExternAbi::SysV64 { unwind }
+        | ExternAbi::Win64 { unwind } => unwind,
+        _ => false,
     }
-    out
-}
-
-fn block_index(block: BasicBlockId) -> usize {
-    block.into_raw().into_u32() as usize
-}
-
-fn block_id(index: usize) -> BasicBlockId {
-    Idx::from_raw(RawIdx::from_u32(index as u32))
-}
-
-fn local_index(local: LocalId) -> usize {
-    local.into_raw().into_u32() as usize
 }
 
 fn local_id(index: usize) -> LocalId {
@@ -401,28 +388,24 @@ fn local_id(index: usize) -> LocalId {
 }
 
 /// The blocks reachable from the start, in reverse postorder, unwinding included.
-fn reverse_postorder(body: &MirBody<'_>) -> Vec<BasicBlockId> {
+fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlockId, &'f Frame> {
     let count = body.basic_blocks.len();
-    let mut visited = vec![false; count];
-    let mut post = Vec::with_capacity(count);
-    let mut stack: Vec<(BasicBlockId, SmallVec<[BasicBlockId; 4]>, usize)> = Vec::new();
+    let mut visited: Bits<'_> = bits_in(count, frame);
+    let mut post = Vec::with_capacity_in(count, frame);
+    // Each block and how many of its successors it has gone to; a block is on it at most once.
+    let mut stack: Vec<(BasicBlockId, usize), &Frame> = Vec::with_capacity_in(count, frame);
     let start = body.start_block;
-    visited[block_index(start)] = true;
-    let succ = |block: BasicBlockId| {
-        body.basic_blocks[block]
+    visited.insert(block_index(start));
+    stack.push((start, 0));
+    while let Some((block, at)) = stack.last_mut() {
+        let next = body.basic_blocks[*block]
             .terminator
             .as_ref()
-            .map(|it| successors(&it.kind))
-            .unwrap_or_default()
-    };
-    stack.push((start, succ(start), 0));
-    while let Some((block, next, at)) = stack.last_mut() {
-        if let Some(&target) = next.get(*at) {
+            .and_then(|it| it.kind.all_successors().nth(*at));
+        if let Some(target) = next {
             *at += 1;
-            if !visited[block_index(target)] {
-                visited[block_index(target)] = true;
-                let more = succ(target);
-                stack.push((target, more, 0));
+            if visited.insert(block_index(target)) {
+                stack.push((target, 0));
             }
         } else {
             post.push(*block);
@@ -434,29 +417,50 @@ fn reverse_postorder(body: &MirBody<'_>) -> Vec<BasicBlockId> {
 }
 
 /// Immediate dominators of the reachable blocks (Cooper, Harvey and Kennedy).
-struct Dominators {
+struct Dominators<'f> {
     /// By block index: the immediate dominator, `None` for a block that is not reachable.
-    idom: Vec<Option<usize>>,
+    idom: Vec<Option<usize>, &'f Frame>,
 }
 
-impl Dominators {
-    fn new(body: &MirBody<'_>) -> Dominators {
-        let rpo = reverse_postorder(body);
+impl<'f> Dominators<'f> {
+    fn new(body: &MirBody<'_>, frame: &'f Frame) -> Dominators<'f> {
+        let rpo = reverse_postorder(body, frame);
         let count = body.basic_blocks.len();
-        let mut order = vec![usize::MAX; count];
+        let mut order = Vec::with_capacity_in(count, frame);
+        order.resize(count, usize::MAX);
         for (at, &block) in rpo.iter().enumerate() {
             order[block_index(block)] = at;
         }
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); count];
+        // The predecessors of block `b` are `preds[starts[b]..starts[b + 1]]`, in reverse
+        // postorder and then successor order.
+        let mut starts = Vec::with_capacity_in(count + 1, frame);
+        starts.resize(count + 1, 0usize);
         for &block in &rpo {
             if let Some(terminator) = &body.basic_blocks[block].terminator {
-                for target in successors(&terminator.kind) {
-                    preds[block_index(target)].push(block_index(block));
+                for target in terminator.kind.all_successors() {
+                    starts[block_index(target) + 1] += 1;
+                }
+            }
+        }
+        for at in 0..count {
+            starts[at + 1] += starts[at];
+        }
+        let mut next = Vec::with_capacity_in(count, frame);
+        next.extend_from_slice(&starts[..count]);
+        let mut preds = Vec::with_capacity_in(starts[count], frame);
+        preds.resize(starts[count], 0usize);
+        for &block in &rpo {
+            if let Some(terminator) = &body.basic_blocks[block].terminator {
+                for target in terminator.kind.all_successors() {
+                    let slot = &mut next[block_index(target)];
+                    preds[*slot] = block_index(block);
+                    *slot += 1;
                 }
             }
         }
         let start = block_index(body.start_block);
-        let mut idom: Vec<Option<usize>> = vec![None; count];
+        let mut idom = Vec::with_capacity_in(count, frame);
+        idom.resize(count, None);
         idom[start] = Some(start);
         let intersect = |idom: &[Option<usize>], mut a: usize, mut b: usize| {
             while a != b {
@@ -475,7 +479,7 @@ impl Dominators {
             for &block in rpo.iter().skip(1) {
                 let block = block_index(block);
                 let mut new = None;
-                for &pred in &preds[block] {
+                for &pred in &preds[starts[block]..starts[block + 1]] {
                     if idom[pred].is_none() {
                         continue;
                     }
@@ -675,15 +679,10 @@ fn visit_body(body: &MirBody<'_>, mut f: impl FnMut(LocalId, Mention, Location))
 fn map_place(place: &mut StoredPlace, map: &mut impl FnMut(LocalId) -> LocalId) {
     place.local = map(place.local);
     if place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_))) {
-        let elems: Vec<PlaceElem> = place
-            .projection
-            .as_slice()
-            .iter()
-            .map(|it| match *it {
-                ProjectionElem::Index(local) => ProjectionElem::Index(map(local)),
-                other => other,
-            })
-            .collect();
+        let elems = place.projection.as_slice().iter().map(|it| match *it {
+            ProjectionElem::Index(local) => ProjectionElem::Index(map(local)),
+            other => other,
+        });
         place.projection = super::Projection::new_from_iter(elems).store();
     }
 }
@@ -708,58 +707,71 @@ fn renumber_locals(
         }
     }
     let get = |local: LocalId| map.get(local_index(local)).copied().flatten();
-    body.locals = new_locals;
-    let mut bindings = ArenaMap::default();
-    for (binding, &local) in body.binding_locals.iter() {
-        if let Some(local) = get(local) {
-            bindings.insert(binding, local);
+    // Each list keeps its order and only gets shorter: a kept local renumbered, a removed one
+    // gone.
+    let renumber = |local: &mut LocalId| match get(*local) {
+        Some(new) => {
+            *local = new;
+            true
         }
+        None => false,
+    };
+    body.locals = new_locals;
+    if body.binding_locals.values().all(|&it| get(it).is_some()) {
+        for (_, local) in body.binding_locals.iter_mut() {
+            *local = get(*local).expect("checked above");
+        }
+    } else {
+        // `ArenaMap::remove` leaves a trailing `None`, which its equality and hash see, so the
+        // map is made again at the length its largest kept binding gives it.
+        let last = body.binding_locals.iter().rev().find(|&(_, &local)| get(local).is_some());
+        let len = last.map_or(0, |(binding, _)| binding.into_raw().into_u32() as usize + 1);
+        let mut bindings = ArenaMap::with_capacity(len);
+        for (binding, &local) in body.binding_locals.iter() {
+            if let Some(local) = get(local) {
+                bindings.insert(binding, local);
+            }
+        }
+        body.binding_locals = bindings;
     }
-    body.binding_locals = bindings;
-    body.param_locals = body.param_locals.iter().filter_map(|&it| get(it)).collect();
-    body.promoted_locals = body
-        .promoted_locals
-        .iter()
-        .filter_map(|&(local, expr)| Some((get(local)?, expr)))
-        .collect();
-    body.promoted_constants = body.promoted_constants.iter().filter_map(|&it| get(it)).collect();
-    body.scope_ends = body.scope_ends.iter().filter_map(|&it| get(it)).collect();
-    body.upvars_in_place =
-        body.upvars_in_place.iter().filter_map(|&(it, field)| Some((get(it)?, field))).collect();
-    let upvars: FxHashMap<_, _> = std::mem::take(&mut body.upvar_locals)
-        .into_iter()
-        .map(|(binding, locals)| {
-            let locals = locals
-                .into_iter()
-                .filter_map(|(local, place)| Some((get(local)?, place)))
-                .collect::<Vec<_>>();
-            (binding, locals)
-        })
-        .filter(|(_, locals)| !locals.is_empty())
-        .collect();
-    body.upvar_locals = upvars;
+    body.param_locals.retain_mut(renumber);
+    body.promoted_locals.retain_mut(|(local, _)| renumber(local));
+    body.promoted_constants.retain_mut(renumber);
+    body.scope_ends.retain_mut(renumber);
+    body.upvars_in_place.retain_mut(|(local, _)| renumber(local));
+    body.inlined.bindings.retain_mut(|it| renumber(&mut it.local));
+    body.inlined.promoted.retain_mut(|it| renumber(&mut it.local));
+    body.upvar_locals.retain(|_, locals| {
+        locals.retain_mut(|(local, _)| renumber(local));
+        !locals.is_empty()
+    });
 }
 
-/// Replaces the blocks of the body by `blocks`, `map` saying where each old block went.
-fn renumber_blocks(body: &mut MirBody<'_>, blocks: Vec<BasicBlock>, map: &[Option<usize>]) {
-    let mut arena = Arena::with_capacity(blocks.len());
-    for mut block in blocks {
+/// The block arena's targets and the body's lists of blocks renumbered by `map`, which says
+/// where each old block went. The caller has already put the kept blocks in
+/// `body.basic_blocks`.
+fn renumber_blocks(body: &mut MirBody<'_>, map: &[Option<usize>]) {
+    let moved = |block: BasicBlockId| map[block_index(block)].map(block_id);
+    for (_, block) in body.basic_blocks.iter_mut() {
         if let Some(terminator) = &mut block.terminator {
             successors_mut(&mut terminator.kind, |it| {
-                *it = block_id(map[block_index(*it)].expect("a removed block is a target"))
+                *it = moved(*it).expect("a removed block is a target")
             });
         }
-        arena.alloc(block);
     }
-    body.basic_blocks = arena;
-    body.start_block = block_id(map[block_index(body.start_block)].expect("start is kept"));
-    body.unreached =
-        body.unreached.iter().filter_map(|&it| map[block_index(it)].map(block_id)).collect();
-    body.panic_unwinds = body
-        .panic_unwinds
-        .iter()
-        .filter_map(|&(block, at, to)| {
-            Some((block_id(map[block_index(block)]?), at, block_id(map[block_index(to)]?)))
-        })
-        .collect();
+    body.start_block = moved(body.start_block).expect("start is kept");
+    body.unreached.retain_mut(|block| match moved(*block) {
+        Some(new) => {
+            *block = new;
+            true
+        }
+        None => false,
+    });
+    body.panic_unwinds.retain_mut(|(block, _, to)| match (moved(*block), moved(*to)) {
+        (Some(new_block), Some(new_to)) => {
+            (*block, *to) = (new_block, new_to);
+            true
+        }
+        _ => false,
+    });
 }

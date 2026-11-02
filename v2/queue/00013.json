@@ -1,0 +1,28 @@
+{
+  "id": "00013",
+  "from_lane": "proof",
+  "owner": "store",
+  "paths": [
+    "crates/blaze-v2-proof",
+    "Cargo.toml",
+    "crates/blaze-format",
+    "crates/blaze-cas",
+    "docs/v2/plan/design/data.md",
+    "crates/blaze-cas/Cargo.toml"
+  ],
+  "what": "## 9. format and store: run every column codec through `blaze_v2_proof::columns::round_trips`\n\n- What: `blaze-v2-proof` as a dev-dependency (`blaze-v2-proof.workspace = true` once the\n  coordinator adds it to `[workspace.dependencies]` as `{ path = \"crates/blaze-v2-proof\" }`),\n  and a test per column encoding (hot narrow widths, warm frame-of-reference bit-packing, cold\n  run-length, delta, dictionary and zstd) calling `columns::round_trips(encode, decode, seed)`\n  over several seeds, and for each encoding read in place (hot narrow widths, warm\n  frame-of-reference) also `columns::reads_in_place(encode, get, seed)`. Store: the same for a\n  record moved hot to warm to cold and back by the tier mover.\n- Where: root `Cargo.toml` (coordinator); `crates/blaze-format`, `crates/blaze-cas` (format,\n  store).\n- Why: docs/v2/plan/design/data.md: \"Every encoding round-trips exactly, which the proof\n  checks.\" `shapes` holds the columns each tier is chosen for and their edges (empty, runs,\n  sorted, CSR offsets, every narrow range, a frame far from zero, the extremes).\n\n> applied: `blaze-v2-proof = { path = \"crates/blaze-v2-proof\" }` in the root `[workspace.dependencies]`; `crates/blaze-format` already uses it.\n> forwarded to store: `crates/blaze-cas/Cargo.toml` has no `blaze-v2-proof` dev-dependency or tier round-trip test yet.",
+  "state": "open",
+  "created": "2026-10-29T23:50:35Z",
+  "updated": "2026-10-29T23:50:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/proof.md#9. format and store: run every column codec through `blaze_v2_proof::columns::round_trips`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/proof.md:135"
+    }
+  ]
+}

@@ -48,6 +48,83 @@ pub struct Unit {
     pub jobserver: Option<String>,
 }
 
+/// A unit that lacks what cargo always gives a script, or gives it in a form cargo never does:
+/// the script is not run with a value guessed in its place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unfilled {
+    /// A field cargo always fills, empty (`TARGET`, `HOST`, `OUT_DIR`, `RUSTC` and the rest).
+    Empty { package: String, field: &'static str },
+    /// A version that is not semver's `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
+    Version { package: String, version: String },
+    /// A line of `target_cfgs` that is not as `rustc --print cfg` prints one.
+    Cfg { package: String, line: String },
+    /// A `rust-version` that is not one to three numbers.
+    RustVersion { package: String, rust_version: String },
+}
+
+impl std::fmt::Display for Unfilled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfilled::Empty { package, field } => write!(
+                f,
+                "the build script of `{package}` has no {field}, which cargo always gives a script"
+            ),
+            Unfilled::Version { package, version } => write!(
+                f,
+                "the version `{version}` of `{package}` is not a semver version (MAJOR.MINOR.PATCH)"
+            ),
+            Unfilled::Cfg { package, line } => write!(
+                f,
+                "the cfg `{line}` of `{package}`'s target is not as `rustc --print cfg` prints one \
+                 (`name` or `name=\"value\"`)"
+            ),
+            Unfilled::RustVersion { package, rust_version } => write!(
+                f,
+                "the `rust-version` `{rust_version}` of `{package}` is not one to three numbers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unfilled {}
+
+impl From<Unfilled> for crate::Error {
+    fn from(it: Unfilled) -> crate::Error {
+        // alloc: error path.
+        crate::Error(it.to_string())
+    }
+}
+
+impl Unit {
+    /// The unit with each field cargo always fills filled.
+    pub fn check(&self) -> Result<(), Unfilled> {
+        let package = &self.package;
+        let paths = [
+            ("CARGO_MANIFEST_DIR", package.manifest_dir.as_os_str()),
+            ("CARGO_MANIFEST_PATH", package.manifest_path.as_os_str()),
+            ("the script's executable", self.script.as_os_str()),
+            ("OUT_DIR", self.out_dir.as_os_str()),
+            ("CARGO", self.tools.cargo.as_os_str()),
+            ("RUSTC", self.tools.rustc.as_os_str()),
+            ("RUSTDOC", self.tools.rustdoc.as_os_str()),
+        ];
+        let texts = [
+            ("CARGO_PKG_NAME", package.name.as_str()),
+            ("CARGO_PKG_VERSION", package.version.as_str()),
+            ("TARGET", self.target.as_str()),
+            ("HOST", self.host.as_str()),
+            ("OPT_LEVEL", self.profile.opt_level.as_str()),
+        ];
+        let empty = paths.iter().find(|(_, it)| it.is_empty()).map(|(field, _)| *field);
+        let empty = empty.or_else(|| texts.iter().find(|(_, it)| it.is_empty()).map(|(field, _)| *field));
+        match empty {
+            // alloc: error path.
+            Some(field) => Err(Unfilled::Empty { package: package.descr(), field }),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The package whose script runs: what of its manifest a run reads.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -127,7 +204,16 @@ impl Target {
 impl Package {
     /// How cargo names the package in messages.
     pub fn descr(&self) -> String {
+        // alloc: a message's text, made when one is.
         self.descr.clone().unwrap_or_else(|| format!("{} v{}", self.name, self.version))
+    }
+
+    /// [`Package::descr`], written into `f` with nothing allocated.
+    pub fn write_descr(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match &self.descr {
+            Some(descr) => f.write_str(descr),
+            None => write!(f, "{} v{}", self.name, self.version),
+        }
     }
 
     /// The name of the package's library's crate, if it has one.
@@ -202,7 +288,9 @@ pub struct DylibSearch {
     pub host_root: Option<PathBuf>,
     /// Where the host's dependencies are: `target/debug/deps`.
     pub host_deps: Vec<PathBuf>,
-    /// The host's library directory in the sysroot (`rustc --print target-libdir`).
+    /// The host's library directory in the sysroot (`rustc --print target-libdir`). Empty for
+    /// a toolchain that has none (blaze's, which ships no dynamic std): then nothing is added,
+    /// as an empty entry would have the loader search the working directory.
     pub sysroot_libdir: PathBuf,
     /// What the scripts of the host-only dependencies (build dependencies, proc macros) of the
     /// unit added with `rustc-link-search`, in order, kinds included (`native=/x`).

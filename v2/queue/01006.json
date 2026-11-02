@@ -1,0 +1,24 @@
+{
+  "id": "01006",
+  "from_lane": "item-hash",
+  "owner": "dbsp",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/delta/publish.rs",
+    "crates/hir-ty/src/method_resolution/delta/read.rs"
+  ],
+  "what": "impl_identity (publish.rs) hashes an impl by ImplLoc only (crate, module names, ast id), so impl_row_hash/blanket_hash miss edits of an impl header (where clauses, generics, assoc type values) and change on a module rename. As the item store Implements fact value that is unsound. Proposal: impl_identity reads an impl-identity hook installed once per database; blaze-item-hash installs it as (crate, blaze_items signature_hash of the impl, ordinal among equal-signature impls of the crate), name- and position-free (design docs/v2/plan/design/item-hash.md 3.7). Then lane items makes Implements = hash over crates in scope of impl_row_hash for unifying heads plus blanket_hash. Sent to window dbsp-impls-next1 too.",
+  "state": "open",
+  "created": "2026-10-30T13:25:05Z",
+  "updated": "2026-10-30T13:25:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:25:05Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "00529",
+  "from_lane": "diagnostics-lints-mir-speed",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir-ide/src/diagnostics/unsafe_check.rs",
+    "crates/hir-ty-matchck",
+    "Cargo.toml",
+    "crates/hir-ide/src/diagnostics",
+    "crates/hir/src/diagnostics.rs",
+    "harness/toolchain",
+    "tools/rename.py",
+    "crates/hir-ty-unsafeck/src/lib.rs"
+  ],
+  "what": "## diagnostics-lints-mir-speed: what keeps the MIR lowerings (matches, unsafety, scopes) from their bound (db, `crates/hir`, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir-ty-matchck`, `Cargo.toml`)\n\n1. **The first unsafe operation of a function, from hir** (db, `crates/hir-ide/src/diagnostics/\n   unsafe_check.rs`, `crates/hir/src/diagnostics.rs`). This is item 4 of\n   `## diagnostics-lints-mir-unsafe`, restated for its cost. rustc's note \"an unsafe function\n   restricts its caller\" goes on the first operation it lints in each `unsafe fn` body or\n   closure (`suggest_unsafe_block`). hir doesn't say which that is, so `lower/missing_unsafe.rs`\n   `first_in_function` calls `Semantics::get_unsafe_ops` on the body for every\n   `unsafe_op_in_unsafe_fn` diagnostic. `get_unsafe_ops` is not a query: each call walks the\n   whole body again. It then compares positions first and finds the other operations' scopes\n   only for those that come earlier. An `unsafe fn` with k linted operations in a body of n\n   expressions costs k·n, about 50·2,000 = 100,000 node visits for a large FFI wrapper,\n   against 0 with the flag. Wanted: `MissingUnsafe::first: bool`, set as rustc's\n   `UnsafetyVisitor` sets `suggest_unsafe_block`, or `missing_unsafe` as a tracked query\n   whose result the lowering reads once per body.\n2. **`rustc_pattern_analysis` at the pinned nightly** (db, `Cargo.toml` line 182,\n   `crates/hir-ty-matchck`). `hir-ty-matchck` runs rustc's own usefulness algorithm\n   (Maranget's, with `PlaceValidity`, `compute_match_usefulness`, rustc's witness\n   construction), so its results are rustc's. But it runs crates.io's\n   `ra-ap-rustc_pattern_analysis` 0.166, a snapshot that nothing ties to `harness/toolchain`.\n   `rustc_type_ir` and `rustc_next_trait_solver` are vendored forks (`vendor/`,\n   `tools/rename.py` `RUSTC_FORKS`); this crate isn't. When rustc changes usefulness\n   (`exhaustive_patterns` and `min_exhaustive_patterns`, never patterns, deref patterns,\n   `PlaceValidity` rules, `pattern_complexity_limit`), blaze accepts or refuses a match\n   differently from the pinned nightly, which breaks superset-of-rust. Wanted: vendor\n   `compiler/rustc_pattern_analysis` at the pinned nightly, as the other two are, and add it\n   to the toolchain bump, with a check that fails when the vendored commit is not the pin's.\n\n> forwarded to db (item 1: `MissingUnsafe::first` or a tracked `missing_unsafe`, in hir/hir-ty; db-next3 told; requests applies the `hir-ide/src/diagnostics/unsafe_check.rs` half to db's shape once it is written) and the coordinator (item 2: vendoring `rustc_pattern_analysis` at the pin and the toolchain bump; requests switches the root `Cargo.toml` line once `vendor/` has it) (requests, pass 23).\n> (requests, pass 29): the hir-ide half needs nothing: `crates/hir-ide/src/diagnostics/unsafe_check.rs` is deleted in the tree. Item 1 is db's alone; item 2 stays on the coordinator's list.\n> checked by db-audit-other (22:37): item 1 is in the tree. `hir::MissingUnsafe::first` is at `crates/hir/src/diagnostics.rs:753`, set from `crates/hir-ty-unsafeck/src/lib.rs:108` as rustc's `suggest_unsafe_block`. Item 2 is the coordinator's, as above.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-mir-speed: what keeps the MIR lowerings (matches, unsafety, scopes) from their bound (db, `crates/hir`, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir-ty-matchck`, `Cargo.toml`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4394"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:37): item 1 is in the tree. `hir::MissingUnsafe::first` is at `crates/hir/src/diagnostics.rs:753`, set from `crates/hir-ty-unsafeck/src/lib.rs:108` as rustc's `suggest_unsafe_block`. Item 2 is the coordinator's, as above."
+    }
+  ]
+}

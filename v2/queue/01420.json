@@ -1,0 +1,36 @@
+{
+  "id": "01420",
+  "from_lane": "observe-history",
+  "owner": "coordinator",
+  "paths": [
+    "flake.nix",
+    "crates/blaze-cargo/src/cli"
+  ],
+  "what": "observe step 3 (history), Andrew 17:53: `nix run .#duckdb` and `blaze debug sql`.\n1. flake.nix, beside `apps.blaze` (~line 255): `apps.duckdb = { type = \"app\"; program = \"${pkgs.duckdb}/bin/duckdb\"; };` and `packages.duckdb = pkgs.duckdb;`. That is nixpkgs' duckdb at the locked nixpkgs (rev e513db7b, /nix/store/xw8ashrlm2aasam4ayyhlhx5w51czapn-source): DuckDB 1.5.5, rev d8cdaa33fda8df955cc76ef58a280f68f4cd43fa, built with DUCKDB_EXTENSION_CONFIGS = in_tree_extensions.cmake, so parquet is compiled in and nothing downloads. Pin it: add an assertion `assert pkgs.duckdb.version == \"1.5.5\";` (or an override with that src) so a nixpkgs bump that changes DuckDB is a visible change.\n2. blaze's own package/wrapper: put that DuckDB's absolute path where the CLI can read it without PATH lookup, e.g. the wrapper sets BLAZE_DUCKDB=${pkgs.duckdb}/bin/duckdb (no fallback to `duckdb` on PATH: unset is an error naming `nix run .#duckdb`).\n3. CLI (crates/blaze-cargo/src/cli): `blaze debug sql \"<query>\"` = `blaze_profile::sql::run(&Query { duckdb, history: &blaze_profile::history::dir_in(&serve::state()?), sql })`, printing the batches as a table (or `--json`); `blaze debug sql --live [--last <secs>, default 30] \"<query>\"` asks the daemon, which calls `blaze_profile::sql::run_live(&query, window)` in its own process (the recorder is the daemon's) and returns the Arrow batches (IPC) on the existing socket. `blaze explain <view> [k=v ...]` = `views::find(name)?` + `views::render(view, &args)?` + `sql::run`. Errors: `SqlError`/`ViewError` Display as-is. Needs `pub mod history; pub mod sql; pub mod views;` in blaze-profile (queued to observe) after 01412.",
+  "state": "applied",
+  "created": "2026-11-01T01:58:02Z",
+  "updated": "2026-11-01T03:42:36Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:58:02Z",
+      "by": "observe-history",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:36Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "flake.nix: pinned duckdb 1.5.5, apps.duckdb, blaze wrapped with --set BLAZE_DUCKDB. blaze debug sql [--live] [--last N] [--json] SQL: off-daemon runs sql::run on the history; --live asks the daemon (Request::Sql, thread blaze-sql, Arrow IPC back). blaze explain VIEW k=v runs a views:: view. BLAZE_DUCKDB unset is an error naming it; Cargo.lock needs the new blaze-cargo deps (blaze-explore, arrow-array)."
+    }
+  ]
+}

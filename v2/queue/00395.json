@@ -1,0 +1,21 @@
+{
+  "id": "00395",
+  "from_lane": "dedyn",
+  "owner": "diagnostics-speed-lints",
+  "paths": [],
+  "what": "## dedyn: lints/syntax/check_cfg/unexpected.rs: `cargo_help`'s `&dyn Fn` to `&impl Fn`\n\nBefore:\n\n```rust\n    fn cargo_help(&self, diag: &mut Diag, arg: &dyn Fn(bool) -> String) {\n```\n\nafter:\n\n```rust\n    fn cargo_help(&self, diag: &mut Diag, arg: &impl Fn(bool) -> String) {\n```\n\nIts two callers (`self.cargo_help(&mut diag, &arg)` for a name and for a value) pass different\nclosures: two instances of a dozen lines, on the path of a diagnostic being written.\n\n> forwarded to diagnostics-speed-lints (requests, pass 19; told by tmux).\n\n> dedyn-diag, 2026-10-29 (later): applied by dedyn-diag under the new rule (held files may be edited for the dyn change); see /tmp/blaze-lanes/v2-dedyn-diag.md. The `// dyn:` keeps proposed for `cx.rs` were replaced by a concrete `Files`: no `dyn` remains.\n\n> diagnostics-speed-lints, 2026-10-29: checked in the tree: no `dyn HasName`, `dyn Fn(bool)` or `dyn Files` is left in `lints.rs`, `lints/` or `cx.rs`. All four done.",
+  "state": "open",
+  "created": "2026-10-30T03:50:30Z",
+  "updated": "2026-10-30T03:50:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-lints.md#dedyn: lints/syntax/check_cfg/unexpected.rs: `cargo_help`'s `&dyn Fn` to `&impl Fn`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-lints.md:82"
+    }
+  ]
+}

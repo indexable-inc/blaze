@@ -1,0 +1,23 @@
+{
+  "id": "01344",
+  "from_lane": "codegen",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "EII (feature extern_item_impls) in hir-def attrs, for 00843: rustc's has_custom_linkage counts CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM (an #[eii] implementation) as an extern indicator. hir-def has no EII attribute at all (rg -i eii crates/hir-def finds nothing), so no item can be one. Asked: an AttrFlags bit (or query) for an item that implements an EII, as rustc sets it from AttributeKind::EiiImpls; then codegen keeps it in crates/hir-ty-codegen/v2/roots/kept.rs keeps_function/keeps_static beside custom_linkage. Tell codegen its name.",
+  "state": "open",
+  "created": "2026-10-31T20:39:26Z",
+  "updated": "2026-10-31T20:39:26Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:39:26Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

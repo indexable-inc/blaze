@@ -190,13 +190,13 @@ fn f() {
     "#,
         expect![[r#"
             ModuleIdLt {
-                [salsa id]: Id(583),
+                [id]: Id(12291),
                 krate: Crate(
-                    Id(380),
+                    Id(9216),
                 ),
                 block: Some(
                     BlockId(
-                        Id(881),
+                        Id(27649),
                     ),
                 ),
                 containing_module_inside_def_map: None,
@@ -425,7 +425,7 @@ mod m {
     "#,
         expect![[r#"
             (block scope)
-            - _ : type
+            - _ : type (import)
             - Tr : type
 
             crate

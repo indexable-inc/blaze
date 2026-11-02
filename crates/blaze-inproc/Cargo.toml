@@ -1,0 +1,47 @@
+[package]
+name = "blaze-inproc"
+description = "blaze v2's dev runs patched with one store: the executable written once per content key and started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Run by the coordinator as a dev run under blaze: a program that checks it is its own
+# executable at cargo's path, symbolizes its backtrace and was attached by its start hook.
+[[example]]
+name = "inproc-exact"
+path = "programs/exact.rs"
+test = false
+
+[features]
+# The daemon's side (`host`): launches a run through `blaze-core`'s `Effect::Spawn`. The run
+# process links the crate without it.
+host = ["dep:blaze-core"]
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-core = { workspace = true, optional = true }
+blaze-mem.workspace = true
+blaze-spin.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+blaze-ids.workspace = true
+blaze-radix.workspace = true
+
+[lints]
+workspace = true

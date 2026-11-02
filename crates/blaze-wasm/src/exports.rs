@@ -98,10 +98,17 @@ pub extern "C" fn blaze_analyze() {
     })
 }
 
-/// Says where in the module the pack is linked into the program goes.
+/// Says where in the memory and table of the module the program lives in it goes. Whether it
+/// worked; if not, [`blaze_report`] says why.
 #[unsafe(no_mangle)]
-pub extern "C" fn blaze_set_start(table_start: u32, memory_start: u32) {
-    PAGE.with_borrow_mut(|page| page.compiler.set_start(table_start, memory_start.into()));
+pub extern "C" fn blaze_set_start(table_start: u32, memory_start: u32) -> bool {
+    PAGE.with_borrow_mut(|page| match page.compiler.set_start(table_start, memory_start.into()) {
+        Ok(()) => true,
+        Err(e) => {
+            page.report = e;
+            false
+        }
+    })
 }
 
 /// Sets the text of a file.

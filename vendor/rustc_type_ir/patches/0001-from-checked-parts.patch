@@ -1,0 +1,62 @@
+diff -ruN a/src/predicate.rs b/src/predicate.rs
+--- a/src/predicate.rs
++++ b/src/predicate.rs
+@@ -126,6 +126,12 @@
+         Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }
+     }
+ 
++    /// A trait reference of parts that were checked when it was first made, read back where no
++    /// interner is at hand (an interned row, a persisted type table).
++    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {
++        Self { def_id, args, _use_trait_ref_new_instead: () }
++    }
++
+     pub fn new(
+         interner: I,
+         trait_def_id: I::TraitId,
+@@ -402,6 +408,11 @@
+         Self { def_id: trait_def_id, args, _use_existential_trait_ref_new_instead: () }
+     }
+ 
++    /// As [`TraitRef::from_checked_parts`].
++    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {
++        Self { def_id, args, _use_existential_trait_ref_new_instead: () }
++    }
++
+     pub fn new(
+         interner: I,
+         trait_def_id: I::TraitId,
+@@ -473,6 +484,15 @@
+         term: I::Term,
+     ) -> ExistentialProjection<I> {
+         interner.debug_assert_existential_args_compatible(def_id.into(), args);
++        Self { def_id, args, term, use_existential_projection_new_instead: () }
++    }
++
++    /// As [`TraitRef::from_checked_parts`].
++    pub fn from_checked_parts(
++        def_id: I::TraitAssocTermId,
++        args: I::GenericArgs,
++        term: I::Term,
++    ) -> Self {
+         Self { def_id, args, term, use_existential_projection_new_instead: () }
+     }
+ 
+diff -ruN a/src/ty/alias.rs b/src/ty/alias.rs
+--- a/src/ty/alias.rs
++++ b/src/ty/alias.rs
+@@ -47,6 +47,14 @@
+     pub fn kind(self, _interner: I) -> K {
+         self.kind
+     }
++
++    /// An alias of parts that were checked when it was first made, read back where no interner
++    /// is at hand (an interned row, a persisted type table). As
++    /// [`crate::TraitRef::from_checked_parts`]; one constructor for every kind of alias
++    /// (`AliasTy`, `AliasTerm`, `AliasConst`, ...).
++    pub fn from_checked_parts(kind: K, args: I::GenericArgs) -> Self {
++        Alias { kind, args, _use_alias_new_instead: () }
++    }
+ }
+ 
+ pub type AliasTerm<I> = Alias<I, AliasTermKind<I>>;

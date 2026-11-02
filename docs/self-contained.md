@@ -200,8 +200,8 @@ proc macros, and M deletes what K and J leave unused. So J goes first, K right b
 last; cargo (11 MB) goes with the switches of [resolution](#resolution-and-fetching) and K.
 
 **J, proc macros** ([#90](https://github.com/indexable-inc/blaze/issues/90)). What is there:
-blaze's proc-macro server (`vendor/proc-macro-srv`, the release's own server with a loader that
-reads blaze's list of macros), proc-macro crates linked by blaze as shared libraries with that
+blaze's proc-macro server (`crates/proc-macro-srv-cli`, `vendor/proc-macro-srv` until
+2026-10-30, the release's own server with a loader that reads blaze's list of macros), proc-macro crates linked by blaze as shared libraries with that
 list (`macro_list.rs`, `--exe --shared`), and `harness/macroserver.py` holding the expansions of
 serde_derive, thiserror-impl, tokio-macros and clap_derive equal to the toolchain's. In order:
 

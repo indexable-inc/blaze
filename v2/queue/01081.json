@@ -1,0 +1,35 @@
+{
+  "id": "01081",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/blaze-store"
+  ],
+  "what": "re 01060: 01042 phase C round 1 is in the tree. hir-ty-codegen no longer has v1 whole-object build (CodegenUnit, ObjectCodegen, Roots, Rejections, patch/units/later/settled/watch modules, tests_reach), and still names blaze_store nowhere (phase A, 01060). Nothing in the workspace depends on blaze-store but its own Cargo.toml (and stale Cargo.lock lines under blaze-macro-wasm and blaze-registry). Go ahead and delete blaze-store.",
+  "state": "applied",
+  "created": "2026-10-30T15:59:44Z",
+  "updated": "2026-10-30T16:33:54Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:59:44Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:54Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:54Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "blaze-store deleted 09:31 (git rm, root Cargo.toml, Cargo.lock block and 2 dependency lines)."
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "01240",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db"
+  ],
+  "what": "query-unify-engine DONE: the whole contract is in crates/blaze-query/src/db, including summaries, 01217 renumbering and 01220 R14/R15. All db::tests pass in round5-test.log, see /tmp/blaze-lanes/v2-query-unify-engine.md. The crate-root test tests::a_warm_miss_allocates_at_most_a_segment fails (src/tests.rs:1162, 2 allocations against a budget of 1). It is outside db/ and not mine.",
+  "state": "applied",
+  "created": "2026-10-31T03:06:11Z",
+  "updated": "2026-10-31T12:05:36Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:06:11Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:05:36Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "read; nothing to do"
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+; Follows cranelift/filetests/filetests/runtests/simd-umulhi.clif (and simd-smulhi.clif,
+; simd-vhighbits-float.clif), for the stencil set: the vector ops it has that Cranelift 0.136
+; does not lower on every host: `umulhi`/`smulhi` of `i16x8` (no backend) and `vhigh_bits` of
+; `f32x4`/`f64x2` by their sign bits (x86-64 does, AArch64 does not). Each line runs in the
+; interpreter everywhere, and as code only where Cranelift lowers its function: `vhigh_bits` on
+; x86-64 hosts, the `mulhi` ones nowhere until Cranelift lowers them.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %umulhi_i16x8(i16x8, i16x8) -> i16x8 {
+block0(v0: i16x8, v1: i16x8):
+    v2 = umulhi v0, v1
+    return v2
+}
+; run: %umulhi_i16x8([1 2 0xff 0xff 0xff 0xff 0xffff 0xffff], [3 4 5 6 7 8 9 0xffff]) == [0 0 0 0 0 0 8 0xfffe]
+; run: %umulhi_i16x8([1 0xfffe 0xff 0xff01 0xff 0xff01 0x7fff 0x8000], [3 4 0xfffb 0xfffa 7 8 0x8000 0x8000]) == [0 3 0xfe 0xfefb 0 7 0x3fff 0x4000]
+; run: %umulhi_i16x8([0xffff 0x8000 0x8000 1 0 0x7fff 0x1234 0xffff], [0xffff 0x8000 2 0xffff 0xffff 0x7fff 0x100 2]) == [0xfffe 0x4000 1 0 0 0x3fff 18 1]
+
+function %smulhi_i16x8(i16x8, i16x8) -> i16x8 {
+block0(v0: i16x8, v1: i16x8):
+    v2 = smulhi v0, v1
+    return v2
+}
+; run: %smulhi_i16x8([1 2 0xff 0xff 0xff 0xff 0xffff 0xffff], [3 4 5 6 7 8 9 0xffff]) == [0 0 0 0 0 0 0xffff 0]
+; run: %smulhi_i16x8([1 0xfffe 0xff 0xff01 0xff 0xff01 0x7fff 0x8000], [3 4 0xfffb 0xfffa 7 8 0x8000 0x8000]) == [0 0xffff 0xffff 0 0 0xffff 0xc000 0x4000]
+; run: %smulhi_i16x8([0xffff 0x8000 0x8000 1 0 0x7fff 0x1234 0xffff], [0xffff 0x8000 2 0xffff 0xffff 0x7fff 0x100 2]) == [0 0x4000 0xffff 0xffff 0 0x3fff 18 0xffff]
+
+function %vhigh_bits_f32x4_i8(f32x4) -> i8 {
+block0(v0: f32x4):
+    v1 = vhigh_bits.i8 v0
+    return v1
+}
+; run: %vhigh_bits_f32x4_i8([0x0.0 0x0.0 0x0.0 0x0.0]) == 0
+; run: %vhigh_bits_f32x4_i8([0x0.0 -0x0.0 0x0.0 0x0.0]) == 2
+; run: %vhigh_bits_f32x4_i8([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 15
+; run: %vhigh_bits_f32x4_i8([0x1.0p0 0x1.0p0 0x1.0p0 0x1.0p0]) == 0
+; run: %vhigh_bits_f32x4_i8([+NaN -NaN -Inf +Inf]) == 6
+; run: %vhigh_bits_f32x4_i8([-0x1.0p0 0x1.0p0 -0x0.000002p-126 0x1.fffffep127]) == 5
+
+function %vhigh_bits_f32x4_i16(f32x4) -> i16 {
+block0(v0: f32x4):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_f32x4_i16([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 15
+; run: %vhigh_bits_f32x4_i16([0x1.0p0 -0x1.0p0 0x1.0p0 -0x1.0p0]) == 10
+
+function %vhigh_bits_f32x4_i32(f32x4) -> i32 {
+block0(v0: f32x4):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_f32x4_i32([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 15
+; run: %vhigh_bits_f32x4_i32([-Inf 0x0.0 0x0.0 -NaN]) == 9
+
+function %vhigh_bits_f32x4_i64(f32x4) -> i64 {
+block0(v0: f32x4):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_f32x4_i64([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 15
+; run: %vhigh_bits_f32x4_i64([0x0.0 0x0.0 -0x1.8p1 0x0.0]) == 4
+
+function %vhigh_bits_f64x2_i8(f64x2) -> i8 {
+block0(v0: f64x2):
+    v1 = vhigh_bits.i8 v0
+    return v1
+}
+; run: %vhigh_bits_f64x2_i8([0x0.0 0x0.0]) == 0
+; run: %vhigh_bits_f64x2_i8([0x0.0 -0x0.0]) == 2
+; run: %vhigh_bits_f64x2_i8([-0x0.0 -0x0.0]) == 3
+; run: %vhigh_bits_f64x2_i8([0x1.0p0 0x1.0p0]) == 0
+; run: %vhigh_bits_f64x2_i8([-NaN +NaN]) == 1
+; run: %vhigh_bits_f64x2_i8([+Inf -Inf]) == 2
+
+function %vhigh_bits_f64x2_i16(f64x2) -> i16 {
+block0(v0: f64x2):
+    v1 = vhigh_bits.i16 v0
+    return v1
+}
+; run: %vhigh_bits_f64x2_i16([-0x0.0 -0x0.0]) == 3
+; run: %vhigh_bits_f64x2_i16([-0x0.0000000000001p-1022 0x0.0]) == 1
+
+function %vhigh_bits_f64x2_i32(f64x2) -> i32 {
+block0(v0: f64x2):
+    v1 = vhigh_bits.i32 v0
+    return v1
+}
+; run: %vhigh_bits_f64x2_i32([-0x0.0 -0x0.0]) == 3
+; run: %vhigh_bits_f64x2_i32([0x1.fffffffffffffp1023 -0x1.fffffffffffffp1023]) == 2
+
+function %vhigh_bits_f64x2_i64(f64x2) -> i64 {
+block0(v0: f64x2):
+    v1 = vhigh_bits.i64 v0
+    return v1
+}
+; run: %vhigh_bits_f64x2_i64([-0x0.0 -0x0.0]) == 3
+; run: %vhigh_bits_f64x2_i64([-0x1.0p0 0x1.0p0]) == 1

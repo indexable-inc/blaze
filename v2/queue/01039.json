@@ -1,0 +1,26 @@
+{
+  "id": "01039",
+  "from_lane": "fastcompile-wire",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/run.rs",
+    "crates/blaze-cargo/src/serve/unit/run/inproc.rs",
+    "crates/blaze-cargo/src/serve/unit/codegen.rs",
+    "crates/blaze-cargo/src/serve/unit.rs"
+  ],
+  "what": "## fastcompile-wire 2 (answers 00744 for cargo): dev `run` and `test` take the lazy, tiered, in-process path\n\nNeeds codegen's `Later` (queue 01038). The blaze-lazy side is written: `crates/blaze-lazy/src/compile.rs` (`Source`, `Lazily`, `Refusal`, `Kept`), design in `docs/v2/plan/lanes/fastcompile/lazy.md`, \"The compiler of a run\". Two changes from what cargo-inbox-exec agreed on 00744 (23:41): **no snapshot** (`Db` has no fork, `docs/v2/plan/lanes/frontend/db.md`), and **no `Later` swapped at a patch**: a lazy slot never takes a patch's code (`blaze-link/src/lazy.rs`), so the image's `Later` stays right for the whole run, and codegen refuses a compile whose instance the front end now describes under another key (the function was edited before its first call), naming it. That refusal is the run's failure, never a compile at the new body.\n\n1. **`run.rs` `launch_of`**: a profile `blaze_lazy::allow` accepts gives a new `Launch::Lazy` (in place of the `NOT_IN_PROCESS` error), `Refused::Release` stays `Launch::File`. `start` (and the test queue) start a `Launch::Lazy` process through `run/inproc.rs` `Loaded::command`.\n2. **`codegen.rs` `generate`**, for a `Launch::Lazy` unit: `Build::run_later(&asked, &roots.statics, &entry, &store)` (`entry` = the places of the `Kind::Start` root, the C `main`; a harness test's start root from `harness::roots`), then `build.into_later()`. `Plan::new(&built.walked, &built.entry, &built.statics)`, `Session::new(&purpose, plan, &Isa::host(..), 0)`, link with `Image::stage_lazy(&session, &stubs)` and `inproc::dev_run(tiered)` (`Some(functions)` when the policy is `Mode::Tiered`), `inproc::load`, then `blaze_link::LazyPlacer::new(image, memory, slots, slide)` with the first session's slide.\n3. **The run's compiler**: `impl blaze_lazy::compile::Source for` a cargo type holding the `Later<HirInstance, HirStatic>`, the job's `Memo` (shared), a store read handle that is `Sync` (`Lookup` from the runner's threads), the build's `HashSource` and `BuildTime`, and the job's front end.\n   - `type Reader` = a `UnitReader` (or what holds one). `reader()` gives the job's current front end, from a cell the loop updates whenever it moves the front end (a new job, `keep`). No lock while no write is pending; while one is, it waits for the write, so it never hands out a reader a write has stopped, and never starves the write.\n   - **The write side must wait, not give up.** Today `UnitWriter::apply` returns `Ok(false)` while a reader is held and `keep` drops the front end when `Arc::into_inner` fails. A lazy compile holds a reader for microseconds to milliseconds at any time during the run, so both must stop the readers and wait for them (as `base_db::Shared::write` does), never re-lower or lose the kept front end because a compile held it.\n   - `compile(reader, key, to)`: build `Backends` and `HirFrontend::new(Databases::new(reader.db()), hashes, build_time)` over the reader; `later.compile_kept(..)`, or with `Some(to)`, `later.tier_up(.., to, ..)`. A `CodegenError` is `Refusal::Failed(error.to_string())`. Wrap the call in `catch_unwind`: a `salsa::Cancelled` payload is `Refusal::Stopped`, any other panic is resumed (the runner names it).\n   - `memo_hit(key)` is `later.memo_hit(&memo, key)`; `keep(puts)` sends them to the loop, which stores them as it stores `Built::puts`.\n4. **The runner**: `Runner::start(session, &session.first(&ahead_functions, &reached), Lazily::new(source), placer, runs, Config { workers, idle: true }, tier)`, where `reached` is the test's history (usercode's `Reached`) and `tier` is `Some(TierUp { cells, policy, config })` for `Mode::Tiered`, with the code memory's `CellView`. Keep the runner with `Loaded` for the program's life; `runner.close()` when its last process exits, and report `Closed::failures` as the run's errors (a whole build would have failed on them) and `Closed::unbound`.\n5. **`run/inproc.rs` `serve`**: route `kinds::LAZY` frames to `runner.frame(pid, frame.kind, frame.seq, frame.body)` instead of refusing them (an `Err` kills the process naming it, as a send failure does), and `runs.add(sender.clone())` before the first frame, `runs.remove(pid)` at its end: `blaze_lazy::runner::Runs` answers by pid with the session's `Sender`.\n6. Tests: `launch_of` gives `Launch::Lazy` for a dev profile and `File` for release (`run/tests.rs`), and a `Source` test that a cancelled compile is `Stopped` and a refused one `Failed`.\n\nThere is no lazy flag (fastcompile.md, fastcompile-lazy 5): lazy is how a dev `run` and `test` start, and `blaze_lazy::allow` keeps release and `blaze build` outputs whole.",
+  "state": "open",
+  "created": "2026-10-30T14:26:08Z",
+  "updated": "2026-10-30T14:26:08Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:26:08Z",
+      "by": "fastcompile-wire",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

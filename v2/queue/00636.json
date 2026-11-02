@@ -1,0 +1,37 @@
+{
+  "id": "00636",
+  "from_lane": "dedup",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/tests.rs"
+  ],
+  "what": "## dedup: bits: blaze-query `Marks` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)\n\nFrom `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.\n\nWhy: `Marks` is a growable `u64`-word set of memo IDs with its own bit logic; it is\n`blaze_ids::bits::BitSet<MemoId>` (`MemoId` is `u32`, a `BitIndex`), sized by `new` and grown\nby `insert_growing` as `Marks::insert` grew. Same members, same \"whether it was new\" result.\n`blaze-query/Cargo.toml` already has `blaze-ids.workspace = true`.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbmd-f (22:32): both subsections in the tree (lines under each); `Marks` is gone from `crates/blaze-query/src/`.\n\n### `crates/blaze-query/src/lib.rs`\n\nImports, before:\n\n```rust\nuse blaze_ids::{ContentId, Fingerprint, Hasher, Idx};\n```\n\nAfter:\n\n```rust\nuse blaze_ids::{ContentId, Fingerprint, Hasher, Idx, bits::BitSet};\n```\n\nDelete `struct Marks` and its `impl` (from the doc comment \"A set of memo IDs as a bit each\" through\nthe end of `fn iter`'s impl block):\n\n```rust\n/// A set of memo IDs as a bit each, sized by the IDs handed out: marking or testing one is a\n/// shift and a word, with no hash. 1 bit a memo of the store.\nstruct Marks(Vec<u64>);\n\nimpl Marks {\n    fn new(end: u32) -> Marks { ... }\n    fn insert(&mut self, memo: MemoId) -> bool { ... }\n    fn contains(&self, memo: MemoId) -> bool { ... }\n    fn iter(&self) -> impl Iterator<Item = MemoId> + '_ { ... }\n}\n```\n\nIn collection, before:\n\n```rust\n        let mut reached = Marks::new(self.store.end());\n        let mut hot = Marks::new(self.store.end());\n```\n\nAfter:\n\n```rust\n        // alloc: one bitset a collection each, 1 bit a memo.\n        let mut reached = BitSet::<MemoId>::new(self.store.end() as usize);\n        let mut hot = BitSet::<MemoId>::new(self.store.end() as usize);\n```\n\nbefore:\n\n```rust\n                hot.insert(memo);\n```\n\nAfter:\n\n```rust\n                hot.insert_growing(memo);\n```\n\nbefore:\n\n```rust\n            if !reached.insert(memo) {\n```\n\nAfter:\n\n```rust\n            if !reached.insert_growing(memo) {\n```\n\nIn reclaim, before:\n\n```rust\n        let mut held = Marks::new(self.store.end());\n```\n\nAfter:\n\n```rust\n        // alloc: one bitset a reclaim, 1 bit a memo.\n        let mut held = BitSet::<MemoId>::new(self.store.end() as usize);\n```\n\nbefore:\n\n```rust\n                    held.insert(resolved.memo);\n```\n\nAfter:\n\n```rust\n                    held.insert_growing(resolved.memo);\n```\n\n(`hot.contains(memo)`, `reached.contains(memo)` and `held.contains(memo)` are unchanged.)\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbmd-f (22:32): in the tree at `crates/blaze-query/src/lib.rs:65-67` (`bits::{BitSet, Bits}`), `:1330`/`:1346` (`insert_growing`), `:1588-1589` (reclaim's `BitSet::<MemoId>::new` with its `// alloc:`), `:1594`. Collection went further since: `reached`/`hot` are `Bits<Vec<u64, &Frame>, MemoId>` in the task frame (`:1319-1324`), still `blaze_ids::bits`, so the rule holds. Test at `tests.rs:12`, `:1121-1125`.\n\n### `crates/blaze-query/src/tests.rs`\n\nImports: `Marks, ` leaves the `use crate::{ ... }` list, and the file gains\n`use blaze_ids::bits::BitSet;` beside its other `use` lines.\n\n`marks_are_a_bit_a_memo`, before:\n\n```rust\n    let mut marks = Marks::new(70);\n    assert!(marks.insert(3));\n    assert!(!marks.insert(3), \"marked once\");\n    assert!(marks.insert(64));\n    assert!(marks.insert(200), \"past the end it was made for\");\n```\n\nAfter:\n\n```rust\n    let mut marks = BitSet::<u32>::new(70);\n    assert!(marks.insert_growing(3));\n    assert!(!marks.insert_growing(3), \"marked once\");\n    assert!(marks.insert_growing(64));\n    assert!(marks.insert_growing(200), \"past the end it was made for\");\n```\n\n(the last two lines of the test are unchanged.)\n\nStatus: open\n\n> applied by db (db-next3, 21:05): `Marks` is gone; collection and reclaim use `BitSet<MemoId>` with `insert_growing`, and the test is as written.\n\n> forwarded to db (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:55:31Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/db.md#dedup: bits: blaze-query `Marks` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:7011"
+    },
+    {
+      "at": "2026-10-30T08:55:31Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:31Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied by db-next3: crates/blaze-query/src/lib.rs:951 Marks is now a type alias Bits<Vec<u64,&Frame>,MemoId> over blaze_ids::bits (no own bit logic); reclaim uses BitSet<MemoId>. Checked by unify-front-def."
+    }
+  ]
+}

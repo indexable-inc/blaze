@@ -4,7 +4,8 @@
 //! Lints and diagnostics are dropped; anything rustc would reject is an `Err` with rustc's
 //! message, and identifiers are not NFC-normalised.
 
-use rustc_lexer::{Base, Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
+use parser::cook;
+use rustc_lexer::{Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
 
 use crate::ast::token::{self, CommentKind, Delimiter, IdentKind, Token, TokenKind};
 use crate::ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
@@ -166,6 +167,18 @@ impl<'src> Lexer<'src> {
                         );
                     }
                     token::Ident(sym, IdentKind::Raw)
+                }
+                rustc_lexer::TokenKind::ForcedKeywordIdent if self.edition.at_least_rust_2021() => {
+                    token::Ident(
+                        Symbol::intern(self.str_from(start + BytePos(2))),
+                        IdentKind::ForcedKeyword,
+                    )
+                }
+                // Before 2021 `k#fn` is the identifier `k` followed by `#fn`.
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    self.pos = start + BytePos(1);
+                    self.cursor = Cursor::new(&str_before[1..], FrontmatterAllowed::No);
+                    self.ident(start)
                 }
                 rustc_lexer::TokenKind::UnknownPrefix => {
                     let prefix = self.str_from(start);
@@ -333,14 +346,9 @@ impl<'src> Lexer<'src> {
         comment_kind: CommentKind,
         doc_style: DocStyle,
     ) -> TokenKind {
-        if let Some(idx) = content.find('\r') {
-            let lo = content_start + BytePos::from_usize(idx);
-            let msg = match comment_kind {
-                CommentKind::Block => "bare CR not allowed in block doc-comment",
-                CommentKind::Line => "bare CR not allowed in doc-comment",
-            };
-            self.err(self.mk_sp(lo, lo + BytePos(1)), msg);
-        }
+        cook::doc_comment_errors(content, comment_kind == CommentKind::Block, |e| {
+            self.cook_error(content_start, e)
+        });
         let attr_style = match doc_style {
             DocStyle::Outer => AttrStyle::Outer,
             DocStyle::Inner => AttrStyle::Inner,
@@ -348,148 +356,35 @@ impl<'src> Lexer<'src> {
         token::DocComment(comment_kind, attr_style, Symbol::intern(content))
     }
 
+    /// `cook_lexer_literal`; where rustc stops, the literal is an error and lexing goes on.
     fn cook_lexer_literal(
         &mut self,
         start: BytePos,
         end: BytePos,
         kind: LiteralKind,
     ) -> (token::LitKind, Symbol) {
-        let unterminated = |this: &mut Self, msg: &str| {
-            this.err(this.mk_sp(start, end), msg);
-        };
-        match kind {
-            LiteralKind::Char { terminated } => {
-                if !terminated {
-                    unterminated(self, "unterminated character literal");
-                }
-                self.cook_quoted(token::Char, start, end, 1, 1)
-            }
-            LiteralKind::Byte { terminated } => {
-                if !terminated {
-                    unterminated(self, "unterminated byte constant");
-                }
-                self.cook_quoted(token::Byte, start, end, 2, 1)
-            }
-            LiteralKind::Str { terminated } => {
-                if !terminated {
-                    unterminated(self, "unterminated double quote string");
-                }
-                self.cook_quoted(token::Str, start, end, 1, 1)
-            }
-            LiteralKind::ByteStr { terminated } => {
-                if !terminated {
-                    unterminated(self, "unterminated double quote byte string");
-                }
-                self.cook_quoted(token::ByteStr, start, end, 2, 1)
-            }
-            LiteralKind::CStr { terminated } => {
-                if !terminated {
-                    unterminated(self, "unterminated C string");
-                }
-                self.cook_quoted(token::CStr, start, end, 2, 1)
-            }
-            LiteralKind::RawStr { n_hashes } => match n_hashes {
-                Some(n_hashes) => {
-                    let n = u32::from(n_hashes);
-                    self.cook_quoted(token::StrRaw(n_hashes), start, end, 2 + n, 1 + n)
-                }
-                None => self.raw_str_error(start, end),
-            },
-            LiteralKind::RawByteStr { n_hashes } => match n_hashes {
-                Some(n_hashes) => {
-                    let n = u32::from(n_hashes);
-                    self.cook_quoted(token::ByteStrRaw(n_hashes), start, end, 3 + n, 1 + n)
-                }
-                None => self.raw_str_error(start, end),
-            },
-            LiteralKind::RawCStr { n_hashes } => match n_hashes {
-                Some(n_hashes) => {
-                    let n = u32::from(n_hashes);
-                    self.cook_quoted(token::CStrRaw(n_hashes), start, end, 3 + n, 1 + n)
-                }
-                None => self.raw_str_error(start, end),
-            },
-            LiteralKind::Int { base, empty_int } => {
-                let mut kind = token::Integer;
-                if empty_int {
-                    self.err(self.mk_sp(start, end), "no valid digits found for number");
-                    kind = token::Err(ErrorGuaranteed::unchecked_error_guaranteed());
-                } else if matches!(base, Base::Binary | Base::Octal) {
-                    let radix = base as u32;
-                    let s = self.str_from_to(start + BytePos(2), end);
-                    if s.chars().any(|c| c != '_' && c.to_digit(radix).is_none()) {
-                        self.err(
-                            self.mk_sp(start, end),
-                            format!("invalid digit for a base {radix} literal"),
-                        );
-                        kind = token::Err(ErrorGuaranteed::unchecked_error_guaranteed());
-                    }
-                }
-                (kind, self.symbol_from_to(start, end))
-            }
-            LiteralKind::Float {
-                base,
-                empty_exponent,
-            } => {
-                let mut kind = token::Float;
-                if empty_exponent {
-                    self.err(
-                        self.mk_sp(start, self.pos),
-                        "expected at least one digit in exponent",
-                    );
-                    kind = token::Err(ErrorGuaranteed::unchecked_error_guaranteed());
-                }
-                let base = match base {
-                    Base::Hexadecimal => Some("hexadecimal"),
-                    Base::Octal => Some("octal"),
-                    Base::Binary => Some("binary"),
-                    Base::Decimal => None,
-                };
-                if let Some(base) = base {
-                    self.err(
-                        self.mk_sp(start, end),
-                        format!("{base} float literal is not supported"),
-                    );
-                    kind = token::Err(ErrorGuaranteed::unchecked_error_guaranteed());
-                }
-                (kind, self.symbol_from_to(start, end))
+        let src: &'src str = self.src;
+        let rest = &src[self.src_index(start)..];
+        let (token_len, suffix_start) = ((self.pos - start).0, (end - start).0);
+        let cooked = cook::cook_lexer_literal(rest, token_len, suffix_start, kind, |e| {
+            self.cook_error(start, e)
+        });
+        match cooked {
+            Ok((kind, symbol)) => (lit_kind(kind), Symbol::intern(symbol)),
+            Err(fatal) => {
+                self.cook_error(start, fatal);
+                (
+                    token::Err(ErrorGuaranteed::unchecked_error_guaranteed()),
+                    self.symbol_from_to(start, end),
+                )
             }
         }
     }
 
-    fn raw_str_error(&mut self, start: BytePos, end: BytePos) -> (token::LitKind, Symbol) {
-        self.err(self.mk_sp(start, end), "invalid raw string literal");
-        (
-            token::Err(ErrorGuaranteed::unchecked_error_guaranteed()),
-            self.symbol_from_to(start, end),
-        )
-    }
-
-    fn cook_quoted(
-        &mut self,
-        kind: token::LitKind,
-        start: BytePos,
-        end: BytePos,
-        prefix_len: u32,
-        postfix_len: u32,
-    ) -> (token::LitKind, Symbol) {
-        let content_start = start + BytePos(prefix_len);
-        let content_end = end - BytePos(postfix_len);
-        if content_end < content_start {
-            return (
-                token::Err(ErrorGuaranteed::unchecked_error_guaranteed()),
-                self.symbol_from_to(start, end),
-            );
-        }
-        let lit_content = self.str_from_to(content_start, content_end);
-        if let Some(message) = escape_error(kind, lit_content) {
-            self.err(self.mk_sp(start, end), message);
-            return (
-                token::Err(ErrorGuaranteed::unchecked_error_guaranteed()),
-                self.symbol_from_to(start, end),
-            );
-        }
-        (kind, Symbol::intern(lit_content))
+    /// An error of [`cook`], its range from `start`.
+    fn cook_error(&mut self, start: BytePos, e: cook::CookError) {
+        let span = self.mk_sp(start + BytePos(e.range.start), start + BytePos(e.range.end));
+        self.err(span, e.message);
     }
 
     fn lex_token_trees(&mut self, is_delimited: bool) -> Result<(Spacing, TokenStream), LexError> {
@@ -589,58 +484,18 @@ impl<'src> Lexer<'src> {
     }
 }
 
-/// The first escape error rustc reports for a quoted literal's contents, if any.
-fn escape_error(kind: token::LitKind, content: &str) -> Option<String> {
-    use syntax::unescape::{self, EscapeError};
-    let mut first: Option<EscapeError> = None;
-    let mut note = |_: std::ops::Range<usize>, err: EscapeError| {
-        if !err.is_fatal() {
-            return;
-        }
-        first.get_or_insert(err);
-    };
+fn lit_kind(kind: cook::LitKind) -> token::LitKind {
     match kind {
-        token::Char => {
-            if let Err(err) = unescape::unescape_char(content) {
-                note(0..content.len(), err);
-            }
-        }
-        token::Byte => {
-            if let Err(err) = unescape::unescape_byte(content) {
-                note(0..content.len(), err);
-            }
-        }
-        token::Str => unescape::unescape_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::ByteStr => unescape::unescape_byte_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::CStr => unescape::unescape_c_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::StrRaw(_) => unescape::check_raw_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::ByteStrRaw(_) => unescape::check_raw_byte_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::CStrRaw(_) => unescape::check_raw_c_str(content, |range, res| {
-            if let Err(err) = res {
-                note(range, err);
-            }
-        }),
-        token::Bool | token::Integer | token::Float | token::Err(_) => {}
+        cook::LitKind::Byte => token::Byte,
+        cook::LitKind::Char => token::Char,
+        cook::LitKind::Integer => token::Integer,
+        cook::LitKind::Float => token::Float,
+        cook::LitKind::Str => token::Str,
+        cook::LitKind::StrRaw(n) => token::StrRaw(n),
+        cook::LitKind::ByteStr => token::ByteStr,
+        cook::LitKind::ByteStrRaw(n) => token::ByteStrRaw(n),
+        cook::LitKind::CStr => token::CStr,
+        cook::LitKind::CStrRaw(n) => token::CStrRaw(n),
+        cook::LitKind::Err => token::Err(ErrorGuaranteed::unchecked_error_guaranteed()),
     }
-    first.map(|err| format!("invalid literal: {err:?}"))
 }

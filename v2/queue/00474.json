@@ -1,0 +1,44 @@
+{
+  "id": "00474",
+  "from_lane": "diagnostics-lints-mir-unsafe",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ide/src/diagnostics/unsafe_check.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir-def/src/signatures.rs",
+    "crates/blaze-diagnostics/src/lower/missing_unsafe.rs",
+    "v2/requests/db-ty-lower.md",
+    "crates/hir-ty/src/target_feature.rs",
+    "v2/requests/db-ty.md",
+    "crates/hir-ty-unsafeck",
+    "crates/parser/src/grammar/expressions/atom.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## diagnostics-lints-mir-unsafe: what rustc's unsafety checking finds that `hir::MissingUnsafe` does not give (db, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir/src/diagnostics.rs`, `crates/hir-def/src/signatures.rs`)\n\n`crates/blaze-diagnostics/src/lower/missing_unsafe.rs` lowers every `MissingUnsafe` as rustc's\n`check_unsafety` gives it. What it cannot, because hir does not find or say it\n(`compiler/rustc_mir_build/src/check_unsafety.rs`):\n\n1. Operations hir does not find, each a program rustc rejects with E0133 and blaze accepts\n   (superset-of-rust). New `UnsafetyReason` variants, found where rustc finds them:\n   - `UnsafeBinderCast`: `ExprKind::{Place,Value}UnwrapUnsafeBinder`, `WrapUnsafeBinder`\n     (`unsafe<'a> T`, feature `unsafe_binders`).\n   - `UseOfUnsafeField` (reading or matching an `unsafe` field, feature `unsafe_fields`) and\n     `InitializingTypeWithUnsafeField` (a struct expression of a variant with one).\n   - `MutationOfLayoutConstrainedField` / `BorrowOfLayoutConstrainedField`: a `ref mut`\n     binding, or a `ref` binding of a non-`Freeze` type, inside a pattern of a type with\n     `#[rustc_layout_scalar_valid_range_*]` (`inside_adt` in rustc's `visit_pat`).\n   With the variant, give its span as rustc does (`pat.span` / `expr.span`).\n2. A call of a `#[rustc_deprecated_safe_2024]` function in the body of an `unsafe fn`, outside a\n   block, before 2024: rustc lints it `deprecated_safe_2024` when `unsafe_op_in_unsafe_fn` is\n   not allowed there (`requires_unsafe`, `SafetyContext::UnsafeFn`). `missing_unsafe` drops it\n   (`!is_unsafe`). Give it as `MissingUnsafe { lint: DeprecatedSafe2024, .. }` with\n   `in_unsafe_fn: bool`, so the lowering can apply rustc's gate.\n3. An operation in the label block of `asm!` inside an `unsafe fn` is a hard error in rustc\n   (`in_safety_context(SafetyContext::Safe)` for `InlineAsmOperand::Label`); hir gives it as\n   `UnsafeLint::UnsafeOpInUnsafeFn`. Give `HardError` there.\n4. rustc's `suggest_unsafe_block`: its note \"an unsafe function restricts its caller\" is on the\n   first operation it lints in the function (and in each closure, from the flag where that\n   starts). The lowering finds it by scanning `Semantics::get_unsafe_ops` of the body for\n   each diagnostic, O(ops²) per `unsafe fn`. Give `MissingUnsafe::first: bool` (the first\n   in rustc's THIR order in its body or closure, counting the scopes around), or make\n   `missing_unsafe` a tracked query the lowering can read once.\n5. Order: `UnsafeVisitor` walks a block's `let` patterns before its statements' expressions;\n   rustc visits a `let`'s initializer, then its pattern, in order. Errors of union patterns\n   come out of rustc's order. Walk in THIR order.\n6. `crates/hir-def/src/signatures.rs`: an `unsafe fn` with `#[rustc_deprecated_safe_2024]` gets\n   `DEPRECATED_SAFE_2024` instead of `UNSAFE`, so its own body is checked as a safe function's\n   (std's `env::set_var` would get E0133 for what is `unsafe_op_in_unsafe_fn` in rustc). Keep\n   `UNSAFE` too, and test `is_deprecated_safe_2024` first where calls are checked.\n   Status: `signatures.rs` part done by speed-hir-defs-sigs (both flags set, test\n   `flags_from_attrs_as_one_if_per_flag`); the call-site reorder in `hir-ty/src/utils.rs` is\n   requested in `v2/requests/db-ty-lower.md`.\n7. `crates/hir-ty/src/target_feature.rs` merges the implications of a feature across\n   architectures; rustc's `is_target_feature_call_safe` uses the target's. A call rustc\n   rejects can pass.\n\n> forwarded to db: 6 (`hir-def/src/signatures.rs`), 7 (`hir-ty/src/target_feature.rs`) and the `hir::MissingUnsafe` fields. > forwarded to coordinator: 1 to 5 are the checker in `crates/hir-ide/src/diagnostics/unsafe_check.rs`, which `crates.md` removes at integration; porting rustc's `check_unsafety` into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate it moves to first, then the port goes there.\n> db-ty-d-lower: 7 was in the tree (fix-names-features' `TargetArch` and per-arch implications in `target_feature.rs`); its test of an `aes` caller and a `neon` callee by arch is in `target_feature/tests.rs`. `target_feature.rs` is db-unsafeck's since 20:32; handed over in `v2/requests/db-ty.md` `## db-ty-d-lower` item 6.\n> checked by db-audit-other (22:37): in the tree except item 1's `UnsafeBinderCast`. The checker moved to `crates/hir-ty-unsafeck`. Item 1's unsafe-field and layout-constrained reasons are at `lib.rs:69-81`. Item 2 is `UnsafeOp::in_unsafe_fn` (`lib.rs:110`, and `hir::MissingUnsafe::in_unsafe_fn` at `crates/hir/src/diagnostics.rs:756`). Item 3: an `asm!` label is walked as `Context::Safe` (`lib.rs:582`). Item 4 is `first` (`lib.rs:108`, `hir` `diagnostics.rs:753`). Item 5 is THIR order (test `order_is_thirs`, `tests.rs:554`). Item 6 is the flags (`hir-def/src/signatures.rs:1156-1174`), with `is_deprecated_safe_2024` tested before `is_unsafe` (`hir-ty/src/utils.rs:66-74`). Item 7 is as db-ty-d-lower says. `UnsafeBinderCast` waits on the front end lowering the expression: the parser makes `UNSAFE_BINDER_CAST_EXPR` (`crates/parser/src/grammar/expressions/atom.rs:311-325`), but there is no AST node or `hir::Expr` variant for it (format's `expr_store/lower.rs`, `hir.rs`). Forwarded by db-audit-other to format through the requests lane (`v2/requests/db.md`, `## format (from db-audit-other): unsafe binder casts in the HIR`).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-mir-unsafe: what rustc's unsafety checking finds that `hir::MissingUnsafe` does not give (db, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir/src/diagnostics.rs`, `crates/hir-def/src/signatures.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:769"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:37): in the tree except item 1's `UnsafeBinderCast`. The checker moved to `crates/hir-ty-unsafeck`. Item 1's unsafe-field and layout-constrained reasons are at `lib.rs:69-81`. Item 2 is `UnsafeOp::in_unsafe_fn` (`lib.rs:110`, and `hir::MissingUnsafe::in_unsafe_fn` at `crates/hir/src/diagnostics.rs:756`). Item 3: an `asm!` label is walked as `Context::Safe` (`lib.rs:58"
+    }
+  ]
+}

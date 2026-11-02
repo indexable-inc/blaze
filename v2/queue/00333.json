@@ -1,0 +1,42 @@
+{
+  "id": "00333",
+  "from_lane": "mem-db-infer-ctx",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-mem/src/frame.rs",
+    "crates/hir",
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir-ty/src/lib.rs",
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-def/src/resolver.rs",
+    "crates/hir-ty/src/lower.rs",
+    "vendor/salsa/src/function/execute.rs"
+  ],
+  "what": "## Prerequisites (other parts)\n\n- **mem-db** request 1: `blaze_mem::frame::current(f: impl FnOnce(&Frame) -> R) -> R` (the\n  frame of the running task; panics outside one). Not in `crates/blaze-mem/src/frame.rs` yet.\n- **mem-db-infer** 1 to 3: `blaze-mem` and `hashbrown` (with `nightly`) in hir-ty's\n  `[dependencies]`, `#![feature(allocator_api)]` in `lib.rs`, `crate::db::INFER_TAG`.\n- **mem-db-salsa**: the `mem_tag = <path>` option of `#[salsa::tracked]` (opens the query's\n  `frame::task` with that tag, which `frame::current` below reads).\n- **mem-db-infer-lower** (R2): `TyLoweringContext::new(.., lifetime_lowering_mode, frame: &'a\n  Frame)`, the frame as its last parameter. Used in `infer/diagnostics.rs` below.\n- **mem-db-def**: `Resolver::traits_in_scope_into` takes any `Extend<TraitId>` (entry D1 at the\n  end). Used by `InferenceContext::new`.\n- **mem-db-infer-method**: `MethodResolutionContext::traits_in_scope` becomes a\n  `TraitsInScope<'a>` (the inference's frame set, or a caller's `FxHashSet`; entry M1 at the end),\n  so the context's frame set goes in as it is and `crates/hir`'s API does not change.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:44): in the tree at `crates/blaze-mem/src/frame.rs:1254` (`current`), `crates/hir-ty/Cargo.toml:51`, `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `crates/hir-def/src/resolver.rs:907` (`traits_in_scope_into`), `crates/hir-ty/src/lower.rs:355` (the lowering context's frame); salsa's `mem_tag` in `vendor/salsa/src/function/execute.rs`.",
+  "state": "applied",
+  "created": "2026-10-30T03:32:35Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-ctx.md#Prerequisites (other parts)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-ctx.md:43"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:44): in the tree at `crates/blaze-mem/src/frame.rs:1254` (`current`), `crates/hir-ty/Cargo.toml:51`, `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `crates/hir-def/src/resolver.rs:907` (`traits_in_scope_into`), `crates/hir-ty/src/lower.rs:355` (the lowering context's frame); salsa's `mem_tag` in `vendor/salsa/src/function/execute.rs`."
+    }
+  ]
+}

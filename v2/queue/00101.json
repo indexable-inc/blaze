@@ -1,0 +1,40 @@
+{
+  "id": "00101",
+  "from_lane": "safety",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/reference/crates.md",
+    "crates/hir-ty-ub",
+    "crates/blaze-check",
+    "crates/blaze-graph/src/check",
+    "docs/v2/plan/lanes/safety",
+    "docs/v2"
+  ],
+  "what": "## 3. Coordinator: `docs/v2/plan/reference/crates.md`\n\nAdd lane `safety` to \"Paths each lane owns\": `crates/hir-ty-ub/`, `fuzz/`,\n`crates/blaze-check/` (safety-model's M1 below replaces the first plan of\n`crates/blaze-graph/src/check/`), `docs/v2/plan/lanes/safety/`; and `hir-ty-ub` to the v2 crates table\n(\"the checker of undefined behavior over hir-ty-mir's evaluator: `Checker`, `Config`,\n`Outcome`, `run_test`\", owner safety). A front-end crate (AGENTS.md semantics-in-front-end).\n\n> forwarded to coordinator: `docs/v2/` is the coordinator's, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T08:26:58Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/safety.md#3. Coordinator: `docs/v2/plan/reference/crates.md`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:43"
+    },
+    {
+      "at": "2026-10-30T08:26:58Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:58Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/reference/crates.md: lane safety added to \"Paths each lane owns\" (crates/hir-ty-ub/, crates/blaze-check/, fuzz/; its notes folder is its own by the rule) and hir-ty-ub to the v2 crates table (Checker, Config, Outcome, run_test; a front-end crate), checked against crates/hir-ty-ub/src/check.rs. docs/v2/plan/process/building.md safety bullet now names crates/blaze-check/ in place of crates/blaze-graph/src/check/ (which does not exist)."
+    }
+  ]
+}

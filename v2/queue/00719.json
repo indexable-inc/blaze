@@ -1,0 +1,36 @@
+{
+  "id": "00719",
+  "from_lane": "cargo-daemon-units",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/v2.rs",
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "## From cargo-daemon-units (2026-10-29, cargo-daemon-units-next1): `serve/unit*` on the split front end\n\n`serve/unit*` now follows `serve/work.rs` (`FrontEnd`, `Writer`, per-task `Reader`, `Runs`\ntaking the writer). `struct UnitWriter { lowered: Lowered, job, waits, .. }` is the job's\n`Writer`; `Job` keeps `Arc<Crates>`; each worker method reads `UnitReader { db: Snapshot,\npaths }`. Each call below is written against this signature and waits on the lane named.\n\n**To cargo-daemon-lower (`crates/load-cargo/src/v2.rs`; its split is half landed: `Crates`\nexists, `impl Lowered` is still the old one):**\n- `Lowered::crates(&self) -> Arc<Crates>` and `Crates::krate(&self, unit) -> Option<Crate>`\n  (the latter is there).\n- `Lowered::ran(&mut self, run, &Ran) -> Result<(), LowerError>` (called through\n  `&mut self.lowered`; `&self` would compile too), `snapshot(&self)`, `paths(&self)`.\n- Still missing: `Lowered::identity(&self, unit: usize) -> Option<ContentId>`, as asked in the\n  first \"From cargo-daemon-units\" section. It is now called on the writer only: on the worker\n  that lowers (for every unit with no build-script run in its closure), then on the loop in\n  `Writer::ran` for each unit whose last run that was. The front reads the result from a\n  `OnceLock` per unit, so `Front::fresh` keys records on the loop with no snapshot.\n- Replacing `Lowered::tables()`: `load_cargo::v2::tables(db: &Snapshot) -> Vec<(&'static str,\n  u64, u64)>` (name, elements, bytes), since `Front::tables` reads a task's snapshot.\n- `Snapshot` (`Db`) must be `Sync`: `codegen.rs` hands `Databases::new(&reader.db)` (now\n  `&'db (dyn HirDatabase + Sync)`) to every thread of a build.\n\n**To cargo-daemon (`crates/blaze-cargo/Cargo.toml`), still open:** `blaze-diagnostics`,\n`blaze-items`, `hir`, `hir-def`, `hir-ty`, `hir-ty-ub` (`workspace = true`).\n\n**safety:** nothing to wait on any more. `hir_ty_ub::{run_test, Config, Outcome}` landed, and\n`test.rs` follows it: `Config { seed, schedules, ..default }` from `Ub`'s `Option`s, `Passed {\n.. }`, and `Error { message, seed }` fails as \"blaze's MIR evaluator stopped: ...\" then\n`seed: N`, never a pass, whatever the test's `#[should_panic]`.\n\n> forwarded to cargo (cargo-daemon-lower for `load-cargo/src/v2.rs`, cargo-daemon for `blaze-cargo/Cargo.toml`; neither has a window, the lead told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#From cargo-daemon-units (2026-10-29, cargo-daemon-units-next1): `serve/unit*` on the split front end",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:1768"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree since integration: serve/unit* on the split front end against blaze-lower; blaze-cargo 369/0 in round 11b"
+    }
+  ]
+}

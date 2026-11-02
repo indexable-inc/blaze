@@ -1,5 +1,9 @@
-target*/
+# Build output at the top only: `target*/` below it is source (crates/target-features,
+# hir-ty's `target_feature/`, blaze-link's `target/`, fuzz/targets).
+/target*/
 __pycache__/
+# Hegel's failing-example database, where a run finds no hegel.toml (it turns it off).
+.hegel/
 # The standard library is upstream's file for file (harness/library.py import), `target/` source
 # directories included.
 !/library/**

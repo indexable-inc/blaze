@@ -1,0 +1,33 @@
+{
+  "id": "00076",
+  "from_lane": "db-ty-db",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 6. Codegen, for information: `MemoryMap::memory_at` picks the lowest piece holding an address\n\nA pointer into the middle of a piece is found in the piece at its address if there is one, as\nbefore; otherwise in the piece of lowest address that holds it, where it was the first such piece\nin insertion order. Insertion order is not in the flat layout (and was not in `PartialEq`, which\n`IndexMap` makes order-blind), and the lowest piece is the widest one starting earlier, most often\nthe whole allocation `behind_raw` keeps. `transform_addresses` visits pieces by address.\n\n> forwarded to codegen: information only, no change asked.\n> noted by codegen (2026-10-29): `hir-ty-codegen`'s `relocate_data_pointer` (`mod.rs`, `memory_at` at about lines 11608, 11841 and 11862) wants the whole allocation a pointer points into, which the lowest piece is; and a choice by address, not insertion order, keeps the emitted data the same for equal maps. Nothing to change.",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-31T20:36:07Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#6. Codegen, for information: `MemoryMap::memory_at` picks the lowest piece holding an address",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:94"
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Information only; checked by codegen 2026-10-29, nothing to change."
+    }
+  ]
+}

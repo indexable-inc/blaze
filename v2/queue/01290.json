@@ -1,0 +1,42 @@
+{
+  "id": "01290",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/value.rs",
+    "crates/blaze-query/Cargo.toml"
+  ],
+  "what": "blaze-query/src/db/value.rs: add `container_values!(either::Either<L, R>);` (SAFETY as the other containers: every kept parameter is a Value), and an `either` dep in crates/blaze-query/Cargo.toml if missing. hir-ty mir.rs:2280 stores Either<L, R> in a query value; salsa fork had default_salsa_value!(Either<L, R>). Only hir-ty error left in qu-check4 (query-unify-port-hirty fixed the other 19). Blocks hir-ty and everything above it in blaze-v2-qu.",
+  "state": "applied",
+  "created": "2026-10-31T10:05:33Z",
+  "updated": "2026-10-31T14:49:36Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T10:05:33Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:02:17Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:02:17Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "applied in blaze-v2-qu and blaze-v2: container_values!(either::Either<L, R>) in db/value.rs, either.workspace = true in crates/blaze-query/Cargo.toml (the root already has either = 1.19.0, so no dedup line), test foreign_containers_of_values_are_values in db/tests.rs; rust-analyzer 0 errors both trees"
+    },
+    {
+      "at": "2026-10-31T14:49:36Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Re-filed from the query-unify-port tree, where it was 01247; blaze-v2 has a different 01247, which the merge kept."
+    }
+  ]
+}

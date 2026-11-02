@@ -2,15 +2,15 @@
 //! `src/util/canonical_url.rs` and `cargo-util-schemas`' `core/source_kind.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow, bail};
+use blaze_ids::{ContentId, Domain, Interner, Sharded};
 use url::Url;
 
 use crate::interning::InternedString;
@@ -249,13 +249,29 @@ impl PartialEq for SourceIdInner {
     }
 }
 
-static SOURCE_ID_CACHE: OnceLock<Mutex<FxHashSet<&'static SourceIdInner>>> = OnceLock::new();
+/// Every source id, by the content ID of what [`SourceIdInner`]'s `Eq` compares (its `Hash`
+/// covers exactly that): a hit is lock-free probes and no allocation.
+static SOURCE_IDS: OnceLock<Sharded<SourceIdInner>> = OnceLock::new();
+static SOURCE_ID: Domain = Domain::new("blaze-source source id 1");
 
-/// The first name each registry was given. An id interned before its named twin (a lock
-/// file's registry read before the manifest's) has no name of its own; cargo always makes the
-/// named one first, and its messages name the registry.
-static REGISTRY_NAMES: OnceLock<Mutex<FxHashMap<(SourceKind, CanonicalUrl), KeyOf>>> =
-    OnceLock::new();
+/// The first name each registry was given, by the content ID of its kind and canonical URL,
+/// written once and read with no lock. An id interned before its named twin (a lock file's
+/// registry read before the manifest's) has no name of its own; cargo always makes the named
+/// one first, and its messages name the registry.
+static REGISTRY_NAMES: OnceLock<Sharded<KeyOf>> = OnceLock::new();
+static REGISTRY_NAME: Domain = Domain::new("blaze-source registry name 1");
+
+fn registry_names() -> &'static Sharded<KeyOf> {
+    REGISTRY_NAMES.get_or_init(Sharded::new)
+}
+
+/// The key of a registry in [`REGISTRY_NAMES`]. `std` hashing is only ever compared within
+/// this process, so the hashes `Hash` writes need not be stable across runs.
+fn registry_name_id(kind: &SourceKind, canonical_url: &CanonicalUrl) -> ContentId {
+    let mut hasher = blaze_ids::Hasher::of(&REGISTRY_NAME);
+    hasher.std(kind).std(canonical_url);
+    hasher.finish()
+}
 
 /// What pins a source: a lock file's entry, a `cargo update --precise` request, or a git
 /// commit.
@@ -308,8 +324,8 @@ impl SourceId {
         }
         let canonical_url = CanonicalUrl::new(&url)?;
         if let Some(key) = &key {
-            let mut names = REGISTRY_NAMES.get_or_init(Default::default).lock().unwrap();
-            names.entry((kind.clone(), canonical_url.clone())).or_insert_with(|| key.clone());
+            // alloc: once per registry name for the life of the process.
+            registry_names().intern(registry_name_id(&kind, &canonical_url), || key.clone());
         }
         Ok(SourceId::wrap(SourceIdInner {
             kind,
@@ -321,16 +337,11 @@ impl SourceId {
     }
 
     fn wrap(inner: SourceIdInner) -> SourceId {
-        let mut cache = SOURCE_ID_CACHE.get_or_init(Default::default).lock().unwrap();
-        let inner = match cache.get(&inner) {
-            Some(&inner) => inner,
-            None => {
-                let inner: &'static SourceIdInner = Box::leak(Box::new(inner));
-                cache.insert(inner);
-                inner
-            }
-        };
-        SourceId { inner }
+        let ids = SOURCE_IDS.get_or_init(Sharded::new);
+        let mut hasher = blaze_ids::Hasher::of(&SOURCE_ID);
+        hasher.std(&inner);
+        let at = ids.intern(hasher.finish(), || inner);
+        SourceId { inner: ids.get(at) }
     }
 
     fn remote_source_kind(url: &Url) -> SourceKind {
@@ -426,14 +437,20 @@ impl SourceId {
     /// crates.io as cargo names it when no `[registry] index` or `[source]` changes it: its
     /// git index URL, named `crates-io`. The sparse protocol is a replacement of this source.
     pub fn crates_io() -> SourceId {
-        let url = Url::parse(CRATES_IO_INDEX).unwrap();
-        SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()
+        static ID: OnceLock<SourceId> = OnceLock::new();
+        *ID.get_or_init(|| {
+            let url = Url::parse(CRATES_IO_INDEX).unwrap();
+            SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()
+        })
     }
 
     /// crates.io's sparse index, named `crates-io`.
     pub fn crates_io_sparse() -> SourceId {
-        let url = Url::parse(CRATES_IO_HTTP_INDEX).unwrap();
-        SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()
+        static ID: OnceLock<SourceId> = OnceLock::new();
+        *ID.get_or_init(|| {
+            let url = Url::parse(CRATES_IO_HTTP_INDEX).unwrap();
+            SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()
+        })
     }
 
     pub fn url(&self) -> &Url {
@@ -462,9 +479,9 @@ impl SourceId {
         if let Some(key) = self.inner.registry_key.as_ref().map(|k| k.key()) {
             return key.into();
         }
-        let names = REGISTRY_NAMES.get_or_init(Default::default).lock().unwrap();
-        match names.get(&(self.inner.kind.clone(), self.inner.canonical_url.clone())) {
-            Some(key) => key.key().to_owned(),
+        let names = registry_names();
+        match names.find(&registry_name_id(&self.inner.kind, &self.inner.canonical_url)) {
+            Some(at) => names.get(at).key().to_owned(),
             None if self.is_crates_io() => CRATES_IO_REGISTRY.to_owned(),
             None => url_display(self.url()),
         }

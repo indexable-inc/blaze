@@ -1,9 +1,0 @@
-{
-  "row": "a workspace member that is also a registry dependency at the same version",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep",
-    "user"
-  ]
-}

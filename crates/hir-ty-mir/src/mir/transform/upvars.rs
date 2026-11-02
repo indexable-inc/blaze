@@ -6,15 +6,17 @@
 //! a yield. Drop elaboration then tracks it like any local, as rustc tracks the fields of its
 //! coroutine argument.
 
+use blaze_mem::Frame;
+
 use crate::mir::{FieldIndex, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind};
 
-pub(super) fn upvars_in_place(body: &mut MirBody<'_>) {
+pub(super) fn upvars_in_place(body: &mut MirBody<'_>, frame: &Frame) {
     if body.coroutine.is_none() {
         return;
     }
     let Some(&future) = body.param_locals.first() else { return };
     let start = body.start_block;
-    let mut upvars = Vec::new();
+    let mut upvars = Vec::with_capacity_in(body.basic_blocks[start].statements.len(), frame);
     body.basic_blocks[start].statements.retain(|statement| {
         let StatementKind::Assign(to, Rvalue::Use(operand)) = &statement.kind else {
             return true;
@@ -44,5 +46,7 @@ pub(super) fn upvars_in_place(body: &mut MirBody<'_>) {
             _ => true,
         });
     }
-    body.upvars_in_place = upvars;
+    let mut kept = Vec::with_capacity(upvars.len());
+    kept.extend_from_slice(&upvars);
+    body.upvars_in_place = kept;
 }

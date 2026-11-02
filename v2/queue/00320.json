@@ -1,0 +1,38 @@
+{
+  "id": "00320",
+  "from_lane": "mem-db-infer-expr",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "crates/hir-ty/src/lib.rs",
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## Prerequisites (other parts)\n\n- **mem-db-infer** (`lib.rs`, `Cargo.toml`): `#![feature(allocator_api)]` in\n  `crates/hir-ty/src/lib.rs`; `blaze-mem.workspace = true` and `hashbrown.workspace = true` in\n  `crates/hir-ty/Cargo.toml` (hashbrown's `nightly` feature is filed by mem-db, root request 3,\n  and is what makes `hashbrown::HashMap<K, V, S, &Frame>` take `core::alloc::Allocator`).\n- **mem-db-infer-ctx** (`infer.rs`): `pub(crate) frame: &'f blaze_mem::Frame` on\n  `InferenceContext<'db, 'f>` (R2). Every `impl<'db> InferenceContext<'db>` header in my seven\n  files becomes `impl<'db, 'f> InferenceContext<'db, 'f>`. That is entry E0 below, written out per\n  file, so this file and ctx's can be applied in either order.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/Cargo.toml:51`, `Cargo.toml` hashbrown `nightly`, and `InferenceContext<'db, 'f>`'s `pub(crate) frame` in `crates/hir-ty/src/infer.rs`.",
+  "state": "applied",
+  "created": "2026-10-30T03:25:12Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-expr.md#Prerequisites (other parts)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-expr.md:42"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:45): in the tree at `crates/hir-ty/src/lib.rs:5`, `crates/hir-ty/Cargo.toml:51`, `Cargo.toml` hashbrown `nightly`, and `InferenceContext<'db, 'f>`'s `pub(crate) frame` in `crates/hir-ty/src/infer.rs`."
+    }
+  ]
+}

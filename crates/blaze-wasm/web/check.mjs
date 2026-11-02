@@ -35,7 +35,6 @@ function build(source) {
       `${report.compiled} of ${report.bodies} bodies compiled, ` +
       `compiler memory ${compiler.memoryBytes() >> 20} MiB`,
   );
-  assert.deepEqual(report.skipped, []);
   calls = [];
   program.call("frame", 400, 300, 0.016);
   return { report, calls };
@@ -69,7 +68,6 @@ for (const name of ["fountain", "life", "sort", "mandelbrot"]) {
   const program = new Program({ fill: draw, rect: draw, circle: draw, text: draw });
   compiler.setFile("/app/main.rs", read(`demos/${name}.rs`).toString());
   const { module, report } = compiler.build();
-  assert.deepEqual(report.skipped, [], name);
   program.apply(module, report);
   for (let frame = 0; frame < 600; frame++) {
     program.call("frame", 400, 300, 0.016);

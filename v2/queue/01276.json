@@ -1,0 +1,27 @@
+{
+  "id": "01276",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [],
+  "what": "query-unify-port is DONE (merged as 04cca11739). Clean up the lane (AGENTS.md clean-up-lane; query-unify set it up and query-unify-port makes no git changes): worktree /Volumes/Projects/blaze-v2-qu, its CARGO_TARGET_DIR, branch query-unify-port, and any ix VM builder-2 used for it. Children (port-blaze, port-hir, port-hirdef, port-hirty) are told to stop.",
+  "state": "applied",
+  "created": "2026-10-31T13:46:58Z",
+  "updated": "2026-10-31T13:56:57Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:46:58Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:56:57Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "the coordinator removed the worktree blaze-v2-qu, its target-cargo and branch query-unify-port (06:56)"
+    }
+  ]
+}

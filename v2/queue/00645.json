@@ -1,0 +1,26 @@
+{
+  "id": "00645",
+  "from_lane": "mem-db-def",
+  "owner": "frontend-tokens",
+  "paths": [
+    "v2/requests/mem-db-def-expand.md",
+    "crates/hir-expand/src/declarative.rs",
+    "crates/mbe/src/lib.rs",
+    "crates/mbe"
+  ],
+  "what": "## mem-db-def: frontend-tokens, `mbe::DeclarativeMacro::expand_making_in` (from db-mem-def, 2026-10-29 22:20)\n\n`v2/requests/mem-db-def-expand.md` E2 and E5 build a `macro_rules!` expansion in the run's frame\n(`parse_macro_expansion` opens it, `frame::task(Tag::Expand, ..)`). Since task 17,\n`DeclarativeMacroExpander::expand_making` (`crates/hir-expand/src/declarative.rs`) needs the\nexpansion's `MadeIdents` too, and mbe offers them only for a global tree\n(`expand_making`, `crates/mbe/src/lib.rs:356`). `expand_in` (`:369`) returns no `MadeIdents`.\n\nIn `crates/mbe/src/lib.rs`, next to `expand_in`:\n```rust\n    /// [`Self::expand_making`] with the output in `frame`, as [`Self::expand_in`].\n    pub fn expand_making_in<'f>(\n        &self,\n        frame: &'f Frame,\n        db: &Db,\n        tt: &tt::TopSubtree,\n        marker: impl Fn(&mut Span) + Copy,\n        call_style: MacroCallStyle,\n        call_site: Span,\n    ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex, MadeIdents)>\n```\nwith `expand_in` becoming `expand_making_in(..).map(|(tree, arm, _)| (tree, arm))`, so the\ntwo can't drift. Then lane db makes `expand_making(db, frame, ..)` call it and `macro_expand`\nreturn the framed tree.\n\n> done by frontend-tokens (2026-10-29 22:10), not built:\n> - `DeclarativeMacro::expand_making_in` is in `crates/mbe/src/lib.rs`, with the signature above.\n>   The match runs in its own `frame::task(Tag::Expand, ..)` as before, and only the tree is\n>   built in `frame`.\n> - `expand_in` now calls `expand_making_in` and drops the third value.\n> - `MadeIdents` is a `SmallVec<[Span; 2]>` on the global allocator, not in the task's scratch,\n>   so it outlives the task. Beyond two spans it allocates globally, the same as\n>   `expand_making`.\n> - hot_lint is clean for this file.\n\n> forwarded to frontend-tokens (`crates/mbe`; frontend-tokens-next1); told by tmux (requests, pass 28).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#mem-db-def: frontend-tokens, `mbe::DeclarativeMacro::expand_making_in` (from db-mem-def, 2026-10-29 22:20)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:10934"
+    }
+  ]
+}

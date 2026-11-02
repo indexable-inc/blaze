@@ -1,0 +1,36 @@
+{
+  "id": "00525",
+  "from_lane": "diagnostics",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-diagnostics",
+    "crates/ide-diagnostics"
+  ],
+  "what": "## 8. The lane's \"Done when\" `rg 'unimplemented!|todo!'` check (coordinator)\n\nWhat: scope the check to unfinished code, for example `rg '\\b(unimplemented|todo)!\\(' -g '*.rs'`,\nwith matches inside string literals and test expectations not counted. Alternatively, say\nplainly that the strings below must change.\n\nWhy: every match left in `crates/blaze-diagnostics` is text that blaze writes for the user, not\nunfinished code:\n- Suggestions inserted into the user's source, as rustc's: the `_ => todo!()` arm for E0004\n  (`lower/missing_match_arms.rs`), `else { todo!() }` for E0005 (`lower/non_exhaustive_let.rs`)\n  and `fn f() { todo!() }` for E0046 (`lower/trait_impl_missing_assoc_items.rs`).\n- The examples in the error-code explanations `emit/codes/E0373.md`, `E0706.md` and `E0772.md`.\n- The test expectations that check them.\n\nReplacing `todo!()` in a suggestion with something that dodges the pattern (such as `panic!()`)\nwould make the suggestion worse, just to pass a check. `crates/ide-diagnostics`' matches are real\nhandler code; they go when the crate is deleted after request 3.\n\nStatus: open\n\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T08:45:35Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#8. The lane's \"Done when\" `rg 'unimplemented!|todo!'` check (coordinator)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4147"
+    },
+    {
+      "at": "2026-10-30T08:45:35Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:45:35Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "docs/v2/plan/lanes/diagnostics.md Done when: the rg check counts unfinished code; it names the todo!() of the E0004/E0005/E0046 suggestions, the E0373/E0706/E0772 explanations and their test expectations as text blaze writes for the user, which stays."
+    }
+  ]
+}

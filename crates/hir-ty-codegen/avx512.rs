@@ -19,6 +19,13 @@
 //! directions with `_MM_FROUND_NO_EXC` (8 to 11) are `{rn-sae}` to `{rz-sae}`, and where the
 //! operand only suppresses exceptions, 8 (or 12) is `{sae}`. LLVM rejects any other value.
 
+#![forbid(unsafe_code)]
+
+use std::fmt;
+
+use hir_ty::{TargetFeature, TargetFeatureSet, intrinsic::SimdOp};
+use smallvec::SmallVec;
+
 /// An operand of the intrinsic as the code generator has it: its size, whether it is an
 /// address, and its value where that is a constant integer.
 #[derive(Clone, Copy, Debug)]
@@ -73,17 +80,41 @@ enum Rounding {
 }
 
 /// The vector register `number` of `bytes`.
-fn reg(bytes: u32, number: usize) -> String {
-    match bytes {
-        64 => format!("zmm{number}"),
-        32 => format!("ymm{number}"),
-        _ => format!("xmm{number}"),
-    }
+fn reg(bytes: u32, number: usize) -> Reg {
+    Reg { bytes, number }
 }
 
 /// The vector register argument `at` is read into.
-fn arg(bytes: u32, at: usize) -> String {
+fn arg(bytes: u32, at: usize) -> Reg {
     reg(bytes, at + 1)
+}
+
+/// A vector register, written `zmm{number}`, `ymm{number}` or `xmm{number}` by its size.
+#[derive(Clone, Copy)]
+struct Reg {
+    bytes: u32,
+    number: usize,
+}
+
+impl fmt::Display for Reg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let class = match self.bytes {
+            64 => "zmm",
+            32 => "ymm",
+            _ => "xmm",
+        };
+        write!(f, "{class}{}", self.number)
+    }
+}
+
+/// A mnemonic of up to three parts, written one after another: `v`, `getexp` and `ps`.
+#[derive(Clone, Copy)]
+struct Concat<'a>([&'a str; 3]);
+
+impl fmt::Display for Concat<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|it| f.write_str(it))
+    }
 }
 
 /// The size of a memory operand of `bytes`, as Intel's syntax names it.
@@ -118,9 +149,9 @@ pub(super) fn lower(
     name: &str,
     args: &[Given],
     result: u32,
-    features: &[&str],
+    features: TargetFeatureSet,
 ) -> Option<Result<Lowered, String>> {
-    let mut words: Vec<&str> = name.strip_prefix("x86.")?.split('.').collect();
+    let mut words = name.strip_prefix("x86.")?.split('.').collect::<SmallVec<[&str; 8]>>();
     let width = match words.last() {
         Some(&(last @ ("128" | "256" | "512"))) => {
             words.pop();
@@ -130,7 +161,7 @@ pub(super) fn lower(
     };
     let lowered = match lowered(&words, width, args, result, features)? {
         Ok(it) => it,
-        Err(e) => return Some(Err(format!("`llvm.{name}` {e}"))),
+        Err(e) => return Some(Err(format!("`llvm.{name}` {e}"))), // alloc: the error's message
     };
     // The width the name says is that of its widest vector.
     let widest = lowered
@@ -156,7 +187,7 @@ fn lowered(
     width: Option<u32>,
     args: &[Given],
     result: u32,
-    features: &[&str],
+    features: TargetFeatureSet,
 ) -> Option<Result<Lowered, String>> {
     let vector = |at: usize| {
         let it = args.get(at)?;
@@ -174,7 +205,10 @@ fn lowered(
     let round = |at: usize, kind: Rounding| rounding(args.get(at).and_then(|it| it.constant), kind);
     let out = |bytes: u32| reg(bytes, 0);
     let vector_result = matches!(result, 16 | 32 | 64).then_some(result);
-    let ok = |text: String, loads: Vec<Load>, out: Out| Some(Ok(Lowered { text, loads, out }));
+    let ok = |text: String, loads: &[Load], out: Out| {
+        // alloc: the stub's loads, the output
+        Some(Ok(Lowered { text, loads: loads.to_vec(), out }))
+    };
     // An error of the operands, which LLVM would refuse.
     macro_rules! check {
         ($e:expr) => {
@@ -200,11 +234,12 @@ fn lowered(
             return None;
         }
         let rounding = match args.len() {
-            4 if !scalar => String::new(),
+            4 if !scalar => "",
             5 if scalar || width == Some(64) => check!(round(4, Rounding::Round)),
             _ => return None,
         };
         let zeros = if how == "maskz" { " {z}" } else { "" };
+        // alloc: the stub's text, the output
         let text = format!(
             "vmovaps {0}, {3}\n{op}c{1} {0} {{k4}}{zeros}, {2}, {4}{rounding}",
             out(result),
@@ -213,9 +248,9 @@ fn lowered(
             arg(c, 2),
             arg(b, 1),
         );
-        let mut loads = vec![Load::Vector(a), Load::Vector(b), Load::Vector(c), Load::Mask(k)];
-        loads.extend((args.len() == 5).then_some(Load::Immediate));
-        return ok(text, loads, Out::Vector(result));
+        let loads =
+            [Load::Vector(a), Load::Vector(b), Load::Vector(c), Load::Mask(k), Load::Immediate];
+        return ok(text, &loads[..args.len()], Out::Vector(result));
     }
     let (masked, words) = match words.split_first() {
         Some((&"mask", rest)) => (true, rest),
@@ -231,20 +266,23 @@ fn lowered(
             }
             let predicate = match args[2].constant {
                 Some(it @ 0..32) => it,
+                // alloc: the error's message
                 Some(it) => return Some(Err(format!("of predicate {it}"))),
+                // alloc: the error's message
                 None => return Some(Err("of a predicate that is not a constant".to_owned())),
             };
             let sae = check!(round(4, Rounding::Sae));
-            let text =
-                format!("vcmp{lanes} k0 {{k4}}, {}, {}{sae}, {predicate}", arg(a, 0), arg(a, 1));
-            let loads = vec![
+            let (x, y) = (arg(a, 0), arg(a, 1));
+            // alloc: the stub's text, the output
+            let text = format!("vcmp{lanes} k0 {{k4}}, {x}, {y}{sae}, {predicate}");
+            let loads = [
                 Load::Vector(a),
                 Load::Vector(a),
                 Load::Immediate,
                 Load::Mask(k),
                 Load::Immediate,
             ];
-            ok(text, loads, Out::Mask(k))
+            ok(text, &loads, Out::Mask(k))
         }
         // Whether the low halves compare as the predicate says, as 0 or 1, with whether to
         // suppress exceptions: LLVM compares into a mask register and moves it out, the bits
@@ -255,13 +293,16 @@ fn lowered(
             }
             let predicate = match args[2].constant {
                 Some(it @ 0..32) => it,
+                // alloc: the error's message
                 Some(it) => return Some(Err(format!("of predicate {it}"))),
+                // alloc: the error's message
                 None => return Some(Err("of a predicate that is not a constant".to_owned())),
             };
             let sae = check!(round(3, Rounding::Sae));
+            // alloc: the stub's text, the output
             let text = format!("vcmpsh k0, xmm1, xmm2{sae}, {predicate}\nkmovw eax, k0");
-            let loads = vec![Load::Vector(16), Load::Vector(16), Load::Immediate, Load::Immediate];
-            ok(text, loads, Out::Int(4))
+            let loads = [Load::Vector(16), Load::Vector(16), Load::Immediate, Load::Immediate];
+            ok(text, &loads, Out::Int(4))
         }
         // An integer of 32 or 64 bits (`si64`), signed or not (`usi`), to the low half, the
         // others the first vector's, rounded as the third operand says.
@@ -277,9 +318,14 @@ fn lowered(
             }
             let rounding = check!(round(2, Rounding::Round));
             let from = if bytes == 8 { "rcx" } else { "ecx" };
+            let op = match op.split_once("64") {
+                Some((head, rest)) => Concat([head, rest, ""]),
+                None => Concat([op, "", ""]),
+            };
             // Intel's syntax has the rounding before the integer register.
-            let text = format!("{} xmm0, xmm1{rounding}, {from}", op.replace("64", ""));
-            ok(text, vec![Load::Vector(a), Load::Int(bytes), Load::Immediate], Out::Vector(16))
+            // alloc: the stub's text, the output
+            let text = format!("{op} xmm0, xmm1{rounding}, {from}");
+            ok(text, &[Load::Vector(a), Load::Int(bytes), Load::Immediate], Out::Vector(16))
         }
         // Pairs of single floats to bfloat16s, rounded to nearest even: those of the second
         // vector in the low half, the first's in the high one.
@@ -288,8 +334,10 @@ fn lowered(
             if vector(1)? != a || result != a {
                 return None;
             }
-            let text = format!("vcvtne2ps2bf16 {}, {}, {}", out(result), arg(a, 0), arg(a, 1));
-            ok(text, vec![Load::Vector(a), Load::Vector(a)], Out::Vector(result))
+            let (r, x, y) = (out(result), arg(a, 0), arg(a, 1));
+            // alloc: the stub's text, the output
+            let text = format!("vcvtne2ps2bf16 {r}, {x}, {y}");
+            ok(text, &[Load::Vector(a), Load::Vector(a)], Out::Vector(result))
         }
         // Single floats to bfloat16s, rounded to nearest even, in a vector of half the size.
         // AVX-NE-CONVERT has the instruction too, in an encoding of its own, so where the
@@ -299,11 +347,13 @@ fn lowered(
             if a < 32 || result != a / 2 {
                 return None;
             }
-            if features.contains(&"avxneconvert") {
+            if features.contains(TargetFeature::AVXNECONVERT) {
+                // alloc: the error's message
                 return Some(Err("in a function with AVX-NE-CONVERT too".to_owned()));
             }
+            // alloc: the stub's text, the output
             let text = format!("{{evex}} vcvtneps2bf16 {}, {}", out(result), arg(a, 0));
-            ok(text, vec![Load::Vector(a)], Out::Vector(result))
+            ok(text, &[Load::Vector(a)], Out::Vector(result))
         }
         // The same of four, merged into the second operand under the mask of the third.
         ("avx512bf16", true, &["cvtneps2bf16"], 3) => {
@@ -311,8 +361,9 @@ fn lowered(
             if a != 16 || src != 16 || result != 16 {
                 return None;
             }
+            // alloc: the stub's text, the output
             let text = "vmovaps xmm0, xmm2\nvcvtneps2bf16 xmm0 {k3}, xmm1".to_owned();
-            ok(text, vec![Load::Vector(a), Load::Vector(src), Load::Mask(k)], Out::Vector(16))
+            ok(text, &[Load::Vector(a), Load::Vector(src), Load::Mask(k)], Out::Vector(16))
         }
         // The sum of each single float of the first vector and the products of the two pairs
         // of bfloat16s of the other two at it.
@@ -321,6 +372,7 @@ fn lowered(
             if src != result || a != result || b != result {
                 return None;
             }
+            // alloc: the stub's text, the output
             let text = format!(
                 "vmovaps {0}, {1}\nvdpbf16ps {0}, {2}, {3}",
                 out(result),
@@ -328,7 +380,7 @@ fn lowered(
                 arg(a, 1),
                 arg(b, 2),
             );
-            ok(text, vec![Load::Vector(src), Load::Vector(a), Load::Vector(b)], Out::Vector(result))
+            ok(text, &[Load::Vector(src), Load::Vector(a), Load::Vector(b)], Out::Vector(result))
         }
         // AVX-NE-CONVERT's, one word each, `128` or `256` bits of result: a bfloat16 or a
         // half at an address made a single float in every lane (`vbcstne`), those at the even
@@ -342,19 +394,22 @@ fn lowered(
                 if a != bytes || result != 16 {
                     return None;
                 }
-                if features.contains(&"avx512bf16") {
+                if features.contains(TargetFeature::AVX512BF16) {
+                    // alloc: the error's message
                     return Some(Err("in a function with AVX512-BF16 too".to_owned()));
                 }
+                // alloc: the stub's text, the output
                 let text = format!("{{vex}} vcvtneps2bf16 xmm0, {}", arg(a, 0));
-                return ok(text, vec![Load::Vector(a)], Out::Vector(16));
+                return ok(text, &[Load::Vector(a)], Out::Vector(16));
             }
             pointer(0)?;
             if result != bytes {
                 return None;
             }
             let read = if op.starts_with("vbcst") { "word" } else { memory(bytes)? };
+            // alloc: the stub's text, the output
             let text = format!("{op} {}, {read} ptr [r11]", out(result));
-            ok(text, vec![Load::Pointer], Out::Vector(result))
+            ok(text, &[Load::Pointer], Out::Vector(result))
         }
         // Of the first vector, merged into the second under the mask of the third, rounded as
         // a fourth says where there is one (the 512-bit forms).
@@ -364,10 +419,11 @@ fn lowered(
                 return None;
             }
             let rounding = match (args.len(), kind) {
-                (3, _) => String::new(),
+                (3, _) => "",
                 (_, Some(kind)) if width == Some(64) => check!(round(3, kind)),
                 _ => return None,
             };
+            // alloc: the stub's text, the output
             let text = format!(
                 "vmovaps {}, {}\n{op} {} {{k3}}, {}{rounding}",
                 out(result),
@@ -375,9 +431,8 @@ fn lowered(
                 out(result),
                 arg(a, 0),
             );
-            let mut loads = vec![Load::Vector(a), Load::Vector(src), Load::Mask(k)];
-            loads.extend((args.len() == 4).then_some(Load::Immediate));
-            ok(text, loads, Out::Vector(result))
+            let loads = [Load::Vector(a), Load::Vector(src), Load::Mask(k), Load::Immediate];
+            ok(text, &loads[..args.len()], Out::Vector(result))
         }
         // Of the first two vectors, merged into the third under the mask of the fourth: on
         // whole vectors (`scalef`), or on the low lane of the second with the others of the
@@ -389,11 +444,12 @@ fn lowered(
                 return None;
             }
             let rounding = match (args.len(), kind) {
-                (4, None) => String::new(),
-                (4, _) if !scalar => String::new(),
+                (4, None) => "",
+                (4, _) if !scalar => "",
                 (5, Some(kind)) if scalar || width == Some(64) => check!(round(4, kind)),
                 _ => return None,
             };
+            // alloc: the stub's text, the output
             let text = format!(
                 "vmovaps {}, {}\n{op} {} {{k4}}, {}, {}{rounding}",
                 out(result),
@@ -402,10 +458,14 @@ fn lowered(
                 arg(a, 0),
                 arg(b, 1),
             );
-            let mut loads =
-                vec![Load::Vector(a), Load::Vector(b), Load::Vector(src), Load::Mask(k)];
-            loads.extend((args.len() == 5).then_some(Load::Immediate));
-            ok(text, loads, Out::Vector(result))
+            let loads = [
+                Load::Vector(a),
+                Load::Vector(b),
+                Load::Vector(src),
+                Load::Mask(k),
+                Load::Immediate,
+            ];
+            ok(text, &loads[..args.len()], Out::Vector(result))
         }
         // Lane by lane of two vectors, or (`psll` and the other shifts) of a vector by the
         // count in the low 64 bits of the second; `max` and `min` with whether to suppress
@@ -416,12 +476,13 @@ fn lowered(
             let (a, b, result) = (vector(0)?, vector(1)?, vector_result?);
             let sae = match args.len() {
                 3 => check!(round(2, Rounding::Sae)),
-                _ => String::new(),
+                _ => "",
             };
-            let text = format!("{op} {}, {}, {}{sae}", out(result), arg(a, 0), arg(b, 1));
-            let mut loads = vec![Load::Vector(a), Load::Vector(b)];
-            loads.extend((args.len() == 3).then_some(Load::Immediate));
-            ok(text, loads, Out::Vector(result))
+            let (r, x, y) = (out(result), arg(a, 0), arg(b, 1));
+            // alloc: the stub's text, the output
+            let text = format!("{op} {r}, {x}, {y}{sae}");
+            let loads = [Load::Vector(a), Load::Vector(b), Load::Immediate];
+            ok(text, &loads[..args.len()], Out::Vector(result))
         }
         // The bits of each 64-bit lane of the first vector that the bytes of the second name.
         ("avx512", false, &["vpshufbitqmb"], 2) => {
@@ -429,14 +490,16 @@ fn lowered(
             if result != a / 8 {
                 return None;
             }
+            // alloc: the stub's text, the output
             let text = format!("vpshufbitqmb k0, {}, {}", arg(a, 0), arg(b, 1));
-            ok(text, vec![Load::Vector(a), Load::Vector(b)], Out::Mask(result))
+            ok(text, &[Load::Vector(a), Load::Vector(b)], Out::Mask(result))
         }
         // Each lane's bits of the lanes before it that are equal to it.
         ("avx512", false, &["conflict", lanes @ ("d" | "q")], 1) => {
             let (a, result) = (vector(0)?, vector_result?);
+            // alloc: the stub's text, the output
             let text = format!("vpconflict{lanes} {}, {}", out(result), arg(a, 0));
-            ok(text, vec![Load::Vector(a)], Out::Vector(result))
+            ok(text, &[Load::Vector(a)], Out::Vector(result))
         }
         // 64-bit integers to floats, and integers of 16, 32 or 64 bits to halves, rounded as
         // the second operand says: in any direction at 512 bits, only the current one below.
@@ -462,12 +525,14 @@ fn lowered(
             }
             let rounding = check!(round(1, Rounding::Round));
             if a != 64 && !rounding.is_empty() {
+                // alloc: the error's message
                 return Some(Err("of a rounding below 512 bits".to_owned()));
             }
             let unsigned = if op == "uitofp" { "u" } else { "" };
-            let text =
-                format!("vcvt{unsigned}{int}2{float} {}, {}{rounding}", out(result), arg(a, 0));
-            ok(text, vec![Load::Vector(a), Load::Immediate], Out::Vector(result))
+            let (r, x) = (out(result), arg(a, 0));
+            // alloc: the stub's text, the output
+            let text = format!("vcvt{unsigned}{int}2{float} {r}, {x}{rounding}");
+            ok(text, &[Load::Vector(a), Load::Immediate], Out::Vector(result))
         }
         // The sum of each 32-bit lane of the first vector and the products of the bytes
         // (`b`) or words (`w`) of the other two at it, wrapping or saturated (`s`).
@@ -489,10 +554,11 @@ fn lowered(
             // takes the shorter encoding) and AVX512-VNNI's otherwise: each runs only on a
             // processor with its extension. AVX-VNNI-INT8's and -INT16's have one encoding.
             let encoding = match (*family, result) {
-                ("avx512", 16 | 32) if features.contains(&"avxvnni") => "{vex} ",
+                ("avx512", 16 | 32) if features.contains(TargetFeature::AVXVNNI) => "{vex} ",
                 ("avx512", 16 | 32) => "{evex} ",
                 _ => "",
             };
+            // alloc: the stub's text, the output
             let text = format!(
                 "vmovaps {0}, {1}\n{encoding}{op} {0}, {2}, {3}",
                 out(result),
@@ -500,7 +566,7 @@ fn lowered(
                 arg(a, 1),
                 arg(b, 2),
             );
-            ok(text, vec![Load::Vector(src), Load::Vector(a), Load::Vector(b)], Out::Vector(result))
+            ok(text, &[Load::Vector(src), Load::Vector(a), Load::Vector(b)], Out::Vector(result))
         }
         // The low lane to an integer of 32 or 64 bits, rounded as the second operand says
         // (`cvtt` toward zero, with whether to suppress exceptions).
@@ -525,8 +591,9 @@ fn lowered(
             }
             let rounding = check!(round(1, kind));
             let to = if bits == 64 { "rax" } else { "eax" };
+            // alloc: the stub's text, the output
             let text = format!("v{op} {to}, xmm1{rounding}");
-            ok(text, vec![Load::Vector(a), Load::Immediate], Out::Int(result))
+            ok(text, &[Load::Vector(a), Load::Immediate], Out::Int(result))
         }
         // Stores: the lanes truncated (`pmov.mem`), or those of the mask one after another
         // (`compress.store`), to the address of the first operand.
@@ -540,17 +607,21 @@ fn lowered(
                 return None;
             }
             let (mnemonic, bytes) = match (op, lanes.as_bytes()) {
-                ("compress", [b'd' | b'q' | b'w' | b'b']) => (format!("vpcompress{lanes}"), a),
-                ("compress", b"ps" | b"pd") => (format!("vcompress{lanes}"), a),
+                ("compress", [b'd' | b'q' | b'w' | b'b']) => {
+                    (Concat(["vpcompress", lanes, ""]), a)
+                }
+                ("compress", b"ps" | b"pd") => (Concat(["vcompress", lanes, ""]), a),
                 ("compress", _) => return None,
                 (_, &[from, to]) => {
                     let (from, to) = (lane_bytes(from.into())?, lane_bytes(to.into())?);
-                    (format!("v{op}{lanes}"), a / from * to)
+                    (Concat(["v", op, lanes]), a / from * to)
                 }
                 _ => return None,
             };
-            let text = format!("{mnemonic} {} ptr [r11] {{k3}}, {}", memory(bytes)?, arg(a, 1));
-            ok(text, vec![Load::Pointer, Load::Vector(a), Load::Mask(k)], Out::Nothing)
+            let (size, x) = (memory(bytes)?, arg(a, 1));
+            // alloc: the stub's text, the output
+            let text = format!("{mnemonic} {size} ptr [r11] {{k3}}, {x}");
+            ok(text, &[Load::Pointer, Load::Vector(a), Load::Mask(k)], Out::Nothing)
         }
         // A load of as many lanes as the mask has bits set, into those lanes, the others the
         // second operand's.
@@ -561,10 +632,11 @@ fn lowered(
                 return None;
             }
             let mnemonic = match lanes {
-                "d" | "q" | "w" | "b" => format!("vpexpand{lanes}"),
-                "ps" | "pd" => format!("vexpand{lanes}"),
+                "d" | "q" | "w" | "b" => Concat(["vpexpand", lanes, ""]),
+                "ps" | "pd" => Concat(["vexpand", lanes, ""]),
                 _ => return None,
             };
+            // alloc: the stub's text, the output
             let text = format!(
                 "vmovaps {}, {}\n{mnemonic} {} {{k3}}, {} ptr [r11]",
                 out(result),
@@ -572,7 +644,7 @@ fn lowered(
                 out(result),
                 memory(result)?,
             );
-            ok(text, vec![Load::Pointer, Load::Vector(src), Load::Mask(k)], Out::Vector(result))
+            ok(text, &[Load::Pointer, Load::Vector(src), Load::Mask(k)], Out::Vector(result))
         }
         // The lanes of each vector equal to one of the other's, as a pair of masks.
         ("avx512", false, &["vp2intersect", lanes @ ("d" | "q")], 2) => {
@@ -585,44 +657,55 @@ fn lowered(
             if result != 2 * bytes {
                 return None;
             }
+            // alloc: the stub's text, the output
             let text = format!("vp2intersect{lanes} k0, {}, {}", arg(a, 0), arg(a, 1));
-            ok(text, vec![Load::Vector(a), Load::Vector(a)], Out::Masks(bytes, bytes))
+            ok(text, &[Load::Vector(a), Load::Vector(a)], Out::Masks(bytes, bytes))
         }
         _ => None,
     }
 }
 
-/// The instruction LLVM selects for the generic intrinsic `name` of `core::intrinsics::simd`
+/// The instruction LLVM selects for the generic intrinsic `op` of `core::intrinsics::simd`
 /// on a vector of halves of `from` bytes, giving `to` bytes, in a function with the target
 /// features `features` (implied ones included): AVX512-FP16's of the lanes for the arithmetic,
 /// operands in order, and F16C's `vcvtph2ps` for `simd_cast` to single floats where the
 /// function does not have AVX512-FP16, which converts by its own. `None` for any other.
 pub(super) fn half_vector(
-    name: &str,
+    op: SimdOp,
     from: u32,
     to: u32,
-    features: impl Fn(&str) -> bool,
+    features: impl Fn(TargetFeature) -> bool,
 ) -> Option<Lowered> {
-    let fp16 =
-        features("avx512fp16") && (from == 64 || matches!(from, 16 | 32) && features("avx512vl"));
-    let (text, loads) = match name {
-        "simd_add" | "simd_sub" | "simd_mul" | "simd_div" if fp16 && from == to => {
-            let op = &name["simd_".len()..];
-            let text = format!("v{op}ph {}, {}, {}", reg(to, 0), arg(from, 0), arg(from, 1));
-            (text, vec![Load::Vector(from); 2])
+    let fp16 = features(TargetFeature::AVX512FP16)
+        && (from == 64 || matches!(from, 16 | 32) && features(TargetFeature::AVX512VL));
+    let (text, operands) = match op {
+        SimdOp::Add | SimdOp::Sub | SimdOp::Mul | SimdOp::Div if fp16 && from == to => {
+            let op = match op {
+                SimdOp::Add => "add",
+                SimdOp::Sub => "sub",
+                SimdOp::Mul => "mul",
+                _ => "div",
+            };
+            let (r, x, y) = (reg(to, 0), arg(from, 0), arg(from, 1));
+            // alloc: the stub's text, the output
+            (format!("v{op}ph {r}, {x}, {y}"), 2)
         }
-        "simd_fsqrt" if fp16 && from == to => {
-            (format!("vsqrtph {}, {}", reg(to, 0), arg(from, 0)), vec![Load::Vector(from)])
+        SimdOp::Fsqrt if fp16 && from == to => {
+            // alloc: the stub's text, the output
+            (format!("vsqrtph {}, {}", reg(to, 0), arg(from, 0)), 1)
         }
-        "simd_cast"
-            if features("f16c")
-                && !features("avx512fp16")
+        SimdOp::Cast
+            if features(TargetFeature::F16C)
+                && !features(TargetFeature::AVX512FP16)
                 && matches!((from, to), (8, 16) | (16, 32)) =>
         {
-            (format!("vcvtph2ps {}, xmm1", reg(to, 0)), vec![Load::Vector(from)])
+            // alloc: the stub's text, the output
+            (format!("vcvtph2ps {}, xmm1", reg(to, 0)), 1)
         }
         _ => return None,
     };
+    // alloc: the stub's loads, the output
+    let loads = vec![Load::Vector(from); operands];
     Some(Lowered { text, loads, out: Out::Vector(to) })
 }
 
@@ -647,23 +730,27 @@ fn no_exceptions_convert(name: &str) -> Option<(&str, u32)> {
 }
 
 /// The instruction of an intrinsic of two vectors and nothing else, of `count` operands.
-fn lanewise(words: &[&str], count: usize) -> Option<String> {
+fn lanewise<'a>(words: &[&'a str], count: usize) -> Option<Concat<'a>> {
     Some(match (words, count) {
-        (&[op @ ("max" | "min"), lanes @ ("ps" | "pd")], 3) => format!("v{op}{lanes}"),
-        (&[op @ ("max" | "min"), "ph"], 2 | 3) => format!("v{op}ph"),
+        (&[op @ ("max" | "min"), lanes @ ("ps" | "pd")], 3) => Concat(["v", op, lanes]),
+        (&[op @ ("max" | "min"), "ph"], 2 | 3) => Concat(["v", op, "ph"]),
         (&[op @ ("psll" | "psrl" | "psra"), lanes @ ("d" | "q" | "w")], 2) => {
-            format!("v{op}{lanes}")
+            Concat(["v", op, lanes])
         }
-        (&["vpermilvar", lanes @ ("ps" | "pd")], 2) => format!("vpermil{lanes}"),
-        (&["pmul", "hr", "sw"], 2) => "vpmulhrsw".to_owned(),
-        (&["pmultishift", "qb"], 2) => "vpmultishiftqb".to_owned(),
+        (&["vpermilvar", lanes @ ("ps" | "pd")], 2) => Concat(["vpermil", lanes, ""]),
+        (&["pmul", "hr", "sw"], 2) => Concat(["vpmulhrsw", "", ""]),
+        (&["pmultishift", "qb"], 2) => Concat(["vpmultishiftqb", "", ""]),
         _ => return None,
     })
 }
 
 /// The instruction of an intrinsic of one vector merged into a source under a mask, and what
 /// a fourth operand says where there is one.
-fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<Rounding>)> {
+fn unary<'a>(
+    family: &str,
+    masked: bool,
+    words: &[&'a str],
+) -> Option<(Concat<'a>, Option<Rounding>)> {
     if family == "avx512fp16" {
         return Some(match (masked, words) {
             // Between halves and integers or other floats: rounded as the operand says, or
@@ -676,16 +763,16 @@ fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<R
                     | "vcvtph2uqq" | "vcvtps2phx" | "vcvtpd2ph" | "vcvtdq2ph" | "vcvtudq2ph"
                     | "vcvtqq2ph" | "vcvtuqq2ph"),
                 ],
-            ) => (op.to_owned(), Some(Rounding::Round)),
+            ) => (Concat([op, "", ""]), Some(Rounding::Round)),
             (
                 true,
                 &[
                     op @ ("vcvttph2w" | "vcvttph2uw" | "vcvttph2dq" | "vcvttph2udq" | "vcvttph2qq"
                     | "vcvttph2uqq" | "vcvtph2psx" | "vcvtph2pd"),
                 ],
-            ) => (op.to_owned(), Some(Rounding::Sae)),
-            (true, &["getexp", "ph"]) => ("vgetexpph".to_owned(), Some(Rounding::Sae)),
-            (true, &[op @ ("rcp" | "rsqrt"), "ph"]) => (format!("v{op}ph"), None),
+            ) => (Concat([op, "", ""]), Some(Rounding::Sae)),
+            (true, &["getexp", "ph"]) => (Concat(["vgetexpph", "", ""]), Some(Rounding::Sae)),
+            (true, &[op @ ("rcp" | "rsqrt"), "ph"]) => (Concat(["v", op, "ph"]), None),
             _ => return None,
         });
     }
@@ -694,10 +781,10 @@ fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<R
     }
     Some(match (masked, words) {
         (false, &[op @ ("rcp14" | "rsqrt14"), lanes @ ("ps" | "pd")]) => {
-            (format!("v{op}{lanes}"), None)
+            (Concat(["v", op, lanes]), None)
         }
         (true, &["getexp", lanes @ ("ps" | "pd")]) => {
-            (format!("vgetexp{lanes}"), Some(Rounding::Sae))
+            (Concat(["vgetexp", lanes, ""]), Some(Rounding::Sae))
         }
         (
             true,
@@ -705,15 +792,15 @@ fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<R
                 op @ ("cvtps2dq" | "cvtps2udq" | "cvtpd2dq" | "cvtpd2udq" | "cvtpd2ps" | "cvtpd2qq"
                 | "cvtps2qq" | "cvtpd2uqq" | "cvtps2uqq"),
             ],
-        ) => (format!("v{op}"), Some(Rounding::Round)),
+        ) => (Concat(["v", op, ""]), Some(Rounding::Round)),
         (
             true,
             &[
                 op @ ("cvttps2dq" | "cvttps2udq" | "cvttpd2dq" | "cvttpd2udq" | "cvttpd2qq"
                 | "cvttps2qq" | "cvttpd2uqq" | "cvttps2uqq" | "cvtps2pd" | "vcvtph2ps"),
             ],
-        ) => (format!("v{}", op.trim_start_matches('v')), Some(Rounding::Sae)),
-        (true, &[op @ ("cvtqq2ps" | "cvtuqq2ps")]) => (format!("v{op}"), None),
+        ) => (Concat(["v", op.trim_start_matches('v'), ""]), Some(Rounding::Sae)),
+        (true, &[op @ ("cvtqq2ps" | "cvtuqq2ps")]) => (Concat(["v", op, ""]), None),
         // Truncations to narrower lanes: wrapping, or saturated as signed (`s`) or unsigned
         // (`us`) integers.
         (
@@ -722,12 +809,12 @@ fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<R
                 op @ ("pmov" | "pmovs" | "pmovus"),
                 lanes @ ("dw" | "db" | "qw" | "qb" | "qd" | "wb"),
             ],
-        ) => (format!("v{op}{lanes}"), None),
+        ) => (Concat(["v", op, lanes]), None),
         // The lanes the mask has set, one after another (`compress`), or the first lanes put
         // where it has bits set (`expand`).
         (true, &[op @ ("compress" | "expand"), lanes]) => match lanes {
-            "d" | "q" | "w" | "b" => (format!("vp{op}{lanes}"), None),
-            "ps" | "pd" => (format!("v{op}{lanes}"), None),
+            "d" | "q" | "w" | "b" => (Concat(["vp", op, lanes]), None),
+            "ps" | "pd" => (Concat(["v", op, lanes]), None),
             _ => return None,
         },
         _ => return None,
@@ -736,34 +823,40 @@ fn unary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<R
 
 /// The instruction of an intrinsic of two vectors merged into a source under a mask, what a
 /// fifth operand says where there is one, and whether it is of the low lane alone.
-fn binary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<Rounding>, bool)> {
+fn binary<'a>(
+    family: &str,
+    masked: bool,
+    words: &[&'a str],
+) -> Option<(Concat<'a>, Option<Rounding>, bool)> {
     let words = match words.split_last() {
         Some((&"round", rest)) => rest,
         _ => words,
     };
     if family == "avx512fp16" {
         return Some(match (masked, words) {
-            (true, &["scalef", "ph"]) => ("vscalefph".to_owned(), Some(Rounding::Round), false),
+            (true, &["scalef", "ph"]) => {
+                (Concat(["vscalefph", "", ""]), Some(Rounding::Round), false)
+            }
             (true, &[op @ ("max" | "min" | "getexp"), "sh"]) => {
-                (format!("v{op}sh"), Some(Rounding::Sae), true)
+                (Concat(["v", op, "sh"]), Some(Rounding::Sae), true)
             }
             (true, &[op @ ("sqrt" | "scalef"), "sh"]) => {
-                (format!("v{op}sh"), Some(Rounding::Round), true)
+                (Concat(["v", op, "sh"]), Some(Rounding::Round), true)
             }
-            (true, &[op @ ("rcp" | "rsqrt"), "sh"]) => (format!("v{op}sh"), None, true),
+            (true, &[op @ ("rcp" | "rsqrt"), "sh"]) => (Concat(["v", op, "sh"]), None, true),
             (true, &[op @ ("vcvtss2sh" | "vcvtsd2sh")]) => {
-                (op.to_owned(), Some(Rounding::Round), true)
+                (Concat([op, "", ""]), Some(Rounding::Round), true)
             }
             (true, &[op @ ("vcvtsh2ss" | "vcvtsh2sd")]) => {
-                (op.to_owned(), Some(Rounding::Sae), true)
+                (Concat([op, "", ""]), Some(Rounding::Sae), true)
             }
             // Products of pairs of halves as complex numbers (`vfcmul` by the conjugate of
             // the second), each pair one lane of the mask.
             (true, &[op @ ("vfmul" | "vfcmul"), "cph"]) => {
-                (format!("{op}cph"), Some(Rounding::Round), false)
+                (Concat([op, "cph", ""]), Some(Rounding::Round), false)
             }
             (true, &[op @ ("vfmul" | "vfcmul"), "csh"]) => {
-                (format!("{op}csh"), Some(Rounding::Round), true)
+                (Concat([op, "csh", ""]), Some(Rounding::Round), true)
             }
             _ => return None,
         });
@@ -773,36 +866,37 @@ fn binary(family: &str, masked: bool, words: &[&str]) -> Option<(String, Option<
     }
     Some(match (masked, words) {
         (true, &["scalef", lanes @ ("ps" | "pd")]) => {
-            (format!("vscalef{lanes}"), Some(Rounding::Round), false)
+            (Concat(["vscalef", lanes, ""]), Some(Rounding::Round), false)
         }
         (true, &[op @ ("max" | "min" | "getexp"), lanes @ ("ss" | "sd")]) => {
-            (format!("v{op}{lanes}"), Some(Rounding::Sae), true)
+            (Concat(["v", op, lanes]), Some(Rounding::Sae), true)
         }
         (true, &[op @ ("sqrt" | "scalef"), lanes @ ("ss" | "sd")]) => {
-            (format!("v{op}{lanes}"), Some(Rounding::Round), true)
+            (Concat(["v", op, lanes]), Some(Rounding::Round), true)
         }
-        (true, &["cvtss2sd"]) => ("vcvtss2sd".to_owned(), Some(Rounding::Sae), true),
-        (true, &["cvtsd2ss"]) => ("vcvtsd2ss".to_owned(), Some(Rounding::Round), true),
+        (true, &["cvtss2sd"]) => (Concat(["vcvtss2sd", "", ""]), Some(Rounding::Sae), true),
+        (true, &["cvtsd2ss"]) => (Concat(["vcvtsd2ss", "", ""]), Some(Rounding::Round), true),
         (false, &[op @ ("rcp14" | "rsqrt14"), lanes @ ("ss" | "sd")]) => {
-            (format!("v{op}{lanes}"), None, true)
+            (Concat(["v", op, lanes]), None, true)
         }
         _ => return None,
     })
 }
 
 /// The text a rounding operand of `value` adds after the last register of the instruction.
-fn rounding(value: Option<u128>, kind: Rounding) -> Result<String, String> {
+fn rounding(value: Option<u128>, kind: Rounding) -> Result<&'static str, String> {
     let Some(value) = value else {
+        // alloc: the error's message
         return Err("of a rounding that is not a constant".to_owned());
     };
     Ok(match (kind, value) {
-        (_, 4) => String::new(),
-        (Rounding::Sae, 8 | 12) => ", {sae}".to_owned(),
-        (Rounding::Round, 8) => ", {rn-sae}".to_owned(),
-        (Rounding::Round, 9) => ", {rd-sae}".to_owned(),
-        (Rounding::Round, 10) => ", {ru-sae}".to_owned(),
-        (Rounding::Round, 11) => ", {rz-sae}".to_owned(),
-        _ => return Err(format!("of rounding {value}")),
+        (_, 4) => "",
+        (Rounding::Sae, 8 | 12) => ", {sae}",
+        (Rounding::Round, 8) => ", {rn-sae}",
+        (Rounding::Round, 9) => ", {rd-sae}",
+        (Rounding::Round, 10) => ", {ru-sae}",
+        (Rounding::Round, 11) => ", {rz-sae}",
+        _ => return Err(format!("of rounding {value}")), // alloc: the error's message
     })
 }
 
@@ -831,6 +925,7 @@ mod tests {
     fn describe(cases: &[(&str, &str, u32, &[&str])]) -> String {
         let mut out = String::new();
         for &(name, shape, result, features) in cases {
+            let features = features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
             let text = match lower(name, &given(shape), result, features) {
                 Some(Ok(it)) => format!("{} {:?}", it.text.replace('\n', "; "), it.out),
                 Some(Err(e)) => e,
@@ -986,5 +1081,27 @@ x86.vcvtneoph2ps256: vcvtneoph2ps ymm0, ymmword ptr [r11] Vector(32)
 x86.vbcstnebf162ps128: vbcstnebf162ps xmm0, word ptr [r11] Vector(16)
 ";
         assert_eq!(described, expected);
+    }
+
+    #[test]
+    fn half_vectors_by_simd_op() {
+        let all = |_: TargetFeature| true;
+        let text = |op, from, to, features: &dyn Fn(TargetFeature) -> bool| {
+            half_vector(op, from, to, features).map(|it| it.text)
+        };
+        for (op, mnemonic) in [
+            (SimdOp::Add, "vaddph"),
+            (SimdOp::Sub, "vsubph"),
+            (SimdOp::Mul, "vmulph"),
+            (SimdOp::Div, "vdivph"),
+        ] {
+            assert_eq!(text(op, 16, 16, &all).unwrap(), format!("{mnemonic} xmm0, xmm1, xmm2"));
+        }
+        assert_eq!(text(SimdOp::Fsqrt, 64, 64, &all).unwrap(), "vsqrtph zmm0, zmm1");
+        let f16c = |it: TargetFeature| it == TargetFeature::F16C;
+        assert_eq!(text(SimdOp::Cast, 8, 16, &f16c).unwrap(), "vcvtph2ps xmm0, xmm1");
+        assert_eq!(text(SimdOp::Cast, 8, 16, &all), None);
+        assert_eq!(text(SimdOp::Neg, 16, 16, &all), None);
+        assert_eq!(text(SimdOp::Add, 16, 16, &f16c), None);
     }
 }

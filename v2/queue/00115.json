@@ -1,0 +1,24 @@
+{
+  "id": "00115",
+  "from_lane": "diagnostics-items",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints.rs",
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## 1. `crate::lints::syntax` reachable from `crate::checks` (parent `diagnostics`: `crates/blaze-diagnostics/src/lints.rs`)\n\nWhat: `mod syntax;` → `pub(crate) mod syntax;` in `crates/blaze-diagnostics/src/lints.rs`\n(`lints/syntax.rs` already has `pub(crate) mod attrs;`, `attrs.rs` `pub(crate) mod features;`).\nWhy: `checks.rs` builds the crate's `lints::syntax::Walk` and `attrs::owners` once and hands\nthem to `checks/{ast_validation,features,attrs}.rs`, which give the errors of the same rustc\npasses whose lints the syntax siblings give, from the same walk and tables (one feature table,\none attribute table). Also asked by `diagnostics-lints-syntax-attrs-features` in\n`v2/requests/diagnostics.md`. Without it `checks.rs` does not compile.\n\n> forwarded to diagnostics: the parent's files.",
+  "state": "open",
+  "created": "2026-10-30T01:06:02Z",
+  "updated": "2026-10-30T01:06:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items.md#1. `crate::lints::syntax` reachable from `crate::checks` (parent `diagnostics`: `crates/blaze-diagnostics/src/lints.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items.md:3"
+    }
+  ]
+}

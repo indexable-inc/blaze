@@ -1,0 +1,36 @@
+{
+  "id": "00858",
+  "from_lane": "unify",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "what": "unify: root Cargo.toml [workspace.dependencies]: add `blaze-rng = { path = \"crates/blaze-rng\" }` after the `blaze-radix` line (132), and let Cargo.lock pick it up. New leaf crate crates/blaze-rng (no dependencies): the one seeded SplitMix64, moved from blaze-ids/src/rng.rs (now `pub use blaze_rng as rng;`), replacing the copies in blaze-core sim::Rng, blaze-check rng::Rng and blaze-radix's tests. blaze-ids, blaze-core, blaze-check (normal) and blaze-radix (dev) already name `blaze-rng.workspace = true`, so the workspace does not load until this line is in.",
+  "state": "applied",
+  "created": "2026-10-30T08:59:11Z",
+  "updated": "2026-10-30T11:27:15Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:59:11Z",
+      "by": "unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:14Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:15Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "already in: root Cargo.toml blaze-rng after blaze-radix."
+    }
+  ]
+}

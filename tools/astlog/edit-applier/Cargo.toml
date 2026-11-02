@@ -1,0 +1,18 @@
+[package]
+name = "edit-applier"
+description = "Apply sorted, non-overlapping byte-range edits to source files and render a unified diff"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+similar.workspace = true
+snafu.workspace = true
+
+[lints]
+workspace = true

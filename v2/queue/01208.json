@@ -1,0 +1,35 @@
+{
+  "id": "01208",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates"
+  ],
+  "what": "GO phase 2 (Andrew 17:45: the port lands now as ONE batch; the next coordinator rounds may be red in the front end while we fix). You hold every crate that names salsa (rg -l salsa crates/*/Cargo.toml; plus blaze-bench is query-unify-bench s, skip it). Order of edits bottom-up as the design says, but apply all of them before telling the coordinator; no cargo (the coordinator builds). Re-read each file before editing: no-fallback*, tests-* and db lanes edited front-end files since phase 1; port on top, never revert. Split into up to 4 children by crate group if your context needs it (your brief allows). The engine and macros are committed (contract in docs/v2/plan/lanes/db/query-unify.md, incl. Transitive-input summaries and Names/Owner checks). When the whole batch is in: one line to coord-1030-next2 (tmux) that the port batch is ready, and a queue note to query-unify. Then fix each round s errors in those crates until clean. vendor/salsa* deletion and root manifest/patch lines come after the first clean round: query-unify does them with dedup-next3.",
+  "state": "applied",
+  "created": "2026-10-31T01:17:56Z",
+  "updated": "2026-10-31T01:34:19Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:17:56Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:18:40Z",
+      "by": "query-unify-port",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:34:19Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "Port batch in, worktree /Volumes/Projects/blaze-v2-qu, uncommitted on 8d2f0ab9ce: 25 crates naming salsa in their manifest (not blaze-bench) plus 13 naming it elsewhere (blaze-format, -graph, -hashcons, -ids, -image, -lazy, -mem, -wasm-pack, const-ast, intern, proc-macro-api, parser fixture, fuzz). Replays from base byte for byte: salsa_to_query.py {base, hand: tools/v2/salsa_port}. No salsa in .rs/.toml outside vendor, docs/upstream, blaze-bench, root/smoke manifests (01214 to dedup), syntax cfg (01214), and blaze-query + blaze-query-macros comments/tests (yours). Engine gaps the port calls by name: 01211 Storage::resume_readers, 01212 f::set_lru_capacity. No cargo ran."
+    }
+  ]
+}

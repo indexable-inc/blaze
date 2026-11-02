@@ -1,0 +1,25 @@
+{
+  "id": "00441",
+  "from_lane": "mem-format-expand",
+  "owner": "frontend-tree-span",
+  "paths": [
+    "crates/syntax-bridge/src/lib.rs",
+    "v2/requests/db-expand-macros.md",
+    "crates/span/src/map.rs"
+  ],
+  "what": "## 2. F2: readers take views; `ranges_with_span` lends the worker's `u32`s\n\n> forwarded to frontend-tokens (2a) and frontend-tree-span (2b), both told by tmux (requests, pass 23).\n\n### 2a. frontend-tokens (`crates/syntax-bridge/src/lib.rs` L254)\n\nAs filed: `token_tree_to_syntax_node(tt: tt::SubtreeView<'_>, entry_point, span_to_edition)`,\nfirst line `let buffer = tt.strip_invisible();`. The callers outside hir-expand, each passing\n`.view()` of what it passes today: `hir-ide/src/const_macro.rs:186`,\n`hir-def/src/nameres/facts/tests.rs:1137`, `hir-def/src/macro_expansion_tests/mod.rs:403` and\n`:447`, `mbe/src/differential.rs:117`, `mbe/src/tests.rs:71`, `syntax-bridge/src/tests.rs:123`,\n`:204`, `:479`, `:713`. `reference::token_tree_to_syntax_node` keeps its `&TopSubtree`. hir-expand's\ncallers are E2's.\n\n> forwarded to frontend-tokens (requests, pass 23).\n> done by frontend-tokens (2026-10-29): `token_tree_to_syntax_node(tt: tt::SubtreeView<'_>, ..)`,\n> through `token_tree_to_syntax_node_in(tt, .., Global)` (3b). Updated so far:\n> - syntax-bridge's test callers (`tests.rs` 121, 202, 217/219, 529, 760).\n>\n> Still to change:\n> - mbe's callers (`tests.rs:71`, the new test at about 635, `differential.rs:119`) go to child\n>   `frontend-tokens-alloc`, which holds mbe now.\n> - The hir-expand, hir-def and hir-ide callers are filed in `v2/requests/db-expand-macros.md`,\n>   `## frontend-tokens: syntax-bridge's new signatures`.\n>\n> `reference::token_tree_to_syntax_node` keeps `&TopSubtree`. Not built.\n\n### 2b. frontend-tree-span (`crates/span/src/map.rs` L266-284)\n\nAs filed in F2: `ranges_with_span` takes `blaze_mem::scratch::lend_u32s()`, `extend`s it with\nthe filtered run, `sort_unstable()`s it (the indices are distinct, so the order is the radix\nsort's) and returns `(0..found.len()).map(move |at| self.range_of(found[at]))`; the doc's \"and one\nallocation\" reads \"and nothing allocated once the worker's buffer has grown\". span has\n`blaze-mem` and `#![feature(allocator_api)]` already. Test, in `map.rs`' tests:\n```rust\n/// Mapping a span down allocates nothing once the map's index and the worker's buffer are made.\n#[cfg(feature = \"salsa\")]\n#[test]\nfn ranges_with_span_allocates_nothing_warm() {\n    let mut rng = SplitMix64::new(7);\n    let (map, pairs) = spans(&mut rng, 200);\n    let span = pairs.0[pairs.0.len() / 2].1;\n    let want = map.ranges_with_span(span).collect::<Vec<_>>();\n    let got = blaze_alloc_count::assert_at_most(0, \"a warm ranges_with_span\", || {\n        map.ranges_with_span(span).count()\n    });\n    assert_eq!(got, want.len());\n    assert_eq!(want, pairs.ranges_with(span, false));\n}\n```\n(`spans` and `Pairs::ranges_with` are the tests' own, L1015 and L957.)\n\n---\n\n> forwarded to frontend-tree-span (requests, pass 23).\n\n> frontend-tree-span (2026-10-29): 2b applied as filed: `found` is `scratch::lend_u32s()`, lent\n> until the iterator drops, `sort_unstable`ed; test `ranges_with_span_allocates_nothing_warm`. Not\n> built.",
+  "state": "open",
+  "created": "2026-10-30T04:24:25Z",
+  "updated": "2026-10-30T04:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-format-expand.md#2. F2: readers take views; `ranges_with_span` lends the worker's `u32`s",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-format-expand.md:377"
+    }
+  ]
+}

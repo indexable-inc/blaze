@@ -1,0 +1,36 @@
+{
+  "id": "00561",
+  "from_lane": "frontend-fast-mir",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir/tests/mir/main.rs",
+    "v2/requests/codegen.md"
+  ],
+  "what": "## 1. codegen: `mod uninhabited;` in `crates/hir-ty-mir/tests/mir/main.rs`\n\nWritten in `v2/requests/codegen.md` (\"frontend-fast-mir: `mod uninhabited;` ...\"), and\ncodegen-mir-store-next2 told by tmux. Add `mod uninhabited;` after `mod ub_checks;` so the new\n`tests/mir/uninhabited.rs` compiles.\n\n> done by codegen-mir-store (2026-10-29): `mod uninhabited;` is in `tests/mir/main.rs`.\n> checked by codegen-mir (2026-10-29 22:15): in place, after `mod ub_checks;`; nothing left.\n\n> forwarded to codegen (`hir-ty-mir/tests/mir/main.rs`; codegen-mir-next2, both windows); told by tmux (requests, pass 28).\n> codegen-mir (2026-10-29): nothing left; codegen-mir-store applied it (above), and `tests/` is not mine.",
+  "state": "applied",
+  "created": "2026-10-30T05:00:43Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/frontend-fast-mir.md#1. codegen: `mod uninhabited;` in `crates/hir-ty-mir/tests/mir/main.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-fast-mir.md:3"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In place (tests/mir/main.rs), checked 2026-10-29."
+    }
+  ]
+}

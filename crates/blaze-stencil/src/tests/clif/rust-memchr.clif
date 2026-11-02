@@ -1,0 +1,139 @@
+; Shaped like what hir-ty-codegen makes for `core::slice::memchr::memchr(x: u8, text: &[u8])
+; -> Option<usize>`: whole `usize` words while one fits, each tested for a zero byte in
+; `word ^ repeat_byte(x)` with `contains_zero_byte` (`(v - LO) & !v & HI`), the first match
+; found with `trailing_zeros() / 8` (little endian), then `memchr_naive` on the tail. The
+; option is a scalar pair (discriminant, index), `None` as (0, 0); the tail's result is
+; offset with a `select` on its discriminant. `%find` and `%find_naive` store three words
+; (24 bytes) to a stack slot and search their first `len` bytes.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %memchr_naive(i8, i64, i64) -> i64, i64 {
+block0(v0: i8, v1: i64, v2: i64):
+    v3 = iconst.i64 0
+    jump block1(v3)
+
+block1(v4: i64):
+    v5 = icmp uge v4, v2
+    brif v5, block3, block2
+
+block2:
+    v6 = iadd v1, v4
+    v7 = load.i8 notrap v6
+    v8 = iconst.i64 1
+    v9 = iadd v4, v8
+    v10 = icmp eq v7, v0
+    brif v10, block4, block1(v9)
+
+block3:
+    v11 = iconst.i64 0
+    return v11, v11
+
+block4:
+    v12 = iconst.i64 1
+    return v12, v4
+}
+
+function %memchr(i8, i64, i64) -> i64, i64 {
+    fn0 = %memchr_naive(i8, i64, i64) -> i64, i64
+
+block0(v0: i8, v1: i64, v2: i64):
+    v3 = uextend.i64 v0
+    v4 = iconst.i64 0x0101010101010101
+    v5 = imul v3, v4
+    v6 = iconst.i64 0
+    jump block1(v6)
+
+block1(v7: i64):
+    v8 = iconst.i64 8
+    v9 = iadd v7, v8
+    v10 = icmp ugt v9, v2
+    brif v10, block4, block2
+
+block2:
+    v11 = iadd v1, v7
+    v12 = load.i64 notrap v11
+    v13 = bxor v12, v5
+    v14 = isub v13, v4
+    v15 = bnot v13
+    v16 = band v14, v15
+    v17 = iconst.i64 0x8080808080808080
+    v18 = band v16, v17
+    brif v18, block3, block1(v9)
+
+block3:
+    v19 = ctz v18
+    v20 = iconst.i64 3
+    v21 = ushr v19, v20
+    v22 = iadd v7, v21
+    v23 = iconst.i64 1
+    return v23, v22
+
+block4:
+    v24 = iadd v1, v7
+    v25 = isub v2, v7
+    v26, v27 = call fn0(v0, v24, v25)
+    v28 = iadd v27, v7
+    v29 = select v26, v28, v6
+    return v26, v29
+}
+
+function %find(i64, i64, i64, i8, i64) -> i64, i64 {
+    ss0 = explicit_slot 24, align = 8
+    fn0 = %memchr(i8, i64, i64) -> i64, i64
+
+block0(v0: i64, v1: i64, v2: i64, v3: i8, v4: i64):
+    v5 = stack_addr.i64 ss0
+    store notrap aligned v0, v5
+    store notrap aligned v1, v5+8
+    store notrap aligned v2, v5+16
+    v6, v7 = call fn0(v3, v5, v4)
+    return v6, v7
+}
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0, 24) == [1, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 5, 24) == [1, 5]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 7, 24) == [1, 7]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 8, 24) == [1, 8]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x10, 24) == [1, 16]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x10, 16) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x12, 20) == [1, 18]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x13, 20) == [1, 19]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x14, 20) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x17, 24) == [1, 23]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x17, 23) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x80, 24) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 3, 0) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 3, 3) == [0, 0]
+; run: %find(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 2, 3) == [1, 2]
+; run: %find(0x4141414141414141, 0, 0, 0x41, 24) == [1, 0]
+; run: %find(0x4142434445464748, 0, 0, 0x41, 8) == [1, 7]
+; run: %find(0x4142434445464748, 0, 0, 0x48, 8) == [1, 0]
+; run: %find(0x0000000000004140, 0, 0, 0x41, 8) == [1, 1]
+; run: %find(0x0000000000000100, 0, 0, 0, 8) == [1, 0]
+; run: %find(0x0000000000000100, 0, 0, 1, 8) == [1, 1]
+; run: %find(0xff00000000000000, 0, 0, 0xff, 8) == [1, 7]
+; run: %find(0xff00000000000000, 0, 0, 0xff, 7) == [0, 0]
+; run: %find(0, 0xff00000000000000, 0, 0xff, 24) == [1, 15]
+; run: %find(-1, -1, 0x00ffffffffffffff, 0, 24) == [1, 23]
+; run: %find(-1, -1, -1, 0xfe, 24) == [0, 0]
+
+function %find_naive(i64, i64, i64, i8, i64) -> i64, i64 {
+    ss0 = explicit_slot 24, align = 8
+    fn0 = %memchr_naive(i8, i64, i64) -> i64, i64
+
+block0(v0: i64, v1: i64, v2: i64, v3: i8, v4: i64):
+    v5 = stack_addr.i64 ss0
+    store notrap aligned v0, v5
+    store notrap aligned v1, v5+8
+    store notrap aligned v2, v5+16
+    v6, v7 = call fn0(v3, v5, v4)
+    return v6, v7
+}
+; run: %find_naive(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0, 24) == [1, 0]
+; run: %find_naive(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x12, 20) == [1, 18]
+; run: %find_naive(0x0706050403020100, 0x0f0e0d0c0b0a0908, 0x1716151413121110, 0x17, 23) == [0, 0]
+; run: %find_naive(0x0000000000004140, 0, 0, 0x41, 8) == [1, 1]
+; run: %find_naive(0xff00000000000000, 0, 0, 0xff, 8) == [1, 7]
+; run: %find_naive(0, 0, 0, 0, 0) == [0, 0]

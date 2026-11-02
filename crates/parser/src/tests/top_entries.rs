@@ -335,6 +335,25 @@ fn expr() {
     );
 }
 
+/// The grammar allocates a fixed number of buffers per parse, none per token or node, so this
+/// budget holds for files of any size:
+/// - the event list, sized at 2 events a token, plus one doubling, since a token is about 3.1
+///   events at 1.05 nodes a token;
+/// - the output's words, sized exactly;
+/// - `event::process`'s forward-parent list, which starts empty and grows to the longest
+///   `precede` chain (a method chain is one link a call): three allocations reach 16.
+#[test]
+fn a_parse_allocates_its_buffers_not_per_token() {
+    for text in super::sources() {
+        let lexed = crate::LexedStr::new(crate::Edition::CURRENT, &text);
+        let input = lexed.to_input(crate::Edition::CURRENT);
+        drop(TopEntryPoint::SourceFile.parse(&input));
+        blaze_alloc_count::assert_at_most(0, "parsing one of the parser's sources again", || {
+            TopEntryPoint::SourceFile.parse(&input)
+        });
+    }
+}
+
 #[track_caller]
 fn check(entry: TopEntryPoint, input: &str, expect: expect_test::Expect) {
     let (parsed, _errors) = super::parse(entry, input, crate::Edition::CURRENT);

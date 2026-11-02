@@ -1,38 +1,37 @@
 //! Things for resolving vars in the infer context of the next-trait-solver.
 
 use rustc_type_ir::{
-    TypeFolder, TypeSuperFoldable, TypeVisitableExt,
-    data_structures::DelayedMap,
-    inherent::{Const as _, Ty as _},
+    PredicateProxy, TypeFolder, TypeSuperFoldable, TypeVisitableExt, data_structures::DelayedMap,
+    inherent::Ty as _,
 };
 
-use crate::next_solver::{Const, DbInterner, ErrorGuaranteed, Region, Ty};
+use crate::next_solver::{Clauses, Const, DbInterner, ErrorGuaranteed, Region, RegionExt, Ty};
 
 use super::InferCtxt;
 
 ///////////////////////////////////////////////////////////////////////////
-// OPPORTUNISTIC VAR RESOLVER
+// DEEP VAR RESOLVER
 
-/// The opportunistic resolver can be used at any time. It simply replaces
+/// The type and const resolver can be used at any time. It simply replaces
 /// type/const variables that have been unified with the things they have
 /// been unified with (similar to `shallow_resolve`, but deep). This is
 /// useful for printing messages etc but also required at various
 /// points for correctness.
-pub struct OpportunisticVarResolver<'a, 'db> {
+pub struct DeepResolverIgnoringRegions<'a, 'db> {
     infcx: &'a InferCtxt<'db>,
     /// We're able to use a cache here as the folder does
     /// not have any mutable state.
     cache: DelayedMap<Ty<'db>, Ty<'db>>,
 }
 
-impl<'a, 'db> OpportunisticVarResolver<'a, 'db> {
+impl<'a, 'db> DeepResolverIgnoringRegions<'a, 'db> {
     #[inline]
     pub fn new(infcx: &'a InferCtxt<'db>) -> Self {
-        OpportunisticVarResolver { infcx, cache: Default::default() }
+        DeepResolverIgnoringRegions { infcx, cache: Default::default() }
     }
 }
 
-impl<'a, 'db> TypeFolder<DbInterner<'db>> for OpportunisticVarResolver<'a, 'db> {
+impl<'a, 'db> TypeFolder<DbInterner<'db>> for DeepResolverIgnoringRegions<'a, 'db> {
     fn cx(&self) -> DbInterner<'db> {
         self.infcx.interner
     }
@@ -41,8 +40,8 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for OpportunisticVarResolver<'a, 'db> 
     fn fold_ty(&mut self, t: Ty<'db>) -> Ty<'db> {
         if !t.has_non_region_infer() {
             t // micro-optimize -- if there is nothing in this type that this fold affects...
-        } else if let Some(ty) = self.cache.get(&t) {
-            *ty
+        } else if let Some(&ty) = self.cache.get(&t) {
+            ty
         } else {
             let shallow = self.infcx.shallow_resolve(t);
             let res = shallow.super_fold_with(self);
@@ -58,6 +57,14 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for OpportunisticVarResolver<'a, 'db> 
             let ct = self.infcx.shallow_resolve_const(ct);
             ct.super_fold_with(self)
         }
+    }
+
+    fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P {
+        if !p.has_non_region_infer() { p } else { p.super_fold_with(self) }
+    }
+
+    fn fold_clauses(&mut self, c: Clauses<'db>) -> Clauses<'db> {
+        if !c.has_non_region_infer() { c } else { c.super_fold_with(self) }
     }
 }
 

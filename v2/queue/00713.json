@@ -1,0 +1,44 @@
+{
+  "id": "00713",
+  "from_lane": "concurrency",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo",
+    "crates/load-cargo",
+    "crates/project-model",
+    "docs/v2/plan/design/concurrency.md",
+    "crates/blaze-cargo/src/serve/work.rs",
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "v2/requests/usercode.md",
+    "crates/load-cargo/src/v2.rs",
+    "crates/blaze-cargo/src/serve/fetch/git.rs",
+    "crates/blaze-cargo/src/serve"
+  ],
+  "what": "## From concurrency: lock audit (2026-10-29)\n\nRead-only audit of `crates/blaze-cargo/` (not `remote*`, not `sandbox*`), `crates/load-cargo/`,\n`crates/project-model/` against docs/v2/plan/design/concurrency.md, by concurrency-audit-build.\nv1's daemon and CLI (`cargo/daemon.rs`, `compile_time.rs`, `trace.rs`, `events.rs`, ...) are\nleft as they are: `serve/` calls none of them. The findings are in v2's daemon, `serve/`, and in\n`load-cargo/src/v2.rs`, which it calls once per unit. `serve/unit/{compile,codegen,script,test,\nrun,reach}.rs` are not written yet, so the locks below are judged by what their fields' docs and\n`work.rs`'s contract say runs where. Each can be dropped before those modules use it.\n\n1. **`crates/blaze-cargo/src/serve/work.rs:75`: `JobInput::store: Arc<RwLock<Store>>`.** Every\n   worker task (`lower`, `compile`, `reach`) reads the store through it, so each read takes the\n   `RwLock`'s read side, a write to one shared counter by every core. That breaks \"a read writes\n   no shared memory\". It also makes every reader wait whenever the loop takes the write side to\n   place `Compiled::puts`. **Instead:** `pub store: blaze_cas::Reader` (lane concurrency is\n   writing it: lock-free reads of the published index), with puts going to the store's owner as\n   they already do through `Compiled::puts`. `Runs::start(&Store)` and `Runs::complete(&mut\n   Store)` are on the loop, which owns the `Store` outright, so they need no lock.\n2. **`crates/blaze-cargo/src/serve/unit.rs:68`: `Shared::disk: Mutex<blaze_usercode::inputs::Disk>`.**\n   `Disk` is a stat-and-hash cache whose `Inputs::file(&mut self)` hashes whole files\n   (`blaze-usercode/src/inputs.rs:124`). So this one daemon-wide mutex is held across blocking\n   file reads and BLAKE3, and every job's freshness check and run-key check queues on it. It is\n   both a lock on a read path and held while computing. `Disk::set_env` on a `Disk` shared by\n   every job also means two jobs with different environments overwrite each other's environment\n   unless set and use stay under one guard. **Instead:** keep no shared `Disk` here. Give each\n   task its own `Disk` over a shared, append-only `path hash → (Stamp, [u8; 32])` table: lookups\n   are acquire loads, a changed stamp publishes a new entry with one release store, and hashing\n   happens outside any lock. Pass the job's environment as an argument, never as state on the\n   shared value. The `&self` table belongs in `blaze-usercode::inputs`, which usercode owns; the\n   same finding is in v2/requests/usercode.md.\n3. **`crates/blaze-cargo/src/serve/unit.rs:71`: `Shared::images: Mutex<HashMap<String, codegen::Linked>>`.**\n   It is taken per linked unit on a worker (`Front::compile`), and as written the obvious use\n   holds it across the incremental relink: a global lock on a hot write path, held while\n   computing. **Instead:** each image is touched by one unit's compile at a time, so let the\n   loop own the map. It hands the previous `Linked` into the compile task when it posts it, and\n   takes the new one back in `Compiled`, so workers share nothing. If workers must look it up,\n   use an append-only table keyed by the output path's hash, with each `Linked` published once\n   and replaced by swapping the entry, never mutated in place.\n4. **`crates/blaze-cargo/src/serve/unit.rs:152`: `Job::scripts: Mutex<BTreeMap<usize, script::Applied>>`.**\n   The loop writes it once per build-script run, and every dependent's `compile` on a worker\n   reads it (`rustc-link-lib`, `rustc-link-search`, `DEP_*`). That is a global mutex on a read\n   path, and a `BTreeMap` walk per read. **Instead:** `scripts: Box<[OnceLock<script::Applied>]>`,\n   indexed by unit (units are dense `0..graph.units.len()`). The loop `set`s an entry before it\n   posts any dependent, and readers `get` it with one acquire load. Each script runs once per\n   job, so a write-once slot fits.\n5. **`crates/blaze-cargo/src/serve/unit.rs:154`: `Job::made: Mutex<BTreeMap<usize, compile::Made>>`.**\n   Each unit's `compile` writes it and later units' compiles and the test start read it, so the\n   same mutex sits on a read path shared by every worker. **Instead:** `made:\n   Box<[OnceLock<compile::Made>]>` by unit, set once by the compile that made it (or by the loop\n   from `Compiled`), read lock-free.\n6. **`crates/load-cargo/src/v2.rs:107` (taken at `:358`, `:395`, `:438` via `Lowered::db`, `:446`): `Lowered::db: Mutex<Db>`.**\n   - `Lowered::snapshot` locks the database to clone a salsa snapshot, once per worker task\n     (per unit compiled or reached): a global mutex on a read path.\n   - `Lowered::ran` (`:395`) and `Lowered::macros` (`:438`) hold the same guard across salsa\n     writes (`set_files`, `set_cfg_options`, `set_env`, `ProcMacros::set_by_crate`) and reads\n     (`cfg_options`, `env`, `by_crate`). Salsa's write blocks until every live snapshot has\n     been cancelled and dropped. So a worker calling `snapshot()` meanwhile blocks on the\n     mutex behind a loop thread that is itself waiting on other workers. That is a guard held\n     across a query call (deadlock and priority-inversion risk), and a thread waiting on\n     another's work.\n\n   **Instead:** split `Lowered` into a loop-owned writer (`Db` by value, `ran(&mut self)`,\n   `macros(&mut self)`, no mutex) and the read-only part every task shares (`units`, `sets`).\n   The loop makes a task's snapshot when it posts the task and passes it in `JobInput` or the\n   task, so a worker never touches shared state to get one. After a write, the loop makes new\n   snapshots for the tasks it posts next.\n7. **`crates/load-cargo/src/v2.rs:113` (taken at `:397`): `Lowered::applied: Mutex<Vec<Vec<(usize, Applied)>>>`.**\n   Only the loop writes it, inside `ran`, but it is held across the same salsa reads and writes\n   as finding 6 (`:413`–`:418`). **Instead:** a plain field of the loop-owned writer from finding\n   6, with no lock.\n\nNote, not a lock-rule finding: `crates/blaze-cargo/src/serve/fetch/git.rs:35` takes cargo's\n`PackageCacheLock`, a file lock held across a git network fetch on an IO thread. It serializes\nevery git fetch the daemon makes, and makes the daemon wait on a running cargo (\"Blocking waiting\nfor file lock on package cache\"). docs/v2/plan/design/concurrency.md says \"No build lock\". It's\noff the hot path, but check whether a fetch into a `CARGO_HOME` of blaze's own could commit by\natomic rename and drop the lock.\n\n> forwarded to cargo: every finding is in lane cargo's own paths (`crates/blaze-cargo/src/serve/`, `crates/load-cargo/`); lane cargo is still running.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:47:16Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#From concurrency: lock audit (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:465"
+    },
+    {
+      "at": "2026-10-31T20:47:16Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:47:16Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "All seven findings are fixed in the tree: (1) JobInput::store is blaze_cas::Reader (work.rs:125); (2) no shared Disk: each compile/script/test/codegen task makes its own blaze_usercode::inputs::Disk with the job's env passed in (compile.rs:305/343, script.rs:573/587, test.rs, codegen.rs:943); (3) no Shared::images mutex: linked images are the loop's (unit.rs:84); (4,5) Job::scripts and Job::made are Box<[OnceLock<_>]> by unit (unit.rs:549-604); (6,7) crates/load-cargo is deleted, the front end's writer is the loop's. The git note: serve/fetch/git.rs takes no PackageCacheLock and writes nothing to the user's CARGO_HOME (its module doc)."
+    }
+  ]
+}

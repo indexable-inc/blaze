@@ -9,31 +9,45 @@ mod allocation;
 mod binder;
 mod consts;
 mod def_id;
+mod features;
 pub mod fold;
 pub mod format_proof_tree;
 pub mod fulfill;
 mod generic_arg;
 pub mod generics;
+mod global_goals;
+pub mod goal_store;
 pub mod infer;
 pub(crate) mod inspect;
 pub mod interner;
 mod ir_print;
 pub mod normalize;
 pub mod obligation_ctxt;
+mod opaque_variances;
 mod opaques;
+pub mod persist;
 pub mod predicate;
+pub(crate) mod recycle;
 mod region;
 mod solver;
 mod structural_normalize;
 mod ty;
 pub mod util;
 
-use std::{mem::ManuallyDrop, sync::OnceLock};
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod coroutine_witness_tests;
+#[cfg(test)]
+mod ported_rules_tests;
+
+use std::sync::OnceLock;
 
 pub use allocation::*;
 pub use binder::*;
 pub use consts::*;
 pub use def_id::*;
+pub use features::Features;
 pub use generic_arg::*;
 pub use interner::*;
 pub use opaques::*;
@@ -149,103 +163,24 @@ impl std::fmt::Debug for DefaultAny<'_> {
 pub fn default_types<'db>() -> &'db DefaultAny<'db> {
     static TYPES: OnceLock<DefaultAny<'static>> = OnceLock::new();
 
-    TYPES.get_or_init(|| {
-        let create_ty = |kind| {
-            let ty = Ty::new_without_interner(kind);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_const = |kind| {
-            let ty = Const::new_without_interner(kind);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_region = |kind| {
-            let ty = Region::new_without_interner(kind);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_generic_args = |slice| {
-            let ty = GenericArgs::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_bound_var_kinds = |slice| {
-            let ty = BoundVarKinds::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_canonical_vars = |slice| {
-            let ty = CanonicalVarKinds::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_variances_of = |slice| {
-            let ty = VariancesOf::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_pat_list = |slice| {
-            let ty = PatList::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_predefined_opaques = |slice| {
-            let ty = PredefinedOpaques::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_solver_def_ids = |slice| {
-            let ty = SolverDefIds::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_bound_existential_predicates = |slice| {
-            let ty = BoundExistentialPredicates::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_clauses = |slice| {
-            let ty = Clauses::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_region_assumptions = |slice| {
-            let ty = RegionAssumptions::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_tys = |slice| {
-            let ty = Tys::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_consts = |slice| {
-            let ty = Consts::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let ty = ManuallyDrop::new(ty.store());
-            ty.as_ref()
-        };
-        let create_projection = |slice| {
-            let it = crate::mir::Projection::new_from_slice_no_empty_check(slice);
-            // We need to increase the refcount (forever), so that the types won't be freed.
-            let it = ManuallyDrop::new(it.store());
-            it.as_ref()
-        };
+    let types = TYPES.get_or_init(|| {
+        let create_ty = Ty::new_without_interner;
+        let create_const = Const::new_without_interner;
+        let create_region = Region::new_without_interner;
+        let create_generic_args = GenericArgs::new_from_slice_no_empty_check;
+        let create_bound_var_kinds = BoundVarKinds::new_from_slice_no_empty_check;
+        let create_canonical_vars = CanonicalVarKinds::new_from_slice_no_empty_check;
+        let create_variances_of = VariancesOf::new_from_slice_no_empty_check;
+        let create_pat_list = PatList::new_from_slice_no_empty_check;
+        let create_predefined_opaques = PredefinedOpaques::new_from_slice_no_empty_check;
+        let create_solver_def_ids = SolverDefIds::new_from_slice_no_empty_check;
+        let create_bound_existential_predicates =
+            BoundExistentialPredicates::new_from_slice_no_empty_check;
+        let create_clauses = Clauses::new_from_slice_no_empty_check;
+        let create_region_assumptions = RegionAssumptions::new_from_slice_no_empty_check;
+        let create_tys = Tys::new_from_slice_no_empty_check;
+        let create_consts = Consts::new_from_slice_no_empty_check;
+        let create_projection = crate::mir::Projection::new_from_slice_no_empty_check;
 
         let str = create_ty(TyKind::Str);
         let statik = create_region(RegionKind::ReStatic);
@@ -320,5 +255,9 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
                 BoundVariableKind::Region(BoundRegionKind::ClosureEnv),
             ]),
         }
-    })
+    });
+    // SAFETY: `DefaultAny` is invariant in `'db` only because `Region` and `Const` name the
+    // interner's associated types; every field is a row index into a table that is never freed
+    // (see the note at the top of this module), so `'db` is a marker and any `'db` is valid.
+    unsafe { std::mem::transmute::<&'static DefaultAny<'static>, &'db DefaultAny<'db>>(types) }
 }

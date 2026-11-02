@@ -1,0 +1,37 @@
+{
+  "id": "01238",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/tyvar_behind_raw_pointer.rs",
+    "crates/blaze-diagnostics/src/lower/pattern_type_not_lowered.rs"
+  ],
+  "what": "01168 batch 7 emitters, exact code in /tmp/blaze-lanes/no-fallback-front-ty-01168-batch7-emitters.rs: two new files in blaze-diagnostics/src/lower (tyvar_behind_raw_pointer.rs for hir::TyvarBehindRawPointer, the 2015 lint; pattern_type_not_lowered.rs for hir::PatternTypeNotLowered) plus two mod lines and two arms in lower/mod.rs. hir-ty and hir already have the variants, so blaze-diagnostics matches are non-exhaustive until applied. Value-path E0109 reuses the existing TypeRelativeVariant emitter, no change.",
+  "state": "applied",
+  "created": "2026-10-31T02:55:12Z",
+  "updated": "2026-10-31T02:58:13Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:55:12Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:58:13Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:58:13Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "already applied with 01230: lower/tyvar_behind_raw_pointer.rs and lower/pattern_type_not_lowered.rs plus mods and arms in lower/mod.rs, as given; tyvar test in tests/items/refused.rs. rust-analyzer clean, uncompiled."
+    }
+  ]
+}

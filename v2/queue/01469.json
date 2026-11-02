@@ -1,0 +1,35 @@
+{
+  "id": "01469",
+  "from_lane": "sched",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/check.rs"
+  ],
+  "what": "Self-build 23:41 panic (Tried to use attached db, but no db is attached; hir-ty next_solver/interner.rs:3126, thread blaze-work-10, building paths; all three in b2-home-rel/v2/serve.log lines 17355-17450): Checking::check -> blaze_diagnostics::check::run -> lower::lower -> lower::unimplemented_trait Cause::of -> <hir::Type as PartialEq>::eq -> hir_ty::with_attached_db. check::run (crates/blaze-diagnostics/src/check.rs:72) never attaches the db; it used to inherit one by chance from an enclosing attach on the same thread, which jobs on fibers no longer have (each job starts with none; the carried db moves only with the job that attached it). Fix: wrap run's body in hir::attach_db(db, || ...) so check_crate and check_planned both attach for their run, as lints/levels.rs:447 and blaze-cargo unit/doc.rs:28 do. Test: check_planned of a crate with an unimplemented-trait error (one that reaches Cause::of comparing hir::Types), run from a thread with no db attached (e.g. a std::thread::spawn), gives the diagnostic instead of panicking. Not nameres decls_ahead: none of the three backtraces passes through it.",
+  "state": "applied",
+  "created": "2026-11-01T06:43:30Z",
+  "updated": "2026-11-01T06:46:40Z",
+  "taken_by": "sched",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T06:43:30Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T06:45:01Z",
+      "by": "sched",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T06:46:40Z",
+      "by": "sched",
+      "action": "done",
+      "note": "crates/blaze-diagnostics/src/check.rs: check_crate and check_planned each run inside hir::attach_db(db, ..) (check_crate around its Plan::new too). Test check::tests::a_check_planned_on_a_thread_with_no_db_attached_gives_its_diagnostics: the E0277 fixture (some_func(5i32), i32: !Foo, which reaches Cause::of comparing hir::Types) checked by check_planned on a scoped thread with no db attached gives the same diagnostics as check_crate. ra diag clean; test unrun."
+    }
+  ]
+}

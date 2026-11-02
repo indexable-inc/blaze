@@ -5,35 +5,35 @@ Cold: load 279.4ms, 1574 of 1574 functions + 15686 instances in 3.9s. Daemon RSS
 
 Each row is one save, followed by a restore that is not counted. Times in ms.
 
-| Edit | Builds | Apply change | Codegen | of which compile / resolve / define / object | Link | Edit to binary | `cargo build` | Program output | Functions recompiled |
-|---|---|---|---|---|---|---|---|---|---|
-| comment appended to one file | 1 | 10.3 | 715 | 270 / 246 / 115 / 30 | 137 | 872 | 1829 | same | 0 of 17260 |
-| blank line at top of one file | 1 | 10.4 | 555 | 181 / 169 / 75 / 49 | 263 | 840 | 1923 | same | 0 of 17260 |
-| blank line at top of 5 files | 1 | 71.9 | 459 | 170 / 136 / 56 / 51 | 177 | 725 | 2363 | same | 0 of 17260 |
-| 1 function body | 1 | 15.9 | 1000 | 453 / 254 / 189 / 51 | 194 | 1200 | 1580 | same | 1 of 17260 |
-| 5 function bodies in 5 files | 1 | 49.5 | 607 | 237 / 194 / 72 / 43 | 144 | 814 | 1736 | same | 11 of 17260 |
-| new private fn added | 1 | 29.5 | 394 | 125 / 123 / 53 / 39 | 153 | 587 | 1491 | same | 0 of 17260 |
-| signature of a private method | 1 | 18.4 | 812 | 388 / 180 / 82 / 44 | 347 | 1200 | 1728 | same | 2 of 17260 |
-| upstream crate: 1 function body | 1 | 19.2 | 458 | 120 / 136 / 60 / 77 | 150 | 647 | 1958 | same | 1 of 17260 |
-| upstream crate: blank line at top | 1 | 20.6 | 618 | 219 / 181 / 75 / 71 | 150 | 826 | 2394 | same | 0 of 17260 |
-| upstream crate: new pub fn | 1 | 20.1 | 549 | 226 / 132 / 51 / 63 | 158 | 756 | 2278 | same | 0 of 17260 |
-| both crates: 3 bodies each + new pub fn upstream | 1 | 85.3 | 824 | 363 / 225 / 93 / 49 | 202 | 1200 | 3276 | same | 5 of 17260 |
-| upstream crate: what the program prints | 1 | 6.2 | 458 | 168 / 109 / 51 / 76 | 142 | 630 | 1771 | same | 1 of 17260 |
-| upstream crate: new pub fn, called from the binary | 1 | 33.0 | 529 | 201 / 154 / 67 / 41 | 156 | 734 | 2099 | same | 2 of 17261 |
-| generic fn with a closure removed, its one call written out | 1 | 5.3 | 350 | 109 / 116 / 43 / 33 | 133 | 498 | 277 | same | 5 of 17257 |
-| closure body | 1 | 4.9 | 503 | 191 / 133 / 60 / 38 | 142 | 661 | 298 | same | 2 of 17260 |
-| const value | 1 | 2.7 | 414 | 148 / 110 / 60 / 37 | 264 | 693 | 265 | same | 1 of 17260 |
-| static initializer | 1 | 2.4 | 462 | 153 / 140 / 66 / 33 | 196 | 670 | 335 | same | 1 of 17260 |
-| file of an include_str! (not a source file) | 1 | 0.2 | 647 | 259 / 164 / 84 / 43 | 172 | 834 | 287 | same | 1 of 17260 |
-| file of an include_bytes! (binary) | 1 | 0.2 | 452 | 157 / 120 / 63 / 32 | 178 | 640 | 269 | same | 9 of 17260 |
-| string literal in a body | 1 | 3.8 | 536 | 201 / 156 / 62 / 45 | 210 | 762 | 271 | same | 1 of 17260 |
-| println! added to a body | 1 | 12.2 | 423 | 144 / 120 / 50 / 31 | 159 | 604 | 324 | same | 2 of 17260 |
-| macro_rules! body | 1 | 2.8 | 391 | 130 / 119 / 59 / 33 | 159 | 562 | 287 | same | 1 of 17260 |
-| default method body of a trait | 1 | 2.3 | 407 | 112 / 121 / 49 / 64 | 132 | 560 | 312 | same | 1 of 17260 |
-| method added to a trait impl | 1 | 2.7 | 594 | 232 / 162 / 66 / 75 | 160 | 771 | 354 | same | 2 of 17260 |
-| trait impl added, not used | 1 | 6.9 | 593 | 226 / 137 / 67 / 78 | 177 | 807 | 250 | same | 0 of 17260 |
-| private fn renamed, with its one call | 1 | 2.7 | 467 | 154 / 132 / 62 / 59 | 189 | 676 | 317 | same | 12 of 17260 |
-| two items swapped | 1 | 2.9 | 424 | 113 / 131 / 66 / 35 | 141 | 579 | 319 | same | 0 of 17260 |
-| derive added to a struct (Span: Debug is hand-written, add PartialOrd) | 1 | 17.6 | 476 | 149 / 143 / 60 / 49 | 182 | 687 | 2718 | same | 2 of 17260 |
-| attribute added to a function (#[inline(never)]) | 1 | 8.9 | 513 | 234 / 126 / 63 / 33 | 227 | 758 | 1216 | same | 0 of 17260 |
-| field added to a struct used everywhere (Input) | 1 | 24.4 | 1000 | 299 / 155 / 78 / 83 | 176 | 1200 | 1624 | same | 60 of 17261 |
+| Edit | Builds | Apply change | Codegen | of which compile / resolve / define / object | Link | Edit to binary | `cargo build` | Functions recompiled |
+|---|---|---|---|---|---|---|---|---|
+| comment appended to one file | 1 | 10.3 | 715 | 270 / 246 / 115 / 30 | 137 | 872 | 1829 | 0 of 17260 |
+| blank line at top of one file | 1 | 10.4 | 555 | 181 / 169 / 75 / 49 | 263 | 840 | 1923 | 0 of 17260 |
+| blank line at top of 5 files | 1 | 71.9 | 459 | 170 / 136 / 56 / 51 | 177 | 725 | 2363 | 0 of 17260 |
+| 1 function body | 1 | 15.9 | 1000 | 453 / 254 / 189 / 51 | 194 | 1200 | 1580 | 1 of 17260 |
+| 5 function bodies in 5 files | 1 | 49.5 | 607 | 237 / 194 / 72 / 43 | 144 | 814 | 1736 | 11 of 17260 |
+| new private fn added | 1 | 29.5 | 394 | 125 / 123 / 53 / 39 | 153 | 587 | 1491 | 0 of 17260 |
+| signature of a private method | 1 | 18.4 | 812 | 388 / 180 / 82 / 44 | 347 | 1200 | 1728 | 2 of 17260 |
+| upstream crate: 1 function body | 1 | 19.2 | 458 | 120 / 136 / 60 / 77 | 150 | 647 | 1958 | 1 of 17260 |
+| upstream crate: blank line at top | 1 | 20.6 | 618 | 219 / 181 / 75 / 71 | 150 | 826 | 2394 | 0 of 17260 |
+| upstream crate: new pub fn | 1 | 20.1 | 549 | 226 / 132 / 51 / 63 | 158 | 756 | 2278 | 0 of 17260 |
+| both crates: 3 bodies each + new pub fn upstream | 1 | 85.3 | 824 | 363 / 225 / 93 / 49 | 202 | 1200 | 3276 | 5 of 17260 |
+| upstream crate: what the program prints | 1 | 6.2 | 458 | 168 / 109 / 51 / 76 | 142 | 630 | 1771 | 1 of 17260 |
+| upstream crate: new pub fn, called from the binary | 1 | 33.0 | 529 | 201 / 154 / 67 / 41 | 156 | 734 | 2099 | 2 of 17261 |
+| generic fn with a closure removed, its one call written out | 1 | 5.3 | 350 | 109 / 116 / 43 / 33 | 133 | 498 | 277 | 5 of 17257 |
+| closure body | 1 | 4.9 | 503 | 191 / 133 / 60 / 38 | 142 | 661 | 298 | 2 of 17260 |
+| const value | 1 | 2.7 | 414 | 148 / 110 / 60 / 37 | 264 | 693 | 265 | 1 of 17260 |
+| static initializer | 1 | 2.4 | 462 | 153 / 140 / 66 / 33 | 196 | 670 | 335 | 1 of 17260 |
+| file of an include_str! (not a source file) | 1 | 0.2 | 647 | 259 / 164 / 84 / 43 | 172 | 834 | 287 | 1 of 17260 |
+| file of an include_bytes! (binary) | 1 | 0.2 | 452 | 157 / 120 / 63 / 32 | 178 | 640 | 269 | 9 of 17260 |
+| string literal in a body | 1 | 3.8 | 536 | 201 / 156 / 62 / 45 | 210 | 762 | 271 | 1 of 17260 |
+| println! added to a body | 1 | 12.2 | 423 | 144 / 120 / 50 / 31 | 159 | 604 | 324 | 2 of 17260 |
+| macro_rules! body | 1 | 2.8 | 391 | 130 / 119 / 59 / 33 | 159 | 562 | 287 | 1 of 17260 |
+| default method body of a trait | 1 | 2.3 | 407 | 112 / 121 / 49 / 64 | 132 | 560 | 312 | 1 of 17260 |
+| method added to a trait impl | 1 | 2.7 | 594 | 232 / 162 / 66 / 75 | 160 | 771 | 354 | 2 of 17260 |
+| trait impl added, not used | 1 | 6.9 | 593 | 226 / 137 / 67 / 78 | 177 | 807 | 250 | 0 of 17260 |
+| private fn renamed, with its one call | 1 | 2.7 | 467 | 154 / 132 / 62 / 59 | 189 | 676 | 317 | 12 of 17260 |
+| two items swapped | 1 | 2.9 | 424 | 113 / 131 / 66 / 35 | 141 | 579 | 319 | 0 of 17260 |
+| derive added to a struct (Span: Debug is hand-written, add PartialOrd) | 1 | 17.6 | 476 | 149 / 143 / 60 / 49 | 182 | 687 | 2718 | 2 of 17260 |
+| attribute added to a function (#[inline(never)]) | 1 | 8.9 | 513 | 234 / 126 / 63 / 33 | 227 | 758 | 1216 | 0 of 17260 |
+| field added to a struct used everywhere (Input) | 1 | 24.4 | 1000 | 299 / 155 / 78 / 83 | 176 | 1200 | 1624 | 60 of 17261 |

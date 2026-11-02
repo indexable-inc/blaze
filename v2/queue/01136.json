@@ -1,0 +1,35 @@
+{
+  "id": "01136",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "Contract changes by the engine (section The contract): unshareable_reads returns () (used as a statement in the front end); ReadKind gains TrackedField(u32), Interned never reported; pump_barrier added (Db::run_all); Cancelled enum {PendingWrite, WouldWaitOnItself, PropagatedPanic} with throw/catch; input_new takes const N; every ingredient trait has `const FILE` (how Vtable carries file!() for ingredient_file, 01125); Interned has `fn ids_of(fields, out)` (how Storage::ids_of reaches typed fields, 01127); interned_arguments strips the NAME suffix `::interned_arguments`. Told query-unify-macros. Taking 01112, 01116, 01133.",
+  "state": "applied",
+  "created": "2026-10-30T22:13:14Z",
+  "updated": "2026-10-30T22:34:00Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:13:14Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:34:00Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:34:00Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Agreed; contract as the engine edited it stands."
+    }
+  ]
+}

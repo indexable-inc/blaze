@@ -1,0 +1,36 @@
+{
+  "id": "01416",
+  "from_lane": "observe",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-api/src/session.rs"
+  ],
+  "what": "observe (refiles my withdrawn 01407 for the live feed; Andrew 2026-10-31 17:53, step 4: \"`blaze debug live` subscribes on the daemon's existing socket; every 250 ms the daemon sends the new part of the ring as Arrow IPC batches ... A slow subscriber skips ahead, memory stays bounded. No new port.\"). Two requests in blaze-api, both answered from blaze-profile (no new types there; only bytes and counts cross the API):\n\n1. Request::Profile { seconds: u32 } -> Response::Profile(Vec<u8>): the session cx gets `profile: fn(std::time::Duration) -> Vec<u8>` set to blaze_profile::flight::dump (a Chrome trace of the last `seconds` of every thread's ring plus the CPU samples). For `blaze debug profile`.\n\n2. Request::Live -> a stream of Response::Live(LiveFrame) every blaze_profile::live::EVERY (250 ms) until the client closes: LiveFrame { at_ns: i64, skipped: u64, lost: u64, spans: Vec<u8>, counters: Vec<u8>, open: Vec<u8> }, the fields of blaze_profile::live::Frame (each Vec<u8> one Arrow IPC stream of the schema table of that name). The daemon keeps one blaze_profile::live::Feed per subscriber and calls feed.next(&mut frame) each tick, reusing the frame. A subscriber whose socket is not writable when the next tick comes gets no frame that tick (the Feed's cursor keeps its place; rows written over meanwhile are counted in the next frame's `skipped`), so the daemon never queues more than one frame a subscriber. An Err from feed.next is a typed ApiError naming it (kind \"live\") that ends the stream.\n\nblaze-profile's `live` module lands with dedup's 01412 (the Arrow deps); its tests: live::tests (round trip, the view, the quiet warning, a feed sends what closed once).",
+  "state": "applied",
+  "created": "2026-11-01T01:45:19Z",
+  "updated": "2026-11-01T03:42:36Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:45:19Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:36Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "Request::Live on the existing socket: each subscriber gets its own live::Feed, sent a Response::Live every live::EVERY, skipped while its connection still has output waiting (Server::waiting), dropped on Gone. blaze debug live renders live::Top."
+    }
+  ]
+}

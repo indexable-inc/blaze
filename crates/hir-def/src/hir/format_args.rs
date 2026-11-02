@@ -4,23 +4,23 @@ use either::Either;
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_parse_format as parse;
+use smallvec::{SmallVec, smallvec};
 use span::SyntaxContext;
-use stdx::TupleExt;
 use syntax::{
-    AstPtr, TextRange,
-    ast::{self, IsString},
+    AstPtr, TextRange, ast,
+    view::{self, IsString as _},
 };
 
 use crate::hir::ExprId;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FormatArgs {
     pub template: Box<[FormatArgsPiece]>,
     pub arguments: FormatArguments,
     pub orphans: Vec<ExprId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FormatArguments {
     pub arguments: Box<[FormatArgument]>,
     pub num_unnamed_args: usize,
@@ -170,7 +170,7 @@ enum PositionUsedAs {
 use PositionUsedAs::*;
 
 pub(crate) fn parse(
-    s: &ast::String,
+    s: view::String<'_>,
     string_ptr: AstPtr<ast::Expr>,
     fmt_snippet: Option<String>,
     mut args: FormatArgumentsCollector,
@@ -183,7 +183,8 @@ pub(crate) fn parse(
         return FormatArgs {
             template: Default::default(),
             arguments: args.finish(),
-            orphans: vec![],
+            // alloc: none, an empty `Vec`; and an error path
+            orphans: Vec::new(),
         };
     };
     let str_style = match s.quote_offsets() {
@@ -197,7 +198,7 @@ pub(crate) fn parse(
     let mut parser =
         parse::Parser::new(&text, str_style, fmt_snippet, false, parse::ParseMode::Format);
 
-    let mut pieces = Vec::new();
+    let mut pieces = SmallVec::<[parse::Piece<'_>; 8]>::new();
     while let Some(piece) = parser.next() {
         if !parser.errors.is_empty() {
             break;
@@ -211,7 +212,8 @@ pub(crate) fn parse(
         return FormatArgs {
             template: Default::default(),
             arguments: args.finish(),
-            orphans: vec![],
+            // alloc: none, an empty `Vec`; and an error path
+            orphans: Vec::new(),
         };
     }
 
@@ -221,8 +223,11 @@ pub(crate) fn parse(
         })
     };
 
-    let mut used = vec![false; args.explicit_args().len()];
+    // alloc: inline for up to 16 explicit arguments
+    let mut used: SmallVec<[bool; 16]> = smallvec![false; args.explicit_args().len()];
+    // alloc: pushed to only for a template with errors
     let mut invalid_refs = Vec::new();
+    // alloc: pushed to only for a named argument used by position, which rustc lints
     let mut numeric_references_to_named_arg = Vec::new();
 
     enum ArgRef<'a> {
@@ -265,11 +270,14 @@ pub(crate) fn parse(
                         // For the moment capturing variables from format strings expanded from macros is
                         // disabled (see RFC #2795)
                         // FIXME: Diagnose
+                        // clone: error path
                         invalid_refs.push((Either::Right(name.clone()), span, used_as, kind));
                         Err(Either::Right(name))
                     } else {
+                        // clone: a `Name` is an interned symbol, a count bump per capture
                         record_usage(name.clone(), span);
                         Ok(args.add(FormatArgument {
+                            // clone: as `record_usage`'s
                             kind: FormatArgumentKind::Captured(name.clone()),
                             // FIXME: This is problematic, we might want to synthesize a dummy
                             // expression proper and/or desugar these.
@@ -287,24 +295,20 @@ pub(crate) fn parse(
         FormatArgPosition { index, kind, span }
     };
 
-    let mut template = Vec::new();
-    let mut unfinished_literal = String::new();
+    // alloc: the output, at most one piece per parsed piece
+    let mut template = Vec::with_capacity(pieces.len());
+    let mut literal = PendingLiteral::default();
     let mut placeholder_index = 0;
 
     for piece in pieces {
         match piece {
-            parse::Piece::Lit(s) => {
-                unfinished_literal.push_str(s);
-            }
+            parse::Piece::Lit(s) => literal.push(s),
             parse::Piece::NextArgument(arg) => {
                 let parse::Argument { position, position_span, format } = *arg;
-                if !unfinished_literal.is_empty() {
-                    template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
-                    unfinished_literal.clear();
-                }
+                literal.flush(&mut template);
 
                 let span =
-                    parser.arg_places.get(placeholder_index).and_then(|s| to_span(s.clone()));
+                    parser.arg_places.get(placeholder_index).and_then(|s| to_span(s.start..s.end));
                 placeholder_index += 1;
 
                 let position_span = to_span(position_span);
@@ -420,36 +424,56 @@ pub(crate) fn parse(
         }
     }
 
-    if !unfinished_literal.is_empty() {
-        template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
-    }
+    literal.flush(&mut template);
 
     if !invalid_refs.is_empty() {
         // FIXME: Diagnose
     }
 
-    let unused = used
+    // FIXME: Diagnose unused arguments (named ones are `FormatArgumentKind::Named`).
+    let orphans = used
         .iter()
         .enumerate()
         .filter(|&(_, used)| !used)
-        .map(|(i, _)| {
-            let named = matches!(args.explicit_args()[i].kind, FormatArgumentKind::Named(_));
-            (args.explicit_args()[i].expr, named)
-        })
+        .map(|(i, _)| args.explicit_args()[i].expr)
+        // alloc: the output; none when every argument is used
         .collect::<Vec<_>>();
 
-    if !unused.is_empty() {
-        // FIXME: Diagnose
+    FormatArgs { template: template.into_boxed_slice(), arguments: args.finish(), orphans }
+}
+
+/// The literal pieces since the last placeholder, as one template piece: the piece itself when
+/// there is one, joined only when the parser split the text (at `{{`, `}}` or an escape).
+#[derive(Default)]
+struct PendingLiteral<'a> {
+    first: Option<&'a str>,
+    joined: String,
+}
+
+impl<'a> PendingLiteral<'a> {
+    fn push(&mut self, piece: &'a str) {
+        if piece.is_empty() {
+            return;
+        }
+        let Some(first) = self.first else {
+            self.first = Some(piece);
+            return;
+        };
+        if self.joined.is_empty() {
+            self.joined.push_str(first);
+        }
+        self.joined.push_str(piece);
     }
 
-    FormatArgs {
-        template: template.into_boxed_slice(),
-        arguments: args.finish(),
-        orphans: unused.into_iter().map(TupleExt::head).collect(),
+    fn flush(&mut self, template: &mut Vec<FormatArgsPiece>) {
+        let Some(first) = self.first.take() else { return };
+        let text = if self.joined.is_empty() { first } else { &self.joined };
+        template.push(FormatArgsPiece::Literal(Symbol::intern(text)));
+        self.joined.clear();
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct FormatArgumentsCollector {
     arguments: Vec<FormatArgument>,
     num_unnamed_args: usize,
@@ -470,6 +494,7 @@ impl FormatArgumentsCollector {
     pub fn add(&mut self, arg: FormatArgument) -> usize {
         let index = self.arguments.len();
         if let Some(name) = arg.kind.ident() {
+            // clone: a `Name` is an interned symbol, a count bump per named argument
             self.names.push((name.clone(), index));
         } else if self.names.is_empty() {
             // Only count the unnamed args before the first named arg.
@@ -527,5 +552,33 @@ impl FormatArgumentKind {
             Self::Named(id) => Some(id),
             Self::Captured(id) => Some(id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pieces of each run of literals become one piece, the concatenation, as the `String`
+    /// the parser's pieces were once joined in made; an empty run makes none.
+    #[test]
+    fn literal_pieces_join_as_a_string_does() {
+        let runs: [&[&str]; 6] =
+            [&[], &[""], &["a"], &["a", "", "{", "b"], &["", "}"], &["x", "y", "z"]];
+        let mut literal = PendingLiteral::default();
+        let mut template = Vec::new();
+        let mut want = Vec::new();
+        for run in runs {
+            for &piece in run {
+                literal.push(piece);
+            }
+            literal.flush(&mut template);
+            let joined = run.concat();
+            if !joined.is_empty() {
+                want.push(FormatArgsPiece::Literal(Symbol::intern(&joined)));
+            }
+            assert!(literal.first.is_none() && literal.joined.is_empty(), "flushed after {run:?}");
+        }
+        assert_eq!(template, want);
     }
 }

@@ -14,7 +14,7 @@ use crate::parse::lexer::{self, StripTokens};
 use crate::parse::lower::{DelimIndex, Lower};
 use crate::parse::stream::parse_ra;
 use crate::span::{BytePos, SourceFile, Span, sym};
-use syntax::AstNode;
+use syntax::view::{self as ra, AstNode};
 
 use crate::Input;
 use crate::parse::session::ParseSess;
@@ -107,18 +107,17 @@ fn parse_mod(psess: &ParseSess, file: &SourceFile) -> Option<ast::Crate> {
             }
         };
     let delims = DelimIndex::new(&stream);
-    let tree = parse_ra(src, edition.to_ra(), parser::TopEntryPoint::SourceFile)
-        .map(|root| syntax::ast::SourceFile::cast(root).expect("a source file parses to one"));
-    let tree = match tree {
-        Ok(tree) => tree,
+    let parse = match parse_ra(src, edition.to_ra(), parser::TopEntryPoint::SourceFile) {
+        Ok(parse) => parse,
         Err((offset, message)) => {
             let at = base + BytePos(offset as u32);
             psess.emit_error(Span::with_root_ctxt(at, at), message);
             return None;
         }
     };
+    let tree = ra::SourceFile::cast(parse.root()).expect("a source file parses to one");
     let lower = Lower::new(base, edition, &delims);
-    let krate = lower.krate(&tree);
+    let krate = lower.krate(tree);
     match lower.finish() {
         Ok(()) => Some(krate),
         Err(unsupported) if unsupported.rustc_rejects => {

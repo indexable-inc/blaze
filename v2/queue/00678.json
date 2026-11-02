@@ -1,0 +1,24 @@
+{
+  "id": "00678",
+  "from_lane": "fastcompile",
+  "owner": "link",
+  "paths": [
+    ".github/scripts/llvm.py",
+    "tools/pgo/pgo.py"
+  ],
+  "what": "## fastcompile-sched 4: link: the profile runtime and relocations for BOLT (ELF, Mach-O, PE writers)\n\nWhat: when a unit is built with `-Cprofile-generate`, link the pinned LLVM's compiler-rt profile\nruntime (`libclang_rt.profile*.a`, from the prefix `.github/scripts/llvm.py` fetches) into the\nbinary, as rustc does with `profiler_builtins`. Honour `-Wl,--emit-relocs` (`-q`) in ELF output:\nkeep the relocation sections in the final binary.\n\nWhy: idea 12. Without the runtime an instrumented blaze writes no profile; without relocations\n`llvm-bolt` cannot move functions (`tools/pgo/pgo.py` adds `--emit-relocs` to the PGO build on\nELF targets).\n\n> forwarded to link.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sched 4: link: the profile runtime and relocations for BOLT (ELF, Mach-O, PE writers)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:344"
+    }
+  ]
+}

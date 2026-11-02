@@ -1,18 +1,21 @@
-use std::{borrow::Cow, fmt, hash::Hash, num::NonZero};
+use std::{borrow::Cow, fmt, hash::Hash, marker::PhantomData, num::{NonZero, NonZeroU32}};
 
+use base_db::Db;
 use hir_def::{AdtId, VariantId};
-use intern::{Interned, InternedRef, impl_internable};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::{Size, TargetDataLayout};
+use blaze_hashcons::Interned;
 use rustc_type_ir::{GenericTypeVisitable, TypeFoldable, TypeVisitable, inherent::IntoKind};
-use stdx::never;
 
 use crate::{
-    MemoryMap, ParamEnvAndCrate, consteval,
+    MemoryMap, ParamEnvAndCrate, PointerAt, consteval,
     db::HirDatabase,
-    layout::Layout,
+    layout::{InternedLayout, Layout},
     mir::{IsSigned, pad16},
-    next_solver::{Const, Consts, TyKind, WorldExposer},
+    next_solver::{
+        Const, Consts, ErrorGuaranteed, TyKind, WorldExposer, ensure_sufficient_stack,
+        interner::table,
+    },
     utils::detect_variant_from_bytes,
 };
 
@@ -32,8 +35,8 @@ pub struct ValueConst<'db> {
 }
 
 impl<'db> ValueConst<'db> {
-    pub fn new(ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self {
-        let value = ValTree::new(kind);
+    #[inline]
+    pub fn new(ty: Ty<'db>, value: ValTree<'db>) -> Self {
         ValueConst { ty, value }
     }
 
@@ -52,7 +55,7 @@ impl<'db> ValueConst<'db> {
     #[inline]
     pub fn try_to_bits(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         param_env: ParamEnvAndCrate<'db>,
     ) -> Option<u128> {
         let (TyKind::Bool | TyKind::Char | TyKind::Uint(_) | TyKind::Int(_) | TyKind::Float(_)) =
@@ -73,249 +76,423 @@ impl<'db> ValueConst<'db> {
     }
 }
 
+/// rustc's `VALTREE_MAX_NODES`: the most nodes a value tree may have.
+pub const VALTREE_MAX_NODES: usize = 100000;
+
+/// Why a constant has no value tree, as rustc's `ValTreeCreationError`. The caller reports
+/// it: rustc's "maximum number of nodes exceeded in constant" for [`Self::NodesOverflow`], and
+/// for [`Self::NonSupportedType`] whatever the constant was for (E0741 for the type of a const
+/// parameter, "cannot be used as pattern" for a pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValTreeCreationError<'db> {
+    /// The tree would have more than [`VALTREE_MAX_NODES`] nodes.
+    NodesOverflow,
+    /// No value of this type, met inside the constant, has a value tree.
+    NonSupportedType(Ty<'db>),
+    /// The constant's type holds an error, already reported.
+    ErrorGuaranteed(ErrorGuaranteed),
+    /// The evaluated bytes are not a value of `ty`: `what`. The evaluation that made them
+    /// and this reader disagree, which rustc's validation of the value rules out.
+    Unreadable { ty: Ty<'db>, what: &'static str },
+}
+
+type Made<'db> = Result<ValTree<'db>, ValTreeCreationError<'db>>;
+
+fn unreadable<'db>(ty: Ty<'db>, what: &'static str) -> ValTreeCreationError<'db> {
+    ValTreeCreationError::Unreadable { ty, what }
+}
+
+/// The type-level constant of the value of `ty` that `memory` holds, its pointers resolved
+/// through `memory_map`: rustc's `const_to_valtree_inner` from the evaluated value's place.
 pub(super) fn allocation_to_const<'db>(
     interner: DbInterner<'db>,
     ty: Ty<'db>,
     memory: &[u8],
     memory_map: &MemoryMap<'db>,
     param_env: ParamEnvAndCrate<'db>,
-) -> Const<'db> {
-    let Ok(data_layout) = interner.db.target_data_layout(param_env.krate) else {
-        return Const::error(interner);
-    };
-    let valtree = match ty.kind() {
-        TyKind::Bool => ValTreeKind::Leaf(ScalarInt::from(memory[0] != 0)),
-        TyKind::Char => {
-            let it = u128::from_le_bytes(pad16(memory, IsSigned::No)) as u32;
-            let Ok(c) = char::try_from(it) else {
-                return Const::error(interner);
-            };
-            ValTreeKind::Leaf(ScalarInt::from(c))
+) -> Result<Const<'db>, ValTreeCreationError<'db>> {
+    let data_layout = interner
+        .db
+        .target_data_layout(param_env.krate)
+        .map_err(|_| unreadable(ty, "the target's data layout did not load"))?;
+    let mut reader = Reader { interner, param_env, data_layout, nodes: 0 };
+    let valtree = reader.value(ty, memory, memory_map, PointerAt::Value(0), None)?;
+    Ok(Const::new_value(interner, valtree, ty))
+}
+
+/// One conversion of evaluated bytes to a value tree.
+struct Reader<'a, 'db> {
+    interner: DbInterner<'db>,
+    param_env: ParamEnvAndCrate<'db>,
+    data_layout: &'a TargetDataLayout,
+    /// rustc's `num_nodes`: the leaves, function items and empty branches made so far.
+    nodes: usize,
+}
+
+impl<'db> Reader<'_, 'db> {
+    fn layout(
+        &self,
+        ty: Ty<'db>,
+    ) -> Result<Interned<'static, InternedLayout>, ValTreeCreationError<'db>> {
+        self.interner
+            .db
+            .layout_of_ty(ty.store(), self.param_env.store())
+            .map_err(|_| unreadable(ty, "its layout could not be computed"))
+    }
+
+    /// The bytes of a target `usize`, little-endian, as a host one.
+    fn word(&self, ty: Ty<'db>, bytes: &[u8]) -> Result<usize, ValTreeCreationError<'db>> {
+        let scalar = scalar(ty, bytes, self.data_layout.pointer_size())?;
+        usize::try_from(scalar.to_bits_unchecked())
+            .map_err(|_| unreadable(ty, "a target address wider than the host's"))
+    }
+
+    fn leaf(&mut self, scalar: ScalarInt) -> Made<'db> {
+        self.nodes += 1;
+        Ok(ValTree::new(ValTreeKind::Leaf(scalar)))
+    }
+
+    /// rustc's `const_to_valtree_inner`: the tree of the value of `ty` in `bytes`, which are at
+    /// `at` in `map`, whose pointers `map` resolves. `len` is the length of an unsized value
+    /// (`str`, a slice, or a struct or tuple ending in one) from the metadata of the pointer it
+    /// was read through.
+    fn value(
+        &mut self,
+        ty: Ty<'db>,
+        bytes: &[u8],
+        map: &MemoryMap<'db>,
+        at: PointerAt,
+        len: Option<usize>,
+    ) -> Made<'db> {
+        if self.nodes >= VALTREE_MAX_NODES {
+            return Err(ValTreeCreationError::NodesOverflow);
         }
-        TyKind::Int(int) => {
-            let it = i128::from_le_bytes(pad16(memory, IsSigned::Yes));
-            let size = int.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let scalar = ScalarInt::try_from_int(it, size).unwrap();
-            ValTreeKind::Leaf(scalar)
-        }
-        TyKind::Uint(uint) => {
-            let it = u128::from_le_bytes(pad16(memory, IsSigned::No));
-            let size = uint.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let scalar = ScalarInt::try_from_uint(it, size).unwrap();
-            ValTreeKind::Leaf(scalar)
-        }
-        TyKind::Float(float) => {
-            let scalar = match float {
-                rustc_ast_ir::FloatTy::F16 => {
-                    ScalarInt::from(u16::from_le_bytes(memory.try_into().unwrap()))
+        let pointer = self.data_layout.pointer_size();
+        match ty.kind() {
+            TyKind::FnDef(..) => {
+                self.nodes += 1;
+                Ok(ValTree::zst())
+            }
+            TyKind::Bool => match scalar(ty, bytes, Size::from_bytes(1))?.to_bits_unchecked() {
+                0 => self.leaf(ScalarInt::FALSE),
+                1 => self.leaf(ScalarInt::TRUE),
+                _ => Err(unreadable(ty, "a bool that is neither 0 nor 1")),
+            },
+            TyKind::Char => {
+                let it = scalar(ty, bytes, Size::from_bytes(4))?;
+                if char::from_u32(it.to_u32()).is_none() {
+                    return Err(unreadable(ty, "a char that is no Unicode scalar value"));
                 }
-                rustc_ast_ir::FloatTy::F32 => {
-                    ScalarInt::from(u32::from_le_bytes(memory.try_into().unwrap()))
+                self.leaf(it)
+            }
+            TyKind::Int(int) => {
+                self.leaf(scalar(ty, bytes, int.bit_width().map_or(pointer, Size::from_bits))?)
+            }
+            TyKind::Uint(uint) => {
+                self.leaf(scalar(ty, bytes, uint.bit_width().map_or(pointer, Size::from_bits))?)
+            }
+            TyKind::Float(float) => {
+                let bits = match float {
+                    rustc_ast_ir::FloatTy::F16 => 16,
+                    rustc_ast_ir::FloatTy::F32 => 32,
+                    rustc_ast_ir::FloatTy::F64 => 64,
+                    rustc_ast_ir::FloatTy::F128 => 128,
+                };
+                self.leaf(scalar(ty, bytes, Size::from_bits(bits))?)
+            }
+            TyKind::Pat(base, _) => {
+                ensure_sufficient_stack(|| self.value(base, bytes, map, at, len))
+            }
+            // A thin raw pointer is a leaf when it is an integer in disguise, a word without
+            // provenance; a wide one is refused even then, as rustc does.
+            TyKind::RawPtr(pointee, _) => {
+                let db = self.interner.db;
+                let tail = crate::layout::struct_tail_erasing_lifetimes(db, pointee, |it| it);
+                let wide =
+                    matches!(tail.kind(), TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..));
+                if wide || map.has_provenance(at) {
+                    return Err(ValTreeCreationError::NonSupportedType(ty));
                 }
-                rustc_ast_ir::FloatTy::F64 => {
-                    ScalarInt::from(u64::from_le_bytes(memory.try_into().unwrap()))
-                }
-                rustc_ast_ir::FloatTy::F128 => {
-                    ScalarInt::from(u128::from_le_bytes(memory.try_into().unwrap()))
-                }
-            };
-            ValTreeKind::Leaf(scalar)
-        }
-        TyKind::Ref(_, t, _) => match t.kind() {
+                Ok(ValTree::new(ValTreeKind::Leaf(scalar(ty, bytes, pointer)?)))
+            }
+            TyKind::FnPtr(..) => Err(ValTreeCreationError::NonSupportedType(ty)),
+            TyKind::Ref(_, pointee, _) => self.deref(ty, pointee, bytes, map),
             TyKind::Str => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let size = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
-                let Some(bytes) = memory_map.get(addr, size) else {
-                    return Const::error(interner);
-                };
-                let u8_values = &interner.default_types().consts.u8_values;
-                ValTreeKind::Branch(Consts::new_from_iter(
-                    bytes.iter().map(|&byte| u8_values[usize::from(byte)]),
-                ))
+                let len = len.ok_or_else(|| unreadable(ty, "a str read through no pointer"))?;
+                self.bytes(ty, bytes, len)
             }
-            TyKind::Slice(ty) => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let count = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
-                let Ok(layout) = interner.db.layout_of_ty(ty.store(), param_env.store()) else {
-                    return Const::error(interner);
-                };
-                let size_one = layout.size.bytes_usize();
-                let Some(bytes) = memory_map.get(addr, size_one * count) else {
-                    return Const::error(interner);
-                };
-                let expected_len = count * size_one;
-                if bytes.len() < expected_len {
-                    never!(
-                        "Memory map size is too small. Expected {expected_len}, got {}",
-                        bytes.len(),
-                    );
-                    return Const::error(interner);
-                }
-                let items = (0..count).map(|i| {
-                    let offset = size_one * i;
-                    let bytes = &bytes[offset..offset + size_one];
-                    allocation_to_const(interner, ty, bytes, memory_map, param_env)
-                });
-                ValTreeKind::Branch(Consts::new_from_iter(items))
+            TyKind::Slice(elem) => {
+                let len = len.ok_or_else(|| unreadable(ty, "a slice read through no pointer"))?;
+                self.elements(ty, elem, bytes, map, at, len)
             }
-            TyKind::Dynamic(_, _) => {
-                let addr = usize::from_le_bytes(memory[0..memory.len() / 2].try_into().unwrap());
-                let ty_id = usize::from_le_bytes(memory[memory.len() / 2..].try_into().unwrap());
-                let Ok(t) = memory_map.vtable_ty(ty_id) else {
-                    return Const::error(interner);
-                };
-                let Ok(layout) = interner.db.layout_of_ty(t.store(), param_env.store()) else {
-                    return Const::error(interner);
-                };
-                let size = layout.size.bytes_usize();
-                let Some(bytes) = memory_map.get(addr, size) else {
-                    return Const::error(interner);
-                };
-                return allocation_to_const(interner, t, bytes, memory_map, param_env);
+            TyKind::Array(elem, count) => {
+                let len = consteval::try_const_usize(self.interner.db, count)
+                    .and_then(|it| usize::try_from(it).ok())
+                    .ok_or_else(|| unreadable(ty, "an array of no known length"))?;
+                self.elements(ty, elem, bytes, map, at, len)
             }
-            TyKind::Adt(..) if memory.len() == 2 * size_of::<usize>() => {
-                // FIXME: Unsized ADT.
-                return Const::error(interner);
+            TyKind::Tuple(tys) => {
+                let layout = self.layout(ty)?;
+                self.branches(&layout, tys.iter(), None, bytes, map, at, len)
             }
-            _ => {
-                let addr = usize::from_le_bytes(match memory.try_into() {
-                    Ok(b) => b,
-                    Err(_) => {
-                        never!(
-                            "tried rendering ty {:?} in const ref with incorrect byte count {}",
-                            t,
-                            memory.len()
-                        );
-                        return Const::error(interner);
-                    }
-                });
-                let Ok(layout) = interner.db.layout_of_ty(t.store(), param_env.store()) else {
-                    return Const::error(interner);
-                };
-                let size = layout.size.bytes_usize();
-                let Some(bytes) = memory_map.get(addr, size) else {
-                    return Const::error(interner);
-                };
-                return allocation_to_const(interner, t, bytes, memory_map, param_env);
+            TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)) => {
+                Err(ValTreeCreationError::NonSupportedType(ty))
             }
-        },
-        TyKind::Tuple(tys) => {
-            let Ok(layout) = interner.db.layout_of_ty(ty.store(), param_env.store()) else {
-                return Const::error(interner);
-            };
-            let items = tys.iter().enumerate().map(|(id, ty)| {
-                let offset = layout.fields.offset(id).bytes_usize();
-                let Ok(layout) = interner.db.layout_of_ty(ty.store(), param_env.store()) else {
-                    return Const::error(interner);
-                };
-                let size = layout.size.bytes_usize();
-                allocation_to_const(
-                    interner,
-                    ty,
-                    &memory[offset..offset + size],
-                    memory_map,
-                    param_env,
-                )
-            });
-            ValTreeKind::Branch(Consts::new_from_iter(items))
-        }
-        TyKind::Adt(def, args) => {
-            // Like rustc: the fields in order, after the variant index if it is an enum.
-            let db = interner.db;
-            let Ok(layout) = db.layout_of_ty(ty.store(), param_env.store()) else {
-                return Const::error(interner);
-            };
-            let mut items = Vec::new();
-            let (variant, layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
-                AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
-                AdtId::UnionId(_) => return Const::error(interner),
-                AdtId::EnumId(id) => {
-                    let Some((variant, layout)) =
-                        detect_variant_from_bytes(&layout, db, data_layout, memory, id)
-                    else {
-                        return Const::error(interner);
+            TyKind::Adt(def, args) => {
+                let db = self.interner.db;
+                let layout = self.layout(ty)?;
+                let (variant, index, layout): (VariantId, Option<u32>, Cow<'_, Layout>) =
+                    match def.def_id() {
+                        AdtId::UnionId(_) => return Err(ValTreeCreationError::NonSupportedType(ty)),
+                        AdtId::StructId(id) => (id.into(), None, Cow::Borrowed(&**layout)),
+                        AdtId::EnumId(id) => {
+                            if matches!(layout.variants, hir_def::layout::Variants::Empty) {
+                                return Err(unreadable(ty, "a value of an enum with no variants"));
+                            }
+                            if bytes.len() < layout.size.bytes_usize() {
+                                return Err(unreadable(ty, "fewer bytes than the enum takes"));
+                            }
+                            let (variant, layout) =
+                                detect_variant_from_bytes(&layout, db, self.data_layout, bytes, id)
+                                    .ok_or_else(|| unreadable(ty, "a tag that names no variant"))?;
+                            let index = id
+                                .enum_variants(db)
+                                .variants
+                                .values()
+                                .position(|it| it.0 == variant)
+                                .ok_or_else(|| unreadable(ty, "a variant not of its enum"))?;
+                            (variant.into(), Some(index as u32), layout)
+                        }
                     };
-                    let variants = &id.enum_variants(db).variants;
-                    let Some(index) = variants.values().position(|it| it.0 == variant) else {
-                        return Const::error(interner);
-                    };
-                    items.push(Const::new_valtree(
-                        interner,
-                        interner.default_types().types.u32,
-                        ValTreeKind::Leaf(ScalarInt::from(index as u32)),
-                    ));
-                    (variant.into(), layout)
-                }
-            };
-            for (i, (_, field)) in db.field_types(variant).iter().enumerate() {
-                let field = field.ty().instantiate(interner, args).skip_norm_wip();
-                let offset = layout.fields.offset(i).bytes_usize();
-                let Ok(field_layout) = db.layout_of_ty(field.store(), param_env.store()) else {
-                    return Const::error(interner);
-                };
-                let Some(bytes) = memory.get(offset..offset + field_layout.size.bytes_usize())
-                else {
-                    return Const::error(interner);
-                };
-                items.push(allocation_to_const(interner, field, bytes, memory_map, param_env));
+                let interner = self.interner;
+                let fields = db.field_types(variant);
+                let tys = fields
+                    .values()
+                    .map(|field| field.ty().instantiate(interner, args).skip_norm_wip());
+                self.branches(&layout, tys, index, bytes, map, at, len)
             }
-            ValTreeKind::Branch(Consts::new_from_iter(items))
+            TyKind::Error(guar) => Err(ValTreeCreationError::ErrorGuaranteed(guar)),
+            TyKind::Dynamic(..)
+            | TyKind::Never
+            | TyKind::Foreign(_)
+            | TyKind::Closure(..)
+            | TyKind::CoroutineClosure(..)
+            | TyKind::Coroutine(..)
+            | TyKind::CoroutineWitness(..)
+            | TyKind::UnsafeBinder(_)
+            | TyKind::Alias(..)
+            | TyKind::Param(_)
+            | TyKind::Bound(..)
+            | TyKind::Placeholder(_)
+            | TyKind::Infer(_) => Err(ValTreeCreationError::NonSupportedType(ty)),
         }
-        TyKind::FnDef(..) => {
-            // FIXME: Fn items.
-            return Const::error(interner);
+    }
+
+    /// rustc's `deref_pointer` and the tree of the place it gives: the value of `pointee` that
+    /// `bytes`, a value of the pointer type `ty`, points to.
+    fn deref(
+        &mut self,
+        ty: Ty<'db>,
+        pointee: Ty<'db>,
+        bytes: &[u8],
+        map: &MemoryMap<'db>,
+    ) -> Made<'db> {
+        let word = self.data_layout.pointer_size().bytes_usize();
+        let tail = crate::layout::struct_tail_erasing_lifetimes(self.interner.db, pointee, |it| it);
+        let wide = match tail.kind() {
+            TyKind::Str | TyKind::Slice(_) => true,
+            // Where rustc's walk would stop at the tail, after the fields before it.
+            TyKind::Dynamic(..) | TyKind::Foreign(_) => {
+                return Err(ValTreeCreationError::NonSupportedType(tail));
+            }
+            _ => false,
+        };
+        if bytes.len() != word * (1 + usize::from(wide)) {
+            return Err(unreadable(ty, "a pointer of the wrong size"));
         }
-        TyKind::FnPtr(_, _) | TyKind::RawPtr(_, _) => {
-            let it = u128::from_le_bytes(pad16(memory, IsSigned::No));
-            // FIXME: Unsized pointers.
-            let scalar = ScalarInt::try_from_uint(it, data_layout.pointer_size()).unwrap();
-            ValTreeKind::Leaf(scalar)
-        }
-        TyKind::Array(ty, len) => {
-            let Some(len) = consteval::try_const_usize(interner.db, len) else {
-                return Const::error(interner);
-            };
-            let Ok(layout) = interner.db.layout_of_ty(ty.store(), param_env.store()) else {
-                return Const::error(interner);
-            };
-            let size_one = layout.size.bytes_usize();
-            let items = (0..len as usize).map(|i| {
-                let offset = size_one * i;
-                allocation_to_const(
-                    interner,
-                    ty,
-                    &memory[offset..offset + size_one],
-                    memory_map,
-                    param_env,
-                )
+        let addr = self.word(ty, &bytes[..word])?;
+        let (len, size) = match wide {
+            true => {
+                let len = self.word(ty, &bytes[word..])?;
+                (Some(len), self.unsized_size(pointee, len)?)
+            }
+            false => (None, self.layout(pointee)?.size.bytes_usize()),
+        };
+        if let Some((id, offset)) = map.static_at(addr) {
+            let value = self.interner.db.const_eval_static(id).map_err(|_| {
+                unreadable(pointee, "a reference to a static that failed to evaluate")
+            })?;
+            let bytes = offset
+                .checked_add(size)
+                .and_then(|end| value.memory.get(offset..end))
+                .ok_or_else(|| unreadable(pointee, "a reference past the end of its static"))?;
+            let at = PointerAt::Value(offset);
+            return ensure_sufficient_stack(|| {
+                self.value(pointee, bytes, &value.memory_map, at, len)
             });
-            ValTreeKind::Branch(Consts::new_from_iter(items))
         }
-        TyKind::Never => return Const::error(interner),
-        // FIXME:
-        TyKind::Closure(_, _)
-        | TyKind::Coroutine(_, _)
-        | TyKind::CoroutineWitness(_, _)
-        | TyKind::CoroutineClosure(_, _)
-        | TyKind::UnsafeBinder(_) => return Const::error(interner),
-        // The below arms are unreachable, since const eval will bail out before here.
-        TyKind::Foreign(_) => return Const::error(interner),
-        TyKind::Pat(_, _) => return Const::error(interner),
-        TyKind::Error(..)
-        | TyKind::Placeholder(_)
-        | TyKind::Alias(..)
-        | TyKind::Param(_)
-        | TyKind::Bound(_, _)
-        | TyKind::Infer(_) => return Const::error(interner),
-        // The below arms are unreachable, since we handled them in ref case.
-        TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(_, _) => {
-            return Const::error(interner);
+        let bytes = match size {
+            0 => &[][..],
+            _ => map.get(addr, size).filter(|it| it.len() == size).ok_or_else(|| {
+                unreadable(pointee, "a reference to memory the map does not hold")
+            })?,
+        };
+        ensure_sufficient_stack(|| self.value(pointee, bytes, map, PointerAt::Memory(addr), len))
+    }
+
+    /// The size of an unsized value of `ty` whose pointer's metadata is `len`, as the
+    /// evaluator's `size_of_unsized_struct` computes it.
+    fn unsized_size(&self, ty: Ty<'db>, len: usize) -> Result<usize, ValTreeCreationError<'db>> {
+        let too_big = || unreadable(ty, "an unsized value larger than the address space");
+        match ty.kind() {
+            TyKind::Str => Ok(len),
+            TyKind::Slice(elem) => {
+                self.layout(elem)?.size.bytes_usize().checked_mul(len).ok_or_else(too_big)
+            }
+            TyKind::Adt(..) | TyKind::Tuple(_) => {
+                let layout = self.layout(ty)?;
+                let (index, last) = self
+                    .tail_field(ty)
+                    .ok_or_else(|| unreadable(ty, "an unsized type with no fields"))?;
+                let start = layout.fields.offset(index).bytes_usize();
+                let tail = self.unsized_size(last, len)?;
+                let align = usize::try_from(layout.align.bytes()).map_err(|_| too_big())?;
+                start
+                    .checked_add(tail)
+                    .and_then(|end| end.checked_next_multiple_of(align))
+                    .ok_or_else(too_big)
+            }
+            _ => Err(unreadable(ty, "an unsized type that is no str, slice, struct or tuple")),
         }
-    };
-    Const::new_valtree(interner, ty, valtree)
+    }
+
+    /// The index and type of the last field of the struct or tuple `ty`.
+    fn tail_field(&self, ty: Ty<'db>) -> Option<(usize, Ty<'db>)> {
+        match ty.kind() {
+            TyKind::Adt(def, args) => {
+                let AdtId::StructId(id) = def.def_id() else { return None };
+                let fields = self.interner.db.field_types(id.into());
+                let last = fields.values().next_back()?;
+                let last = last.ty().instantiate(self.interner, args).skip_norm_wip();
+                Some((fields.len() - 1, last))
+            }
+            TyKind::Tuple(tys) => Some((tys.len().checked_sub(1)?, *tys.as_slice().last()?)),
+            _ => None,
+        }
+    }
+
+    /// rustc's `branches`: for an enum its variant's index as a `u32` leaf, then the tree of
+    /// each field. The last field gets `len`, the metadata of an unsized tail.
+    fn branches(
+        &mut self,
+        layout: &Layout,
+        tys: impl ExactSizeIterator<Item = Ty<'db>>,
+        variant: Option<u32>,
+        bytes: &[u8],
+        map: &MemoryMap<'db>,
+        at: PointerAt,
+        len: Option<usize>,
+    ) -> Made<'db> {
+        let interner = self.interner;
+        let count = tys.len();
+        let index = variant.map(|it| {
+            let leaf = ValTree::new(ValTreeKind::Leaf(ScalarInt::from(it)));
+            Ok(Const::new_value(interner, leaf, interner.default_types().types.u32))
+        });
+        let fields = tys.enumerate().map(|(i, ty)| {
+            let offset = layout.fields.offset(i).bytes_usize();
+            let (size, len) = match len {
+                Some(len) if i + 1 == count => (self.unsized_size(ty, len)?, Some(len)),
+                _ => (self.layout(ty)?.size.bytes_usize(), None),
+            };
+            let bytes = offset
+                .checked_add(size)
+                .and_then(|end| bytes.get(offset..end))
+                .ok_or_else(|| unreadable(ty, "a field outside the value it is of"))?;
+            let at = shifted(at, offset);
+            let tree = ensure_sufficient_stack(|| self.value(ty, bytes, map, at, len))?;
+            Ok(Const::new_value(interner, tree, ty))
+        });
+        let consts = Consts::new_from_iter(index.into_iter().chain(fields))?;
+        if consts.is_empty() {
+            self.nodes += 1;
+        }
+        Ok(ValTree::new(ValTreeKind::Branch(consts)))
+    }
+
+    /// rustc's `slice_branches` for a `str` or `[u8]`: a branch of `len` `u8` leaves, the
+    /// shared constants of each byte.
+    fn bytes(&mut self, ty: Ty<'db>, bytes: &[u8], len: usize) -> Made<'db> {
+        if bytes.len() != len {
+            return Err(unreadable(ty, "a length its bytes do not have"));
+        }
+        // rustc counts each leaf as it makes it, and stops at the one that would reach the
+        // budget; `nodes` is below it here.
+        if len > VALTREE_MAX_NODES - self.nodes {
+            return Err(ValTreeCreationError::NodesOverflow);
+        }
+        self.nodes += len;
+        let u8_values = &self.interner.default_types().consts.u8_values;
+        let elements =
+            Consts::new_from_iter(bytes.iter().map(|&byte| u8_values[usize::from(byte)]));
+        Ok(ValTree::new(ValTreeKind::Branch(elements)))
+    }
+
+    /// rustc's `slice_branches`: a branch of the tree of each of the `len` elements of type
+    /// `elem` in `bytes`, a value of `ty`. No node of its own, even when empty.
+    fn elements(
+        &mut self,
+        ty: Ty<'db>,
+        elem: Ty<'db>,
+        bytes: &[u8],
+        map: &MemoryMap<'db>,
+        at: PointerAt,
+        len: usize,
+    ) -> Made<'db> {
+        if let TyKind::Uint(rustc_ast_ir::UintTy::U8) = elem.kind() {
+            return self.bytes(ty, bytes, len);
+        }
+        let size = self.layout(elem)?.size.bytes_usize();
+        if size.checked_mul(len) != Some(bytes.len()) {
+            return Err(unreadable(ty, "a length its bytes do not have"));
+        }
+        let interner = self.interner;
+        let elements = (0..len).map(|i| {
+            let bytes = &bytes[i * size..(i + 1) * size];
+            let at = shifted(at, i * size);
+            let tree = ensure_sufficient_stack(|| self.value(elem, bytes, map, at, None))?;
+            Ok(Const::new_value(interner, tree, elem))
+        });
+        Ok(ValTree::new(ValTreeKind::Branch(Consts::new_from_iter(elements)?)))
+    }
+}
+
+/// The word `by` bytes past `at`.
+fn shifted(at: PointerAt, by: usize) -> PointerAt {
+    match at {
+        PointerAt::Value(offset) => PointerAt::Value(offset + by),
+        PointerAt::Memory(addr) => PointerAt::Memory(addr + by),
+    }
+}
+
+/// A leaf of the little-endian bits in `bytes`, which must be `size` long.
+fn scalar<'db>(
+    ty: Ty<'db>,
+    bytes: &[u8],
+    size: Size,
+) -> Result<ScalarInt, ValTreeCreationError<'db>> {
+    if size.bytes() == 0 || bytes.len() as u64 != size.bytes() || bytes.len() > 16 {
+        return Err(unreadable(ty, "a scalar of the wrong size"));
+    }
+    Ok(ScalarInt::raw(u128::from_le_bytes(pad16(bytes, IsSigned::No)), size))
 }
 
 impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'db> {
+    #[inline]
+    fn new(ty: Ty<'db>, valtree: ValTree<'db>) -> Self {
+        ValueConst { ty, value: valtree }
+    }
+
     fn ty(self) -> Ty<'db> {
         self.ty
     }
@@ -323,16 +500,69 @@ impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'d
     fn valtree(self) -> ValTree<'db> {
         self.value
     }
+
+    fn try_to_target_usize(self, interner: DbInterner<'db>) -> Option<u64> {
+        ValueConst::try_to_target_usize(self, rustc_abi::HasDataLayout::data_layout(&interner))
+    }
 }
 
+impl fmt::Display for ValueConst<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.ty.kind(), self.value.inner()) {
+            (TyKind::Bool, ValTreeKind::Leaf(leaf)) => match leaf.try_to_bool() {
+                Ok(value) => write!(f, "{value}"),
+                Err(()) => write!(f, "{leaf:?}_bool"),
+            },
+            (TyKind::Char, ValTreeKind::Leaf(leaf)) => match char::try_from(*leaf) {
+                Ok(value) => write!(f, "{value:?}"),
+                Err(_) => write!(f, "{leaf:?}_char"),
+            },
+            (TyKind::Int(int), ValTreeKind::Leaf(leaf)) => {
+                write!(f, "{}_{}", leaf.to_int_unchecked(), int.name_str())
+            }
+            (TyKind::Uint(uint), ValTreeKind::Leaf(leaf)) => {
+                write!(f, "{}_{}", leaf.to_uint_unchecked(), uint.name_str())
+            }
+            (_, valtree) => write!(f, "{valtree:?}: {:?}", self.ty),
+        }
+    }
+}
+
+/// The value a [`ScalarInt`] leaf stands for (`Interner::Scalar`). A value tree's leaf is always
+/// an integer (hir-ty keeps no pointer in a leaf), so the scalar is the integer itself.
+pub type Scalar = ScalarInt;
+
+impl<'db> rustc_type_ir::inherent::ScalarInt<DbInterner<'db>> for ScalarInt {
+    #[inline]
+    fn to_scalar(self) -> Scalar {
+        self
+    }
+
+    #[inline]
+    fn try_from_uint(i: impl Into<u128>, size: Size) -> Option<Self> {
+        ScalarInt::try_from_uint(i, size)
+    }
+}
+
+/// Every interned [`ValTree`], kept whole: [`ValTree::inner`] hands out a reference.
+static VALTREES: table::Values<ValTreeKind<'static>> = table::Values::new("valtrees");
+table::erase!(ValTreeKind);
+
+/// A value tree: its row in [`VALTREES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct ValTree<'db> {
-    interned: InternedRef<'db, ValTreeInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
+const _: () = assert!(size_of::<Option<ValTree<'static>>>() == 4);
+
+// SAFETY: the handle holds one value, its row's kind, which this visits whenever the visitor
+// asks to go into the row.
+unsafe impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(VALTREES.name(), self.index.get()).is_continue() {
             self.inner().generic_visit_with(visitor);
         }
     }
@@ -360,16 +590,6 @@ impl<'db> TypeFoldable<DbInterner<'db>> for ValTree<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub(in super::super) struct ValTreeInterned(ValTreeKind<'static>);
-
-impl_internable!(gc; ValTreeInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<ValTree<'static>>();
-};
-
 impl<'db> IntoKind for ValTree<'db> {
     type Kind = ValTreeKind<'db>;
 
@@ -381,24 +601,38 @@ impl<'db> IntoKind for ValTree<'db> {
 impl<'db> ValTree<'db> {
     #[inline]
     pub fn new(kind: ValTreeKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<ValTreeKind<'db>, ValTreeKind<'static>>(kind) };
-        Self { interned: Interned::new_gc(ValTreeInterned(kind)) }
+        Self::at(VALTREES.intern(kind))
     }
 
     #[inline]
     pub fn inner(&self) -> &ValTreeKind<'db> {
-        let inner = &self.interned.0;
-        unsafe { std::mem::transmute::<&ValTreeKind<'static>, &ValTreeKind<'db>>(inner) }
+        VALTREES.get(self.index)
     }
 
     pub fn from_scalar_int(_interner: DbInterner<'db>, i: ScalarInt) -> Self {
         ValTree::new(ValTreeKind::Leaf(i))
     }
+
+    /// The value of a zero-sized type, as rustc's `ValTree::zst`: a branch with no fields.
+    #[inline]
+    pub fn zst() -> Self {
+        ValTree::new(ValTreeKind::Branch(Consts::empty()))
+    }
+
+    #[inline]
+    pub(in super::super) fn at(index: NonZeroU32) -> Self {
+        ValTree { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(in super::super) fn row(self) -> NonZeroU32 {
+        self.index
+    }
 }
 
 impl std::fmt::Debug for ValTree<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.interned.fmt(f)
+        self.inner().fmt(f)
     }
 }
 
@@ -788,5 +1022,216 @@ impl fmt::Display for ScalarInt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.check_data();
         write!(f, "{}", { self.data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base_db::Crate;
+    use hir_def::{CallableDefId, ModuleDefId, nameres::crate_def_map};
+    use rustc_type_ir::inherent::Ty as _;
+    use hir_expand::fixture;
+
+    use super::*;
+    use crate::{
+        ComplexMemoryMap,
+        next_solver::{GenericArgs, ParamEnv},
+    };
+
+    const FIXTURE: &str = r#"
+//- minicore: sized, copy
+fn f() {}
+struct B(u8);
+union U { a: u8, b: u16 }
+"#;
+
+    fn item(db: &Db, krate: Crate, name: &str) -> ModuleDefId {
+        let def_map = crate_def_map(db, krate);
+        let scope = def_map.module(db, def_map.root_module_id()).scope(db);
+        scope
+            .types()
+            .map(|(it, item)| (it, item.def))
+            .chain(scope.values().map(|(it, item)| (it, item.def)))
+            .find(|(it, _)| it.as_str() == name)
+            .map(|(_, def)| def)
+            .unwrap_or_else(|| panic!("the fixture defines `{name}`"))
+    }
+
+    struct Fixture {
+        db: Db,
+        krate: Crate,
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            let db = fixture::db(FIXTURE).into_db();
+            let krate = fixture::test_crate(&db);
+            Fixture { db, krate }
+        }
+
+        fn interner(&self) -> DbInterner<'_> {
+            DbInterner::new_with(&self.db, self.krate)
+        }
+
+        fn convert<'db>(
+            &'db self,
+            ty: Ty<'db>,
+            memory: &[u8],
+            map: &MemoryMap<'db>,
+        ) -> Result<Const<'db>, ValTreeCreationError<'db>> {
+            let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: self.krate };
+            allocation_to_const(self.interner(), ty, memory, map, env)
+        }
+
+        /// A target `usize` of each of `words`, one after another.
+        fn words(&self, words: &[usize]) -> Vec<u8> {
+            let size = self.db.target_data_layout(self.krate).unwrap().pointer_size();
+            let size = size.bytes_usize();
+            words.iter().flat_map(|it| it.to_le_bytes()[..size].to_vec()).collect()
+        }
+
+        fn bytes_branch<'db>(&'db self, ty: Ty<'db>, bytes: &[u8]) -> Const<'db> {
+            let interner = self.interner();
+            let u8_values = &interner.default_types().consts.u8_values;
+            let elements =
+                Consts::new_from_iter(bytes.iter().map(|&it| u8_values[usize::from(it)]));
+            Const::new_value(interner, ValTree::new(ValTreeKind::Branch(elements)), ty)
+        }
+    }
+
+    fn piece<'db>(at: usize, bytes: &[u8]) -> MemoryMap<'db> {
+        let mut map = ComplexMemoryMap::default();
+        map.insert(at, Box::from(bytes));
+        MemoryMap::Complex(Box::new(map))
+    }
+
+    #[test]
+    fn a_fn_item_is_a_zero_sized_branch() {
+        let fixture = Fixture::new();
+        let interner = fixture.interner();
+        let ModuleDefId::FunctionId(f) = item(&fixture.db, fixture.krate, "f") else {
+            panic!("`f` is a function")
+        };
+        let ty =
+            Ty::new_fn_def(interner, CallableDefId::FunctionId(f).into(), GenericArgs::empty());
+        let konst = fixture.convert(ty, &[], &MemoryMap::Empty);
+        assert_eq!(konst, Ok(Const::new_value(interner, ValTree::zst(), ty)));
+    }
+
+    #[test]
+    fn a_raw_pointer_is_a_leaf_only_without_provenance() {
+        let fixture = Fixture::new();
+        let interner = fixture.interner();
+        let ty = Ty::new_imm_ptr(interner, interner.default_types().types.u8);
+        let unsupported = Err(ValTreeCreationError::NonSupportedType(ty));
+        let pointer = fixture.db.target_data_layout(fixture.krate).unwrap().pointer_size();
+        let leaf = |word: u128| {
+            let leaf = ValTree::new(ValTreeKind::Leaf(ScalarInt::raw(word, pointer)));
+            Ok(Const::new_value(interner, leaf, ty))
+        };
+        // An integer made a pointer, with or without memory at that address.
+        assert_eq!(fixture.convert(ty, &fixture.words(&[0x10]), &MemoryMap::Empty), leaf(0x10));
+        let map = piece(0x1000, &[7]);
+        assert_eq!(fixture.convert(ty, &fixture.words(&[0x1000]), &map), leaf(0x1000));
+        // The same word when the evaluation wrote a pointer there.
+        let with_provenance = |at| {
+            let mut map = ComplexMemoryMap::default();
+            map.insert(0x1000, Box::from(&[7u8][..]));
+            map.note_pointer(at);
+            MemoryMap::Complex(Box::new(map))
+        };
+        let map = with_provenance(PointerAt::Value(0));
+        assert_eq!(fixture.convert(ty, &fixture.words(&[0x1000]), &map), unsupported);
+        // Inside a tuple, the word's own offset is what is asked.
+        let pair = Ty::new_tup(interner, &[ty, ty]);
+        let words = fixture.words(&[0x10, 0x1000]);
+        let map = with_provenance(PointerAt::Value(words.len() / 2));
+        assert_eq!(fixture.convert(pair, &words, &map), unsupported);
+        let map = with_provenance(PointerAt::Value(words.len()));
+        assert!(fixture.convert(pair, &words, &map).is_ok());
+        // Behind a reference, the word's address is.
+        let reference = Ty::new_imm_ref(interner, interner.default_types().regions.statik, ty);
+        let mut map = ComplexMemoryMap::default();
+        map.insert(0x2000, Box::from(&fixture.words(&[0x1000])[..]));
+        map.note_pointer(PointerAt::Memory(0x2000));
+        let map = MemoryMap::Complex(Box::new(map));
+        assert_eq!(fixture.convert(reference, &fixture.words(&[0x2000]), &map), unsupported);
+        // A wide one, even without provenance.
+        let ty = Ty::new_imm_ptr(interner, interner.default_types().types.u8_slice);
+        let map = piece(0x1000, &[7, 8]);
+        assert_eq!(
+            fixture.convert(ty, &fixture.words(&[0x1000, 2]), &map),
+            Err(ValTreeCreationError::NonSupportedType(ty)),
+        );
+    }
+
+    #[test]
+    fn a_str_reference_is_a_branch_of_its_bytes() {
+        let fixture = Fixture::new();
+        let ty = fixture.interner().default_types().types.static_str_ref;
+        let map = MemoryMap::simple(Box::from(&b"hi"[..]));
+        let konst = fixture.convert(ty, &fixture.words(&[0, 2]), &map);
+        assert_eq!(konst, Ok(fixture.bytes_branch(ty, b"hi")));
+    }
+
+    #[test]
+    fn a_byte_slice_reference_is_a_branch_of_its_elements() {
+        let fixture = Fixture::new();
+        let ty = fixture.interner().default_types().types.static_u8_slice;
+        let map = piece(0x1000, &[1, 2, 3, 4]);
+        let konst = fixture.convert(ty, &fixture.words(&[0x1000, 3]), &map);
+        assert_eq!(konst, Ok(fixture.bytes_branch(ty, &[1, 2, 3])));
+        let empty = fixture.convert(ty, &fixture.words(&[0x1000, 0]), &map);
+        assert_eq!(empty, Ok(fixture.bytes_branch(ty, &[])));
+        // A length past the memory the map holds.
+        let past = fixture.convert(ty, &fixture.words(&[0x1000, 5]), &map);
+        assert!(matches!(past, Err(ValTreeCreationError::Unreadable { .. })), "{past:?}");
+    }
+
+    #[test]
+    fn a_union_has_no_value_tree() {
+        let fixture = Fixture::new();
+        let interner = fixture.interner();
+        let ModuleDefId::AdtId(u) = item(&fixture.db, fixture.krate, "U") else {
+            panic!("`U` is a union")
+        };
+        let ty = Ty::new_adt(interner, u, GenericArgs::empty());
+        assert_eq!(
+            fixture.convert(ty, &[1], &MemoryMap::Empty),
+            Err(ValTreeCreationError::NonSupportedType(ty)),
+        );
+        // Also behind a reference.
+        let reference = Ty::new_imm_ref(interner, interner.default_types().regions.statik, ty);
+        let map = piece(0x1000, &[1, 0]);
+        assert_eq!(
+            fixture.convert(reference, &fixture.words(&[0x1000]), &map),
+            Err(ValTreeCreationError::NonSupportedType(ty)),
+        );
+    }
+
+    #[test]
+    fn a_tree_of_more_than_the_node_budget_overflows() {
+        let fixture = Fixture::new();
+        let ty = fixture.interner().default_types().types.static_u8_slice;
+        let bytes = vec![0; VALTREE_MAX_NODES + 1];
+        let map = piece(0x1000, &bytes);
+        let at_budget = fixture.convert(ty, &fixture.words(&[0x1000, VALTREE_MAX_NODES]), &map);
+        assert_eq!(at_budget, Ok(fixture.bytes_branch(ty, &bytes[..VALTREE_MAX_NODES])));
+        let over = fixture.convert(ty, &fixture.words(&[0x1000, VALTREE_MAX_NODES + 1]), &map);
+        assert_eq!(over, Err(ValTreeCreationError::NodesOverflow));
+    }
+
+    #[test]
+    fn a_struct_is_a_branch_of_its_fields() {
+        let fixture = Fixture::new();
+        let interner = fixture.interner();
+        let ModuleDefId::AdtId(b) = item(&fixture.db, fixture.krate, "B") else {
+            panic!("`B` is a struct")
+        };
+        let ty = Ty::new_adt(interner, b, GenericArgs::empty());
+        let field = interner.default_types().consts.u8_values[9];
+        let expected = ValTree::new(ValTreeKind::Branch(Consts::new_from_slice(&[field])));
+        let konst = fixture.convert(ty, &[9], &MemoryMap::Empty);
+        assert_eq!(konst, Ok(Const::new_value(interner, expected, ty)));
     }
 }

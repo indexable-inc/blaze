@@ -1,0 +1,276 @@
+; Follows cranelift/filetests/filetests/runtests/br_table.clif, for the stencil set: tables of
+; 1, 2, 4 and 9 entries and an empty one (only the default), indices in range, one past the
+; end, large and `0xffffffff` (all to the default: the index is unsigned), block arguments on
+; some edges and the default, two entries to the same block, the default's block also an
+; entry, and a `br_table` in a loop.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %br_table_empty(i32) -> i32 {
+block0(v0: i32):
+    br_table v0, block1, []
+
+block1:
+    v1 = iconst.i32 7
+    return v1
+}
+; run: %br_table_empty(0) == 7
+; run: %br_table_empty(1) == 7
+; run: %br_table_empty(-1) == 7
+
+function %br_table_1(i32) -> i32 {
+block0(v0: i32):
+    br_table v0, block2, [block1]
+
+block1:
+    v1 = iconst.i32 10
+    return v1
+
+block2:
+    v2 = iconst.i32 20
+    return v2
+}
+; run: %br_table_1(0) == 10
+; run: %br_table_1(1) == 20
+; run: %br_table_1(2) == 20
+; run: %br_table_1(0x7fffffff) == 20
+; run: %br_table_1(0x80000000) == 20
+; run: %br_table_1(0xffffffff) == 20
+
+function %br_table_2(i32) -> i32 {
+block0(v0: i32):
+    br_table v0, block3, [block1, block2]
+
+block1:
+    v1 = iconst.i32 1
+    return v1
+
+block2:
+    v2 = iconst.i32 2
+    return v2
+
+block3:
+    v3 = iconst.i32 3
+    return v3
+}
+; run: %br_table_2(0) == 1
+; run: %br_table_2(1) == 2
+; run: %br_table_2(2) == 3
+; run: %br_table_2(3) == 3
+; run: %br_table_2(0xffffffff) == 3
+
+function %br_table_4_args(i32, i64) -> i64 {
+block0(v0: i32, v1: i64):
+    v2 = iconst.i64 100
+    v3 = iadd v1, v2
+    br_table v0, block5(v1), [block1, block2(v3), block3, block4(v1, v3)]
+
+block1:
+    v4 = iconst.i64 -1
+    return v4
+
+block2(v5: i64):
+    return v5
+
+block3:
+    v6 = iconst.i64 0x0123456789abcdef
+    return v6
+
+block4(v7: i64, v8: i64):
+    v9 = isub v8, v7
+    return v9
+
+block5(v10: i64):
+    v11 = ineg v10
+    return v11
+}
+; run: %br_table_4_args(0, 5) == -1
+; run: %br_table_4_args(1, 5) == 105
+; run: %br_table_4_args(2, 5) == 0x0123456789abcdef
+; run: %br_table_4_args(3, 5) == 100
+; run: %br_table_4_args(4, 5) == -5
+; run: %br_table_4_args(5, 5) == -5
+; run: %br_table_4_args(1000, 7) == -7
+; run: %br_table_4_args(0xffffffff, -3) == 3
+; run: %br_table_4_args(1, -1) == 99
+
+function %br_table_shared(i32) -> i32 {
+block0(v0: i32):
+    br_table v0, block3, [block1, block2, block1, block3, block2]
+
+block1:
+    v1 = iconst.i32 11
+    return v1
+
+block2:
+    v2 = iconst.i32 22
+    return v2
+
+block3:
+    v3 = iconst.i32 33
+    return v3
+}
+; run: %br_table_shared(0) == 11
+; run: %br_table_shared(1) == 22
+; run: %br_table_shared(2) == 11
+; run: %br_table_shared(3) == 33
+; run: %br_table_shared(4) == 22
+; run: %br_table_shared(5) == 33
+; run: %br_table_shared(0xffffffff) == 33
+
+function %br_table_shared_args(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iconst.i32 1000
+    br_table v0, block1(v2), [block1(v1), block1(v2), block2(v1, v1)]
+
+block1(v3: i32):
+    return v3
+
+block2(v4: i32, v5: i32):
+    v6 = imul v4, v5
+    return v6
+}
+; run: %br_table_shared_args(0, 6) == 6
+; run: %br_table_shared_args(1, 6) == 1000
+; run: %br_table_shared_args(2, 6) == 36
+; run: %br_table_shared_args(3, 6) == 1000
+; run: %br_table_shared_args(0xffffffff, 6) == 1000
+
+function %br_table_9(i32) -> i64 {
+block0(v0: i32):
+    br_table v0, block10, [block1, block2, block3, block4, block5, block6, block7, block8, block9]
+
+block1:
+    v1 = iconst.i64 101
+    return v1
+
+block2:
+    v2 = iconst.i64 102
+    return v2
+
+block3:
+    v3 = iconst.i64 103
+    return v3
+
+block4:
+    v4 = iconst.i64 104
+    return v4
+
+block5:
+    v5 = iconst.i64 105
+    return v5
+
+block6:
+    v6 = iconst.i64 106
+    return v6
+
+block7:
+    v7 = iconst.i64 107
+    return v7
+
+block8:
+    v8 = iconst.i64 108
+    return v8
+
+block9:
+    v9 = iconst.i64 109
+    return v9
+
+block10:
+    v10 = iconst.i64 -1
+    return v10
+}
+; run: %br_table_9(0) == 101
+; run: %br_table_9(1) == 102
+; run: %br_table_9(2) == 103
+; run: %br_table_9(3) == 104
+; run: %br_table_9(4) == 105
+; run: %br_table_9(5) == 106
+; run: %br_table_9(6) == 107
+; run: %br_table_9(7) == 108
+; run: %br_table_9(8) == 109
+; run: %br_table_9(9) == -1
+; run: %br_table_9(10) == -1
+; run: %br_table_9(0x10000) == -1
+; run: %br_table_9(0x80000000) == -1
+; run: %br_table_9(0xffffffff) == -1
+
+; A state machine: each step's `br_table` picks the next state by the state number, until the
+; default exits. The sum is of the states visited.
+function %br_table_loop(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    jump block1(v0, v1)
+
+block1(v2: i32, v3: i32):
+    v4 = iadd v3, v2
+    br_table v2, block5(v4), [block2(v4), block3(v4), block4(v4), block2(v4)]
+
+block2(v5: i32):
+    v6 = iconst.i32 2
+    jump block1(v6, v5)
+
+block3(v7: i32):
+    v8 = iconst.i32 0
+    jump block1(v8, v7)
+
+block4(v9: i32):
+    v10 = iconst.i32 7
+    jump block1(v10, v9)
+
+block5(v11: i32):
+    return v11
+}
+; run: %br_table_loop(0) == 9
+; run: %br_table_loop(1) == 10
+; run: %br_table_loop(2) == 9
+; run: %br_table_loop(3) == 12
+; run: %br_table_loop(4) == 4
+; run: %br_table_loop(0xffffffff) == -1
+
+; A counted loop whose body branches through a table on the counter's low two bits.
+function %br_table_counted(i32) -> i64 {
+block0(v0: i32):
+    v1 = iconst.i64 0
+    jump block1(v0, v1)
+
+block1(v2: i32, v3: i64):
+    brif v2, block2, block7(v3)
+
+block2:
+    v4 = iconst.i32 1
+    v5 = isub v2, v4
+    v6 = iconst.i32 3
+    v7 = band v5, v6
+    br_table v7, block6, [block3, block4, block5]
+
+block3:
+    v8 = iconst.i64 1
+    v9 = iadd v3, v8
+    jump block1(v5, v9)
+
+block4:
+    v10 = iconst.i64 10
+    v11 = iadd v3, v10
+    jump block1(v5, v11)
+
+block5:
+    v12 = iconst.i64 100
+    v13 = iadd v3, v12
+    jump block1(v5, v13)
+
+block6:
+    v14 = iconst.i64 1000
+    v15 = iadd v3, v14
+    jump block1(v5, v15)
+
+block7(v16: i64):
+    return v16
+}
+; run: %br_table_counted(0) == 0
+; run: %br_table_counted(1) == 1
+; run: %br_table_counted(2) == 11
+; run: %br_table_counted(4) == 1111
+; run: %br_table_counted(9) == 2223

@@ -1,0 +1,30 @@
+;; rust-relock-in-statement: two calls that take the same lock (`.device_manager()`, `.lock()`, `.write()`,
+;; `.borrow_mut()` on the same receiver) in two fields of one struct literal or two arguments of one call, each reached from
+;; its field or argument through expressions alone (method calls, field reads, `&`, `?`, `.await`, indexing), not through a
+;; closure or a block. A temporary lives until the end of its statement, so the first guard is still held when the second call
+;; takes the lock again: parking_lot and std mutexes deadlock (#3516, 2026-10-17: every VM start hung in run_vm's
+;; `Control { .. }`). Read the first value into a `let` before the literal.
+(rule (lock-call c recv)
+  (match rust "(call_expression function: (field_expression value: (_) @recv field: (field_identifier) @m) arguments: (arguments)) @c")
+  (text-match m "^(device_manager|lock|write|borrow_mut)$"))
+
+;; (held a e): the guard of lock call `a` lives through expression `e` (e is `a`, or encloses it by expression nodes only).
+(rule (held a a) (lock-call a r))
+(rule (held a p)
+  (held a c)
+  (parent p c)
+  (kind p k)
+  (text-match k "^(field_expression|call_expression|arguments|reference_expression|try_expression|await_expression|index_expression|parenthesized_expression|unary_expression|type_cast_expression)$"))
+
+(rule (rust-relock-in-statement b a)
+  (match rust "(field_initializer_list (field_initializer value: (_) @x) (field_initializer value: (_) @y))")
+  (held a x) (held b y)
+  (lock-call a ra) (lock-call b rb) (same-text ra rb))
+
+(rule (rust-relock-in-statement b a)
+  (match rust "(arguments (_) @x (_) @y)")
+  (held a x) (held b y)
+  (lock-call a ra) (lock-call b rb) (same-text ra rb))
+
+(lint rust-relock-in-statement error
+  "the same lock is taken again in one statement while an earlier temporary guard of it is still alive (a deadlock): read the earlier value into a `let` first")

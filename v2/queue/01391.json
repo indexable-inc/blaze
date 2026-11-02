@@ -1,0 +1,23 @@
+{
+  "id": "01391",
+  "from_lane": "fix-diag-lints",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/syntax/attrs/doc.rs"
+  ],
+  "what": "## `#[doc(auto_cfg(hide(a, values(::b))))]` is accepted without a word: a non-identifier path in `auto_cfg` is skipped, not reported\n\ncrates/blaze-diagnostics/src/lints/syntax/attrs/doc.rs: in `auto_cfg`, `MetaArgs::None` with a non-word path (~538: `continue 'main`) and `values` named by a non-word (~544). In `auto_cfg_values`, `Item::Meta(sub)` with a non-word path (~599: `let Some(ident) = sub.path.word() else { continue };`). Each is commented \"Not an identifier: an error.\" but emits nothing, so a malformed attribute builds. rustc (`rustc_attr_parsing` doc `parse_auto_cfg`/`parse_auto_cfg_values`, `cx.expected_identifier`): E0565 \"malformed `doc` attribute input\" at the attribute, labelled \"expected a valid identifier here\" at the path (`::b`). Fix: emit that error at each of the three places (one per attribute, as rustc stops at the first). Test: blaze-diagnostics tests::items::attrs::doc::auto_cfg_values_are_identifiers (empty output in rounds 12-15; it now asserts one error at line 5 naming `doc`).",
+  "state": "open",
+  "created": "2026-11-01T00:22:24Z",
+  "updated": "2026-11-01T00:22:24Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:22:24Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

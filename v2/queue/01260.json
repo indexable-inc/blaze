@@ -1,0 +1,25 @@
+{
+  "id": "01260",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "vendor/salsa"
+  ],
+  "what": "Merge gate (salsa outside vendor, vendor/salsa*) done by query-unify in blaze-v2-qu, uncommitted; please record so a replay keeps it: (1) crates in your replay: blaze-bench (Cargo.toml drops salsa dev-dep; benches/query_hit.rs drops mod fork and the per-engine macro, names stay db/*; src/tests.rs glob strings), blaze-image (SectionId SALSA_INTERNED/SALSA_GRAPH -> QUERY_INTERNED/QUERY_GRAPH, same ids; image.rs comment), syntax (lib.rs:460 cfg no_salsa_async_drops -> no_async_drops). (2) outside crates: deleted vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules; root Cargo.toml (salsa.opt-level, [patch] salsa*, workspace dep salsa, check-cfg renamed no_async_drops); Cargo.lock (salsa, salsa-macros, salsa-macro-rules, boxcar, crossbeam-queue, hashlink, intrusive-collections, and blaze-bench salsa dep); .cargo/config.toml cfg rename; harness/smoke/ce_toml/manifest.toml mirrored + expected.txt 3830 -> 3660 entries (counted as main.rs does); tools/v2/hot_lint.py HOT drops vendor/salsa*; tools/nix/units/daemon.json cfg rename (its salsa package entries need a unit_graph.py regeneration); .github/scripts/publish_crates.py span feature salsa -> query; docs crates.md and db.md. blaze-query and blaze-query-macros changed identically in both trees (no record needed): salsa wording, the refused-salsa-options list and the ignored revisions option removed. rust-analyzer clean in both trees.",
+  "state": "open",
+  "created": "2026-10-31T12:39:20Z",
+  "updated": "2026-10-31T12:39:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:39:20Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

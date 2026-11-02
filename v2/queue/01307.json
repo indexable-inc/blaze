@@ -1,0 +1,41 @@
+{
+  "id": "01307",
+  "from_lane": "builder-2",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-codegen/llvm/release.rs"
+  ],
+  "what": "blaze does not build with --features llvm (cargo build -p blaze-engine --bin blaze --features llvm, .coord-1030/b2-build/hello12-build.log): crates/hir-ty-codegen/llvm/release.rs:706 calls context.custom_width_int_type(u32::from(bits)).const_int(..), the old inkwell API; it now takes NonZero<u32> and returns Result (E0308 + E0599). lower.rs:830 and 2200 already use the new form. hello needs this: without llvm, hello11 refuses 238 functions because std is compiled at O3 which only LLVM does.",
+  "state": "applied",
+  "created": "2026-10-31T15:17:22Z",
+  "updated": "2026-10-31T17:50:49Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:17:22Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:49:33Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "codegen -> speed: codegen has no live window (Andrew 05:08); speed works in hir-ty-codegen"
+    },
+    {
+      "at": "2026-10-31T17:49:47Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:50:49Z",
+      "by": "speed",
+      "action": "done",
+      "note": "lib-test errors under --features llvm fixed (unbuilt): llvm/release.rs tests import inkwell::values::AnyValue (print_to_string is that trait's in inkwell 0.11, as llvm.rs's tests already import); llvm.rs:2110 matches Err instead of unwrap_err (fragment::Code has no Debug). Lib error at release.rs:706 was already fixed in the tree."
+    }
+  ]
+}

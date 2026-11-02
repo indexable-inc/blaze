@@ -1,0 +1,24 @@
+{
+  "id": "01505",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/job.rs",
+    "crates/blaze-cargo/src/serve/observe.rs"
+  ],
+  "what": "observe (explore-web questions 6 and 8). blaze-profile has two new history tables, `links` and `crate_deps` (schema.rs, facts.rs), written at the next flush from `History::linked(rows)` and `History::crate_graph(rows)`. Please call them where the daemon hands its BuildRow to the history (serve/observe.rs, the `ended` path): 1) links: for each `(image, Linking)` of the request's links (job.rs `link_kind` reads them), a `facts::LinkRow { build_id, image, krate: the package, outcome: if how.placed() { LinkOutcome::Placed } else { LinkOutcome::Patched }, dur_ns: the link's time if Linking has it }`. 2) crate_deps: once a build, from the plan's resolved graph, one `facts::CrateDepRow { build_id, krate, dep, kind: DepKind::Normal|Build|Dev }` per edge of the units built. Unbuilt on my side; test history `the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush`.",
+  "state": "open",
+  "created": "2026-11-01T13:46:02Z",
+  "updated": "2026-11-01T13:46:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:46:02Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

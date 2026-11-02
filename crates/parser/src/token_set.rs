@@ -1,10 +1,12 @@
 //! A bit-set of `SyntaxKind`s.
 
+use blaze_ids::bits::BitArray;
+
 use crate::SyntaxKind;
 
 /// A bit-set of `SyntaxKind`s
 #[derive(Clone, Copy)]
-pub(crate) struct TokenSet([u64; 3]);
+pub(crate) struct TokenSet(BitArray<3>);
 
 /// `TokenSet`s should only include token `SyntaxKind`s, so the discriminant of any passed/included
 /// `SyntaxKind` must *not* be greater than that of the last token `SyntaxKind`.
@@ -12,10 +14,10 @@ pub(crate) struct TokenSet([u64; 3]);
 const LAST_TOKEN_KIND_DISCRIMINANT: usize = SyntaxKind::SHEBANG as usize;
 
 impl TokenSet {
-    pub(crate) const EMPTY: TokenSet = TokenSet([0; 3]);
+    pub(crate) const EMPTY: TokenSet = TokenSet(BitArray::EMPTY);
 
     pub(crate) const fn new(kinds: &[SyntaxKind]) -> TokenSet {
-        let mut res = [0; 3];
+        let mut res: BitArray<3> = BitArray::EMPTY;
         let mut i = 0;
         while i < kinds.len() {
             let discriminant = kinds[i] as usize;
@@ -23,15 +25,14 @@ impl TokenSet {
                 discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
                 "Expected a token `SyntaxKind`"
             );
-            let idx = discriminant / 64;
-            res[idx] |= 1 << (discriminant % 64);
+            res = res.with_bit(discriminant);
             i += 1;
         }
         TokenSet(res)
     }
 
     pub(crate) const fn union(self, other: TokenSet) -> TokenSet {
-        TokenSet([self.0[0] | other.0[0], self.0[1] | other.0[1], self.0[2] | other.0[2]])
+        TokenSet(self.0.or(&other.0))
     }
 
     pub(crate) const fn contains(&self, kind: SyntaxKind) -> bool {
@@ -40,9 +41,7 @@ impl TokenSet {
             discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
             "Expected a token `SyntaxKind`"
         );
-        let idx = discriminant / 64;
-        let mask = 1 << (discriminant % 64);
-        self.0[idx] & mask != 0
+        self.0.has_bit(discriminant)
     }
 }
 

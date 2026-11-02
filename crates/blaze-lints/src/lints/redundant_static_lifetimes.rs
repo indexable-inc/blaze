@@ -4,16 +4,19 @@
 //! Follows clippy's `clippy_lints/src/redundant_static_lifetimes.rs` at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
-use syntax::{AstNode, SyntaxKind, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{check::Cx, conf::Version, diag::Applicability};
 
-const LINT: &str = "redundant_static_lifetimes";
+const LINT: super::Implemented = super::Implemented::RedundantStaticLifetimes;
 
 /// clippy's `msrvs::STATIC_IN_CONST`.
 const STATIC_IN_CONST: Version = Version(1, 17, 0);
 
-pub(super) fn check_const(cx: &mut Cx<'_, '_, '_>, item: &ast::Const) {
+pub(super) fn check_const<'t>(cx: &mut Cx<'_, 't>, item: ast::Const<'t>) {
     // An associated constant cannot leave `'static` out.
     let associated =
         item.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
@@ -21,36 +24,36 @@ pub(super) fn check_const(cx: &mut Cx<'_, '_, '_>, item: &ast::Const) {
         return;
     }
     if let Some(ty) = item.ty() {
-        visit(cx, item.syntax(), &ty, "constants have by default a `'static` lifetime");
+        visit(cx, item.syntax(), ty, "constants have by default a `'static` lifetime");
     }
 }
 
-pub(super) fn check_static(cx: &mut Cx<'_, '_, '_>, item: &ast::Static) {
+pub(super) fn check_static<'t>(cx: &mut Cx<'_, 't>, item: ast::Static<'t>) {
     let foreign =
         item.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::EXTERN_ITEM_LIST);
     if foreign || !cx.on(LINT) || !cx.conf().meets(STATIC_IN_CONST) {
         return;
     }
     if let Some(ty) = item.ty() {
-        visit(cx, item.syntax(), &ty, "statics have by default a `'static` lifetime");
+        visit(cx, item.syntax(), ty, "statics have by default a `'static` lifetime");
     }
 }
 
-fn visit(cx: &mut Cx<'_, '_, '_>, item: &syntax::SyntaxNode, ty: &ast::Type, reason: &'static str) {
+fn visit<'t>(cx: &mut Cx<'_, 't>, item: ast::Node<'t>, ty: ast::Type<'t>, reason: &'static str) {
     match ty {
         ast::Type::ArrayType(it) => {
             if let Some(ty) = it.ty() {
-                visit(cx, item, &ty, reason);
+                visit(cx, item, ty, reason);
             }
         }
         ast::Type::SliceType(it) => {
             if let Some(ty) = it.ty() {
-                visit(cx, item, &ty, reason);
+                visit(cx, item, ty, reason);
             }
         }
         ast::Type::TupleType(it) => {
             for ty in it.fields() {
-                visit(cx, item, &ty, reason);
+                visit(cx, item, ty, reason);
             }
         }
         ast::Type::RefType(reference) => {
@@ -83,7 +86,7 @@ fn visit(cx: &mut Cx<'_, '_, '_>, item: &syntax::SyntaxNode, ty: &ast::Type, rea
                     Applicability::MachineApplicable,
                 );
             }
-            visit(cx, item, &borrowed, reason);
+            visit(cx, item, borrowed, reason);
         }
         _ => {}
     }

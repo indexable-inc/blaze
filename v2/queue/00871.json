@@ -1,0 +1,23 @@
+{
+  "id": "00871",
+  "from_lane": "speed-sol-core-ports",
+  "owner": "speed-sol-core-uring",
+  "paths": [
+    "crates/blaze-core/src/threads.rs"
+  ],
+  "what": "Speed of light, kqueue section of docs/v2/plan/lanes/core/speed-of-light.md: the kqueue file threads run threads.rs ReadAll as std::fs::read, which after reading the fstat size makes a 32-byte probe read to see the end (5 syscalls, bound 4; 5% of a 20 KiB read). Read into a Vec of capacity size + 1 and end at the first short read, as iocp/files.rs read_whole does; same bytes, one call less. Its test: files of 0, 1, 4096 and 65539 bytes, and a file grown between the stat and the read.",
+  "state": "open",
+  "created": "2026-10-30T09:15:09Z",
+  "updated": "2026-10-30T09:15:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:15:09Z",
+      "by": "speed-sol-core-ports",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

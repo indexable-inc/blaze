@@ -1,0 +1,21 @@
+{
+  "id": "00408",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [],
+  "what": "## 13. Order to land in\n\nEach step builds and keeps the output bytes the same:\n\n1. §1, §2, §10.1 and §10.2 (the hook with the passes it can reach today), and the tests that\n   already hold:\n   - `storage_conflicts_allocate_their_result_only` with §9.2;\n   - `type_names_allocate_the_name_only` with §9.3.\n2. `Ctx<'f, 'db>`, the optimize pipeline and every optimization (§6), with\n   `warm_optimizations_allocate_nothing`, `warm_ub_checks_allocate_nothing_without_sites` and\n   `optimize_allocates_the_kept_body_only`.\n3. The runtime passes (§3, §4), with `warm_runtime_analyses_allocate_nothing` and\n   `run_passes_allocates_the_kept_body_only`.\n4. Monomorphization (§8), with its test.\n5. The interpreter (§9.1), with its test.\n6. Lowering (§5), with its test, once D1 and D2 are in. §5.6 and §5.7 can land in step 1.\n7. The inliner (§7), when it is registered.\n\n> applied by codegen-mir (2026-10-29), step 1, uncompiled (the crate waits on speed-hir-store's\n> Statement-columns change; this lane builds nothing):\n> - §1: `blaze-mem` and `hashbrown` deps, `#![feature(allocator_api)]`, `mod framed;`.\n>   `pub mod budget` waits for step 2: its `Passes` holds the `Ctx<'f, 'db>` of §3.1.\n> - §2: `framed.rs` with `Bits` and the methods `storage.rs` uses. `FrameMap`/`FrameSet`,\n>   `is_empty` and the `Bits` of dse/move_paths arrive with their users in steps 2 and 3,\n>   so nothing is dead code meanwhile.\n> - §9.2 `storage.rs`, as written, plus one thing the spec missed: `successors()` copies a\n>   `SwitchInt`'s targets into a `SmallVec<[_; 2]>`, which spills for a `match` with a third\n>   target (an enum's `otherwise`), so the walk reads `all_targets()` itself (`next_blocks`).\n>   Without that the budget of 2 fails on `work`.\n> - §9.3 `type_name.rs` (`Lent<String>`, `into_name`), §9.4 `operands` as an iterator\n>   (`hir-ty-codegen/fncache.rs:1619`'s `.into_iter()` is now clippy's `useless_conversion`;\n>   codegen's to drop), §5.6, §5.7.\n> - §10.2, and §10.3's `storage_conflicts_allocate_their_result_only` and\n>   `type_names_allocate_the_name_only` in `tests/mir/alloc_budget.rs`, with three memo-hit\n>   tests (`mir_body`, `optimized_mir_body`, `const_eval`: 0 allocations).\n> - Next: step 2 (§6 with `Ctx<'f>`), then 3, 4, 5. Step 6 waits on D1 and D2 (hir-ty).\n> - §10.1's `budget.rs` is written against `&'db dyn HirDatabase`; the database is concrete\n>   now (`base_db::Db`, common.md), so it lands taking `db: &'db Db`.\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).\n\n> mem-codegen (2026-10-29 20:53): every `&'db dyn HirDatabase` in this request's code is now\n> `&'db Db` (`base_db::Db`, as the tree has it: `optimize.rs:36`), so no request brings back a\n> `dyn` database; `budget.rs` gains `use base_db::Db;`. Told codegen-mir.",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#13. Order to land in",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:2591"
+    }
+  ]
+}

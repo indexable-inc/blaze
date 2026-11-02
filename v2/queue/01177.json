@@ -1,0 +1,36 @@
+{
+  "id": "01177",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-front",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower/macro_error.rs"
+  ],
+  "what": "hir/src/diagnostics.rs emit_def_diagnostic DefDiagnosticKind::MacroError formats message as \"{path}: {message}\", so blaze-diagnostics lower/macro_error.rs exact matches (\"overflow expanding the original macro\", \"proc-macro panicked: \", \"macro definition has parse errors\") never match a def-level (item position) macro error; e.g. the RecursionOverflow DefDiagnostic hir-def now records (nameres DefDiagnostic::recursion_overflow) is worded as a generic \"blaze can't expand\" instead of rustc's recursion-limit error. Give hir::MacroError the ExpandErrorKind (or drop the prefix) so the lowering matches on the kind.",
+  "state": "applied",
+  "created": "2026-10-30T23:27:07Z",
+  "updated": "2026-10-31T00:27:42Z",
+  "taken_by": "no-fallback-front",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:27:07Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:36:10Z",
+      "by": "no-fallback-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T00:27:42Z",
+      "by": "no-fallback-front",
+      "action": "done",
+      "note": "no-fallback-front-def: hir MacroError arm prints rustc message without the {path}: prefix (crates/hir/src/diagnostics.rs)"
+    }
+  ]
+}

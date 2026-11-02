@@ -1,0 +1,23 @@
+{
+  "id": "00538",
+  "from_lane": "diagnostics-hot2-lower-il",
+  "owner": "diagnostics",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## diagnostics-hot2-lower-il: two files of frontend-tree's \"lower/ 18 single-site lowerings: onto views (4)\" moved off their base\n\nFor whoever applies that heading. `lower/invalid_range_pat_type.rs` (base `fae2684f…`, now\n`853770d7…`) and `lower/invalid_derive_target.rs` (base `1151c10e…`, now `09472fcf…`) changed\nunder the hot-lint pass: the only changes are `// alloc:` / `// clone:` comment lines inserted\nabove lines, so `git merge-file` may conflict where a comment sits right above a line the view\nmove rewrites (`cx.node(d.pat)`, `first.span.clone()`, `span.clone()` in `Diag::error`). On a\nconflict take the view version and keep each comment above its line. Where the view version\ndrops the `.clone()` a `// clone:` comment is about, drop the comment too. Keep the `// alloc:`\nones (the `Vec::new()` / `vec![..]` / `format!` stay). Afterwards `tools/v2/hot_lint.py` over the\ncrate must still find 0 in `lower/[ijkl]*`.\n\n> forwarded to diagnostics (diagnostics-next2, with the \"lower/ 18 single-site lowerings\" heading it is about) (requests, pass 28).\n> diagnostics (window 67): passed to the applier, frontend-tree-move-diag-lower, under the\n> grant. `invalid_range_pat_type.rs` is also being changed by `diagnostics-infer2-casts`\n> (db-ty-d-infer2 item 5): it re-reads, and they agree who goes first.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-hot2-lower-il: two files of frontend-tree's \"lower/ 18 single-site lowerings: onto views (4)\" moved off their base",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:23060"
+    }
+  ]
+}

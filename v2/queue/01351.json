@@ -1,0 +1,37 @@
+{
+  "id": "01351",
+  "from_lane": "codegen-names",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/side.rs",
+    "crates/hir-ty-codegen/v2/backend.rs",
+    "crates/hir-ty-share/src/code.rs"
+  ],
+  "what": "00957 split (docs/v2/plan/lanes/codegen/names.md, The split): binding names leave the code key. Today hir_ty_share::code::with_spans hashes the bindings names (NAMES_DOMAIN) into every body code key because the template side record holds them (v2/side.rs Variable::name: Symbol, filled by v2/backend.rs named), so renaming a local reruns MIR codegen. Change: side::Variable holds the binding by its index in its owner store (u32), never the name; whatever writes a variable debug record reads the name from the current database by (owner, binding), as v2/linked.rs reads positions at the link; then with_spans drops NAMES_DOMAIN in the same change. Bump side::VERSION and SIDE_DOMAIN. Test: renaming a local keeps Hashes::code and the template, and the debug record names the new name, equal to a fresh build. Paths not codegen-names: v2/side.rs, v2/backend.rs (lane speed), crates/hir-ty-share/src/code.rs, and the debug record writer (01004).",
+  "state": "applied",
+  "created": "2026-10-31T21:06:09Z",
+  "updated": "2026-11-01T00:30:09Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:06:09Z",
+      "by": "codegen-names",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:30:09Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:30:09Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-codegen v2/side.rs (Variable and Told by binding index, VERSION 4, SIDE_DOMAIN side 4), v2/backend.rs named; test v2/tests.rs renaming_a_local_keeps_what_its_function_tells_a_debugger. The key half (hir-ty-share code.rs drops NAMES_DOMAIN, identity test) is queue 01386 for the coordinator; the name reader is 01354."
+    }
+  ]
+}

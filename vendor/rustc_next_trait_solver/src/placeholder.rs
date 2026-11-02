@@ -3,8 +3,9 @@ use core::panic;
 use rustc_type_ir::data_structures::IndexMap;
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::{
-    self as ty, InferCtxtLike, Interner, PlaceholderConst, PlaceholderRegion, PlaceholderType,
-    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    self as ty, Const, InferCtxtLike, Interner, PlaceholderConst, PlaceholderRegion,
+    PlaceholderType, PredicateProxy, Region, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt,
 };
 use tracing::debug;
 
@@ -47,6 +48,8 @@ where
         IndexMap<ty::PlaceholderType<I>, ty::BoundTy<I>>,
         IndexMap<ty::PlaceholderConst<I>, ty::BoundConst<I>>,
     ) {
+        // Read only with `assumptions_on_binders`, so copied only then.
+        let old_universes = infcx.cx().assumptions_on_binders().then(|| universe_indices.clone());
         let mut replacer = BoundVarReplacer {
             infcx,
             mapped_regions: Default::default(),
@@ -57,8 +60,29 @@ where
         };
 
         let value = value.fold_with(&mut replacer);
+        let BoundVarReplacer {
+            mapped_regions,
+            mapped_types,
+            mapped_consts,
+            universe_indices,
+            infcx: _,
+            current_index: _,
+        } = replacer;
 
-        (value, replacer.mapped_regions, replacer.mapped_types, replacer.mapped_consts)
+        if let Some(old_universes) = old_universes {
+            for (old, new) in old_universes.into_iter().zip(universe_indices.iter()) {
+                if let (None, Some(new)) = (old, new) {
+                    // FIXME(-Zassumptions-on-binders): `replace_bound_vars` does not have enough
+                    // context to compute placeholder assumptions for the binders it enters.
+                    infcx.insert_placeholder_assumptions(
+                        *new,
+                        rustc_type_ir::region_constraint::Assumptions::empty(),
+                    );
+                }
+            }
+        }
+
+        (value, mapped_regions, mapped_types, mapped_consts)
     }
 
     fn universe_for(&mut self, debruijn: ty::DebruijnIndex) -> ty::UniverseIndex {
@@ -91,7 +115,7 @@ where
         t
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         match r.kind() {
             ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _)
                 if debruijn.as_usize()
@@ -138,7 +162,7 @@ where
         }
     }
 
-    fn fold_const(&mut self, ct: I::Const) -> I::Const {
+    fn fold_const(&mut self, ct: Const<I>) -> Const<I> {
         match ct.kind() {
             ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), _)
                 if debruijn.as_usize() + 1
@@ -161,7 +185,7 @@ where
         }
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         if p.has_vars_bound_at_or_above(self.current_index) { p.super_fold_with(self) } else { p }
     }
 }
@@ -224,9 +248,9 @@ where
         t
     }
 
-    fn fold_region(&mut self, r0: I::Region) -> I::Region {
+    fn fold_region(&mut self, r0: Region<I>) -> Region<I> {
         let r1 = match r0.kind() {
-            ty::ReVar(vid) => self.infcx.opportunistic_resolve_lt_var(vid),
+            ty::ReVar(vid) => self.infcx.shallow_resolve_region_var(vid),
             _ => r0,
         };
 
@@ -288,7 +312,7 @@ where
         }
     }
 
-    fn fold_const(&mut self, ct: I::Const) -> I::Const {
+    fn fold_const(&mut self, ct: Const<I>) -> Const<I> {
         let ct = self.infcx.shallow_resolve_const(ct);
         if let ty::ConstKind::Placeholder(p) = ct.kind() {
             let replace_var = self.mapped_consts.get(&p);

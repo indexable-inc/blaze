@@ -2,7 +2,7 @@
 """loadedits.py: a file written while a worker loads the workspace is built as written.
 
 usage: loadedits.py [--rounds N] [--keep]   (BLAZE_BIN names the blaze built; blaze
-                                             and blaze-rustc are found next to it)
+                                             is found next to it)
 
 A worker reads the workspace's files when it loads, and from then on builds a file again
 when its timestamp is no longer the one it took. A write after the read and before the

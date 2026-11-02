@@ -3,13 +3,11 @@
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
-  build_release.py --target T [--profdata FILE] [--features F] [--out DIR [--server]]
-                                                  # the build, into target/T/dist; DIR gets every binary of blaze,
-                                                  # and with --server blaze's proc-macro server
+  build_release.py --target T [--profdata FILE] [--features F] [--out DIR]
+                                                  # the build, into target/T/dist; DIR gets every binary of blaze
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
   build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
-  build_release.py --server-beside BLAZE         # blaze's proc-macro server beside a blaze already built (CI)
 
 The build is `cargo build -p blaze-engine --profile dist --locked --target T --features llvm` with
 `RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
@@ -45,15 +43,7 @@ on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
 them. macOS and Linux; stdlib only.
 
-With `--server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
-docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
-proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1`). It is
-built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
-bridge of the libraries that blaze compiles; its own serde derives are expanded by the
-toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
-Not on Windows, whose release blaze does not build yet.
-
-On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
+On Linux every binary in DIR is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
 oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
 (GitHub issue #351). install.sh says the same floor to a system below it. With `--nix` (the
@@ -87,10 +77,6 @@ RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles
 # A training run that reached the workers counts tens of billions; one that lost them a few
 # million (the client's own short runs).
 MIN_COUNT = 1_000_000_000
-# blaze's proc-macro server: its workspace, the crate of its executable, and the name it ships as.
-SERVER = ROOT / "vendor" / "proc-macro-srv"
-SERVER_CRATE = "rust_analyzer_proc_macro_srv"
-SERVER_BIN = "blaze-proc-macro-srv"
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
 # The hash rustc gives the crate blaze-engine, in each of its symbols. Cargo derives it from the
@@ -298,24 +284,6 @@ def pin(dirs):
     PINS.write_text(json.dumps(table, indent=2) + "\n")
 
 
-def proc_macro_server(blaze, out):
-    """blaze's proc-macro server, built and linked by `blaze` into `out`, from a store of its
-    own; the path of the executable."""
-    exe = out / SERVER_BIN
-    with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
-        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_CACHE=str(Path(work) / "store"),
-                   BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
-        start = time.monotonic()
-        # `proc_macro` is not in the standard library's unit: the program that links it has it.
-        run([str(blaze), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
-             "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env)
-    said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
-                          env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
-    print(f"build_release: {said.stdout.strip()} as {exe}, built by blaze in {time.monotonic() - start:.1f} s",
-          flush=True)
-    return exe
-
-
 def glibc_asked(binary):
     """The newest glibc `binary` asks for, as (major, minor), or None for one that asks for none."""
     found = {(int(major), int(minor)) for major, minor in GLIBC_VERSION.findall(binary.read_bytes())}
@@ -385,14 +353,12 @@ def check_nix(out):
 
 
 def ship(args, binaries):
-    """The binaries copied into `--out`, with blaze's proc-macro server for `--server`."""
+    """The binaries copied into `--out`."""
     if not args.out:
         return
     args.out.mkdir(parents=True, exist_ok=True)
     for binary in binaries:
         shutil.copy2(binary, args.out / binary.name)
-    if args.server:
-        proc_macro_server(args.out / "blaze-engine", args.out)
     check_loads(args.out)
     if "linux" in args.target:
         check_nix(args.out) if args.nix else check_glibc(args.out)
@@ -406,9 +372,6 @@ def main():
     parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
     parser.add_argument("--features", help="cargo features of blaze besides `llvm`, which every build has")
-    parser.add_argument("--server", action="store_true", help="build blaze's proc-macro server into --out with that blaze")
-    parser.add_argument("--server-beside", type=Path, metavar="BLAZE",
-                        help="only build blaze's proc-macro server, with BLAZE, beside it (CI's build of blaze)")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
@@ -417,15 +380,8 @@ def main():
     args = parser.parse_args()
     if args.pin:
         return pin(args.pin)
-    if args.server_beside:
-        blaze = args.server_beside.resolve()
-        proc_macro_server(blaze, blaze.parent)
-        return
     if not args.target:
         parser.error("--target is required")
-    if args.server and not args.out:
-        parser.error("--server builds into --out")
-    # The server is built from its own directory, where a relative `--out` names nothing.
     args.out = args.out and args.out.resolve()
     if args.train:
         return train(args.target, args.train)

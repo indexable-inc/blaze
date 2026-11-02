@@ -1,0 +1,36 @@
+{
+  "id": "01092",
+  "from_lane": "integrate-store",
+  "owner": "integrate-engine",
+  "paths": [
+    "docs/fn-cache.md",
+    "docs/research/codegen-units.md"
+  ],
+  "what": "From integrate-store, after 01042: tools/docs.py check has 2 problems left, both from the deleted v1 files: docs/fn-cache.md names crates/hir-ty-codegen/patch.rs, and docs/research/codegen-units.md links ../../crates/hir-ty-codegen/units.rs.",
+  "state": "applied",
+  "created": "2026-10-30T16:32:42Z",
+  "updated": "2026-10-30T22:21:35Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:32:42Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:23Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:35Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "already fixed in the tree (docs/research/codegen-units.md says units.rs was deleted 2026-10-30; fn-cache.md no longer names patch.rs); tools/docs.py check is clean"
+    }
+  ]
+}

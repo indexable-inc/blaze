@@ -1,0 +1,38 @@
+{
+  "id": "00951",
+  "from_lane": "speed-clone-link",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/state.rs",
+    "crates/blaze-link/src/place.rs",
+    "crates/blaze-link/src/write.rs",
+    "crates/blaze-link/src/file.rs"
+  ],
+  "what": "blaze-link State::clone (once per Image::stage, lib.rs stage: `let mut new = self.state.clone()`) allocates once: the `spaces: Vec<Space>` copy (state.rs `State::spaces`). Make it zero on a stage that writes no region: hold `spaces` as `Arc<Vec<Space>>` (or a CowVec) and take `Arc::make_mut` at its writers (place.rs:284 and :580, write.rs:716, :879, :945, file.rs:379, :383; readers place.rs:771, premap.rs:671 unchanged). Then change state.rs `a_clone_allocates_the_regions_list_only` from `assert_eq!(used.allocations, 1)` to 0 and rename it. Why: the clone is per stage, and a stage that only moves slots or changes names writes no region.",
+  "state": "applied",
+  "created": "2026-10-30T11:02:45Z",
+  "updated": "2026-10-30T14:18:13Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:02:45Z",
+      "by": "speed-clone-link",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:18:12Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:18:13Z",
+      "by": "speed",
+      "action": "done",
+      "note": "link DONE, so speed applied it. state.rs: `spaces: Arc<Vec<Space>>`; every writer takes `Arc::make_mut` only where a region changes (place.rs end_frames, allocate, resize; write.rs relocate_all resize only when a space is short, write-back only when `back` is non-empty, write_cells only with writes; file.rs synthetic homes, offsets only when one differs); full layout `Arc::new` once. Test `a_clone_allocates_nothing` (0, ptr_eq) replaces the 1-allocation test; new `a_write_to_a_copys_region_leaves_the_original` (first write 2 allocations, second 0, original untouched). Unbuilt."
+    }
+  ]
+}

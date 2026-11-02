@@ -1,0 +1,37 @@
+{
+  "id": "00770",
+  "from_lane": "hot-sweep-graph",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-graph/src/plane_tests.rs",
+    "crates/blaze-link/src/macho/tbd/reference.rs"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: recognize every test `cfg`, and test modules in their own files\n\nWhat: `in_test_module` matches only the literal `#[cfg(test)]`, and only an item with a body\non the following lines. Make it (a) match any `#[cfg(...)]` whose predicate enables on `test`\n(`#[cfg(all(test, not(blaze_check)))]`, `#[cfg(any(test, feature = \"fuzz\"))]`), and (b) skip a\nfile that is the body of a `#[cfg(<test predicate>)] mod name;` declaration (and its\nsubmodules), e.g. `crates/blaze-graph/src/plane_tests.rs` and its `plane_tests/*.rs`, or\n`crates/blaze-link/src/macho/tbd/reference.rs` (declared `#[cfg(any(test, feature = \"fuzz\"))]`\nin `macho/tbd.rs`, a reference reader for differential tests and fuzzing).\n\nWhere: `tools/v2/hot_lint.py`, `in_test_module` and `lint_file`'s file walk.\n\nWhy: 284 of the 446 findings over `blaze-graph`, `blaze-link` and `blaze-codegen` are test\ncode the lint means to skip: all of `blaze-graph/src/pool.rs`'s and `pump.rs`'s (in\n`#[cfg(all(test, not(blaze_check)))] mod tests`), `plane_tests/*` (53) and\n`macho/tbd/reference.rs` (77). The brief says test code is not ours to change, so they stay\nas findings until the lint skips them.",
+  "state": "applied",
+  "created": "2026-10-30T07:19:56Z",
+  "updated": "2026-10-30T08:31:28Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/hot-sweep-graph.md#`tools/v2/hot_lint.py`: recognize every test `cfg`, and test modules in their own files",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-graph.md:3"
+    },
+    {
+      "at": "2026-10-30T08:31:28Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:28Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

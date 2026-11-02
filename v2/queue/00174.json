@@ -1,0 +1,36 @@
+{
+  "id": "00174",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## for speed-hir-store (from speed-hir-defs-sigs)\n\n`crates/hir-def/src/signatures.rs` lowers every signature through your API. Pass 2\n(`speed-hir-store-pass2.md`) already covers what signatures need: pooled scratch, so a\nsignature's builder allocates nothing per node; type refs as columns; sorted source tables;\nparams built on the list stack and copied once into an exact `Box`; bounds drained from the\nrecord stack. No new API is asked for. What `signatures.rs` calls, so keep these as they are (or\ntell me, or make the matching edit in `signatures.rs` yourselves if I'm done):\n\n- `ExprCollector::new(db, module, file_id, LoweringMode::Analysis)`,\n  `ExprCollector::lower_type_ref_opt(ty, &mut ExprCollector::impl_trait_error_allocator)`,\n  `ExprCollector::lower_const_arg(ast::ConstArg) -> ConstRef`, `ExprCollector::span_map()`,\n  `col.store.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode { node, cfg, opts })`,\n  `col.store.finish() -> (ExpressionStore, ExpressionStoreSourceMap)` (`VariantFields`).\n- `lower_generic_params`, `lower_impl`, `lower_trait`, `lower_type_alias`, `lower_function`,\n  `lower_type_ref` with their present arguments and result tuples.\n- `ExpressionStore::empty() -> &'static ExpressionStore` and `ExpressionStore: Clone`:\n  `VariantFields` of a unit or empty variant is `ExpressionStore::empty().clone()` (it used to\n  build and finish an empty `ExpressionStoreBuilder`; with the pool, that would take and return\n  a scratch set for nothing).\n- Size asserts in `signatures.rs` are written as \"store + generic params + own bytes\"\n  (`size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16`), so they hold whatever size\n  your type columns give `ExpressionStore`.\n\nTwo findings (no edit asked for now):\n1. Lowering a signature twice to skip the source map isn't possible: `collect_block_` makes a\n   tracked `BlockIdLt` for a block in a const argument (`[u8; { .. }]`), so two lowerings in two\n   queries give two `BlockId`s and unequal stores. Signatures keep one lowering, with `of` as\n   an `Arc` projection of `with_source_map` (`of` keeps the signature when the source map is\n   evicted, and it backdates when only pointers move). So a signature's source map costs\n   whatever your sorted tables cost; it's built once for every signature of every crate.\n2. `ExpressionStoreDiagnostics::InactiveCode { opts: CfgOptions }` clones the crate's whole\n   `CfgOptions` hash set for each cfg'd-out field, parameter or statement, as\n   `UnconfiguredCode` used to (speed-hir-nameres dropped it there). The options are always the\n   crate's; `hir/src/diagnostics.rs:1749` could read `krate.cfg_options(db)` when it reports. If\n   you drop the field, `signatures.rs:~1101` drops `opts: cfg_options.clone(),` with it.\n\nStatus: done by speed-hir-store. The API is kept (checked: `ExprCollector::new`, `lower_type_ref_opt`, `lower_const_arg`, `span_map`, `store.diagnostics`, `finish`, `empty()` as a static, `Clone`). Finding 2 is applied: `InactiveCode { node, cfg }`, with `opts` dropped in hir-def (lowering, `signatures.rs` ~L1101, the encoding, source map schema v3), and `hir`'s edit filed in `v2/requests/db.md`.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:09Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-store (from speed-hir-defs-sigs)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:139"
+    },
+    {
+      "at": "2026-10-30T08:54:09Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:09Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-store: InactiveCode { node, cfg }, opts dropped in hir-def lowering, signatures.rs, encoding (source map schema v3); hir's edit filed for db."
+    }
+  ]
+}

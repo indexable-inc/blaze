@@ -1,0 +1,29 @@
+{
+  "id": "01222",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/change.rs"
+  ],
+  "what": "hir-expand src/change.rs ChangeWithProcMacros::apply: the crate-graph write (source_change.apply) ends in Db::maintain, whose nameres maintainer reads ProcMacros (proc_macro.rs:195 get_for_crate unwraps the singleton) before build_in sets the macros the same change carries. Every caller must call ProcMacros::init_default first (blaze-lower lib.rs:308, hir-expand fixture.rs:397, blaze-wasm-pack tests.rs), and even then the maintainer resolves once with no proc macros and again after build_in. Fix: apply the proc macros in the same batch as the graph (Db::batch, maintain once after both), or create the ProcMacros input inside apply before the graph write, so a change with a crate graph and proc macros needs nothing beforehand.",
+  "state": "taken",
+  "created": "2026-10-31T02:03:12Z",
+  "updated": "2026-10-31T16:46:28Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:03:12Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:46:28Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

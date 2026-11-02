@@ -1,0 +1,21 @@
+{
+  "id": "00515",
+  "from_lane": "diagnostics-lints-syntax-cfg",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-syntax-cfg: `--cfg` and `--edition` on the command line (owner of `lints/levels.rs`)\n\nWhat: `CommandLine::cfg: Vec<String>`, every `--cfg v` / `--cfg=v` as given (already asked of\nlevels by the parent). `check_cfg::lints` reads it: it parses each in the crate's edition\n(rustc's `parse_cfg`; one it cannot parse is rustc's fatal error, emitted unplaced), keeps each\nonce, and lints `explicit_builtin_cfgs_in_flags`. Also: read `--edition x` / `--edition=x` and\ncall `flags.check_cfg.add_in(&spec, edition)?` in place of `add(&spec)` for `--check-cfg`.\nWhy: until `cfg` exists `check_cfg.rs` does not compile; and a `--check-cfg` naming `async` or\n`r#true` is read as 2015 whatever the crate's edition.\n\n> forwarded to diagnostics: `lints/levels.rs` is its own.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-cfg: `--cfg` and `--edition` on the command line (owner of `lints/levels.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2555"
+    }
+  ]
+}

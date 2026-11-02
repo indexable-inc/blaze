@@ -1,0 +1,35 @@
+{
+  "id": "00954",
+  "from_lane": "fix-borrowck-cow",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/cow.rs"
+  ],
+  "what": "crates/blaze-link/src/cow.rs is invalid Rust, not a checker false positive (00939's premise): rustc rejects `unique` (200), `own` (213) and `node_mut` (231) with E0106 'missing lifetime specifier', because each one's only parameter has two lifetimes, the elided `&mut` and the written `'static` (rustc_resolve late.rs resolve_fn_params counts `'static` as an elision candidate; rustc's tests/ui/lifetimes/issue-26638.rs is the same case). Fix: give each a lifetime, e.g. `fn unique<'s, P, E, const N: usize>(shared: &'s mut Shared<'static, [E; N]>) -> &'s mut [E; N]`, `fn own<'s, T, const N: usize>(chunk: &'s mut Shared<'static, [T; N]>) -> &'s mut [T; N]`, `fn node_mut<'s, P, X>(slot: &'s mut Option<Shared<'static, [Option<X>; FAN]>>) -> &'s mut [Option<X>; FAN]`. The late-bound `'s` keeps every turbofish caller (`unique::<P, E, N>`, `node_mut::<F, C>`) valid. The `Shared::<'static, [E; N]>::get_mut` turbofish added at 208 does nothing and can go back to `Shared::get_mut(shared)`. The installed blaze reports this as 'lifetime may not live long enough' at 208:5 because it lacks the E0106; the v2 tree reports the E0106s (see /tmp/blaze-lanes/v2-fix-borrowck-cow.md).",
+  "state": "applied",
+  "created": "2026-10-30T11:38:31Z",
+  "updated": "2026-10-30T11:47:36Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:38:31Z",
+      "by": "fix-borrowck-cow",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:47:36Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:47:36Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "crates/blaze-link/src/cow.rs: unique, own and node_mut name the borrow they return (fn f<'a, ..>(x: &'a mut Shared<'static, ..>) -> &'a mut ..), fixing rustc E0106 at 200, 213, 231. The lifetime is late-bound, so turbofish callers are unchanged."
+    }
+  ]
+}

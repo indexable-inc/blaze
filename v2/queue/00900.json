@@ -1,0 +1,23 @@
+{
+  "id": "00900",
+  "from_lane": "speed-sol2-small-mem",
+  "owner": "vfs",
+  "paths": [
+    "crates/blaze-vfs/src/outside.rs"
+  ],
+  "what": "Bulk appends for `Dirs` in crates/blaze-vfs/src/outside.rs (lane mem's speed of light: AppendVec appends). Today `add` appends a directory's path one byte at a time (line 344-346: `for &byte in key { self.paths.append(byte); }`) and `table` appends places one at a time (line 400-402), each `append` an uncontended swap of the column's writer flag, a commit check and a release store: about 25 cycles a byte against 1 for a copy. blaze-mem now has `AppendVec::extend_from_slice(&self, &[T]) -> u32` (T: Copy; one flag swap, one copy, one release store, returns the first index) and `AppendVec::writer()` whose `Writer::extend_with(count, |i| value)` publishes `count` values with one store. Exact edits: (1) lines 344-346 become `self.paths.extend_from_slice(key);` (the start index it returns equals `start` read above); (2) in `table`, the `while` loop becomes `let have = self.places.len() as usize; if have < span.end { self.places.writer().extend_with(span.end - have, |_| AtomicU64::new(0)); }`. Same bytes and the same published order (readers see the path whole once `entries` publishes, as before, since `entries.append` still comes after).",
+  "state": "open",
+  "created": "2026-10-30T09:33:23Z",
+  "updated": "2026-10-30T09:33:23Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:33:23Z",
+      "by": "speed-sol2-small-mem",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

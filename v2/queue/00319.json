@@ -1,0 +1,36 @@
+{
+  "id": "00319",
+  "from_lane": "mem-db-infer-expr",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir-ty/src/infer"
+  ],
+  "what": "## What these files allocate, in short\n\n| temporary | made | before | after |\n|---|---|---|---|\n| coercion's adjustment list (`CoerceResult`) | per coercion | `Vec<Adjustment>` then `into_boxed_slice` (1 to 2 global) | `Vec<Adjustment, &'f Frame>`, copied once into the table; usually the frame's top block, so its drop frees it in place |\n| every `write_expr_adj` argument | per adjusted expression | `Box<[Adjustment]>` (1 global; LUB: 1 per earlier arm) | `&[Adjustment]` (an array on the stack or a frame `Vec`) |\n| autoderef's adjustment list (`adjust_steps_as_infer_ok`) | per field access, call, index, reborrow | `Vec<Adjustment>` (1 global) | `Vec<Adjustment, &'f Frame>` at exact length (ctx's function, interface X2) |\n| `CoerceMany`'s pushed expressions | per `match`/block/loop/return site | `SmallVec<[ExprId; 4]>`, spills on a 5th arm (1 global per big `match`) | `Vec<ExprId, &'f Frame>`; `match` reserves its arm count once |\n| `check_call_arguments`' formal/expected input lists | per call, method call, overloaded call | up to 4 global `Vec<Ty>` (collect, clone, two re-collecting folds in `fudge_inference_if_ok`, clone for the fallback) | 1 to 3 frame `Vec<Ty>`; the fold is in place (`FrameList`), the fallback borrows |\n| tuple expression element types | per tuple expression | `Vec<Ty>` (1 global) | frame `Vec<Ty>` at exact length |\n| struct literal field maps (`remaining_fields`, `seen_fields`, the two missing lists) | per struct literal | 2 `FxHashMap` (cloning a `Name` per field) + 2 `Vec` | frame `hashbrown` maps at exact capacity keyed by `&Name`, frame `Vec`s |\n| record pattern field maps (`field_map`, `used_fields`, `inexistent_fields`, `unmentioned_fields`) | per record pattern | 2 `FxHashMap` + 2 `Vec` | frame maps at exact capacity keyed by `&Name`, frame `Vec`; the unmentioned list is made only for the diagnostic that owns it |\n| `DeferredCallResolution::adjustments` | per call of a closure whose kind is unknown | `Vec<Adjustment>` | `Vec<Adjustment, &'f Frame>` (`DeferredCallResolution<'db, 'f>`) |\n| `check_legacy_const_generics` | per call of a fn item | `generics()` and a `Vec<ConstParamId>` for every fn-item call, then `Box<[u32]>` | `&'f mut [u32]` in the frame; `generics()` and the frame `Vec<ConstParamId>` only for a function with legacy const generics |\n| `CastCheck` | per `as` | 24 bytes in ctx's global `Vec<CastCheck>` | the same value in ctx's frame `Vec` (X4); `CastCheck` holds no heap data and gains no lifetime |\n| `cast.rs`'s auto-trait set | per dyn-to-dyn pointer cast | `FxHashSet` | frame `Vec` with `contains` (a handful of auto traits) |\n| `could_coerce` (entry point from `crates/hir`) | per IDE/diagnostic query | ran the coercion, then evaluated obligations, folded and re-collected the adjustments, all of which `.is_ok()` ignored | runs only the coercion, in `frame::task(Tag::Infer, ..)` |\n\nNot present in this tree, though the brief names them: `coerce_unsized` has no queue (it checks\n`CoerceUnsized`/`Unsize` with one `visit_proof_tree` and `CoerceVisitor`; the visitor's\n`goal.candidates()` list is the solver's, mem-db-solver's). Pattern lowering has no binding-mode\nstack (`PatInfo` is a `Copy` value passed down), slice patterns borrow their prefix and suffix\nfrom the store (`before: &[PatId]`, `after: &[PatId]`), subpattern type lists are interned\n`Tys`, and `PatOrigin` is a `Copy` enum. Those need no change.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-mem (22:45): a summary of E0 to E17, each settled in its own section; in the tree (`crates/hir-ty/src/infer/{coerce,expr,pat,callee,cast,op,place_op}.rs`).",
+  "state": "applied",
+  "created": "2026-10-30T03:25:12Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-expr.md#What these files allocate, in short",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-expr.md:14"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:45): a summary of E0 to E17, each settled in its own section; in the tree (`crates/hir-ty/src/infer/{coerce,expr,pat,callee,cast,op,place_op}.rs`)."
+    }
+  ]
+}

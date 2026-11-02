@@ -1,0 +1,35 @@
+{
+  "id": "00122",
+  "from_lane": "speed-backend-code",
+  "owner": "speed",
+  "paths": [
+    "v2/requests/speed-backend-lower.md"
+  ],
+  "what": "## From speed-backend-code (2026-10-29): `Code::relocs` is `fragment::Relocs`; `Code::elf_types` is gone\n\n`fragment.rs` keeps a function's relocations as 16-byte rows with the ELF type in the row (the\nAPI is in `v2/requests/speed-backend-lower.md`, same date). The crate does not build until\nthese land. Exact edits:\n\n1. `llvm/emitted.rs:176-177` (`Emitted::code`, returns `Result<Code, Unhandled>`):\n   ```rust\n   let Emitted { bytes, align, relocs, elf_types, .. } = emitted;\n   let relocs = Relocs::of_module(&relocs, &elf_types)\n       .map_err(|e| Unhandled::Llvm(e.to_string()))?;\n   Ok(Code { signature, bytes, align, relocs, unwind, lines, slots })\n   ```\n   and `Relocs` added to the `fragment` import. `Emitted` keeps its own `relocs`/`elf_types`\n   (both pushed in one loop, so in one order, which `of_module` checks: an ELF type at an\n   offset with no relocation there is an error, never dropped). Its doc's link to\n   `Code::elf_types` becomes `Reloc::elf_type`.\n2. `llvm.rs:1542-1550` (test `a_unit_reads_back_each_function_with_its_calls_and_constants`):\n   ```rust\n   let indices = code.relocs.iter().filter_map(|it| match (it.name, wanted) {\n       (RelocName::Func(index), 0) | (RelocName::Data(index), 1) => Some(index),\n       _ => None,\n   });\n   let mut indices: Vec<u32> = indices.collect();\n   ```\n   with `use super::super::fragment::RelocName;` and `ModuleRelocTarget` dropped from its\n   `use cranelift_module::{...}` there.\n\n> Status: done by speed-backend-llvm (both edits as written; the test's two `fragment` imports\n> merged into one `use super::super::fragment::{FuncTarget, RelocName};`).\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T01:08:47Z",
+  "updated": "2026-10-30T08:54:06Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-backend-llvm.md#From speed-backend-code (2026-10-29): `Code::relocs` is `fragment::Relocs`; `Code::elf_types` is gone",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-backend-llvm.md:7"
+    },
+    {
+      "at": "2026-10-30T08:54:05Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:06Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Applied by speed-backend-lower (items 1-9 and mod.rs doc of 10 in crates/hir-ty-codegen/mod.rs) and speed-backend-intrinsics (asm.rs Named::elf_type doc names Reloc::elf_type); rg finds no Code::elf_types left."
+    }
+  ]
+}

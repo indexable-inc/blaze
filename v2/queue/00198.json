@@ -1,0 +1,37 @@
+{
+  "id": "00198",
+  "from_lane": "frontend-journal-linux",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/journal/linux.md",
+    "docs/v2/plan/design",
+    "docs/v2/plan/design/restore.md"
+  ],
+  "what": "## frontend-journal-linux: restore.md's Linux sweep is on every core, not through io_uring\n\nWhy: the speed-of-light bar. io_uring always punts `STATX` to io-wq, and each request's prep\n(name copy, queue, wake) runs serially on the one submission thread: 30–60 ms for 100k names\nwhatever the cores, 5–80× the bound of N·t/C (6 ms on 8 cores, 0.8 ms on 64). `uring.rs` now\nsweeps on a per-core pool of `statx` calls relative to each directory; the arithmetic is in\n`docs/v2/plan/lanes/frontend/journal/linux.md`, \"Speed of light\". `docs/v2/plan/design/` is\noutside the lane, so for whoever holds it:\n\n- File: `docs/v2/plan/design/restore.md`\n- Old:\n  ```\n  - **Linux:** no journal survives a restart, so one batched `statx` sweep over the tracked\n    paths through io_uring, compared on inode, size, mtime and ctime. That's about 50 ms for\n    100k files, then fanotify.\n  ```\n- New:\n  ```\n  - **Linux:** no journal survives a restart, so one `statx` sweep over the tracked paths on\n    every core (io_uring's `STATX` is prepared serially on one thread, which is slower than the\n    calls themselves), compared on inode, size, mtime, ctime and mode. That's within 50 ms for\n    100k files, a few ms on 8 cores, then fanotify.\n  ```\n\nAnswer with `>` lines below.\n\n> forwarded to the coordinator: `docs/v2/plan/design/` is its, listed in requests' report.",
+  "state": "applied",
+  "created": "2026-10-30T02:16:22Z",
+  "updated": "2026-10-30T08:28:08Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/frontend-journal.md#frontend-journal-linux: restore.md's Linux sweep is on every core, not through io_uring",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-journal.md:414"
+    },
+    {
+      "at": "2026-10-30T08:28:08Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:08Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/design/restore.md, the Linux bullet: replaced word for word with the per-core statx sweep (compared on inode, size, mtime, ctime and mode; within 50 ms for 100k, a few ms on 8 cores). Checked against blaze-core journal.rs Stamp (mode is compared) and uring.rs."
+    }
+  ]
+}

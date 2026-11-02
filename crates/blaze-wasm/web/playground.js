@@ -106,10 +106,7 @@ class Builds {
   }
 }
 
-const skipped = (report) => [
-  ...report.skipped.map(({ name, why }) => `not compiled: ${name}: ${why}`),
-  ...(report.errors ?? []),
-];
+const errors = (report) => report.errors ?? [];
 
 // The programs that draw: `core` and the program are all there is, compiled from source.
 class Canvas extends Builds {
@@ -170,7 +167,7 @@ class Canvas extends Builds {
     this.stopped = null;
     return {
       parts: [`${report.bodies} in the program`, `analysis ${ms(report.listing_ms)}`],
-      notes: skipped(report),
+      notes: errors(report),
     };
   }
 
@@ -256,14 +253,7 @@ class Dioxus extends Builds {
     } else {
       program.base.blaze_rerender();
     }
-    const host = Object.keys(report.host ?? {}).length;
-    return {
-      parts: host > 0 ? [`${count(host, "function")} of rustc's module linked`] : [],
-      notes: [
-        ...skipped(report),
-        ...(report.mismatched ?? []).map((it) => `signature differs from rustc's: ${it}`),
-      ],
-    };
+    return { parts: [], notes: errors(report) };
   }
 }
 

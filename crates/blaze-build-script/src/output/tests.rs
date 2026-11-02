@@ -3,6 +3,8 @@
 //! rust-lang/cargo at 5f94df478, MIT or Apache-2.0), with the messages cargo fails with. Each
 //! names the test it comes from; `[ROOT]` is `/p`.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::unit::Target;
 
@@ -183,6 +185,16 @@ fn new_syntax_and_rust_version() {
             "{message}"
         );
     }
+    // A `rust-version` that is no version is refused, not taken to allow `cargo::`.
+    for unread in ["", "1.x", "1.77.0.1", "latest"] {
+        let package = foo("0.0.0", Some(unread), lib());
+        let want = crate::unit::Unfilled::RustVersion {
+            package: "foo v0.0.0 (/p/foo)".into(),
+            rust_version: unread.into(),
+        };
+        assert_eq!(read(&package, "cargo::metadata=foo=bar"), Err(Error::from(want)), "{unread}");
+        assert!(read(&package, "cargo:foo=bar").is_ok(), "the old syntax reads no rust-version");
+    }
 }
 
 /// `build_script_extra_link_arg_bin`, `..._bin_single`, `..._tests`, `..._benches`,
@@ -355,6 +367,64 @@ fn the_rest() {
     );
 }
 
+/// A directive after any of Unicode's spaces is read, as `str::trim` reads it: one past
+/// ASCII takes the whole check, one in ASCII (the vertical tab too) the quick one.
+#[test]
+fn a_directive_after_any_space_is_read() {
+    let package = foo("0.0.1", None, lib());
+    let out = read(
+        &package,
+        "\u{a0}cargo:rustc-cfg=a\n\x0b\x0ccargo::rustc-cfg=b\r\n\u{2003}\tcargo:rustc-cfg=c\n\u{85}x\n",
+    )
+    .unwrap();
+    assert_eq!(out.cfgs, ["a", "b", "c"]);
+}
+
+/// [`directive`] against what cargo does to every line (`from_utf8`, `trim`, then the prefix),
+/// over seeded lines of the bytes that matter: ASCII and Unicode spaces, `cargo:`'s pieces,
+/// bytes that are not UTF-8.
+#[test]
+fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
+    let pieces: [&[u8]; 14] = [
+        b" ", b"\t", b"\x0b", b"\x0c", b"\r", "\u{a0}".as_bytes(), "\u{85}".as_bytes(),
+        "\u{2003}".as_bytes(), b"cargo:", b"cargo", b":", b"x=y", b"\xff", b"\xc2",
+    ];
+    fn cargo(line: &[u8]) -> Option<&str> {
+        std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
+    }
+    let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
+    for _ in 0..50_000 {
+        let mut line = Vec::new();
+        let state = rng.next_u64();
+        for at in 0..(state % 6) {
+            line.extend_from_slice(pieces[((state >> (8 + 4 * at)) % pieces.len() as u64) as usize]);
+        }
+        assert_eq!(directive(&line), cargo(&line), "{line:?}");
+    }
+}
+
+/// The `match` of reserved keys against cargo's list of prefixes.
+#[test]
+fn a_reserved_key_is_one_of_cargo_s_prefixes() {
+    const CARGO: &[&str] = &[
+        "rustc-flags=", "rustc-link-lib=", "rustc-link-search=", "rustc-link-arg-cdylib=",
+        "rustc-cdylib-link-arg=", "rustc-link-arg-bins=", "rustc-link-arg-bin=",
+        "rustc-link-arg-tests=", "rustc-link-arg-benches=", "rustc-link-arg-examples=",
+        "rustc-link-arg=", "rustc-cfg=", "rustc-check-cfg=", "rustc-env=", "warning=",
+        "rerun-if-changed=", "rerun-if-env-changed=",
+    ];
+    let mut flags: Vec<String> = Vec::new();
+    for prefix in CARGO {
+        let key = &prefix[..prefix.len() - 1];
+        flags.extend([prefix.to_string(), format!("{prefix}x=y"), key.to_owned(), format!("{key}x=1")]);
+        flags.push(format!("{}={key}", &key[..key.len() - 1]));
+    }
+    flags.extend(["".to_owned(), "=".to_owned(), "metadata=k=v".to_owned(), "error=e".to_owned()]);
+    for flag in &flags {
+        assert_eq!(has_reserved_prefix(flag), CARGO.iter().any(|it| flag.starts_with(it)), "{flag:?}");
+    }
+}
+
 #[test]
 fn link_lib_specs() {
     let lib = LinkLib::parse("static:+whole-archive,-bundle=foo:bar");
@@ -366,3 +436,198 @@ fn link_lib_specs() {
     assert_eq!((plain.kind, plain.name, plain.rename), (None, "z", None));
     assert_eq!(LinkLib::parse("framework=Security").kind, Some("framework"));
 }
+
+/// [`Key::of`]'s length-then-bytes match against a search of every name, over each name,
+/// each with one byte changed, cut or lengthened, and seeded bytes of every length up to 24.
+#[test]
+fn a_key_is_found_exactly_by_its_name() {
+    let searched = |name: &[u8]| KEYS.iter().position(|it| it.as_bytes() == name);
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for key in KEYS {
+        let key = key.as_bytes();
+        names.push(key.to_vec());
+        names.push(key[..key.len() - 1].to_vec());
+        names.push([key, b"s"].concat());
+        for at in 0..key.len() {
+            for byte in [b'-', b'a', b'e', b'l', b'u', b'c', key[at] ^ 0x20] {
+                let mut changed = key.to_vec();
+                changed[at] = byte;
+                names.push(changed);
+            }
+        }
+    }
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
+    for _ in 0..20_000 {
+        let state = rng.next_u64();
+        let len = (state % 25) as usize;
+        names.push(
+            (0..len).map(|at| b"rustc-linkargbe"[(state >> (at % 60)) as usize % 15]).collect(),
+        );
+    }
+    for name in &names {
+        let found = Key::of(name);
+        assert_eq!(
+            found.map(|it| it as usize),
+            searched(name),
+            "{:?}",
+            String::from_utf8_lossy(name)
+        );
+        if let Some(key) = found {
+            assert_eq!(key.name().as_bytes(), name.as_slice());
+        }
+    }
+}
+
+/// The single borrowed pass against the reading it replaced ([`reference::parse`]), over
+/// seeded outputs of directives of every key, of both syntaxes, valid or not, for packages
+/// with and without each kind of target and an old `rust-version`, with the `OUT_DIR`
+/// moved or not: the same [`Output`], or the same error.
+#[test]
+fn the_single_pass_reads_as_the_old_parser() {
+    let prefixes = ["cargo:", "cargo::", "  cargo:", "\u{a0}cargo::", "\tcargo::", "x", "cargo"];
+    let mut keys: Vec<&str> = KEYS.to_vec();
+    keys.extend(["foo", "", "RUSTC", "rustc-link", "warnings"]);
+    let values = [
+        "a",
+        "x=y",
+        "-l z -L native=/old/out/lib",
+        "-lfoo   -L/elsewhere",
+        "-L",
+        "-q x",
+        "/old/out/lib",
+        "native=/old/out/x/old/out",
+        "RUSTC_BOOTSTRAP=1",
+        "FOO=bar=baz",
+        "foo=one",
+        "abc=two",
+        "noeq",
+        " spaced  \t",
+        "\u{e9}t\u{e9}",
+        "",
+        "cfg(foo, values(\"a\"))",
+    ];
+    let ends: [&[u8]; 4] = [b"\n", b"\r\n", b"\xff\n", b"\n\n"];
+    let targets = [
+        lib(),
+        vec![
+            target("foo", "lib", "lib"),
+            target("foo", "bin", "bin"),
+            target("t", "test", "bin"),
+            target("b", "bench", "bin"),
+            target("e", "example", "bin"),
+        ],
+        vec![target("foo", "cdylib", "cdylib")],
+    ];
+    let packages: Vec<Package> = targets
+        .iter()
+        .flat_map(|targets| {
+            [None, Some("1.60"), Some("1.80.0")].map(|msrv| foo("0.1.0", msrv, targets.clone()))
+        })
+        .collect();
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let (mut agreed_ok, mut agreed_err) = (0, 0);
+    for _ in 0..40_000 {
+        let mut printed = Vec::new();
+        for _ in 0..1 + rng.index(5) {
+            printed.extend_from_slice(prefixes[rng.index(prefixes.len())].as_bytes());
+            printed.extend_from_slice(keys[rng.index(keys.len())].as_bytes());
+            if rng.index(6) > 0 {
+                printed.push(b'=');
+            }
+            printed.extend_from_slice(values[rng.index(values.len())].as_bytes());
+            printed.extend_from_slice(ends[rng.index(ends.len())]);
+        }
+        let package = &packages[rng.index(packages.len())];
+        let generated = if rng.index(2) == 0 { "/old/out" } else { "/new/out" };
+        let rustc_bootstrap = [None, Some("1"), Some("foo")][rng.index(3)].map(str::to_owned);
+        let cx = Context {
+            package,
+            out_dir_when_generated: Path::new(generated),
+            out_dir: Path::new("/new/out"),
+            nightly_features_allowed: rng.index(2) == 0,
+            rustc_bootstrap,
+        };
+        let (new, old) = (parse(&printed, &cx), reference::parse(&printed, &cx));
+        assert_eq!(new, old, "{:?}", String::from_utf8_lossy(&printed));
+        match new {
+            Ok(_) => agreed_ok += 1,
+            Err(_) => agreed_err += 1,
+        }
+    }
+    assert!(agreed_ok > 1_000 && agreed_err > 1_000, "{agreed_ok} read, {agreed_err} refused");
+}
+
+/// A value is the output's own bytes, borrowed, unless it names the `OUT_DIR` the script ran
+/// with and that moved; the pieces of `rustc-flags`, `rustc-env` and metadata too.
+#[test]
+fn a_value_borrows_the_output_unless_its_out_dir_moved() {
+    let package = foo("0.0.1", None, lib());
+    let printed = b"cargo::rustc-cfg=a\ncargo:rustc-flags=-l z -L /old/out/lib\n\
+                    cargo::rustc-env=K=V\ncargo:k=v\ncargo::rustc-link-search=/old/out/x\n";
+    let read_in = |generated: &str| {
+        let cx = Context {
+            package: &package,
+            out_dir_when_generated: Path::new(generated),
+            out_dir: Path::new("/new/out"),
+            nightly_features_allowed: false,
+            rustc_bootstrap: None,
+        };
+        let mut directives: Vec<Directive<'_>> = Vec::new();
+        super::read(printed, &cx, &mut directives).unwrap();
+        directives
+    };
+    let borrowed = |it: &Cow<'_, str>| matches!(it, Cow::Borrowed(_));
+    let same = read_in("/new/out");
+    assert_eq!(same.len(), 6);
+    for directive in &same {
+        let all_borrowed = match directive {
+            Directive::Cfg(it) | Directive::LinkLib(it) | Directive::LinkSearch(it) => borrowed(it),
+            Directive::Env(a, b) | Directive::Metadata(a, b) => borrowed(a) && borrowed(b),
+            other => panic!("{other:?}"),
+        };
+        assert!(all_borrowed, "{directive:?}");
+    }
+    let moved = read_in("/old/out");
+    assert_eq!(moved[0], Directive::Cfg(Cow::Borrowed("a")));
+    assert_eq!(moved[2], Directive::LinkSearch(Cow::Owned("/new/out/lib".to_owned())));
+    assert!(matches!(&moved[5], Directive::LinkSearch(Cow::Owned(it)) if it == "/new/out/x"));
+}
+
+/// [`read`] of every directive that names no moved `OUT_DIR`, no single bin and no message
+/// it makes allocates nothing: each value is borrowed from what was printed.
+#[test]
+fn read_allocates_nothing() {
+    struct Count(usize);
+    impl<'a> Sink<'a> for Count {
+        fn directive(&mut self, _: Directive<'a>) {
+            self.0 += 1;
+        }
+    }
+    let package = foo("0.5.0", None, lib());
+    let cx = Context {
+        package: &package,
+        out_dir_when_generated: Path::new(OUT),
+        out_dir: Path::new(OUT),
+        nightly_features_allowed: false,
+        rustc_bootstrap: None,
+    };
+    let printed = "cargo:rustc-link-lib=static=foo\n\
+                   cargo:rustc-link-search=native=/p/foo/target/debug/build/foo-1/out/lib\n\
+                   cargo:rustc-cfg=has_foo\n\
+                   cargo:rustc-check-cfg=cfg(has_foo)\n\
+                   cargo:rustc-env=FOO=bar\n\
+                   cargo:rustc-flags=-l z -L /usr/lib\n\
+                   cargo:rustc-link-arg=-Wl,-z,now\n\
+                   cargo:warning=hello\r\n\
+                   not a directive\n\
+                   cargo:rerun-if-changed=build.rs\n\
+                   cargo:rerun-if-env-changed=CC\n\
+                   cargo:include=/p/foo/include";
+    let mut count = Count(0);
+    blaze_alloc_count::assert_at_most(0, "reading a script's output", || {
+        super::read(printed.as_bytes(), &cx, &mut count).unwrap()
+    });
+    assert_eq!(count.0, 12);
+}
+
+mod reference;

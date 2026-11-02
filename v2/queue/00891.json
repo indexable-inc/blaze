@@ -1,0 +1,35 @@
+{
+  "id": "00891",
+  "from_lane": "speed-sol2-small",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/db.rs"
+  ],
+  "what": "## speed-sol2-small: a logged database locks on every salsa event, also outside `Db::log` (base-db db.rs, the event hook in `Db::with`)\n\n- Where: `crates/base-db/src/db.rs` `Db::with`: the callback does `log.lock()` for every event whenever the database has a log (`Db::logged`, `Db::for_tests`), and pushes only while `Db::log` runs.\n- Why: the firewall harness and every fixture test pay an uncontended lock (~20 ns) per validated or executed memo outside the logged closures too, about the cost of the validation itself (~35 ns); the firewall bench's absolute times are about twice a build's (docs/v2/plan/lanes/firewall/speed-of-light.md).\n- Change: `EventLog` gains `active: AtomicBool`; `Db::log` sets it (release) before running `f` and clears it after; the hook reads it (relaxed) and returns before the lock when it is false. Same events kept: the lock is still taken while `log` runs.\n- Test: the existing `Db::log` tests (events in order) unchanged; one more that an event outside `log` is not kept.",
+  "state": "applied",
+  "created": "2026-10-30T09:30:31Z",
+  "updated": "2026-10-30T10:00:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:30:31Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: crates/base-db/src/db.rs EventLog is a struct { active: AtomicBool, events: Mutex<..> }; Db::log/log_mut go through EventLog::record, which sets active (release) around f; the hook loads it (relaxed) before the lock. Test an_event_outside_log_is_not_kept in db/tests.rs"
+    }
+  ]
+}

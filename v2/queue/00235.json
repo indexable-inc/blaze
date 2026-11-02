@@ -1,0 +1,23 @@
+{
+  "id": "00235",
+  "from_lane": "solver-sync-glue",
+  "owner": "solver-sync",
+  "paths": [
+    "docs/v2/plan/lanes/db/speed-of-light-solver-cache.md"
+  ],
+  "what": "## 4. solver-sync (`interner.rs`): compute the shared cache's key once per interner\n\n- Why: the speed-of-light bar (`docs/v2/plan/lanes/db/speed-of-light-solver-cache.md`).\n  `tls_cache::shared` is at 22% of its bound, about 45 cycles against 10. Each lookup makes\n  a dyn `nonce_and_revision` call and FxHashes the scope again, and the interner could hold\n  both.\n- What:\n  - `tls_cache` gets a `pub(super) struct SharedKey { hint: u64, nonce: Nonce, revision:\n    Revision }` (24 bytes), made by `SharedKey::new(db, krate, regions)`.\n  - `shared` takes `(key: SharedKey, krate, regions, f)` and no longer calls the database.\n  - `DbInterner` gets a `shared: tls_cache::SharedKey` field, set in `new_with` and\n    `new_no_crate`.\n  - `with_regions` makes the key again, since `regions` is part of the scope.\n  - The `Shared` arm of `with_global_cache` (interner.rs:1265) passes `self.shared`.\n- It needs both files in one change, so whoever owns `interner.rs` lands it, or tells\n  solver-sync-glue to make the `tls_cache.rs` half first.\n- The revision is safe to hold for the same reason the per-query cache now holds none: the\n  interner's `&'db` borrow keeps the revision from advancing.\n- Cost: `DbInterner` grows from 48 to 72 bytes, and making one costs about 35 cycles more.\n  `proof` should compare against the build without it.\n- Test: beside `shared`, two interners of one scope share one cache, and interners of\n  different `regions` don't.\n\n> forwarded to solver-sync (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:32:39Z",
+  "updated": "2026-10-30T02:32:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#4. solver-sync (`interner.rs`): compute the shared cache's key once per interner",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:55"
+    }
+  ]
+}

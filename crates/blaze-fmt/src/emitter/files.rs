@@ -14,12 +14,10 @@ impl FilesEmitter {
             print_misformatted_file_names,
         }
     }
-}
 
-impl Emitter for FilesEmitter {
-    fn emit_formatted_file(
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        output: &mut dyn Write,
+        output: &mut impl Write,
         FormattedFile {
             filename,
             original_text,

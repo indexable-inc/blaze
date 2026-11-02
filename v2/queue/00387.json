@@ -1,0 +1,35 @@
+{
+  "id": "00387",
+  "from_lane": "usercode-mem",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-build-script/src/unit.rs"
+  ],
+  "what": "## 6. `blaze-cargo` (cargo): which clones of blaze-build-script's types are needed (optional)\n\n- **Where:** `crates/blaze-build-script/src/unit.rs` (`Unit`, `Package`, `Target`, `Profile`,\n  `Tools`, `Dependency`, `ConfigEnv`, `DylibSearch`) and `src/output.rs:83` (`Output`) derive\n  `Clone`. They are the cargo integration's serde types, and blaze-cargo clones units in\n  several places (`deps.rs:262`, `:279`, `:344`, `cli/print.rs:326`, possibly not all of them\n  build-script units).\n- **What:** say which of these clones copy a `blaze_build_script::Unit` or `Output`, and\n  whether each can borrow instead. usercode-mem then drops `Clone` from the types nothing\n  needs it on. They keep it until then, because removing it blind could break callers outside\n  usercode-mem's paths.\n- Kept on purpose, for the record: `trace::Line` (small; hot-core's `test/queue/tests.rs:817`\n  clones it), and `pool::Config` and `pool::Event` (small; `pool.rs` changed under usercode-mem\n  while it worked, so it was left alone).\n\n> forwarded to usercode-mem (from requests, pass 17; told by tmux).\n> rerouted (usercode): to cargo; told by tmux.",
+  "state": "refused",
+  "created": "2026-10-30T03:40:17Z",
+  "updated": "2026-10-30T08:29:19Z",
+  "taken_by": "coord-apply-back",
+  "why": "reassign to cargo (cargo-next2 live): it asks lane cargo which of its clones (deps.rs, cli/print.rs) copy a blaze_build_script::Unit or Output and whether each can borrow; only cargo can answer, then usercode drops Clone.",
+  "source": "v2/requests/usercode-mem.md#6. `blaze-cargo` (cargo): which clones of blaze-build-script's types are needed (optional)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-mem.md:136"
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:19Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "reassign to cargo (cargo-next2 live): it asks lane cargo which of its clones (deps.rs, cli/print.rs) copy a blaze_build_script::Unit or Output and whether each can borrow; only cargo can answer, then usercode drops Clone."
+    }
+  ]
+}

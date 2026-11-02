@@ -1,0 +1,24 @@
+{
+  "id": "01433",
+  "from_lane": "repro",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/pump.rs",
+    "crates/blaze-graph/src/pool.rs"
+  ],
+  "what": "Self-build deadlock (self7, checkpoint 0c2af08751): a missed cycle, not a lost wakeup. Pool::scope (scope_in) is a wait the cycle graph cannot see: the scope owner publishes no edge to the jobs it waits for. In self7 worker 11 runs variances_of, waits on a query, pumps a hir::check::bodies job, whose Db::run_all (run_on_pool -> Pool::scope) parks in scope_in; that scope jobs, on the other workers, ask for keys whose runner is below the scope owner on worker 11. Their join() walks reaches(runner, me): runner -> above -> scope owner -> (no edge) -> stops, so the wait is let through and every worker parks. run_on_pool handles only the same-thread case (a job pumped onto the owner thread). Fix: give a scope wait out-edges to its running jobs, e.g. record the owner task id (pump::current()) in Pending, have each scope job publish it in its Published slot (`of`) when it starts, and let edges() of a task that owns a scope also yield the live tasks whose `of` is it (a scan of the published stacks, only for scope owners, only under WAITS). Then the scope job that asks is the one whose wait closes the cycle and gets Cancelled; db/function.rs:331 already turns that into WouldWaitOnItself, which run_on_pool reruns next round. Tests (run in well under a second when fixed, time out at 20 s now): crates/blaze-graph/tests/scope_wait.rs no_wait_chain_through_a_scope_leaves_every_worker_parked (owner on a worker) and no_wait_chain_through_a_clients_scope_leaves_every_worker_parked (owner on a client thread). Detail: /tmp/blaze-lanes/v2-repro.md.",
+  "state": "open",
+  "created": "2026-11-01T02:41:48Z",
+  "updated": "2026-11-01T02:41:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:41:48Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

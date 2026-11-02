@@ -1,0 +1,23 @@
+{
+  "id": "00993",
+  "from_lane": "integrate-ide-fixture",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "tools/v2/hot_lint.py: add `feature = \"fixture\"` to TEST_ATOMS. hir-expand now has `#[cfg(any(test, feature = \"fixture\"))] pub mod fixture;` (the v2 test fixture replacing crates/test-fixture), a feature only dev-dependencies turn on; hot_lint flags its setup allocations as hot today.",
+  "state": "open",
+  "created": "2026-10-30T13:00:57Z",
+  "updated": "2026-10-30T13:00:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:00:57Z",
+      "by": "integrate-ide-fixture",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

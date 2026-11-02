@@ -13,20 +13,22 @@ use hir_def::hir::PatId;
 use rustc_type_ir::inherent::Ty as _;
 
 use crate::{
-    BindingMode, ByRef, CallableDefId,
+    CallableDefId,
     mir::{
         BasicBlockId, BorrowKind, GenericArgs, MirSpan, MutBorrowKind, Operand, OperandKind, Place,
         ProjectionElem, Rvalue, Ty,
         lower::{MirLowerCtx, MirLowerError, Result},
     },
-    next_solver::{Region, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt},
+    next_solver::{
+        IsRigid, Region, RegionExt, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
+    },
 };
 
 /// Which deref of a pattern a temporary is for: the index among the pattern's implicit
 /// adjustments, or one past them for the pattern's own `deref!`.
 pub(super) type DerefKey = (PatId, u32);
 
-impl<'db> MirLowerCtx<'_, 'db> {
+impl<'db> MirLowerCtx<'_, '_, 'db> {
     /// The place a deref pattern at `key` matches its inner pattern against, given the place
     /// of the pointer, `place` of type `pointer`. `test` is set when the pattern is being
     /// tested, where the call is made; binding after reads through the temporary it wrote.
@@ -73,6 +75,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             CallableDefId::FunctionId(method).into(),
             GenericArgs::new_from_slice(&[pointer.into()]),
         ));
+        // alloc: the call's arguments, kept in the body
         let args = Box::new([Operand {
             kind: OperandKind::Move(Place::from(source).store()),
             span: None,
@@ -87,7 +90,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
     /// `<pointer as Deref>::Target`, normalized.
     fn deref_target(&self, pointer: Ty<'db>) -> Result<'db, Ty<'db>> {
         let target = self.lang_items().DerefTarget.ok_or(MirLowerError::LangItemNotFound)?;
-        let target = Ty::new_projection(self.interner(), target.into(), [pointer]);
+        let target = Ty::new_projection(self.interner(), IsRigid::No, target.into(), [pointer]);
         let mut ocx = ObligationCtxt::new(&self.infcx);
         Ok(ocx
             .structurally_normalize_ty(&ObligationCause::dummy(), self.env, target)
@@ -97,14 +100,6 @@ impl<'db> MirLowerCtx<'_, 'db> {
     /// Whether `pattern` binds anything by `ref mut`, which makes a deref pattern around it
     /// call `DerefMut::deref_mut` (rustc's `deref_pat_borrow_mode`).
     fn has_ref_mut_binding(&self, pattern: PatId) -> bool {
-        let mut found = false;
-        self.store.walk_pats(pattern, &mut |pat| {
-            if let Some(BindingMode(ByRef::Yes(rustc_ast_ir::Mutability::Mut), _)) =
-                self.infer.binding_mode(pat)
-            {
-                found = true;
-            }
-        });
-        found
+        hir_ty::utils::pat_has_ref_mut_binding(self.store, pattern, |pat| self.infer.binding_mode(pat))
     }
 }

@@ -35,9 +35,9 @@ impl ProcMacroKind {
 impl Attrs<'_> {
     pub(crate) fn parse_proc_macro_decl(&self, func_name: &Name) -> Option<ProcMacroDef> {
         if self.is_proc_macro() {
-            Some(ProcMacroDef { name: func_name.clone(), kind: ProcMacroKind::Bang })
+            Some(ProcMacroDef { name: *func_name, kind: ProcMacroKind::Bang })
         } else if self.is_proc_macro_attribute() {
-            Some(ProcMacroDef { name: func_name.clone(), kind: ProcMacroKind::Attr })
+            Some(ProcMacroDef { name: *func_name, kind: ProcMacroKind::Attr })
         } else if self.by_key(sym::proc_macro_derive).exists() {
             let derive = self.parse_proc_macro_derive();
             Some(match derive {
@@ -45,7 +45,7 @@ impl Attrs<'_> {
                     ProcMacroDef { name, kind: ProcMacroKind::Derive { helpers } }
                 }
                 None => ProcMacroDef {
-                    name: func_name.clone(),
+                    name: *func_name,
                     kind: ProcMacroKind::Derive { helpers: Box::default() },
                 },
             })
@@ -68,7 +68,7 @@ pub(crate) fn parse_macro_name_and_helper_attrs(tt: &TopSubtree) -> Option<(Name
     {
         // `#[proc_macro_derive(Trait)]`
         // `#[rustc_builtin_macro(Trait)]`
-        Some((trait_name.as_name(), Box::new([])))
+        Some((trait_name.as_name(), Box::default()))
     } else if let Some(
         [
             TtElement::Leaf(Leaf::Ident(trait_name)),

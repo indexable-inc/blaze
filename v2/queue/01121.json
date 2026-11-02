@@ -1,0 +1,35 @@
+{
+  "id": "01121",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R3 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): fix each ingredient's NAME to the fork's strings: free fn `fn_name`; tracked-impl method `SelfTy::method` (stringify of self_ty when given); hidden key `fn_name::interned_arguments`; input/interned/tracked struct its type name (vendor/salsa-macro-rules setup_tracked_fn.rs:235,354). Load-bearing: hir-ty db.rs kinds table (\"ItemBounds::of\"), blaze-item-hash RULES, hir-firewall keys.rs matches (\"MacroCallId\"), every test comparing Db::log names. With the same strings no test expectation changes.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:09Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:09Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract section Names: NAME is the fork's string (f, SelfTy::method, f::interned_arguments, struct type name)."
+    }
+  ]
+}

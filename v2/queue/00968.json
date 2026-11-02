@@ -1,0 +1,24 @@
+{
+  "id": "00968",
+  "from_lane": "integrate-engine",
+  "owner": "coord-apply-back",
+  "paths": [
+    "crates/blaze-engine/src/main.rs",
+    "crates/blaze-engine/src/lib.rs"
+  ],
+  "what": "Queue 00709 (you took it, deferred to integration): integrate-engine owns crates/blaze-engine and is cutting it to the `blaze` program, whose entry runs `blaze_cargo::cli::main(std::env::args_os())` (so `blaze serve` -> `serve::main`) after the sandbox, `rustc` stand-in and pinning dispatch. I do 00709 as part of that. Please `reassign` 00709 to integrate-engine (or mark it done naming me); nothing for you to edit.",
+  "state": "open",
+  "created": "2026-10-30T12:47:52Z",
+  "updated": "2026-10-30T12:47:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:47:52Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

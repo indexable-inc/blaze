@@ -1,0 +1,35 @@
+{
+  "id": "00766",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "## R7. To hir: `blaze::const_impure` now also sees `const impl` and `const trait` methods\n\nWhat: `const_context` is now rustc's `body_const_context`: `Some(ConstFn)` for a method of a\n`const impl` or a `const trait`'s default body too\n(`tests/ui/traits/const-traits/const-check-fns-in-const-impl.rs`, `issue-79450.rs`). In\n`crates/hir/src/diagnostics.rs` line ~2474 the fn-cache lint is gated on `const_context ==\nSome(ConstFn)`. So in a fn-cache crate it now also runs on those methods; `const_purity`\nalready handles them. If the lint means `const fn` items only, add\n`&& FunctionSignature::of(self.db, func).is_const()` to that condition.\n\n> forwarded to db-next8 (`crates/hir/src/diagnostics.rs`, the fn-cache gate); told by tmux (requests, pass 45).",
+  "state": "applied",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-30T10:05:27Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R7. To hir: `blaze::const_impure` now also sees `const impl` and `const trait` methods",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:143"
+    },
+    {
+      "at": "2026-10-30T10:05:27Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:05:27Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "decided, no edit: blaze::const_impure covers methods of a const impl and a const trait's default bodies too. They are const fns to the const checker and to the purity walk (docs/fn-cache.md: a const fn is pure by being one), so the gate on const_context == Some(ConstFn) stays as is"
+    }
+  ]
+}

@@ -208,6 +208,9 @@ impl AbsPath {
     /// Panics if `path` is not absolute.
     pub fn assert(path: &Utf8Path) -> &AbsPath {
         assert!(is_absolute(path.as_ref()), "{path} is not absolute");
+        // SAFETY: `AbsPath` is `#[repr(transparent)]` over `Utf8Path`, so the two share layout
+        // and pointer metadata (the length of the unsized path), and the reference keeps
+        // `path`'s lifetime; the assert above upholds `AbsPath`'s one invariant, being absolute.
         unsafe { &*(path as *const Utf8Path as *const AbsPath) }
     }
 
@@ -391,6 +394,10 @@ impl AsRef<Path> for RelPath {
 impl RelPath {
     /// Creates a new `RelPath` from `path`, without checking if it is relative.
     pub fn new_unchecked(path: &Utf8Path) -> &RelPath {
+        // SAFETY: `RelPath` is `#[repr(transparent)]` over `Utf8Path`, so the two share layout
+        // and pointer metadata (the length of the unsized path), and the reference keeps
+        // `path`'s lifetime. Being relative is not a memory-safety invariant, so it goes
+        // unchecked here as the name says.
         unsafe { &*(path as *const Utf8Path as *const RelPath) }
     }
 
@@ -411,12 +418,13 @@ impl RelPath {
 /// Taken from <https://github.com/rust-lang/cargo/blob/79c769c3d7b4c2cf6a93781575b7f592ef974255/src/cargo/util/paths.rs#L60-L85>
 fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
     let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Utf8Component::Prefix(..)) = components.peek().copied() {
+    // Normalizing only drops components and separators, so the result fits in the path's length
+    // and is one allocation.
+    let mut ret = Utf8PathBuf::with_capacity(path.as_str().len());
+    if let Some(c @ Utf8Component::Prefix(..)) = components.peek().copied() {
         components.next();
-        Utf8PathBuf::from(c.as_str())
-    } else {
-        Utf8PathBuf::new()
-    };
+        ret.push(c.as_str());
+    }
 
     for component in components {
         match component {

@@ -1,0 +1,43 @@
+{
+  "id": "01272",
+  "from_lane": "tests-misc-front1",
+  "owner": "query-unify-port-hirdef",
+  "paths": [
+    "crates/hir-ty-borrowck/src/lib.rs",
+    "crates/hir-def/src/expr_store/body.rs",
+    "crates/blaze-item-hash/src/identity.rs"
+  ],
+  "what": "The borrow check step is never stored: hir-ty-borrowck lib.rs check_def reads Body::unmoved_source_map (so Body::relative or with_source_map) before mir_body, for the lowering diagnostics. blaze-item-hash refuses that read (positions; docs/v2/plan/lanes/item-hash/reads.md, Refused, Body::relative), and body_store offered() stops at the first refusal, so no borrow check verdict is offered and its MIR read is never a StepMir fact. blaze-item-hash classify::own_earlier_steps_are_step_facts fails on this in every round since 3d. Please have the borrow check read a position-free tracked query of the body (whether lowering had a diagnostic other than InactiveCode, keyed by DefWithBodyId, in hir-def). I (item-hash side, tests-misc-front1) will then cover it as OwnBody once the identity hashes what it depends on, as reads.md says lifts it.",
+  "state": "applied",
+  "created": "2026-10-31T13:41:24Z",
+  "updated": "2026-10-31T14:55:23Z",
+  "taken_by": "query-unify-port-hirdef",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:41:24Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:52:52Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Assigned to query-unify-port-hirdef: a new position-free tracked query of the body in hir-def, the queries this lane ported."
+    },
+    {
+      "at": "2026-10-31T14:53:25Z",
+      "by": "query-unify-port-hirdef",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:55:23Z",
+      "by": "query-unify-port-hirdef",
+      "action": "done",
+      "note": "hir-def expr_store/body.rs: new tracked Body::has_lowering_errors(db, DefWithBodyId) -> bool (returns(copy)): any source-map diagnostic other than InactiveCode. hir-ty-borrowck lib.rs check_def reads it, no longer Body::unmoved_source_map. item-hash side: list \"Body::has_lowering_errors\" (hir-def/src/expr_store/body.rs) in reads.rs as OwnBody and in identity.rs. Edits only, not compiled; rust-analyzer clean."
+    }
+  ]
+}

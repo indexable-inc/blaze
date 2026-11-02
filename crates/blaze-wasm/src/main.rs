@@ -4,15 +4,18 @@
 //! ```text
 //! blaze-wasm bundle library core.bundle
 //! blaze-wasm build core.bundle out/ first.rs [edited.rs ...]
+//! blaze-wasm analyze workspace.pack
 //! ```
 //!
 //! `build` writes `out/<n>.wasm` and `out/<n>.json` for each source in turn, as edits of
-//! one program.
+//! one program. A pack is made by `blaze serve` of a workspace it loaded, its build scripts
+//! and proc macros run in the sandbox (`blaze_wasm_pack::record`).
 
 use std::{error::Error, fs, path::Path};
 
 use blaze_wasm::{Compiler, MAIN, bundle, pack};
 
+// dyn: the CLI's error, printed once.
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -40,35 +43,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("{source}: {}", build.report());
             }
         }
-        ["pack", project, main, out] => {
-            let pack =
-                pack::record(Path::new(project), "wasm32-unknown-unknown", main, |db, crates| {
-                    for &krate in crates {
-                        hir_def::nameres::crate_def_map(db, krate);
-                    }
-                    hir::attach_db(db, || {
-                        for function in
-                            blaze_wasm::functions_of(db, crates[crates.len() - 1].into())
-                        {
-                            hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(function));
-                        }
-                    });
-                })?;
-            eprintln!(
-                "{} crates, {} files, {} expansions",
-                pack.crates.len(),
-                pack.files.len(),
-                pack.expansions.len()
-            );
-            fs::write(out, serde_json::to_vec(&pack)?)?;
-        }
-        ["host", module, pack] => {
-            let mut packed: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
-            let host = blaze_wasm::host::Host::read(&fs::read(module)?)?;
-            eprintln!("{} functions, {} data symbols", host.functions.len(), host.data.len());
-            packed.host = Some(host);
-            fs::write(pack, serde_json::to_vec(&packed)?)?;
-        }
         ["analyze", pack] => {
             let mut compiler = Compiler::default();
             let pack: pack::Pack = serde_json::from_slice(&fs::read(pack)?)?;
@@ -88,22 +62,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             let start = std::time::Instant::now();
             let build = compiler.build()?;
             eprintln!(
-                "build: {:.1?}, {} functions, {} bytes, {} of {} bodies compiled, {} skipped",
+                "build: {:.1?}, {} functions, {} bytes, {} of {} bodies compiled",
                 start.elapsed(),
                 build.patch.functions.len(),
                 build.patch.module.len(),
                 build.compiled,
                 build.bodies,
-                build.skipped.len()
             );
-            for (name, why) in build.skipped.iter().take(20) {
-                eprintln!("  {name}: {why}");
-            }
         }
         _ => {
-            return Err(
-                "usage: blaze-wasm bundle <library> <out> | build <bundle> <out> <rs>..".into()
-            );
+            return Err("usage: blaze-wasm bundle <library> <out> | build <bundle> <out> <rs>.. | analyze <pack>".into());
         }
     }
     Ok(())

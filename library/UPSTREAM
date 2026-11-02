@@ -7,3 +7,10 @@ commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977
 nightly nightly-2026-10-27
 rustc 1.101.0-nightly (16d1ffac1 2026-10-26)
 rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a93702df5593f45fe549b38ec589d33f503fa9966c1bbfd933ff8d8b4997726c
+#
+# blaze's changes to library/ (to be kept through each bump; `harness/library.py`'s rewrite must keep these lines):
+# - std/src/sys/env/unix.rs `walked`, called by `env()` and by `Command::spawn`/`exec`
+#   (std/src/sys/process/unix/unix.rs) when the child gets `environ` whole: a weak call of
+#   `__blaze_environ_walked`, which only blaze's sandbox interposers define, so a traced run is
+#   keyed by the whole environment only when the program reads it whole. Unresolved, nothing is
+#   called (v2/requests/usercode.md item 6, part 1).

@@ -13,11 +13,14 @@ mod item;
 mod pat;
 mod ty;
 
+#[cfg(test)]
+mod tests;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use syntax::ast::{self as ra, AstNode, HasGenericArgs as _, HasName as _, HasTypeBounds as _};
-use syntax::{NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, T, TextRange};
+use syntax::view::{self as ra, AstNode, HasGenericArgs as _, HasName as _, HasTypeBounds as _};
+use syntax::{NodeOrToken, SyntaxKind, T, TextRange};
 
 use crate::ast::token::{self, Delimiter, Token, TokenKind};
 use crate::ast::tokenstream::{DelimSpan, TokenStream, TokenTree};
@@ -132,50 +135,58 @@ impl<'a> Lower<'a> {
         Span::with_root_ctxt(self.pos(range.start()), self.pos(range.end()))
     }
 
-    pub(crate) fn tsp(&self, token: &SyntaxToken) -> Span {
+    pub(crate) fn tsp(&self, token: ra::Token<'_>) -> Span {
         self.sp(token.text_range())
     }
 
     /// A node's span as rustc's `lo.to(self.prev_token.span)`: its first token after its own
     /// outer attributes and doc comments, to its last token.
-    pub(crate) fn nsp(&self, node: &SyntaxNode) -> Span {
+    pub(crate) fn nsp(&self, node: ra::Node<'_>) -> Span {
         match (first_token_after_attrs(node), last_token(node)) {
-            (Some(first), Some(last)) => self.tsp(&first).to(self.tsp(&last)),
+            (Some(first), Some(last)) => self.tsp(first).to(self.tsp(last)),
             _ => self.sp(TextRange::empty(node.text_range().start())),
         }
     }
 
     /// A node's span including its outer attributes (`lo` taken before `parse_outer_attributes`).
-    pub(crate) fn nsp_with_attrs(&self, node: &SyntaxNode) -> Span {
+    pub(crate) fn nsp_with_attrs(&self, node: ra::Node<'_>) -> Span {
         match (first_token(node), last_token(node)) {
-            (Some(first), Some(last)) => self.tsp(&first).to(self.tsp(&last)),
+            (Some(first), Some(last)) => self.tsp(first).to(self.tsp(last)),
             _ => self.sp(TextRange::empty(node.text_range().start())),
         }
     }
 
     // ---- tokens ----
 
-    pub(crate) fn ident(&self, token: &SyntaxToken) -> Ident {
+    pub(crate) fn ident(&self, token: ra::Token<'_>) -> Ident {
         let text = token.text();
         let name = text.strip_prefix("r#").unwrap_or(text);
         Ident::new(Symbol::intern(name), self.tsp(token))
     }
 
-    pub(crate) fn name(&self, name: &ra::Name) -> Ident {
+    pub(crate) fn name(&self, name: ra::Name<'_>) -> Ident {
         match name.syntax().first_token() {
-            Some(token) => self.ident(&token),
-            None => Ident::new(sym::empty, self.sp(name.syntax().text_range())),
+            Some(token) => self.ident(token),
+            None => {
+                let span = self.sp(name.syntax().text_range());
+                self.unsupported(span, "a name without a token");
+                Ident::new(sym::empty, span)
+            }
         }
     }
 
-    pub(crate) fn name_ref(&self, name: &ra::NameRef) -> Ident {
+    pub(crate) fn name_ref(&self, name: ra::NameRef<'_>) -> Ident {
         match name.syntax().first_token() {
-            Some(token) => self.ident(&token),
-            None => Ident::new(sym::empty, self.sp(name.syntax().text_range())),
+            Some(token) => self.ident(token),
+            None => {
+                let span = self.sp(name.syntax().text_range());
+                self.unsupported(span, "a name without a token");
+                Ident::new(sym::empty, span)
+            }
         }
     }
 
-    pub(crate) fn lifetime(&self, lt: &ra::Lifetime) -> ast::Lifetime {
+    pub(crate) fn lifetime(&self, lt: ra::Lifetime<'_>) -> ast::Lifetime {
         let token = lt.lifetime_ident_token();
         let ident = match token {
             Some(token) => {
@@ -184,9 +195,13 @@ impl<'a> Lower<'a> {
                     Some(rest) => format!("'{rest}"),
                     None => text.to_owned(),
                 };
-                Ident::new(Symbol::intern(&name), self.tsp(&token))
+                Ident::new(Symbol::intern(&name), self.tsp(token))
             }
-            None => Ident::new(sym::empty, self.sp(lt.syntax().text_range())),
+            None => {
+                let span = self.sp(lt.syntax().text_range());
+                self.unsupported(span, "a lifetime without a name");
+                Ident::new(sym::empty, span)
+            }
         };
         ast::Lifetime {
             id: DUMMY_NODE_ID,
@@ -195,7 +210,7 @@ impl<'a> Lower<'a> {
     }
 
     /// A literal token as rustc's lexer cooks it.
-    pub(crate) fn token_lit(&self, token: &SyntaxToken) -> token::Lit {
+    pub(crate) fn token_lit(&self, token: ra::Token<'_>) -> token::Lit {
         let text = token.text();
         match text {
             "true" => return token::Lit::new(token::Bool, kw::True, None),
@@ -232,7 +247,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    pub(crate) fn delimited(&self, open: &SyntaxToken) -> Option<Delimited> {
+    pub(crate) fn delimited(&self, open: ra::Token<'_>) -> Option<Delimited> {
         let found = self.delims.get(self.tsp(open).lo()).cloned();
         if found.is_none() {
             self.unsupported(self.tsp(open), "a delimiter rustc's lexer did not pair");
@@ -241,9 +256,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The delimited arguments of a macro call or attribute, from the token tree's first token.
-    pub(crate) fn delim_args(&self, tt: &ra::TokenTree) -> ast::DelimArgs {
+    pub(crate) fn delim_args(&self, tt: ra::TokenTree<'_>) -> ast::DelimArgs {
         let open = tt.syntax().first_token();
-        match open.and_then(|open| self.delimited(&open)) {
+        match open.and_then(|open| self.delimited(open)) {
             Some(d) => ast::DelimArgs {
                 dspan: d.dspan,
                 delim: d.delim,
@@ -260,11 +275,11 @@ impl<'a> Lower<'a> {
     // ---- attributes ----
 
     /// Outer attributes and doc comments written on `node`, in order.
-    pub(crate) fn outer_attrs(&self, node: &SyntaxNode) -> ast::AttrVec {
+    pub(crate) fn outer_attrs(&self, node: ra::Node<'_>) -> ast::AttrVec {
         let mut attrs = ThinVec::new();
         for child in node.children() {
             if let Some(any) = ra::AnyAttr::cast(child)
-                && let Some(attr) = self.attr(&any)
+                && let Some(attr) = self.attr(any)
                 && attr.style == AttrStyle::Outer
             {
                 attrs.push(attr);
@@ -274,11 +289,11 @@ impl<'a> Lower<'a> {
     }
 
     /// Inner attributes (`#![..]`, `//!`) that are direct children of `node`.
-    pub(crate) fn inner_attrs(&self, node: &SyntaxNode) -> ast::AttrVec {
+    pub(crate) fn inner_attrs(&self, node: ra::Node<'_>) -> ast::AttrVec {
         let mut attrs = ThinVec::new();
         for child in node.children() {
             if let Some(any) = ra::AnyAttr::cast(child)
-                && let Some(attr) = self.attr(&any)
+                && let Some(attr) = self.attr(any)
                 && attr.style == AttrStyle::Inner
             {
                 attrs.push(attr);
@@ -287,7 +302,7 @@ impl<'a> Lower<'a> {
         attrs
     }
 
-    pub(crate) fn attr(&self, any: &ra::AnyAttr) -> Option<ast::Attribute> {
+    pub(crate) fn attr(&self, any: ra::AnyAttr<'_>) -> Option<ast::Attribute> {
         match any {
             ra::AnyAttr::DocComment(doc) => {
                 let token = doc.syntax().first_token()?;
@@ -314,7 +329,7 @@ impl<'a> Lower<'a> {
                     kind: ast::AttrKind::DocComment(kind, Symbol::intern(content)),
                     id: AttrId(0),
                     style,
-                    span: self.tsp(&token),
+                    span: self.tsp(token),
                 })
             }
             ra::AnyAttr::Attr(attr) => self.normal_attr(attr),
@@ -324,7 +339,7 @@ impl<'a> Lower<'a> {
     /// `#[..]` or `#![..]`, read from rustc's tokens inside the brackets (rustc's
     /// `parse_attribute` and `parse_attr_item`), with the expression of `#[k = expr]` lowered
     /// from rust-analyzer's tree.
-    fn normal_attr(&self, attr: &ra::Attr) -> Option<ast::Attribute> {
+    fn normal_attr(&self, attr: ra::Attr<'_>) -> Option<ast::Attribute> {
         let node = attr.syntax();
         let style = if attr.excl_token().is_some() {
             AttrStyle::Inner
@@ -332,15 +347,11 @@ impl<'a> Lower<'a> {
             AttrStyle::Outer
         };
         let span = self.sp(node.text_range());
-        let open = node
-            .children_with_tokens()
-            .filter_map(SyntaxElement::into_token)
-            .find(|t| t.kind() == T!['[']);
-        let Some(open) = open else {
+        let Some(open) = node.child_token(T!['[']) else {
             self.unsupported(span, "an attribute without brackets");
             return None;
         };
-        let group = self.delimited(&open)?;
+        let group = self.delimited(open)?;
         let item = self.attr_item(&group.tokens, attr, span)?;
         Some(ast::Attribute {
             kind: ast::AttrKind::Normal(Box::new(ast::NormalAttr { item, tokens: None })),
@@ -353,7 +364,7 @@ impl<'a> Lower<'a> {
     fn attr_item(
         &self,
         tokens: &TokenStream,
-        attr: &ra::Attr,
+        attr: ra::Attr<'_>,
         span: Span,
     ) -> Option<ast::AttrItem> {
         let tts: Vec<&TokenTree> = tokens.iter().collect();
@@ -391,7 +402,7 @@ impl<'a> Lower<'a> {
                 };
                 ast::AttrArgs::Eq {
                     eq_span,
-                    expr: self.expr(&expr),
+                    expr: self.expr(expr),
                 }
             }
             Some(tt) => {
@@ -447,22 +458,29 @@ impl<'a> Lower<'a> {
 
     /// A path, flattened from rust-analyzer's qualifier chain (rustc's `parse_path` and
     /// `parse_qpath`).
-    pub(crate) fn path(&self, path: &ra::Path) -> (Option<Box<ast::QSelf>>, ast::Path) {
-        let mut chain = vec![path.clone()];
-        while let Some(q) = chain.last().and_then(|p| p.qualifier()) {
-            chain.push(q);
+    pub(crate) fn path(&self, path: ra::Path<'_>) -> (Option<Box<ast::QSelf>>, ast::Path) {
+        let mut innermost = path;
+        while let Some(q) = innermost.qualifier() {
+            innermost = q;
         }
-        chain.reverse();
+        // A qualifier is a child of the path it qualifies, so its parent is the next segment out.
+        let chain = std::iter::successors(Some(innermost), |p| {
+            if *p == path {
+                None
+            } else {
+                p.syntax().parent().and_then(ra::Path::cast)
+            }
+        });
         let span = self.nsp(path.syntax());
         let mut segments = ThinVec::new();
         let mut qself = None;
-        for (n, p) in chain.iter().enumerate() {
+        for (n, p) in chain.enumerate() {
             let Some(seg) = p.segment() else {
                 self.unsupported(span, "a path segment rust-analyzer did not parse");
                 continue;
             };
             if n == 0 && seg.coloncolon_token().is_some() {
-                let root = seg.coloncolon_token().map(|t| self.tsp(&t)).unwrap_or(span);
+                let root = seg.coloncolon_token().map(|t| self.tsp(t)).unwrap_or(span);
                 segments.push(ast::PathSegment::path_root(root.shrink_to_lo()));
             }
             if let Some(anchor) = seg.type_anchor() {
@@ -475,7 +493,7 @@ impl<'a> Lower<'a> {
                     self.unsupported(span, "a qualified path without a type");
                     continue;
                 };
-                let ty = self.ty(&ty);
+                let ty = self.ty(ty);
                 let trait_path = match types.next() {
                     Some(ra::Type::PathType(pt)) => pt.path(),
                     Some(other) => {
@@ -489,13 +507,13 @@ impl<'a> Lower<'a> {
                 };
                 let path_span = match trait_path {
                     Some(trait_path) => {
-                        let (_, trait_path) = self.path(&trait_path);
+                        let (_, trait_path) = self.path(trait_path);
                         let path_span = trait_path.span;
                         segments.extend(trait_path.segments);
                         path_span
                     }
                     None => match anchor.r_angle_token() {
-                        Some(gt) => self.tsp(&gt),
+                        Some(gt) => self.tsp(gt),
                         None => span,
                     },
                 };
@@ -506,14 +524,14 @@ impl<'a> Lower<'a> {
                 }));
                 continue;
             }
-            segments.push(self.path_segment(&seg));
+            segments.push(self.path_segment(seg));
         }
         (qself, ast::Path { span, segments })
     }
 
-    pub(crate) fn path_segment(&self, seg: &ra::PathSegment) -> ast::PathSegment {
+    pub(crate) fn path_segment(&self, seg: ra::PathSegment<'_>) -> ast::PathSegment {
         let ident = match seg.name_ref() {
-            Some(name) => self.name_ref(&name),
+            Some(name) => self.name_ref(name),
             None => {
                 let span = self.nsp(seg.syntax());
                 self.unsupported(span, "a path segment without a name");
@@ -521,9 +539,9 @@ impl<'a> Lower<'a> {
             }
         };
         let args = if let Some(list) = seg.generic_arg_list() {
-            Some(Box::new(self.angle_args(&list)))
+            Some(Box::new(self.angle_args(list)))
         } else if let Some(list) = seg.parenthesized_arg_list() {
-            Some(Box::new(self.paren_args(ident, &list, seg.ret_type())))
+            Some(Box::new(self.paren_args(ident, list, seg.ret_type())))
         } else if let Some(rts) = seg.return_type_syntax() {
             let span = self.nsp(rts.syntax());
             Some(Box::new(ast::GenericArgs::ParenthesizedElided(span)))
@@ -538,34 +556,34 @@ impl<'a> Lower<'a> {
     }
 
     /// `<..>` with its span from `<` to `>`, leaving out a turbofish's `::`.
-    pub(crate) fn angle_args(&self, list: &ra::GenericArgList) -> ast::GenericArgs {
-        let lo = list.l_angle_token().map(|t| self.tsp(&t));
-        let hi = list.r_angle_token().map(|t| self.tsp(&t));
+    pub(crate) fn angle_args(&self, list: ra::GenericArgList<'_>) -> ast::GenericArgs {
+        let lo = list.l_angle_token().map(|t| self.tsp(t));
+        let hi = list.r_angle_token().map(|t| self.tsp(t));
         let span = match (lo, hi) {
             (Some(lo), Some(hi)) => lo.to(hi),
             _ => self.nsp(list.syntax()),
         };
         let args = list
             .generic_args()
-            .map(|arg| self.angle_arg(&arg))
+            .map(|arg| self.angle_arg(arg))
             .collect();
         ast::GenericArgs::AngleBracketed(ast::AngleBracketedArgs { span, args })
     }
 
-    fn angle_arg(&self, arg: &ra::GenericArg) -> ast::AngleBracketedArg {
+    fn angle_arg(&self, arg: ra::GenericArg<'_>) -> ast::AngleBracketedArg {
         match arg {
             ra::GenericArg::TypeArg(t) => match t.ty() {
-                Some(ty) => ast::AngleBracketedArg::Arg(ast::GenericArg::Type(self.ty(&ty))),
+                Some(ty) => ast::AngleBracketedArg::Arg(ast::GenericArg::Type(self.ty(ty))),
                 None => self.missing_arg(t.syntax()),
             },
             ra::GenericArg::LifetimeArg(l) => match l.lifetime() {
                 Some(lt) => {
-                    ast::AngleBracketedArg::Arg(ast::GenericArg::Lifetime(self.lifetime(&lt)))
+                    ast::AngleBracketedArg::Arg(ast::GenericArg::Lifetime(self.lifetime(lt)))
                 }
                 None => self.missing_arg(l.syntax()),
             },
             ra::GenericArg::ConstArg(c) => match c.expr() {
-                Some(e) => ast::AngleBracketedArg::Arg(ast::GenericArg::Const(self.anon_const(&e))),
+                Some(e) => ast::AngleBracketedArg::Arg(ast::GenericArg::Const(self.anon_const(e))),
                 None => self.missing_arg(c.syntax()),
             },
             ra::GenericArg::AssocTypeArg(a) => {
@@ -574,38 +592,41 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn missing_arg(&self, node: &SyntaxNode) -> ast::AngleBracketedArg {
+    fn missing_arg(&self, node: ra::Node<'_>) -> ast::AngleBracketedArg {
         let span = self.nsp(node);
         self.unsupported(span, "a generic argument rust-analyzer did not parse");
         ast::AngleBracketedArg::Arg(ast::GenericArg::Type(self.ty_err(span)))
     }
 
     /// `Item = T`, `Item: Bound` (rustc's `parse_angle_arg`: from the name to the last token).
-    fn assoc_constraint(&self, a: &ra::AssocTypeArg) -> ast::AssocItemConstraint {
+    fn assoc_constraint(&self, a: ra::AssocTypeArg<'_>) -> ast::AssocItemConstraint {
         let span = self.nsp(a.syntax());
         let ident = match a.name_ref() {
-            Some(n) => self.name_ref(&n),
-            None => Ident::new(sym::empty, span),
+            Some(n) => self.name_ref(n),
+            None => {
+                self.unsupported(span, "an associated item constraint without a name");
+                Ident::new(sym::empty, span)
+            }
         };
         let gen_args = if let Some(list) = a.generic_arg_list() {
-            Some(self.angle_args(&list))
+            Some(self.angle_args(list))
         } else if let Some(params) = a.param_list() {
-            Some(self.paren_args_from_params(ident, &params, a.ret_type()))
+            Some(self.paren_args_from_params(ident, params, a.ret_type()))
         } else {
             a.return_type_syntax()
                 .map(|rts| ast::GenericArgs::ParenthesizedElided(self.nsp(rts.syntax())))
         };
         let kind = if let Some(bounds) = a.type_bound_list() {
             ast::AssocItemConstraintKind::Bound {
-                bounds: self.bounds(&bounds),
+                bounds: self.bounds(bounds),
             }
         } else if let Some(ty) = a.ty() {
             ast::AssocItemConstraintKind::Equality {
-                term: ast::Term::Ty(self.ty(&ty)),
+                term: ast::Term::Ty(self.ty(ty)),
             }
         } else if let Some(c) = a.const_arg().and_then(|c| c.expr()) {
             ast::AssocItemConstraintKind::Equality {
-                term: ast::Term::Const(self.anon_const(&c)),
+                term: ast::Term::Const(self.anon_const(c)),
             }
         } else if a.colon_token().is_some() {
             ast::AssocItemConstraintKind::Bound {
@@ -634,18 +655,18 @@ impl<'a> Lower<'a> {
     fn paren_args(
         &self,
         ident: Ident,
-        list: &ra::ParenthesizedArgList,
-        ret: Option<ra::RetType>,
+        list: ra::ParenthesizedArgList<'_>,
+        ret: Option<ra::RetType<'_>>,
     ) -> ast::GenericArgs {
         let inputs_span = match (list.l_paren_token(), list.r_paren_token()) {
-            (Some(l), Some(r)) => self.tsp(&l).to(self.tsp(&r)),
+            (Some(l), Some(r)) => self.tsp(l).to(self.tsp(r)),
             _ => self.nsp(list.syntax()),
         };
         let inputs = list
             .type_args()
             .filter_map(|arg| arg.ty())
             .map(|ty| {
-                let ty = self.ty(&ty);
+                let ty = self.ty(ty);
                 let pat = Box::new(ast::Pat {
                     id: DUMMY_NODE_ID,
                     kind: ast::PatKind::Missing,
@@ -662,7 +683,7 @@ impl<'a> Lower<'a> {
                 }
             })
             .collect();
-        let output = self.ret_ty(ret.as_ref(), inputs_span);
+        let output = self.ret_ty(ret, inputs_span);
         let hi = match &output {
             ast::FnRetTy::Ty(ty) => ty.span,
             ast::FnRetTy::Default(_) => inputs_span,
@@ -678,15 +699,15 @@ impl<'a> Lower<'a> {
     fn paren_args_from_params(
         &self,
         ident: Ident,
-        params: &ra::ParamList,
-        ret: Option<ra::RetType>,
+        params: ra::ParamList<'_>,
+        ret: Option<ra::RetType<'_>>,
     ) -> ast::GenericArgs {
         let inputs_span = match (params.l_paren_token(), params.r_paren_token()) {
-            (Some(l), Some(r)) => self.tsp(&l).to(self.tsp(&r)),
+            (Some(l), Some(r)) => self.tsp(l).to(self.tsp(r)),
             _ => self.nsp(params.syntax()),
         };
-        let inputs = params.params().map(|p| self.param(&p)).collect();
-        let output = self.ret_ty(ret.as_ref(), inputs_span);
+        let inputs = params.params().map(|p| self.param(p)).collect();
+        let output = self.ret_ty(ret, inputs_span);
         let hi = match &output {
             ast::FnRetTy::Ty(ty) => ty.span,
             ast::FnRetTy::Default(_) => inputs_span,
@@ -701,9 +722,9 @@ impl<'a> Lower<'a> {
 
     /// `-> T`, or rustc's `FnRetTy::Default(self.prev_token.span.shrink_to_hi())`: empty, right
     /// after the parameters.
-    pub(crate) fn ret_ty(&self, ret: Option<&ra::RetType>, params_span: Span) -> ast::FnRetTy {
+    pub(crate) fn ret_ty(&self, ret: Option<ra::RetType<'_>>, params_span: Span) -> ast::FnRetTy {
         match ret.and_then(|r| r.ty()) {
-            Some(ty) => ast::FnRetTy::Ty(self.ty(&ty)),
+            Some(ty) => ast::FnRetTy::Ty(self.ty(ty)),
             None => {
                 if let Some(ret) = ret {
                     self.unsupported(
@@ -716,7 +737,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    pub(crate) fn anon_const(&self, expr: &ra::Expr) -> ast::AnonConst {
+    pub(crate) fn anon_const(&self, expr: ra::Expr<'_>) -> ast::AnonConst {
         ast::AnonConst {
             id: DUMMY_NODE_ID,
             value: self.expr(expr),
@@ -729,12 +750,12 @@ impl<'a> Lower<'a> {
     /// span at the item's first token when there is none.
     pub(crate) fn visibility(
         &self,
-        vis: Option<ra::Visibility>,
-        owner: &SyntaxNode,
+        vis: Option<ra::Visibility<'_>>,
+        owner: ra::Node<'_>,
     ) -> ast::Visibility {
         let Some(vis) = vis else {
             let at = first_token_after_attrs(owner)
-                .map(|t| self.tsp(&t).shrink_to_lo())
+                .map(|t| self.tsp(t).shrink_to_lo())
                 .unwrap_or_else(|| self.sp(TextRange::empty(owner.text_range().start())));
             return ast::Visibility {
                 kind: ast::VisibilityKind::Inherited,
@@ -747,7 +768,7 @@ impl<'a> Lower<'a> {
             Some(inner) => match inner.path() {
                 Some(path) => {
                     let shorthand = inner.in_token().is_none();
-                    let (_, path) = self.path(&path);
+                    let (_, path) = self.path(path);
                     ast::VisibilityKind::Restricted {
                         path: Box::new(path),
                         id: DUMMY_NODE_ID,
@@ -768,8 +789,8 @@ impl<'a> Lower<'a> {
     /// rustc's `parse_generics`: the span of `<..>`, or empty right after the name.
     pub(crate) fn generics(
         &self,
-        list: Option<ra::GenericParamList>,
-        where_clause: Option<ra::WhereClause>,
+        list: Option<ra::GenericParamList<'_>>,
+        where_clause: Option<ra::WhereClause<'_>>,
         after: Span,
         where_after: Span,
     ) -> ast::Generics {
@@ -777,7 +798,7 @@ impl<'a> Lower<'a> {
             Some(list) => {
                 let params = list
                     .generic_params()
-                    .map(|p| self.generic_param(&p))
+                    .map(|p| self.generic_param(p))
                     .collect();
                 (params, self.nsp(list.syntax()))
             }
@@ -794,7 +815,7 @@ impl<'a> Lower<'a> {
     /// or empty right after what precedes it.
     pub(crate) fn where_clause(
         &self,
-        wc: Option<ra::WhereClause>,
+        wc: Option<ra::WhereClause<'_>>,
         after: Span,
     ) -> ast::WhereClause {
         match wc {
@@ -805,27 +826,27 @@ impl<'a> Lower<'a> {
             },
             Some(wc) => ast::WhereClause {
                 has_where_token: true,
-                predicates: wc.predicates().map(|p| self.where_pred(&p)).collect(),
+                predicates: wc.predicates().map(|p| self.where_pred(p)).collect(),
                 span: self.nsp(wc.syntax()),
             },
         }
     }
 
-    fn where_pred(&self, p: &ra::WherePred) -> ast::WherePredicate {
+    fn where_pred(&self, p: ra::WherePred<'_>) -> ast::WherePredicate {
         let span = self.nsp(p.syntax());
         let attrs = self.outer_attrs(p.syntax());
         let bounds = p
             .type_bound_list()
-            .map(|b| self.bounds(&b))
+            .map(|b| self.bounds(b))
             .unwrap_or_default();
         let kind = if let Some(lt) = p.lifetime() {
             ast::WherePredicateKind::RegionPredicate(ast::WhereRegionPredicate {
-                lifetime: self.lifetime(&lt),
+                lifetime: self.lifetime(lt),
                 bounds,
             })
         } else {
             let bounded_ty = match p.ty() {
-                Some(ty) => self.ty(&ty),
+                Some(ty) => self.ty(ty),
                 None => {
                     self.unsupported(span, "a where predicate without a type");
                     self.ty_err(span)
@@ -834,7 +855,7 @@ impl<'a> Lower<'a> {
             let bound_generic_params = p
                 .for_binder()
                 .and_then(|b| b.generic_param_list())
-                .map(|l| l.generic_params().map(|g| self.generic_param(&g)).collect())
+                .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
                 .unwrap_or_default();
             ast::WherePredicateKind::BoundPredicate(ast::WhereBoundPredicate {
                 bound_generic_params,
@@ -851,12 +872,12 @@ impl<'a> Lower<'a> {
         }
     }
 
-    pub(crate) fn generic_param(&self, p: &ra::GenericParam) -> ast::GenericParam {
+    pub(crate) fn generic_param(&self, p: ra::GenericParam<'_>) -> ast::GenericParam {
         let attrs = self.outer_attrs(p.syntax());
         match p {
             ra::GenericParam::LifetimeParam(lp) => {
                 let lifetime = match lp.lifetime() {
-                    Some(lt) => self.lifetime(&lt),
+                    Some(lt) => self.lifetime(lt),
                     None => {
                         let span = self.nsp(lp.syntax());
                         self.unsupported(span, "a lifetime parameter without a name");
@@ -866,10 +887,10 @@ impl<'a> Lower<'a> {
                         }
                     }
                 };
-                let colon_span = lp.colon_token().map(|t| self.tsp(&t));
+                let colon_span = lp.colon_token().map(|t| self.tsp(t));
                 let bounds = lp
                     .type_bound_list()
-                    .map(|b| self.bounds(&b))
+                    .map(|b| self.bounds(b))
                     .unwrap_or_default();
                 ast::GenericParam {
                     id: DUMMY_NODE_ID,
@@ -883,16 +904,19 @@ impl<'a> Lower<'a> {
             }
             ra::GenericParam::TypeParam(tp) => {
                 let span = self.nsp(tp.syntax());
-                let ident = tp
-                    .name()
-                    .map(|n| self.name(&n))
-                    .unwrap_or(Ident::new(sym::empty, span));
-                let colon_span = tp.colon_token().map(|t| self.tsp(&t));
+                let ident = match tp.name() {
+                    Some(n) => self.name(n),
+                    None => {
+                        self.unsupported(span, "a type parameter without a name");
+                        Ident::new(sym::empty, span)
+                    }
+                };
+                let colon_span = tp.colon_token().map(|t| self.tsp(t));
                 let bounds = tp
                     .type_bound_list()
-                    .map(|b| self.bounds(&b))
+                    .map(|b| self.bounds(b))
                     .unwrap_or_default();
-                let default = tp.default_type().map(|t| self.ty(&t));
+                let default = tp.default_type().map(|t| self.ty(t));
                 ast::GenericParam {
                     id: DUMMY_NODE_ID,
                     ident,
@@ -905,12 +929,15 @@ impl<'a> Lower<'a> {
             }
             ra::GenericParam::ConstParam(cp) => {
                 let span_all = self.nsp(cp.syntax());
-                let ident = cp
-                    .name()
-                    .map(|n| self.name(&n))
-                    .unwrap_or(Ident::new(sym::empty, span_all));
+                let ident = match cp.name() {
+                    Some(n) => self.name(n),
+                    None => {
+                        self.unsupported(span_all, "a const parameter without a name");
+                        Ident::new(sym::empty, span_all)
+                    }
+                };
                 let ty = match cp.ty() {
-                    Some(t) => self.ty(&t),
+                    Some(t) => self.ty(t),
                     None => {
                         self.unsupported(span_all, "a const parameter without a type");
                         self.ty_err(span_all)
@@ -919,7 +946,7 @@ impl<'a> Lower<'a> {
                 let default = cp
                     .default_val()
                     .and_then(|c| c.expr())
-                    .map(|e| self.anon_const(&e));
+                    .map(|e| self.anon_const(e));
                 // rustc's `parse_const_param`: `const` through the type, or the default.
                 let span = span_all;
                 ast::GenericParam {
@@ -939,8 +966,8 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn fn_decl(
         &self,
-        params: Option<ra::ParamList>,
-        ret: Option<ra::RetType>,
+        params: Option<ra::ParamList<'_>>,
+        ret: Option<ra::RetType<'_>>,
         owner: Span,
     ) -> ast::FnDecl {
         let Some(params) = params else {
@@ -955,24 +982,24 @@ impl<'a> Lower<'a> {
         };
         let mut inputs = ThinVec::new();
         if let Some(sp) = params.self_param() {
-            inputs.push(self.self_param(&sp));
+            inputs.push(self.self_param(sp));
         }
         for p in params.params() {
-            inputs.push(self.param(&p));
+            inputs.push(self.param(p));
         }
         let params_span = self.nsp(params.syntax());
-        let output = self.ret_ty(ret.as_ref(), params_span);
+        let output = self.ret_ty(ret, params_span);
         ast::FnDecl { inputs, output }
     }
 
     /// rustc's `parse_param_general`: the span starts before the parameter's attributes.
-    pub(crate) fn param(&self, p: &ra::Param) -> ast::Param {
+    pub(crate) fn param(&self, p: ra::Param<'_>) -> ast::Param {
         let span = self.nsp_with_attrs(p.syntax());
         let attrs = self.outer_attrs(p.syntax());
         if p.dotdotdot_token().is_some() && p.ty().is_none() {
-            let dots = p.dotdotdot_token().map(|t| self.tsp(&t)).unwrap_or(span);
+            let dots = p.dotdotdot_token().map(|t| self.tsp(t)).unwrap_or(span);
             let (pat, ty_span) = match p.pat() {
-                Some(pat) => (self.pat(&pat), dots),
+                Some(pat) => (self.pat(pat), dots),
                 None => (
                     Box::new(ast::Pat {
                         id: DUMMY_NODE_ID,
@@ -998,14 +1025,14 @@ impl<'a> Lower<'a> {
             };
         }
         let ty = match p.ty() {
-            Some(ty) => self.ty(&ty),
+            Some(ty) => self.ty(ty),
             None => {
                 self.unsupported(span, "a parameter without a type");
                 self.ty_err(span)
             }
         };
         let pat = match p.pat() {
-            Some(pat) => self.pat(&pat),
+            Some(pat) => self.pat(pat),
             None => Box::new(ast::Pat {
                 id: DUMMY_NODE_ID,
                 kind: ast::PatKind::Missing,
@@ -1029,11 +1056,11 @@ impl<'a> Lower<'a> {
 
     /// rustc's `parse_self_param` and `Param::from_self`: the span runs from the first token
     /// after the attributes to `self`, leaving out a `: Type`.
-    fn self_param(&self, sp: &ra::SelfParam) -> ast::Param {
+    fn self_param(&self, sp: ra::SelfParam<'_>) -> ast::Param {
         let attrs = self.outer_attrs(sp.syntax());
         let all = self.nsp(sp.syntax());
         let self_tok = sp.name().and_then(|n| n.syntax().first_token());
-        let eself_ident = match &self_tok {
+        let eself_ident = match self_tok {
             Some(t) => Ident::new(kw::SelfLower, self.tsp(t)),
             None => {
                 self.unsupported(all, "a self parameter without `self`");
@@ -1046,15 +1073,15 @@ impl<'a> Lower<'a> {
             ast::Mutability::Not
         };
         let kind = if sp.amp_token().is_some() {
-            let lt = sp.lifetime().map(|l| self.lifetime(&l));
+            let lt = sp.lifetime().map(|l| self.lifetime(l));
             ast::SelfKind::Region(lt, mutbl)
         } else if let Some(ty) = sp.ty() {
-            ast::SelfKind::Explicit(self.ty(&ty), mutbl)
+            ast::SelfKind::Explicit(self.ty(ty), mutbl)
         } else {
             ast::SelfKind::Value(mutbl)
         };
         let lo = first_token_after_attrs(sp.syntax())
-            .map(|t| self.tsp(&t))
+            .map(|t| self.tsp(t))
             .unwrap_or(all);
         let eself = ast::ExplicitSelf {
             node: kind,
@@ -1065,31 +1092,31 @@ impl<'a> Lower<'a> {
 
     // ---- bounds ----
 
-    pub(crate) fn bounds(&self, list: &ra::TypeBoundList) -> ast::GenericBounds {
-        list.bounds().map(|b| self.bound(&b)).collect()
+    pub(crate) fn bounds(&self, list: ra::TypeBoundList<'_>) -> ast::GenericBounds {
+        list.bounds().map(|b| self.bound(b)).collect()
     }
 
-    fn bound(&self, b: &ra::TypeBound) -> ast::GenericBound {
+    fn bound(&self, b: ra::TypeBound<'_>) -> ast::GenericBound {
         let span = self.nsp(b.syntax());
         if let Some(lt) = b.lifetime() {
-            return ast::GenericBound::Outlives(self.lifetime(&lt));
+            return ast::GenericBound::Outlives(self.lifetime(lt));
         }
         if let Some(args) = b.use_bound_generic_args() {
             let args = args
                 .use_bound_generic_args()
                 .map(|a| match a {
                     ra::UseBoundGenericArg::Lifetime(lt) => {
-                        ast::PreciseCapturingArg::Lifetime(self.lifetime(&lt))
+                        ast::PreciseCapturingArg::Lifetime(self.lifetime(lt))
                     }
                     ra::UseBoundGenericArg::NameRef(n) => {
-                        let ident = self.name_ref(&n);
+                        let ident = self.name_ref(n);
                         ast::PreciseCapturingArg::Arg(ast::Path::from_ident(ident), DUMMY_NODE_ID)
                     }
                 })
                 .collect();
             return ast::GenericBound::Use(args, span);
         }
-        let parens = if child_token(b.syntax(), T!['(']).is_some() {
+        let parens = if b.syntax().child_token(T!['(']).is_some() {
             ast::Parens::Yes
         } else {
             ast::Parens::No
@@ -1097,37 +1124,37 @@ impl<'a> Lower<'a> {
         let bound_generic_params = b
             .for_binder()
             .and_then(|f| f.generic_param_list())
-            .map(|l| l.generic_params().map(|g| self.generic_param(&g)).collect())
+            .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
             .unwrap_or_default();
         let constness = if let Some(t) = b.tilde_token() {
             let c = b
                 .const_token()
-                .map(|c| self.tsp(&c))
-                .unwrap_or(self.tsp(&t));
-            ast::BoundConstness::Maybe(self.tsp(&t).to(c))
+                .map(|c| self.tsp(c))
+                .unwrap_or(self.tsp(t));
+            ast::BoundConstness::Maybe(self.tsp(t).to(c))
         } else if let Some(l) = b.l_brack_token() {
             let r = b
                 .r_brack_token()
-                .map(|r| self.tsp(&r))
-                .unwrap_or(self.tsp(&l));
-            ast::BoundConstness::Maybe(self.tsp(&l).to(r))
+                .map(|r| self.tsp(r))
+                .unwrap_or(self.tsp(l));
+            ast::BoundConstness::Maybe(self.tsp(l).to(r))
         } else if let Some(c) = b.const_token() {
-            ast::BoundConstness::Always(self.tsp(&c))
+            ast::BoundConstness::Always(self.tsp(c))
         } else {
             ast::BoundConstness::Never
         };
         let asyncness = match b.async_token() {
-            Some(t) => ast::BoundAsyncness::Async(self.tsp(&t)),
+            Some(t) => ast::BoundAsyncness::Async(self.tsp(t)),
             None => ast::BoundAsyncness::Normal,
         };
         let polarity = if let Some(q) = b.question_mark_token() {
-            ast::BoundPolarity::Maybe(self.tsp(&q))
+            ast::BoundPolarity::Maybe(self.tsp(q))
         } else {
             ast::BoundPolarity::Positive
         };
         let path = match b.ty() {
             Some(ra::Type::PathType(pt)) => match pt.path() {
-                Some(p) => self.path(&p).1,
+                Some(p) => self.path(p).1,
                 None => self.err_path(span),
             },
             Some(other) => {
@@ -1170,14 +1197,14 @@ impl<'a> Lower<'a> {
 
     // ---- macro calls ----
 
-    pub(crate) fn mac_call(&self, mc: &ra::MacroCall) -> Box<ast::MacCall> {
+    pub(crate) fn mac_call(&self, mc: ra::MacroCall<'_>) -> Box<ast::MacCall> {
         let span = self.nsp(mc.syntax());
         let path = match mc.path() {
-            Some(p) => self.path(&p).1,
+            Some(p) => self.path(p).1,
             None => self.err_path(span),
         };
         let args = match mc.token_tree() {
-            Some(tt) => Box::new(self.delim_args(&tt)),
+            Some(tt) => Box::new(self.delim_args(tt)),
             None => {
                 self.unsupported(span, "a macro call without arguments");
                 Box::new(ast::DelimArgs {
@@ -1201,13 +1228,13 @@ fn is_attr_node(kind: SyntaxKind) -> bool {
     matches!(kind, SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
 }
 
-pub(crate) fn first_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn first_token(node: ra::Node<'_>) -> Option<ra::Token<'_>> {
     node.descendants_with_tokens()
-        .filter_map(SyntaxElement::into_token)
+        .filter_map(NodeOrToken::into_token)
         .find(|t| !is_trivia(t.kind()))
 }
 
-pub(crate) fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn last_token(node: ra::Node<'_>) -> Option<ra::Token<'_>> {
     let mut token = node.last_token()?;
     let start = node.text_range().start();
     while is_trivia(token.kind()) {
@@ -1222,14 +1249,14 @@ pub(crate) fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 /// The first token of `node` that is not trivia and not inside an attribute leading it, or
 /// leading its first child: rust-analyzer may hang a statement's attributes on the innermost
 /// expression of a method chain, where rustc's span leaves them out.
-pub(crate) fn first_token_after_attrs(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn first_token_after_attrs(node: ra::Node<'_>) -> Option<ra::Token<'_>> {
     for child in node.children_with_tokens() {
         match child {
             NodeOrToken::Token(t) if is_trivia(t.kind()) => continue,
             NodeOrToken::Token(t) => return Some(t),
             NodeOrToken::Node(n) if is_attr_node(n.kind()) => continue,
             NodeOrToken::Node(n) => {
-                if let Some(t) = first_token_after_attrs(&n) {
+                if let Some(t) = first_token_after_attrs(n) {
                     return Some(t);
                 }
             }
@@ -1238,7 +1265,7 @@ pub(crate) fn first_token_after_attrs(node: &SyntaxNode) -> Option<SyntaxToken> 
     None
 }
 
-pub(crate) fn next_real_token(token: &SyntaxToken) -> Option<SyntaxToken> {
+pub(crate) fn next_real_token(token: ra::Token<'_>) -> Option<ra::Token<'_>> {
     let mut t = token.next_token()?;
     while is_trivia(t.kind()) {
         t = t.next_token()?;
@@ -1246,17 +1273,10 @@ pub(crate) fn next_real_token(token: &SyntaxToken) -> Option<SyntaxToken> {
     Some(t)
 }
 
-pub(crate) fn prev_real_token(token: &SyntaxToken) -> Option<SyntaxToken> {
+pub(crate) fn prev_real_token(token: ra::Token<'_>) -> Option<ra::Token<'_>> {
     let mut t = token.prev_token()?;
     while is_trivia(t.kind()) {
         t = t.prev_token()?;
     }
     Some(t)
-}
-
-/// The direct child token of `node` of the given kind.
-pub(crate) fn child_token(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
-    node.children_with_tokens()
-        .filter_map(SyntaxElement::into_token)
-        .find(|t| t.kind() == kind)
 }

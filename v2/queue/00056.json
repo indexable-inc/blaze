@@ -1,0 +1,37 @@
+{
+  "id": "00056",
+  "from_lane": "codegen-devspeed",
+  "owner": "codegen",
+  "paths": [
+    "docs/v2/plan.md",
+    "crates/blaze-codegen",
+    "crates/hir-ty-mir"
+  ],
+  "what": "## Past rustc's -O0 (the \"everything is ours\" rule, docs/v2/plan.md)\n\nrustc's debug build is the floor, not the target. These keep Rust's semantics and make dev code\nfaster than cargo debug.\n\n11. **plan (parent): tier code that no edit reaches (#807).** Dependencies from the registry and\n    git, and std, are never edited in a session, and their units are cached by key.\n    `Spec::backend` is already per unit (`blaze_codegen::Backend::Llvm { opt }`). As the lane\n    file's #807 says, Cranelift comes first and LLVM runs in the background, not `-O2` on\n    every dependency function: a dependency unit is built with Cranelift, and where it is hot,\n    or always for std (`opt: 3`, as shipped), LLVM's build of the same key replaces it once it\n    is done. ripgrep's hot loops are all in dependencies (aho-corasick, memchr,\n    regex-automata), so once tiered, dev ripgrep should approach cargo release. Not allowed:\n    an LLVM failure that falls back to Cranelift (no-fallback; `backend.rs`'s `produce` has\n    one today). A failed LLVM build is an error for the unit's tier, and the Cranelift build\n    stays as the tier below it, not as a substitute.\n12. **adapter: the MIR level follows the unit.** `mod.rs` `mir_opt_level_of` now picks rustc's\n    level from the crate and from the process's backend (`backend::above_o0`). Under v2 a\n    unit's backend is its `Spec`'s, so `v2::build::Build` should carry the unit's MIR level\n    (2 for `Llvm { opt > 0 }` and library crates, else 1). `mir_opt_level_of` would then read it\n    as it reads `debug_assertions` (`Recorder::unit`). The refs walk and `Hashes::code` must\n    read the same body as the IR builder (`compiled_mir_body`), or a unit's references and key\n    would be of a different body than its code.\n13. **adapter (hir-ty-mir): port rustc's MIR `Inline` pass** (listed in `passes_not_ported`\n    for level 2). rustc ships std's MIR with it run, so every std `#[inline]` helper arrives\n    already inside its caller. blaze approximates that with `inlinable`'s size limits\n    (`mod.rs` `inlinable`: at most 4 blocks, 12 statements and 64 instructions), which leave\n    out most `assert_unsafe_precondition!` wrappers (`ptr::copy_nonoverlapping`,\n    `slice::from_raw_parts`) now that `ub_checks()` is on at dev. Running the ported pass on\n    library crates at level 2, and on dependency units under item 11, would let codegen\n    drop its own size heuristic for them. Code hashes of the inlined callees go into the\n    caller's key (`CompiledFunction::inlined`), as in item 6.\n14. **parent: a Cranelift backend that optimizes.** `blaze_codegen::Backend::Cranelift` has no\n    level, and `hir-ty-codegen/target.rs:324` sets `opt_level=none`. Cranelift's `speed`\n    (egraph rewrites, GVN, LICM, redundant-load removal; production in wasmtime) is a cheaper\n    middle step than LLVM for item 11's units, and possibly for workspace code. Proposed:\n    `Backend::Cranelift { speed: bool }`. `target.rs` would then keep one ISA per level (as\n    it already keeps `target_for_large`). I'll make the `target.rs` side once the variant\n    exists.\n\n> forwarded to codegen: items 11 to 14 (`Backend::Cranelift { speed }` is codegen's own interface in `crates/blaze-codegen/`; the MIR `Inline` pass is in `crates/hir-ty-mir/`).",
+  "state": "applied",
+  "created": "2026-10-30T00:26:26Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-devspeed.md#Past rustc's -O0 (the \"everything is ours\" rule, docs/v2/plan.md)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-devspeed.md:77"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "11: tiering through plan.rs / tier.rs (LLVM a tier above, never a substitute). 12: Build::of(spec) picks MirOptLevel per unit. 13: rustc's Inline pass ported (optimize/inline.rs). 14: Backend::Cranelift { speed } is in blaze-codegen lib.rs."
+    }
+  ]
+}

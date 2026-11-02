@@ -11,6 +11,8 @@
 //! A variable is told of when it is kept in one slot of the frame for as long as the function
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
+#![forbid(unsafe_code)]
+
 mod codeview;
 mod set;
 mod split;
@@ -21,6 +23,9 @@ pub(super) use set::TypeSet;
 use set::{Of, Told};
 pub(super) use types::{ByEnv, Sets, described};
 
+use blaze_core::decimal::decimal;
+use blaze_format::leb;
+use blaze_hash::{FixedHasher, HashMap};
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
@@ -52,18 +57,21 @@ use cranelift_object::{
         write::{Relocation, StandardSegment, SymbolId},
     },
 };
-use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHasher};
+use intern::{Symbol, sym};
 use serde_derive::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 /// The statement the code of a function is of from `offset` on, as an index into the
-/// statements the function was built from.
+/// statements the function was built from. 8 bytes; a function's rows are one array of
+/// exactly their number, in the order of the offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct LineRow {
     pub(super) offset: CodeOffset,
     pub(super) span: u32,
 }
+
+const _: () = assert!(size_of::<LineRow>() == 8);
 
 impl LineRow {
     /// The first source location that stands for a statement: 0 is that of none.
@@ -80,17 +88,35 @@ impl LineRow {
 
     /// The rows of a function from the source location its code has from each offset on, in
     /// the order of the offsets. Code of no statement goes with the statement before it.
-    pub(super) fn of_ranges(
-        ranges: impl IntoIterator<Item = (CodeOffset, ir::SourceLoc)>,
-    ) -> Vec<LineRow> {
-        let mut rows: Vec<LineRow> = Vec::new();
-        for (offset, loc) in ranges {
-            let Some(span) = Self::span_of(loc) else { continue };
-            if rows.last().is_none_or(|last| last.span != span) {
-                rows.push(LineRow { offset, span });
-            }
-        }
-        rows
+    /// The ranges are walked twice, to count the rows and then to write them into an array
+    /// of that length.
+    pub(super) fn of_ranges<I>(ranges: I) -> Vec<LineRow>
+    where
+        I: IntoIterator<Item = (CodeOffset, ir::SourceLoc), IntoIter: Clone>,
+    {
+        // alloc: none until the rows are counted, then exactly that many: the caller keeps them
+        let mut out = Vec::new();
+        Self::extend_ranges(&mut out, ranges);
+        out
+    }
+
+    /// [`Self::of_ranges`] onto the end of `out`, grown once to its exact length: what v2's
+    /// emit writes into the thread's kept rows ([`crate::spare::lines`]).
+    pub(super) fn extend_ranges<I>(out: &mut Vec<LineRow>, ranges: I)
+    where
+        I: IntoIterator<Item = (CodeOffset, ir::SourceLoc), IntoIter: Clone>,
+    {
+        let ranges = ranges.into_iter();
+        let rows = || {
+            let mut last = None;
+            // clone: the iterator, not what it yields: the rows are counted, then written
+            ranges.clone().filter_map(move |(offset, loc)| {
+                let span = Self::span_of(loc)?;
+                (last.replace(span) != Some(span)).then_some(LineRow { offset, span })
+            })
+        };
+        out.reserve_exact(rows().count());
+        out.extend(rows());
     }
 }
 
@@ -108,7 +134,7 @@ pub(super) type TypeIndex = u32;
 /// What a debugger is told of a type: its name, its size, and what it is made of as far as
 /// that is told. A type names the types it is made of by their place in the same list, so
 /// one that points to itself can be told of.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum DebugType {
     /// A number, a `bool` or a `char`, whose bytes are read as the `DW_ATE_*` of `encoding`.
     Base {
@@ -149,7 +175,7 @@ impl DebugType {
 }
 
 /// A name, a size, the fields and the types the generic parameters stand for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Aggregate {
     pub(super) name: String,
     pub(super) size: u64,
@@ -157,7 +183,7 @@ pub(super) struct Aggregate {
     pub(super) parameters: Vec<(String, TypeIndex)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] // clone: each state of a coroutine keeps what it captured as its fields
 pub(super) struct Field {
     pub(super) name: String,
     pub(super) offset: u64,
@@ -176,7 +202,7 @@ pub(super) struct Tag {
 
 /// A variant of an enum. `tag` is the value of the tag that says a value is of this variant;
 /// the variant without one is what every other value of the tag means.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Variant {
     pub(super) name: String,
     pub(super) tag: Option<u64>,
@@ -184,7 +210,8 @@ pub(super) struct Variant {
 }
 
 /// Where the value of a variable is while the function runs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Clone))] // clone: tests keep the places they hand `SlotPlaces::new`
 pub(super) enum VariablePlace {
     /// In the frame, this far from what the frame is found by, from the first instruction
     /// to the last.
@@ -195,19 +222,44 @@ pub(super) enum VariablePlace {
 }
 
 /// Where the stack slots of a function are while it runs, for the ones that hold a local
-/// written with a name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// written with a name. Made by [`SlotPlaces::new`], and sorted again when read back, so that
+/// [`SlotPlaces::of`] finds a slot by binary search: one is asked for each variable told of.
+#[derive(Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "UnsortedSlotPlaces")]
 pub(super) struct SlotPlaces {
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
     pub(super) frame_base: Vec<u8>,
-    /// The number of a slot and where its bytes are.
+    /// The number of a slot and where its bytes are, by the number.
     pub(super) slots: Vec<(u32, VariablePlace)>,
 }
 
+/// [`SlotPlaces`] as an entry written before its slots were kept sorted has them.
+#[derive(Deserialize)]
+struct UnsortedSlotPlaces {
+    frame_base: Vec<u8>,
+    slots: Vec<(u32, VariablePlace)>,
+}
+
+impl From<UnsortedSlotPlaces> for SlotPlaces {
+    fn from(it: UnsortedSlotPlaces) -> Self {
+        SlotPlaces::new(it.frame_base, it.slots)
+    }
+}
+
 impl SlotPlaces {
+    /// The places of `slots`, in any order: sorted by number, and of a number told twice the
+    /// first is the one [`SlotPlaces::of`] gives.
+    pub(super) fn new(frame_base: Vec<u8>, mut slots: Vec<(u32, VariablePlace)>) -> SlotPlaces {
+        if !slots.is_sorted_by_key(|it| it.0) {
+            slots.sort_by_key(|it| it.0);
+        }
+        SlotPlaces { frame_base, slots }
+    }
+
     /// The places in a frame Cranelift laid out for `func`, which it finds by the frame
     /// pointer.
     pub(super) fn of_frame(
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn TargetIsa,
         frame: &cranelift_codegen::MachBufferFrameLayout,
         func: &ir::Function,
@@ -224,14 +276,19 @@ impl SlotPlaces {
         // Every slot of the function is in the layout, but one read back from Cranelift's
         // incremental cache leaves out the slots at its end that are at the bottom of the
         // frame, as a `SecondaryMap` written out leaves out its default entries (#242).
-        let slots = slots
-            .filter(|&slot| func.sized_stack_slots.is_valid(slot))
-            .map(|slot| {
-                let offset = i64::from(frame.stackslots[slot].offset) - to_fp;
-                (slot.as_u32(), VariablePlace::Frame(offset))
-            })
-            .collect();
-        SlotPlaces { frame_base: vec![gimli::DW_OP_reg0.0 + register.0 as u8], slots }
+        let slots = slots.filter(|&slot| func.sized_stack_slots.is_valid(slot));
+        let mut places = Vec::with_capacity(slots.size_hint().1.unwrap_or(0));
+        places.extend(slots.map(|slot| {
+            let offset = i64::from(frame.stackslots[slot].offset) - to_fp;
+            (slot.as_u32(), VariablePlace::Frame(offset))
+        }));
+        // A frame base no variable is told from would be read by nothing: every variable
+        // told of is where one of these slots is.
+        if places.is_empty() {
+            return SlotPlaces::default();
+        }
+        // alloc: the one byte of frame base the function's entry keeps, as `SlotPlaces` has it
+        SlotPlaces::new(vec![gimli::DW_OP_reg0.0 + register.0 as u8], places)
     }
 }
 
@@ -240,18 +297,29 @@ impl VariablePlace {
     /// debugger cannot read the address in has no place for the value.
     pub(super) fn pointee(&self, offset: u32) -> VariablePlace {
         let ranges = match self {
-            VariablePlace::Frame(offset) => {
-                let mut held = vec![gimli::DW_OP_fbreg.0];
-                // An expression of one operation writes nowhere it can fail.
-                let _ = gimli::leb128::write::signed(&mut held, *offset);
-                vec![(0, CodeOffset::MAX, held)]
+            // What `pointee_expression` makes of `DW_OP_fbreg`, written once into an
+            // expression of its exact length.
+            &VariablePlace::Frame(at) => {
+                let plus = if offset == 0 { 0 } else { 1 + leb::len_u64(offset.into()) };
+                let mut pointee = Vec::with_capacity(1 + leb::len_i64(at) + 1 + plus);
+                pointee.push(gimli::DW_OP_fbreg.0);
+                leb::write_i64(&mut pointee, at);
+                pointee.push(gimli::DW_OP_deref.0);
+                if offset != 0 {
+                    pointee.push(gimli::DW_OP_plus_uconst.0);
+                    leb::write_u64(&mut pointee, u64::from(offset));
+                }
+                // alloc: the one range the place keeps, as `VariablePlace::Ranges` has it
+                vec![(0, CodeOffset::MAX, pointee)]
             }
-            VariablePlace::Ranges(ranges) => ranges.clone(),
+            VariablePlace::Ranges(ranges) => {
+                let mut pointee = Vec::with_capacity(ranges.len());
+                pointee.extend(ranges.iter().filter_map(|(from, to, held)| {
+                    Some((*from, *to, pointee_expression(held, offset)?))
+                }));
+                pointee
+            }
         };
-        let ranges = ranges
-            .into_iter()
-            .filter_map(|(from, to, held)| Some((from, to, pointee_expression(&held, offset)?)))
-            .collect();
         VariablePlace::Ranges(ranges)
     }
 }
@@ -262,8 +330,11 @@ fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
     let (&operation, operands) = held.split_first()?;
     let register = gimli::DW_OP_reg0.0..=gimli::DW_OP_reg31.0;
     let based = gimli::DW_OP_breg0.0..=gimli::DW_OP_breg31.0;
+    let plus = if offset == 0 { 0 } else { 1 + leb::len_u64(offset.into()) };
     let mut pointee = if register.contains(&operation) && operands.is_empty() {
-        vec![operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]
+        let mut pointee = Vec::with_capacity(2 + plus);
+        pointee.extend_from_slice(&[operation - gimli::DW_OP_reg0.0 + gimli::DW_OP_breg0.0, 0]);
+        pointee
     } else if operation == gimli::DW_OP_fbreg.0 || based.contains(&operation) {
         // The one operand is a LEB128 number, which ends at the first byte without the high
         // bit.
@@ -271,25 +342,29 @@ fn pointee_expression(held: &[u8], offset: u32) -> Option<Vec<u8>> {
         if end + 1 != operands.len() {
             return None;
         }
-        [held, &[gimli::DW_OP_deref.0]].concat()
+        let mut pointee = Vec::with_capacity(held.len() + 1 + plus);
+        pointee.extend_from_slice(held);
+        pointee.push(gimli::DW_OP_deref.0);
+        pointee
     } else {
         return None;
     };
     if offset != 0 {
         pointee.push(gimli::DW_OP_plus_uconst.0);
-        gimli::leb128::write::unsigned(&mut pointee, u64::from(offset)).ok()?;
+        leb::write_u64(&mut pointee, u64::from(offset));
     }
     Some(pointee)
 }
 
 impl SlotPlaces {
     pub(super) fn of(&self, slot: u32) -> Option<&VariablePlace> {
-        self.slots.iter().find(|it| it.0 == slot).map(|it| &it.1)
+        let at = self.slots.partition_point(|it| it.0 < slot);
+        self.slots.get(at).filter(|it| it.0 == slot).map(|it| &it.1)
     }
 }
 
 /// A part of a function its names are looked up in: the body, a block, what follows a `let`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scope {
     /// The scope this one is inside of, by its place among the scopes. It comes before.
     pub(super) parent: Option<u32>,
@@ -298,7 +373,7 @@ pub(super) struct Scope {
 }
 
 /// A parameter or a `let` of a function.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct VariableDebug {
     pub(super) name: String,
     pub(super) param: bool,
@@ -312,7 +387,7 @@ pub(super) struct VariableDebug {
 
 /// What a debugger is told about one function, with nothing in it that depends on where the
 /// function ends up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct FunctionDebug {
     /// The path a debugger knows the function by, as in `a::B<c::D>::e<F>`.
     pub(super) name: String,
@@ -324,12 +399,9 @@ pub(super) struct FunctionDebug {
     pub(super) declared: Option<Place>,
     /// Where the code is from, from each offset on, in the order of the offsets.
     pub(super) rows: Vec<(CodeOffset, Place)>,
-    /// The types of the variables and what those are made of. The store keeps a set once,
-    /// for every function that has it: see `stored_types`.
+    /// The types of the variables and what those are made of.
     #[serde(skip)]
     pub(super) types: Vec<TypeSet>,
-    /// The keys `types` are in the store under, of an entry of the store.
-    pub(super) stored_types: Vec<[u8; super::store::KEY]>,
     pub(super) scopes: Vec<Scope>,
     pub(super) variables: Vec<VariableDebug>,
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
@@ -338,18 +410,7 @@ pub(super) struct FunctionDebug {
 
 impl FunctionDebug {
     pub(super) fn new(name: String, linkage_name: String) -> Self {
-        FunctionDebug {
-            name,
-            linkage_name,
-            files: Vec::new(),
-            declared: None,
-            rows: Vec::new(),
-            types: Vec::new(),
-            stored_types: Vec::new(),
-            scopes: Vec::new(),
-            variables: Vec::new(),
-            frame_base: Vec::new(),
-        }
+        FunctionDebug { name, linkage_name, ..FunctionDebug::default() }
     }
 
     /// The place of `line` and `column` in the file rustc calls `file`.
@@ -385,6 +446,7 @@ impl DebugContext {
     /// With `grouped`, each unit linked on ELF has sections of its own (see
     /// [`Dwarf::sections`]).
     pub(super) fn new(
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn TargetIsa,
         directory: &str,
         variables: bool,
@@ -398,10 +460,12 @@ impl DebugContext {
             target_lexicon::BinaryFormat::Elf => {
                 let mut dwarf = Dwarf::new(isa, directory, variables, apart);
                 dwarf.grouped = grouped;
+                // alloc: once per object, its context
                 Some(DebugContext::Dwarf(Box::new(dwarf)))
             }
             target_lexicon::BinaryFormat::Macho => {
                 let dwarf = Dwarf::new(isa, directory, variables, None);
+                // alloc: once per object, its context
                 Some(DebugContext::Dwarf(Box::new(dwarf)))
             }
             target_lexicon::BinaryFormat::Coff => {
@@ -424,28 +488,10 @@ impl DebugContext {
     pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         match self {
             DebugContext::Dwarf(dwarf) => dwarf.emit(product),
+            // alloc: empty, allocates nothing: CodeView keeps nothing apart
             DebugContext::CodeView(codeview) => codeview.emit(product).map(|()| Vec::new()),
         }
     }
-}
-
-/// A [`DebugContext`] on threads of their own, which describe the functions they are sent
-/// while the thread that sends them goes on putting code in the object. DWARF linked into
-/// an ELF object is described on several, each writing units of its own: one thread falls
-/// behind the one putting code in the object, and the object waits for it.
-pub(super) struct Describer {
-    shards: Vec<Shard>,
-    /// How many functions were sent, which picks the thread a function goes to.
-    sent: std::sync::atomic::AtomicUsize,
-}
-
-/// A function to describe, with the entries it is of when the store had it: its types are read
-/// on the describing thread.
-type Sent = (FuncId, u32, FunctionDebug, Option<std::sync::Arc<super::cached::Entries>>);
-
-struct Shard {
-    functions: std::sync::mpsc::Sender<Sent>,
-    described: std::thread::JoinHandle<Described>,
 }
 
 /// What a [`Describer`] ends with.
@@ -454,94 +500,6 @@ enum Described {
     Sections(Result<Vec<Section>, String>),
     /// What writes them once it has the object to look into.
     Context(DebugContext),
-}
-
-impl Describer {
-    /// With `elf`, the object is an ELF one, which can have DWARF of several threads: its
-    /// linker puts the sections of one name together, and each unit reads the sections
-    /// beside it.
-    pub(super) fn new(context: DebugContext, elf: bool) -> Describer {
-        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let mut contexts = vec![];
-        if let DebugContext::Dwarf(dwarf) = &context
-            && elf
-            && dwarf.apart.is_none()
-            && !dwarf.grouped
-        {
-            // The types of the functions put in from the store are read here as well.
-            contexts.extend((1..(threads / 4).clamp(1, 16)).map(|_| dwarf.like()));
-        }
-        let contexts = std::iter::once(context)
-            .chain(contexts.into_iter().map(|it| DebugContext::Dwarf(Box::new(it))));
-        let shards = contexts.map(Shard::new).collect();
-        Describer { shards, sent: Default::default() }
-    }
-
-    /// Describes the function `func` of the module, which is `len` bytes of code.
-    pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
-        self.send((func, len, debug, None));
-    }
-
-    /// Describes the function `func` put in the module from `entries`.
-    pub(super) fn add_stored(
-        &self,
-        func: FuncId,
-        len: u32,
-        debug: FunctionDebug,
-        entries: std::sync::Arc<super::cached::Entries>,
-    ) {
-        self.send((func, len, debug, Some(entries)));
-    }
-
-    fn send(&self, function: Sent) {
-        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shard = &self.shards[(sent / FUNCTIONS_OF_A_UNIT) % self.shards.len()];
-        // The thread ends only when it panicked, which `emit` says.
-        let _ = shard.functions.send(function);
-    }
-
-    /// Writes the sections into the object, when it has a function to describe. What is
-    /// returned is what was kept apart from the object.
-    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
-        let mut written = Vec::new();
-        let mut kept = None;
-        // Every thread is told there is nothing more before any is waited for.
-        let threads: Vec<_> = self.shards.into_iter().map(|it| it.described).collect();
-        for described in threads {
-            match described.join().map_err(|_| "describing the functions panicked")? {
-                Described::Sections(sections) => written.push(sections?),
-                Described::Context(context) => kept = Some(context),
-            }
-        }
-        if let Some(context) = kept {
-            return context.emit(product);
-        }
-        if matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
-            place_all(product, written)?;
-        }
-        Ok(Vec::new())
-    }
-}
-
-impl Shard {
-    fn new(mut context: DebugContext) -> Shard {
-        let (functions, sent) = std::sync::mpsc::channel::<Sent>();
-        let described = std::thread::spawn(move || {
-            for (func, len, mut debug, entries) in sent {
-                if let Some(entries) = entries {
-                    entries.describe(&mut debug);
-                }
-                context.add_function(func, len, &debug);
-            }
-            match context {
-                DebugContext::Dwarf(dwarf) if dwarf.apart.is_none() => {
-                    Described::Sections(dwarf.sections())
-                }
-                context => Described::Context(context),
-            }
-        });
-        Shard { functions, described }
-    }
 }
 
 /// How many functions a compilation unit describes before the next one is begun. What reads
@@ -560,25 +518,29 @@ pub(super) struct Dwarf {
     /// they are kept apart from what is linked, and the units that are.
     apart: Option<(String, Vec<split::Apart>)>,
     /// What tells the unit functions are being added to from another: what was added.
-    id: FxHasher,
+    id: FixedHasher,
     encoding: Encoding,
     directory: Vec<u8>,
-    files: FxHashMap<String, FileId>,
+    files: HashMap<String, FileId>,
     ranges: Vec<Range>,
     /// The addresses the entries of a unit kept apart name by their place in this list.
     addresses: Vec<Address>,
-    types: FxHashMap<SharedType, UnitEntryId>,
+    types: HashMap<SharedType, UnitEntryId>,
     /// The first entry of each name among `types`.
-    names: FxHashMap<Symbol, UnitEntryId>,
+    names: HashMap<Symbol, UnitEntryId>,
     /// The entry of the type each set seen is of, by where the set is, with the set so that
     /// nothing else comes to be there.
-    sets: FxHashMap<usize, (TypeSet, Option<UnitEntryId>)>,
+    sets: HashMap<usize, (TypeSet, Option<UnitEntryId>)>,
     /// The modules and functions of the unit that a type is written in, by their paths.
-    namespaces: FxHashMap<String, UnitEntryId>,
+    namespaces: HashMap<String, UnitEntryId>,
     /// Whether the variables of the functions are told of, and not their lines alone.
     variables: bool,
     /// Whether each unit is written in sections of its own.
     grouped: bool,
+    /// The files of the function being added.
+    function_files: Vec<FileId>,
+    /// The entry of each scope of the function being added, as far as one is made.
+    blocks: Vec<Option<UnitEntryId>>,
 }
 
 /// What tells one type of the unit from another: every function with a variable of the
@@ -593,7 +555,7 @@ enum SharedType {
 #[derive(Default)]
 struct FunctionTypes {
     /// By where each type's set is.
-    entries: FxHashMap<usize, UnitEntryId>,
+    entries: HashMap<usize, UnitEntryId>,
     /// How many types the one being told of is inside of.
     inside: u32,
 }
@@ -603,15 +565,19 @@ impl Dwarf {
     /// variables of the functions are left out unless `variables` asks for them. Their
     /// entries are kept apart from what is linked when `apart` names the file a debugger
     /// reads them from.
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     fn new(isa: &dyn TargetIsa, directory: &str, variables: bool, apart: Option<String>) -> Self {
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
+        // alloc: once per object, the directory its files are named from
         Self::of(encoding, directory.as_bytes().to_vec(), variables, apart)
     }
 
     /// Units of their own, of the object this describes the functions of.
     fn like(&self) -> Self {
+        // clone: once per object and describing thread, the names its units are written with
         let apart = self.apart.as_ref().map(|it| it.0.clone());
+        // clone: once per object and describing thread, as above
         let mut dwarf = Self::of(self.encoding, self.directory.clone(), self.variables, apart);
         dwarf.grouped = self.grouped;
         dwarf
@@ -621,19 +587,26 @@ impl Dwarf {
         let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Written::default(),
+            // alloc: empty, allocates nothing: grows by a unit kept apart per unit
             apart: apart.map(|name| (name, Vec::new())),
-            id: FxHasher::default(),
+            id: FixedHasher::default(),
+            // alloc: empty, allocates nothing: each unit kept apart takes the ones it names
             addresses: Vec::new(),
             encoding,
             directory,
-            files: FxHashMap::default(),
+            files: HashMap::default(),
+            // alloc: empty, allocates nothing: a unit reserves its ranges at its first function
             ranges: Vec::new(),
-            types: FxHashMap::default(),
-            names: FxHashMap::default(),
-            sets: FxHashMap::default(),
-            namespaces: FxHashMap::default(),
+            types: HashMap::default(),
+            names: HashMap::default(),
+            sets: HashMap::default(),
+            namespaces: HashMap::default(),
             variables,
             grouped: false,
+            // alloc: empty, allocates nothing: reused for every function
+            function_files: Vec::new(),
+            // alloc: empty, allocates nothing: reused for every function
+            blocks: Vec::new(),
         };
         context.begin_unit();
         context
@@ -645,8 +618,10 @@ impl Dwarf {
         dwarf.unit.line_program = LineProgram::new(
             self.encoding,
             LineEncoding::default(),
+            // clone: once per unit of `FUNCTIONS_OF_A_UNIT` functions: the line program owns it
             LineString::String(self.directory.clone()),
             None,
+            // alloc: once per unit of `FUNCTIONS_OF_A_UNIT` functions: the line program owns it
             LineString::String(b"<blaze>".to_vec()),
             None,
         );
@@ -654,7 +629,7 @@ impl Dwarf {
         // no crate below it (crates/blaze-engine/build.rs).
         let producer = self.text(b"blaze");
         let name = self.text(b"<blaze>");
-        let directory = self.text(&self.directory.clone());
+        let directory = text_in(self.apart.is_some(), &mut self.dwarf.strings, &self.directory);
         let unit = &mut self.dwarf.unit;
         let root = unit.get_mut(unit.root());
         root.set(DW_AT_producer, producer);
@@ -671,10 +646,7 @@ impl Dwarf {
     /// A name as an entry has it: among the strings of the object, or in the entry itself
     /// when it is kept apart, where there are no strings to share.
     fn text(&mut self, text: &[u8]) -> AttributeValue {
-        match self.apart {
-            Some(_) => AttributeValue::String(text.to_vec()),
-            None => AttributeValue::StringRef(self.dwarf.strings.add(text)),
-        }
+        text_in(self.apart.is_some(), &mut self.dwarf.strings, text)
     }
 
     /// Ends the unit functions were added to, which is left out when it has none, and
@@ -721,9 +693,11 @@ impl Dwarf {
         let full = &mut self.full;
         full.units += 1;
         if !self.grouped {
+            // alloc: the error's message
             return units.write(&mut full.shared, line_strings, strings).map_err(|e| e.to_string());
         }
         let mut out = Sections::new(SectionWriter::default());
+        // alloc: the error's message
         units.write(&mut out, line_strings, strings).map_err(|e| e.to_string())?;
         let group = Some(full.units - 1);
         out.for_each_mut(|id, section: &mut SectionWriter| {
@@ -738,7 +712,9 @@ impl Dwarf {
         }
         let program = &mut self.dwarf.unit.line_program;
         let directory = program.default_directory();
+        // alloc: once per file of a unit, on a miss: the line program owns its name
         let id = program.add_file(LineString::String(name.as_bytes().to_vec()), directory, None);
+        // alloc: once per file of a unit, on a miss: the key it is found by
         self.files.insert(name.to_owned(), id);
         id
     }
@@ -749,7 +725,9 @@ impl Dwarf {
         if let Some((_, entry)) = self.sets.get(&at) {
             return *entry;
         }
-        let entry = self.ty(&mut FunctionTypes::default(), &Of::Type(types.clone()));
+        let entry = self.ty_of_set(&mut FunctionTypes::default(), types);
+        // The set is kept so that no other comes to be at the address it is keyed by.
+        // clone: one count of the set's group, once per set of the unit
         self.sets.insert(at, (types.clone(), entry));
         entry
     }
@@ -759,10 +737,14 @@ impl Dwarf {
     /// what a compiler would have written, and each one inside another takes a few frames of
     /// the stack.
     fn ty(&mut self, of: &mut FunctionTypes, part: &Of<'_>) -> Option<UnitEntryId> {
-        let set = match part {
-            Of::Type(set) => set,
-            Of::Named(name) => return self.names.get(*name).copied(),
-        };
+        match part {
+            Of::Type(set) => self.ty_of_set(of, set),
+            Of::Named(name) => self.names.get(*name).copied(),
+        }
+    }
+
+    /// [`Self::ty`] of the type of `set`.
+    fn ty_of_set(&mut self, of: &mut FunctionTypes, set: &TypeSet) -> Option<UnitEntryId> {
         if let Some(&entry) = of.entries.get(&set.at()) {
             return Some(entry);
         }
@@ -778,19 +760,18 @@ impl Dwarf {
     /// The entry of the type of `set`, which has none yet.
     fn new_type(&mut self, of: &mut FunctionTypes, set: &TypeSet) -> Option<UnitEntryId> {
         let ty: &Told = &set.node().told;
-        let made_of: Vec<Of<'_>> = set.of().collect();
+        let mut made_of = SmallVec::<[Of<'_>; 4]>::new();
+        made_of.extend(set.of());
         let shared = match ty {
-            Told::Base { name, size, .. } => {
-                SharedType::Named(DW_TAG_base_type, name.clone(), *size)
-            }
-            Told::Pointer { name } => SharedType::Named(DW_TAG_pointer_type, name.clone(), 0),
+            Told::Base { name, size, .. } => SharedType::Named(DW_TAG_base_type, *name, *size),
+            Told::Pointer { name } => SharedType::Named(DW_TAG_pointer_type, *name, 0),
             Told::Array { len } => SharedType::Array(self.ty(of, made_of.first()?)?, *len),
             Told::Struct(it) | Told::Enum { of: it, .. } => {
-                SharedType::Named(DW_TAG_structure_type, it.name.clone(), it.size)
+                SharedType::Named(DW_TAG_structure_type, it.name, it.size)
             }
-            Told::Union(it) => SharedType::Named(DW_TAG_union_type, it.name.clone(), it.size),
+            Told::Union(it) => SharedType::Named(DW_TAG_union_type, it.name, it.size),
             Told::Names { name, size, .. } => {
-                SharedType::Named(DW_TAG_enumeration_type, name.clone(), *size)
+                SharedType::Named(DW_TAG_enumeration_type, *name, *size)
             }
         };
         if let Some(&entry) = self.types.get(&shared) {
@@ -819,7 +800,7 @@ impl Dwarf {
         };
         of.entries.insert(set.at(), entry);
         if let SharedType::Named(_, name, _) = &shared {
-            self.names.entry(name.clone()).or_insert(entry);
+            self.names.entry(*name).or_insert(entry);
         }
         self.types.insert(shared, entry);
         // A type made of itself finds its entry here.
@@ -837,6 +818,7 @@ impl Dwarf {
         let (outer, name) = last_of(path);
         let parent = self.namespace(outer);
         let entry = self.named(parent, DW_TAG_namespace, name);
+        // alloc: once per module of a unit, on a miss: the key it is found by
         self.namespaces.insert(path.to_owned(), entry);
         entry
     }
@@ -938,7 +920,9 @@ impl Dwarf {
                 self.dwarf.unit.get_mut(choice).set(DW_AT_discr_value, value);
             }
             let member = match variant.tag {
-                Some(state) if states => self.named(choice, DW_TAG_member, &state.to_string()),
+                Some(state) if states => {
+                    self.named(choice, DW_TAG_member, decimal(state, &mut [0; 20]))
+                }
                 _ => self.named(choice, DW_TAG_member, variant.name.as_str()),
             };
             let member = self.dwarf.unit.get_mut(member);
@@ -982,16 +966,24 @@ impl Dwarf {
 
     /// The unsigned number of `size` bytes.
     fn unsigned(&mut self, size: u64) -> UnitEntryId {
-        let name = format!("u{}", size * 8);
-        let shared = SharedType::Named(DW_TAG_base_type, Symbol::intern(&name), size);
+        let name = match size {
+            1 => sym::u8,
+            2 => sym::u16,
+            4 => sym::u32,
+            8 => sym::u64,
+            16 => sym::u128,
+            // alloc: a size no integer type has, which no layout gives a tag
+            _ => Symbol::intern(&format!("u{}", size * 8)),
+        };
+        let shared = SharedType::Named(DW_TAG_base_type, name, size);
         if let Some(&entry) = self.types.get(&shared) {
             return entry;
         }
-        let entry = self.named(self.dwarf.unit.root(), DW_TAG_base_type, &name);
+        let entry = self.named(self.dwarf.unit.root(), DW_TAG_base_type, name.as_str());
         let unit = self.dwarf.unit.get_mut(entry);
         unit.set(DW_AT_byte_size, AttributeValue::Udata(size));
         unit.set(DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
-        self.names.entry(Symbol::intern(&name)).or_insert(entry);
+        self.names.entry(name).or_insert(entry);
         self.types.insert(shared, entry);
         entry
     }
@@ -1015,9 +1007,12 @@ impl Dwarf {
         if !self.variables || debug.variables.is_empty() || debug.frame_base.is_empty() {
             return;
         }
+        // clone: the unit owns its expressions, and `DebugContext::add_function` borrows `debug`
         let base = Expression::raw(debug.frame_base.clone());
         self.dwarf.unit.get_mut(function).set(DW_AT_frame_base, AttributeValue::Exprloc(base));
-        let mut blocks = vec![None; debug.scopes.len()];
+        let mut blocks = std::mem::take(&mut self.blocks);
+        blocks.clear();
+        blocks.resize(debug.scopes.len(), None);
         for variable in &debug.variables {
             let Some(types) = debug.types.get(variable.ty as usize) else { continue };
             let Some(ty) = self.set(types) else { continue };
@@ -1034,6 +1029,7 @@ impl Dwarf {
                 self.dwarf.unit.get_mut(entry).set(DW_AT_location, place);
             }
         }
+        self.blocks = blocks;
     }
 
     /// The entry of the scope `scope` of a function, inside the entry of the scope it is in.
@@ -1048,7 +1044,7 @@ impl Dwarf {
         scope: u32,
     ) -> Option<UnitEntryId> {
         // The scopes from this one out that have no entry yet, and the entry they are in.
-        let mut without = Vec::new();
+        let mut without = SmallVec::<[(u32, &[(CodeOffset, CodeOffset)]); 8]>::new();
         let mut outer = Some(scope);
         let mut parent = function;
         while let Some(scope) = outer {
@@ -1060,7 +1056,7 @@ impl Dwarf {
             if ranges.is_empty() || without.len() == debug.scopes.len() {
                 return None;
             }
-            without.push((scope, ranges));
+            without.push((scope, ranges.as_slice()));
             outer = *parent;
         }
         for (scope, ranges) in without.into_iter().rev() {
@@ -1087,8 +1083,10 @@ impl Dwarf {
             let within = ranges
                 .iter()
                 .map(|&(from, to)| Range::OffsetPair { begin: from.into(), end: to.into() });
-            let ranges =
-                std::iter::once(Range::BaseAddress { address: start }).chain(within).collect();
+            let ranges = std::iter::once(Range::BaseAddress { address: start })
+                .chain(within)
+                // alloc: the range list the unit keeps, one allocation of its exact length
+                .collect();
             let ranges = self.dwarf.unit.ranges.add(RangeList(ranges));
             self.dwarf.unit.get_mut(block).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
         }
@@ -1124,20 +1122,23 @@ impl Dwarf {
         if let [(0, to, expression)] = ranges.as_slice()
             && *to >= len
         {
+            // clone: the unit owns its expressions, and `DebugContext::add_function` borrows them
             return Some(AttributeValue::Exprloc(Expression::raw(expression.clone())));
         }
-        let places: Vec<Location> = ranges
-            .iter()
-            .filter(|(from, to, _)| from < to && *from < len)
-            .map(|(from, to, expression)| Location::StartLength {
-                begin: past(start, *from),
-                length: (to.min(&len) - from).into(),
-                data: Expression::raw(expression.clone()),
-            })
-            .collect();
-        if places.is_empty() {
+        let read = |&&(from, to, _): &&(CodeOffset, CodeOffset, Vec<u8>)| from < to && from < len;
+        let count = ranges.iter().filter(read).count();
+        if count == 0 {
             return None;
         }
+        let mut places = Vec::with_capacity(count);
+        places.extend(ranges.iter().filter(read).map(|(from, to, expression)| {
+            Location::StartLength {
+                begin: past(start, *from),
+                length: (to.min(&len) - from).into(),
+                // clone: the unit owns its expressions, as above
+                data: Expression::raw(expression.clone()),
+            }
+        }));
         let places = self.dwarf.unit.locations.add(LocationList(places));
         Some(AttributeValue::LocationListRef(places))
     }
@@ -1150,8 +1151,13 @@ impl Dwarf {
         if self.ranges.len() == FUNCTIONS_OF_A_UNIT {
             self.end_unit();
         }
+        if self.ranges.is_empty() {
+            self.ranges.reserve_exact(FUNCTIONS_OF_A_UNIT);
+        }
         let start = Address::Symbol { symbol: func.as_u32() as usize, addend: 0 };
-        let files: Vec<FileId> = debug.files.iter().map(|it| self.file(it)).collect();
+        let mut files = std::mem::take(&mut self.function_files);
+        files.clear();
+        files.extend(debug.files.iter().map(|it| self.file(it)));
         let file = |place: &Place| files.get(place.file as usize).copied();
         self.ranges.push(Range::StartLength { begin: start, length: len.into() });
 
@@ -1203,6 +1209,7 @@ impl Dwarf {
         if any {
             program.end_sequence(len.into());
         }
+        self.function_files = files;
     }
 
     /// The sections of the units, none of which is kept apart: none when no function is
@@ -1222,7 +1229,9 @@ impl Dwarf {
             return Ok(sections);
         }
         let (strings, line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
+        // alloc: the error's message
         line_strings.write(&mut shared.debug_line_str).map_err(|e| e.to_string())?;
+        // alloc: the error's message
         strings.write(&mut shared.debug_str).map_err(|e| e.to_string())?;
         shared.for_each_mut(|id, section: &mut SectionWriter| {
             sections.push(Section { id, group: None, written: std::mem::take(section) });
@@ -1236,10 +1245,12 @@ impl Dwarf {
     fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         self.end_unit();
         if !matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
+            // alloc: empty, allocates nothing: there is no DWARF to keep apart
             return Ok(Vec::new());
         }
         let Some((name, apart)) = self.apart.take() else {
             place(product, self.sections()?)?;
+            // alloc: empty, allocates nothing: nothing is kept apart
             return Ok(Vec::new());
         };
         let mut split = split::Split::new(self.encoding, self.directory, name, &product.object);
@@ -1268,6 +1279,7 @@ impl Default for Written {
         Written {
             units: 0,
             shared: Sections::new(SectionWriter::default()),
+            // alloc: empty, allocates nothing: filled only when grouped, per unit
             grouped: Vec::new(),
             failed: None,
         }
@@ -1294,13 +1306,15 @@ pub struct Sidecar {
 /// map: an offset into another section is written as it is, and an address is relocated
 /// against its section, which [`settle_macho`] adds the address of once the object is laid out.
 fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), String> {
+    // alloc: once per object
     place_all(product, vec![sections])
 }
 
 /// [`place`] for the sections of several [`Dwarf`]s, each of which reads only its own.
 fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), String> {
     let macho = product.object.format() == BinaryFormat::MachO;
-    let mut placed = FxHashMap::default();
+    let mut placed = HashMap::default();
+    // alloc: once per object, its debug sections
     let mut linked = Vec::new();
     // A section with nothing in it is still there when another says where in it to read. A
     // unit's own sections are read by that unit, and the shared ones by every unit.
@@ -1311,6 +1325,7 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
             Target::Section(section) => Some((of, group, section)),
             Target::Function(_) => None,
         })
+        // alloc: once per object, the sections its debug sections point into
         .collect();
     let sections = (all.into_iter().enumerate())
         .flat_map(|(of, sections)| sections.into_iter().map(move |it| (of, it)));
@@ -1325,13 +1340,16 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
             _ => SectionKind::Debug,
         };
         let (segment, name) = if macho {
+            // alloc: once per debug section of the object, the names the object owns
             let segment = product.object.segment_name(StandardSegment::Debug).to_vec();
+            // alloc: once per debug section of the object, the names the object owns
             (segment, format!("__{}", &id.name()[1..]).into_bytes())
         } else {
+            // alloc: once per debug section of the object, the names the object owns
             (Vec::new(), id.name().as_bytes().to_vec())
         };
         let at = product.object.add_section(segment, name, kind);
-        product.object.section_mut(at).set_data(written.bytes.slice().to_vec(), 1);
+        product.object.section_mut(at).set_data(written.bytes.into_vec(), 1);
         placed.insert((of, group, id), at);
         linked.push((of, id, group, at, written.relocs));
     }
@@ -1343,6 +1361,7 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
                     let found =
                         placed.get(&(of, group, section)).or(placed.get(&(of, None, section)));
                     let Some(&section) = found else {
+                        // alloc: the error's message
                         return Err(format!("{} points to a section left out", id.name()));
                     };
                     if macho {
@@ -1350,6 +1369,7 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
                         let field = (product.object.section_mut(at).data_mut())
                             .get_mut(reloc.offset as usize..)
                             .and_then(|it| it.get_mut(..size))
+                            // alloc: the error's message
                             .ok_or_else(|| format!("{} has an offset outside it", id.name()))?;
                         field.copy_from_slice(&reloc.addend.to_le_bytes()[..size]);
                         continue;
@@ -1364,39 +1384,9 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
             };
             let relocation =
                 Relocation { offset: reloc.offset, symbol, flags, addend: addend + reloc.addend };
+            // alloc: the error's message
             product.object.add_relocation(at, relocation).map_err(|e| e.to_string())?;
         }
-    }
-    Ok(())
-}
-
-/// Adds to each address in the debug sections of the Mach-O `object` the address its section
-/// was laid out at, as a relocation against a section has it.
-pub(super) fn settle_macho(object: &mut [u8]) -> Result<(), String> {
-    use object::{Object, ObjectSection, RelocationTarget};
-    let file = object::File::parse(&*object).map_err(|e| e.to_string())?;
-    let mut settled = Vec::new();
-    for section in file.sections() {
-        if section.segment_name().ok().flatten() != Some("__DWARF") {
-            continue;
-        }
-        let Some((start, _)) = section.file_range() else { continue };
-        for (offset, relocation) in section.relocations() {
-            let RelocationTarget::Section(target) = relocation.target() else { continue };
-            let address = file.section_by_index(target).map_err(|e| e.to_string())?.address();
-            settled.push((start + offset, usize::from(relocation.size() / 8), address));
-        }
-    }
-    drop(file);
-    for (at, size, address) in settled {
-        let field = object
-            .get_mut(at as usize..)
-            .and_then(|it| it.get_mut(..size))
-            .ok_or("a debug section with a relocation outside it")?;
-        let mut held = [0; 8];
-        held[..size].copy_from_slice(field);
-        let value = u64::from_le_bytes(held).wrapping_add(address);
-        field.copy_from_slice(&value.to_le_bytes()[..size]);
     }
     Ok(())
 }
@@ -1432,6 +1422,17 @@ fn last_of(path: &str) -> (Option<&str>, &str) {
     match parted {
         Some(at) if at > 0 && at + 2 < path.len() => (Some(&path[..at]), &path[at + 2..]),
         _ => (None, path),
+    }
+}
+
+/// A name as an entry has it: in the entry itself when it is kept `apart`, where there are no
+/// strings to share, and otherwise among `strings`.
+fn text_in(apart: bool, strings: &mut gimli::write::StringTable, text: &[u8]) -> AttributeValue {
+    if apart {
+        // alloc: the entry kept apart owns its name: `AttributeValue::String` takes a `Vec`
+        AttributeValue::String(text.to_vec())
+    } else {
+        AttributeValue::StringRef(strings.add(text))
     }
 }
 
@@ -1472,7 +1473,7 @@ struct Reloc {
 
 /// A [`Writer`] of one debug section that collects the relocations its output needs: the
 /// addresses of functions, and the offsets into other debug sections, which a linker moves.
-#[derive(Clone)]
+#[derive(Clone)] // clone: gimli's `Sections::new` copies the empty writer once per section
 struct SectionWriter {
     relocs: Vec<Reloc>,
     bytes: EndianVec<RunTimeEndian>,
@@ -1489,6 +1490,7 @@ impl SectionWriter {
 
 impl Default for SectionWriter {
     fn default() -> Self {
+        // alloc: empty, allocates nothing: one per debug section, filled as it is written
         SectionWriter { relocs: Vec::new(), bytes: EndianVec::new(RunTimeEndian::Little) }
     }
 }
@@ -1551,5 +1553,94 @@ impl Writer for SectionWriter {
             addend: val as i64,
         });
         self.write_udata_at(offset, 0, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded(seed: u64) -> impl FnMut() -> u64 {
+        let mut rng = blaze_ids::rng::SplitMix64::new(seed);
+        move || rng.next_u64()
+    }
+
+    /// A slot is found by binary search where a linear search of the slots as they were told
+    /// found it: the first told of its number, or none. What is read back of slots written
+    /// in any order is sorted too.
+    #[test]
+    fn a_slot_is_found_as_a_search_in_the_order_told_finds_it() {
+        for seed in 0..200 {
+            let mut next = seeded(seed);
+            let told: Vec<(u32, VariablePlace)> = (0..next() % 40)
+                .map(|at| ((next() % 24) as u32, VariablePlace::Frame(at as i64)))
+                .collect();
+            let places = SlotPlaces::new(vec![0x56], told.clone());
+            for slot in 0..26 {
+                let first = told.iter().find(|it| it.0 == slot).map(|it| &it.1);
+                assert_eq!(places.of(slot), first, "seed {seed}, slot {slot}");
+            }
+            let unsorted = SlotPlaces { frame_base: vec![0x56], slots: told };
+            let bytes = postcard::to_allocvec(&unsorted).unwrap();
+            let read: SlotPlaces = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(read, places, "seed {seed}");
+        }
+    }
+
+    /// The rows as they were made before they were counted first: one push at a time.
+    fn rows_one_at_a_time(ranges: &[(CodeOffset, ir::SourceLoc)]) -> Vec<LineRow> {
+        let mut rows: Vec<LineRow> = Vec::new();
+        for &(offset, loc) in ranges {
+            let Some(span) = LineRow::span_of(loc) else { continue };
+            if rows.last().is_none_or(|last| last.span != span) {
+                rows.push(LineRow { offset, span });
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn line_rows_are_the_rows_pushed_one_at_a_time() {
+        for seed in 0..300 {
+            let mut next = seeded(seed);
+            let mut offset = 0;
+            let ranges: Vec<_> = (0..next() % 200)
+                .map(|_| {
+                    let bits = next();
+                    offset += (bits % 9) as u32;
+                    let span = ((bits >> 8) % 6) as u32;
+                    let loc = match bits >> 16 & 7 {
+                        0 => ir::SourceLoc::default(),
+                        1 => ir::SourceLoc::new(0),
+                        2 => super::super::unwind::seh::guarded(LineRow::source_loc(span)),
+                        _ => LineRow::source_loc(span),
+                    };
+                    (offset, loc)
+                })
+                .collect();
+            let rows = LineRow::of_ranges(ranges.iter().copied());
+            assert_eq!(rows, rows_one_at_a_time(&ranges), "seed {seed}");
+            assert_eq!(rows.capacity(), rows.len(), "seed {seed}");
+            assert_eq!(LineRow::of_ranges(ranges.clone()), rows, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_pointee_of_a_frame_place_is_what_the_expression_of_its_address_gives() {
+        let mut next = seeded(7);
+        let edges = [0, 1, -1, 63, 64, -64, -65, 8191, 8192, -8192, -8193, i64::MAX, i64::MIN];
+        let offsets = edges.into_iter().chain((0..500).map(|_| next() as i64 >> (next() % 64)));
+        for at in offsets {
+            for offset in [0, 1, 127, 128, 0x3fff, 0x4000, u32::MAX] {
+                let mut held = vec![gimli::DW_OP_fbreg.0];
+                gimli::leb128::write::signed(&mut held, at).expect("written");
+                let expected = pointee_expression(&held, offset).expect("a pointee");
+                let VariablePlace::Ranges(ranges) = VariablePlace::Frame(at).pointee(offset) else {
+                    panic!("a frame place's pointee is in ranges");
+                };
+                assert_eq!(ranges, vec![(0, CodeOffset::MAX, expected)], "{at} + {offset}");
+                assert_eq!(ranges[0].2.capacity(), ranges[0].2.len(), "{at} + {offset}");
+            }
+        }
     }
 }

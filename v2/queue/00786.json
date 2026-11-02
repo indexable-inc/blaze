@@ -1,0 +1,23 @@
+{
+  "id": "00786",
+  "from_lane": "frontend-tree-go-tokens",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax/src/view.rs"
+  ],
+  "what": "frontend-tree-go-tokens: addendum to 00785 (same impl block). syntax-bridge, mbe and hir-def tests call `parse.debug_dump()` on token_tree_to_syntax_node's parse, which only `Parse<SourceFile>` has. In the `impl Parse<Untyped>` of 00785 add:\n\n    /// The tree, one element a line ([`Node`]'s `{:#?}`), then its errors: the text\n    /// `Parse::<SourceFile>::debug_dump` gives.\n    pub fn debug_dump(&self) -> String {\n        // alloc: test and debug output only.\n        let mut buf = format!(\"{:#?}\", self.root());\n        for err in self.errors() {\n            format_to!(buf, \"error {:?}: {}\\n\", err.range(), err);\n        }\n        buf\n    }\n\n(`format_to` as lib.rs imports it: `use stdx::format_to;`.)",
+  "state": "open",
+  "created": "2026-10-30T07:53:46Z",
+  "updated": "2026-10-30T07:53:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:53:46Z",
+      "by": "frontend-tree-go-tokens",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

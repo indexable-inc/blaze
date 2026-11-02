@@ -2,48 +2,58 @@
 
 use std::{iter::repeat_with, mem};
 
+use blaze_hash::FixedState;
+use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
     AdtId, FieldId, TupleFieldId, TupleId, VariantId,
     expr_store::path::{GenericArgs as HirGenericArgs, Path},
     hir::{
-        Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId,
+        ArithOp, Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId,
         ExprOrPatIdPacked, InlineAsmKind, LabelId, LoopSource, Pat, PatId, RecordLitField,
-        RecordSpread, Statement, UnaryOp,
+        RecordSpread, Statement, Statements, UnaryOp, UnsafeBinderCastKind,
     },
-    resolver::ValueNs,
+    resolver::{TypeNs, ValueNs},
     signatures::VariantFields,
+    type_ref::TypeRefId,
 };
-use hir_def::{FunctionId, hir::ClosureKind};
-use hir_expand::name::Name;
+use hir_def::{
+    FunctionId,
+    hir::{ClosureKind, CoroutineKind},
+    lang_item::LangItemTarget,
+};
+use hir_expand::{mod_path::ModPath, name::Name};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
-    InferTy, Interner,
+    FallibleTypeFolder, InferTy, Interner, TypeFoldable, TypeFolder, TypeVisitable,
+    TypeVisitableExt, TypeVisitor, VisitorResult,
     inherent::{IntoKind, Ty as _},
+    try_visit,
 };
-use stdx::never;
+use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
     Adjust, Adjustment, CallableDefId, Rawness, Span,
     consteval::literal_ty,
+    db::HirDatabase,
     infer::{AllowTwoPhase, BreakableKind, coerce::CoerceMany, find_continuable, pat::PatOrigin},
     lower::lower_mutability,
     method_resolution::{self, CandidateId, MethodCallee, MethodError},
     next_solver::{
-        ClauseKind, FnSig, Ty, TyKind, TypeError,
+        ClauseKind, FnSig, IsRigid, StoredTy, Ty, TyKind, TypeError,
         infer::{
             BoundRegionConversionTime, InferOk,
-            traits::{Obligation, ObligationCause},
+            resolve::ReplaceInferWithError,
+            traits::{Obligation, ObligationCause, ObligationCauseCode},
         },
         obligation_ctxt::ObligationCtxt,
     },
 };
 
 use super::{
-    BreakableContext, Diverges, Expectation, InferenceContext, InferenceDiagnostic, ReturnKind,
-    cast::CastCheck, find_breakable,
+    BreakableContext, CallArguments, Diverges, Expectation, InferenceContext, InferenceDiagnostic,
+    ReturnKind, Unreachable, UnreachableAt, cast::CastCheck, find_breakable,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,7 +62,37 @@ pub(crate) enum ExprIsRead {
     No,
 }
 
-impl<'db> InferenceContext<'db> {
+/// A frame list of foldable values, folded in place: `fudge_inference_if_ok` folds what its
+/// closure returns, and `TypeFoldable for Vec<T>` collects a new list in the global allocator.
+#[derive(Clone, Debug)]
+struct FrameList<'f, T>(Vec<T, &'f Frame>);
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for FrameList<'_, T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        for item in &self.0 {
+            try_visit!(item.visit_with(visitor));
+        }
+        V::Result::output()
+    }
+}
+
+impl<I: Interner, T: TypeFoldable<I>> TypeFoldable<I> for FrameList<'_, T> {
+    fn try_fold_with<F: FallibleTypeFolder<I>>(mut self, folder: &mut F) -> Result<Self, F::Error> {
+        for item in &mut self.0 {
+            *item = item.clone().try_fold_with(folder)?; // clone: an interned `Ty`, a copied ID
+        }
+        Ok(self)
+    }
+
+    fn fold_with<F: TypeFolder<I>>(mut self, folder: &mut F) -> Self {
+        for item in &mut self.0 {
+            *item = item.clone().fold_with(folder); // clone: an interned `Ty`, a copied ID
+        }
+        self
+    }
+}
+
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn infer_expr(
         &mut self,
         tgt_expr: ExprId,
@@ -75,7 +115,7 @@ impl<'db> InferenceContext<'db> {
         let ty = self.infer_expr_inner(expr, expected, is_read);
         if ty.is_never() {
             if let Some(adjustments) = self.result.expr_adjustments.get(&expr) {
-                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = &**adjustments {
+                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = adjustments {
                     target.as_ref()
                 } else {
                     self.err_ty()
@@ -164,7 +204,7 @@ impl<'db> InferenceContext<'db> {
     /// it is matching against. This is used to determine whether we should
     /// perform `NeverToAny` coercions.
     fn pat_guaranteed_to_constitute_read_for_never(&self, pat: PatId) -> bool {
-        match &self.store[pat] {
+        match self.store.pat(pat) {
             // Does not constitute a read.
             Pat::Wild | Pat::Rest => false,
 
@@ -207,7 +247,7 @@ impl<'db> InferenceContext<'db> {
     // FIXME(tschottdorf): this is problematic as the HIR is being scraped, but
     // ref bindings are be implicit after #42640 (default match binding modes). See issue #44848.
     fn contains_explicit_ref_binding(&self, pat: PatId) -> bool {
-        if let Pat::Bind { id, .. } = self.store[pat]
+        if let Pat::Bind { id, .. } = self.store.pat(pat)
             && matches!(self.store[id].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
         {
             return true;
@@ -219,7 +259,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn is_syntactic_place_expr(&mut self, expr: ExprId) -> bool {
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             // Lang item paths cannot currently be local variables or statics.
             Expr::Path(Path::LangItem(_, _)) => false,
             Expr::Path(Path::Normal(path)) => path.type_anchor.is_none(),
@@ -241,6 +281,8 @@ impl<'db> InferenceContext<'db> {
             Expr::Underscore => true,
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
             Expr::Field { .. } | Expr::Index { .. } => true,
+            // rustc's `is_place_expr`: an unsafe binder cast keeps its operand's place-ness.
+            Expr::UnsafeBinderCast { expr, .. } => self.is_syntactic_place_expr(expr),
             Expr::Call { .. }
             | Expr::MethodCall { .. }
             | Expr::Tuple { .. }
@@ -273,12 +315,12 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    pub(crate) fn check_lhs_assignable(&mut self, lhs: ExprId) {
+    pub(crate) fn check_lhs_assignable(&mut self, lhs: ExprId, assign: ExprId, op: Option<ArithOp>) {
         if self.is_syntactic_place_expr(lhs) {
             return;
         }
 
-        self.push_diagnostic(InferenceDiagnostic::InvalidLhsOfAssignment { lhs });
+        self.push_diagnostic(InferenceDiagnostic::InvalidLhsOfAssignment { lhs, assign, op });
     }
 
     fn infer_expr_coerce_never(
@@ -292,7 +334,7 @@ impl<'db> InferenceContext<'db> {
         // coercions from `!` to `expected`.
         if ty.is_never() {
             if let Some(adjustments) = self.result.expr_adjustments.get(&expr) {
-                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = &**adjustments {
+                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = adjustments {
                     target.as_ref()
                 } else {
                     self.err_ty()
@@ -313,14 +355,17 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, is_read), ret)]
     pub(super) fn infer_expr_inner(
         &mut self,
         tgt_expr: ExprId,
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        self.db.unwind_if_revision_cancelled();
+        // Every expression is inferred and ids are dense, so one in 64 bounds how long a
+        // cancelled revision runs on, without two dependent loads per expression.
+        if tgt_expr.into_raw().into_u32() % 64 == 0 {
+            blaze_query::db::unwind_if_cancelled(self.db);
+        }
         // An expression is inferred within the one it is in: rustc's 5,204-arm `else if`.
         crate::next_solver::ensure_sufficient_stack(|| {
             self.infer_expr_inner_here(tgt_expr, expected, is_read)
@@ -333,17 +378,24 @@ impl<'db> InferenceContext<'db> {
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        let expr = &self.store[tgt_expr];
-        tracing::trace!(?expr);
+        let expr = self.store.expr(tgt_expr);
+        // Expressions after siblings that diverged; not inside `.await`'s desugaring, nor of a
+        // `try` block's generated `Try::from_output(())`.
+        if !matches!(expr, Expr::Await { .. }) && !self.is_try_block_output_of_unit(tgt_expr) {
+            self.warn_if_unreachable(UnreachableAt::Expr(tgt_expr));
+        }
+        // Whether a past expression diverged doesn't affect the typing of this one.
+        let old_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
         let ty = match expr {
             Expr::Missing => self.err_ty(),
-            &Expr::If { condition, then_branch, else_branch } => {
+            Expr::If { condition, then_branch, else_branch } => {
                 let expected = &expected.adjust_for_branches(&mut self.table, tgt_expr.into());
                 self.infer_expr_coerce_never(
                     condition,
                     &Expectation::HasType(self.types.types.bool),
                     ExprIsRead::Yes,
                 );
+                self.warn_if_unreachable(UnreachableAt::IfBlock(tgt_expr));
 
                 let condition_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
 
@@ -370,7 +422,10 @@ impl<'db> InferenceContext<'db> {
                         let else_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                         coerce.coerce(
                             self,
-                            &ObligationCause::new(else_branch),
+                            &ObligationCause::with_code(
+                                else_branch,
+                                ObligationCauseCode::IfExpression,
+                            ),
                             else_branch,
                             else_ty,
                             ExprIsRead::Yes,
@@ -381,7 +436,10 @@ impl<'db> InferenceContext<'db> {
                         coerce.coerce_forced_unit(
                             self,
                             tgt_expr,
-                            &ObligationCause::new(tgt_expr),
+                            &ObligationCause::with_code(
+                                tgt_expr,
+                                ObligationCauseCode::IfExpressionWithNoElse,
+                            ),
                             true,
                             ExprIsRead::Yes,
                         );
@@ -391,7 +449,9 @@ impl<'db> InferenceContext<'db> {
 
                 coerce.complete(self)
             }
-            &Expr::Let { pat, expr } => {
+            Expr::Let { pat, expr } => {
+                // For a `let` statement, `check_stmt` warns of the statement instead.
+                self.warn_if_unreachable(UnreachableAt::LetInit(tgt_expr));
                 self.infer_let(
                     self.table.next_ty_var(tgt_expr.into()),
                     Some(expr),
@@ -401,15 +461,20 @@ impl<'db> InferenceContext<'db> {
                 self.types.types.bool
             }
             Expr::Block { statements, tail, label, id: _, unsafe_: _ } => {
-                self.infer_block(tgt_expr, statements, *tail, *label, expected)
+                self.infer_block(tgt_expr, statements, tail, label, expected)
             }
             Expr::Const(id) => {
-                self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-                    this.infer_expr(*id, expected, ExprIsRead::Yes)
-                })
-                .1
+                // rustc checks an inline const's body with a `FnCtxt` of its own.
+                let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
+                let ty = self
+                    .with_breakable_ctx(BreakableKind::Border, None, None, |this| {
+                        this.infer_expr(id, expected, ExprIsRead::Yes)
+                    })
+                    .1;
+                self.diverges = prev_diverges;
+                ty
             }
-            &Expr::Loop { body, label, source } => {
+            Expr::Loop { body, label, source } => {
                 let coerce = match source {
                     // you can only use break with a value from a normal `loop { }`
                     LoopSource::Loop => {
@@ -429,28 +494,28 @@ impl<'db> InferenceContext<'db> {
                 if breaks.may_break {
                     self.diverges = Diverges::Maybe;
                 } else {
-                    self.diverges = Diverges::Always;
+                    self.diverges |= Diverges::always(tgt_expr);
                 }
                 breaks.coerce.map(|c| c.complete(self)).unwrap_or(self.types.types.unit)
             }
             Expr::Closure { body, args, ret_type, arg_types, closure_kind, capture_by: _ } => self
                 .infer_closure(
-                    *body,
+                    body,
                     args,
-                    *ret_type,
+                    ret_type,
                     arg_types,
-                    *closure_kind,
+                    closure_kind,
                     tgt_expr,
                     expected,
                 ),
-            Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, *callee, args, expected),
+            Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, callee, args, expected),
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
                 .infer_method_call(
                     tgt_expr,
-                    *receiver,
+                    receiver,
                     args,
                     method_name,
-                    generic_args.as_deref(),
+                    generic_args,
                     expected,
                 ),
             Expr::Match { expr, arms } => {
@@ -463,18 +528,23 @@ impl<'db> InferenceContext<'db> {
                 let scrutinee_is_read =
                     if scrutinee_is_read { ExprIsRead::Yes } else { ExprIsRead::No };
                 let input_ty = self.demand_scrutinee_type(
-                    *expr,
+                    expr,
                     contains_ref_bindings,
                     arms.is_empty(),
                     scrutinee_is_read,
                 );
 
                 if arms.is_empty() {
-                    self.diverges = Diverges::Always;
+                    self.diverges |= Diverges::always(tgt_expr);
                     self.types.types.never
                 } else {
+                    // rustc's `warn_arms_when_scrutinee_diverges`.
+                    for index in 0..arms.len() {
+                        let index = index as u32;
+                        self.warn_if_unreachable(UnreachableAt::Arm { match_expr: tgt_expr, index });
+                    }
                     let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
-                    let mut all_arms_diverge = Diverges::Always;
+                    let mut all_arms_diverge = Diverges::WarnedAlways;
                     for arm in arms.iter() {
                         self.infer_top_pat(arm.pat, input_ty, PatOrigin::MatchArm);
                     }
@@ -484,40 +554,64 @@ impl<'db> InferenceContext<'db> {
                         // We don't coerce to `()` so that if the match expression is a
                         // statement it's branches can have any consistent type.
                         Expectation::HasType(ty) if *ty != self.types.types.unit => *ty,
-                        _ => self.table.next_ty_var((*expr).into()),
+                        _ => self.table.next_ty_var(expr.into()),
                     };
-                    let mut coerce = CoerceMany::new(result_ty);
+                    let mut coerce = CoerceMany::with_capacity(result_ty, arms.len(), self.frame);
+                    let mut prior_arms = 0;
 
                     for arm in arms.iter() {
+                        self.diverges = Diverges::Maybe;
                         if let Some(guard_expr) = arm.guard {
-                            self.diverges = Diverges::Maybe;
                             self.infer_expr_coerce_never(
                                 guard_expr,
                                 &Expectation::HasType(self.types.types.bool),
                                 ExprIsRead::Yes,
                             );
                         }
-                        self.diverges = Diverges::Maybe;
+                        // Not reset after the guard: a guard that diverges makes its arm's
+                        // body unreachable, and the arm diverge.
 
                         let arm_ty = self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
                         all_arms_diverge &= self.diverges;
+                        // An arm of type `!` does not count as a prior arm: it does not shape
+                        // the type later arms must agree with.
+                        let code = match prior_arms {
+                            0 => ObligationCauseCode::BlockTailExpression,
+                            prior_arms => ObligationCauseCode::MatchExpressionArm { prior_arms },
+                        };
                         coerce.coerce(
                             self,
-                            &ObligationCause::new(arm.expr),
+                            &ObligationCause::with_code(arm.expr, code),
                             arm.expr,
                             arm_ty,
                             ExprIsRead::Yes,
                         );
+                        if !arm_ty.is_never() {
+                            prior_arms += 1;
+                        }
                     }
 
+                    if let Diverges::Always { .. } = all_arms_diverge
+                        && !self.is_desugared_match(expr)
+                    {
+                        all_arms_diverge = Diverges::Always {
+                            span: tgt_expr.into(),
+                            custom_note: Some(Unreachable::ALL_ARMS_DIVERGE),
+                        };
+                    }
                     self.diverges = matchee_diverges | all_arms_diverge;
 
                     coerce.complete(self)
                 }
             }
             Expr::Path(p) => self.infer_expr_path(p, tgt_expr.into(), tgt_expr),
-            &Expr::Continue { label } => {
-                if find_continuable(&self.breakables, label).is_none() {
+            Expr::Continue { label } => {
+                if label.is_none() && self.in_labeled_block() {
+                    self.push_diagnostic(InferenceDiagnostic::UnlabeledJumpInLabeledBlock {
+                        expr: tgt_expr,
+                        is_break: false,
+                    });
+                } else if find_continuable(&self.breakables, label).is_none() {
                     self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
                         expr: tgt_expr,
                         is_break: false,
@@ -526,18 +620,28 @@ impl<'db> InferenceContext<'db> {
                 };
                 self.types.types.never
             }
-            &Expr::Break { expr, label } => {
+            Expr::Break { expr, label } => {
                 let breakable_idx = find_breakable(&self.breakables, label);
+                // rustc reports only E0695 for it, and types it as a jump to the loop.
+                let in_labeled_block = label.is_none() && self.in_labeled_block();
+                if in_labeled_block {
+                    self.push_diagnostic(InferenceDiagnostic::UnlabeledJumpInLabeledBlock {
+                        expr: tgt_expr,
+                        is_break: true,
+                    });
+                }
                 let val_ty = if let Some(expr) = expr {
                     let opt_coerce_to = match breakable_idx {
                         Some(breakable_idx) => match &self.breakables[breakable_idx].coerce {
                             Some(coerce) => coerce.expected_ty(),
                             None => {
-                                self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
-                                    expr: tgt_expr,
-                                    is_break: true,
-                                    bad_value_break: true,
-                                });
+                                if !in_labeled_block {
+                                    self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
+                                        expr: tgt_expr,
+                                        is_break: true,
+                                        bad_value_break: true,
+                                    });
+                                }
                                 self.err_ty()
                             }
                         },
@@ -573,6 +677,7 @@ impl<'db> InferenceContext<'db> {
                             self.breakables[breakable_idx].coerce = Some(coerce);
                         }
                     }
+                    None if in_labeled_block => {}
                     None => {
                         self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
                             expr: tgt_expr,
@@ -583,13 +688,22 @@ impl<'db> InferenceContext<'db> {
                 }
                 self.types.types.never
             }
-            &Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
-            &Expr::Become { expr } => self.infer_expr_become(tgt_expr, expr),
+            Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
+            Expr::Become { expr } => self.infer_expr_become(tgt_expr, expr),
             Expr::Yield { expr } => {
-                if let Some((resume_ty, yield_ty)) = self.resume_yield_tys {
+                if self.coroutine_desugaring == Some(CoroutineKind::Async) {
+                    // rustc lowers it to `{ expr; <error> }`.
+                    if let Some(expr) = expr {
+                        self.infer_expr_no_expect(expr, ExprIsRead::Yes);
+                    }
+                    self.push_diagnostic(InferenceDiagnostic::AsyncCoroutinesNotSupported {
+                        expr: tgt_expr,
+                    });
+                    self.types.types.error
+                } else if let Some((resume_ty, yield_ty)) = self.resume_yield_tys {
                     if let Some(expr) = expr {
                         self.infer_expr_coerce(
-                            *expr,
+                            expr,
                             &Expectation::has_type(yield_ty),
                             ExprIsRead::Yes,
                         );
@@ -612,47 +726,58 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Yeet { expr } => {
-                if let &Some(expr) = expr {
+                if let Some(expr) = expr {
                     self.infer_expr_no_expect(expr, ExprIsRead::Yes);
                 }
                 self.types.types.never
             }
             Expr::RecordLit { path, fields, spread, .. } => {
-                self.infer_record_expr(tgt_expr, expected, path, fields, *spread)
+                self.infer_record_expr(tgt_expr, expected, path, fields, spread)
             }
-            Expr::Field { expr, name } => self.infer_field_access(tgt_expr, *expr, name, expected),
-            Expr::Await { expr } => self.infer_await_expr(tgt_expr, *expr),
+            Expr::Field { expr, name } => self.infer_field_access(tgt_expr, expr, name, expected),
+            Expr::Await { expr } => self.infer_await_expr(tgt_expr, expr),
             Expr::Cast { expr, type_ref } => {
-                let cast_ty = self.make_ty(*type_ref);
+                let cast_ty = self.make_ty(type_ref);
                 let expr_ty =
-                    self.infer_expr(*expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
-                self.deferred_cast_checks.push(CastCheck::new(tgt_expr, *expr, expr_ty, cast_ty));
-                cast_ty
+                    self.infer_expr(expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
+                // As rustc's `CastCheck::new`, a cast to an unsized type is reported here and is
+                // of the error type, so nothing that uses its value reports it again.
+                let resolved = self.table.resolve_vars_with_obligations(cast_ty);
+                if !resolved.has_infer_types() && !self.table.type_is_sized_modulo_regions(resolved) {
+                    self.push_diagnostic(InferenceDiagnostic::CastToUnsized {
+                        expr: tgt_expr,
+                        cast_ty: resolved.store(),
+                    });
+                    self.err_ty()
+                } else {
+                    self.deferred_cast_checks.push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
+                    cast_ty
+                }
             }
             Expr::Ref { expr, rawness, mutability } => self.infer_ref_expr(
-                *rawness,
-                lower_mutability(*mutability),
-                *expr,
+                rawness,
+                lower_mutability(mutability),
+                expr,
                 expected,
                 tgt_expr,
             ),
-            Expr::UnaryOp { expr, op } => self.infer_unop_expr(*op, *expr, expected, tgt_expr),
+            Expr::UnaryOp { expr, op } => self.infer_unop_expr(op, expr, expected, tgt_expr),
             Expr::BinaryOp { lhs, rhs, op } => match op {
                 Some(BinaryOp::Assignment { op: Some(op) }) => {
-                    self.infer_assign_op_expr(tgt_expr, *op, *lhs, *rhs)
+                    self.infer_assign_op_expr(tgt_expr, op, lhs, rhs, expected)
                 }
-                Some(op) => self.infer_binop_expr(tgt_expr, *op, *lhs, *rhs),
+                Some(op) => self.infer_binop_expr(tgt_expr, op, lhs, rhs, expected),
                 None => self.err_ty(),
             },
-            &Expr::Assignment { target, value } => {
+            Expr::Assignment { target, value } => {
                 // In ordinary (non-destructuring) assignments, the type of
                 // `lhs` must be inferred first so that the ADT fields
                 // instantiations in RHS can be coerced to it. Note that this
                 // cannot happen in destructuring assignments because of how
                 // they are desugared.
-                let lhs_ty = match &self.store[target] {
+                let lhs_ty = match self.store.pat(target) {
                     // LHS of assignment doesn't constitute reads.
-                    &Pat::Expr(expr) => {
+                    Pat::Expr(expr) => {
                         Some(self.infer_expr(expr, &Expectation::none(), ExprIsRead::No))
                     }
                     _ => None,
@@ -662,6 +787,9 @@ impl<'db> InferenceContext<'db> {
                 if let Some(lhs_ty) = lhs_ty {
                     self.write_pat_ty(target, lhs_ty);
                     self.infer_expr_coerce(value, &Expectation::has_type(lhs_ty), ExprIsRead::Yes);
+                    if let Pat::Expr(lhs) = self.store.pat(target) {
+                        self.check_lhs_assignable(lhs, tgt_expr, None);
+                    }
                 } else {
                     // Let the target pattern constrain the RHS coercion target. In particular,
                     // this allows a diverging RHS to coerce to the pattern's type.
@@ -684,15 +812,15 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Index { base, index } => {
-                let base_t = self.infer_expr_no_expect(*base, ExprIsRead::Yes);
-                let idx_t = self.infer_expr_no_expect(*index, ExprIsRead::Yes);
+                let base_t = self.infer_expr_no_expect(base, ExprIsRead::Yes);
+                let idx_t = self.infer_expr_no_expect(index, ExprIsRead::Yes);
 
-                let base_t = self.structurally_resolve_type((*base).into(), base_t);
-                match self.lookup_indexing(tgt_expr, *base, *index, base_t, idx_t) {
+                let base_t = self.structurally_resolve_type(base.into(), base_t);
+                match self.lookup_indexing(tgt_expr, base, index, base_t, idx_t) {
                     Some((trait_index_ty, trait_element_ty)) => {
                         // two-phase not needed because index_ty is never mutable
                         self.demand_coerce(
-                            *index,
+                            index,
                             idx_t,
                             trait_index_ty,
                             AllowTwoPhase::No,
@@ -702,26 +830,30 @@ impl<'db> InferenceContext<'db> {
                         trait_element_ty
                     }
                     None => {
+                        let at_error = self.ty_at_error(base_t);
                         self.push_diagnostic(InferenceDiagnostic::CannotIndexInto {
                             expr: tgt_expr,
                             found: base_t.store(),
+                            at_error,
                         });
                         self.types.types.error
                     }
                 }
             }
             Expr::Tuple { exprs, .. } => {
-                let mut tys = match expected
+                let mut tys = Vec::with_capacity_in(exprs.len(), self.frame);
+                match expected
                     .only_has_type(&mut self.table)
                     .map(|t| self.table.try_structurally_resolve_type(tgt_expr.into(), t).kind())
                 {
-                    Some(TyKind::Tuple(substs)) => substs
-                        .iter()
-                        .chain(repeat_with(|| self.table.next_ty_var(Span::Dummy)))
-                        .take(exprs.len())
-                        .collect::<Vec<_>>(),
-                    _ => exprs.iter().map(|&expr| self.table.next_ty_var(expr.into())).collect(),
-                };
+                    Some(TyKind::Tuple(substs)) => tys.extend(
+                        substs
+                            .iter()
+                            .chain(repeat_with(|| self.table.next_ty_var(Span::Dummy)))
+                            .take(exprs.len()),
+                    ),
+                    _ => tys.extend(exprs.iter().map(|&expr| self.table.next_ty_var(expr.into()))),
+                }
 
                 for (expr, ty) in exprs.iter().zip(tys.iter_mut()) {
                     *ty =
@@ -734,7 +866,7 @@ impl<'db> InferenceContext<'db> {
                 self.infer_array_elements_expr(elements, expected, tgt_expr)
             }
             Expr::Array(Array::Repeat { initializer, repeat }) => {
-                self.infer_array_repeat_expr(*initializer, *repeat, expected, tgt_expr)
+                self.infer_array_repeat_expr(initializer, repeat, expected, tgt_expr)
             }
             Expr::Literal(lit) => literal_ty(
                 self.interner(),
@@ -802,6 +934,7 @@ impl<'db> InferenceContext<'db> {
                         let ty = this.structurally_resolve_type(expr.into(), ty);
                         match ty.kind() {
                             TyKind::FnDef(def, parameters) => {
+                                let parameters = parameters.no_bound_vars().unwrap();
                                 let fnptr_ty = Ty::new_fn_ptr(
                                     this.interner(),
                                     this.interner()
@@ -864,11 +997,11 @@ impl<'db> InferenceContext<'db> {
                         self.infer_expr(expr, &Expectation::None, ExprIsRead::No);
                     }
                     // FIXME: `sym` should report for things that are not functions or statics.
-                    AsmOperand::Sym(ref path) => {
+                    AsmOperand::Sym(path) => {
                         // rustc type checks a `sym` as a path to a value, with the generic
                         // arguments it spells out.
                         if let Some((ValueNs::FunctionId(_), ty)) =
-                            self.infer_path(path, tgt_expr.into())
+                            self.infer_path(self.store.path_at(path), tgt_expr.into())
                         {
                             self.result.asm_sym_tys.insert((tgt_expr, index as u32), ty.store());
                         }
@@ -880,20 +1013,44 @@ impl<'db> InferenceContext<'db> {
                     self.types.types.unit
                 }
             }
+            Expr::UnsafeBinderCast { kind, expr, ty } => {
+                self.infer_unsafe_binder_cast(tgt_expr, kind, expr, ty, expected, is_read)
+            }
             Expr::IncludeBytes => {
                 let len = self.table.next_const_var(Span::Dummy);
                 let arr = Ty::new_array_with_const_len(self.interner(), self.types.types.u8, len);
                 Ty::new_ref(self.interner(), self.types.regions.statik, arr, Mutability::Not)
             }
         };
-        let ty = self.insert_type_vars_shallow(ty);
+        // rustc's `ExprKind::Err` is of the error type, which unifies with what it meets: a
+        // fresh variable in its place would leave its uses ambiguous (E0284).
+        let ty = if matches!(expr, Expr::Missing) { ty } else { self.insert_type_vars_shallow(ty) };
+        // Non-block expressions whose children diverged.
+        match expr {
+            Expr::Block { .. }
+            | Expr::If { .. }
+            | Expr::Let { .. }
+            | Expr::Loop { .. }
+            | Expr::Match { .. } => {}
+            // A cast from `!` is sometimes needed to appease type checking.
+            Expr::Cast { .. } => {}
+            // rustc lowers a destructuring assignment to a block, and `.await` to a `match`.
+            Expr::Assignment { target, .. } if !matches!(self.store.pat(target), Pat::Expr(_)) => {}
+            Expr::Await { .. } => {}
+            Expr::Call { .. } if self.is_try_block_output(tgt_expr) => {}
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
+                self.warn_if_unreachable(UnreachableAt::Call(tgt_expr))
+            }
+            _ => self.warn_if_unreachable(UnreachableAt::Expr(tgt_expr)),
+        }
         self.write_expr_ty(tgt_expr, ty);
         if self.table.resolve_vars_with_obligations(ty).is_never()
             && self.expr_guaranteed_to_constitute_read_for_never(tgt_expr, is_read)
         {
             // Any expression that produces a value of type `!` must have diverged
-            self.diverges = Diverges::Always;
+            self.diverges |= Diverges::always(tgt_expr);
         }
+        self.diverges |= old_diverges;
         ty
     }
 
@@ -955,7 +1112,12 @@ impl<'db> InferenceContext<'db> {
         self.table.register_bound(awaitee_ty, into_future, ObligationCause::new(expr));
         self.table.try_structurally_resolve_type(
             expr.into(),
-            Ty::new_projection(self.interner(), into_future_output.into(), [awaitee_ty]),
+            Ty::new_projection(
+                self.interner(),
+                IsRigid::No,
+                into_future_output.into(),
+                [awaitee_ty],
+            ),
         )
     }
 
@@ -963,13 +1125,15 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         expr: ExprId,
         expected: &Expectation<'db>,
-        path: &Path,
+        path: Path<'_>,
         fields: &[RecordLitField],
         base_expr: RecordSpread,
     ) -> Ty<'db> {
         // Find the relevant variant
         let (adt_ty, Some(variant)) = self.resolve_variant(expr.into(), path, false) else {
-            // FIXME: Emit an error.
+            if let Some(segment) = self.first_unresolved_segment(path, expr.into()) {
+                self.push_diagnostic(InferenceDiagnostic::UnresolvedPath { id: expr.into(), segment });
+            }
             for field in fields {
                 self.infer_expr_no_expect(field.expr, ExprIsRead::Yes);
             }
@@ -990,7 +1154,7 @@ impl<'db> InferenceContext<'db> {
 
         self.check_record_expr_fields(adt_ty, expected, expr, variant, fields, base_expr);
 
-        self.require_type_is_sized(adt_ty, expr.into());
+        self.require_type_is_sized(adt_ty, expr.into(), ObligationCauseCode::Misc);
         adt_ty
     }
 
@@ -1024,7 +1188,8 @@ impl<'db> InferenceContext<'db> {
         }
 
         let TyKind::Adt(adt, args) = adt_ty.kind() else {
-            never!("non-ADT passed to check_struct_expr_fields");
+            // An error type was reported where it was made; anything else is rustc's `span_bug!`.
+            assert!(adt_ty.is_ty_error(), "non-ADT passed to check_struct_expr_fields: {adt_ty:?}");
             return;
         };
         let adt_id = adt.def_id();
@@ -1032,13 +1197,15 @@ impl<'db> InferenceContext<'db> {
         let variant_fields = variant.fields(self.db);
         let variant_field_tys = self.db.field_types(variant);
         let variant_field_vis = VariantFields::field_visibilities(self.db, variant);
-        let mut remaining_fields = variant_fields
-            .fields()
-            .iter()
-            .map(|(i, field)| (field.name.clone(), i))
-            .collect::<FxHashMap<_, _>>();
+        let mut remaining_fields = hashbrown::HashMap::with_capacity_and_hasher_in(
+            variant_fields.len(),
+            FixedState,
+            self.frame,
+        );
+        remaining_fields.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
 
-        let mut seen_fields = FxHashMap::default();
+        let mut seen_fields =
+            hashbrown::HashMap::with_capacity_and_hasher_in(hir_fields.len(), FixedState, self.frame);
 
         // Type-check each field.
         for field in hir_fields {
@@ -1089,8 +1256,8 @@ impl<'db> InferenceContext<'db> {
 
         match base_expr {
             RecordSpread::FieldDefaults => {
-                let mut missing_mandatory_fields = Vec::new();
-                let mut missing_optional_fields = Vec::new();
+                let mut missing_mandatory_fields = Vec::new_in(self.frame);
+                let mut missing_optional_fields = Vec::new_in(self.frame);
                 for (field_idx, field) in variant_fields.fields().iter() {
                     if remaining_fields.remove(&field.name).is_some() {
                         if field.default_value.is_none() {
@@ -1131,7 +1298,7 @@ impl<'db> InferenceContext<'db> {
                                         self.table.register_predicates(obligations)
                                     }
                                     Err(_) => {
-                                        never!(
+                                        unreachable!(
                                             "subtyping remaining fields of type changing FRU \
                                                 failed: {target_ty:?} != {fru_ty:?}: {:?}",
                                             field.name,
@@ -1270,20 +1437,62 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    fn infer_expr_path(&mut self, path: &Path, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {
+    fn infer_expr_path(&mut self, path: Path<'_>, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {
         let g = self.resolver.update_to_inner_scope(self.db, self.store_owner, scope_id);
         let ty = match self.infer_path(path, id) {
             Some((_, ty)) => ty,
+            // A `Self` that resolves but has no constructor is reported already.
+            None if self.diagnostics.any(|it| {
+                matches!(it, InferenceDiagnostic::SelfCtorNotTupleOrUnit { expr, .. }
+                    if ExprOrPatIdPacked::from(*expr) == id)
+            }) =>
+            {
+                self.err_ty()
+            }
             None => {
                 if path.mod_path().is_some_and(|mod_path| mod_path.is_ident() || mod_path.is_self())
                 {
                     self.push_diagnostic(InferenceDiagnostic::UnresolvedIdent { id });
+                } else if let Some(segment) = self.first_unresolved_segment(path, id) {
+                    self.push_diagnostic(InferenceDiagnostic::UnresolvedPath { id, segment });
                 }
                 self.err_ty()
             }
         };
         self.resolver.reset_to_guard(g);
         ty
+    }
+
+    /// The index of the first segment of `path` that names nothing, as rustc's late resolver
+    /// finds it (`report_path_resolution_error`): a prefix that is no module or type, or a last
+    /// segment that names nothing in its module in either namespace. `None` when a prefix is
+    /// a type (an unknown associated item is E0599's, reported where it is looked up), the
+    /// path is type-anchored or a lang item's, or its last segment names something of the
+    /// other namespace (rustc's E0423/E0574, not this).
+    pub(super) fn first_unresolved_segment(
+        &self,
+        path: Path<'_>,
+        id: ExprOrPatIdPacked,
+    ) -> Option<u32> {
+        if path.type_anchor().is_some() {
+            return None;
+        }
+        let mod_path = path.mod_path()?;
+        let segments = mod_path.segments();
+        let last = segments.len().checked_sub(1)?;
+        for len in 1..=last {
+            // alloc: error path: a path that failed to resolve.
+            let prefix = ModPath::from_segments(mod_path.kind, segments[..len].iter().cloned());
+            match self.resolver.resolve_path_in_type_ns(self.db, Path::BarePath(&prefix)) {
+                None => return Some(len as u32 - 1),
+                Some((TypeNs::ModuleId(_), None, _)) => {}
+                Some(_) => return None,
+            }
+        }
+        let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
+        let names_something = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene).is_some()
+            || self.resolver.resolve_path_in_type_ns(self.db, path).is_some();
+        (!names_something).then_some(last as u32)
     }
 
     fn infer_unop_expr(
@@ -1305,9 +1514,11 @@ impl<'db> InferenceContext<'db> {
                 if let Some(ty) = self.lookup_derefing(expr, oprnd, oprnd_t) {
                     oprnd_t = ty;
                 } else {
+                    let at_error = self.ty_at_error(oprnd_t);
                     self.push_diagnostic(InferenceDiagnostic::CannotBeDereferenced {
                         expr,
                         found: oprnd_t.store(),
+                        at_error,
                     });
                     oprnd_t = self.types.types.error;
                 }
@@ -1425,7 +1636,7 @@ impl<'db> InferenceContext<'db> {
         let mut coerce_many = self.return_coercion.take().unwrap();
         coerce_many.coerce(
             self,
-            &ObligationCause::new(expr),
+            &ObligationCause::with_code(expr, ObligationCauseCode::ReturnValue),
             expr,
             return_expr_ty,
             ExprIsRead::Yes,
@@ -1443,7 +1654,7 @@ impl<'db> InferenceContext<'db> {
                     coerce.coerce_forced_unit(
                         self,
                         ret,
-                        &ObligationCause::new(ret),
+                        &ObligationCause::with_code(ret, ObligationCauseCode::ReturnNoExpression),
                         true,
                         ExprIsRead::Yes,
                     );
@@ -1458,6 +1669,8 @@ impl<'db> InferenceContext<'db> {
                 if let Some(expr) = expr {
                     self.infer_expr_no_expect(expr, ExprIsRead::Yes);
                 }
+                // rustc's lowering makes it `ExprKind::Err`: nothing more is reported of it.
+                return self.err_ty();
             }
         }
         self.types.types.never
@@ -1481,6 +1694,7 @@ impl<'db> InferenceContext<'db> {
                     kind: ReturnKind::BecomeExpr,
                 });
                 self.infer_expr_no_expect(expr, ExprIsRead::Yes);
+                return self.err_ty();
             }
         }
 
@@ -1490,7 +1704,7 @@ impl<'db> InferenceContext<'db> {
     fn infer_block(
         &mut self,
         expr: ExprId,
-        statements: &[Statement],
+        statements: Statements<'_>,
         tail: Option<ExprId>,
         label: Option<LabelId>,
         expected: &Expectation<'db>,
@@ -1501,31 +1715,37 @@ impl<'db> InferenceContext<'db> {
 
         let (ctxt, tail_expr_ty) =
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
-                for stmt in statements {
+                for (index, stmt) in statements.iter().enumerate() {
+                    if matches!(stmt, Statement::Item(_)) {
+                        continue;
+                    }
+                    // rustc's `check_stmt`: the statement, and the outer divergence hidden.
+                    this.warn_if_unreachable(UnreachableAt::Stmt { block: expr, index: index as u32 });
+                    let old_diverges = mem::replace(&mut this.diverges, Diverges::Maybe);
                     match stmt {
                         Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                             let decl_ty = type_ref
                                 .as_ref()
                                 .map(|&tr| this.make_ty(tr))
-                                .unwrap_or_else(|| this.table.next_ty_var((*pat).into()));
+                                .unwrap_or_else(|| this.table.next_ty_var(pat.into()));
 
                             this.infer_let(
                                 decl_ty,
-                                *initializer,
-                                *pat,
+                                initializer,
+                                pat,
                                 PatOrigin::LetStmt { has_else: else_branch.is_some() },
                             );
                             if let Some(expr) = else_branch {
                                 let previous_diverges = this.diverges;
                                 this.infer_expr_coerce(
-                                    *expr,
+                                    expr,
                                     &Expectation::HasType(this.types.types.never),
                                     ExprIsRead::Yes,
                                 );
                                 this.diverges = previous_diverges;
                             }
                         }
-                        &Statement::Expr { expr, has_semi } => {
+                        Statement::Expr { expr, has_semi } => {
                             if has_semi {
                                 this.infer_expr(expr, &Expectation::none(), ExprIsRead::Yes);
                             } else {
@@ -1538,6 +1758,7 @@ impl<'db> InferenceContext<'db> {
                         }
                         Statement::Item(_) => (),
                     }
+                    this.diverges |= old_diverges;
                 }
 
                 // check the tail expression **without** holding the
@@ -1547,7 +1768,8 @@ impl<'db> InferenceContext<'db> {
 
         let mut coerce = ctxt.coerce.unwrap();
         if let Some((tail_expr, tail_expr_ty)) = tail_expr_ty {
-            let cause = ObligationCause::new(tail_expr);
+            let cause =
+                ObligationCause::with_code(tail_expr, ObligationCauseCode::BlockTailExpression);
             coerce.coerce_inner(
                 self,
                 &cause,
@@ -1620,8 +1842,9 @@ impl<'db> InferenceContext<'db> {
         field_expr: ExprId,
         receiver_ty: Ty<'db>,
         name: &Name,
-    ) -> Option<(Ty<'db>, Either<FieldId, TupleFieldId>, Vec<Adjustment>, bool)> {
+    ) -> Option<(Ty<'db>, Either<FieldId, TupleFieldId>, Vec<Adjustment, &'f Frame>, bool)> {
         let interner = self.interner();
+        let frame = self.frame;
         let mut autoderef = self.table.autoderef_with_tracking(receiver_ty, field_expr.into());
         let mut private_field = None;
         let res = autoderef.by_ref().find_map(|(derefed_ty, _)| {
@@ -1631,9 +1854,7 @@ impl<'db> InferenceContext<'db> {
                         substs.as_slice().get(idx).copied().map(|ty| {
                             (
                                 Either::Right(TupleFieldId {
-                                    tuple: TupleId(
-                                        self.tuple_field_accesses_rev.insert_full(substs).0 as u32,
-                                    ),
+                                    tuple: TupleId(self.tuple_field_accesses_rev.insert(substs)),
                                     index: idx as u32,
                                 }),
                                 ty,
@@ -1675,7 +1896,7 @@ impl<'db> InferenceContext<'db> {
         Some(match res {
             Some((field_id, ty)) => {
                 let adjustments =
-                    self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok());
+                    self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok(frame));
                 let ty = self.process_remote_user_written_ty(ty);
 
                 (ty, field_id, adjustments, true)
@@ -1683,7 +1904,7 @@ impl<'db> InferenceContext<'db> {
             None => {
                 let (field_id, subst) = private_field?;
                 let adjustments =
-                    self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok());
+                    self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok(frame));
                 let ty = self.db.field_types(field_id.parent)[field_id.local_id]
                     .ty()
                     .instantiate(self.interner(), subst)
@@ -1693,6 +1914,78 @@ impl<'db> InferenceContext<'db> {
                 (ty, Either::Left(field_id), adjustments, false)
             }
         })
+    }
+
+    /// rustc's `check_expr_unsafe_binder_cast`. `wrap_binder!` checks its operand against the
+    /// binder's contents and has the binder's type; `unwrap_binder!` has the contents of its
+    /// operand's binder. Each binder is instantiated with fresh region variables.
+    fn infer_unsafe_binder_cast(
+        &mut self,
+        tgt_expr: ExprId,
+        kind: UnsafeBinderCastKind,
+        operand: ExprId,
+        type_ref: Option<TypeRefId>,
+        expected: &Expectation<'db>,
+        is_read: ExprIsRead,
+    ) -> Ty<'db> {
+        let ascribed = type_ref.map(|type_ref| self.make_ty(type_ref));
+        match kind {
+            UnsafeBinderCastKind::Wrap => {
+                let binder_ty = match (ascribed, expected.only_has_type(&mut self.table)) {
+                    (Some(ascribed), Some(expected)) => {
+                        _ = self.demand_eqtype(operand.into(), expected, ascribed);
+                        expected
+                    }
+                    (Some(ty), None) | (None, Some(ty)) => ty,
+                    (None, None) => self.table.next_ty_var(operand.into()),
+                };
+                let binder_ty = self.structurally_resolve_type(operand.into(), binder_ty);
+                let contents = self.unsafe_binder_contents(tgt_expr, kind, operand, binder_ty);
+                self.infer_expr_suptype_coerce_never(
+                    operand,
+                    &Expectation::HasType(contents),
+                    is_read,
+                );
+                binder_ty
+            }
+            UnsafeBinderCastKind::Unwrap => {
+                let hint = ascribed.unwrap_or_else(|| self.table.next_ty_var(operand.into()));
+                let binder_ty = self.infer_expr_suptype_coerce_never(
+                    operand,
+                    &Expectation::HasType(hint),
+                    is_read,
+                );
+                let binder_ty = self.structurally_resolve_type(operand.into(), binder_ty);
+                self.unsafe_binder_contents(tgt_expr, kind, operand, binder_ty)
+            }
+        }
+    }
+
+    /// What `binder_ty`, the binder of the cast `tgt_expr`, holds; an error, reported unless
+    /// `binder_ty` is one, when it is no unsafe binder.
+    fn unsafe_binder_contents(
+        &mut self,
+        tgt_expr: ExprId,
+        kind: UnsafeBinderCastKind,
+        operand: ExprId,
+        binder_ty: Ty<'db>,
+    ) -> Ty<'db> {
+        match binder_ty.kind() {
+            TyKind::UnsafeBinder(inner) => self.infcx().instantiate_binder_with_fresh_vars(
+                operand.into(),
+                BoundRegionConversionTime::HigherRankedType,
+                inner.into(),
+            ),
+            TyKind::Error(_) => binder_ty,
+            _ => {
+                self.push_diagnostic(InferenceDiagnostic::UnsafeBinderCastOfNonBinder {
+                    expr: tgt_expr,
+                    kind,
+                    found: binder_ty.store(),
+                });
+                self.err_ty()
+            }
+        }
     }
 
     fn infer_field_access(
@@ -1714,7 +2007,7 @@ impl<'db> InferenceContext<'db> {
 
         match self.lookup_field(tgt_expr, receiver_ty, name) {
             Some((ty, field_id, adjustments, is_public)) => {
-                self.write_expr_adj(receiver, adjustments.into_boxed_slice());
+                self.write_expr_adj(receiver, &adjustments);
                 self.result.field_resolutions.insert(tgt_expr, field_id);
                 if !is_public && let Either::Left(field) = field_id {
                     // FIXME: Merge this diagnostic into UnresolvedField?
@@ -1726,19 +2019,15 @@ impl<'db> InferenceContext<'db> {
                 ty
             }
             None => {
-                // no field found, lets attempt to resolve it like a function so that IDE things
-                // work out while people are typing
-                let resolved = self.lookup_method_including_private(
-                    receiver_ty,
-                    name.clone(),
-                    None,
-                    receiver,
-                    tgt_expr,
-                );
+                // No field: probe for a method of the name, as rustc's
+                // `method_exists_for_diagnostic`, which also lets IDE features work while
+                // people are typing.
+                let resolved =
+                    self.lookup_method_for_diagnostic(receiver_ty, *name, receiver, tgt_expr);
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedField {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
-                    name: name.clone(),
+                    name: *name,
                     method_with_same_name_exists: resolved.is_ok(),
                 });
                 match resolved {
@@ -1780,6 +2069,7 @@ impl<'db> InferenceContext<'db> {
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
         if let TyKind::FnDef(def_id, args) = callee_ty.kind() {
+            let args = args.no_bound_vars().unwrap();
             let def_id = match def_id.0 {
                 CallableDefId::FunctionId(it) => it.into(),
                 CallableDefId::StructId(it) => it.into(),
@@ -1807,7 +2097,7 @@ impl<'db> InferenceContext<'db> {
         receiver: ExprId,
         args: &[ExprId],
         method_name: &Name,
-        generic_args: Option<&HirGenericArgs>,
+        generic_args: Option<HirGenericArgs<'_>>,
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
         let receiver_ty = self.infer_expr_inner(receiver, &Expectation::none(), ExprIsRead::Yes);
@@ -1815,7 +2105,7 @@ impl<'db> InferenceContext<'db> {
 
         let resolved = self.lookup_method_including_private(
             receiver_ty,
-            method_name.clone(),
+            *method_name,
             generic_args,
             receiver,
             tgt_expr,
@@ -1836,7 +2126,7 @@ impl<'db> InferenceContext<'db> {
                 let field_with_same_name_exists =
                     match self.lookup_field(tgt_expr, receiver_ty, method_name) {
                         Some((ty, field_id, adjustments, _public)) => {
-                            self.write_expr_adj(receiver, adjustments.into_boxed_slice());
+                            self.write_expr_adj(receiver, &adjustments);
                             self.result.field_resolutions.insert(tgt_expr, field_id);
                             Some(ty)
                         }
@@ -1851,7 +2141,7 @@ impl<'db> InferenceContext<'db> {
                         ) {
                             ctx.probe_for_name(
                                 method_resolution::Mode::Path,
-                                method_name.clone(),
+                                *method_name,
                                 receiver_ty,
                             )
                         } else {
@@ -1872,7 +2162,7 @@ impl<'db> InferenceContext<'db> {
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedMethodCall {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
-                    name: method_name.clone(),
+                    name: *method_name,
                     field_with_same_name: field_with_same_name_exists.map(|it| it.store()),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(|it| it.def_id),
                 });
@@ -1964,21 +2254,23 @@ impl<'db> InferenceContext<'db> {
         // Whether the arguments have been bundled in a tuple (ex: closures)
         tuple_arguments: TupleArgumentsFlag,
     ) {
-        let formal_input_tys: Vec<_> = formal_input_tys
-            .iter()
-            .map(|&ty| {
+        let frame = self.frame;
+        let formal_input_tys = {
+            let mut generalized = Vec::with_capacity_in(formal_input_tys.len(), frame);
+            for &ty in formal_input_tys {
                 let generalized_ty = self.table.next_ty_var(call_expr.into());
                 let _ = self.demand_eqtype(call_expr.into(), ty, generalized_ty);
-                generalized_ty
-            })
-            .collect();
+                generalized.push(generalized_ty);
+            }
+            generalized
+        };
 
         // First, let's unify the formal method signature with the expectation eagerly.
         // We use this to guide coercion inference; it's output is "fudged" which means
         // any remaining type variables are assigned to new, unrelated variables. This
         // is because the inference guidance here is only speculative.
         let formal_output = self.table.resolve_vars_with_obligations(formal_output);
-        let expected_input_tys: Option<Vec<_>> = expectation
+        let expected_input_tys: Option<Vec<Ty<'db>, &Frame>> = expectation
             .only_has_type(&mut self.table)
             .and_then(|expected_output| {
                 self.table
@@ -2008,11 +2300,12 @@ impl<'db> InferenceContext<'db> {
 
                         // Record all the argument types, with the args
                         // produced from the above subtyping unification.
-                        Ok(Some(formal_input_tys.clone()))
+                        Ok(Some(FrameList(formal_input_tys.clone()))) // clone: a frame list the fudge hands back
                     })
                     .ok()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .map(|list| list.0);
 
         // If the arguments should be wrapped in a tuple (ex: closures), unwrap them here
         let (formal_input_tys, expected_input_tys) = if tuple_arguments
@@ -2028,20 +2321,30 @@ impl<'db> InferenceContext<'db> {
                     let expected_input_tys = match expected_input_tys {
                         Some(expected_input_tys) => match expected_input_tys.first() {
                             Some(ty) => match ty.kind() {
-                                TyKind::Tuple(tys) => Some(tys.iter().collect()),
+                                TyKind::Tuple(tys) => {
+                                    let mut list = Vec::with_capacity_in(tys.len(), frame);
+                                    list.extend_from_slice(tys.as_slice());
+                                    Some(list)
+                                }
                                 _ => None,
                             },
                             None => None,
                         },
                         None => None,
                     };
-                    (arg_types.to_vec(), expected_input_tys)
+                    let mut formal = Vec::with_capacity_in(arg_types.len(), frame);
+                    formal.extend_from_slice(arg_types.as_slice());
+                    (formal, expected_input_tys)
                 }
                 _ => {
                     // Otherwise, there's a mismatch, so clear out what we're expecting, and set
                     // our input types to err_args so we don't blow up the error messages
-                    // FIXME: Emit an error.
-                    (vec![self.types.types.error; provided_args.len()], None)
+                    if !tuple_type.is_ty_error() {
+                        self.push_diagnostic(InferenceDiagnostic::FnTraitArgsNotTuple { call_expr });
+                    }
+                    let mut formal = Vec::with_capacity_in(provided_args.len(), frame);
+                    formal.resize(provided_args.len(), self.types.types.error);
+                    (formal, None)
                 }
             }
         } else {
@@ -2049,11 +2352,12 @@ impl<'db> InferenceContext<'db> {
         };
 
         // If there are no external expectations at the call site, just use the types from the function defn
-        let expected_input_tys = if let Some(expected_input_tys) = expected_input_tys {
-            assert_eq!(expected_input_tys.len(), formal_input_tys.len());
-            expected_input_tys
-        } else {
-            formal_input_tys.clone()
+        let expected_input_tys: &[Ty<'db>] = match &expected_input_tys {
+            Some(expected_input_tys) => {
+                assert_eq!(expected_input_tys.len(), formal_input_tys.len());
+                expected_input_tys
+            }
+            None => &formal_input_tys,
         };
 
         let minimum_input_count = expected_input_tys.len();
@@ -2069,24 +2373,12 @@ impl<'db> InferenceContext<'db> {
             provided_arg_count == minimum_input_count
         };
 
-        if !args_count_matches {
-            self.push_diagnostic(InferenceDiagnostic::MismatchedArgCount {
-                call_expr,
-                expected: expected_input_tys.len() + skip_indices.len(),
-                found: provided_args.len(),
-                is_fn_trait_call: tuple_arguments == TupleArgumentsFlag::TupleArguments,
-            });
-        }
-
         // We introduce a helper function to demand that a given argument satisfy a given input
         // This is more complicated than just checking type equality, as arguments could be coerced
         // This version writes those types back so further type checking uses the narrowed types
-        let demand_compatible = |this: &mut InferenceContext<'db>, idx| {
+        let demand_compatible = |this: &mut InferenceContext<'db, 'f>, idx: usize, provided_arg: ExprId| {
             let formal_input_ty: Ty<'db> = formal_input_tys[idx];
             let expected_input_ty: Ty<'db> = expected_input_tys[idx];
-            let provided_arg = provided_args[idx];
-
-            debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
             // We're on the happy path here, so we'll do a more involved check and write back types
             // To check compatibility, we'll do 3 things:
@@ -2130,6 +2422,11 @@ impl<'db> InferenceContext<'db> {
             }
         };
 
+        // rustc's `compatibility_diagonal`, by position among the arguments not taken as legacy
+        // const generics: those below `minimum_input_count` that did not fit their own input
+        // (the rest are `Incompatible(None)`, never checked against one).
+        let mut incompatible = SmallVec::<[u32; 2]>::new();
+
         // Check the arguments.
         // We do this in a pretty awful way: first we type-check any arguments
         // that are not closures, then we type-check the closures. This is so
@@ -2143,13 +2440,21 @@ impl<'db> InferenceContext<'db> {
                 self.table.select_obligations_where_possible();
             }
 
-            let mut skip_indices = skip_indices.iter().copied();
+            let mut skip_indices = skip_indices.iter().copied().peekable();
+            let mut position = 0;
             // Check each argument, to satisfy the input it was provided for
             // Visually, we're traveling down the diagonal of the compatibility matrix
             for (idx, arg) in provided_args.iter().enumerate() {
-                if skip_indices.clone().next() == Some(idx as u32) {
+                if skip_indices.peek() == Some(&(idx as u32)) {
                     skip_indices.next();
                     continue;
+                }
+                let idx = position;
+                position += 1;
+                // Only in the first pass: a closure can't diverge, but an argument before it
+                // can (`f(panic!(), || {})`).
+                if !check_closures {
+                    self.warn_if_unreachable(UnreachableAt::Expr(*arg));
                 }
 
                 // For this check, we do *not* want to treat async coroutine closures (async blocks)
@@ -2157,7 +2462,7 @@ impl<'db> InferenceContext<'db> {
                 // the return value of an argument-position async block to an argument-position
                 // closure wrapped in a block.
                 // See <https://github.com/rust-lang/rust/issues/112225>.
-                let is_closure = if let Expr::Closure { closure_kind, .. } = self.store[*arg] {
+                let is_closure = if let Expr::Closure { closure_kind, .. } = self.store.expr(*arg) {
                     !matches!(closure_kind, ClosureKind::OldCoroutine(_))
                 } else {
                     false
@@ -2172,16 +2477,133 @@ impl<'db> InferenceContext<'db> {
                     continue;
                 }
 
-                if let Err((_error, expected, found)) = demand_compatible(self, idx)
-                    && args_count_matches
-                {
-                    // Don't report type mismatches if there is a mismatch in args count.
-                    self.emit_type_mismatch((*arg).into(), expected, found);
+                if let Err((_error, expected, found)) = demand_compatible(self, idx, *arg) {
+                    incompatible.push(idx as u32);
+                    if args_count_matches {
+                        // Don't report type mismatches if there is a mismatch in args count.
+                        self.emit_type_mismatch((*arg).into(), expected, found);
+                    }
                 }
             }
         }
 
-        if !args_count_matches {}
+        // rustc's `call_appears_satisfied`.
+        if !args_count_matches || !incompatible.is_empty() {
+            let args = self.call_arguments(
+                call_expr,
+                provided_args,
+                skip_indices,
+                &formal_input_tys,
+                &expected_input_tys,
+                &incompatible,
+                c_variadic,
+            );
+            self.push_diagnostic(if args_count_matches {
+                InferenceDiagnostic::IncorrectArguments { call_expr, args }
+            } else {
+                InferenceDiagnostic::MismatchedArgCount {
+                    call_expr,
+                    expected: expected_input_tys.len() + skip_indices.len(),
+                    found: provided_args.len(),
+                    is_fn_trait_call: tuple_arguments == TupleArgumentsFlag::TupleArguments,
+                    args,
+                }
+            });
+        }
+    }
+
+    /// rustc's `report_arg_errors` inputs of a call whose arguments do not fit: the callee, the
+    /// inputs and the provided types as found, and `ArgMatrix::new`'s compatibility, its
+    /// diagonal as `check_argument_types` found it (`incompatible` the positions that failed).
+    fn call_arguments(
+        &mut self,
+        call_expr: ExprId,
+        provided_args: &[ExprId],
+        skip_indices: &[u32],
+        formal_input_tys: &[Ty<'db>],
+        expected_input_tys: &[Ty<'db>],
+        incompatible: &[u32],
+        c_variadic: bool,
+    ) -> Box<CallArguments> {
+        let inputs = formal_input_tys.len();
+        // alloc: error path, one per call whose arguments do not fit
+        let provided: Vec<Ty<'db>> = provided_args
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| !skip_indices.contains(&(idx as u32)))
+            .take(if c_variadic { inputs } else { usize::MAX })
+            .map(|(_, &arg)| {
+                let ty = self.expr_ty_after_adjustments(arg);
+                self.table.resolve_vars_if_possible(ty)
+            })
+            .collect(); // alloc: error path
+        let inputs_tys: Vec<(Ty<'db>, Ty<'db>)> = formal_input_tys
+            .iter()
+            .zip(expected_input_tys)
+            .map(|(&formal, &expected)| {
+                (self.table.resolve_vars_if_possible(formal), self.table.resolve_vars_if_possible(expected))
+            })
+            .collect(); // alloc: error path
+
+        let mut compatible_ends = Vec::with_capacity(provided.len());
+        let mut compatible = Vec::new(); // alloc: error path
+        for (provided_idx, &arg_ty) in provided.iter().enumerate() {
+            for (expected_idx, &(formal, expected)) in inputs_tys.iter().enumerate() {
+                let fits = if provided_idx == expected_idx {
+                    !incompatible.contains(&(provided_idx as u32))
+                } else {
+                    self.check_compatible(arg_ty, formal, expected)
+                };
+                if fits {
+                    compatible.push(expected_idx as u32);
+                }
+            }
+            compatible_ends.push(compatible.len() as u32);
+        }
+
+        let (callee, method) = match self.store.expr(call_expr) {
+            Expr::Call { callee, .. } => (self.expr_ty_after_adjustments(callee), None),
+            Expr::MethodCall { receiver, .. } => (
+                self.expr_ty_after_adjustments(receiver),
+                self.result.method_resolution(call_expr).map(|(func, _)| func),
+            ),
+            _ => (self.types.types.error, None),
+        };
+        // alloc: error path, the diagnostic's own record
+        Box::new(CallArguments {
+            callee: self.ty_as_found(callee),
+            method,
+            is_method: matches!(self.store.expr(call_expr), Expr::MethodCall { .. }),
+            c_variadic,
+            // alloc: error path
+            formal_inputs: inputs_tys.iter().map(|&(formal, _)| self.ty_as_found(formal)).collect(),
+            // alloc: error path
+            expected_inputs: inputs_tys.iter().map(|&(_, expected)| self.ty_as_found(expected)).collect(),
+            // alloc: error path
+            provided: provided.iter().map(|&ty| self.ty_as_found(ty)).collect(),
+            compatible_ends: compatible_ends.into_boxed_slice(),
+            compatible: compatible.into_boxed_slice(),
+        })
+    }
+
+    /// rustc's `ArgMatchingCtxt::check_compatible` off the diagonal: whether an argument of
+    /// type `arg_ty` would fit the input `(formal, expected)`, inference left as it was.
+    fn check_compatible(&mut self, arg_ty: Ty<'db>, formal: Ty<'db>, expected: Ty<'db>) -> bool {
+        // An error type fits nothing, so the heuristics don't pass errors into every input. An
+        // error region is no error: a type inference recorded keeps its regions as errors.
+        if formal.references_non_lt_error() || expected.references_non_lt_error() {
+            return false;
+        }
+        let expectation = Expectation::rvalue_hint(self, expected);
+        let coerced_ty = expectation.only_has_type(&mut self.table).unwrap_or(formal);
+        if !self.may_coerce(arg_ty, coerced_ty) {
+            return false;
+        }
+        let infcx = &self.table.infer_ctxt;
+        let cause = ObligationCause::dummy();
+        let subtyping_error = infcx
+            .probe(|_| infcx.sup_raw(&cause, self.table.param_env, formal, coerced_ty).is_err());
+        !subtyping_error && !coerced_ty.references_non_lt_error() && !arg_ty.references_non_lt_error()
     }
 
     pub(super) fn with_breakable_ctx<T>(
@@ -2190,13 +2612,91 @@ impl<'db> InferenceContext<'db> {
         ty: Option<Ty<'db>>,
         label: Option<LabelId>,
         cb: impl FnOnce(&mut Self) -> T,
-    ) -> (BreakableContext<'db>, T) {
+    ) -> (BreakableContext<'db, 'f>, T) {
+        let frame = self.frame;
         self.breakables.push({
-            BreakableContext { kind, may_break: false, coerce: ty.map(CoerceMany::new), label }
+            BreakableContext {
+                kind,
+                may_break: false,
+                coerce: ty.map(|ty| CoerceMany::new(ty, frame)),
+                label,
+            }
         });
         let res = cb(self);
         let ctx = self.breakables.pop().expect("breakable stack broken");
         (ctx, res)
+    }
+
+    /// rustc's `require_label_in_labeled_block`: whether the innermost of the labeled blocks,
+    /// loops and closures around an unlabeled `break`/`continue` is a labeled block, E0695. An
+    /// unlabeled block, or a `try` block (whose label is desugared), is not one.
+    fn in_labeled_block(&self) -> bool {
+        self.breakables
+            .iter()
+            .rev()
+            .find_map(|ctx| match ctx.kind {
+                BreakableKind::Block => {
+                    ctx.label.filter(|&label| !self.store[label].name.is_generated()).map(|_| true)
+                }
+                BreakableKind::Loop | BreakableKind::Border => Some(false),
+            })
+            .unwrap_or(false)
+    }
+
+    /// `ty` as inference has it at an error (`types_at_error`, for one type).
+    pub(super) fn ty_at_error(&self, ty: Ty<'db>) -> Option<StoredTy> {
+        self.types_at_error(ty, self.types.types.unit).map(|it| it.0)
+    }
+
+    /// `ty` as an error reports it: an undecided numeric literal's type fresh (`ty_at_error`),
+    /// any other variable an error.
+    fn ty_as_found(&self, ty: Ty<'db>) -> StoredTy {
+        self.ty_at_error(ty).unwrap_or_else(|| {
+            let ty = self.table.resolve_vars_if_possible(ty);
+            ty.fold_with(&mut ReplaceInferWithError::new(self.interner())).store()
+        })
+    }
+
+    /// rustc's `warn_if_unreachable`: `what` is unreachable when what came before it in its
+    /// parent diverged. Once per divergence (`WarnedAlways`). The `#[automatically_derived]`
+    /// rule is applied when the body is done (`in_automatically_derived_impl`).
+    pub(super) fn warn_if_unreachable(&mut self, what: UnreachableAt) {
+        let Diverges::Always { span, custom_note } = self.diverges else { return };
+        self.diverges = Diverges::WarnedAlways;
+        self.unreachable.push(Unreachable { what, after: span, note: custom_note });
+    }
+
+    /// The lang item the callee of `call` names, when hir-def wrote it as a lang path: only
+    /// its desugarings (`?`, `for`, `try` blocks, `format_args!`) do.
+    fn lang_callee(&self, call: ExprId) -> Option<LangItemTarget> {
+        let Expr::Call { callee, .. } = self.store.expr(call) else { return None };
+        match self.store.expr(callee) {
+            Expr::Path(Path::LangItem(target, _)) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// A `try` block's `Try::from_output(..)` of its tail: rustc's call with a `TryBlock`
+    /// desugaring span.
+    fn is_try_block_output(&self, call: ExprId) -> bool {
+        let Some(from_output) = self.lang_items.TryTraitFromOutput else { return false };
+        self.lang_callee(call) == Some(LangItemTarget::FunctionId(from_output))
+    }
+
+    /// A `try` block's `Try::from_output(())` where the block has no tail: hir-def allocates
+    /// that `()` after the callee's path, and a tail that is written before it.
+    fn is_try_block_output_of_unit(&self, call: ExprId) -> bool {
+        let Expr::Call { callee, args: &[arg] } = self.store.expr(call) else { return false };
+        arg > callee
+            && matches!(self.store.expr(arg), Expr::Tuple { exprs: [] })
+            && self.is_try_block_output(call)
+    }
+
+    /// Whether a `match` of `scrutinee` is a desugaring (rustc's `MatchSource` other than
+    /// `Normal`): `?` matches on `Try::branch(..)`, a `for` loop on `IntoIterator::into_iter(..)`
+    /// and `Iterator::next(..)`.
+    fn is_desugared_match(&self, scrutinee: ExprId) -> bool {
+        self.lang_callee(scrutinee).is_some()
     }
 }
 

@@ -1,0 +1,39 @@
+{
+  "id": "01457",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-expand/src/builtin/fn_macro.rs",
+    "crates/hir-def/src/deps/reads.rs",
+    "crates/blaze-engine/src/as_rustc/probe.rs",
+    "crates/blaze-macro-eval/tests/corpus/load.rs",
+    "crates/hir-firewall/tests/real.rs"
+  ],
+  "what": "Half of 01455 (std shared across workspaces on one daemon); must land in the SAME batch as cargo's 01455 edits, which add `BuildConfig::std` and stop hashing the process env into std crates' unit identity.\n\n(1) Build fix, 3 literal `BuildConfig { .. }` sites outside cargo's paths gain the new field after `library: ...,`:\n- crates/blaze-engine/src/as_rustc/probe.rs:~128: `std: format!(\"{DIR}/std\"),` (a check-only probe: nothing is placed there).\n- crates/blaze-macro-eval/tests/corpus/load.rs:~166 and crates/hir-firewall/tests/real.rs:~213: `std: \"/s/std\".to_owned(),`.\n\n(2) Soundness, hir-expand fn_macro.rs `get_env_inner`: the standard library's crates (`CrateOrigin::Lang`, set for `unit.is_std` units alone) see their crate env only, never the process env, as a std built elsewhere does. blaze-lower's `identity_of` no longer hashes the process env for Lang crates, so without this a std crate reading a process variable could reuse a stale record. Exact body:\n```rust\nfn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {\n    let krate = arg_id.loc(db).krate;\n    db.env_is_read(krate, key.as_str());\n    // As rustc reads them: what cargo set for the crate, then the process the build is for.\n    // The standard library's crates read their own alone, as a std built elsewhere does: no\n    // workspace's environment is in their identity.\n    let own = krate.env(db).get(key.as_str());\n    match krate.data(db).origin.is_lang() {\n        true => own,\n        false => own.or_else(|| base_db::process_env_var(db, key.as_str())),\n    }\n}\n```\nThe library's sysroot crates read no process variable today (`env!`/`option_env!` of library/ outside docs and test-only crates are STD_ENV_ARCH and CARGO_*, all crate env), so no program changes.\n\n(3) Consistency, optional: hir-def deps/reads.rs `Reads::values` hashes `process_env_var` of each name read; for a Lang crate it should hash none (what (2) makes it read). Today it over-keys std images, which is safe.",
+  "state": "applied",
+  "created": "2026-11-01T04:20:51Z",
+  "updated": "2026-11-01T04:22:01Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:20:51Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:22:01Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:22:01Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "Applied (1) std field at probe.rs (format!(\"{DIR}/std\")), corpus/load.rs and hir-firewall tests/real.rs (\"/s/std\"); (2) get_env_inner: Lang crates read their crate env only. (3) not done: Reads::values still hashes process_env_var for Lang crates (over-keys std, safe). Lands with 01455 in round 21."
+    }
+  ]
+}

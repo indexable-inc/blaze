@@ -1,0 +1,25 @@
+{
+  "id": "00964",
+  "from_lane": "drop-oracles",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-build-script/src/main.rs",
+    "crates/blaze-build-script/src/lib.rs",
+    "crates/blaze-build-script/src/env/tests.rs"
+  ],
+  "what": "harness/scripts.py and harness/scripts/ are deleted (Andrew 2026-10-30: no harness compares blaze with cargo). Reword the comments naming it in crates/blaze-build-script/src/{main.rs,lib.rs,env/tests.rs}.",
+  "state": "open",
+  "created": "2026-10-30T12:43:07Z",
+  "updated": "2026-10-30T12:43:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:43:07Z",
+      "by": "drop-oracles",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

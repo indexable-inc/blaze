@@ -1,0 +1,24 @@
+{
+  "id": "00029",
+  "from_lane": "vfs",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-vfs/src/watch.rs"
+  ],
+  "what": "## 6. core: a file's mode in `Meta`, and reading a symlink\n\nWhat: in `crates/blaze-core/src/lib.rs`, `Meta` gains what `lstat` says of a file's kind and\nmode (for example `executable: bool` and `symlink: bool`, from `S_IXUSR` and `S_IFLNK`, in\n`Stat` and `List`, without following a link), and an `Effect::ReadLink { file, tag }` that\ncompletes with the link's target bytes; in the simulation, threads and io_uring drivers.\n\nWhy: files carry a mode now (`blaze_vfs::Mode`, regular, executable or symlink, hashed into\nthe tree). The watcher can't see either today: `Stat` has no mode and `ReadAll` reads through\na link. So it keeps the head's mode for a file it has, writes a new file as regular, and\nmisses a chmod alone (documented in `crates/blaze-vfs/src/watch.rs`). With this it writes\nthe disk's mode, and a symlink as its target.\n\n> forwarded to core: `Meta` has no mode and there is no `Effect::ReadLink` yet.",
+  "state": "open",
+  "created": "2026-10-29T23:57:30Z",
+  "updated": "2026-10-29T23:57:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/vfs.md#6. core: a file's mode in `Meta`, and reading a symlink",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/vfs.md:60"
+    }
+  ]
+}

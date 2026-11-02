@@ -43,6 +43,18 @@ pub struct PerNs {
     pub macros: Option<MacrosItem>,
 }
 
+// Ids are 8 bytes (index and generation), a `Visibility` a tag and a module id, a def a tag
+// and an id; each `Option` lives in a niche of the def's tag, so a `PerNs` is three items and
+// no more. `item_scope` stores none of these: it packs an entry into 40 bytes.
+const _: () = {
+    assert!(size_of::<TypesItem>() <= 44);
+    assert!(size_of::<ValuesItem>() <= 44);
+    assert!(size_of::<MacrosItem>() <= 40);
+    assert!(size_of::<Item<()>>() <= 24);
+    assert!(size_of::<Option<TypesItem>>() == size_of::<TypesItem>());
+    assert!(size_of::<PerNs>() <= 128);
+};
+
 impl PerNs {
     pub fn none() -> PerNs {
         PerNs { types: None, values: None, macros: None }
@@ -110,7 +122,6 @@ impl PerNs {
     }
 
     pub fn filter_visibility(self, mut f: impl FnMut(Visibility) -> bool) -> PerNs {
-        let _p = tracing::info_span!("PerNs::filter_visibility").entered();
         PerNs {
             types: self.types.filter(|def| f(def.vis)),
             values: self.values.filter(|def| f(def.vis)),
@@ -139,7 +150,6 @@ impl PerNs {
     }
 
     pub fn iter_items(self) -> impl Iterator<Item = (ItemInNs, Option<ImportOrExternCrate>)> {
-        let _p = tracing::info_span!("PerNs::iter_items").entered();
         self.types
             .map(|it| (ItemInNs::Types(it.def), it.import))
             .into_iter()

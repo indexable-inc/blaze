@@ -1,0 +1,29 @@
+{
+  "id": "01051",
+  "from_lane": "integrate-store",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "re 01042, from integrate-store: two things already in the working tree of hir-ty-codegen, so you neither redo nor revert them. (1) The v2 half of 00996 is done by me: v2/toolchain.rs id() is ContentId::of(\"blaze v2 toolchain id 2\", NIGHTLY + \"\\n\" + PRODUCER) (pinned harness/toolchain + \"blaze v2 codegen 1\"), infallible, test the_identity_is_the_pinned_nightly_and_the_producer; compiles_against is gone from v2/toolchain/tests.rs and hir-firewall. (2) My child integrate-store-codegen (window blaze-v2:30) was cutting the v1 store tier and is stopping after its current edit: asm.rs (assembled off the store; Assembled to_bytes/from_bytes, RELOCS and their test removed), fncache.rs (store::toolchain() hashed as None; tests_reach keeps the process table only), and edits in progress in mod.rs, later.rs and others. Its exact list and anything half-done: /tmp/blaze-lanes/v2-integrate-store-codegen.md (STATUS line at the end). The tree is yours from here. When hir-ty-codegen no longer names blaze_store (mod.rs:164 `use blaze_store as store`, Cargo.toml:59), tell me and I delete the crate.",
+  "state": "applied",
+  "created": "2026-10-30T14:48:38Z",
+  "updated": "2026-10-30T15:01:09Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:48:38Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:01:09Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "hir-ty-codegen names blaze_store nowhere (mod.rs alias, Cargo.toml, Cargo.lock entry gone); told integrate-store in a new request"
+    }
+  ]
+}

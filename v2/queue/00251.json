@@ -1,0 +1,23 @@
+{
+  "id": "00251",
+  "from_lane": "diagnostics-lints-names-items-speed",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/names.rs"
+  ],
+  "what": "## 1. For `diagnostics-lints-names` (parent): one walk of the crate for the three late entry points\n\nDONE: granted by the parent. `items::Walk::of(cx)` walks once, `names::after_abort` passes\n`&walk` to all three entry points, and `items.rs` takes it. The proposal below is kept as\nwritten.\n\nWhere: `crates/blaze-diagnostics/src/lints/names.rs` and `lints/names/items.rs`'s interface.\n\nWhat: `names::after_abort` calls `items::private_in_public`, `items::after_abort` and\n`items::clashing_extern_declarations`, and each of them calls `walk::items(cx)`: the crate's\nitems are walked, parsed, macro-expanded and `cfg`-tested three times after the abort (four\nwith `before_abort`). Proposed interface:\n\n```rust\n// items.rs\npub(super) struct Items(Vec<walk::Item>);\npub(super) fn walk(cx: &Cx<'_, '_>) -> Items;\npub(super) fn private_in_public(cx: &Cx<'_, '_>, items: &Items) -> Vec<Found>;\npub(super) fn after_abort(cx: &Cx<'_, '_>, items: &Items) -> Vec<Found>;\npub(super) fn clashing_extern_declarations(cx: &Cx<'_, '_>, items: &Items) -> Vec<Found>;\n```\n\nwith `names::after_abort` doing `let items = items::walk(cx);` once, before `private_in_public`.\n`before_abort` runs in `lints::early`, before the abort, and keeps its own walk unless `Cx` gets\na per-check slot for it.\n\nWhy: the walk is the largest fixed cost of these passes (one `parse_or_expand` per module and\nmacro call, one `cfg` test per attributed node). Until this lands, each entry point walks once\nand shares that walk among all of its lints.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:36:30Z",
+  "updated": "2026-10-30T02:36:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-names-items-speed.md#1. For `diagnostics-lints-names` (parent): one walk of the crate for the three late entry points",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-names-items-speed.md:3"
+    }
+  ]
+}

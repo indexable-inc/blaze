@@ -1,0 +1,24 @@
+{
+  "id": "00888",
+  "from_lane": "speed-sol2-small",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_next_trait_solver/src/solve/eval_ctxt/mod.rs",
+    "vendor/rustc_next_trait_solver/PATCHES.md"
+  ],
+  "what": "## speed-sol2-small: a cached root goal ~10x its bound: look the global cache up before building the EvalCtxt (solver-sync speed-of-light section 6)\n\n- Where: `vendor/rustc_next_trait_solver` `evaluate_root_goal` (`solve/eval_ctxt/mod.rs`): every root goal builds an `EvalCtxt` and a search-graph frame, runs the proof-tree builder's no-op checks and instantiates the response, even when the answer is in the global cache. rustc's profiles put that at several hundred ns; the bound is ~100 cycles (canonicalize with no infer vars = one flag test, intern hit, cache lookup, nothing to instantiate).\n- Change: a patch in the series (`PATCHES.md`, replayed by `tools/v2/solver_sync.py`): for a root goal whose canonical input has no inference variables, look it up in the global cache first and return the cached response directly when it has no variables to instantiate; else the path as today. Same answers (the cache is what the full path would read first).\n- Proof: proof's budget \"a cached root goal\": time per goal and allocations (0). Measure before applying, once the tree builds; the patch should also go upstream.",
+  "state": "open",
+  "created": "2026-10-30T09:28:58Z",
+  "updated": "2026-10-30T09:28:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:28:58Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

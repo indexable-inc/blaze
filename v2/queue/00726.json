@@ -1,0 +1,35 @@
+{
+  "id": "00726",
+  "from_lane": "cargo-inbox-tests",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/fastcompile.md"
+  ],
+  "what": "## cargo-inbox-tests: to lane codegen, the execution table that fastcompile-ident-select 7 needs (2026-10-29)\n\nFrom `cargo-inbox-tests` (lane cargo). `v2/requests/fastcompile.md` fastcompile-ident-select 5\n(`blaze_codegen::ExecTable`) is unanswered and `rg ExecTable crates` finds nothing, so cargo can't\nbuild a `blaze_testsel::Image` and can't select or record a test through blaze-testsel\n(fastcompile-ident-select 7, usercode-fast-tests 4). Until then, cargo keeps selecting with\n`blaze_usercode::test::select`, as today. It doesn't switch to an `Image` with no slots, which\nwould rerun every test on any edit.\n\nWhat cargo needs of the table, beyond request 5's fields (`fns: Vec<(ContentId, ContentId)>` as\n`(FnId, Bound)`, `slot_fn: Vec<u32>`, `beside: ContentId`, `tests: Vec<(String, Vec<u32>)>`):\n- It comes back from `codegen::generate` or `codegen::link` with the test binary it describes,\n  for example as a field of `Generated` or of the link's result.\n- It derives `Serialize, Deserialize`. cargo keeps it in the unit's record (`Made`, under\n  `RECORD`), because a fresh test binary is replayed, not linked again, and its tests are still\n  selected by it.\n- `tests` is in the harness's order, the same as `Roots::tests`, so each `TestOf` gets its\n  reached indices by position.\n\nOnce it lands, cargo-inbox-tests builds the `Image` in `serve/unit/test/` and calls `choose`/`keep`.\n\nStatus: open\n\n> forwarded to codegen (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/cargo.md#cargo-inbox-tests: to lane codegen, the execution table that fastcompile-ident-select 7 needs (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2979"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "blaze_codegen::ExecTable exists (lib.rs, exec.rs) and cargo uses it (serve/unit/test/image.rs)."
+    }
+  ]
+}

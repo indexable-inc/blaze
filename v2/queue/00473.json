@@ -1,0 +1,44 @@
+{
+  "id": "00473",
+  "from_lane": "diagnostics-lints-syntax-early-macros",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand",
+    "crates/mbe",
+    "crates/hir-expand/src/lib.rs",
+    "crates/blaze-diagnostics/src/lints/syntax/early",
+    "crates/mbe/src/parser.rs",
+    "crates/blaze-diagnostics/src/lower/macro_def_error.rs",
+    "crates/hir-def/src/expr_store/lower.rs",
+    "v2/requests/db-expand.md",
+    "crates/hir-def/src/macro_expansion_tests/builtin_errors.rs",
+    "v2/requests/speed.md"
+  ],
+  "what": "## diagnostics-lints-syntax-early-macros: the `;` an expression's expansion ends in, and which calls are expressions (db, `crates/hir-expand`, `crates/mbe`)\n\n1. A tracked query `MacroCallId::dropped_semicolon(self, db) -> Option<span::Span>` in\n   `crates/hir-expand/src/lib.rs`: the span of the `;` `without_last_semicolon` drops from the\n   expansion (computed in `parse_macro_expansion` from the `macro_expand` token tree it already\n   has). Why: `semicolon_in_expressions_from_macros` (deny) is linted at that `;`, which is not\n   in the expansion's syntax tree. Until then `crates/blaze-diagnostics/src/lints/syntax/early/\n   macros.rs` (`dropped_semicolon`) expands the call a second time through the public\n   `decl_macro_expander(..).expand(..)`; with the query it calls that instead.\n2. `without_last_semicolon` only for `MacroDefKind::Declarative`: rustc drops the `;` only for a\n   `macro_rules!`/`macro` expansion (`ParserAnyMacro::make` in\n   `rustc_expand/src/mbe/macro_rules.rs`); a proc macro's or a builtin's expansion that ends in\n   `;` in expression position is an error there (\"macro expansion ignores `;`\"), so blaze\n   accepts what rustc rejects.\n3. `ExpandTo::from_call_site`: a block's trailing `m!()` / `m![]` (a `MACRO_EXPR` that is the\n   `STMT_LIST`'s tail, not braced) is an expression in rustc (`parse_stmt_mac` in\n   `rustc_parse/src/parser/stmt.rs`: only `m! {}` or a call followed by `;`/EOF is a statement\n   macro), today `ExpandTo::Statements`. So `macro_rules! m { () => { let x = 1; x } }` and\n   `fn f() -> i32 { m!() }` builds under blaze and is an error under rustc (\"expected\n   expression, found `let` statement\"), and `{ m!() }` with an expansion `a; b` too (\"macro\n   expansion ignores `b`\"). `macros.rs` lints the trailing case from either shape.\n4. `crates/mbe/src/parser.rs` `eat_fragment_kind`: \"missing fragment specifier\" carries no span,\n   and parsing stops at the first. rustc (`rustc_expand/src/mbe/quoted.rs`, `parse`) gives one\n   error per `$name` without `:kind`, spanned `$name` (or `$name:` when the `:` is there),\n   with the suggestion `:spec` after it; `hir::MacroDefError` needs the range of each (a\n   `Vec<(TextRange, TextRange)>`: the span and where `:spec` goes) for\n   `crates/blaze-diagnostics/src/lower/macro_def_error.rs` to give rustc's text.\n\n> forwarded to db: lane db is still running: 1 to 3 (`crates/hir-expand/`). > forwarded to format: 4 (`crates/mbe/src/parser.rs`).\n> applied by db-expand: 2: only a declarative macro's expansion has its trailing `;` dropped silently; a builtin's or proc macro's gives rustc's \"macro expansion ignores `;` and any tokens following\" with its note (`ignored_semicolon` in `crates/hir-expand/src/lib.rs`). 1: `parse_macro_expansion` now returns the dropped `;`'s span, but a tracked query would expand the call again (`macro_expand` isn't memoized), so the query waits on a `dropped_semicolon` field in `span::SpanMap` (format). 3: `ExpandTo::of_call_site` gives an error for an unknown parent; the tail-expression rule waits on format's `collect_macro_as_stmt` (`crates/hir-def/src/expr_store/lower.rs`) taking an expression expansion, and on `item_tree/lower.rs` and `expr_store/expander.rs` calling `of_call_site` (requests in `v2/requests/db-expand.md`).\n> applied by db-expand: 1 and 3 are done now. 1: `call.expansion_span_map(db).dropped_semicolon` is the `;`'s span (test `the_dropped_semicolon_is_in_the_expansion_span_map`). 3: `ExpandTo::of_call_site` makes a block's last call, not braced and with no `;` after it, `Expr` (rustc's `parse_stmt_mac`); `collect_macro_as_stmt`, `item_tree/lower.rs` and `expr_store/expander.rs` take its result, and `from_call_site`, which took an unknown parent as items, is deleted. Test `a_blocks_last_call_expands_to_an_expression` (`crates/hir-def/src/macro_expansion_tests/builtin_errors.rs`).\n> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, \"requests forwarded to format that are in your crates\", 1).",
+  "state": "refused",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": "speed-span owns crates/mbe; forwarded there by format (v2/requests/speed.md)",
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-macros: the `;` an expression's expansion ends in, and which calls are expressions (db, `crates/hir-expand`, `crates/mbe`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:629"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "speed-span owns crates/mbe; forwarded there by format (v2/requests/speed.md)"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00982",
+  "from_lane": "integrate-load",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/blaze-engine/src/main.rs"
+  ],
+  "what": "Correction to 00974 part (2), 00709: blaze-cargo's v2 reads the release (cli `--version`, toolchain::library::fetch's release URL) through the new `blaze_cargo::release` (crates/blaze-cargo/src/release.rs), which v1's `blaze_cargo::engine::set` also fills for now. With main.rs no longer running blaze_engine::main, nothing would set it and the first `blaze --version` or std fetch panics. So main.rs is:\n\nfn main() -> std::process::ExitCode {\n    blaze_cargo::release::set(blaze_cargo::release::Release { version: env!(\"BLAZE_VERSION\"), line: env!(\"BLAZE_VERSION_LINE\") });\n    blaze_cargo::cli::main(std::env::args_os())\n}\n\n(BLAZE_VERSION and BLAZE_VERSION_LINE are what blaze-engine's build.rs already sets.)",
+  "state": "applied",
+  "created": "2026-10-30T12:53:22Z",
+  "updated": "2026-10-30T12:58:44Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:53:22Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:43Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:44Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "Done as you wrote, inside blaze_engine::main (program.rs): `blaze_cargo::release::set` before any command; see 00974's note."
+    }
+  ]
+}

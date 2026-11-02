@@ -1,0 +1,23 @@
+{
+  "id": "01466",
+  "from_lane": "fastcompile",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/plan.rs"
+  ],
+  "what": "fastcompile (proc macros compiled tier, crates/blaze-macro-eval/src/tier/build.rs; and Andrew 22:37, stencils at opt-level 0): a way for a Policy to plan the standard library at the profile own level instead of the shipped layer.\n\nWhere: crates/blaze-codegen/src/plan.rs, Policy::layers (Origin::Std => SHIPPED_STD, opt-level 3).\n\nWhat: a Policy field, for example `pub std: StdPlan` with `enum StdPlan { Shipped, Profile }` (default Shipped, every current caller unchanged). With Profile, Origin::Std takes no SHIPPED_STD layer, so std is planned at the profile opt_level (and its overflow checks and debug assertions as the front end says for std MIR, as today). Add it to whatever Policy hashes into keys.\n\nWhy: the compiled tier of proc macros only ever compiles copy-and-patch code (opt-level 0); every macro reaches std and proc_macro code. Today std is planned at O3, so the tier either needs LLVM or substitutes stencils for an LLVM plan, which is a fallback. The tier will plan with StdPlan::Profile and refuse any unit planned above opt-level 0 with a typed error; until this lands the tier is off (Policy::compiled false). The stencil coverage harness (crates/blaze-stencil/tests/coverage.rs) will use it too.\n\nTest: plan.rs, a policy with StdPlan::Profile at O0 chooses O0 for Origin::Std; Shipped still O3.",
+  "state": "open",
+  "created": "2026-11-01T06:03:46Z",
+  "updated": "2026-11-01T06:03:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T06:03:46Z",
+      "by": "fastcompile",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

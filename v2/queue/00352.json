@@ -1,0 +1,36 @@
+{
+  "id": "00352",
+  "from_lane": "usercode-wire",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/lib.rs",
+    "crates/load-cargo"
+  ],
+  "what": "## 1. load-cargo: `answer()` refuses a server's ids with errors, not panics (`crates/load-cargo/src/lib.rs`)\n\nFrom safety-fuzz-procmacro item 7, forwarded because `load-cargo` is not this lane's.\n\nWhat: `answer` (line 950) builds `FileId::from_raw`, `EditionedFileId::from_raw`,\n`TextRange::new` and `SyntaxContext::from_u32` from the numbers in a server's `SubRequest`.\nEach panics on some input (`TextRange::new` on `start > end`, `EditionedFileId::from_raw` on the\nreserved bit or an edition past the latest, `from_u32` on `u32::MAX`). Answer those inputs with\n`SubResponse::Cancel { reason }` naming the field and its value, in place of the panic.\n`proc_macro_api::wire::raw_part(tt::WirePart { file_id, ast_id, ctx })` is public now and\ndoes exactly the id checks, returning `Result<(SpanAnchor, SyntaxContext), String>`, so\n`SpanSource`, `SpanParent` and `SpanJoin` can take their anchor and context from it. The range\nstill needs `start <= end` checked by hand. `LocalFilePath` and `FilePath` take a bare `FileId`,\nand `FileId::from_raw` asserts the id is at most `FileId::MAX`, so check that too.\n\nWhy: the server is user code in a sandbox. `run_conversation`'s `catch_unwind` catches these\npanics today, but a panic is no answer: the error should name what the server sent.\n\n> forwarded to cargo (`crates/load-cargo`) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:35:14Z",
+  "updated": "2026-10-31T20:32:43Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode-wire.md#1. load-cargo: `answer()` refuses a server's ids with errors, not panics (`crates/load-cargo/src/lib.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-wire.md:8"
+    },
+    {
+      "at": "2026-10-31T20:32:43Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:32:43Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "crates/blaze-lower/src/answer.rs: every id of a server's question is checked against the db before use (file id bound and has_file_text, the editioned id's reserved and edition bits, the ast id via try_get_erased, start <= end, the offset add checked, the ctx root or on a page SyntaxContextImpl owns); a miss is SubResponse::Cancel naming the field and value. Also FilePath of a file with no path and a LineColumn offset outside the text are refusals, no longer \"\" and (1,1). Test: blaze-lower tests.rs a_question_naming_nothing_of_the_build_is_refused. Gap: an unmade slot on an owned page still panics; queued to db (Storage::made)."
+    }
+  ]
+}

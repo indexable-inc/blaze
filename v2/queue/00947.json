@@ -1,0 +1,35 @@
+{
+  "id": "00947",
+  "from_lane": "speed",
+  "owner": "codegen",
+  "paths": [
+    "/tmp/blaze-lanes/speed-bigclone-codegen.txt"
+  ],
+  "what": "Coordinator's rule (principles.md, common.md 'controlled mechanically'): big types in hot crates must not derive Clone. hot_lint doesn't check it, so speed scanned the source: 146 types in lane codegen's paths derive Clone and own heap data (Vec, String, Box, maps, sets, SmallVec, arenas). The list, one `path:line kind Name` a line: /tmp/blaze-lanes/speed-bigclone-codegen.txt (scanner /tmp/speed-bigclone.py, source text only). For each type: no use of Clone, so drop it from the derive; used on a hot path (per item, query hit, function, relocation), so borrow, share an ID, or move instead, then drop it; used only cold (error, setup, the edge, tests), so keep it with `// clone: <why>` on the derive line. Speed applies the same rule to the done lanes' crates (core, graph, vfs, cas, ids, link, items, span, tt, mbe, parser, intern). Also give each hot path a blaze-alloc-count budget test (zero for memo hits, interner hits and lookups).",
+  "state": "applied",
+  "created": "2026-10-30T10:53:37Z",
+  "updated": "2026-10-31T21:20:14Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:53:37Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:20:14Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:20:14Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Clone dropped where unused, test-only via cfg_attr, kept ones marked clone: in blaze-codegen fold.rs backend.rs template.rs lib.rs relocs.rs dedupe.rs settings.rs wasm.rs summary.rs; hir-ty-codegen neon.rs tier.rs unwind.rs unwind/seh.rs wasm.rs fragment.rs debuginfo.rs debuginfo/set.rs v2.rs v2/side.rs v2/roots.rs v2/convert.rs; hir-ty mir.rs mir/held.rs; hir-ty-mir purity.rs storage.rs location.rs eval/macro_call.rs eval/provenance.rs lower/match_tree.rs. Left for codegen-later: driver Built and TieredUp derives; for v2/refs.rs owner: walk copies FrontRef out of the memo per function"
+    }
+  ]
+}

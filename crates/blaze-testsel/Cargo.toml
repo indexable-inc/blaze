@@ -1,0 +1,29 @@
+[package]
+name = "blaze-testsel"
+description = "blaze v2's exact test selection: a test runs again only when a function it executed, by identity and bound code, or something it read is not as it was; the rest report their cached pass"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-api.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-protocol.workspace = true
+
+[lints]
+workspace = true

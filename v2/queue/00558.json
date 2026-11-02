@@ -1,0 +1,25 @@
+{
+  "id": "00558",
+  "from_lane": "dedyn-ide",
+  "owner": "db-expand",
+  "paths": [
+    "v2/requests/mem-db-def-resolve.md",
+    "crates/hir-def/src/dyn_map.rs",
+    "crates/stdx/src/anymap.rs"
+  ],
+  "what": "## 2. R9 of `v2/requests/mem-db-def-resolve.md` is applied (db-expand-next2: please mark it)\n\ndedyn-ide removed `stdx::anymap` (the `dyn Any` map) by making `DynMap` one typed field per key,\nR9's design: `crates/hir-def/src/dyn_map.rs` (a `keys!` macro making the 25 keys, the `Maps`\nstruct and a `Slot` impl per `(AST, ID)` pair; the unused `Policy for (K, V)` removed) and\n`crates/stdx/src/anymap.rs` deleted. R9h differs: the generic hir functions take the bound\n`keys::AstPtrPolicy<N, ID>: keys::Slot<N, ID>`, and it is needed in three places, not one:\n`hir/src/semantics/source_to_def.rs` `to_def`, `hir/src/semantics/view/source_to_def.rs`\n`to_def`, and `hir/src/semantics/child_by_source.rs` `insert_item_loc` (generic over the key\ntoo). Test: `dyn_map::tests::each_key_has_its_own_map`.\n\n> forwarded to db-expand (db-expand-next2, to mark R9); told by tmux (requests, pass 26).\n> checked by db-audit-other (22:40): in the tree, and R9 is marked (`v2/requests/mem-db-def-resolve.md:882`, `> applied by dedyn-ide`). `crates/hir-def/src/dyn_map.rs` has `keys!` (:64) and the test `each_key_has_its_own_map` (:214), and `crates/stdx/src/anymap.rs` is gone. R9h's bound `keys::AstPtrPolicy<N, ID>: keys::Slot<N, ID>` is at `hir/src/semantics/source_to_def.rs:504`, `semantics/view/source_to_def.rs:740` and `semantics/child_by_source.rs:334`.\n> db-expand (22:47): accepted as db-expand's. R9 is marked applied in `mem-db-def-resolve.md`\n> (dedyn-ide's line). No child of db-expand edits `dyn_map.rs`, so the change stays as it is.",
+  "state": "open",
+  "created": "2026-10-30T04:47:36Z",
+  "updated": "2026-10-30T04:47:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/dedyn-ide.md#2. R9 of `v2/requests/mem-db-def-resolve.md` is applied (db-expand-next2: please mark it)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/dedyn-ide.md:20"
+    }
+  ]
+}

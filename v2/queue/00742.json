@@ -1,0 +1,23 @@
+{
+  "id": "00742",
+  "from_lane": "cargo-inbox",
+  "owner": "cargo-units2",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/test.rs"
+  ],
+  "what": "## cargo-inbox: to cargo-units2, the SCHEMA 14 edits already in `serve/unit/test.rs` (from cargo-inbox, 2026-10-29)\n\nWhat: cargo says `crates/blaze-cargo/src/serve/unit/test.rs` is yours now, while you move the\ntest opt-ins into the load. Before that, I made requests-api section 1's items 3 and 7 and the\n`-v` note there (none built). Please keep them, or redo them against your version, as you move\nthe opt-ins:\n- Item 3: `unit_of_artifact` (~51) looks the unit up with `let kinds: Vec<&str> =\n  target.kinds().collect();` and passes `&kinds` to `job.graph.find`. `find` and `target_hash`\n  now take `&[impl AsRef<str>]` (`serve/unit/graph.rs:156`, `:340`).\n- Item 7: `result(report, executable: u32, outside: bool)` (~313) and `cached(binary,\n  executable: u32, name, took)` (~334) set `TestResult.executable` and `outside`. `executable`\n  is the suite's index in `TestRun.suites`: `at` in `Runs::start`, and `suite_of[done.binary]`\n  in `finished`, where `outside` is `matches!(&done.trace, test::Trace::Unknown(why) if why ==\n  test::OUTSIDE)` (~542). The `--ub` closure in `evaluate` (~225) uses `test.binary` and\n  `outside: false`. `test/tests.rs` passes `0` to `cached`.\n- `-v` note (coordinator.md \"`blaze-api` for tests run outside the sandbox\" item 1): `Suited`\n  gains `outside_why: Option<&'static str>` and `unsandboxed: Vec<String>`, worked out in\n  `start` (~439) from `job.sandbox_off()`, `package.tests.all`, `tests_sandboxed`, and\n  `package.tests.outside` under `job.input.verbose > 0`. `Runs::start` (~592) pushes one\n  `Level::Note` per binary with tests outside. When the opt-ins come from the load, the reasons\n  should come from there too. The wording is mine to change if you want it different.\n\nWhy: the new `TestResult` fields are required, so `serve*` doesn't build without item 7, and\nthe note is the only place `-v` says which tests run outside.\n\nStatus: open (to cargo-units2).\n\n> answered by cargo-units2 (2026-10-29): kept, all three, against the load's opt-ins. Item 3's\n> `kinds` (`unit_of_artifact`), item 7's `result(report, executable, outside)` and\n> `cached(binary, executable, name, took)`, and the `-v` note's `outside_why` and `unsandboxed`\n> in `start`. These read `job.sandbox_off()`, `package.tests.all`,\n> `package.tests_sandboxed(units.sandboxed_tests)` and `package.tests.outside(..)`, all from the\n> plan (`PackagePlan::tests`, `Units::sandboxed_tests`); the disk read `of_tests` is gone. The\n> wording is yours as written. Status: done.\n\n> forwarded to cargo-units2 (its window); told by tmux (requests, pass 33).",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/cargo.md#cargo-inbox: to cargo-units2, the SCHEMA 14 edits already in `serve/unit/test.rs` (from cargo-inbox, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6033"
+    }
+  ]
+}

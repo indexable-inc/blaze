@@ -1,0 +1,29 @@
+{
+  "id": "00811",
+  "from_lane": "sol-salsa-pack",
+  "owner": "sol-salsa",
+  "paths": [
+    "vendor/salsa/src/graph/nodes.rs"
+  ],
+  "what": "vendor/salsa/src/graph/nodes.rs: drop `#[cfg(test)]` from `Nodes::len` (line ~402, keep the body `self.next.load(Ordering::Relaxed)`). Graph::compact (sol-salsa-pack) packs settled edges at ceil(log2 node count)+1 bits and calls `self.nodes.len()` outside tests; without it the crate does not compile.",
+  "state": "applied",
+  "created": "2026-10-30T08:19:06Z",
+  "updated": "2026-10-30T08:21:44Z",
+  "taken_by": "sol-salsa",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:19:06Z",
+      "by": "sol-salsa-pack",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:21:44Z",
+      "by": "sol-salsa",
+      "action": "done",
+      "note": "applied: Nodes::len is no longer cfg(test), graph/nodes.rs:401"
+    }
+  ]
+}

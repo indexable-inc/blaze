@@ -1,0 +1,24 @@
+{
+  "id": "00897",
+  "from_lane": "speed-sol2-proof",
+  "owner": "frontend",
+  "paths": [
+    "crates/blaze-v2-proof/src/nameres.rs",
+    "crates/blaze-v2-proof/src/main.rs"
+  ],
+  "what": "blaze-v2-proof nameres check copies three whole traces (main.rs compare(): before/incremental/scratch .to_trace(), about 3.8 GB copied at nushell size, ~0.5-1 s, against a check that reads a few kinds' runs, <5 ms). Exact edit, as speed-sol2-proof did for dbsp.rs: make nameres::check, differ and of_kind generic over crate::join::Columns (A: Columns, B: Columns, C: Columns), using join::of_kind, join::index_from, join::result, join::same_edges and join::ran_results (all pub(crate) now in join.rs) in place of Trace fields and crate::same_edges; for crate::under on the views call join::under; then in main.rs compare() pass &before, &incremental, &scratch (the Views) instead of .to_trace(). Add a test that check on Views equals check on Traces for every case (see dbsp.rs a_check_in_place_answers_as_on_owned_traces). nameres.rs is out for speed-sol2-proof because frontend-next1 (live, lane frontend BLOCKED) extends the oracle cases there.",
+  "state": "open",
+  "created": "2026-10-30T09:32:19Z",
+  "updated": "2026-10-30T09:32:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:32:19Z",
+      "by": "speed-sol2-proof",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

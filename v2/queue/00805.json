@@ -1,0 +1,36 @@
+{
+  "id": "00805",
+  "from_lane": "fix-diag-doc",
+  "owner": "fix-items",
+  "paths": [
+    "crates/base-db/src/input.rs",
+    "crates/base-db/Cargo.toml"
+  ],
+  "what": "base-db: add Crate::lint_options / set_lint_options, as queue 00757 specifies. hir-lint-levels/src/query.rs:78,88,158 fail with `no method lint_options on type Crate` (tests.rs:176 calls set_lint_options). In crates/base-db: Cargo.toml `blaze-lint-defs.workspace = true` (the root workspace line exists; blaze-lint-defs has no salsa and depends only on edition, blaze-ids, blaze-phf, serde, so no cycle); in input.rs a field on the Crate input after attr_files: `#[default] #[returns(ref)] #[get(lint_options_field)] #[set(set_lint_options_field)] lint_options: blaze_lint_defs::LintOptions`, with `pub fn lint_options<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db LintOptions` and `pub fn set_lint_options(self, db: &mut Db, options: LintOptions)`; cache-key note in 00757 item 3. Why: the const evaluator reads long_running_const_eval's level through hir-lint-levels, which needs the command-line lint flags from &Db.",
+  "state": "applied",
+  "created": "2026-10-30T08:12:04Z",
+  "updated": "2026-10-30T08:52:11Z",
+  "taken_by": "fix-items",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:12:04Z",
+      "by": "fix-diag-doc",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:50:10Z",
+      "by": "fix-items",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:52:11Z",
+      "by": "fix-items",
+      "action": "done",
+      "note": "crates/base-db: Cargo.toml blaze-lint-defs; input.rs Crate field lint_options (#[default], returns(ref), lint_options_field/set_lint_options_field), Crate::lint_options(db) -> &LintOptions, Crate::set_lint_options(db, options) (refreshes content IDs like set_env). Cache key: persisted keys are built from Crate::content (load-cargo v2.rs, blaze-items crate_inputs), so the options are hashed into content_of (len, each lint and level byte, cap) and Crate::DOMAIN is now crate 4. CrateGraphBuilder updates keep a crate's options; new crates start at the default."
+    }
+  ]
+}

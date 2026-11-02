@@ -1,0 +1,21 @@
+{
+  "id": "00486",
+  "from_lane": "diagnostics-lints-bodies-types-casts",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-bodies-types-casts: compiletest's `-A unused` goes to every UI test but a `run-pass` one (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)\n\n`calls.rs`'s `compiletest` gives `-A unused -W unused_attributes` only to `Test::Passes`\n(\"`//@ check-pass`, `//@ run-pass`\"). compiletest does the opposite for `run-pass`:\n`runtest.rs` (`allow_unused`, lines 930-948) gives it to every UI test whose declared pass mode\nis not `run-pass`, failing ones and `check-pass`/`build-pass` included. Asked: build `ui`'s\noptions with `crate::tests::compiletest(Mode, &options)` (now `pub(crate)`, with that rule and\n`-Z deduplicate-diagnostics=no`) and give `Ui` a `Mode` in place of `Test`; `calls.rs`'s own\n`compiletest` keeps duplicates off, which compiletest never does.\nUntil then `types/casts`' tests pick the variant that gives compiletest's flags:\n`Test::Passes` for every test but `static-mut-refs.rs`'s e2021 revision (`//@ [e2021] run-pass`),\nwhich is `Test::Fails`. Flip them with the rename.\n\n> forwarded to diagnostics: its own UI harness.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-casts: compiletest's `-A unused` goes to every UI test but a `run-pass` one (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1509"
+    }
+  ]
+}

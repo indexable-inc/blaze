@@ -1,0 +1,36 @@
+{
+  "id": "00642",
+  "from_lane": "mem-db-infer-eval",
+  "owner": "coordinator",
+  "paths": [
+    "crates/rustc_abi",
+    "v2/requests/mem-db-infer-eval.md"
+  ],
+  "what": "## mem-db-infer-eval, for the coordinator: `crates/rustc_abi` takes borrowed variants (R-abi, from db-mem-infer-b-eval)\n\n`v2/requests/mem-db-infer-eval.md`, \"R-abi: a request to the coordinator\" (line 78): the layout\ncalculator's `layout_of_struct_or_enum`, `layout_of_union`, `layout_of_struct`, `layout_of_enum`\n(`rustc_abi/src/layout.rs`) and `layout_of_coroutine`, `coroutine::layout`,\n`coroutine_saved_local_eligibility` (`layout/coroutine.rs`) take variants as\n`&IndexSlice<VariantIdx, V>` with `V: Deref<Target = IndexSlice<FieldIdx, _>>` in place of nested\nowned `IndexVec`s, so layout stops making one global block per variant. `IndexVec` meets the bound,\nso existing callers compile unchanged. Lane items' L4 step 2 and A2 wait on it.\n\n> forwarded to the coordinator (`crates/rustc_abi`): on requests' coordinator list (requests, pass 23).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:39:53Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/db.md#mem-db-infer-eval, for the coordinator: `crates/rustc_abi` takes borrowed variants (R-abi, from db-mem-infer-b-eval)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:8418"
+    },
+    {
+      "at": "2026-10-30T08:39:53Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:39:53Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "rustc_abi layout.rs: layout_of_struct_or_enum, layout_of_union, layout_of_struct, layout_of_enum take &IndexSlice<VariantIdx, V> with V: Deref<Target = IndexSlice<FieldIdx, F>>; layout_of_coroutine, coroutine::layout and coroutine_saved_local_eligibility take &IndexSlice<VariantIdx, K> with K: Deref<Target = IndexSlice<FieldIdx, LocalIdx>>. Direct loops over a variant now call .iter() (layout.rs only_variant, repr(C) prefix_align, ScalarPair zip; coroutine.rs eligibility). Existing IndexVec callers unchanged; hir-ty can now pass borrowed slices."
+    }
+  ]
+}

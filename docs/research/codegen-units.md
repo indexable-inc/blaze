@@ -20,7 +20,8 @@ crate's codegen units, bring them to cargo's time with no slower a program?
 
 ## What was built
 
-`BLAZE_UNITS=1` ([`units.rs`](../../crates/hir-ty-codegen/units.rs)) compiles a whole-program
+`BLAZE_UNITS=1` (hir-ty-codegen's `units.rs`, deleted with v1's whole-object build on 2026-10-30)
+compiles a whole-program
 build in units; without it nothing changes.
 
 - A function's IR is built without LLVM's part (`Detach::Unit`), and its imports are chosen

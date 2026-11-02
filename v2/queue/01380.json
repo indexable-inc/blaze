@@ -1,0 +1,25 @@
+{
+  "id": "01380",
+  "from_lane": "fix-diag-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs",
+    "crates/hir-ty-borrowck/src/lib.rs",
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "## Internal text leaks: \"blaze cannot borrow-check `main`: IncompleteExpr / TypeError(..)\" after an error already reported\n\nrustc never borrow-checks a body tainted by an error. hir-ty-borrowck has `NotChecked` for this (`check_def`, crates/hir-ty-borrowck/src/lib.rs:344-403), but two reported errors get past its guards. MIR lowering then fails, `check_owner` (lib.rs:450-454) sets `skipped`, and hir pushes `BorrowckSkipped` (crates/hir/src/diagnostics.rs:2980-2993). The user gets a second error that is blaze-internal text. Under AGENTS.md useful-not-parity that text is a useless message, and the tests now assert it isn't there.\n\n1. Unresolved macro in statement position (`k!();`, `iamnotanextensionthatexists!(\"\");`): crates/hir-def/src/expr_store/lower.rs:3068 calls `collect_macro_call(mac_call, macro_ptr, false, ..)`, so `Err(UnresolvedMacro)` (lower.rs:3014-3023) pushes no `ExpressionStoreDiagnostics::UnresolvedMacroCall`. `Body::has_lowering_errors` (expr_store/body.rs:181) is then false, and `failed_expansion` (hir-ty-mir/src/mir/lower.rs:4736) sees no call: an unresolved call has no MacroCallId. The body is checked, and MIR gives `IncompleteExpr`. Fix: record that the body has an unresolved macro call even where the diagnostic is reported elsewhere. Either a flag the guard reads, or record the diagnostic and dedupe at reporting. Then make `check_def` treat it as `NotChecked::LoweringErrors`. Tests: blaze-diagnostics tests::items::macros::{a_macro_that_does_not_exist_is_not_found, an_undefined_macro_suggests_the_similar_one}.\n2. Missing field in a record literal (E0063): it's reported by body validation, not inference, so `infer.diagnostics()` is empty and `check_def` goes on. MIR then fails with `TypeError(\"missing field in record literal\")`. In rustc E0063 is a typeck error and taints the body. Fix: count it in the guard (rustc's place for it is inference), not by mapping MIR's TypeError to not-checked (that would hide unreported cases). Tests: tests::check::{a_missing_field_in_a_test_module_is_an_error, an_error_leaves_out_the_late_lints}.\n3. `x!(!)`, where the expansion ends inside an expression: blaze reports only the borrowck leak, not the parse error of the expansion (\"macro expansion ends with an incomplete expression\" at the `!`). Test: tests::items::macros::an_expansion_that_ends_inside_an_expression_says_so_at_its_last_token. The expansion's parse error should be reported at the call and taint the body.",
+  "state": "open",
+  "created": "2026-11-01T00:15:17Z",
+  "updated": "2026-11-01T00:15:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:15:17Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

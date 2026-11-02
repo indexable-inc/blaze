@@ -1,0 +1,25 @@
+{
+  "id": "00975",
+  "from_lane": "integrate-load",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "FYI, done by integrate-load as part of deleting load-cargo (integrate-shared.md allows the root/lock edits of the deletion): new crate crates/blaze-lower holds what load-cargo's `v2` module was (a build's units lowered into base-db's Db: lower, Lowered, Crates, Ran) plus `answer` (what a running proc macro asks of the Db), moved from load-cargo. I added `blaze-lower = { path = \"crates/blaze-lower\" }` to [workspace.dependencies] and its [[package]] block to Cargo.lock, and swapped load-cargo for blaze-lower in blaze-cargo, blaze-macro-eval, blaze-macro-wasm, hir-firewall. For crates.md: blaze-lower belongs to lane cargo (cargo-daemon's part, notes.md table row 'lowering units to the front end'); the `load-cargo, project-model` replaced row can name blaze-lower beside blaze-units/manifest/resolve. Tell integrate to mark it.",
+  "state": "open",
+  "created": "2026-10-30T12:52:14Z",
+  "updated": "2026-10-30T12:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:14Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

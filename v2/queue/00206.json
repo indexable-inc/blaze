@@ -1,0 +1,35 @@
+{
+  "id": "00206",
+  "from_lane": "codegen-inline",
+  "owner": "coordinator",
+  "paths": [
+    "v2/hashes.rs"
+  ],
+  "what": "## 3. Exhaustive `MirSpan` matches (each crate's owner)\n\n`MirSpan::Inlined(n)` is a span of another body: where a match maps a span to source, it goes\nthrough `hir_ty_mir::mir::source_span(db, body, span)`, which gives the owner and the span in\nit; where it only compares or hashes, `Inlined(n)` is its own value. Arms at:\n`hir/src/diagnostics.rs:1259,1404`, `blaze-items/src/form.rs:343`,\n`hir-ty-codegen/mod.rs:4407`, `hir-ty-codegen/places.rs:165`, `hir-ty-codegen/v2/hashes.rs:173`,\n`hir-ty-codegen/v2/backend.rs:397`, `hir-ty-ub/src/check/report.rs:148`,\n`hir-ide/src/mir_pretty/errors.rs:244`, `hir-ty-mir/src/mir/location.rs:347`,\n`hir-ty-mir/src/mir/eval.rs:677`, `hir-ty-mir/src/mir/lower.rs:3315`,\n`blaze-diagnostics/src/lints/bodies.rs:237`, `hir-ty-borrowck/src/check.rs:192`,\n`hir-ty-borrowck/src/regions.rs:4174`. `v2/hashes.rs` hashes `body.inlined` whole with the\nbody (the scopes, spans, bindings and promoted are what the inlined code means).\n\n> forwarded: `hir/`, `hir-ty-borrowck` to db; `hir-ty-codegen`, `hir-ty-mir` to codegen; `blaze-diagnostics` to diagnostics; `hir-ty-ub` to safety (each told by tmux). `hir-ide/src/mir_pretty/errors.rs:244` and `blaze-items/src/form.rs:343` (items is DONE) are requests': their arms go in once 1 adds `MirSpan::Inlined`, which is not in `hir-ty/src/mir.rs` yet.",
+  "state": "refused",
+  "created": "2026-10-30T02:22:41Z",
+  "updated": "2026-10-30T08:27:46Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done for its path: crates/hir-ty-codegen/v2/hashes.rs Hashes::span goes through hir_ty_share::code::table_of, whose MirSpan::Inlined arm is Err(n), and refuses an inlined span with an error naming it (by_id.rs likewise); no match on MirSpan is left non-exhaustive there. The other crates listed were forwarded to their owners (db, codegen, diagnostics, safety, requests) in the request itself.",
+  "source": "v2/requests/codegen-inline.md#3. Exhaustive `MirSpan` matches (each crate's owner)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-inline.md:113"
+    },
+    {
+      "at": "2026-10-30T08:27:46Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:27:46Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done for its path: crates/hir-ty-codegen/v2/hashes.rs Hashes::span goes through hir_ty_share::code::table_of, whose MirSpan::Inlined arm is Err(n), and refuses an inlined span with an error naming it (by_id.rs likewise); no match on MirSpan is left non-exhaustive there. The other crates listed were forwarded to their owners (db, codegen, diagnostics, safety, requests) in the request itself."
+    }
+  ]
+}

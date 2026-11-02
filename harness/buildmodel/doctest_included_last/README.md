@@ -1,5 +1,0 @@
-intro
-
-```
-assert!(true);
-```

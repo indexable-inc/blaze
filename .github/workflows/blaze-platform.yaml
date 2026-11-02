@@ -3,7 +3,7 @@
 # machine of their own. The tiers `gate` (the merge gate's, blaze.yaml) and `warm` (a push to
 # main, which writes the caches the other runs read) are the unit tests and the build alone;
 # `full` is the release train's (train.yaml). Each platform builds on its own kind of machine,
-# so nothing is cross-compiled or emulated but what `buildmodel.py` builds for other targets.
+# so nothing is cross-compiled or emulated.
 name: blaze platform
 on:
   workflow_call:
@@ -20,18 +20,6 @@ on:
         description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
         required: true
-      borrowck:
-        description: rustc's borrow-check tests, against this build
-        type: boolean
-        default: false
-      pinned-ui:
-        description: the run-pass tests of rustc's in harness/ui-pinned.txt, against this build
-        type: boolean
-        default: false
-      consteval:
-        description: rustc's tests/ui/consts and const-generics, against this build's const evaluator
-        type: boolean
-        default: false
       blaze-cli:
         description: "`blaze` against cargo on small projects at pinned commits"
         type: boolean
@@ -42,14 +30,6 @@ on:
         default: false
       bench:
         description: harness/bench.py on ripgrep against the stored baseline (not required)
-        type: boolean
-        default: false
-      bun-e2e:
-        description: the reduced fixtures of what kept Bun from building
-        type: boolean
-        default: false
-      wasm32:
-        description: harness/wasm32.py, programs built for wasm32 and run under wasmtime against cargo's
         type: boolean
         default: false
       smoke:
@@ -172,10 +152,6 @@ jobs:
           project: ${{ steps.blaze.outputs.project }}
           token: ${{ secrets.BLAZE_CACHE_TOKEN }}
           sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
-      # On a push to main, rustc's tests into the cache for the borrowck and pinned-ui jobs of
-      # the runs after it, which then need not fetch them.
-      - if: inputs.tier == 'warm' && (inputs.borrowck || inputs.pinned-ui)
-        uses: ./.github/actions/rust-tests
 
   build:
     name: build
@@ -278,33 +254,12 @@ jobs:
           project: ${{ steps.blaze.outputs.project }}
           token: ${{ secrets.BLAZE_CACHE_TOKEN }}
           sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
-      # blaze's proc-macro server beside blaze, as a release has it: a load into blaze's own
-      # target directory has blaze link every proc macro for that server, and fails without
-      # one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on Windows, whose
-      # release blaze does not build yet. Only for the harnesses of the `fast` and `full` tiers:
-      # the smoke corpus of every tier is std alone, with no proc macros.
-      - name: blaze's proc-macro server
-        if: runner.os != 'Windows' && inputs.harnesses == '' && (inputs.tier == 'fast' || inputs.tier == 'full')
-        run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
-      - name: blaze's proc-macro server (named harnesses)
-        if: runner.os != 'Windows' && inputs.harnesses != ''
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/proc-macro-server
-          BLAZE_STD_FROM: 'off'
-          RUST_BACKTRACE: '0'
-        run: |
-          "$PWD/target/release/blaze-engine" cargo build --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-srv-cli --bin rust-analyzer-proc-macro-srv --release --locked
-          cp "$CARGO_TARGET_DIR/release/rust-analyzer-proc-macro-srv" target/release/blaze-proc-macro-srv
-          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
-      # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`
-      # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
-      # blaze-proc-macro-srv beside blaze). A tar keeps them executable.
+      # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
-          tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-rustc$exe $server
+          tar -cf blaze.tar blaze-engine$exe blaze$exe
       - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
@@ -333,7 +288,7 @@ jobs:
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
 
   harness:
-    name: harness (${{ matrix.backend }}, ${{ matrix.part }})
+    name: harness (${{ matrix.part }})
     if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
@@ -341,12 +296,9 @@ jobs:
     timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
       fail-fast: false
-      # {"include": [{"backend", "part", "apt"}, ...]}: each backend has parts of its own.
+      # {"include": [{"part", "apt"}, ...]}. No backend: v2 picks it by the profile, and refuses
+      # every unit while BLAZE_BACKEND or BLAZE_OPT is set (harness/ci.py).
       matrix: ${{ fromJSON(needs.build.outputs.parts) }}
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
@@ -354,14 +306,12 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           llvm: run
-          # What `buildmodel.py` builds for besides the host.
-          targets: ${{ matrix.part == 'buildmodel' && inputs.os == 'ubuntu-24.04' && 'aarch64-unknown-linux-gnu x86_64-unknown-linux-musl' || '' }}
-      # What ci.py says the part's harnesses use (valgrind, gdb), and the cross tools of buildmodel.
+      # What ci.py says the part's harnesses use (gdb).
       - name: Linux tools
-        if: runner.os == 'Linux' && (matrix.apt != '' || (matrix.part == 'buildmodel' && runner.arch == 'X64'))
+        if: runner.os == 'Linux' && matrix.apt != ''
         uses: ./.github/actions/apt
         with:
-          packages: ${{ matrix.part == 'buildmodel' && 'gcc-aarch64-linux-gnu musl-tools qemu-user' || matrix.apt }}
+          packages: ${{ matrix.apt }}
       # `debuginfo.py` has perf unwind what blaze built, which it says it did not run where
       # there is no perf or the kernel does not let this user sample.
       - name: perf
@@ -372,19 +322,6 @@ jobs:
           perf --version || sudo ln -sf "$(ls /usr/lib/linux-tools/*/perf | tail -n 1)" /usr/local/bin/perf
           perf --version
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-      # MinIO as one program in the home directory, which is where remote.py looks for it and
-      # needs it: it kills the service and starts it again. The image is the one that is still
-      # published, for both architectures; the runner's docker takes a file out of it without
-      # root.
-      - name: MinIO
-        if: runner.os == 'Linux' && matrix.part == 'daemon'
-        run: |
-          image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
-          mkdir -p "$HOME/s3tools"
-          container=$(docker create "$image")
-          docker cp "$container:/usr/bin/minio" "$HOME/s3tools/minio"
-          docker rm "$container"
-          "$HOME/s3tools/minio" --version
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
@@ -407,7 +344,7 @@ jobs:
         env:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
-          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES, \"backend\": \"${{ matrix.backend }}\"}"
+          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
       # temporary directory of its own), and the report of a process that crashed on macOS.
       - name: Daemon logs
@@ -420,152 +357,6 @@ jobs:
             [ -f "$report" ] && { echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::"; }
           done
           true
-
-  bun-e2e:
-    name: Bun E2E fixtures
-    if: inputs.bun-e2e && (inputs.tier == 'fast' || inputs.tier == 'full')
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - name: blaze
-        working-directory: target/release
-        run: |
-          tar -xf blaze.tar
-          echo "BLAZE_BIN=$PWD/blaze-engine" >> "$GITHUB_ENV"
-      - run: $PYTHON harness/bun_repros.py
-
-  # wasm32 with blaze's own wasm lowering (docs/platforms.md, "wasm32"): this build compiles for
-  # the target and the programs run under the wasmtime of the flake's `wasm` shell.
-  wasm32:
-    name: wasm32
-    if: inputs.wasm32 && (inputs.tier == 'fast' || inputs.tier == 'full')
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-          targets: wasm32-wasip1 wasm32-unknown-unknown
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - name: blaze
-        working-directory: target/release
-        run: |
-          tar -xf blaze.tar
-          echo "BLAZE_BIN=$PWD/blaze-engine" >> "$GITHUB_ENV"
-      - run: nix develop .#wasm --command python3 harness/wasm32.py
-
-  # The borrow checker against rustc's own borrow-check tests (docs/borrowck.md), at the
-  # commit of the pinned toolchain whose verdicts they are scored by, with a floor under the passes.
-  borrowck:
-    name: borrowck
-    if: inputs.borrowck && (inputs.tier == 'fast' || inputs.tier == 'full')
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
-      - uses: ./.github/actions/rust-tests
-      - run: python3 harness/borrowck_ui.py "$RUNNER_TEMP/rust" --bin target/release/blaze-engine --jobs 4 --mode both --min-pass 1538  # TODO(rjn): re-measure at the new pin
-      # Crates rustc accepts: an error is a false one, and a file the checker panics on (which
-      # fails `blaze-engine borrowck`) would have none of its errors reported.
-      - name: the corpus and mixfutures
-        run: |
-          for crate in corpus mixfutures; do
-            (cd harness/$crate && ../../target/release/blaze-engine borrowck --project .) > "$RUNNER_TEMP/$crate.json" || true
-            python3 -c 'import json, sys
-          lines = [json.loads(it) for it in open(sys.argv[1])]
-          bad = [it for it in lines if "error" in it or "panic" in it]
-          print(sys.argv[2], *bad, lines[-1] if lines else "no output", sep="\n")
-          sys.exit(bool(bad) or not lines or "files" not in lines[-1])' "$RUNNER_TEMP/$crate.json" $crate
-          done
-
-  # The const evaluator against rustc's tests/ui/consts and const-generics (docs/harness.md),
-  # at the commit of the pinned toolchain, with floors under the units and run-pass tests that
-  # match. Its summary lists every difference.
-  consteval:
-    name: consteval
-    if: inputs.consteval
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
-      - uses: ./.github/actions/rust-tests
-      - run: |
-          python3 harness/consteval_ui.py "$(python3 -c 'import json, os, sys
-          tmp = os.environ["RUNNER_TEMP"]
-          print(json.dumps({"rust": f"{tmp}/rust", "bin": "target/release/blaze-engine", "jobs": 4,
-                            "work": f"{tmp}/consteval", "out": f"{tmp}/consteval-out",
-                            "min_evaluation": 727, "min_run_pass": 222}))')" || status=$?
-          cat "$RUNNER_TEMP/consteval-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
-          exit "${status:-0}"
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: consteval-${{ inputs.platform }}
-          path: ${{ runner.temp }}/consteval-out
-
-  # The few run-pass tests of rustc's that claims.yaml's full run, or a run on another
-  # platform, once caught blaze failing (harness/ui-pinned.txt), from the tests of the pinned
-  # toolchain. Their workspaces are under a link, as they are under /tmp on macOS: rustc's
-  # dep-info names their files where they are, and blaze is given them through the link.
-  pinned-ui:
-    name: pinned run-pass tests
-    if: inputs.pinned-ui && (inputs.tier == 'fast' || inputs.tier == 'full')
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - run: tar -xf blaze.tar
-        working-directory: target/release
-      - uses: ./.github/actions/rust-tests
-      - name: pinned run-pass tests
-        run: |
-          mkdir "$RUNNER_TEMP/ui-real"
-          ln -s "$RUNNER_TEMP/ui-real" "$RUNNER_TEMP/ui"
-          cd "$GITHUB_WORKSPACE"
-          cd harness
-          BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 uitest.py "$RUNNER_TEMP/rust" --tests ui-pinned.txt --jobs 4 --work "$RUNNER_TEMP/ui"
 
   # The std cases of the smoke corpus (docs/release.md): small programs with no dependencies
   # that `blaze run` must print the expected output of and `blaze test` must pass, dev and
@@ -598,12 +389,12 @@ jobs:
           BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
             "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
 
-  # `blaze` in place of cargo on projects at pinned commits, and the flags, the daemon's
-  # life and plain cargo after `blaze enable`. Incremental compilation is left to the profile,
+  # `blaze` in place of cargo on projects at pinned commits, and the flags and the daemon's
+  # life. Incremental compilation is left to the profile,
   # as on a developer's machine: with it off the tests of every project are cargo's (the
   # harness has that case among the flags).
   blaze-cli:
-    name: blaze (${{ matrix.backend }}, ${{ matrix.group }})
+    name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
     needs: build
     runs-on: ${{ inputs.os }}
@@ -611,12 +402,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
         group: ["ripgrep hyperfine", "fd", "checks"]
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -641,7 +427,7 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: blaze-cli-logs-${{ inputs.platform }}-${{ matrix.backend }}-${{ strategy.job-index }}
+          name: blaze-cli-logs-${{ inputs.platform }}-${{ strategy.job-index }}
           path: |
             /tmp/blaze-cargo-processes.txt
             /tmp/blaze-cargo-*/home-*/*.log
@@ -652,7 +438,7 @@ jobs:
   # what every test says has to be what cargo gives. The ten after these take more than a hosted
   # runner's three hours, and it was shut down loading rust-analyzer.
   projects:
-    name: projects (${{ matrix.backend }}, ${{ matrix.projects }})
+    name: projects (${{ matrix.projects }})
     if: inputs.projects
     needs: build
     runs-on: ${{ inputs.os }}
@@ -665,12 +451,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
         projects: ["ripgrep fd", "bat hyperfine", "just", "axum", "nushell", "checks"]
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain

@@ -1,0 +1,24 @@
+{
+  "id": "01213",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir-ty/src/infer"
+  ],
+  "what": "hir::UnresolvedField needs `at_error: Option<String>` like CannotIndexInto/CannotBeDereferenced (00280): the receiver type as rustc prints it when it reports E0610/E0609, before integer fallback. `1.foo` (tests/ui/error-codes/E0610.rs) is \"`{integer}` is a primitive type and therefore doesn't have fields\"; blaze prints `i32`. blaze-diagnostics lower/unresolved_field.rs will take it when Some (test tests::bodies::members::a_field_of_a_primitive).",
+  "state": "open",
+  "created": "2026-10-31T01:28:47Z",
+  "updated": "2026-10-31T01:28:47Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:28:47Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

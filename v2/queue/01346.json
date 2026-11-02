@@ -1,0 +1,23 @@
+{
+  "id": "01346",
+  "from_lane": "cargo",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/pool.rs"
+  ],
+  "what": "Correction to cargo's done note on 00864 (speed-sol-core, plane loop): item (3) said blaze_graph::pool::submit boxes each job; it does not, jobs go in pooled cells (pool.rs ~L200-260, take_cell/give_back). The alloc-count test through serve/plane.rs Threads is still unwritten, because a cell is given back to the cache of the worker that ran it, not of the daemon's loop thread that submitted it, so it is unclear whether a warm submit from a thread outside the pool allocates nothing. Say whether it does (or make it so); then cargo adds `a warm task through Threads allocates nothing` in serve/plane.rs's tests.",
+  "state": "open",
+  "created": "2026-10-31T20:46:56Z",
+  "updated": "2026-10-31T20:46:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:46:56Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -18,11 +18,11 @@ the blaze version instead.
 
 ## Why one toolchain, and why blaze's
 
-blaze compiles your code itself (Cranelift or LLVM, from rust-analyzer's MIR) and links it with
-code rustc compiled. The two must agree on how types are laid out, how functions are called,
-what a `TypeId` hashes, the names of symbols, libtest's entry point, the proc-macro bridge and
-what rustc answers about targets. blaze knows those facts for one toolchain, checked by the
-corpus difftest, and that toolchain is the base blaze replaces piece by piece
+blaze compiles your code itself (Cranelift or LLVM, from its front end's MIR), the standard
+library too (from `library/`, below), and must behave as that nightly's rustc would: how types
+are laid out, how functions are called, what a `TypeId` hashes, the names of symbols, libtest's
+entry point, the proc-macro bridge and what rustc answers about targets. blaze knows those facts
+for one toolchain, and that toolchain is the base blaze replaces piece by piece
 ([no-rustc.md](no-rustc.md): cargo, then rustc, then the standard library's build). Following
 each project's pin would mean knowing every release's facts and checking every release; the
 goal is the reverse, no rustc at all. So the toolchain is part of blaze, versioned with it, like
@@ -31,35 +31,52 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`). `blaze toolchain` prints it and where it
-  is; `blaze toolchain --path` prints the directory alone.
-- **Bytes:** the upstream nightly's `rustc`, `cargo` and `rust-std` (the host's, and
-  `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
+  has no command that prints it or where it is (v1's `blaze toolchain` did).
+- **Bytes:** the upstream nightly's `rustc`, `cargo` and the host's `rust-std`, unchanged,
+  from static.rust-lang.org, each checked against the sha256 compiled into blaze
+  (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
-  when rustup already has it (the same bytes). The installer downloads it once;
-  `blaze toolchain --path` prints its directory.
+  when rustup already has it (the same bytes), found with nothing run
+  (`crates/blaze-cargo/src/toolchain.rs`, `found`). The installer downloads it by running
+  `blaze toolchain`, which v2's blaze does not have, and no v2 build downloads it
+  (`toolchain::own::fetch` has no caller): today it must already be in one of those two places,
+  or a build stops with "blaze's toolchain is not installed".
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
-  and a process of blaze's front end with no `BLAZE_LIBRARY` stops with an error naming it
-  rather than looking for a `rust-src` (`crates/project-model/src/sysroot.rs`). Where
+  and the daemon's front end reads the library blaze fetched (`crates/blaze-cargo/src/toolchain/library.rs`,
+  the build's `library` mount) rather than looking for a `rust-src`. Where
   `rust-src` is still installed it is for something that is not blaze: rustc's side of the
   harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
   in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
   which imports `library/` from the nightly's `rust-src` tarball.
-- **Who uses it:** cargo, rustc and the daemon that blaze starts (`CARGO`, `RUSTC`, `RUSTDOC`,
-  `RUSTUP_TOOLCHAIN`, `PATH` for its own processes), whatever they were set to. The user's
-  `cargo`, `rustc` and pins are untouched, and blaze reads none of them.
+- **Who uses it:** the daemon, which runs none of its programs. Its linker takes the C runtime
+  WASI links and the sanitizer runtimes from the toolchain's sysroot
+  (`blaze_link::target::locate`), and blaze answers `rustc --print sysroot` with it. A build
+  script's `RUSTC` and `RUSTDOC` are blaze itself, linked as `rustc` and `rustdoc` in the
+  daemon's `tools` directory (`crates/blaze-engine/src/as_rustc.rs`). The user's `cargo`,
+  `rustc` and pins are untouched, and blaze reads none of them.
 - **What rustc says:** blaze answers every question asked of rustc (`--version`, `-vV`,
-  `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release, whoever
-  asks: cargo through blaze's wrapper, rust-analyzer in process, a build script through blaze's
-  rustc stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
-  `version_check`, `anyhow`'s and `thiserror`'s). No rustc is run to find any of it
+  `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release
+  (`blaze_cargo::answers`): the daemon in process, and a build script through blaze's rustc
+  stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
+  `version_check`, `anyhow`'s and `thiserror`'s) with `blaze check`'s verdict. No rustc is run to find any of it
   ([no-rustc.md](no-rustc.md), step B).
 - **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
   release train as the gate ([The daily bump](#the-daily-bump)).
+
+## The LLVM blaze is built with
+
+Building blaze itself takes one more pinned piece, LLVM: `crates/hir-ty-codegen/llvm.json` names
+its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
+archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flake's
+`blaze-llvm`); outside the shell, `python3 .github/scripts/llvm.py fetch` unpacks the same
+archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
+one. llvm-sys's build script refuses any other prefix with one error before anything links it
+([contributing.md](contributing.md#llvm-for---features-llvm)). The LLVM inside a blaze binary
+is not a toolchain for projects: it builds them with the toolchain above.
 
 ## The daily bump
 
@@ -70,29 +87,27 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
    `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
-   `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, merges
+   `crates/rustc_abi` from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `install.sh`, the server's
-   manifest, `Cargo.toml` and the flake.
+   library](#the-standard-library-library)), and moves the pin in `install.sh`, `Cargo.toml`
+   and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
-   `answers/rustc.json`.
+   `crates/blaze-units/src/stdlib/rustc.json`.
 3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
    which runs the merge gate, and the release train is started on the branch and on
    `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are
    cancelled by the next merge more often than not, and an older one has red that main gained
    since.) The train is
-   what a bump needs beyond the gate: the corpus difftest with `--layouts` and every other
-   harness on four platforms, rustc's borrow-check UI tests in both modes against the new
-   nightly's own verdicts (at its commit, `--min-pass` as the floor) and
-   `blaze` on real projects.
-4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
-   build and with `toolchain/base`'s (the same main commit, the old pin), each against its own
-   `library/`, and counts the functions each refuses. Against main's newest build
-   instead, the first bump counted +1463 that were main's std fixes since the bump's commit. The verdict (`.github/scripts/toolchain_bump_ci.py verdict`):
+   what a bump needs beyond the gate: every harness on four platforms and `blaze` on real
+   projects.
+4. When the train finishes, the verdict (`.github/scripts/toolchain_bump_ci.py verdict`)
+   compares its jobs with `toolchain/base`'s train. (v1's count of the functions the standard
+   library refused, `stdcount.py`, was deleted on 2026-10-30: v2 compiles std's crates as units
+   of the build like any other, and the train's harnesses build them.)
    - **green**: no job or harness red that is green on `toolchain/base`'s train (waited for, or
-     started if there is none; main's newest finished train only if it was cancelled), and no
-     more std refusals than main: `gh pr merge --auto`, so it lands once the gate passes, and
+     started if there is none; main's newest finished train only if it was cancelled):
+     `gh pr merge --auto`, so it lands once the gate passes, and
      the next release of blaze carries the new pin. The gate passed hours before, and GitHub
      acts on auto-merge only when a check finishes after it is set, so the gate's `ci` job runs
      again (seconds). A merge made for GITHUB_TOKEN starts no workflow, so once it merges the
@@ -134,7 +149,7 @@ from crates.io so that a cold build needs no network beyond blaze's store, and s
 paths, which panics and `file!()` show, are the ones `rust-src` gives: blaze names a file of
 it `/rustc/<commit>/library/...` as rustc does, wherever it is on disk.
 
-Where blaze reads it (`crates/blaze-cargo/src/cargo/toolchain/library.rs`): it is known by its
+Where blaze reads it (`crates/blaze-cargo/src/toolchain/library.rs`): it is known by its
 digest, `library/DIGEST` (the sha256 of a line per file, `harness/library.py digest` writes
 it), which is compiled into blaze and is what the store keys the standard library by
 (`library=<digest>` in place of the nightly's commit and `rustc_driver` name). Every process
@@ -203,11 +218,11 @@ Measured 2026-10-27, on the first bump the workflow made.
 
 - A project that pins another toolchain (a stable release, an older nightly, in a
   rust-toolchain file, `rustup override` or `RUSTUP_TOOLCHAIN`) builds with blaze's. The pin is
-  not read: blaze runs nothing to learn what it names. Under `-v`, a rust-toolchain file blaze
-  passes over gets one line: `blaze: <file> is ignored: blaze builds with its own Rust, ...`.
-- `edition` applies as cargo applies it. A workspace member whose `rust-version` is newer than
-  blaze's Rust is one error naming both versions and saying to update blaze (and pin it);
-  `--ignore-rust-version` builds it anyway, as with cargo.
+  not read: blaze runs nothing to learn what it names, and says nothing about the file.
+- `edition` applies as cargo applies it. `rust-version` is read for resolving dependencies
+  (cargo's `incompatible-rust-versions`), but v2 does not yet refuse a member whose
+  `rust-version` is newer than blaze's Rust, as cargo does; `--ignore-rust-version` is taken
+  and changes nothing.
 - Rust keeps building old code, so stable code builds; `#![feature(...)]` code builds too.
 - Code blaze's toolchain cannot build (a nightly feature it removed, a library item newer than
   it) fails with blaze's error. A project that needs another Rust pins another blaze.
@@ -220,7 +235,7 @@ blaze is moving off rustc ([no-rustc.md](no-rustc.md)); the rule is in [AGENTS.m
 blaze's nightly is the definition of the language and the standard library blaze matches while
 rustc is still in the tree: its layouts, ABI, `TypeId`s and answers are what blaze agrees with.
 It is not a rustc blaze maintains. As the no-rustc steps land its pieces go: cargo, then rustc
-with rust-lld and the proc-macro server, then `rust-std`. The standard library's source is
+with rust-lld, then `rust-std`. The standard library's source is
 already blaze's (`library/`, downloaded with blaze's release rather than as the nightly's
 `rust-src`), so what is left then is blaze alone.
 

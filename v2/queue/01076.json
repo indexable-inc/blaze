@@ -1,0 +1,24 @@
+{
+  "id": "01076",
+  "from_lane": "integrate-tooling",
+  "owner": "coordinator",
+  "paths": [
+    "harness/",
+    "docs/harness.md"
+  ],
+  "what": "v2 harnesses for what the v1 harnesses deleted in the tooling pass held (they drove the v1 engine forms: `blaze-engine WS --crate --out --exe/--patch/--socket`, `blaze sync`, `blaze-rustc`, rustc's link line): (1) an edit reaching the program as a fresh build of the edited source does (programs.py, splices.py, farsplices.py, stress.py, worktrees.py, fuzz/edits.py, editloop.py), for when v2 has a live-edit CLI; (2) debuginfo of what blaze built (debuginfo.py: its helpers are now harness/dwarf.py, used by realdebug.py); (3) a runtime bench (runbench.py; benchreport.py keeps v1's last numbers, bench-readme.yaml and bench-bun.yaml lost their Runtime bench steps); (4) borrowck over the apps via `blaze check` (borrowck_apps.py, borrowck_speed.py); (5) wasm32 programs under wasmtime (wasm32.py, allblaze_wasm.py; the train's wasm32 job is removed); (6) the toolchain bump's std check (stdcount.py counted v1's rustc refusals; the bump's verdict now blocks only on train jobs red that are green on base).",
+  "state": "open",
+  "created": "2026-10-30T15:39:32Z",
+  "updated": "2026-10-30T15:39:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:39:32Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

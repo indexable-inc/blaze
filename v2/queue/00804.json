@@ -1,0 +1,24 @@
+{
+  "id": "00804",
+  "from_lane": "fix-items",
+  "owner": "fix-front-ty",
+  "paths": [
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-ty/src/traits.rs"
+  ],
+  "what": "crates/hir-ty/src/lower.rs:353,403 TyLoweringContext store: &'db ExpressionStore -> &'a ExpressionStore, and crates/hir-ty/src/traits.rs:328 where_predicate_must_hold store -> &ExpressionStore. hir lowers a path type anchor / where clause against a store it just built (hir/src/source_analyzer.rs:414,1932,2141: E0597/E0621), which cannot live for 'db; every use of the field takes &ExpressionStore of any lifetime.",
+  "state": "open",
+  "created": "2026-10-30T08:11:57Z",
+  "updated": "2026-10-30T08:11:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:11:57Z",
+      "by": "fix-items",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

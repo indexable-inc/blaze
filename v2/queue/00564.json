@@ -1,0 +1,49 @@
+{
+  "id": "00564",
+  "from_lane": "db-expand",
+  "owner": "coordinator",
+  "paths": [
+    "crates/ide-db/src/lib.rs",
+    "crates/blaze-doc/src/lib.rs",
+    "crates/blaze-engine/src/doctest.rs",
+    "crates/blaze-engine/src/consteval.rs",
+    "crates/blaze-engine/src/borrowck.rs",
+    "crates/blaze-engine/src/lib.rs",
+    "crates/hir-def/src/nameres/tests.rs",
+    "crates/hir-ide/src/test_db.rs",
+    "crates/blaze-items/src/tests/db.rs",
+    "crates/hir-def/src/test_db.rs",
+    "docs/v2/plan.md",
+    "docs/v2/plan/reference/crates.md",
+    "crates/blaze-engine/src",
+    "crates/hir-ty-codegen/v2/tests/db.rs",
+    "crates/blaze-items"
+  ],
+  "what": "## Inputs keyed by content: callers outside base-db (from `db-expand-inputs`)\n\nWhat: every base-db input now carries the `ContentId` of what it is, and its fields are set\nonly through base-db so the ID and the value can't disagree. The salsa setters of `Crate`,\n`FileText` (`text`, `appended_root_module`), `IncludedFile`, `SourceRootInput` and `ProcessEnv`\nare private now, and their builders take a `base_db::InputId` that only base-db can make. Each\ncaller outside base-db that set a field directly must call the base-db function named here:\n\n- `crates/ide-db/src/lib.rs:169-172` (`RootDatabase::set_env`): `krate.set_env(self).to(env)`\n  becomes `krate.set_env(self, env)` (`base_db::Crate::set_env`). The `use salsa::Setter as _`\n  there becomes unused.\n- `crates/blaze-doc/src/lib.rs:203`: `krate.set_cfg_options(db).to(cfg)` becomes\n  `krate.set_cfg_options(db, cfg)` (`base_db::Crate::set_cfg_options`).\n- `crates/blaze-engine/src/doctest.rs:774` and `:1284`: the same change, `set_cfg_options(db, cfg)`.\n- `crates/blaze-engine/src/consteval.rs:91` and `crates/blaze-engine/src/borrowck.rs:112`:\n  `krate.set_cfg_options(&mut db).to(options)` becomes `krate.set_cfg_options(&mut db, options)`.\n- `crates/blaze-engine/src/doctest.rs:1093`: `base_db::Crate::builder(data, extra,\n  workspace.clone(), cfg.clone(), env.clone()).durability(Durability::MEDIUM).new(db)` becomes\n  `base_db::Crate::create(db, data, extra, workspace.clone(), cfg.clone(), env.clone(),\n  Durability::MEDIUM)`. Its root file must already be in a source root (it is: the root is set\n  just above).\n- `crates/blaze-engine/src/lib.rs:4074` (`write_harnesses`): `input.set_appended_root_module(db)\n  .with_durability(Durability::LOW).to(module)` becomes `db.set_appended_root_module(*file,\n  module, Durability::LOW)` (the new `SourceDatabase` method; it does nothing when the module is\n  that already, so the `if` around it can go).\n- `crates/hir-def/src/nameres/tests.rs:878` and `:887` (the parent's): `db.file_text(root)\n  .set_appended_root_module(&mut db).to(Some(\"__blaze_test_harness\"))` becomes\n  `db.set_appended_root_module(root, Some(\"__blaze_test_harness\"), Durability::LOW)`, and `.to(None)`\n  becomes `db.set_appended_root_module(root, None, Durability::LOW)`.\n- `crates/blaze-engine/src/lib.rs:6190` calls `RootDatabase::set_env`: no change once ide-db's is.\n\nReaders don't change: `krate.data(db)`, `env(db)`, `cfg_options(db)`, `extra_data(db)`,\n`workspace_data(db)`, `file_text.text(db)`, `appended_root_module(db)`, `included.bytes(db)`,\n`source_root_input.source_root(db)`, `process_env.vars(db)` keep their signatures.\n\n**Two new required `SourceDatabase` methods**, forwarded to `Files` as the others are. Where:\n`crates/ide-db/src/lib.rs` (`RootDatabase`), `crates/hir-ide/src/test_db.rs`,\n`crates/blaze-items/src/tests/db.rs` (coordinator), `crates/hir-def/src/test_db.rs` (the parent):\n\n```rust\nfn set_appended_root_module(\n    &mut self,\n    file_id: vfs::FileId,\n    module: Option<&'static str>,\n    durability: Durability,\n) {\n    let files = Arc::clone(&self.files);\n    files.set_appended_root_module(self, file_id, module, durability);\n}\n\nfn set_view_root(\n    &mut self,\n    view: base_db::ViewRoot<'_>,\n) -> Result<base_db::ViewChange, base_db::ViewError> {\n    let files = Arc::clone(&self.files);\n    files.set_view_root(self, view)\n}\n```\n\nAlso: a crate's content ID names its root file by path, so `CrateGraphBuilder::set_in_db` and\n`Crate::create` now need the root file in a source root (`file_source_root` and the root's\n`FileSet`) and stop with a panic naming the file otherwise. Every caller found sets the roots\nfirst (`FileChange::apply`, load-cargo, test-fixture, blaze-wasm, the doctest crates).\n\nWhy: docs/v2/plan.md section 2 and docs/v2/plan/reference/crates.md \"IDs\": results keyed by input hashes,\nnever by revision, so views with equal inputs share them; a setter that changes a value without\nits ID would let a stale result be reused.\n\n> applied: `crates/ide-db/src/lib.rs`: `RootDatabase::set_env` calls `krate.set_env(self, env)` (the `salsa::Setter` import is gone); `RootDatabase` and hir-ide's `TestDB` forward `set_appended_root_module` and `set_view_root` to `Files`. hir-def's tests (lines 878, 887) already call `db.set_appended_root_module`.\n> forwarded to codegen: `crates/blaze-engine/src/{doctest.rs,consteval.rs,borrowck.rs,lib.rs}`'s setter calls, and `crates/hir-ty-codegen/v2/tests/db.rs`, which lacks both new methods.\n> forwarded to items: `crates/blaze-items/src/tests/db.rs` is items' (`crates/blaze-items/`), not the coordinator's; it lacks both new methods.\n> applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` forwards `set_appended_root_module` and `set_view_root` to `Files`, as hir-ide's `TestDB` does.\n> forwarded to coordinator: `crates/blaze-doc/src/lib.rs:203` (blaze-doc is the coordinator's, not among the paths `requests` applies).",
+  "state": "refused",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T08:37:49Z",
+  "taken_by": "coord-apply-front",
+  "why": "already done: crates/blaze-doc/src/lib.rs:202 calls krate.set_cfg_options(db, cfg) (base-db input.rs:770); ide-db set_env calls krate.set_env(self, env); no old `.set_cfg_options(db).to`, `.set_appended_root_module(db)` or outside `Crate::builder(` call is left in crates/ (blaze-engine included). The per-test-DB forwarding methods no longer exist since the database is the concrete base_db::Db.",
+  "source": "v2/requests/db-expand.md#Inputs keyed by content: callers outside base-db (from `db-expand-inputs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:91"
+    },
+    {
+      "at": "2026-10-30T08:37:49Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:37:49Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done: crates/blaze-doc/src/lib.rs:202 calls krate.set_cfg_options(db, cfg) (base-db input.rs:770); ide-db set_env calls krate.set_env(self, env); no old `.set_cfg_options(db).to`, `.set_appended_root_module(db)` or outside `Crate::builder(` call is left in crates/ (blaze-engine included). The per-test-DB forwarding methods no longer exist since the database is the concrete base_db::Db."
+    }
+  ]
+}

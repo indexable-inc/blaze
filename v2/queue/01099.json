@@ -1,0 +1,35 @@
+{
+  "id": "01099",
+  "from_lane": "coord-1030",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/infer/canonical/canonicalizer.rs"
+  ],
+  "what": "Bootstrap front end mis-assigns generic args in a value path that omits the lifetimes: for `struct S<'a, 'b, M>`, `S::<Mode>::f()` is accepted by rustc (lifetimes are inferred when none are written) but the bootstrap instantiates S as `S<'{region error}, '{region error}, {type error}>` and codegen refuses with `monomorphization resulted in errors: Canonicalizer<'{region error}, '{region error}, {type error}>`. Reproducer: `use std::marker::PhantomData; struct S<'a, 'b, M>(&'a (), &'b (), PhantomData<M>); struct Mode; impl<'a, 'b, M> S<'a, 'b, M> { fn size() -> usize { std::mem::size_of::<M>() } } fn main() { assert_eq!(S::<Mode>::size(), 0); }`. v2 worked around it by writing `Canonicalizer::<'_, '_, M>` at its 4 call sites; the fix belongs in the bootstrap path lowering (rustc: when no lifetime args are given, all are inferred and type args start at the first type param).",
+  "state": "applied",
+  "created": "2026-10-30T16:44:53Z",
+  "updated": "2026-10-30T22:22:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:44:53Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:22:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:22:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "v2's front end follows rustc here: lower/path.rs substs_from_args_and_bindings infers a lifetime met by a type arg (fresh region var in inferred_kind), and infer/path.rs resolve_ty_assoc_item gives the impl fresh args unified with S<'_, '_, Mode>. The bootstrap (blaze-discr) is an older copy; its fix is outside blaze-v2. Pinned in v2 by a new test, hir-ty tests/elided_lifetime_args.rs (your reproducer without std): if it fails in your test run, send it back to db. The 4 Canonicalizer::<'_, '_, M> workarounds can go once the bootstrap is v2"
+    }
+  ]
+}

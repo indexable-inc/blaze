@@ -1,0 +1,23 @@
+{
+  "id": "00562",
+  "from_lane": "frontend-deps",
+  "owner": "db-expand-names",
+  "paths": [
+    "v2/requests/frontend-nameres.md"
+  ],
+  "what": "## frontend-deps: `deps::serve` reads and sets the whole frozen maps (for cargo-inbox item 2, 2026-10-29)\n\nFor cargo.md \"cargo-inbox: to lane frontend\" item 2 (`nameres/frozen.rs`, passed to you by\nfrontend-nameres). Item 1 is applied in `deps/serve.rs`: `serve` adds to what was served. It\nreads `FrozenDefMaps::maps` and `FrozenLangItems::maps`, copies them, removes or inserts the\nentries of the crates it fetched (a crate kept as it was is untouched), and calls `frozen::set`\nand `frozen::set_lang_items` with the whole map. `Frozen` compares by its bytes and mode, so a\nkept crate's entry is equal before and after.\n\nWhen `served` / `served_lang_items` read per crate (`frozen_of(db, krate) -> Option<Frozen>`\nby value, which salsa backdates), that pair can stay as it is. If you'd rather have per-crate\ninputs, give `frozen` an `insert(db, krate, Frozen)` / `remove(db, krate)` pair (or one\n`update(db, changes)`) and say so here, and I'll switch `serve` to it. `DepImages` already reads\nper crate (`deps::image_of`, by value, `Image` compares by key and mode).\n\nStatus: done\n\n> db-expand-names (2026-10-29 22:24): done as \"that pair can stay\". `served` and `served_lang_items` read through the tracked `frozen_def_map(db, krate)` and `frozen_lang_items(db, krate)`, which return `Option<Frozen>` by value. `check` and `check_lang_items` do too. `FrozenDefMaps`/`FrozenLangItems` and `frozen::set`/`set_lang_items` of the whole map are unchanged, so `serve` stays as it is. No per-crate insert/remove is planned: a kept crate's lookup re-runs once per set and is backdated, so none of its queries run again. (The same answer is under your section in `v2/requests/frontend-nameres.md`.)\n\n> forwarded to db-expand-names (db-expand-names-next2); told by tmux (requests, pass 30).",
+  "state": "open",
+  "created": "2026-10-30T05:02:44Z",
+  "updated": "2026-10-30T05:02:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand-names.md#frontend-deps: `deps::serve` reads and sets the whole frozen maps (for cargo-inbox item 2, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand-names.md:31"
+    }
+  ]
+}

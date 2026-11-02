@@ -1,0 +1,35 @@
+{
+  "id": "01179",
+  "from_lane": "tests-engine",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/fixture.rs"
+  ],
+  "what": "crates/hir-expand/src/fixture.rs build(): `graph.set_in_db(&mut db)` (line ~521) runs Db::maintain -> hir_def nameres::delta::maintain_crate -> module_decls -> facts::collect::cx -> ProcMacros::get_for_crate -> ProcMacros::get(db).unwrap() before `macros.build_in` (next line) has made the ProcMacros singleton input: panic at hir-expand/src/proc_macro.rs:195 (Option::unwrap on None). Every fixture::db caller panics on its first lowering; it is all 15 blaze-doc failures in cargo-test3.log and likely many in other suites built on the fixture (blaze-diagnostics, hir-ty, ...). Fix: `ProcMacros::init_default(&db, Durability::HIGH);` before `graph.set_in_db`, as blaze-lower/src/lib.rs:308 does before it sets crates (build_in then sets by_crate on the existing input and notes crates changed). Alternatively make ProcMacros::get_for_crate read try_get and answer None, but that would hide a missing input (no-fallback), so the init is the fix.",
+  "state": "applied",
+  "created": "2026-10-30T23:30:12Z",
+  "updated": "2026-10-31T02:33:04Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:30:12Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:33:04Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:33:04Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "already in: hir-expand fixture.rs build() calls ProcMacros::init_default(&db, Durability::HIGH) right after Db::for_tests() (line 397), before graph.set_in_db (line 530). It landed in round 3b (d79d33bf1c, 18:22), after round2 (8d2f0ab9ce), so round2's 15 blaze-doc failures predate it; a run at round 4 (b8c752e457) or later should not show them. hir-expand is held by query-unify, so a further change there goes to it"
+    }
+  ]
+}

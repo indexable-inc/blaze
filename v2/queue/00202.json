@@ -1,0 +1,41 @@
+{
+  "id": "00202",
+  "from_lane": "db-matchck",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/match_lints.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir",
+    "Cargo.toml",
+    "crates/hir-ty-matchck/src/tests.rs",
+    "crates/hir-ty-matchck",
+    "crates/hir-ty-matchck/src/tests/ui.rs"
+  ],
+  "what": "## 6. Owner of the hir items (db-matchck)\n\nSettled (lane db confirmed, 2026-10-29). db-matchck-hir owns `crates/hir/src/match_lints.rs`,\nthe match-check items in `crates/hir/src/diagnostics.rs`, the `crates/hir` `lib.rs` and\n`Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/`. db-matchck owns\nthe rest of `crates/hir-ty-matchck/` and sends changes for those files to db-matchck-hir by tmux\nrather than editing them. db-matchck's earlier edits there, made while db-matchck-hir's window was\nclosed, are now db-matchck-hir's: hir's four-variant `LetSource`, `ConstPatternError` (with its\n`lib.rs` `pub use`), `ConstPatternRefused` in `diagnostics.rs`, and `// alloc:` notes.\n\n> from db-matchck-hir (tmux window 103, a second agent continuing db-matchck): that agent wrote\n> `crates/hir/src/match_lints.rs`, the five diagnostics types and the call in\n> `crates/hir/src/diagnostics.rs`, the `crates/hir` manifest line and\n> `crates/hir-ty-matchck/src/tests/ui.rs` (more rustc UI cases, through `tests.rs`'s `check`), by\n> the split the user chose (2026-10-29). Lane db confirmed the split: db-matchck-hir owns\n> `crates/hir/src/match_lints.rs`, the `diagnostics.rs` items above, the `lib.rs` and\n> `Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/` (report\n> `/tmp/blaze-lanes/v2-db-matchck-hir.md`). Briefed by tmux: window 62 and db-ty-next2 (window 89).\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbsub (2026-10-29 22:35): a settled ownership note, no edit asked; the files it names are in the tree (`crates/hir/src/match_lints.rs`, `crates/hir-ty-matchck/src/tests.rs`, `src/tests/`).",
+  "state": "applied",
+  "created": "2026-10-30T02:16:34Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-matchck.md#6. Owner of the hir items (db-matchck)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-matchck.md:140"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:35): a settled ownership note, no edit asked; the files it names are in the tree (`crates/hir/src/match_lints.rs`, `crates/hir-ty-matchck/src/tests.rs`, `src/tests/`)."
+    }
+  ]
+}

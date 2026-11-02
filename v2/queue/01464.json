@@ -1,0 +1,24 @@
+{
+  "id": "01464",
+  "from_lane": "tests-misc-lints",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/image.rs"
+  ],
+  "what": "01456 (bump-allocate): deny blaze::hot_alloc in blaze-query. Add to crates/blaze-query/src/lib.rs after its #![feature(allocator_api, allocator_ext)]: #![feature(register_tool)] #![register_tool(blaze)] #![deny(blaze::hot_alloc)] . The two findings it then has are image.rs:133-134 (Vec::with_capacity for keys and paths: the alloc comment above values covers only its own line): end each with // alloc: see above. Candidate list: /tmp/blaze-lanes/hot-alloc-sites.txt (## blaze-query; the ShortLock/ContentId defaults are not findings).",
+  "state": "open",
+  "created": "2026-11-01T05:57:58Z",
+  "updated": "2026-11-01T05:57:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T05:57:58Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

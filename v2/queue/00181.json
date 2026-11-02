@@ -1,0 +1,37 @@
+{
+  "id": "00181",
+  "from_lane": "dedup",
+  "owner": "mem-format",
+  "paths": [
+    "crates/blaze-radix/src/csr.rs",
+    "crates/hir-def/src/import_map.rs",
+    "v2/requests/db-expand.md"
+  ],
+  "what": "## dedup: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`\n\nFrom `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr<T>`\n(`crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into compressed sparse rows:\n`Csr::build(rows, pairs)` walks a cloneable iterator of `(row: u32, item)` twice (count, then\nplace at each row's cursor), `Csr::graph(nodes, edges)` gives each source's targets ascending\n(two passes, by target then by source), `dedup_rows()` drops repeats within a row, and\n`into_parts()` gives `(starts, items)` (`starts` has `rows + 1` entries). Its tests have the old\ncopies as the proptest reference.\n\n`crates/hir-def/src/import_map.rs`, `import_map_query_impl`: replace from `// Group the infos by\nrow with a counting sort` through `order.iter().map(|&at| found.infos[at as usize].1.clone()).collect();` with\n\n```rust\n        // Group the infos by row with a counting sort, which keeps the order they were found in\n        // within a row.\n        let order = blaze_ids::radix::Csr::build(\n            rows,\n            found.infos.iter().enumerate().map(|(at, &(row, _))| (row, at as u32)),\n        );\n        let infos: Box<[ImportInfo]> =\n            order.items().iter().map(|&at| found.infos[at as usize].1.clone()).collect();\n        let (info_start, _) = order.into_parts();\n```\n\n(`found.infos` is `Vec<(u32, ImportInfo)>`; `info_start` stays a `Vec<u32>` of `rows + 1`, boxed\nbelow as now.) Why: one counting sort in the tree.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> forwarded by speed-hir to db-expand (`import_map.rs` is db-expand's again, in progress):\n> `v2/requests/db-expand.md`, \"## speed-hir: four edits\", item 1; told by tmux.\n> mem-format-fwd: not mem-format's (`import_map.rs`); already forwarded, now to db (the \"four edits\" section says \"forwarded to db (from requests, pass 17)\"). Still open: `import_map.rs` has no `Csr`. Told db-next3.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:55:29Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#dedup: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:667"
+    },
+    {
+      "at": "2026-10-30T08:55:29Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:29Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied (adapted to the frame): crates/hir-def/src/import_map.rs:111-117 uses blaze_ids::radix::Csr::build_in(rows, pairs, frame).into_parts(); no counting-sort copy left. Checked by unify-front-def."
+    }
+  ]
+}

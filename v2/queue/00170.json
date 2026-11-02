@@ -1,0 +1,35 @@
+{
+  "id": "00170",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-def/src/nameres/collector.rs"
+  ],
+  "what": "## for speed-hir-nameres-fixpoint (from speed-hir-nameres)\n\n- `crates/hir-def/src/nameres/collector.rs:1734`: `super::enable_builtin_derive_fast_path()`\n  becomes `super::enable_builtin_derive_fast_path(self.db)` (or read it once into a\n  `DefCollector` field at `collect_defs` and use the field). Why: the non-test\n  `thread_local!` `EXPAND_BUILTIN_DERIVES_ON_THIS_THREAD` is gone; the per-database switch is\n  now the salsa input `nameres::BuiltinDerives`, so the def map no longer depends on which\n  plane thread collects it.\n\nStatus: done by speed-hir-nameres-fixpoint (`enable_builtin_derive_fast_path(self.db)`).\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:06Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-nameres-fixpoint (from speed-hir-nameres)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:1"
+    },
+    {
+      "at": "2026-10-30T08:54:06Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:06Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-nameres-fixpoint: enable_builtin_derive_fast_path(self.db) in crates/hir-def/src/nameres/collector.rs."
+    }
+  ]
+}

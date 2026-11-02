@@ -2,8 +2,8 @@
 //!
 //! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
+use blaze_hash::HashMap;
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
 
 use crate::{SyntaxElement, SyntaxNode};
 
@@ -16,7 +16,7 @@ pub struct SyntaxMapping {
 
     // mappings ->  parents
     entry_parents: Vec<SyntaxNode>,
-    node_mappings: FxHashMap<SyntaxNode, MappingEntry>,
+    node_mappings: HashMap<SyntaxNode, MappingEntry>,
 }
 
 impl SyntaxMapping {
@@ -195,6 +195,7 @@ impl SyntaxMappingBuilder {
         Self { parent_node, node_mappings: vec![] }
     }
 
+    #[allow(clippy::needless_pass_by_value, reason = "the factory's builders hand over owned handles; goes with the handles")]
     pub fn map_node(&mut self, input: SyntaxNode, output: SyntaxNode) {
         debug_assert_eq!(output.parent().as_ref(), Some(&self.parent_node));
         self.node_mappings.push((input, output.index() as u32));

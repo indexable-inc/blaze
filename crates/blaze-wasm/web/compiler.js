@@ -42,9 +42,12 @@ export class Compiler {
     }
   }
 
-  // Where in the module the pack is linked into the program may put its functions and data.
+  // Where in the memory and table of the module the program lives in it may put its
+  // functions and data.
   setStart(tableStart, memoryStart) {
-    this.blaze.blaze_set_start(tableStart, memoryStart);
+    if (!this.blaze.blaze_set_start(tableStart, memoryStart)) {
+      throw new Error(this.report());
+    }
   }
 
   analyze() {

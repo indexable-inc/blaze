@@ -1,0 +1,29 @@
+{
+  "id": "00778",
+  "from_lane": "diagnostics-constcheck",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "## <a id=\"dcc-3\"></a>DCC3. To db (`crates/hir/src/diagnostics.rs`): the node `LiveDrop` drops at\n\nWhat: `ConstCheckError` gets `dropped_at: Option<InFile<SyntaxNodePtr>>`, `LiveDrop`'s\n`dropped_at` (a `MirSpan`) mapped with the body's source map as `node` is, `None` for every\nother kind.\n\nWhy: rustc's `LiveDrop` (E0493) labels it \"value is dropped here\". No `LiveDrop` is reported\nyet (the qualifs, `codegen-rq-mir-constcheck-qualifs`), so this is needed when they are.",
+  "state": "refused",
+  "created": "2026-10-30T07:23:53Z",
+  "updated": "2026-10-30T08:41:23Z",
+  "taken_by": null,
+  "why": "addressed to lane db (db-next8, live), which owns crates/hir/src/diagnostics.rs and the const-check lowering; db applies it.",
+  "source": "v2/requests/diagnostics-constcheck.md#<a id=\"dcc-3\"></a>DCC3. To db (`crates/hir/src/diagnostics.rs`): the node `LiveDrop` drops at",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-constcheck.md:39"
+    },
+    {
+      "at": "2026-10-30T08:41:23Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "addressed to lane db (db-next8, live), which owns crates/hir/src/diagnostics.rs and the const-check lowering; db applies it."
+    }
+  ]
+}

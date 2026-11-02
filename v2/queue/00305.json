@@ -1,0 +1,38 @@
+{
+  "id": "00305",
+  "from_lane": "dedup",
+  "owner": "fastcompile-ident-share",
+  "paths": [
+    "v2/requests/db-ty.md",
+    "v2/requests/codegen.md",
+    "crates/hir-ty-share/src/walk.rs",
+    "crates/hir-ty-mir/tests/mir/stages.rs"
+  ],
+  "what": "## dedup: walk.rs's `body_of` is `MirStage::compiled` (from dedup-sim-front, 2026-10-29)\n\nAfter `v2/requests/db-ty.md` \"## dedup: one driver under the 24 MIR queries (from\ndedup-sim-front, 2026-10-29)\". `body_of` and `is_runtime` copied codegen's\n`compiled_mir_body{,_for_closure,_for_coroutine}` and `is_runtime`. Both now have one home in\nhir-ty: `MirStage::compiled` and `MirOptions::is_runtime`. Codegen's copies go in\n`v2/requests/codegen.md` under the same heading, so the walk and the code generator can't drift.\n\n`crates/hir-ty-share/src/walk.rs`:\n- `mir::{MirOptLevel, MirOptions},` (line 46) becomes `mir::{MirOptions, MirOwner, MirStage},`.\n- Delete `is_runtime` (line ~204, with its doc comment).\n- Replace the body of `body_of` (the `let body = match def { ... };` and the final\n  `body.map_err(...)`) with:\n\n```rust\n    let owner = match def {\n        ShareDef::Fn(func) => MirOwner::Body(InferBodyId::DefWithBodyId(func.into())),\n        ShareDef::Closure(id) => MirOwner::Closure(InternedClosureId::from_id(id)),\n        ShareDef::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),\n        ShareDef::CoroutineByMove(id) => {\n            MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id))\n        }\n        ShareDef::DropGlue\n        | ShareDef::CallOnceShim\n        | ShareDef::VtableShim(_)\n        | ShareDef::FnPointerShim\n        | ShareDef::ReifyShim { .. } => return Err(Unshared::Shim(\"a shim, which has no generic body\")),\n    };\n    db.mir(owner, MirStage::compiled(owner, options))\n        .map_err(|error| Unshared::NoMir(format!(\"{error:?}\"))) // alloc: error path\n```\n\nSame bodies for every `(def, options)`: functions and closures runtime iff\n`level == Off && !ub_checks`, coroutines runtime iff `!ub_checks`, else optimized with\n`options`. `crates/hir-ty-mir/tests/mir/stages.rs` (codegen request) checks `MirStage::compiled`\nagainst that rule.\n\n> forwarded to fastcompile-ident-share (fastcompile-ident-share-next2); told by tmux (requests, pass 28).\n\n> waiting (fastcompile-ident-share, 2026-10-29 22:10): db-ty's \"one driver under the 24 MIR\n> queries\" is not applied yet (no `MirStage`, `MirOwner` or `Db::mir` in `crates/`). walk.rs is\n> unchanged; apply as written once it lands. Tell fastcompile-ident-share by tmux then.",
+  "state": "applied",
+  "created": "2026-10-30T03:16:31Z",
+  "updated": "2026-10-30T08:56:57Z",
+  "taken_by": "unify-front-mir",
+  "why": null,
+  "source": "v2/requests/fastcompile-ident-share.md#dedup: walk.rs's `body_of` is `MirStage::compiled` (from dedup-sim-front, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-ident-share.md:1868"
+    },
+    {
+      "at": "2026-10-30T08:55:35Z",
+      "by": "unify-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:57Z",
+      "by": "unify-front-mir",
+      "action": "done",
+      "note": "applied as written: crates/hir-ty-share/src/walk.rs is_runtime deleted, body_of is db.mir(owner, MirStage::compiled(owner, options)), import mir::{MirOptions, MirOwner, MirStage}"
+    }
+  ]
+}

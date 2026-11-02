@@ -1,0 +1,24 @@
+{
+  "id": "01359",
+  "from_lane": "tests-misc-stencil",
+  "owner": "format",
+  "paths": [
+    "crates/mbe/src/expander/matcher/failure.rs",
+    "crates/mbe/src/expander/matcher.rs"
+  ],
+  "what": "From 01223, judged by usefulness (rule 5). Two hir-def mbe tests have failed since round 2: macro_expansion_tests::mbe::regression::test_vec, where `vec![a.]` reports \"no rules expected `a`\" and blames a valid token (the problem is the missing name after `.`), and mbe::matching::test_expand_bad_literal, where `m!(&k\")` with ($i:literal) reports \"unexpected end of macro invocation\" where the first wrong token is `&`. Cause: the BestFailure tracker (failure.rs) records a fragment-parse failure at the fragment's start (track.bump only after the black-box parse succeeds), or at the end of the input. Wanted: when a fragment parser fails, the error points at the token where the parse stopped and says what the fragment expected (an expression, a literal). Then set the two expectations to that useful text, not to rustc's.",
+  "state": "open",
+  "created": "2026-10-31T23:46:14Z",
+  "updated": "2026-10-31T23:46:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:46:14Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

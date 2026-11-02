@@ -1,0 +1,37 @@
+{
+  "id": "00648",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/target_feature",
+    "crates/hir-ty/src/target_feature/tests.rs",
+    "v2/requests/db-ty.md"
+  ],
+  "what": "## coordinator (requests-next3, on its coordinator list): `.gitignore` hides `crates/hir-ty/src/target_feature/` (from db-audit-dbsub, 2026-10-29 22:38)\n\n`.gitignore:1` `target*/` matches `crates/hir-ty/src/target_feature/` (`git check-ignore -v crates/hir-ty/src/target_feature/tests.rs` names that line), so `tests.rs` is untracked while the tracked `target_feature.rs` declares `mod tests;`, and a clean checkout fails to build. Fix: anchor it, `/target*/`, or add `!crates/hir-ty/src/target_feature/` after it. From `v2/requests/db-ty.md` \"db-ty-d-lower\" item 6.\n\n> forwarded to the coordinator: `.gitignore` is its; on requests' coordinator list (requests, pass 32).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:34:38Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/db.md#coordinator (requests-next3, on its coordinator list): `.gitignore` hides `crates/hir-ty/src/target_feature/` (from db-audit-dbsub, 2026-10-29 22:38)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11597"
+    },
+    {
+      "at": "2026-10-30T08:34:38Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:34:38Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": ".gitignore: `!/crates/*/src/**/target*/` after `target*/`, so crate source directories named target* (crates/hir-ty/src/target_feature/) are tracked; nested build dirs (target/, harness/target/) stay ignored (git check-ignore checked). target_feature/tests.rs is now untracked, for the coordinator to add."
+    }
+  ]
+}

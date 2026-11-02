@@ -1,0 +1,36 @@
+{
+  "id": "00077",
+  "from_lane": "db-ty-db",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/mir.rs",
+    "v2/requests/items.md"
+  ],
+  "what": "## 7. db-ty (`crates/hir-ty/src/mir.rs`), optional\n\n`VTableMap::types(&self) -> &[Ty<'db>]` (its `id_to_ty`) would let `hir_ty::vtable_types`\n(`lib.rs`) and `blaze-items` (`form.rs`, `facts.rs`) stop probing ids up from 0 to find the\nfirst, which is `VTableMap::OFFSET`. `vtable_types` now probes once per process and caches the\nfirst id in an atomic, but a slice would also make hashing and writing one pass instead of two\nlookups per type.\n\n> forwarded to db: `crates/hir-ty/src/mir.rs` is lane db's (db-ty); the same accessor items-form asked for (`v2/requests/items.md`, `VTableMap::tys`).\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/mir.rs:2172` (`VTableMap::tys`, an `ExactSizeIterator` over `id_to_ty`, with `FIRST_ID` at :2155), items-form's form of the same accessor.",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#7. db-ty (`crates/hir-ty/src/mir.rs`), optional",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:105"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/mir.rs:2172` (`VTableMap::tys`, an `ExactSizeIterator` over `id_to_ty`, with `FIRST_ID` at :2155), items-form's form of the same accessor."
+    }
+  ]
+}

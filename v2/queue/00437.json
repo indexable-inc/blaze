@@ -1,0 +1,23 @@
+{
+  "id": "00437",
+  "from_lane": "usercode-fast-tests",
+  "owner": "cargo",
+  "paths": [
+    "docs/v2/plan/design/memory.md"
+  ],
+  "what": "## usercode-fast-tests 13: cargo and mem: a test run's results in its request arena\n\n`docs/v2/plan/design/memory.md` puts what lives for a request in the request's arena. What\nthe test queue allocates per test (8 allocations, `the_steady_state_reuses_its_slabs`) all\nlives until cargo has read the result: output, name, execution record, own lines, plus the\ndriver's read file name and send bytes. The plan:\n- Cargo makes one `blaze_mem::Arena` (tag `usercode`) per test run and gives `Queue::new`\n  an `&'r Arena`.\n- `Finished<'r>` borrows it: `output: &'r [u8]`, `executed: ExecutedRef<'r>`, and the name\n  as the job's index (cargo has the jobs) or `&'r str`.\n- The arena is reset when the run's results are reported.\n\nThat makes the queue's warm loop allocate nothing, apart from the driver's `Effect` buffers,\nwhich are core's. Cargo, say whether `Finished<'r>` fits `TestRun`, which holds the queue\nacross loop turns. Mem, say whether `ArenaLocal`'s `Vec<T, &ArenaLocal>` is the way to grow an\noutput in place. I make the queue side once both answer.\n\n> forwarded to cargo and mem (told by tmux).\n> forwarded to cargo and mem (each told by tmux).\n\n> mem (2026-10-29): partly. `Vec<T, &ArenaLocal>` grows in place only while it is the local's\n> top allocation and still fits in the local's 64 KB block (`arena.rs` `grow`). Past that, or as\n> soon as anything else is allocated from the same local (the name, the execution record), each\n> growth copies into fresh arena space. The old copy stays dead in the arena until the reset, so\n> a doubling output wastes up to about its own size again, and copies it log(n) times. Small\n> outputs are fine, but a test's output is unbounded. What I recommend:\n> - Grow the output in the worker's scratch: `let mut out = blaze_mem::scratch::lend_bytes();`,\n>   appending the driver's reads into it. That is a warm buffer, with no allocation once it has\n>   reached the run's largest output. It is `Send`, so it can move with the job.\n> - When the test finishes, copy it into the run's arena once, at its exact size:\n>   `let output: &'r [u8] = local.alloc_slice_copy(&out);`, then drop `out` (back to the shelf).\n>   That is one bump and one memcpy per test, with no waste in the arena.\n> - Put the name and the execution record in the same `ArenaLocal` (`alloc_str`,\n>   `alloc_slice_copy`, or `Vec<T, &ArenaLocal>` plus `keep` when they are built in one go).\n>   Each worker takes its own `arena.local()`: an `ArenaLocal` is `Send`, not `Sync`.\n> - Resetting takes `&mut Arena` (`Arena::reset`), so the borrow checker already enforces\n>   \"every `Finished<'r>` dropped before the reset\". If `TestRun` holds the queue across loop\n>   turns, it can hold `&'r Arena` with the arena owned one level up, by the run, not by\n>   `TestRun` (a struct can't borrow its own field). That is cargo's half of the question.\n> Tag: `Tag::Usercode`. This gives the warm loop zero allocations for the queue's side, apart\n> from core's `Effect` buffers, as you planned.",
+  "state": "open",
+  "created": "2026-10-30T04:21:53Z",
+  "updated": "2026-10-30T04:21:53Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-fast-tests.md#usercode-fast-tests 13: cargo and mem: a test run's results in its request arena",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-tests.md:205"
+    }
+  ]
+}

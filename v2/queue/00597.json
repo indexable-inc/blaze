@@ -1,0 +1,21 @@
+{
+  "id": "00597",
+  "from_lane": "diagnostics-infer2-solver",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## diagnostics-infer2-solver: which written bound a `bound_index` is (owner: db-ty)\n\n`ObligationCauseCode::WhereClauseInExpr { item, bound_index, .. }` counts `item`'s predicates\n(parents first, implied trait predicate, then the assoc-type bounds) but nothing maps that index\nback to the bound's syntax. rustc puts \"required by a bound in `f`\" on the bound\n(`note_obligation_cause_code`, `WhereClauseInExpr`) and says \"an implicit `Sized`\" with \"the\nimplicit `Sized` requirement on this type parameter\" when the bound is a parameter's implicit\n`Sized`. `obligation_cause.rs` now finds the bound again by its trait in a function's syntax\n(nothing when it writes two bounds of the trait), and for any other item, or a goal that is not\na trait's, puts the note on the item's head. Asked: a source map from `(GenericDef,\nbound_index)` to `enum BoundSource { Written(InFile<AstPtr<ast::TypeBound>>), WherePredicate(..),\nImplicitSized(TypeParam), ImpliedTrait }`, or the bound's `TextRange` with its kind.\n\nThe same for `UnimplementedTrait::parent_impls`: the index of the impl's predicate the step\nwent through, so \"unsatisfied trait bound introduced here\" is on that bound (now: the one bound\nof the child's trait in the impl's syntax, nothing when there are two).\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T05:33:30Z",
+  "updated": "2026-10-30T05:33:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-infer2-solver.md#diagnostics-infer2-solver: which written bound a `bound_index` is (owner: db-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-infer2-solver.md:39"
+    }
+  ]
+}

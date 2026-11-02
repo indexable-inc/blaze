@@ -1,0 +1,35 @@
+{
+  "id": "00301",
+  "from_lane": "mem-db-checks",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/loans.rs"
+  ],
+  "what": "## S. Per-call buffers, reused\n\nThe hit paths (a memo read: `borrowck`, `wfcheck`, `inferred_outlives` through\n`Inferred::of`, `gate::checked` on a passing body) make no buffer: they read the memo in\nplace (T1, T2 check it). The buffers made per call inside a run, each now made once per run\nand cleared per use:\n\n| where | per | now |\n|---|---|---|\n| `loans.rs` `out_of_scope` (844-882) | loan: a bitset of all blocks, a work list, a `SmallVec` of ends | one `ScopeWalk` per body, cleared by the blocks entered (B5.2) |\n| `loans.rs` two-phase scan (596) | point: `let mut used = Vec::new()` | one `used`, cleared per point (B5.2) |\n| `loans.rs` `borrows_rejected` (496) | promoted local: `vec![expr]` | one stack, cleared per call (B5.2) |\n| `loans.rs` `const_promotable` (422-458) | aggregate: a copy of its children | iterators, nothing (B5.2) |\n| `qualifs.rs` `value` (124) | record literal: its fields | an iterator, nothing (B5.8) |\n| `intervals.rs` `insert_new` | walk step: a `SmallVec` of runs | the caller's buffer (B2.5, B5.4) |\n| `intervals.rs` `union`, `subtract` | call: a merged copy | `scratch::with_u64s`, copied back only when changed (B2.5) |\n| `liveness.rs` `alias_bound` (856) | alias: its bounds | the frame (B5.1) |\n| `inference.rs` `strongly_connected` | body: vectors grown by doubling | frame arrays at their final size (B5.5) |\n| `constraints.rs` `of_sup` | rebuild: a new graph | the last graph's arrays (B5.6) |\n| wfcheck `function` (320-355) | input: `&mut Vec::new()`, `found` | one `dropped`, one `found` (W1) |\n| wfcheck `opaques`, `trait_opaques` (405, 450) | opaque: `found` | one, cleared per opaque (W1) |\n| wfcheck `resolve` (627-667) | need: a message before the duplicate test | made only when new (W1) |\n| wfcheck `needs_since` (479-491) | normalization: two vectors and a map | the frame (W2) |\n| wfcheck `region_outlives` (854) | call: two `SmallVec`s, heap past eight | one frame vector at the top, freed in place (W2) |\n| wfcheck `variants`, compare `own`/`synthetic`/`hybrid` | call: a `SmallVec` | iterators (W2, W3) |\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-mem (22:33): a table of the B2/B5/W rows, each applied with its section; e.g. `ScopeWalk` at crates/hir-ty-borrowck/src/loans.rs:772.",
+  "state": "applied",
+  "created": "2026-10-30T03:15:09Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks.md#S. Per-call buffers, reused",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks.md:3355"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:33): a table of the B2/B5/W rows, each applied with its section; e.g. `ScopeWalk` at crates/hir-ty-borrowck/src/loans.rs:772."
+    }
+  ]
+}

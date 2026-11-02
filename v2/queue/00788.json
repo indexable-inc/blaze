@@ -1,0 +1,35 @@
+{
+  "id": "00788",
+  "from_lane": "fix-diag",
+  "owner": "fix-items",
+  "paths": [
+    "crates/hir/src/semantics/view/analyze.rs"
+  ],
+  "what": "Add `pub fn expr_adjustments(&self, expr: ast::Expr<'db>) -> Option<&'db [hir_ty::Adjustment]>` to hir::view::Semantics (crates/hir/src/semantics/view/analyze.rs), forwarding to `self.analyze(expr.syntax())?.expr_adjustments_view(expr)` (crates/hir/src/source_analyzer/view.rs:187, already exists pub(crate)). The handle Semantics had expr_adjustments; the view one lacks it, so crates/blaze-diagnostics/src/lints/names/dead/mark.rs:761 fails (E0599). Zero-copy slice, no Vec: mark.rs only checks for an Adjust::Deref. fix-diag already switched mark.rs to match `hir_ty::Adjust::Deref(_)` on the slice.",
+  "state": "applied",
+  "created": "2026-10-30T07:58:06Z",
+  "updated": "2026-10-30T08:50:30Z",
+  "taken_by": "fix-items",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:58:06Z",
+      "by": "fix-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:50:10Z",
+      "by": "fix-items",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:50:30Z",
+      "by": "fix-items",
+      "action": "done",
+      "note": "crates/hir/src/semantics/view/analyze.rs: view Semantics::expr_adjustments(expr: ast::Expr<'db>) -> Option<&'db [hir_ide::Adjustment]> (hir_ide re-exports hir_ty), forwarding to expr_adjustments_view"
+    }
+  ]
+}

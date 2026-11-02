@@ -7,7 +7,7 @@ profile of the whole run to be cut by ([research/lean-frontend.md](../docs/resea
     perf script -i run.data > run.txt
     python3 cpufold.py run.txt --phases W/phases.json
 
-The standard library's unit is made once with `blaze-engine std` and fetched, as bench.py does. The
+The standard library's crates are units of the cold build like any other, as in bench.py. The
 phases: `cold` (`blaze build` from nothing until the daemon is ready), `base` (the
 build of its own base it makes once idle), each edit of `--edits` (default `body,signature`,
 from bench.py's `PROJECTS`) made and taken back `--rounds` times (default 3), and `warm` (the
@@ -43,10 +43,8 @@ def main():
     home = os.path.join(work, "home")
     env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
     env["PATH"] = os.path.dirname(bench.blaze_of("cranelift")) + os.pathsep + env["PATH"]
-    env.update(bench.BACKENDS["cranelift"], BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, "store"))
+    env.update(BLAZE_STATS="1")
     env.pop("RUSTC_WRAPPER", None)
-    # As bench.py's cold start: the standard library's unit is fetched as a release fetches it.
-    env["BLAZE_STD_FROM"], _ = bench.shipped_std(bench.blaze_of("cranelift"), "cranelift", work)
     reports = env.get("BLAZE_MEMORY")
     build = spec.get("build", [])
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)

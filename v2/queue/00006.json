@@ -1,0 +1,24 @@
+{
+  "id": "00006",
+  "from_lane": "speed-link-edge-macho",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/model.rs",
+    "crates/blaze-link"
+  ],
+  "what": "## 11. From speed-link-edge-macho (found by speed-link-edge-macho-input2): `Class::Named` allocates per section\n\nStatus: open, does not block. For lead `link` (`crates/blaze-link/src/model.rs`).\n\nWhat is slow: `Class::Named { name: String, .. }`. The Mach-O reader makes one per Mach-O section\nthat is `__LD,__compact_unwind` (every C object has one: `macho.rs` `compact_unwind()`),\n`__DATA,__thread_init` or a `#[link_section]` one (`macho.rs` `classify`, `format!` at ~271), and\nclones it into every other atom of a section split into atoms. ELF and COFF named sections pay\nthe same. `Class` is also compared and hashed as a key by the core (`Writer::order`, region\nlookup), each time comparing the `String`.\n\nThe change: `Class::Named`'s name interned once per link: a `u32` into a link-wide table of\nsection names (or `Arc<str>` as a first step, so the clone per atom is a count bump), with\n`Writer::section`/`classify` returning the interned id. Fixed names (`__LD,__compact_unwind`,\n`__DATA,__thread_init`) become constants of that table.\n\nWhy: no allocation per named section or per atom of one, and class comparisons on the core's\nsorting and lookups become one `u32` compare.\n\n> forwarded to link: its own `crates/blaze-link/`.",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-29T23:49:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#11. From speed-link-edge-macho (found by speed-link-edge-macho-input2): `Class::Named` allocates per section",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:671"
+    }
+  ]
+}

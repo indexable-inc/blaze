@@ -1,12 +1,9 @@
 //! Storage for type variables for the infer context the next-trait-solver.
 
 use std::cmp;
-use std::marker::PhantomData;
 use std::ops::Range;
 
-use ena::snapshot_vec as sv;
-use ena::undo_log::Rollback;
-use ena::unify as ut;
+use hir_def::TypeParamId;
 use rustc_type_ir::TyVid;
 use rustc_type_ir::UniverseIndex;
 use rustc_type_ir::inherent::Ty as _;
@@ -14,56 +11,16 @@ use tracing::debug;
 
 use crate::Span;
 use crate::next_solver::Ty;
-use crate::next_solver::infer::{InferCtxtUndoLogs, iter_idx_range};
+use crate::next_solver::infer::iter_idx_range;
+use crate::next_solver::infer::touched::Touched;
+use crate::next_solver::infer::union_find::{NoError, UnifyValue, UnionFind, UnionFindMark};
 
-/// Represents a single undo-able action that affects a type inference variable.
-#[derive(Clone)]
-pub(crate) enum UndoLog<'tcx> {
-    EqRelation(sv::UndoLog<ut::Delegate<TyVidEqKey<'tcx>>>),
-    SubRelation(sv::UndoLog<ut::Delegate<TyVidSubKey>>),
-}
-
-/// Convert from a specific kind of undo to the more general UndoLog
-impl<'db> From<sv::UndoLog<ut::Delegate<TyVidEqKey<'db>>>> for UndoLog<'db> {
-    fn from(l: sv::UndoLog<ut::Delegate<TyVidEqKey<'db>>>) -> Self {
-        UndoLog::EqRelation(l)
-    }
-}
-
-/// Convert from a specific kind of undo to the more general UndoLog
-impl<'db> From<sv::UndoLog<ut::Delegate<TyVidSubKey>>> for UndoLog<'db> {
-    fn from(l: sv::UndoLog<ut::Delegate<TyVidSubKey>>) -> Self {
-        UndoLog::SubRelation(l)
-    }
-}
-
-impl<'db> Rollback<sv::UndoLog<ut::Delegate<TyVidEqKey<'db>>>> for TypeVariableStorage<'db> {
-    fn reverse(&mut self, undo: sv::UndoLog<ut::Delegate<TyVidEqKey<'db>>>) {
-        self.eq_relations.reverse(undo)
-    }
-}
-
-impl<'tcx> Rollback<sv::UndoLog<ut::Delegate<TyVidSubKey>>> for TypeVariableStorage<'tcx> {
-    fn reverse(&mut self, undo: sv::UndoLog<ut::Delegate<TyVidSubKey>>) {
-        self.sub_unification_table.reverse(undo)
-    }
-}
-
-impl<'tcx> Rollback<UndoLog<'tcx>> for TypeVariableStorage<'tcx> {
-    fn reverse(&mut self, undo: UndoLog<'tcx>) {
-        match undo {
-            UndoLog::EqRelation(undo) => self.eq_relations.reverse(undo),
-            UndoLog::SubRelation(undo) => self.sub_unification_table.reverse(undo),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct TypeVariableStorage<'db> {
     /// Two variables are unified in `eq_relations` when we have a
     /// constraint `?X == ?Y`. This table also stores, for each key,
     /// the known value.
-    eq_relations: ut::UnificationTableStorage<TyVidEqKey<'db>>,
+    eq_relations: UnionFind<TyVid, TypeVariableValue<'db>>,
     /// Only used by `-Znext-solver` and for diagnostics. Tracks whether
     /// type variables are related via subtyping at all, ignoring which of
     /// the two is the subtype.
@@ -82,13 +39,22 @@ pub(crate) struct TypeVariableStorage<'db> {
     /// Even for something like `let x = returns_arg(); x.method();` the
     /// type of `x` is only a supertype of the argument of `returns_arg`. We
     /// still want to suggest specifying the type of the argument.
-    sub_unification_table: ut::UnificationTableStorage<TyVidSubKey>,
+    sub_unification_table: UnionFind<TyVid, TypeVariableSubValue>,
+    /// The type parameter each variable made for one stands for (rustc's
+    /// `TypeVariableOrigin::param_def_id`), in variable order. Per variable, not per set, as in
+    /// rustc; sparse, as most variables stand for no parameter.
+    params: Vec<(TyVid, TypeParamId)>,
+}
+
+/// Where both tables of type variables stood when a snapshot started.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypeVariableMark {
+    eq: UnionFindMark,
+    sub: UnionFindMark,
 }
 
 pub(crate) struct TypeVariableTable<'a, 'db> {
     storage: &'a mut TypeVariableStorage<'db>,
-
-    undo_log: &'a mut InferCtxtUndoLogs<'db>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,28 +81,109 @@ impl<'db> TypeVariableValue<'db> {
     }
 }
 
+impl Clone for TypeVariableStorage<'_> {
+    fn clone(&self) -> Self {
+        TypeVariableStorage {
+            // clone: only `InferCtxt::fork` copies a table.
+            eq_relations: self.eq_relations.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
+            sub_unification_table: self.sub_unification_table.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
+            params: self.params.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.eq_relations.clone_from(&source.eq_relations);
+        self.sub_unification_table.clone_from(&source.sub_unification_table);
+        self.params.clone_from(&source.params);
+    }
+}
+
 impl<'db> TypeVariableStorage<'db> {
-    #[inline]
-    pub(crate) fn with_log<'a>(
-        &'a mut self,
-        undo_log: &'a mut InferCtxtUndoLogs<'db>,
-    ) -> TypeVariableTable<'a, 'db> {
-        TypeVariableTable { storage: self, undo_log }
+    /// Back to `default()`, its capacity kept.
+    pub(crate) fn empty(&mut self) {
+        self.eq_relations.empty();
+        self.sub_unification_table.empty();
+        self.params.clear();
+    }
+
+    /// Bytes it holds room for.
+    pub(crate) fn held(&self) -> usize {
+        self.eq_relations.held()
+            + self.sub_unification_table.held()
+            + self.params.capacity() * size_of::<(TyVid, TypeParamId)>()
     }
 
     #[inline]
-    pub(crate) fn eq_relations_ref(&self) -> &ut::UnificationTableStorage<TyVidEqKey<'db>> {
-        &self.eq_relations
+    pub(crate) fn table(&mut self) -> TypeVariableTable<'_, 'db> {
+        TypeVariableTable { storage: self }
     }
 
-    pub(super) fn finalize_rollback(&mut self) {}
+    /// The value of `vid` if it is the root of its set, read without changing the table.
+    #[inline]
+    pub(crate) fn try_probe_value(&self, vid: TyVid) -> Option<&TypeVariableValue<'db>> {
+        self.eq_relations.try_probe_value(vid)
+    }
+
+    /// Whether `vid` is the root of its set in the sub-unification table, read without changing
+    /// the table.
+    #[inline]
+    pub(crate) fn is_sub_unification_table_root_var(&self, vid: TyVid) -> bool {
+        self.sub_unification_table.try_probe_value(vid).is_some()
+    }
+
+    /// The count of changes to both tables; see `UnionFind::changes`.
+    #[inline]
+    pub(crate) fn changes(&self) -> u64 {
+        self.eq_relations.changes() + self.sub_unification_table.changes()
+    }
+
+    /// The rows written in the equality table; see `infer::touched`.
+    #[inline]
+    pub(crate) fn touched_eq(&self) -> &Touched {
+        self.eq_relations.touched()
+    }
+
+    /// The rows written in the sub-unification table.
+    #[inline]
+    pub(crate) fn touched_sub(&self) -> &Touched {
+        self.sub_unification_table.touched()
+    }
+
+    pub(crate) fn start_snapshot(&mut self) -> TypeVariableMark {
+        TypeVariableMark {
+            eq: self.eq_relations.start_snapshot(),
+            sub: self.sub_unification_table.start_snapshot(),
+        }
+    }
+
+    pub(crate) fn rollback_to(&mut self, mark: TypeVariableMark) {
+        self.eq_relations.rollback_to(mark.eq);
+        self.sub_unification_table.rollback_to(mark.sub);
+        let len = self.eq_relations.len();
+        while self.params.last().is_some_and(|&(vid, _)| vid.as_usize() >= len) {
+            self.params.pop();
+        }
+    }
+
+    /// The type parameter `vid` was made for, if any.
+    pub(crate) fn param(&self, vid: TyVid) -> Option<TypeParamId> {
+        let at = self.params.binary_search_by_key(&vid, |&(vid, _)| vid).ok()?;
+        Some(self.params[at].1)
+    }
+
+    pub(crate) fn commit(&mut self, mark: TypeVariableMark) {
+        self.eq_relations.commit(mark.eq);
+        self.sub_unification_table.commit(mark.sub);
+    }
 }
 
 impl<'db> TypeVariableTable<'_, 'db> {
     pub(crate) fn var_span(&mut self, vid: TyVid) -> Span {
         // We return the span from unification and not equation, since when equating we also unify,
         // and we want to prevent duplicate diagnostics from vars that were unified.
-        self.sub_unification_table().probe_value(vid).span
+        self.storage.sub_unification_table.probe_value(vid).span
     }
 
     /// Records that `a == b`, depending on `dir`.
@@ -145,8 +192,8 @@ impl<'db> TypeVariableTable<'_, 'db> {
     pub(crate) fn equate(&mut self, a: TyVid, b: TyVid) {
         debug_assert!(self.probe(a).is_unknown());
         debug_assert!(self.probe(b).is_unknown());
-        self.eq_relations().union(a, b);
-        self.sub_unification_table().union(a, b);
+        self.storage.eq_relations.union(a, b);
+        self.storage.sub_unification_table.union(a, b);
     }
 
     /// Records that `a` and `b` are related via subtyping. We don't track
@@ -156,7 +203,7 @@ impl<'db> TypeVariableTable<'_, 'db> {
     pub(crate) fn sub_unify(&mut self, a: TyVid, b: TyVid) {
         debug_assert!(self.probe(a).is_unknown());
         debug_assert!(self.probe(b).is_unknown());
-        self.sub_unification_table().union(a, b);
+        self.storage.sub_unification_table.union(a, b);
     }
 
     /// Instantiates `vid` with the type `ty`.
@@ -167,22 +214,36 @@ impl<'db> TypeVariableTable<'_, 'db> {
         debug_assert!(!ty.is_ty_var(), "instantiating ty var with var: {vid:?} {ty:?}");
         debug_assert!(self.probe(vid).is_unknown());
         debug_assert!(
-            self.eq_relations().probe_value(vid).is_unknown(),
+            self.storage.eq_relations.probe_value(vid).is_unknown(),
             "instantiating type variable `{vid:?}` twice: new-value = {ty:?}, old-value={:?}",
-            self.eq_relations().probe_value(vid)
+            self.storage.eq_relations.probe_value(vid)
         );
-        self.eq_relations().union_value(vid, TypeVariableValue::Known { value: ty });
+        self.storage.eq_relations.union_value(vid, TypeVariableValue::Known { value: ty });
     }
 
     pub(crate) fn new_var(&mut self, universe: UniverseIndex, span: Span) -> TyVid {
-        let eq_key = self.eq_relations().new_key(TypeVariableValue::Unknown { universe });
+        let eq_key = self.storage.eq_relations.new_key(TypeVariableValue::Unknown { universe });
 
-        let sub_key = self.sub_unification_table().new_key(TypeVariableSubValue { span });
-        debug_assert_eq!(eq_key.vid, sub_key.vid);
+        let sub_key = self.storage.sub_unification_table.new_key(TypeVariableSubValue { span });
+        debug_assert_eq!(eq_key, sub_key);
 
-        debug!("new_var(index={:?}, universe={:?}, span={:?})", eq_key.vid, universe, span);
+        debug!("new_var(index={:?}, universe={:?}, span={:?})", eq_key, universe, span);
 
-        eq_key.vid
+        eq_key
+    }
+
+    /// Like `new_var`, remembering the type parameter the variable stands for.
+    pub(crate) fn new_var_for_param(
+        &mut self,
+        universe: UniverseIndex,
+        span: Span,
+        param: Option<TypeParamId>,
+    ) -> TyVid {
+        let vid = self.new_var(universe, span);
+        if let Some(param) = param {
+            self.storage.params.push((vid, param));
+        }
+        vid
     }
 
     /// Returns the number of type variables created thus far.
@@ -196,19 +257,17 @@ impl<'db> TypeVariableTable<'_, 'db> {
     /// algorithm), so `root_var(a) == root_var(b)` implies that `a ==
     /// b` (transitively).
     pub(crate) fn root_var(&mut self, vid: TyVid) -> TyVid {
-        self.eq_relations().find(vid).vid
+        self.storage.eq_relations.find(vid)
     }
 
     /// Returns the "root" variable of `vid` in the `sub_unification_table`
-    /// equivalence table. All type variables that have been are related via
+    /// equivalence table. All type variables that have been related via
     /// equality or subtyping will yield the same root variable (per the
     /// union-find algorithm), so `sub_unification_table_root_var(a)
-    /// == sub_unification_table_root_var(b)` implies that:
-    /// ```text
-    /// exists X. (a <: X || X <: a) && (b <: X || X <: b)
-    /// ```
+    /// == sub_unification_table_root_var(b)` implies that `a` and `b` are
+    /// transitively related via subtyping.
     pub(crate) fn sub_unification_table_root_var(&mut self, vid: TyVid) -> TyVid {
-        self.sub_unification_table().find(vid).vid
+        self.storage.sub_unification_table.find(vid)
     }
 
     /// Retrieves the type to which `vid` has been instantiated, if
@@ -220,84 +279,49 @@ impl<'db> TypeVariableTable<'_, 'db> {
     /// An always-inlined variant of `probe`, for very hot call sites.
     #[inline(always)]
     pub(crate) fn inlined_probe(&mut self, vid: TyVid) -> TypeVariableValue<'db> {
-        self.eq_relations().inlined_probe_value(vid)
+        self.storage.eq_relations.inlined_probe_value(vid)
     }
 
-    #[inline]
-    fn eq_relations(&mut self) -> super::UnificationTable<'_, 'db, TyVidEqKey<'db>> {
-        self.storage.eq_relations.with_log(self.undo_log)
+    /// Retrieves the type to which `vid` has been instantiated, if
+    /// any, along with the root `vid`.
+    pub(crate) fn probe_with_root_vid(&mut self, vid: TyVid) -> (TyVid, TypeVariableValue<'db>) {
+        self.inlined_probe_with_vid(vid)
     }
 
-    #[inline]
-    fn sub_unification_table(&mut self) -> super::UnificationTable<'_, 'db, TyVidSubKey> {
-        self.storage.sub_unification_table.with_log(self.undo_log)
+    /// An always-inlined variant of `probe_with_root_vid`, for very hot call sites.
+    #[inline(always)]
+    pub(crate) fn inlined_probe_with_vid(
+        &mut self,
+        vid: TyVid,
+    ) -> (TyVid, TypeVariableValue<'db>) {
+        self.storage.eq_relations.inlined_probe_key_value(vid)
     }
 
     /// Returns a range of the type variables created during the snapshot.
-    pub(crate) fn vars_since_snapshot(&mut self, value_count: usize) -> (Range<TyVid>, Vec<Span>) {
+    pub(crate) fn vars_since_snapshot(
+        &mut self,
+        value_count: usize,
+    ) -> (Range<TyVid>, Vec<(Span, Option<TypeParamId>)>) {
         let range = TyVid::from_usize(value_count)..TyVid::from_usize(self.num_vars());
-        (range.clone(), iter_idx_range(range).map(|index| self.var_span(index)).collect())
+        (
+            range.start..range.end,
+            iter_idx_range(range)
+                .map(|vid| (self.var_span(vid), self.storage.param(vid)))
+                // alloc: only when fudging, one origin per variable made in the snapshot.
+                .collect(),
+        )
     }
 
-    /// Returns indices of all variables that are not yet
-    /// instantiated.
-    pub(crate) fn unresolved_variables(&mut self) -> Vec<TyVid> {
+    /// Returns indices of all root variables that are not yet instantiated.
+    pub(crate) fn unresolved_root_variables(&mut self) -> Vec<TyVid> {
         (0..self.num_vars())
-            .filter_map(|i| {
-                let vid = TyVid::from_usize(i);
-                match self.probe(vid) {
-                    TypeVariableValue::Unknown { .. } => Some(vid),
-                    TypeVariableValue::Known { .. } => None,
-                }
+            .map(TyVid::from_usize)
+            .filter(|&vid| {
+                let (root, value) = self.probe_with_root_vid(vid);
+                root == vid && value.is_unknown()
             })
+            // alloc: once per body, for fallback.
             .collect()
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////
-
-/// These structs (a newtyped TyVid) are used as the unification key
-/// for the `eq_relations`; they carry a `TypeVariableValue` along
-/// with them.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TyVidEqKey<'db> {
-    vid: TyVid,
-
-    // in the table, we map each ty-vid to one of these:
-    phantom: PhantomData<TypeVariableValue<'db>>,
-}
-
-impl<'db> From<TyVid> for TyVidEqKey<'db> {
-    #[inline] // make this function eligible for inlining - it is quite hot.
-    fn from(vid: TyVid) -> Self {
-        TyVidEqKey { vid, phantom: PhantomData }
-    }
-}
-
-impl<'db> ut::UnifyKey for TyVidEqKey<'db> {
-    type Value = TypeVariableValue<'db>;
-    #[inline(always)]
-    fn index(&self) -> u32 {
-        self.vid.as_u32()
-    }
-    #[inline]
-    fn from_index(i: u32) -> Self {
-        TyVidEqKey::from(TyVid::from_u32(i))
-    }
-    fn tag() -> &'static str {
-        "TyVidEqKey"
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TyVidSubKey {
-    vid: TyVid,
-}
-
-impl From<TyVid> for TyVidSubKey {
-    #[inline] // make this function eligible for inlining - it is quite hot.
-    fn from(vid: TyVid) -> Self {
-        TyVidSubKey { vid }
     }
 }
 
@@ -306,33 +330,20 @@ pub(crate) struct TypeVariableSubValue {
     span: Span,
 }
 
-impl ut::UnifyKey for TyVidSubKey {
-    type Value = TypeVariableSubValue;
-    #[inline]
-    fn index(&self) -> u32 {
-        self.vid.as_u32()
-    }
-    #[inline]
-    fn from_index(i: u32) -> TyVidSubKey {
-        TyVidSubKey { vid: TyVid::from_u32(i) }
-    }
-    fn tag() -> &'static str {
-        "TyVidSubKey"
-    }
-}
+impl UnifyValue for TypeVariableSubValue {
+    type Error = NoError;
 
-impl ut::UnifyValue for TypeVariableSubValue {
-    type Error = ut::NoError;
-
-    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, Self::Error> {
+    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, NoError> {
         Ok(TypeVariableSubValue { span: Span::pick_best(value1.span, value2.span) })
     }
 }
 
-impl<'db> ut::UnifyValue for TypeVariableValue<'db> {
-    type Error = ut::NoError;
+impl<'db> UnifyValue for TypeVariableValue<'db> {
+    type Error = NoError;
+    /// rustc's `order_roots` of `TyVidEqKey`; the sub-unification table keeps `ena`'s rule.
+    const OLDER_ROOT: bool = true;
 
-    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, ut::NoError> {
+    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, NoError> {
         match (value1, value2) {
             // We never equate two type variables, both of which
             // have known types. Instead, we recursively equate

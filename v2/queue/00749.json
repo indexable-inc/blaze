@@ -1,0 +1,37 @@
+{
+  "id": "00749",
+  "from_lane": "diagnostics-crateattr",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-diagnostics/src/tests/items/crate_attr.rs",
+    "crates/test-utils",
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "## for test-utils: a fixture's `crate-attr:` with a space\n\n`tests/ui/attributes/z-crate-attr/injection.rs` gives\n`-Zcrate-attr=feature(yeet_expr)]fn main(){}#[inline`, which has a space. A fixture's meta line is\nsplit on whitespace (`test-utils/src/fixture.rs` `parse_meta_line`), so the test can't be written.\nA quoted value (`crate-attr:\"feature(yeet_expr)]fn main(){}#[inline\"`) would let it; then\n`crates/blaze-diagnostics/src/tests/items/crate_attr.rs` takes `injection.rs` verbatim.\n\n> for: whoever owns `crates/test-utils`.\n\n> forwarded to the coordinator: `test-utils` is on the coordinator's line of `docs/v2/plan/reference/crates.md`; on requests' coordinator list (requests, pass 33).\n\n> diagnostics (window 84, 2026-10-29 23:45): used, not built. `lower/parse/crate_attr.rs:57` matches `CrateAttrError::UnexpectedToken { .. }` (it was `Trailing`). The messages for `(` and `a, b` come from the file's own errors, so the tests in `tests/items/crate_attr.rs` (multiple, unbalanced-paren, injection2) keep rustc's stderr unchanged.",
+  "state": "applied",
+  "created": "2026-10-30T06:45:00Z",
+  "updated": "2026-10-30T08:41:14Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/diagnostics-crateattr.md#for test-utils: a fixture's `crate-attr:` with a space",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-crateattr.md:78"
+    },
+    {
+      "at": "2026-10-30T08:41:14Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:41:14Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "test-utils fixture.rs: meta lines split through meta_components, where a value starting with a quote (key:\"a b\") runs to the next quote followed by whitespace or the end of the line, and parse_meta_line strips the quotes; unquoted values (cfg(target_arch=\"x86\")) are unchanged. Test parse_fixture_takes_a_quoted_crate_attr_with_spaces. Diagnostics still has to add injection.rs to blaze-diagnostics/src/tests/items/crate_attr.rs (and drop the line-3 note that it cannot be written)."
+    }
+  ]
+}

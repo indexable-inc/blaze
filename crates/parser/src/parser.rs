@@ -1,15 +1,13 @@
 //! See [`Parser`].
 
-use std::{cell::Cell, num::NonZeroU32};
-
-use drop_bomb::DropBomb;
+use std::{borrow::Cow, num::NonZeroU32};
 
 use crate::{
     Edition,
     SyntaxKind::{self, EOF, ERROR, TOMBSTONE},
     T, TokenSet,
-    event::Event,
-    input::Input,
+    event::{self, Event, Events},
+    input::Tokens,
 };
 
 /// Build a forward-parent offset. The offset is always ≥ 1 because the
@@ -30,29 +28,68 @@ fn fwd_parent(offset: u32) -> NonZeroU32 {
 /// "start expression, consume number literal,
 /// finish expression". See `Event` docs for more.
 pub(crate) struct Parser<'t> {
-    inp: &'t Input,
+    /// The tokens, an [`crate::Input`]'s or a token tree's words where they lie.
+    inp: Tokens<'t>,
     pos: usize,
-    events: Vec<Event>,
+    /// The thread's event list, lent until [`event::process`] is done with it.
+    events: blaze_mem::scratch::Lent<Events>,
     /// Side table of error messages. `Event::Error { err }` carries an index
     /// into this vec, keeping `Event` itself a flat 8-byte enum.
-    errors: Vec<String>,
-    steps: Cell<u32>,
+    errors: Vec<Cow<'static, str>>,
+    /// Nodes started and errors made since the last token was consumed. A loop that consumes
+    /// nothing still starts a node or makes an error each turn (or asks to bump at `EOF`), so
+    /// counting those, and not every kind test, catches it.
+    steps: u32,
+    /// Whether `fn` bodies are skipped as lazy nodes ([`crate::outline`]).
+    outline: bool,
+    /// Which tokens are a `{` some `}` closes ([`Parser::curly_closes`]), made when first asked.
+    closed_curlies: Option<Vec<bool>>,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
 
 impl<'t> Parser<'t> {
-    pub(super) fn new(inp: &'t Input) -> Parser<'t> {
+    pub(super) fn new(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        let inp = inp.into();
         Parser {
             inp,
             pos: 0,
-            events: Vec::with_capacity(2 * inp.len()),
-            errors: Vec::new(),
-            steps: Cell::new(0),
+            events: event::lend_events(inp.len()),
+            errors: Vec::new(), // alloc: empty until the first syntax error, an error path
+            steps: 0,
+            outline: false,
+            closed_curlies: None,
         }
     }
 
-    pub(crate) fn finish(self) -> (Vec<Event>, Vec<String>) {
+    pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { outline: true, ..Parser::new(inp) }
+    }
+
+    /// In an outline, the number of tokens of the `fn` body at the current `{` when it can be
+    /// left unparsed ([`crate::outline::lazy_block_len`]).
+    pub(crate) fn lazy_body(&self) -> Option<u32> {
+        if !self.outline {
+            return None;
+        }
+        crate::outline::lazy_block_len(self.inp, self.pos)
+    }
+
+    /// Skips the next `n_input_tokens` tokens as one lazy node of `kind`.
+    pub(crate) fn bump_lazy(&mut self, kind: SyntaxKind, n_input_tokens: u32) {
+        self.pos += n_input_tokens as usize;
+        self.steps = 0;
+        self.push_event(Event::Lazy { kind, n_input_tokens });
+    }
+
+    /// Runs `parse` with every body in it parsed, in an outline too.
+    pub(crate) fn in_full(&mut self, parse: impl FnOnce(&mut Parser<'t>)) {
+        let outline = std::mem::replace(&mut self.outline, false);
+        parse(self);
+        self.outline = outline;
+    }
+
+    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<Cow<'static, str>>) {
         (self.events, self.errors)
     }
 
@@ -67,12 +104,43 @@ impl<'t> Parser<'t> {
     /// token.
     pub(crate) fn nth(&self, n: usize) -> SyntaxKind {
         assert!(n <= 3);
-
-        let steps = self.steps.get();
-        assert!((steps as usize) < PARSER_STEP_LIMIT, "the parser seems stuck");
-        self.steps.set(steps + 1);
-
         self.inp.kind(self.pos + n)
+    }
+
+    /// The index of the current token, for [`Parser::curly_closes`].
+    pub(crate) fn token_index(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether a `}` closes the `{` at token `open` before the input ends, each `}` closing the
+    /// nearest `{` before it not yet closed, as rustc's token trees pair them.
+    pub(crate) fn curly_closes(&mut self, open: usize) -> bool {
+        let inp = self.inp;
+        let closed = self.closed_curlies.get_or_insert_with(|| {
+            let mut closed = vec![false; inp.len()]; // alloc: once a parse, an error path
+            let mut unclosed = Vec::new(); // alloc: once a parse, an error path
+            for at in 0..inp.len() {
+                match inp.kind(at) {
+                    T!['{'] => unclosed.push(at),
+                    T!['}'] => {
+                        if let Some(it) = unclosed.pop() {
+                            closed[it] = true;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            closed
+        });
+        closed.get(open).copied().unwrap_or(false)
+    }
+
+    /// Counts one step that consumed no token, and panics when there have been too many: the
+    /// grammar is in a loop that makes no progress.
+    #[inline]
+    fn step(&mut self) {
+        assert!((self.steps as usize) < PARSER_STEP_LIMIT, "the parser seems stuck");
+        self.steps += 1;
     }
 
     /// Whether the current token starts a fragment a macro transcribed, which goes on no
@@ -199,6 +267,7 @@ impl<'t> Parser<'t> {
     /// consumed between the `start` and the corresponding `Marker::complete`
     /// belong to the same node.
     pub(crate) fn start(&mut self) -> Marker {
+        self.step();
         let pos = self.events.len() as u32;
         self.push_event(Event::tombstone());
         Marker::new(pos)
@@ -213,6 +282,7 @@ impl<'t> Parser<'t> {
     pub(crate) fn bump_any(&mut self) {
         let kind = self.nth(0);
         if kind == EOF {
+            self.step();
             return;
         }
         self.do_bump(kind, 1);
@@ -239,10 +309,11 @@ impl<'t> Parser<'t> {
                 }
                 _ => unreachable!(),
             }
-            marker.bomb.defuse();
+            marker.done = true;
             marker = new_marker;
         };
         self.pos += 1;
+        self.steps = 0;
         self.push_event(Event::FloatSplitHack { ends_in_dot });
         (ends_in_dot, marker)
     }
@@ -256,6 +327,7 @@ impl<'t> Parser<'t> {
     pub(crate) fn bump_remap(&mut self, kind: SyntaxKind) {
         if self.nth(0) == EOF {
             // FIXME: panic!?
+            self.step();
             return;
         }
         self.do_bump(kind, 1);
@@ -265,7 +337,12 @@ impl<'t> Parser<'t> {
     /// FIXME: this should be much more fancy and support
     /// structured errors with spans and notes, like rustc
     /// does.
-    pub(crate) fn error<T: Into<String>>(&mut self, message: T) {
+    ///
+    /// A failed [`Parser::expect`] and every path of [`Parser::err_recover`] come through
+    /// here, so each counts as a step.
+    /// A fixed message is kept borrowed; only a formatted one is an owned `String`.
+    pub(crate) fn error<T: Into<Cow<'static, str>>>(&mut self, message: T) {
+        self.step();
         let err = self.errors.len() as u32;
         self.errors.push(message.into());
         self.push_event(Event::Error { err });
@@ -277,22 +354,48 @@ impl<'t> Parser<'t> {
         if self.eat(kind) {
             return true;
         }
-        self.error(format!("expected {kind:?}"));
+        self.error(format!("expected {kind:?}")); // alloc: a syntax error, an error path
         false
     }
 
     /// Create an error node and consume the next token.
-    pub(crate) fn err_and_bump(&mut self, message: &str) {
+    /// A `{` some `}` closes is taken with everything up to that `}`, each pair inside it in a
+    /// node of its own, so every pair of braces is the first and last child of one node.
+    pub(crate) fn err_and_bump(&mut self, message: &'static str) {
         let m = self.start();
         self.error(message);
-        self.bump_any();
+        if self.at(T!['{']) && self.curly_closes(self.pos) {
+            // Every `{` after a closed one is closed before it: a stack pairs them.
+            let mut inner = Vec::new(); // alloc: an error path, one marker a nested pair
+            self.bump_any();
+            loop {
+                match self.current() {
+                    T!['{'] => {
+                        inner.push(self.start());
+                        self.bump_any();
+                    }
+                    T!['}'] => {
+                        self.bump_any();
+                        match inner.pop() {
+                            Some(pair) => {
+                                pair.complete(self, ERROR);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ => self.bump_any(),
+                }
+            }
+        } else {
+            self.bump_any();
+        }
         m.complete(self, ERROR);
     }
 
     /// Create an error node and consume the next token unless it is in the recovery set.
     ///
     /// Returns true if recovery kicked in.
-    pub(crate) fn err_recover(&mut self, message: &str, recovery: TokenSet) -> bool {
+    pub(crate) fn err_recover(&mut self, message: &'static str, recovery: TokenSet) -> bool {
         if matches!(self.current(), T!['{'] | T!['}']) {
             self.error(message);
             return true;
@@ -312,7 +415,8 @@ impl<'t> Parser<'t> {
 
     fn do_bump(&mut self, kind: SyntaxKind, n_raw_tokens: u8) {
         self.pos += n_raw_tokens as usize;
-        self.steps.set(0);
+        debug_assert!(self.pos <= self.inp.len(), "a bump past the end of the input");
+        self.steps = 0;
         self.push_event(Event::Token { kind, n_raw_tokens });
     }
 
@@ -328,19 +432,29 @@ impl<'t> Parser<'t> {
 /// See [`Parser::start`].
 pub(crate) struct Marker {
     pos: u32,
-    bomb: DropBomb,
+    /// Completed, abandoned or taken by `extend_to` or `split_float`: dropping it is fine.
+    done: bool,
+}
+
+impl Drop for Marker {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            panic!("Marker must be either completed or abandoned");
+        }
+    }
 }
 
 impl Marker {
     fn new(pos: u32) -> Marker {
-        Marker { pos, bomb: DropBomb::new("Marker must be either completed or abandoned") }
+        Marker { pos, done: false }
     }
 
     /// Finishes the syntax tree node and assigns `kind` to it,
     /// and mark the create a `CompletedMarker` for possible future
     /// operation like `.precede()` to deal with forward_parent.
     pub(crate) fn complete(mut self, p: &mut Parser<'_>, kind: SyntaxKind) -> CompletedMarker {
-        self.bomb.defuse();
+        self.done = true;
         let idx = self.pos as usize;
         match &mut p.events[idx] {
             Event::Start { kind: slot, .. } => {
@@ -356,7 +470,7 @@ impl Marker {
     /// Abandons the syntax tree node. All its children
     /// are attached to its parent instead.
     pub(crate) fn abandon(mut self, p: &mut Parser<'_>) {
-        self.bomb.defuse();
+        self.done = true;
         let idx = self.pos as usize;
         if idx == p.events.len() - 1 {
             assert!(matches!(
@@ -405,7 +519,7 @@ impl CompletedMarker {
 
     /// Extends this completed marker *to the left* up to `m`.
     pub(crate) fn extend_to(self, p: &mut Parser<'_>, mut m: Marker) -> CompletedMarker {
-        m.bomb.defuse();
+        m.done = true;
         let idx = m.pos as usize;
         match &mut p.events[idx] {
             Event::Start { forward_parent, .. } => {
@@ -425,7 +539,109 @@ impl CompletedMarker {
         debug_assert_eq!(p.events[end_pos - 1], Event::Finish);
         p.events[..end_pos].iter().rev().find_map(|event| match event {
             Event::Token { kind, .. } => Some(*kind),
+            // A lazy node is a balanced `{ ... }`.
+            Event::Lazy { .. } => Some(T!['}']),
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Input;
+
+    fn input(kinds: &[SyntaxKind]) -> Input {
+        let mut input = Input::with_capacity(kinds.len());
+        for &kind in kinds {
+            input.push(kind, Edition::CURRENT);
+        }
+        input
+    }
+
+    #[test]
+    #[should_panic(expected = "Marker must be either completed or abandoned")]
+    fn a_marker_dropped_unfinished_panics() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        let _m = p.start();
+    }
+
+    #[test]
+    fn a_finished_marker_drops_quietly() {
+        let input = input(&[T![;], T![;]]);
+        let mut p = Parser::new(&input);
+        let m = p.start();
+        p.bump(T![;]);
+        let done = m.complete(&mut p, ERROR);
+        p.start().abandon(&mut p);
+        let m = done.precede(&mut p);
+        let outer = p.start();
+        p.bump(T![;]);
+        outer.complete(&mut p, ERROR).extend_to(&mut p, m);
+        assert_eq!(p.finish().0.len(), 7);
+    }
+
+    #[test]
+    fn kind_tests_are_not_steps() {
+        let input = input(&[T![;]]);
+        let p = Parser::new(&input);
+        for _ in 0..=PARSER_STEP_LIMIT {
+            assert_eq!(p.current(), T![;]);
+            assert!(p.nth_at(1, EOF));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn starting_nodes_without_consuming_a_token_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        loop {
+            p.start().abandon(&mut p);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn bumping_at_eof_is_stuck() {
+        let input = input(&[]);
+        let mut p = Parser::new(&input);
+        loop {
+            p.bump_any();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn failing_to_expect_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        p.steps = PARSER_STEP_LIMIT as u32 - 1;
+        assert!(!p.expect(T![,]));
+        p.expect(T![,]);
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn recovering_at_the_recovery_set_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        p.steps = PARSER_STEP_LIMIT as u32 - 1;
+        assert!(p.err_recover("x", TokenSet::new(&[T![;]])));
+        p.err_recover("x", TokenSet::new(&[T![;]]));
+    }
+
+    #[test]
+    fn a_consumed_token_resets_the_count() {
+        let input = input(&[T![;], T![;]]);
+        let mut p = Parser::new(&input);
+        for _ in 0..2 {
+            for _ in 1..PARSER_STEP_LIMIT {
+                p.start().abandon(&mut p);
+            }
+            p.bump(T![;]);
+        }
+        assert_eq!(p.current(), EOF);
     }
 }

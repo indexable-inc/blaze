@@ -1,0 +1,38 @@
+{
+  "id": "01306",
+  "from_lane": "tests-misc-stencil",
+  "owner": "tests-misc-stencil",
+  "paths": [
+    "crates/blaze-stencil/src/shape.rs",
+    "crates/blaze-stencil/gen/ops.rs",
+    "crates/blaze-stencil/src/patch/select.rs",
+    "crates/blaze-stencil/src/tests/stencil/build.rs"
+  ],
+  "what": "AArch64 fma with an fneg operand: select fused shapes as Cranelift lower.isle does (fma x (fneg y) z and (fneg x) y z -> fmsub, scalar and vector; scalar fma x y (fneg z) -> fnmsub; scalar both -> fnmadd). Today the patcher runs an fneg stencil then fma, so the NaN sign differs from Cranelift code (Cranelift fmsub negates x, flipping x NaN sign): round 8 stencils_shard_* fma.{f32,f64,f32x4,f64x2}.0.sas.* fail stencil vs Cranelift. Fused shapes also save a stencil.",
+  "state": "applied",
+  "created": "2026-10-31T15:17:21Z",
+  "updated": "2026-10-31T17:21:20Z",
+  "taken_by": "tests-misc-stencil",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:17:21Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:17:24Z",
+      "by": "tests-misc-stencil",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:21:20Z",
+      "by": "tests-misc-stencil",
+      "action": "done",
+      "note": "Op::Fma gained Aux::Negated (aux 1 = fmsub/fmls, x negated); patch/select.rs negate() fuses fma x (fneg y) z into it always, as Cranelift (any block, any use count; the fneg is dropped when the fma was its only use, else its operand gains a use and goes global across blocks). Only that fold changes bits: fma (fneg x) y z and scalar fma x y (fneg z) give the same bits unfused. gen/ops.rs writes fmsub/fmls; tests/stencil/build.rs builds aux 1 as fma x (fneg y) z and hands an fma operand 1 through the accumulator by a bitcast of its integer bits (Xform::Bits); patch/tests.rs an_fma_by_an_fneg_is_the_negated_fma_of_its_operand_wherever_the_fneg_is. Needs a round."
+    }
+  ]
+}

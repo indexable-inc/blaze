@@ -1,0 +1,37 @@
+{
+  "id": "00996",
+  "from_lane": "integrate-store",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/toolchain.rs",
+    "crates/hir-ty-codegen/v2/toolchain/tests.rs",
+    "crates/hir-ty-codegen/mod.rs",
+    "crates/hir-ty-codegen/fncache.rs",
+    "crates/hir-ty-codegen/later.rs",
+    "crates/hir-ty-codegen/asm.rs",
+    "crates/hir-ty-codegen/debuginfo.rs",
+    "crates/hir-ty-codegen/backend.rs",
+    "crates/hir-ty-codegen/Cargo.toml"
+  ],
+  "what": "integrate-store (00031, Andrew 2026-10-30 05:37: \"delete v1 stuff, only use new stuff\"): hir-ty-codegen off `blaze-store`, so it can be deleted. Both parts are more than an import swap, so they are yours.\n\n1. v2: `v2/toolchain.rs` `id()` (236-246) names blaze's code by `blaze_store::build_name()`, v1's `Identity` (a hash of all of blaze's sources plus the toolchain `blaze_store::compiles_against` was told). That has no v2 equivalent by design (#1439): v2 keys a value by its schema and the code that produced it (`blaze_cas::Key::of(schema, producer, inputs)`, docs/v2/plan/lanes/store.md). `Toolchain::id`'s doc (blaze-codegen settings.rs:38) already says what it should be: the pinned nightly (`harness/toolchain`, e.g. `include_bytes!`) and the codegen producer, a versioned domain bumped when the code generator's output changes (as `hir_ty::check_cache::PRODUCER` is made). Then `compiles_against` goes from `v2/toolchain/tests.rs:12`, and I remove it from `hir-firewall/src/codegen.rs:30` (my line) once `id()` no longer needs it.\n\n2. v1: the whole-object build's store use: `mod.rs` (`use blaze_store as store` at 164, `bench::entry_key` at 174 over `blaze_store::KEY`, the settle/flush at 1258, `IncrementalCache` at 5529 and `emit_cached` at 5571 through `Store::global()`, 5767, 6894, 6984), `fncache.rs` (144-193, 403-552), `later.rs:333`, `asm.rs:34`, `debuginfo.rs:406`, `backend.rs:288`, and `cached`/`settled`. v2 compiles with none of it (`emit_lent` passes no store). Delete it with v1's build, or move what stays onto `blaze_cas::Handle::installed()` with a `Key::of` that misses no input. `crates/blaze-bench/benches/store.rs` still benches `hir_ty_codegen::bench::entry_key` (now with a literal `[7; 32]` program key): drop that benchmark with it. Then drop `blaze-store.workspace = true` from Cargo.toml.\n\nPlease mark this done when hir-ty-codegen names `blaze_store` nowhere.",
+  "state": "applied",
+  "created": "2026-10-30T13:02:17Z",
+  "updated": "2026-10-30T15:01:09Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:02:17Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:01:09Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "resolved by 01042 phase A: hir-ty-codegen off blaze-store"
+    }
+  ]
+}

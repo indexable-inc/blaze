@@ -1,0 +1,39 @@
+{
+  "id": "00194",
+  "from_lane": "requests-link-next",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-premap/src",
+    "crates/blaze-cargo/src/serve/unit/run.rs",
+    "crates/blaze-cargo",
+    "crates/blaze-premap",
+    "v2/requests/link.md"
+  ],
+  "what": "## From requests-link-next (2026-10-29): what a dev executable's link needs outside blaze-link (`crates/blaze-premap/src/{prelink.rs,tests.rs,key.rs}`, `crates/blaze-cargo/src/serve/unit/run.rs`)\n\n`fastcompile.md` \"fastcompile-inproc-exec 1\" is in blaze-link. `Output` has a new field,\n`dev_run: Option<blaze_link::DevRun>` (`DevRun { arena, cells, fixed }`, byte sizes, 0 for none),\nand `Image::commit_into(staged, &mut blaze_inproc::CodeMemory) -> Result<Option<Vec<u8>>, LinkError>`\nand `Image::roll_back_into(&mut CodeMemory)` exist beside `commit`/`roll_back`.\n\n1. **blaze-premap** (lane fastcompile):\n   - `src/prelink.rs` `output` and `src/tests.rs`'s `Output` literal: add `dev_run: None`. A\n     dependency image is a shared image, which a dev run never is (`Image::new` refuses one).\n     Without this the crate doesn't build.\n   - Also `Output.triple: String` (the target triple, which tells `wasm32-wasip1` from\n     `wasm32-unknown-unknown` and `-gnu` from `-musl`): `triple: dev.triple.clone()` in\n     `prelink.rs` `output`, a triple in `tests.rs`'s literal, and `triple` hashed into\n     `key.rs`'s image key beside `dev_run`.\n   - `src/key.rs`: hash `output.dev_run` into the image key. `None` must hash differently from\n     `Some` with zero sizes, and all three sizes go in. The dev layout changes the bytes (64 KiB\n     PE granules, reservation segments, the start-hook entry), so a key without it reuses a\n     non-dev image for a dev run.\n\n   > done (fastcompile-sol-premap): `prelink.rs` `output` sets `dev_run: None`, `triple: dev.triple.clone()`, `exec_log: false`; `key.rs` hashes `dev_run` (tag 0 for none, 1 plus the three sizes), `triple` and `exec_log` into the graph and image keys; `tests.rs` has a case for each. Not built here (no builds in this pass).\n2. **cargo** (`crates/blaze-cargo`, lane cargo):\n   - For a dev profile's `run` or test binary, set `Output.dev_run` to the sizes the run's\n     `CodeMemory` uses for the arena, cells and fixed maps.\n   - Make the `CodeMemory` with an image part of at least the file's length plus room to grow.\n     A file longer than `image_len()` is an error, never written into the arena.\n   - Commit each stage with `commit_into`: the first into a fresh memory, later ones into the\n     same memory. Keep the message it returns (`Some` after the first link, with `Output.live`)\n     and announce it, as fastcompile-inproc 1 item 4 says. Roll back with `roll_back_into`.\n   - The executable must link blaze-live's dev runtime (`blaze_inproc::runtime`, which defines\n     `blaze_inproc_start`). Without it the link stops with an error naming the symbol.\n   - Then `NOT_IN_PROCESS` (`serve/unit/run.rs`) can drop its linker clause.\n   - Limits, each a link error: Mach-O dev runs are arm64 only (blaze-inproc reads arm64\n     `MH_EXECUTE` only), and wasm has none.\n\n> forwarded to fastcompile (1, `crates/blaze-premap`; window `fastcompile`) and cargo (2, `serve/unit/run.rs`; cargo-next1); told by tmux (requests, pass 28).\n\n> cargo (2026-10-29 22:35): part 2 is waiting, because no dev link can happen yet.\n> `run::launch_of` refuses every dev-profile process before anything is linked, since the code\n> generator has no lazy build (`Build::compile_one`, tiered mode). The driver's link step also\n> doesn't compile until lane link gives it `blaze_link::target::{output, locate}`\n> (`v2/requests/link.md`). Filling `Output.dev_run` and committing with `commit_into` now would be\n> code no path reaches. `NOT_IN_PROCESS` is corrected instead. Its linker clause about the layout\n> and `commit_into` is gone, since the linker has both now. It says what is missing: the lazy\n> build and tiered mode, the linker's lazy placement (blaze-link has none yet), and the daemon\n> linking a dev executable for the overlay and committing it into code memory. When the lazy\n> build lands, lane cargo does part 2 as written, with `launch` giving `Launch::InProcess`:\n> - `dev_run` takes the `CodeMemory`'s sizes;\n> - the memory's image part is the file's length plus room, and a longer file is an error;\n> - `commit_into` goes first into a fresh memory, then into the same one, with its message\n>   announced; `roll_back_into` undoes;\n> - the executable links `blaze_inproc::runtime`.\n>\n> Status: open (after codegen's lazy build and link's `target`).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-30T14:23:56Z",
+  "taken_by": "fastcompile-premap-start",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-link-next (2026-10-29): what a dev executable's link needs outside blaze-link (`crates/blaze-premap/src/{prelink.rs,tests.rs,key.rs}`, `crates/blaze-cargo/src/serve/unit/run.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:376"
+    },
+    {
+      "at": "2026-10-30T14:23:56Z",
+      "by": "fastcompile-premap-start",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:23:56Z",
+      "by": "fastcompile-premap-start",
+      "action": "done",
+      "note": "Part 1 (blaze-premap) is in: prelink.rs `output` sets `dev_run: None`, `triple`, `exec_log: false`; key.rs hashes `dev_run` (none vs zero sizes), `triple` and `exec_log`, with a graph-key test case each. Part 2 (cargo) moved to 01034 with premap 5 restated for the exec-the-file start."
+    }
+  ]
+}

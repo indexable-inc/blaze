@@ -1,0 +1,23 @@
+{
+  "id": "00922",
+  "from_lane": "speed-sol2-proof-fuzz",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/lib.rs"
+  ],
+  "what": "blaze_link::fuzz_read (lib.rs:636) builds an Output (two Strings, a Vec) and a model::writer(&output) for every read, and the 13 fuzz/targets/link_* targets call it 2 to 3 times a run (now one arch and one compared read a run, was 4 to 6). Most fuzz inputs are a few hundred bytes, so the writer setup may be most of a read. Please measure fuzz_read on a 256-byte refused input with the writer setup and without; if the setup is over 10% of it, give the fuzz feature a reader made once per (format, arch), e.g. `pub struct FuzzReader` with `fn new(format, arch) -> FuzzReader` and `fn read(&mut self, kind, bytes) -> bool`, each read starting from the same state as a fresh writer (so a target can hold one in a thread_local, deterministic per input). Tell the owner of fuzz/ which you did.",
+  "state": "open",
+  "created": "2026-10-30T09:46:21Z",
+  "updated": "2026-10-30T09:46:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:46:21Z",
+      "by": "speed-sol2-proof-fuzz",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use syntax_tree::TextRange;
 
 use crate::{
@@ -217,7 +217,7 @@ pub struct SyntaxEdit {
     old_root: SyntaxNode,
     new_root: SyntaxNode,
     changed_elements: Vec<SyntaxElement>,
-    annotations: FxHashMap<SyntaxAnnotation, Vec<SyntaxElement>>,
+    annotations: HashMap<SyntaxAnnotation, Vec<SyntaxElement>>,
 }
 
 impl SyntaxEdit {
@@ -570,11 +570,13 @@ fn is_ancestor_or_self_of_element(node: &SyntaxElement, ancestor: &SyntaxNode) -
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use expect_test::expect;
 
     use crate::{
-        AstNode,
-        ast::{self, make},
+        AstNode, Text,
+        ast::{self, HasGenericParams as _, make},
     };
 
     use super::*;
@@ -937,5 +939,190 @@ mod tests {
 
         let expect = expect![["(()1, ()2)"]];
         expect.assert_eq(&edit.new_root.to_string());
+    }
+
+    /// What `derive(CoercePointee)` does: delete an attribute inside a struct taken from a
+    /// file, and add a where clause after its generics.
+    #[test]
+    fn test_derive_style_edit() {
+        let file = ast::SourceFile::parse(
+            "struct S<#[pointee] T: ?Sized, U> { a: Box<T>, b: U }\n",
+            parser::Edition::CURRENT,
+        );
+        let strukt = file.tree().syntax().descendants().find_map(ast::Struct::cast).unwrap();
+        let (editor, strukt) = SyntaxEditor::with_ast_node(&strukt);
+        assert!(strukt.syntax().parent().is_none());
+        let attr = strukt.syntax().descendants().find_map(ast::Attr::cast).unwrap();
+        editor.delete(attr.syntax());
+        let preds = ["T", "U"].map(|name| {
+            let bound = make::type_bound_text("Clone");
+            make::where_pred(either::Either::Right(make::ty(name)), [bound])
+        });
+        strukt.get_or_create_where_clause(&editor, preds.into_iter());
+        let edit = editor.finish();
+
+        let expect =
+            expect![["struct S< T: ?Sized, U> where T: Clone, U: Clone { a: Box<T>, b: U }"]];
+        expect.assert_eq(&edit.new_root.to_string());
+        let new = ast::Struct::cast(edit.new_root().clone()).unwrap();
+        assert!(new.syntax().descendants().all(|it| it.kind() != SyntaxKind::ATTR));
+        assert_eq!(new.where_clause().unwrap().predicates().count(), 2);
+        assert_eq!(new.where_clause().unwrap().syntax().parent().as_ref(), Some(new.syntax()));
+        // The tree edited is as it was.
+        assert_eq!(
+            strukt.syntax().to_string(),
+            "struct S<#[pointee] T: ?Sized, U> { a: Box<T>, b: U }"
+        );
+    }
+
+    /// An element as the random edits see it: its kind and, for a token, its text.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Shape {
+        Node(SyntaxKind, Vec<Shape>),
+        Token(SyntaxKind, String),
+    }
+
+    fn shape(element: &SyntaxElement) -> Shape {
+        match element {
+            SyntaxElement::Node(node) => Shape::Node(
+                node.kind(),
+                node.children_with_tokens().map(|it| shape(&it)).collect(),
+            ),
+            SyntaxElement::Token(token) => Shape::Token(token.kind(), token.text().to_owned()),
+        }
+    }
+
+    /// The child index of `element` and of each of its ancestors below the root, root first.
+    fn path(element: &SyntaxElement) -> Vec<usize> {
+        let mut path = vec![element.index()];
+        path.extend(
+            iter::successors(element.parent(), SyntaxNode::parent)
+                .filter(|it| it.parent().is_some())
+                .map(|it| it.index()),
+        );
+        path.reverse();
+        path
+    }
+
+    /// The children of the node at `path` in `shape`.
+    fn children_at<'a>(shape: &'a mut Shape, path: &[usize]) -> &'a mut Vec<Shape> {
+        let mut children = match shape {
+            Shape::Node(_, children) => children,
+            Shape::Token(..) => unreachable!("a path goes through nodes"),
+        };
+        for &index in path {
+            children = match &mut children[index] {
+                Shape::Node(_, it) => it,
+                Shape::Token(..) => unreachable!("a path goes through nodes"),
+            };
+        }
+        children
+    }
+
+    /// A small deterministic generator for [`random_edits_of_real_files`].
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    enum Edit {
+        Delete,
+        Replace(SyntaxElement),
+        InsertAfter(SyntaxElement),
+    }
+
+    /// Random deletes, replacements and inserts in real files, full and outline parses, with
+    /// elements of other files: the edited tree is the edited structure, its text is the edits
+    /// applied to the text, and the tree edited is unchanged.
+    #[test]
+    fn random_edits_of_real_files() {
+        let mut files = Vec::new();
+        let project = test_utils::project_root().into_std_path_buf();
+        collect_rs(&project.join("crates/syntax/src"), &mut files);
+        files.sort();
+        assert!(files.len() > 20, "the sources of syntax");
+        let texts: Vec<String> =
+            files.iter().map(|it| std::fs::read_to_string(it).unwrap()).collect();
+        let edition = parser::Edition::CURRENT;
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        for (number, text) in texts.iter().enumerate() {
+            let donor = ast::SourceFile::parse(&texts[(number + 1) % texts.len()], edition);
+            let donors: Vec<SyntaxElement> =
+                donor.tree().syntax().descendants_with_tokens().collect();
+            for outline in [false, true] {
+                let root = match outline {
+                    false => ast::SourceFile::parse(text, edition),
+                    true => ast::SourceFile::parse_outline(Text::from(text.as_str()), edition),
+                }
+                .syntax_node();
+                let before = shape(&root.clone().into());
+                let elements: Vec<SyntaxElement> = root.descendants_with_tokens().skip(1).collect();
+                // Targets apart from each other: none holds another or touches its ends.
+                let mut targets = Vec::new();
+                let mut last_end = None;
+                for element in &elements {
+                    let range = element.text_range();
+                    if range.is_empty() || last_end.is_some_and(|end| range.start() <= end) {
+                        continue;
+                    }
+                    if rng.index(elements.len()) < 8 {
+                        let edit = match rng.below(3) {
+                            0 => Edit::Delete,
+                            1 => Edit::Replace(donors[rng.index(donors.len())].clone()),
+                            _ => Edit::InsertAfter(donors[rng.index(donors.len())].clone()),
+                        };
+                        targets.push((element.clone(), edit));
+                        last_end = Some(range.end());
+                    }
+                }
+
+                let (editor, edited) = SyntaxEditor::new(root.clone());
+                assert_eq!(edited, root);
+                let mut expected = before.clone();
+                let mut expected_text = text.clone();
+                for (target, edit) in targets.iter().rev() {
+                    let path = path(target);
+                    let (index, parent) = path.split_last().unwrap();
+                    let children = children_at(&mut expected, parent);
+                    let range = Range::<usize>::from(target.text_range());
+                    match edit {
+                        Edit::Delete => {
+                            editor.delete(target);
+                            children.remove(*index);
+                            expected_text.replace_range(range, "");
+                        }
+                        Edit::Replace(with) => {
+                            editor.replace(target, with);
+                            children[*index] = shape(with);
+                            expected_text.replace_range(range, &with.to_string());
+                        }
+                        Edit::InsertAfter(with) => {
+                            editor.insert(Position::after(target), with);
+                            children.insert(index + 1, shape(with));
+                            expected_text.insert_str(range.end, &with.to_string());
+                        }
+                    }
+                }
+                let edit = editor.finish();
+                let new = edit.new_root();
+                let at = format!("{}, outline {outline}", files[number].display());
+                assert!(new.parent().is_none(), "{at}");
+                assert_eq!(new.to_string(), expected_text, "{at}");
+                assert!(shape(&new.clone().into()) == expected, "{at}: not the edited structure");
+                let mut offset = 0;
+                for token in new.descendants_with_tokens().filter_map(SyntaxElement::into_token) {
+                    assert_eq!(usize::from(token.text_range().start()), offset, "{at}");
+                    offset += token.text().len();
+                }
+                assert!(shape(&root.clone().into()) == before, "{at}: the tree edited changed");
+                assert_eq!(edit.old_root(), &root, "{at}");
+            }
+        }
     }
 }

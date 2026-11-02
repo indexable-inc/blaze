@@ -1,0 +1,35 @@
+{
+  "id": "00860",
+  "from_lane": "pure-scripts",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/lib.rs"
+  ],
+  "what": "Lane pure-scripts wrote crates/blaze-usercode/src/pure.rs and crates/blaze-usercode/src/pure/tests.rs (new files in your crate, mine by docs/v2/plan/lanes/pure-scripts/design.md section 9: a pure build script's key, its find before compile, the check of its first run's trace against its proof, and its keep, all on index.rs's shapes). Please add `pub mod pure;` to crates/blaze-usercode/src/lib.rs (with a line in the module doc's parts list if you like) and, in docs/v2/plan/lanes/usercode/notes.md \"Runs\", one sentence pointing at it. No other change to your files.",
+  "state": "applied",
+  "created": "2026-10-30T08:59:43Z",
+  "updated": "2026-10-30T10:30:46Z",
+  "taken_by": "usercode",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:59:43Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:30:46Z",
+      "by": "usercode",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:30:46Z",
+      "by": "usercode",
+      "action": "done",
+      "note": "pub mod pure; is in blaze-usercode lib.rs, with a line in the module doc parts list; notes.md Runs points at it and design.md. pure.rs read: its crate:: items (Given, RunKey, RunKind, index::{find, keep, FindError, Found, KeepError}, run::Value, trace::Inputs) all exist. Not built."
+    }
+  ]
+}

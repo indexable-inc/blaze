@@ -1,0 +1,37 @@
+{
+  "id": "00120",
+  "from_lane": "db-ty-types",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_type_ir",
+    "crates/hir-ty/src/next_solver/persist.rs",
+    "v2/requests/solver-sync-inbox.md"
+  ],
+  "what": "## 2. Lane db: interner-free constructors in `vendor/rustc_type_ir`\n\nWhat: a constructor that takes no interner for each struct whose private `()` field forces one\nthrough `new_from_args(interner, ..)`, so a decoder can rebuild them from their fields:\n\n```diff\n--- a/vendor/rustc_type_ir/src/predicate.rs\n+++ b/vendor/rustc_type_ir/src/predicate.rs\n@@ impl<I: Interner> TraitRef<I> {\n     pub fn new_from_args(interner: I, trait_def_id: I::TraitId, args: I::GenericArgs) -> Self {\n         interner.debug_assert_args_compatible(trait_def_id.into(), args);\n         Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }\n     }\n+\n+    /// A trait reference of fields that were checked when it was first made, e.g. read back\n+    /// from an interned row.\n+    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {\n+        Self { def_id, args, _use_trait_ref_new_instead: () }\n+    }\n@@ impl<I: Interner> ExistentialTraitRef<I> {\n     pub fn new_from_args(interner: I, trait_def_id: I::TraitId, args: I::GenericArgs) -> Self {\n         interner.debug_assert_existential_args_compatible(trait_def_id.into(), args);\n         Self { def_id: trait_def_id, args, _use_existential_trait_ref_new_instead: () }\n     }\n+\n+    /// As [`TraitRef::from_checked_parts`].\n+    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {\n+        Self { def_id, args, _use_existential_trait_ref_new_instead: () }\n+    }\n@@ impl<I: Interner> ExistentialProjection<I> {\n     ) -> ExistentialProjection<I> {\n         interner.debug_assert_existential_args_compatible(def_id.into(), args);\n         Self { def_id, args, term, use_existential_projection_new_instead: () }\n     }\n+\n+    /// As [`TraitRef::from_checked_parts`].\n+    pub fn from_checked_parts(\n+        def_id: I::TraitAssocTermId,\n+        args: I::GenericArgs,\n+        term: I::Term,\n+    ) -> Self {\n+        Self { def_id, args, term, use_existential_projection_new_instead: () }\n+    }\n@@ impl<I: Interner> AliasTerm<I> {\n     ) -> AliasTerm<I> {\n         interner.debug_assert_args_compatible(kind.def_id(), args);\n         AliasTerm { kind, args, _use_alias_term_new_instead: () }\n     }\n+\n+    /// As [`TraitRef::from_checked_parts`].\n+    pub fn from_checked_parts(kind: AliasTermKind<I>, args: I::GenericArgs) -> Self {\n+        AliasTerm { kind, args, _use_alias_term_new_instead: () }\n+    }\n--- a/vendor/rustc_type_ir/src/ty_kind.rs\n+++ b/vendor/rustc_type_ir/src/ty_kind.rs\n@@ impl<I: Interner> AliasTy<I> {\n     pub fn new_from_args(interner: I, kind: AliasTyKind<I>, args: I::GenericArgs) -> AliasTy<I> {\n         interner.debug_assert_args_compatible(kind.def_id(), args);\n         AliasTy { kind, args, _use_alias_ty_new_instead: () }\n     }\n+\n+    /// As [`crate::TraitRef::from_checked_parts`].\n+    pub fn from_checked_parts(kind: AliasTyKind<I>, args: I::GenericArgs) -> AliasTy<I> {\n+        AliasTy { kind, args, _use_alias_ty_new_instead: () }\n+    }\n```\n\nWhy: `crates/hir-ty/src/next_solver/persist.rs` decodes these from interned rows and persisted\ntype tables, where no `DbInterner` exists (`kind()` takes none). Today it writes them field by\nfield through `MaybeUninit` (its `assemble!` macro), which is sound only because the private\nfield is a `()` and `DbInterner`'s two `debug_assert_*_args_compatible` are empty. With these,\n`assemble!` goes and each use becomes `X::from_checked_parts(..)`; I make that change when this\nlands.\n\n> forwarded to db: `vendor/rustc_type_ir` is lane db's.\n>\n> landed (2026-10-29): `persist.rs` now uses `from_checked_parts`; `assemble!` and its\n> `MaybeUninit` are gone.\n>\n> 2026-10-29: `vendor/` passed to solver-sync for the nightly-2026-10-27 rebase; asked to keep\n> this patch in `PATCHES.md` (`v2/requests/solver-sync-inbox.md`). Request 3 also went there.",
+  "state": "applied",
+  "created": "2026-10-30T01:08:34Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-types.md#2. Lane db: interner-free constructors in `vendor/rustc_type_ir`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-types.md:26"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: this patch in `PATCHES.md` (`v2/requests/solver-sync-inbox.md`). Request 3 also went there."
+    }
+  ]
+}

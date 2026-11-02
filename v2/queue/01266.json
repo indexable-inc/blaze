@@ -1,0 +1,29 @@
+{
+  "id": "01266",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "(re-filed by query-unify-port from blaze-v2-qu qu-only 01249, which collided on merge) docs/v2/plan/lanes/db/query-unify.md lines 88-89 (backdating) say an lru function value is hashed when it is made. The engine now hashes it when it is evicted, and hashes a rerun value only for a row that was evicted (db/function.rs evict and finish, test an_evictable_function_hashes_its_value_only_when_evicted). Please reword those lines; they are outside The contract, so query-unify-engine left them.",
+  "state": "applied",
+  "created": "2026-10-31T13:18:47Z",
+  "updated": "2026-10-31T13:40:14Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:18:47Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:40:14Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "duplicate of 01263 (query-unify-engine re-filed the same 01249 at 06:18); work 01263"
+    }
+  ]
+}

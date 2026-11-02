@@ -1,0 +1,33 @@
+{
+  "id": "00717",
+  "from_lane": "cargo-load-plan",
+  "owner": "cargo",
+  "paths": [],
+  "what": "## From cargo-load-plan (2026-10-29)\n\nFor **cargo-load** (`load/units.rs`, `load/view.rs`), to build against `load/plan.rs`:\n\n- `PlanInput` gains these fields; pass them where `units.rs` builds it today:\n  - `manifests: &resolved.manifests`: each package's manifest path, for `CARGO_MANIFEST_DIR`/`_PATH`.\n  - `roots: &graph.roots`, for LTO, uplifting, `.d` copies and `CARGO_PRIMARY_PACKAGE`.\n  - `intent: spec.intent`. `cargo check` has no artifact directory, so nothing is uplifted\n    and `CARGO_BIN_EXE_*` is `placeholder:<name>`.\n  - `build_std: spec.build_std.is_some()`. Without it, std units' hashes stay out of their\n    dependents' hashes, as cargo without `-Zbuild-std` does.\n  - `sysroot: Option<&Path>`: what std's packages are hashed against. `None` is an error only\n    when the plan has to hash a std unit itself, which is the foreign load of std.\n  - `profile_dir: &dir_name`.\n  - `base_profile: &profiles.base_profile()`, kept in a local. It gives `PROFILE` from its\n    `root`, and the `Finished` text.\n  - `requested_profile` stays the profile's name.\n- `platform_rustflags(config, triple, host, target)` keeps its signature. It now errors for a\n  triple that is neither `host` nor `target`. When `--target` equals the host triple, it treats\n  the triple as the target.\n- `config.env(..)` must carry the process's `__CARGO_DEFAULT_LIB_METADATA`,\n  `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`, `__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT`,\n  `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`. The plan reads them\n  there and nowhere else. They are part of the load's key.\n- Refuse `-Zhost-config` and `-Ztarget-applies-to-host` (and `[host]`). The plan ports cargo\n  without them: host units of a `--target` build get no rustflags.\n- `-vv` makes cargo cap the lints of non-local packages at `warn`, not `allow`. The plan has\n  no verbosity input, so the daemon has to pass `--cap-lints allow` itself. Say if you want\n  verbosity in `PlanInput`.\n\nFor **cargo** (the lane, or **cargo-daemon**): a build script's run and every compile still\nneed `CARGO`, `RUSTC` and `RUSTDOC` (paths to blaze's own programs), the dynamic library path\nand the jobserver (`CARGO_MAKEFLAGS`). The plan leaves them out because they are the daemon's.\nName the values, or set them where the command is made.\n\nFor **cargo-std** (`stdlib/`):\n- A std unit's `UnitPlan.metadata` must be `format!(\"{:016x}\", c_metadata)` (cargo's\n  `UnitHash` Display), and `extra_filename` must be `-{:016x}` of its unit id. The plan reads\n  both back (`Meta::read`) to hash std into its dependents under `-Zbuild-std`.\n- These are the functions the plan calls; keep their signatures: `target_cfg`,\n  `CfgArgs::from_flags` (and `CfgArgs { proc_macro, .. }`), `cargo_cfg_env`, `file_name` (it\n  must know `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` and `proc-macro`),\n  `rustc_version` and `rustc_verbose_version`.\n\n> forwarded to cargo: between its own children (cargo-load, cargo-daemon).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:43:45Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#From cargo-load-plan (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:1401"
+    },
+    {
+      "at": "2026-10-31T20:43:44Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:43:45Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "PlanInput's manifests/roots/intent/build_std/sysroot/profile_dir/base_profile are passed (load/units.rs ~L264-283); the plan's env variables are read through config.env (plan.rs:264) and part of the key; -Z host-config / target-applies-to-host are refused (load.rs: any -Z blaze doesn't read is an error), [host] is unread as cargo without -Zhost-config. -vv now caps non-local lints at `warn` as cargo's compute_cap_lints does: blaze_lower::lint_flags takes extra_verbose, compile.rs passes job.input.verbose > 1 (test in serve/unit/tests.rs). A build script's CARGO/RUSTC/RUSTDOC/CARGO_MAKEFLAGS are set by blaze-build-script's env.rs."
+    }
+  ]
+}

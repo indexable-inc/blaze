@@ -1,0 +1,25 @@
+{
+  "id": "01089",
+  "from_lane": "coord-1030",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer.rs",
+    "crates/hir-def/src/resolver.rs",
+    "crates/hir-ty/src/diagnostics.rs"
+  ],
+  "what": "## `blaze check` (bootstrap, blaze-discr front end) passes code rustc rejects\n\nv2's first build by the bootstrap passed `blaze check`, then codegen refused functions because their bodies had errors check never reported (`{type error}` layouts, `UnresolvedName`, `MissingFunctionDefinition`, `HasErrors`). Each case below is invalid Rust, now fixed in v2; check should have stopped on each. Minimal reproducers, each one crate:\n\n1. E0412, a type not imported in an inline module:\n```rust\nmod a { pub struct Db; }\nmod b { pub fn f(_: &Db) {} }\n```\n(v2: `mod tls_db` in `crates/hir-ty/src/next_solver/interner.rs`.)\n2. E0433, an unimported module as a path's first segment:\n```rust\nmod ir { pub mod types { pub const I64: u8 = 1; } }\nuse ir::{self};\nfn f() -> u8 { types::I64 }\n```\n(v2: `crates/blaze-stencil/src/arch/aarch64/glue.rs:255`.)\n3. E0425, a call to a function that does not exist in another crate: `other_crate::frame::cancelling()` (v2: `vendor/salsa/src/function/sync.rs:741`, `blaze_mem::frame::cancelling`).\n4. E0277, an unmet bound inside macro output: `#[salsa::tracked] fn f(db: &Db, ty: StoredTy) -> u32`, one argument that is no salsa struct, so the generated `<StoredTy as SalsaStructInDb>::lookup_ingredient_index` and `AsId::as_id(&ty)` have no impl (v2: `ty_form` in `crates/blaze-items/src/form.rs`). Plain form:\n```rust\ntrait T { fn g(); }\nstruct S;\nfn f() { <S as T>::g() }\n```\n5. E0277, `#[derive(Clone)]` on an enum with a field that is not `Clone`:\n```rust\nstruct NotClone;\n#[derive(Clone)] enum E { A(NotClone) }\n```\n(v2: `mbe::expander::Fragment` holding `tt::TopSubtree`.)\n6. E0774, `#[derive(Clone)]` left on a `fn` (v2: `crates/hir-def/src/item_scope.rs`, `fn exact` inserted between `Keyed`'s derive and the struct).\n7. E0277, `Result<(), &E>::map_err(Clone::clone)` with `E: !Clone` (v2: `fuzz/targets/api_cbor.rs:93`).\n8. E0308, `Body { store: ExpressionStore::empty().clone(), .. }`: `empty()` is `&'static ExpressionStore`, not `Clone`, so `.clone()` is the reference's (v2: `fuzz/targets/hir_body.rs:80`).\n9. E0282, a method call on an uninferred `Self`: `std::os::unix::ffi::OsStrExt::from_bytes(b).to_owned()` (rustc does not pick the trait's one impl for an inference variable; v2: `crates/blaze-usercode/src/trace.rs:714`).\n\nWhat each needs: the diagnostic rustc gives, as an error of `blaze check`, never a body that check passes and codegen then refuses. A test per case in the front end's diagnostics tests.",
+  "state": "open",
+  "created": "2026-10-30T16:20:42Z",
+  "updated": "2026-10-30T16:20:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:20:42Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

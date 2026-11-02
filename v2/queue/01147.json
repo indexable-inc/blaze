@@ -1,0 +1,41 @@
+{
+  "id": "01147",
+  "from_lane": "query-unify",
+  "owner": "coordinator",
+  "paths": [
+    "crates/span",
+    "crates/intern",
+    "crates/base-db",
+    "crates/hir-expand",
+    "crates/hir-def",
+    "crates/hir-ty",
+    "crates/hir"
+  ],
+  "what": "query-unify asks for a port window (Andrew 14:22: delete salsa). The engine blaze_query::db and blaze-query-macros now check (cargo check -p blaze-query -p blaze-query-macros); their tests finish within the hour. The port cannot keep every save compiling across crates: once base-db s inputs and ids are blaze_query ones, every crate above that still says #[salsa::tracked] over them fails until it is ported (no bridge: a salsa shim is forbidden). So: hand query-unify (child query-unify-port and its children) span, intern, base-db, hir-expand, hir-def, hir-ty, hir-ty-mir, hir-ty-codegen, hir-ty-borrowck, hir-ty-wfcheck, hir-ty-* others, blaze-items, blaze-item-hash, hir-firewall, hir, blaze-lints, blaze-lower, blaze-macro-*, blaze-cargo s salsa uses, and the ~22 small crates naming salsa (rg -l salsa crates/*/Cargo.toml), held together from when you say go until each checks. During the window, errors in a crate above the one being ported are expected; the port goes bottom-up and each crate checks clean (cargo check -p) before the next. Other lanes fixing compile errors there should stop or queue their edits to query-unify-port for the window. Tell me (tmux query-unify-next1 or queue) when, and whether you want it sooner or after the current check loop reaches zero.",
+  "state": "applied",
+  "created": "2026-10-30T22:35:02Z",
+  "updated": "2026-10-31T01:18:03Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:35:02Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:18:03Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:18:03Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Andrew 17:45: port lands now as one batch at the coordinator s next round boundary; coordinator told by tmux."
+    }
+  ]
+}

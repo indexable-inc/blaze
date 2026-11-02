@@ -1,0 +1,23 @@
+{
+  "id": "00001",
+  "from_lane": "speed-link-edge-macho",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link"
+  ],
+  "what": "## 6. From speed-link-edge-macho: a writer may encode pointer slots (Mach-O chained fixups)\n\nStatus: open, a proposal. For lead `link`.\n\nWhat: Mach-O's `LC_DYLD_CHAINED_FIXUPS` (ld-prime's default from macOS 12) stores each rebase\nand bind in the 8-byte slot itself: target (or import ordinal) plus the distance to the next\nslot of the same page. Today the core writes every `Abs64` slot as the unslid address and the\nwriter can only add file parts, so it cannot emit chains.\n\nThe change: `Writer` gains\n`fn encode(&self, placed: &Placed<'_>, region: usize, bytes: &mut [u8]) -> Result<Vec<Range<u64>>, LinkError>`\nwith a default body `Ok(Vec::new())`, called by `file.rs` after relocation and before\n`synthesize` for every region holding a rebase or bind (in parallel, one call per region),\nreturning the byte ranges it rewrote so `Stage::dirty` writes them. Mach-O implements it for\ndeployment targets of macOS 12 and later (`Output::platform.minimum >= 0x000c_0000`);\n`LC_DYLD_INFO_ONLY` opcodes stay for older ones, as ld64 chooses.\n\nWhy: chains are built in one pass per page as slots are placed (no sort when the slots are\nalready in address order), cost dyld nothing until a page is touched, and a relink rewrites only\nthe slots whose target or neighbour changed instead of re-encoding every opcode.\n\n> forwarded to link: `crates/blaze-link/` is lane link's.",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-29T23:49:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#6. From speed-link-edge-macho: a writer may encode pointer slots (Mach-O chained fixups)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:235"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "01046",
+  "from_lane": "integrate-engine",
+  "owner": "integrate",
+  "paths": [
+    "crates/blaze-wasm/src/lib.rs",
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "On 01042 (taken). hir-ty-codegen's v1 whole-object build has one user outside the crate besides blaze-bench: blaze-wasm, which you kept at 14:32 (00976 (a)). blaze-wasm/src/lib.rs compiles through v1's `CodegenUnit::compile(db, resolver, roots, ..)` with `Roots`, `Rejections`, `SymbolResolver`, `CodegenError`, `exported_symbol`, `link_name` (names.rs) and `hir_ty_codegen::wasm::{INDEX_LEN, WasmFunction, WasmSignature, WasmType}` (link.rs). That is the crate-at-a-time path 01042 deletes. v2 already compiles for wasm32 (v2/toolchain.rs Arch::Wasm32, v2/statics.rs wasm imports, blaze-link's wasm writer). Decision needed, my proposal first: (a) blaze-wasm compiles through v2's per-function units (hir_ty_codegen::v2 + blaze-link's wasm image) as part of integrate-load's 00976 rewrite (record.rs already goes onto blaze_lower), and I delete CodegenUnit and everything only it reaches in one step once blaze-wasm is off it; (b) blaze-wasm goes. Either way I start now on what doesn't wait: the closure of what v2/, host_cpu, Target, Assembled and the wasm types v2 uses need, and hir-ty-codegen off blaze_store (v1's store caches: cached.rs, later.rs Keeper, IncrementalCache, fncache's reach store, bench::entry_key) so integrate-store isn't blocked on blaze-wasm. Please answer which, and who moves blaze-wasm.",
+  "state": "applied",
+  "created": "2026-10-30T14:34:10Z",
+  "updated": "2026-10-30T14:53:13Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:34:10Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "(a): blaze-wasm compiles through v2 per-function units (hir_ty_codegen::v2 + blaze-link wasm image); then delete CodegenUnit and all only it reaches in one step. Owner of all of crates/blaze-wasm is now integrate-engine, including 00976 (a) (pack/record.rs onto blaze_lower over a serve job front end), which moves from integrate-load (near its context limit, part 2 not started); split it among children as you like. Coordinate the serve work kind in blaze-cargo/src/serve with integrate-load or cargo by queue."
+    }
+  ]
+}

@@ -1,13 +1,15 @@
 //! This module resolves `mod foo;` declaration to file.
-use arrayvec::ArrayVec;
-use base_db::{AnchoredPath, Crate, SourceDatabase};
+use base_db::{Db, AnchoredPath, Crate};
 use hir_expand::{EditionedFileId, name::Name};
+use intern::Symbol;
 
 use crate::HirFileId;
 
 const MOD_DEPTH_LIMIT: usize = 32;
 
-#[derive(Clone, Debug)]
+/// 16 bytes and `Copy`: the directory is an interned symbol, so the collector keeps one per module
+/// and hands it to every expansion collected there without copying the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ModDir {
     /// `` for `mod.rs`, `lib.rs`
     /// `foo/` for `foo.rs`
@@ -19,124 +21,145 @@ pub(super) struct ModDir {
     depth: u32,
 }
 
+const _: () = assert!(size_of::<ModDir>() == 12);
+
 impl ModDir {
     pub(super) fn root() -> ModDir {
         ModDir { dir_path: DirPath::empty(), root_non_dir_owner: false, depth: 0 }
     }
 
+    /// `buf` is scratch the caller keeps across declarations.
     pub(super) fn descend_into_definition(
         &self,
         name: &Name,
         attr_path: Option<&str>,
+        buf: &mut String,
     ) -> Option<ModDir> {
-        let path = match attr_path {
+        let depth = self.child_depth()?;
+        buf.clear();
+        match attr_path {
             None => {
-                let mut path = self.dir_path.clone();
-                path.push(name.as_str());
-                path
+                buf.push_str(self.dir_path.as_str());
+                buf.push_str(name.as_str());
+                buf.push('/');
             }
             Some(attr_path) => {
-                let mut path = self.dir_path.join_attr(attr_path, self.root_non_dir_owner);
-                if !(path.is_empty() || path.ends_with('/')) {
-                    path.push('/')
+                self.dir_path.join_attr(attr_path, self.root_non_dir_owner, buf);
+                if !(buf.is_empty() || buf.ends_with('/')) {
+                    buf.push('/')
                 }
-                DirPath::new(path)
             }
-        };
-        self.child(path, false)
+        }
+        Some(ModDir { dir_path: DirPath::new(buf), root_non_dir_owner: false, depth })
     }
 
-    fn child(&self, dir_path: DirPath, root_non_dir_owner: bool) -> Option<ModDir> {
+    fn child_depth(&self) -> Option<u32> {
         let depth = self.depth + 1;
         if depth as usize > MOD_DEPTH_LIMIT {
             tracing::error!("MOD_DEPTH_LIMIT exceeded");
             cov_mark::hit!(circular_mods);
             return None;
         }
-        Some(ModDir { dir_path, root_non_dir_owner, depth })
+        Some(depth)
     }
 
+    /// The candidate files are built one after the other in `buf`, scratch the caller keeps
+    /// across declarations.
     pub(super) fn resolve_declaration(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         file_id: HirFileId,
         name: &Name,
         attr_path: Option<&str>,
+        buf: &mut String,
     ) -> Result<(EditionedFileId, bool, ModDir), Box<[String]>> {
         let name = name.as_str();
+        let orig_file_id = file_id.original_file_respecting_includes(db);
+        let anchor = orig_file_id.file_id(db);
 
-        let mut candidate_files = ArrayVec::<_, 2>::new();
-        match attr_path {
+        buf.clear();
+        let suffixes: &[&str] = match attr_path {
             Some(attr_path) => {
-                candidate_files.push(self.dir_path.join_attr(attr_path, self.root_non_dir_owner))
+                self.dir_path.join_attr(attr_path, self.root_non_dir_owner, buf);
+                &[""]
             }
             None => {
-                candidate_files.push(format!("{}{}.rs", self.dir_path.0, name));
-                candidate_files.push(format!("{}{}/mod.rs", self.dir_path.0, name));
+                buf.push_str(self.dir_path.as_str());
+                buf.push_str(name);
+                &[".rs", "/mod.rs"]
             }
         };
-
-        let orig_file_id = file_id.original_file_respecting_includes(db);
-        for candidate in candidate_files.iter() {
-            let path = AnchoredPath { anchor: orig_file_id.file_id(db), path: candidate.as_str() };
-            if let Some(file_id) = db.resolve_path(path) {
-                let is_mod_rs = candidate.ends_with("/mod.rs");
+        let stem = buf.len();
+        for suffix in suffixes {
+            buf.truncate(stem);
+            buf.push_str(suffix);
+            if let Some(file_id) = db.resolve_path(AnchoredPath { anchor, path: buf.as_str() }) {
+                let is_mod_rs = buf.ends_with("/mod.rs");
 
                 let root_dir_owner = is_mod_rs || attr_path.is_some();
-                let dir_path = if root_dir_owner {
-                    DirPath::empty()
-                } else {
-                    DirPath::new(format!("{name}/"))
-                };
-                if let Some(mod_dir) = self.child(dir_path, !root_dir_owner) {
+                if let Some(depth) = self.child_depth() {
+                    let dir_path = if root_dir_owner {
+                        DirPath::empty()
+                    } else {
+                        buf.clear();
+                        buf.push_str(name);
+                        buf.push('/');
+                        DirPath::new(buf)
+                    };
                     return Ok((
                         // FIXME: Edition, is this rightr?
                         EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
                         is_mod_rs,
-                        mod_dir,
+                        ModDir { dir_path, root_non_dir_owner: !root_dir_owner, depth },
                     ));
                 }
             }
         }
+
+        let candidate_files: Box<[String]> = match attr_path {
+            Some(attr_path) => {
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
+                let mut path = String::new();
+                self.dir_path.join_attr(attr_path, self.root_non_dir_owner, &mut path);
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
+                Box::new([path])
+            }
+            None => {
+                let dir = self.dir_path.as_str();
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
+                Box::new([format!("{dir}{name}.rs"), format!("{dir}{name}/mod.rs")])
+            }
+        };
         // A `#[path]` can name a file outside the package, which its source root does not have.
         for candidate in &candidate_files {
-            db.include_source(
-                AnchoredPath { anchor: orig_file_id.file_id(db), path: candidate.as_str() },
-                krate,
-            );
+            db.include_source(AnchoredPath { anchor, path: candidate.as_str() }, krate);
         }
-        Err(candidate_files.into_iter().collect())
+        Err(candidate_files)
     }
 }
 
-#[derive(Clone, Debug)]
-struct DirPath(String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DirPath(Symbol);
 
 impl DirPath {
-    fn assert_invariant(&self) {
-        assert!(self.0.is_empty() || self.0.ends_with('/'));
-    }
-    fn new(repr: String) -> DirPath {
-        let res = DirPath(repr);
-        res.assert_invariant();
-        res
+    fn new(repr: &str) -> DirPath {
+        assert!(repr.is_empty() || repr.ends_with('/'));
+        DirPath(Symbol::intern(repr))
     }
     fn empty() -> DirPath {
-        DirPath::new(String::new())
+        DirPath(Symbol::empty())
     }
-    fn push(&mut self, name: &str) {
-        self.0.push_str(name);
-        self.0.push('/');
-        self.assert_invariant();
+    fn as_str(&self) -> &str {
+        self.0.as_str()
     }
     fn parent(&self) -> Option<&str> {
-        if self.0.is_empty() {
+        let path = self.as_str();
+        if path.is_empty() {
             return None;
         };
-        let idx =
-            self.0[..self.0.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
-        Some(&self.0[..idx])
+        let idx = path[..path.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
+        Some(&path[..idx])
     }
     /// So this is the case which doesn't really work I think if we try to be
     /// 100% platform agnostic:
@@ -151,14 +174,14 @@ impl DirPath {
     /// Here, we need to join logical dir path to a string path from an
     /// attribute. Ideally, we should somehow losslessly communicate the whole
     /// construction to `FileLoader`.
-    fn join_attr(&self, mut attr: &str, relative_to_parent: bool) -> String {
-        let base = if relative_to_parent { self.parent().unwrap() } else { &self.0 };
-
-        if attr.starts_with("./") {
-            attr = &attr["./".len()..];
+    fn join_attr(&self, attr: &str, relative_to_parent: bool, out: &mut String) {
+        let base = if relative_to_parent { self.parent().unwrap() } else { self.as_str() };
+        let attr = attr.strip_prefix("./").unwrap_or(attr);
+        out.push_str(base);
+        if attr.contains('\\') {
+            out.extend(attr.chars().map(|c| if c == '\\' { '/' } else { c }));
+        } else {
+            out.push_str(attr);
         }
-        let attr = if attr.contains('\\') { &attr.replace('\\', "/") } else { attr };
-        let res = format!("{base}{attr}");
-        res
     }
 }

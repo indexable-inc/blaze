@@ -1,0 +1,12 @@
+diff -ruN a/src/fast_reject.rs b/src/fast_reject.rs
+--- a/src/fast_reject.rs
++++ b/src/fast_reject.rs
+@@ -12,7 +12,7 @@
+ use crate::{self as ty, Const, Interner};
+ 
+ /// See `simplify_type`.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
+ pub enum SimplifiedType<DefId> {
+     Bool,

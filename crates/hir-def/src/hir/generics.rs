@@ -1,16 +1,14 @@
 //! Pre-type IR item generics
 use std::{ops, sync::LazyLock};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::name::Name;
 use la_arena::{Arena, Idx, RawIdx};
-use salsa::SalsaValue;
 use stdx::impl_from;
-use thin_vec::ThinVec;
 
 use crate::{
     AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
-    expr_store::{ExpressionStore, ExpressionStoreSourceMap},
+    expr_store::{ExpressionStore, ExpressionStoreSourceMap, path::Names},
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
         StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
@@ -53,7 +51,22 @@ impl LifetimeParamData {
     pub fn is_early_bound(&self) -> bool {
         self.bound_type == LifetimeBoundType::EarlyBound
     }
+
+    /// The name of the `index`th lifetime an impl's header leaves out (`&T`, `'_`), a fresh
+    /// lifetime parameter of the impl as rustc's resolver `fresh_lifetime` makes it: `'_#0`,
+    /// which no source can write, so only the header's own references name it.
+    pub fn fresh_name(index: u32) -> Name {
+        Name::new_lifetime(&format!("{FRESH_PREFIX}{index}")) // alloc: one name per fresh lifetime
+    }
+
+    /// Whether this is a lifetime an impl's header leaves out ([`Self::fresh_name`]), which
+    /// rustc names `'_`.
+    pub fn is_fresh(&self) -> bool {
+        self.name.as_str().starts_with(FRESH_PREFIX)
+    }
 }
+
+const FRESH_PREFIX: &str = "'_#";
 
 /// Data about a generic const parameter (to a function, struct, impl, ...).
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -70,7 +83,7 @@ pub enum TypeParamProvenance {
     ArgumentImplTrait,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub enum TypeOrConstParamData {
     TypeParamData(TypeParamData),
     ConstParamData(ConstParamData),
@@ -190,10 +203,11 @@ impl ops::Index<LocalLifetimeParamId> for GenericParams {
 /// A single predicate from a where clause, i.e. `where Type: Trait`. Combined
 /// where clauses like `where T: Foo + Bar` are turned into multiple of these.
 /// It might still result in multiple actual predicates though, because of
-/// associated type bindings like `Iterator<Item = u32>`.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+/// associated type bindings like `Iterator<Item = u32>`. `lifetimes` is the predicate's
+/// `for<..>` binder, a run in the store of the generics ([`ExpressionStore::names`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum WherePredicate {
-    TypeBound { lifetimes: Option<ThinVec<Name>>, target: TypeRefId, bound: TypeBound },
+    TypeBound { lifetimes: Option<Names>, target: TypeRefId, bound: TypeBound },
     Lifetime { target: LifetimeRefId, bound: LifetimeRefId },
 }
 
@@ -214,12 +228,12 @@ impl GenericParams {
         LazyLock::force(&EMPTY)
     }
 
-    pub fn of(db: &dyn SourceDatabase, def: GenericDefId) -> &GenericParams {
+    pub fn of(db: &Db, def: GenericDefId) -> &GenericParams {
         Self::with_store(db, def).0
     }
 
     pub fn with_store(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> (&GenericParams, &ExpressionStore) {
         match def {
@@ -263,7 +277,7 @@ impl GenericParams {
     }
 
     pub fn with_source_map(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> (&GenericParams, &ExpressionStore, &ExpressionStoreSourceMap) {
         match def {

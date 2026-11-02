@@ -1,0 +1,37 @@
+{
+  "id": "00054",
+  "from_lane": "codegen-devspeed",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir",
+    "crates/hir-ty-codegen",
+    "crates/blaze-codegen"
+  ],
+  "what": "## codegen-adapter (`v2/`, `crates/hir-ty-mir/`)\n\n1. **Call `settle`, not `inline` + `promote`.** `mod.rs`'s new `settle(ctx, cg)` is what every IR\n   build goes through before a backend: `inline`, `promote`, then `copies::lower_small` (small\n   `memcpy`/`memmove` of a known size become loads and stores, and every remaining libcall is\n   called in place), then `promote` again. `compile_as`, the tier body and the inlinable bodies\n   call it; `v2::backend`'s `prepare` should too, so v2's IR is v1's.\n2. **`v2::build` is read.** `Recorder::new` (fragment.rs) sets `Recorder::unit` from\n   `v2::build::building()`. With `Some`: `build` takes `aborts` and the compiling crate's\n   `debug_assertions` from it (what `ub_checks()` and core's `check_*_ub()` become, by rustc's\n   rule in `ub_checks_in`), and `inlined_callee` and `show_callee` build nothing in.\n3. **Keep storage markers at MIR level 1 when the code generator uses them**\n   (`hir-ty-mir/src/mir/optimize.rs:110`). rustc runs `RemoveStorageMarkers` only when it\n   emits no lifetime markers (`!sess.emit_lifetime_markers()`, which is at `-Copt-level=0`).\n   blaze's code generator always uses them: `overlap.rs` shares the slots of borrowed locals\n   from them, as LLVM's stack colouring does from lifetime markers. Codegen now asks for level\n   1 for every non-library crate at dev (`mod.rs` `mir_opt_level_of`). Without markers, every\n   borrowed local is live through the whole body (`mir/storage.rs`), and the frames of\n   functions with many borrowed locals grow back toward #1307's sizes. Suggested change: a\n   parameter of `optimize` (or a level variant) for \"the code generator emits lifetime\n   markers\", which codegen passes as true.\n4. **Fix `optimize.rs`'s module doc**: \"the code generator asks only when told to\n   (`BLAZE_MIR_OPT`)\" is no longer true. Codegen uses rustc's level (1 for a crate at -O0, 2\n   for library crates and above -O0), and `BLAZE_MIR_OPT` only overrides it.\n5. **rustc's debug-build UB checks** (`CheckAlignment`, `CheckNull`, `CheckEnums`,\n   `passes_not_ported`) are a behavior difference: rustc's debug build panics on a misaligned\n   or null raw-pointer dereference and on an invalid enum transmute; blaze's doesn't. They are\n   on when `ub_checks()` is (`sess.ub_checks()`). Now that codegen has that value\n   (`FunctionCx::ub_checks`), they can be ported and keyed on it.\n6. **v2 and inlining.** With a v2 unit building nothing in, the largest dev-speed fix (every\n   dependency's `#[inline(always)]` body built into its callers, as LLVM's always-inliner does\n   at -O0) is lost on the v2 path. `Recorder::built_in` now lists every instance whose body a\n   function has in it, transitively (`Inlinable::built_in`). Filling\n   `blaze_codegen::CompiledFunction::inlined` with their code hashes, and adding their requests\n   to `refs::walk`, would let v2 build them in too.\n7. **wasm under v2**: `inlined_callee` returns `None` for a v2 unit before its wasm branch, so\n   wasm-bindgen's descriptor shims (which must have their marker import's call built in, see\n   `always_inlined`) would not work under v2 until item 6 is done.\n\n> forwarded to codegen: items 1 to 7 are in lane codegen's own paths (`crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-codegen/`), for codegen-adapter.",
+  "state": "applied",
+  "created": "2026-10-30T00:26:26Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-devspeed.md#codegen-adapter (`v2/`, `crates/hir-ty-mir/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-devspeed.md:7"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "All in: compile_as runs settle (mod.rs:2004) and v2's built() goes through compile_as; v2::build::Build carries the unit's settings; optimize.rs MirOptions::lifetime_markers keeps storage markers; the module doc is true (BLAZE_MIR_OPT only overrides); check_pointers.rs / check_enums.rs port rustc's UB checks; inlined callees are listed by refs.rs and built_in, CompiledFunction::inlined holds their code hashes."
+    }
+  ]
+}

@@ -21,7 +21,7 @@ zlib, zstd, libxml2 or terminfo, so neither it nor a binary that links it asks t
 more than libc. On Linux it is built on the oldest hosted Ubuntu (22.04) like the release, on
 macOS for macOS 13 like the release, and on Windows against the static C runtime like blaze's
 Windows build. The prefix gets `blaze-llvm.json` (version, repository, commit, target), which
-crates/hir-ty-codegen/build.rs reads to refuse any other LLVM.
+vendor/llvm-sys/pin.rs reads to refuse any other LLVM.
 
 The fork is public: it is fetched anonymously, or with `--from` from a clone or a bundle that
 has the commit.
@@ -117,7 +117,8 @@ def cmake_args(target):
     args = [
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DLLVM_TARGETS_TO_BUILD=X86;AArch64",
+        # WebAssembly: blaze builds proc-macro crates for wasm32-wasip1 and runs them in Wasmtime.
+        "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;WebAssembly",
         "-DLLVM_ENABLE_PROJECTS=",
         "-DLLVM_ENABLE_ASSERTIONS=OFF",
         "-DLLVM_INCLUDE_TESTS=OFF",

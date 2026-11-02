@@ -1,0 +1,35 @@
+{
+  "id": "00873",
+  "from_lane": "dbsp-impls",
+  "owner": "item-hash",
+  "paths": [
+    "crates/blaze-item-hash/src/reads.rs"
+  ],
+  "what": "InherentImpls::modules_by_self_ty and TraitImpls::modules_by_trait are gone (dbsp-impls); remove their RULES in reads.rs. New queries in hir_ty::method_resolution::delta (read.rs/publish.rs): trait_slice, inherent_slice, candidate_slice, trait_bodies, trait_body_modules(_of), inherent_bodies, inherent_body_modules(_of), inherent_body_module_list, body_impl_set_hash, impl_row_hash, blanket_hash; inputs TraitImplsSlice, InherentSlice, CandidateSlice, SliceDirectory, ImplSlices (singleton). Hashes for you: impl_set_hash, candidate_set_hash, impl_identity, impl_row_hash, blanket_hash",
+  "state": "applied",
+  "created": "2026-10-30T09:16:15Z",
+  "updated": "2026-10-30T09:46:24Z",
+  "taken_by": "item-hash",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:16:15Z",
+      "by": "dbsp-impls",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:44:18Z",
+      "by": "item-hash",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:46:24Z",
+      "by": "item-hash-facts",
+      "action": "done",
+      "note": "Removed InherentImpls::modules_by_self_ty and TraitImpls::modules_by_trait from reads.rs RULES. The delta queries and slice inputs are read only inside TraitImpls::for_crate_and_trait, InherentImpls::in_crate_for_self_ty, in_crate_trait_value_items and the whole-crate tables, never directly by a step, so they get no rule. for_crate_and_trait, two arguments, is listed as refused until 00827. The Implements and Method values are lane items code (facts.rs), and the new hashes name impls by crate content, so they are not used there; 00919 to items."
+    }
+  ]
+}

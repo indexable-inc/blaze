@@ -1,0 +1,38 @@
+{
+  "id": "00676",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/design/unsafe.md",
+    "fuzz/targets/codegen_blob.rs",
+    "crates/blaze-codegen/src/blob.rs",
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "## From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` \"Fuzzing\")\n\nWhat: `fuzz/targets/codegen_blob.rs`, feeding arbitrary bytes to each decoder of\n`crates/blaze-codegen/src/blob.rs`: `decode`, `decode_static`, `decode_masked`, and\n`decode_view(bytes, &frame)` with a fresh `Frame`. Each gives `Err` or a value; for a value, check\nthat decoding its encoding (`encode`, `encode_static`, `encode_masked`) gives it again (the\nformat need not be canonical, so not \"its encoding is the input\"), and for `decode_view` that it\nagrees with `decode` of the same bytes.\nWhy: the blob is read from the store and the remote cache. The store verifies each value against\nits key before the decoder sees it (`blaze-cas` `Reader::get`), and the decoders are safe Rust,\nbut a parser of bytes from disk or the network gets a fuzz target by the plan. All four functions\nare `pub` already; nothing in codegen changes.\n\n> forwarded to the coordinator: `fuzz/` and `blaze-fuzz` are on the coordinator's line of `docs/v2/plan/reference/crates.md`, and no safety window runs; on requests' coordinator list (requests, pass 32).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:33:29Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/codegen.md#From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` \"Fuzzing\")",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:10221"
+    },
+    {
+      "at": "2026-10-30T08:33:29Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:29Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "New fuzz/targets/codegen_blob.rs (bin in fuzz/Cargo.toml, row in fuzz/README.md): every input through decode, decode_view (fresh frame::task frame), decode_static and decode_masked; a value read must read back the same after encode/encode_static/encode_masked, and decode_view.owned() must equal decode (same error too). Seeds are the writers own blobs (bare, full DWARF, Windows unwind templates; a bytes and a zeroed static; masked Some and None), each also a byte short and long. Not built (no builds this round); manifest lint clean."
+    }
+  ]
+}

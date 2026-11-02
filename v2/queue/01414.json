@@ -1,0 +1,36 @@
+{
+  "id": "01414",
+  "from_lane": "observe-explore",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "what": "observe-explore (the explorer's daemon side, crate blaze-explore; design docs/v2/plan/lanes/observe/explore.md): root Cargo.toml [workspace.dependencies], versions checked against crates.io today (wtransport 0.7.2 is the latest, 2026-08-11; rcgen 0.14.10 the latest, 2026-08-28; both sources read in ~/.cargo/registry):\n\n# The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a\n# self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;\n# no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).\nwtransport = { version = \"0.7.2\", default-features = false, features = [\"ring\"] }\n# The explorer's ECDSA P-256 certificate, made at start and rotated before it expires.\nrcgen = { version = \"0.14.10\", default-features = false, features = [\"ring\"] }\n\nand in the path-dependency block (beside blaze-profile; blaze-web is a member but not listed yet):\nblaze-explore = { path = \"crates/blaze-explore\" }\nblaze-web = { path = \"crates/blaze-web\" }\n\nCargo.lock regenerated (wtransport pulls quinn 0.11, wtransport-proto 0.7.2, x509-parser 0.18, sha2 0.11, socket2 0.6, url, pem; rcgen pulls yasna and time 0.3, already in the lock through other crates or new). Nothing uses these until crates/blaze-explore lands; I move it in only after this lands. arrow-array/arrow-ipc/arrow-schema come from 01412.",
+  "state": "applied",
+  "created": "2026-11-01T01:44:31Z",
+  "updated": "2026-11-01T02:31:03Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:44:31Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:26:21Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:31:03Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "root wtransport 0.7.2 and rcgen 0.14.10 (as written), blaze-web path line added. blaze-explore path line left out: manifest_lint refuses a path with no Cargo.toml, so add that one line in the change that moves crates/blaze-explore in. Until then manifest_lint reports wtransport, rcgen and blaze-web as used by no member (rayon already was)."
+    }
+  ]
+}

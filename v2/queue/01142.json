@@ -1,0 +1,25 @@
+{
+  "id": "01142",
+  "from_lane": "tests-engine",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/maintain.rs",
+    "crates/hir-def/src/nameres/delta.rs",
+    "crates/hir-def/src/nameres/facts/collect.rs"
+  ],
+  "what": "Every lowering panics in salsa: \"cannot create a tracked struct disambiguator outside of a tracked function\" (vendor/salsa/src/zalsa_local.rs:481). base_db::Db::maintain (crates/base-db/src/maintain.rs:361, reached from set_all_crates_with_durability via blaze_lower::lower_into) runs hir_def::nameres::delta::maintain -> maintain_all -> maintain_crate -> cutoff -> run::run_in -> facts::macros::resolve_round -> collect_expansion -> ModCollector::push_child_module, which calls ModuleIdLt::new (crates/hir-def/src/nameres/facts/collect.rs:1684), a salsa tracked struct, with no tracked function on the query stack. Fails blaze-engine as_rustc::tests::{autocfg_probes, rustix_writes_to_standard_output, type_error_fails_as_rustc, unknown_feature_fails, anyhow_backtrace_probe} (cargo-test3.log, HEAD 15:00) and any blaze-lower caller. Fix at the owner: make the maintainer create module ids through an interned/input id or inside a tracked fn, not tracked-struct new outside one. tests-engine reruns the 5 blaze-engine tests once done.",
+  "state": "open",
+  "created": "2026-10-30T22:27:44Z",
+  "updated": "2026-10-30T22:27:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

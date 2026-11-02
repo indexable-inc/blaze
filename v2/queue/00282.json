@@ -1,0 +1,23 @@
+{
+  "id": "00282",
+  "from_lane": "diagnostics",
+  "owner": "lints",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/registry/lints.rs"
+  ],
+  "what": "## diagnostics: register blaze's new lints and the group `blaze::hot`\n\n- What: in `crates/blaze-diagnostics/src/lints/registry/lints.rs`, next to\n  `blaze::const_impure`, six lints, each `Allow` by default, and a group:\n  - `blaze::hot_clone`: \"detects a `.clone()` that allocates or bumps a reference count in hot code\";\n  - `blaze::hot_alloc`: \"detects a call that reaches the global allocator in hot code\";\n  - `blaze::hot_dyn`: \"detects a call through `dyn` in hot code\";\n  - `blaze::std_hashmap`: \"detects std's `HashMap` and `HashSet` with their default hasher\";\n  - `blaze::parallelizable`: \"detects a sequential loop or iterator chain whose iterations are\n    independent and worth running in parallel\";\n  - `blaze::serial_dependence`: \"detects a hot loop kept serial by one loop-carried dependence\";\n  - group `blaze::hot` = the four hot lints (`hot_clone`, `hot_alloc`, `hot_dyn`,\n    `std_hashmap`); the two parallel lints are in no group.\n  The command line accepts `--warn=blaze::hot_alloc` and the rest (from `[lints.blaze]`).\n  (Updated 2026-10-29 for child `lints-parallel`; `blaze_lints::blaze::Lint::ALL` has the same six.)\n- Why: they run in blaze-lints (`blaze clippy`), but rustc's level machinery in\n  blaze-diagnostics sees `#[deny(blaze::hot)]` and `--deny=blaze::hot_alloc`: without them\n  registered, it says `unknown_lints`. Allow by default, so nothing changes for a crate that\n  doesn't name them (superset-of-rust).\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T02:56:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints.md#diagnostics: register blaze's new lints and the group `blaze::hot`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:79"
+    }
+  ]
+}

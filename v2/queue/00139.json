@@ -1,0 +1,40 @@
+{
+  "id": "00139",
+  "from_lane": "fix-names",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/proc-macro-srv",
+    "docs/v2/plan/reference/crates.md",
+    "vendor/proc-macro-srv/crates/parser/src/syntax_kind/generated.rs",
+    "crates/parser",
+    "crates/parser/src/syntax_kind/keywords.rs",
+    "Cargo.lock"
+  ],
+  "what": "## 2. Keywords in `vendor/proc-macro-srv` (no owner in `docs/v2/plan/reference/crates.md`)\n- What: give `vendor/proc-macro-srv/crates/parser/src/syntax_kind/generated.rs`\n  (`from_keyword`, `from_contextual_keyword`) the same tables as `crates/parser`\n  (`crates/parser/src/syntax_kind/keywords.rs`), with `blaze-phf` as a path dependency\n  (`path = \"../../../../crates/blaze-phf\"`) of that workspace's parser.\n- Why it is a request: `vendor/proc-macro-srv` is a workspace of its own (excluded from the\n  root, its own `Cargo.lock`, built alone by the release workflow), so the change needs its\n  lock regenerated, which no agent may run now; and it has no v2 owner to agree to diverging\n  from the release's copy. Its lexer runs only on the token text of macro input and output in\n  the server, so this is the smaller win of the two.\n\n> forwarded to coordinator: `vendor/proc-macro-srv/` has no owner in crates.md (also asked by usercode-macros 3).",
+  "state": "refused",
+  "created": "2026-10-30T01:36:52Z",
+  "updated": "2026-10-30T08:28:49Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "obsolete: vendor/proc-macro-srv (and its own parser and Cargo.lock) was deleted in v2 checkpoint 2f9a618943; the server now builds on the workspace crates/parser, which already has the blaze-phf keyword tables. Nothing left to change.",
+  "source": "v2/requests/fix-names.md#2. Keywords in `vendor/proc-macro-srv` (no owner in `docs/v2/plan/reference/crates.md`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fix-names.md:14"
+    },
+    {
+      "at": "2026-10-30T08:28:48Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:49Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "obsolete: vendor/proc-macro-srv (and its own parser and Cargo.lock) was deleted in v2 checkpoint 2f9a618943; the server now builds on the workspace crates/parser, which already has the blaze-phf keyword tables. Nothing left to change."
+    }
+  ]
+}

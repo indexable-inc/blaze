@@ -1,0 +1,23 @@
+{
+  "id": "00492",
+  "from_lane": "diagnostics-lints-bodies-types-values",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/hir.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-types-values: whether a closure is `const` (format, `crates/hir-def/src/hir.rs`)\n\nWhat: `Expr::Closure` records `const` (`const || ..`, `ast::ClosureExpr::const_token`), e.g. a\n`ClosureKind::Closure { is_const }` or a flag beside `capture_by`. Why: rustc's\n`hir_body_const_context` of a const closure is `ConstFn`, so `ptr_to_integer_transmute_in_consts`\nlints a pointer transmuted to an integer in one, and `unnecessary_transmutes` suggests `as u8`\nthere rather than `u8::from` (`lints/bodies/types/values/transmutes.rs`, `CheckTransmutes`).\nUntil it is there, a const closure counts as a closure that is not const, and those two cases\nin one are linted as in a plain closure.\n\n> forwarded to format: `crates/hir-def/src/hir.rs` is lane format's.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-values: whether a closure is `const` (format, `crates/hir-def/src/hir.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1645"
+    }
+  ]
+}

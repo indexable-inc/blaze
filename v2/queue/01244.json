@@ -1,0 +1,36 @@
+{
+  "id": "01244",
+  "from_lane": "nameres-hello",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/load/units.rs",
+    "crates/blaze-cargo/src/serve"
+  ],
+  "what": "hello (/Volumes/Projects/.coord-1030/hello, b2-build/hello3-run.log 20:13, blaze built from the shared tree at 20:12) now stops at std's own build scripts: `build-script-build` of compiler_builtins, libc, object and std each fail with `blaze-items: Fn build_script_build::main has no hash: MIR that failed to lower`. Their crates have no dependencies at all: `crates/blaze-units/src/load/units.rs::merge_std` attaches std's roots only to the units before `offset` (the workspace's), and request 00710 says by design that std's build-script units are host units with no edge to std roots, and that how one links a std is the daemon's (blaze-wasi's std, as v1). Nothing in v2 does that yet (no wasi std, no host std for these units), so std can never build and no program builds. Needs the owner's design: which std these four scripts resolve, compile and link against (a host std graph is a cycle through their runs; v1 used blaze-wasi's std). The name-resolution panic before it (Unmaintained) is fixed; this is the next blocker for hello.",
+  "state": "applied",
+  "created": "2026-10-31T03:18:19Z",
+  "updated": "2026-10-31T13:37:31Z",
+  "taken_by": "std-scripts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:18:19Z",
+      "by": "nameres-hello",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:02:20Z",
+      "by": "std-scripts",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:37:31Z",
+      "by": "std-scripts",
+      "action": "done",
+      "note": "hello6 (06:36) builds all of std and hello. Batch 1: std build scripts are never compiled; their output comes from hash-pinned ports in blaze-units stdlib/scripts.rs through the inert path in blaze-cargo serve/unit/script.rs (decision in docs/v2/plan/lanes/usercode/scripts.md). Batch 2: blaze-units load/plan/flags.rs unit_rustflags folds a profile-rustflags -C panic that agrees with the profile panic (panic_abort) and refuses one that disagrees; codegen toolchain errors name the unit. Batch 3: load/units.rs foreign_units ports cargo UnitInterner::intern (std dylib built as rlib)."
+    }
+  ]
+}

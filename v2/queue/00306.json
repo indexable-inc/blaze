@@ -1,0 +1,38 @@
+{
+  "id": "00306",
+  "from_lane": "usercode-hot-sandbox",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/sandbox.rs",
+    "crates/blaze-cargo/src/sandbox/linux.rs",
+    "docs/v2/plan/goals/principles.md"
+  ],
+  "what": "## 1. `blaze-alloc-count` as a dev-dependency of `blaze-cargo`\n\n- **What**: in `crates/blaze-cargo/Cargo.toml`, under `[dev-dependencies]`, add one line:\n\n  ```toml\n  blaze-alloc-count.workspace = true\n  ```\n\n  `blaze-alloc-count` is already in the root `[workspace.dependencies]`.\n- **Where it is used**: the allocation-budget tests of the sandbox's hot paths\n  (`crates/blaze-cargo/src/sandbox.rs` `mod tests`, `crates/blaze-cargo/src/sandbox/linux.rs`\n  `mod tests`). `sandbox.rs`'s `mod tests` installs the counting allocator for the crate's test\n  binary (`#[global_allocator] static ALLOC: blaze_alloc_count::Counting`). It forwards to\n  `System`, which is the allocator that binary uses today, so no other test changes.\n- **Why**: docs/v2/plan/goals/principles.md, \"By test\": each hot path has an allocation-budget\n  test. Without the line the crate's tests don't build.\n- **Note for whoever adds a second budget test elsewhere in `blaze-cargo`**: a test binary can\n  have only one `#[global_allocator]`, and this one is in `sandbox.rs`. Don't add another: call\n  `blaze_alloc_count::measure` from anywhere in the crate.\n\n> forwarded to cargo (`crates/blaze-cargo/Cargo.toml`) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:17:26Z",
+  "updated": "2026-10-31T20:29:29Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode-hot-sandbox.md#1. `blaze-alloc-count` as a dev-dependency of `blaze-cargo`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-hot-sandbox.md:3"
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: crates/blaze-cargo/Cargo.toml:115 blaze-alloc-count.workspace = true under [dev-dependencies]"
+    }
+  ]
+}

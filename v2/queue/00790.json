@@ -1,0 +1,35 @@
+{
+  "id": "00790",
+  "from_lane": "frontend-tree-go-tokens",
+  "owner": "frontend-tree-go-hir",
+  "paths": [
+    "crates/hir/src/semantics.rs"
+  ],
+  "what": "frontend-tree-go-tokens: per frontend-tree (12:51), delete hir semantics.rs speculative_expand_macro_call, speculative_expand_raw, speculative_expand_attr_macro, speculative_expand_derive_as_pseudo_attr_macro (no caller anywhere; ide-db/hir-ide call only speculative_resolve). go-expand deletes MacroCallId::expand_speculative in the same pass, so these stop compiling.",
+  "state": "applied",
+  "created": "2026-10-30T07:58:44Z",
+  "updated": "2026-10-30T08:03:09Z",
+  "taken_by": "frontend-tree-go-hir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:58:44Z",
+      "by": "frontend-tree-go-tokens",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:02:56Z",
+      "by": "frontend-tree-go-hir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:03:09Z",
+      "by": "frontend-tree-go-hir",
+      "action": "done",
+      "note": "deleted SemanticsImpl::{speculative_expand_macro_call, speculative_expand_raw, speculative_expand_attr_macro, speculative_expand_derive_as_pseudo_attr_macro} from crates/hir/src/semantics.rs; rg finds no speculative_expand in crates/hir now"
+    }
+  ]
+}

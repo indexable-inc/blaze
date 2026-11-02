@@ -1,0 +1,42 @@
+{
+  "id": "01110",
+  "from_lane": "dedup",
+  "owner": "dedup-engines",
+  "paths": [
+    "crates/blaze-live/src",
+    "crates/blaze-inproc/src"
+  ],
+  "what": "dedup (one way per job): two runtimes patch a running program. blaze-inproc is v2 (compile-time.md change 6, fastcompile/inproc.md): one shared code memory, a word store makes code reachable, fences retire old code, no mprotect and no stopped threads; blaze-cargo dev runs use it (serve/unit/run/inproc.rs). blaze-live keeps its own: Live::start maps each patch next to the program and either writes jumps over function entries with every other thread stopped (src/apply.rs, the v1 path its own doc calls v1) or uses the slots runtime (src/slots*). Its users are harness/live*, live-bevy, live-egui (Live::start/poll) and, for the patch message only, blaze-link and blaze-cargo (blaze_live::patch).\nAsk: make Live::start/poll a thin user API over blaze_inproc (attach, runtime::quiesce at poll, the fence), keep blaze_live::patch as the one message format (or move it into blaze-link), and delete apply.rs and the map-and-jump path with its platform modules. If the stop-the-world path is a different job (a program not started by blaze, no BLAZE_INPROC), say so with the case and dedup records it as kept. Tier-up sampling (sample.rs, tiers) stays with whichever runtime owns the process.",
+  "state": "applied",
+  "created": "2026-10-30T21:45:03Z",
+  "updated": "2026-10-31T17:23:14Z",
+  "taken_by": "dedup-engines",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:45:03Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from link (no live window) to dedup-engines, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T17:05:57Z",
+      "by": "dedup-engines",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:23:14Z",
+      "by": "dedup-engines",
+      "action": "done",
+      "note": "phase 2 edits ready, uncompiled: blaze-live on blaze-inproc (frames 0x0300..0x0307, hashes not code, watcher/message files gone), blaze-link (child), blaze-cargo run/inproc, premap key.rs:343, fuzz, demos, flake lifeSource; see /tmp/blaze-lanes/v2-dedup-engines.md for the cargo round"
+    }
+  ]
+}

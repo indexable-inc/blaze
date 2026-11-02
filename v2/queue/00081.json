@@ -1,0 +1,36 @@
+{
+  "id": "00081",
+  "from_lane": "core-windows",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/core.md",
+    "docs/v2/plan/lanes/core/plane.md"
+  ],
+  "what": "## 4. docs/v2/plan/lanes/core.md's Windows section: how a process's end is heard\n\n- What: where it says the process's end is the job's `JOB_OBJECT_MSG_EXIT_PROCESS`, say\n  instead: \"a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to\n  the port; the job's messages, which Windows does not promise to deliver, only say that the job\n  went past its memory, and the driver then kills it\". Also: \"a memory-limited job's peak is at\n  most its limit: Windows refuses any commit past it\".\n- Where: `docs/v2/plan/lanes/core.md` and `~/restart-2026-10-28/briefs/v2/core-windows.md` (if\n  that brief is kept as the record).\n- Why: the job's completion-port messages are documented as not guaranteed. A lost\n  `EXIT_PROCESS` would leave a spawn in flight forever, while a wait on the process handle\n  always fires. And with `JOB_OBJECT_LIMIT_JOB_MEMORY` the commit is refused at the limit, so\n  \"a peak over it\" can't be observed; the test checks `0 < peak_memory <= limit` and an exit\n  code other than 0.\n\n---\nApplied by core: 1 asked of the coordinator (core's request 6, with blaze-core's line in the\nsame change); 2 (the file script runs on `Iocp` in `tests.rs`; the process scripts stay Unix,\n`iocp.rs` covers Windows processes); 3 (`fs.rs` on Windows re-exports `iocp::files`'s\n`write_atomically`, `rename`, `clone`, `set_mode` and `map`, so `Threads` and `Iocp` share one\nimplementation; `files_end_as_on_threads` no longer special-cases the clone); 4 asked of the\ncoordinator (core's request 7) and in docs/v2/plan/lanes/core/plane.md.\n\n> forwarded to coordinator: a lane's plan (`docs/v2/plan/lanes/core.md`) changes by request to the coordinator, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T00:47:49Z",
+  "updated": "2026-10-30T08:26:24Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/core-windows.md#4. docs/v2/plan/lanes/core.md's Windows section: how a process's end is heard",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-windows.md:82"
+    },
+    {
+      "at": "2026-10-30T08:26:24Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:24Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/lanes/core.md \"Windows\": added that a child end comes from a thread-pool wait on the process (RegisterWaitForSingleObject) posted to the port, the job messages only say it went past its memory and the driver then kills it (iocp.rs KEY_JOB arm), and a memory-limited job peak is at most its limit. plane.md already said so. The brief under ~/restart-2026-10-28 is a record, left as it is."
+    }
+  ]
+}

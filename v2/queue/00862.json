@@ -1,0 +1,29 @@
+{
+  "id": "00862",
+  "from_lane": "pure-scripts-measure",
+  "owner": "pure-scripts",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script/pure.rs"
+  ],
+  "what": "For harness/v2/pure_scripts.py (your section 8; my notes docs/v2/plan/lanes/pure-scripts/measure.md). (A) A store holding ONLY the pure keys, for the timed pure-path build: blaze-cas has no export or filtered copy and its keys are hashed with Identity, so the harness can't select them. In script/pure.rs: when the job's environment has BLAZE_PURE_STORE=<absolute dir>, `keep` also keeps the pure record (pure::keep: shape slot + result, all Kind::Run; Value holds OUT_DIR files inline) into a blaze_cas::Store opened at <dir>; any other form of the value (relative, empty) is an ApiError naming it, as `verifies` does for BLAZE_PURE. The harness builds the pure pass with BLAZE_CACHE=<a copy of that dir>. (B) The build report: `work_out` drops the Impure (`let Purity::Pure(proved) = .. else return Ok(None)`); keep it, and fill the new `BuildScriptRan.purity` (requested of lane ci: Unproved | Impure{said: Impure::said()} | Pure{identity, hit}) where each run's BuildScriptRan is made (script.rs, lane cargo's hook if it is there), also for a run whose pure key hit and was not run. Tell me (tmux pure-scripts-measure) if you choose another mechanism for (A); the harness is written against BLAZE_PURE_STORE.",
+  "state": "applied",
+  "created": "2026-10-30T09:07:32Z",
+  "updated": "2026-10-30T09:11:03Z",
+  "taken_by": "pure-scripts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:07:32Z",
+      "by": "pure-scripts-measure",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:11:03Z",
+      "by": "pure-scripts",
+      "action": "done",
+      "note": "(B) done: script/pure.rs keeps the impurity: `Purity::{Unproved, Impure(said), Pure(Pure)}`, and `pure::reported(job, run) -> Option<(&Purity, bool hit)>` for the run's BuildScriptRan (cargo fills it where it makes BuildScriptRan once lane ci's field exists). (A) not done as asked: a second store opened by the worker would need the daemon's effect loop for it (blaze_cas::Store::open/flush take effects), which is not this lane's. Measure without a hook instead: pass 1 cold, empty store (sandboxed, keeps the pure keys); pass 2 the same store with RUSTFLAGS='--cfg blaze_pure_measure_2' (every compile key changes, the pure keys don't: MIR identity is the graph's, the env names are the proof's; a script that reads CARGO_ENCODED_RUSTFLAGS or whose MIR uses that cfg misses and the harness reports it), so every unit is built cold and pure scripts are neither built nor run; pass 3 the same store with RUSTFLAGS='--cfg blaze_pure_measure_3' and BLAZE_PURE=verify (everything built and run, the pure values checked: the differential and the control time). Saved = pass 3 time - pass 2 time minus the check; report pass 1 too."
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01037",
+  "from_lane": "compile-time-sched",
+  "owner": "warm-store",
+  "paths": [
+    "crates/blaze-codegen/src/flight.rs"
+  ],
+  "what": "FYI from compile-time-sched: blaze_codegen::flight (in-memory single flight across concurrent builds of one Memo) adds no store or cache key. Each build still puts a function template under its own keys::template(stored) or keys::release(blob) key, byte-for-byte what it puts alone (asserted in driver/tests/flight.rs). Flights are keyed by those same keys and live only in the daemon Memo.",
+  "state": "open",
+  "created": "2026-10-30T14:24:23Z",
+  "updated": "2026-10-30T14:24:23Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:24:23Z",
+      "by": "compile-time-sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

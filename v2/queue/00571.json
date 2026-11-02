@@ -1,0 +1,24 @@
+{
+  "id": "00571",
+  "from_lane": "db-expand",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/names/dead",
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## db-expand: `pub macro` reachability (diagnostics, `crates/blaze-diagnostics/src/lints/names/dead/`)\n\nWhat: `hir_def::macro_reach` (new) is the front end's half of rustc's\n`update_reachability_from_macro`. rustc reads nothing of a macro's body. Each pass of\n`EmbargoVisitor`'s fixpoint marks the names of the macro's module (and of the modules in it\nthat are accessible from it) as reachable, and in each later pass the next ancestor's names,\nalways asking what is accessible from the macro's module.\n- `macro_reach_module(db, MacroId) -> Option<ModuleId>`: `Some(module)` for an opaque macro\n  (a `macro`, or a `macro_rules!` with `#[rustc_macro_transparency = \"opaque\"]`) whose parent\n  is a module, not a block.\n- `MacroReachable::default()`, kept for the whole fixpoint, and\n  `update_from_macro(db, module, |reached| ..)`, called once per pass for each macro whose\n  effective visibility is public at some level (rustc's `public_at_level(macro).is_some()`).\n  `Reached::Def(def)` is rustc's `update(def, macro_ev, Reachable)`: public when its own\n  visibility is `pub`, which is `Walk::update`. `Reached::FieldType(field)` is\n  `reach(field, macro_ev).ty()`: `Walk::ty` of the field's type, and not the field itself.\n\nWhere: `lints/names/dead/reach.rs` `Walk::interfaces`. rustc's passes matter here: a macro\nreaches one more ancestor per pass, and the fixpoint stops after a pass that changes nothing.\nSo the worklist loop becomes passes: each pass calls `update_from_macro` for the public macros,\nthen drains the queue and the impls as now, and the loop ends after a pass that made nothing\nnew public. Then `defs.rs:418-422` drops `unported` for a `MacroDef` with a visibility.\n\nWhy: `v2/requests/diagnostics.md` \"diagnostics-lints-names-dead: a `global_asm!` item and `pub\nmacro` reachability\", part (2). Part (1) (`global_asm!`) waits on format's item-tree item.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand: `pub macro` reachability (diagnostics, `crates/blaze-diagnostics/src/lints/names/dead/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:395"
+    }
+  ]
+}

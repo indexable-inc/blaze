@@ -1,0 +1,21 @@
+{
+  "id": "00008",
+  "from_lane": "speed-link-edge-macho",
+  "owner": "link",
+  "paths": [],
+  "what": "## 14. From speed-link-edge-macho: a suffix of a pushed name (`model.rs` `Names`)\n\nStatus: open, does not block. For lead `link`.\n\n`impl Names { pub fn suffix(&self, name: Name, from: u32) -> Option<Name> }`: `name`'s bytes from\n`from`, when `from` is at most its length and on a character boundary. A reader of a string\ntable indexed by offset (a BSD `__.SYMDEF`, ELF's `.strtab` with tail-merged strings) then\npushes each string once and names every offset inside it as a suffix, so its arena is at most\nthe table's size whatever the index says (item 12's bug 5 in its remaining form).\n\n> forwarded to link.",
+  "state": "open",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-29T23:49:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/link.md#14. From speed-link-edge-macho: a suffix of a pushed name (`model.rs` `Names`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:965"
+    }
+  ]
+}

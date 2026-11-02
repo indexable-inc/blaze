@@ -1,0 +1,37 @@
+{
+  "id": "00499",
+  "from_lane": "diagnostics-lints-bodies-panics",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/eval.rs",
+    "crates/base-db/src/lib.rs",
+    "v2/requests/codegen-rq-mir.md"
+  ],
+  "what": "## diagnostics-lints-bodies-panics: `long_running_const_eval` (codegen, `crates/hir-ty-mir/src/mir/eval.rs`, `crates/base-db/src/lib.rs` `ConstEvalBudget`)\n\nWhat: count the evaluator's steps as rustc's `rustc_const_eval/src/const_eval/machine.rs`\n(`increment_const_eval_counter`) does: at `LINT_TERMINATOR_LIMIT` (2,000,000) emit the deny\nlint `long_running_const_eval` at the evaluation's lint scope, message \"constant evaluation is\ntaking a long time\", note \"this lint makes sure the compiler doesn't get stuck due to infinite\nloops in const eval.\\n    If your compilation actually takes a long time, you can safely allow\nthe lint\", help \"the constant being evaluated\" at the item's span; stop when its level is an\nerror, go on when it is allowed or warn (`TINY_LINT_TERMINATOR_LIMIT`, 20, under\n`-Z tiny-const-eval-limit`); from `PROGRESS_INDICATOR_START` (4,000,000) steps, the\n`LongRunningWarn` warning at each power of two (\"the const evaluator is currently\ninterpreting this expression\"). Why: it is const evaluation's, not a body lint (the brief asked\nme to decide: codegen's). Today `ConstEvalBudget { steps: 1_000_000_000, .. }` stops with\n`MirEvalError::OverBudget` instead, so a program rustc accepts with\n`#![allow(long_running_const_eval)]` and a long loop blaze refuses, and one rustc refuses at\n2,000,000 steps blaze evaluates (superset-of-rust). The front end has no step counter to read.\n\n> forwarded to codegen: `crates/hir-ty-mir/src/mir/eval.rs` is lane codegen's.\n> not applied, by codegen-rq-mir (2026-10-29): waits on db and diagnostics. The evaluator\n> counts what rustc counts already (blocks run, `eval.rs` `run_frame`). What it can't get is\n> the lint's level: only blaze-diagnostics computes levels, and hir-ty-mir can't depend on it.\n> The design and the asks are in `v2/requests/codegen-rq-mir.md` R5: a front-end `lint_level`\n> query (moved from `lints/levels/`, one copy), and a `long_running` field on hir-ty's\n> const-eval result for the warn level and the progress warnings. After that, the evaluator\n> folds the 2,000,000-step check into the counter it already decrements, so speed is\n> unchanged. It reads the level only when an evaluation reaches that step.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-31T20:36:07Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-panics: `long_running_const_eval` (codegen, `crates/hir-ty-mir/src/mir/eval.rs`, `crates/base-db/src/lib.rs` `ConstEvalBudget`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1859"
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-mir/src/mir/eval.rs: LINT_TERMINATOR_LIMIT (2,000,000), Evaluator::lint_mark checked in the step decrement (one compare per block), long_running reads hir_lint_levels' level at the outermost frame of the evaluation's crate (best_lint_scope; crate root when none) and stops with the new MirEvalError::LongRunning (hir-ty/src/mir.rs) at an error level. Only for constant/static initializers. Rendered in mir_pretty/errors.rs and hir-ty-codegen mod.rs. Tests in tests/consteval.rs exec_limits (deny, allow, warn, callee allowed). The warn-level warning and progress notes need a field on hir-ty's const-eval result: asked of db."
+    }
+  ]
+}

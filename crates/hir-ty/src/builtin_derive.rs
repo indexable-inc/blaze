@@ -2,23 +2,25 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, LocalFieldId, TraitId,
+    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, TraitId,
     TypeOrConstParamId, TypeParamId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait,
     hir::generics::{GenericParams, TypeOrConstParamData},
 };
 use itertools::Itertools;
-use la_arena::ArenaMap;
 use rustc_type_ir::{
     AliasTyKind, TypeFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast,
     inherent::{GenericArgs as _, IntoKind},
 };
 
 use crate::{
-    FieldType, GenericPredicates,
+    GenericPredicates,
     db::HirDatabase,
+    lower::FieldTypes,
     next_solver::{
         AliasTy, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
         StoredEarlyBinder, TraitRef, Ty, TyKind, Unnormalized, fold::fold_tys, generics::Generics,
@@ -84,7 +86,7 @@ pub(crate) fn generics_of<'db>(
     }
 }
 
-pub fn generic_params_count(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> usize {
+pub fn generic_params_count(db: &Db, id: BuiltinDeriveImplId) -> usize {
     let loc = id.loc(db);
     let adt_params = GenericParams::of(db, loc.adt.into());
     let extra_params_count = match loc.trait_ {
@@ -129,7 +131,7 @@ pub fn impl_trait<'db>(
                 loc.adt,
                 GenericArgs::identity_for_item(interner, loc.adt.into()),
             );
-            EarlyBinder::bind(TraitRef::new_from_args(
+            EarlyBinder::bind(interner, TraitRef::new_from_args(
                 interner,
                 trait_id.into(),
                 trait_args(loc.trait_, self_ty),
@@ -144,7 +146,7 @@ pub fn impl_trait<'db>(
                 coerce_pointee_params(interner, loc, generic_params, trait_id)
             else {
                 // Malformed derive.
-                return EarlyBinder::bind(TraitRef::new(
+                return EarlyBinder::bind(interner, TraitRef::new(
                     interner,
                     trait_id.into(),
                     [self_ty, self_ty],
@@ -152,7 +154,10 @@ pub fn impl_trait<'db>(
             };
             let changed_args = replace_pointee(interner, pointee_param_idx, new_param_ty, args);
             let changed_self_ty = Ty::new_adt(interner, loc.adt, changed_args);
-            EarlyBinder::bind(TraitRef::new(interner, trait_id.into(), [self_ty, changed_self_ty]))
+            EarlyBinder::bind(
+                interner,
+                TraitRef::new(interner, trait_id.into(), [self_ty, changed_self_ty]),
+            )
         }
     }
 }
@@ -163,11 +168,11 @@ pub fn impl_super_outlives<'db>(
     _id: BuiltinDeriveImplId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     // Currently no builtin-derived traits have super outlive bounds.
-    EarlyBinder::bind(&[])
+    EarlyBinder::bind_iter(&[])
 }
 
-#[salsa::tracked(returns(ref))]
-pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPredicates {
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+pub fn predicates(db: &Db, impl_: BuiltinDeriveImplId) -> GenericPredicates {
     let loc = impl_.loc(db);
     let generic_params = GenericParams::of(db, loc.adt.into());
     let interner = DbInterner::new_with(db, loc.module(db).krate(db));
@@ -176,7 +181,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
         .trait_
         .get_id(interner.lang_items())
         .expect("we don't pass the impl to the solver if we can't resolve the trait");
-    match loc.trait_ {
+    blaze_mem::frame::current(|frame| match loc.trait_ {
         BuiltinDeriveImplTrait::Copy
         | BuiltinDeriveImplTrait::Clone
         | BuiltinDeriveImplTrait::Debug
@@ -185,7 +190,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
         | BuiltinDeriveImplTrait::PartialOrd
         | BuiltinDeriveImplTrait::Eq
         | BuiltinDeriveImplTrait::PartialEq => {
-            simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
+            simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id, frame)
         }
         BuiltinDeriveImplTrait::Reborrow => {
             explicit_own_predicates(adt_predicates.own_explicit_predicates())
@@ -195,7 +200,14 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
                 // Enums don't have extra bounds.
                 explicit_own_predicates(adt_predicates.own_explicit_predicates())
             } else {
-                simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
+                simple_trait_predicates(
+                    interner,
+                    loc,
+                    generic_params,
+                    adt_predicates,
+                    trait_id,
+                    frame,
+                )
             }
         }
         BuiltinDeriveImplTrait::CoerceUnsized | BuiltinDeriveImplTrait::DispatchFromDyn => {
@@ -204,6 +216,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
             else {
                 // Malformed derive.
                 return GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+                    interner,
                     Clauses::empty().store(),
                 ));
             };
@@ -226,6 +239,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
                     .upcast(interner)
             });
             GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+                interner,
                 Clauses::new_from_iter(
                     adt_predicates
                         .explicit_predicates()
@@ -237,13 +251,13 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
                 .store(),
             ))
         }
-    }
+    })
 }
 
 fn explicit_own_predicates<'db>(
     predicates: EarlyBinder<'db, impl Iterator<Item = Clause<'db>>>,
 ) -> GenericPredicates {
-    GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+    GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind_no_rigid_aliases(
         Clauses::new_from_iter(predicates.skip_binder()).store(),
     ))
 }
@@ -290,6 +304,7 @@ fn simple_trait_predicates<'db>(
     generic_params: &GenericParams,
     adt_predicates: &GenericPredicates,
     trait_id: TraitId,
+    frame: &Frame,
 ) -> GenericPredicates {
     let extra_predicates = generic_params
         .iter_type_or_consts()
@@ -306,7 +321,7 @@ fn simple_trait_predicates<'db>(
             let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), trait_args);
             trait_ref.upcast(interner)
         });
-    let mut assoc_type_bounds = Vec::new();
+    let mut assoc_type_bounds = Vec::new_in(frame);
     match loc.adt {
         AdtId::StructId(id) => extend_assoc_type_bounds(
             interner,
@@ -335,6 +350,7 @@ fn simple_trait_predicates<'db>(
         }
     }
     GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+        interner,
         Clauses::new_from_iter(
             adt_predicates
                 .explicit_predicates()
@@ -349,23 +365,23 @@ fn simple_trait_predicates<'db>(
 
 fn extend_assoc_type_bounds<'db>(
     interner: DbInterner<'db>,
-    assoc_type_bounds: &mut Vec<Clause<'db>>,
-    fields: &ArenaMap<LocalFieldId, FieldType>,
+    assoc_type_bounds: &mut Vec<Clause<'db>, &Frame>,
+    fields: &FieldTypes,
     trait_id: TraitId,
     trait_: BuiltinDeriveImplTrait,
 ) {
-    struct ProjectionFinder<'a, 'db> {
+    struct ProjectionFinder<'a, 'f, 'db> {
         interner: DbInterner<'db>,
-        assoc_type_bounds: &'a mut Vec<Clause<'db>>,
+        assoc_type_bounds: &'a mut Vec<Clause<'db>, &'f Frame>,
         trait_id: TraitId,
         trait_: BuiltinDeriveImplTrait,
     }
 
-    impl<'db> TypeVisitor<DbInterner<'db>> for ProjectionFinder<'_, 'db> {
+    impl<'db> TypeVisitor<DbInterner<'db>> for ProjectionFinder<'_, '_, 'db> {
         type Result = ();
 
         fn visit_ty(&mut self, t: Ty<'db>) -> Self::Result {
-            if let TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
+            if let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
                 self.assoc_type_bounds.push(
                     TraitRef::new_from_args(
                         self.interner,

@@ -30,26 +30,26 @@
 //! that order, or the seed, is not; `blaze` writes their entries sorted in a key for the
 //! same reason.
 
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::borrow::Cow;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::LazyLock;
 
-use base_db::{Crate, LangCrateOrigin};
+use base_db::{Crate, Db, LangCrateOrigin};
+use blaze_hash::{FixedState, HashMap, HashSet};
+use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
-use cranelift_module::ModuleRelocTarget;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
     signatures::{
         FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
     },
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
-use salsa::plumbing::{AsId, FromId};
 
-use hir_def::CallableDefId;
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    intrinsic::Intrinsic,
     mir::{
         AggregateKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
         TerminatorKind,
@@ -63,8 +63,7 @@ mod dispatch;
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
-    InstanceDef, MEM, Requests, Result, SymbolResolver, compiled_instance, compiled_root,
-    compiled_static,
+    InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root, compiled_static,
     fragment::{Code, TextPart},
     home::Homes,
     is_thread_local, link_name, ptr, type_id,
@@ -77,40 +76,31 @@ const CODE: &str = "__blaze_cache_code";
 const CODEC: &str = "__blaze_codec";
 /// Changes when what is hashed does, so no hash of before means anything now.
 const FORMAT: u32 = 1;
+/// Whether `BLAZE_FN_CACHE_TRACE` asks for what the walk goes through, read once a process.
+static TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some());
 
 /// Whether `func` is the function a cached function asks for the code of its body.
-pub(super) fn is_code(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub(super) fn is_code(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).name.as_str() == CODE
 }
 
-fn is_codec(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn is_codec(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).name.as_str() == CODEC
 }
 
 /// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
-pub(super) fn cached_closure(db: &dyn HirDatabase, func: FunctionId) -> Option<salsa::Id> {
-    if !uses_cache(db, func.krate(db)) {
+pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<blaze_query::db::Id> {
+    if !hir_ty::fn_cache::uses_fn_cache(db, func.krate(db)) {
         return None;
     }
     cached_closure_of(db, func).map(|it| it.as_id())
 }
 
-/// Whether `krate` can have cached functions: the attribute calls into the `blaze` crate, so
-/// a crate without it as a dependency has none, and costs nothing to look through.
-pub(super) fn uses_cache(db: &dyn HirDatabase, krate: Crate) -> bool {
-    krate.data(db).dependencies.iter().any(|dep| {
-        dep.crate_id
-            .extra_data(db)
-            .display_name
-            .as_ref()
-            .is_some_and(|name| name.crate_name().symbol().as_str() == "blaze")
-    })
-}
-
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn cached_closure_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
 ) -> Option<InternedClosureId<'db>> {
     let body = db.mir_body(func.into()).ok()?;
@@ -118,7 +108,7 @@ fn cached_closure_of<'db>(
         let TerminatorKind::Call { func: callee, .. } = &block.terminator.as_ref()?.kind else {
             return None;
         };
-        let (callee, args) = fn_item(callee)?;
+        let (callee, args) = callee.fn_item()?;
         if !is_code(db, callee) {
             return None;
         }
@@ -127,46 +117,33 @@ fn cached_closure_of<'db>(
     })
 }
 
-/// The function a constant operand names, with its generic arguments.
-fn fn_item<'db>(operand: &Operand) -> Option<(FunctionId, GenericArgs<'db>)> {
-    let ty: Ty<'db> = match &operand.kind {
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        _ => return None,
-    };
-    let TyKind::FnDef(def, args) = ty.kind() else { return None };
-    match def.0 {
-        CallableDefId::FunctionId(func) => Some((func, args)),
-        _ => None,
-    }
-}
-
 /// The hash of the code of the closure a cached function keeps its body in and of all it
 /// reaches, or why the function can't be cached.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn cache_code(
-    db: &dyn HirDatabase,
+    db: &Db,
     closure: Instance,
     env: StoredParamEnvAndCrate,
 ) -> std::result::Result<u128, String> {
     let (trouble, counted) = arguments_trouble(db, &closure, &env);
     let mut walk = Walk::new(db, counted);
-    let root = walk.reach(Node::Instance(closure.clone(), env.clone()));
+    // clone: the root node owns its key; a stored param env is a reference count
+    let root = walk.reach(Node::Instance(closure, env.clone()));
     let mut next = 0;
-    while let Some(node) = walk.nodes.get(next).map(|it| it.node.clone()) {
-        walk.hash_node(next as u32, &node);
+    while next < walk.nodes.len() {
+        walk.hash_node(next as u32);
         next += 1;
     }
-    let name = cached_name(db, &closure);
-    if let Some(why) = walk.impure(root) {
-        return Err(format!("`{name}` is not cached: {why}"));
-    }
-    if let Some(why) = trouble {
+    if let Some(why) = walk.impure(root).or(trouble) {
+        let name = cached_name(db, &closure);
+        // alloc: the error, why the function is not cached
         return Err(format!("`{name}` is not cached: {why}"));
     }
     let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    (FORMAT, super::target::Target::current().triple(), super::store::toolchain())
-        .hash(&mut hasher);
+    // The nightly: what is outside the checkout is hashed by its stable name, which a
+    // nightly's std can change the code of.
+    let toolchain = crate::v2::toolchain::NIGHTLY;
+    (FORMAT, super::target::Target::current().triple(), toolchain).hash(&mut hasher);
     closure.checked.hash(&mut hasher);
     for arg in closure.args.as_ref().iter() {
         arg.ty()
@@ -180,428 +157,24 @@ pub(super) fn cache_code(
     Ok(u128::from(low) | u128::from(high) << 64)
 }
 
-/// For each of `roots`, the functions a test harness runs, a hash of the code of the function
-/// and of everything it reaches, as [`cache_code`] hashes a cached body, for a test to be run
-/// again only once that changed, and the first of each [`Kind`] of what makes its end depend
-/// on more than that code, by the fewest calls ([`Reach::found`]): what blaze can't compile,
-/// the world outside the program (files, the environment, processes, the network), foreign
-/// code, assembly, a function pointer made from data, a static other tests can change, and
-/// the clock, randomness and threads, which only make a test flaky.
-///
-/// The nodes are hashed once for all the roots; each root then hashes, in the order it finds
-/// them, every node it reaches with where the node's edges go in that order, so that a hash
-/// does not depend on the other roots.
-///
-/// A function of crates outside the checkout, instantiated with their types, is hashed by its
-/// stable name and not gone into: the name stands for its code and for all it reaches, as it
-/// does for the store's compiled functions ([`super::cached`]). What a test's hash says of
-/// what is below it, what it reaches of each kind, is kept in the store by the name, so that
-/// a daemon with the store compiles none of it.
-pub fn tests_reach(
-    db: &dyn HirDatabase,
-    symbols: &dyn SymbolResolver,
-    roots: &[FunctionId],
-) -> Vec<Reach> {
-    let header = (
-        FORMAT,
-        "tests by stable names",
-        super::target::Target::current().triple(),
-        super::store::toolchain(),
-    );
-    let started = std::time::Instant::now();
-    let mut took = Vec::new();
-    let names = super::stable::StableNames::new(db, symbols, FxHashSet::default(), true);
-    took.push(("names", started.elapsed()));
-    let store = super::store::Store::global();
-    let mut walk = Walk::new(db, false);
-    walk.tests = true;
-    let starts: Vec<u32> = roots.iter().map(|&it| walk.reach(Node::Root(it))).collect();
-    let mut sealed: FxHashMap<u32, Sealed> = FxHashMap::default();
-    let mut spent = [std::time::Duration::ZERO; 5];
-    let mut next = 0;
-    // In waves of the nodes found and not yet hashed: each is named and looked up in the
-    // store, the code of those to be hashed is compiled on every core, then they are hashed
-    // in the order found, which is all a hash depends on.
-    while next < walk.nodes.len() {
-        let wave: Vec<Node> = walk.nodes[next..].iter().map(|it| it.node.clone()).collect();
-        let mut looked = Vec::with_capacity(wave.len());
-        for node in &wave {
-            let before = std::time::Instant::now();
-            let name = sealed_name(db, &names, node);
-            spent[0] += before.elapsed();
-            let Some(name) = name else {
-                looked.push(None);
-                continue;
-            };
-            let key = below_key(&header, &name);
-            let before = std::time::Instant::now();
-            let below = Below::known(store, &key);
-            spent[1] += before.elapsed();
-            looked.push(Some((name, key, below)));
-        }
-        let hashed: Vec<&Node> = wave
-            .iter()
-            .zip(&looked)
-            .filter(|(_, looked)| matches!(looked, None | Some((_, _, None))))
-            .map(|(node, _)| node)
-            .filter(|node| !matches!(node, Node::Leaf(..)))
-            .collect();
-        let before = std::time::Instant::now();
-        compile_ahead(symbols, &hashed);
-        spent[4] += before.elapsed();
-        for (node, looked) in wave.iter().zip(looked) {
-            let at = next as u32;
-            next += 1;
-            let Some((name, key, below)) = looked else {
-                let before = std::time::Instant::now();
-                walk.hash_node(at, node);
-                spent[2] += before.elapsed();
-                continue;
-            };
-            if below.is_none() {
-                let before = std::time::Instant::now();
-                walk.hash_node(at, node);
-                spent[3] += before.elapsed();
-                walk.segments.pop();
-            }
-            let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-            (4u8, &name).hash(&mut hasher);
-            let type_id::Fingerprint(low, high) = hasher.finish();
-            walk.segments.push(u128::from(low) | u128::from(high) << 64);
-            sealed.insert(at, Sealed { key, below });
-        }
-    }
-    took.push(("nodes", started.elapsed()));
-    // One found later is mostly below one found earlier, and is then taken whole by it.
-    let mut walked: Vec<u32> =
-        sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
-    walked.sort_unstable_by(|a, b| b.cmp(a));
-    let added = walked.len();
-    for at in walked {
-        let below = Arc::new(below_of(&walk, &sealed, at));
-        Below::keep(store, &sealed[&at].key, &below);
-        sealed.get_mut(&at).unwrap().below = Some(below);
-    }
-    // What a daemon adds is left in the store's open pack, which the next daemon does not
-    // read: sealed now, a daemon that starts later walks none of it again.
-    if added >= SEAL_AFTER
-        && let Some(store) = store
-    {
-        std::thread::spawn(move || store.seal());
-    }
-    took.push(("below", started.elapsed()));
-    let mut local: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut way = Way::default();
-    let reach = starts
-        .into_iter()
-        .map(|start| {
-            local.clear();
-            way.clear(start);
-            local.insert(start, 0);
-            let mut found = Vec::new();
-            let mut at = 0;
-            while let Some(&node) = way.order.get(at) {
-                if let Some(Sealed { below: Some(below), .. }) = sealed.get(&node) {
-                    for it in &below.found {
-                        if !found.iter().any(|seen: &Found| seen.kind == it.kind) {
-                            let path = joined(walk.path_to(&way, at), &it.path);
-                            found.push(Found { path, ..it.clone() });
-                        }
-                    }
-                    at += 1;
-                    continue;
-                }
-                for (kind, what, why) in walk.reasons(node) {
-                    if !found.iter().any(|seen| seen.kind == kind) {
-                        found.push(Found { kind, what, why, path: walk.path_to(&way, at) });
-                    }
-                }
-                for edge in &walk.nodes[node as usize].edges {
-                    if let std::collections::hash_map::Entry::Vacant(it) = local.entry(edge.to) {
-                        it.insert(way.order.len() as u32);
-                        way.push(edge.to, at, edge.site);
-                    }
-                }
-                at += 1;
-            }
-            let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-            header.hash(&mut hasher);
-            for &node in &way.order {
-                walk.segments[node as usize].hash(&mut hasher);
-                let edges = match sealed.contains_key(&node) {
-                    true => &[][..],
-                    false => &walk.nodes[node as usize].edges[..],
-                };
-                edges.len().hash(&mut hasher);
-                for edge in edges {
-                    local[&edge.to].hash(&mut hasher);
-                }
-            }
-            let type_id::Fingerprint(low, high) = hasher.finish();
-            found.sort_by_key(|it| it.kind);
-            Reach { hash: u128::from(low) | u128::from(high) << 64, found }
-        })
-        .collect();
-    took.push(("roots", started.elapsed()));
-    if std::env::var_os("BLAZE_STATS").is_some() {
-        let steps: Vec<String> =
-            took.iter().map(|(name, at)| format!("{name}={}", at.as_micros())).collect();
-        eprintln!(
-            "tests-reach-steps-us: {} (naming={} store={} compiling={} hashing={} sealed-hashing={}; {} roots, {} nodes, {} sealed)",
-            steps.join(" "),
-            spent[0].as_micros(),
-            spent[1].as_micros(),
-            spent[4].as_micros(),
-            spent[2].as_micros(),
-            spent[3].as_micros(),
-            roots.len(),
-            walk.nodes.len(),
-            sealed.len()
-        );
-    }
-    reach
-}
-
-/// Compiles the code [`Walk::hash_node`] hashes of each of `nodes` on every core, for the
-/// queries to have it when the walk asks.
-fn compile_ahead(symbols: &dyn SymbolResolver, nodes: &[&Node]) {
-    symbols.in_parallel(nodes.len(), &|db, _, at| match nodes[at] {
-        Node::Root(func) => _ = compiled_root(db, *func),
-        Node::Instance(instance, env) => _ = compiled_instance(db, instance.clone(), env.clone()),
-        Node::Static(id) => _ = compiled_static(db, *id),
-        Node::Leaf(..) => {}
-    });
-}
-
-/// The nodes a walk from one node found, in the order found, each with where in `order` the
-/// node that first reached it is and by what.
-#[derive(Default)]
-struct Way {
-    order: Vec<u32>,
-    from: Vec<u32>,
-    via: Vec<Site>,
-}
-
-impl Way {
-    fn clear(&mut self, start: u32) {
-        self.order.clear();
-        self.from.clear();
-        self.via.clear();
-        self.push(start, 0, Site::None);
-    }
-
-    fn push(&mut self, node: u32, from: usize, via: Site) {
-        self.order.push(node);
-        self.from.push(from as u32);
-        self.via.push(via);
-    }
-}
-
-/// The calls to a sealed node, then those `rest` has below it: the sealed node calls the next
-/// where `rest`'s first, itself, says.
-fn joined(mut path: Vec<Call>, rest: &[Call]) -> Vec<Call> {
-    if let (Some(last), Some(first)) = (path.last_mut(), rest.first()) {
-        last.at = first.at.clone();
-    }
-    path.extend(rest.iter().skip(1).cloned());
-    path
-}
-
-/// A node [`tests_reach`] takes whole by its stable name.
-struct Sealed {
-    /// Where the store keeps what is below it.
-    key: [u8; super::store::KEY],
-    /// Read from the store, or found by going into it.
-    below: Option<Arc<Below>>,
-}
-
-/// What a test's hash says of what a node reaches, the node itself too: the first of each
-/// [`Kind`], with the calls to it from the node.
-#[derive(Default)]
-struct Below {
-    found: Vec<Found>,
-}
-
-/// What is below each sealed node this process found or read, by its key: the store gives
-/// only what its sealed packs have, and a pack is sealed once it is full, so what one build
-/// adds is not found there by the next builds of the daemon.
-static KNOWN: LazyLock<Mutex<FxHashMap<[u8; super::store::KEY], Arc<Below>>>> =
-    LazyLock::new(Default::default);
-
-/// How many sealed nodes a walk finds what is below of for the store's open pack to be sealed.
-const SEAL_AFTER: usize = 256;
-
-/// How many sealed nodes [`KNOWN`] keeps before it starts again.
-const KNOWN_AT_MOST: usize = 1 << 20;
-
-impl Below {
-    const FORMAT: &str = "below 2";
-
-    /// What is below the sealed node of `key`, as this process or the store has it.
-    fn known(
-        store: Option<&super::store::Store>,
-        key: &[u8; super::store::KEY],
-    ) -> Option<Arc<Below>> {
-        if let Some(it) = KNOWN.lock().unwrap().get(key) {
-            return Some(it.clone());
-        }
-        let below = Arc::new(Below::read(&store?.get(key)?)?);
-        Below::remember(key, &below);
-        Some(below)
-    }
-
-    /// Keeps what is below the sealed node of `key`, for this process and in the store.
-    fn keep(
-        store: Option<&super::store::Store>,
-        key: &[u8; super::store::KEY],
-        below: &Arc<Below>,
-    ) {
-        if let Some(store) = store {
-            store.insert(key, below.write().as_bytes());
-        }
-        Below::remember(key, below);
-    }
-
-    fn remember(key: &[u8; super::store::KEY], below: &Arc<Below>) {
-        let mut known = KNOWN.lock().unwrap();
-        if known.len() >= KNOWN_AT_MOST {
-            known.clear();
-        }
-        known.insert(*key, below.clone());
-    }
-
-    /// A line for each found: its kind, what, why and each call, all after tabs; where a
-    /// call calls the next follows its name after a `\x1f`.
-    fn write(&self) -> String {
-        let field = |it: &str| it.replace(['\t', '\n', '\x1f'], " ");
-        let mut out = format!("{}\n", Self::FORMAT);
-        for it in &self.found {
-            out.push_str(it.kind.name());
-            for text in [&it.what, &it.why] {
-                out.push('\t');
-                out.push_str(&field(text));
-            }
-            for call in &it.path {
-                out.push('\t');
-                out.push_str(&field(&call.name));
-                if let Some(at) = &call.at {
-                    out.push('\x1f');
-                    out.push_str(&field(at));
-                }
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn read(bytes: &[u8]) -> Option<Below> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.lines();
-        if lines.next()? != Self::FORMAT {
-            return None;
-        }
-        let mut below = Below::default();
-        for line in lines {
-            let mut fields = line.split('\t');
-            let kind = Kind::from_name(fields.next()?)?;
-            let what = fields.next()?.to_owned();
-            let why = fields.next()?.to_owned();
-            let path = fields
-                .map(|it| match it.split_once('\x1f') {
-                    Some((name, at)) => Call { name: name.to_owned(), at: Some(at.to_owned()) },
-                    None => Call { name: it.to_owned(), at: None },
-                })
-                .collect();
-            below.found.push(Found { kind, what, why, path });
-        }
-        Some(below)
-    }
-}
-
-/// The stable name `node` is taken whole by in a test's hash: that of a function, a closure
-/// or a coroutine with nothing of the checkout in its name. `None` for anything else, and for
-/// what has no stable name.
-fn sealed_name(
-    db: &dyn HirDatabase,
-    names: &super::stable::StableNames<'_, '_>,
-    node: &Node,
-) -> Option<String> {
-    let name = match node {
-        Node::Root(func) => names.instance(&super::root_instance(db, *func))?,
-        Node::Instance(instance, _) => match instance.def {
-            InstanceDef::Fn(_)
-            | InstanceDef::Closure(_)
-            | InstanceDef::Coroutine(_)
-            | InstanceDef::CoroutineByMove(_) => names.instance(instance)?,
-            _ => return None,
-        },
-        Node::Static(_) | Node::Leaf(..) => return None,
+/// What `instance` of the cached function `func` writes as the code of its body
+/// ([`FunctionCx::cache_code`]): the hash of all its closure reaches, or why it is not cached.
+/// `None` for a function that asks for no closure's code. The function's own code hash takes
+/// its closure by interface, so a key of its code must take this beside it.
+pub(super) fn written_code<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    instance: &Instance,
+    env: &StoredParamEnvAndCrate,
+) -> Option<&'db std::result::Result<u128, String>> {
+    let id = (*cached_closure_of(db, func))?;
+    let closure = Instance {
+        def: InstanceDef::Closure(id.as_id()),
+        args: instance.args,
+        checked: instance.checked,
     };
-    (!super::stable::StableNames::of_checkout(&name)).then_some(name)
-}
-
-fn below_key(header: &impl std::fmt::Debug, name: &str) -> [u8; super::store::KEY] {
-    use sha2::Digest;
-    sha2::Sha256::digest(
-        format!("tests reach below\n{}\n{header:?}\n{name}", Below::FORMAT).as_bytes(),
-    )
-    .into()
-}
-
-/// What `start`, a sealed node gone into, reaches, as [`Below`] has it: a sealed node below it
-/// that has what is below it is not gone into again.
-fn below_of(walk: &Walk<'_>, sealed: &FxHashMap<u32, Sealed>, start: u32) -> Below {
-    let mut below = Below::default();
-    let mut way = Way::default();
-    way.clear(start);
-    let mut seen = FxHashSet::from_iter([start]);
-    let mut at = 0;
-    while let Some(&node) = way.order.get(at) {
-        let known = sealed.get(&node).and_then(|it| it.below.as_ref()).filter(|_| node != start);
-        match known {
-            Some(inner) => {
-                for it in &inner.found {
-                    if !below.found.iter().any(|seen| seen.kind == it.kind) {
-                        let path = joined(walk.path_to(&way, at), &it.path);
-                        below.found.push(Found { path, ..it.clone() });
-                    }
-                }
-            }
-            None => {
-                for (kind, what, why) in walk.reasons(node) {
-                    if !below.found.iter().any(|seen| seen.kind == kind) {
-                        below.found.push(Found { kind, what, why, path: walk.path_to(&way, at) });
-                    }
-                }
-                for edge in &walk.nodes[node as usize].edges {
-                    if seen.insert(edge.to) {
-                        way.push(edge.to, at, edge.site);
-                    }
-                }
-            }
-        }
-        if below.found.len() == Kind::ALL.len() {
-            break;
-        }
-        at += 1;
-    }
-    below.found.sort_by_key(|it| it.kind);
-    below
-}
-
-/// What [`tests_reach`] says of a test.
-pub struct Reach {
-    /// Of its code and all it reaches; of what it reaches that can't be compiled, by name.
-    pub hash: u128,
-    /// The first of each [`Kind`] it reaches, by the fewest calls, in the order of the kinds.
-    pub found: Vec<Found>,
-}
-
-impl Reach {
-    /// Whether its end is a function of its code alone: nothing it reaches [`Kind::blocks`].
-    pub fn hermetic(&self) -> bool {
-        self.found.iter().all(|it| !it.kind.blocks())
-    }
+    let env = Homes::default().home(db, &closure, env);
+    Some(cache_code(db, closure, env))
 }
 
 /// A way a test's end depends on more than its code.
@@ -614,6 +187,9 @@ pub struct Found {
     pub why: String,
     /// The fewest calls that take the test to it: the test, what it calls and so on.
     pub path: Vec<Call>,
+}
+
+impl Found {
 }
 
 /// A function on the way from a test to what it reaches.
@@ -650,7 +226,7 @@ fn without_arguments(name: &str) -> String {
 /// decide, by its symbol, and of which [`Kind`]: `None` for what gives the same for the same
 /// input, as far as a test can tell. Locks are left out: a test that turns on how its threads
 /// are scheduled is flaky whether it runs again or not.
-fn outside(symbol: &str) -> Option<(Kind, &'static str)> {
+pub(crate) fn outside(symbol: &str) -> Option<(Kind, &'static str)> {
     let name = symbol.trim_start_matches('_');
     let name = name.split('$').next().unwrap_or(name);
     let name = name.strip_suffix("64").unwrap_or(name);
@@ -805,28 +381,37 @@ impl Kind {
 }
 
 /// The name of the function whose body `closure` is, as a backtrace has it.
-pub(super) fn cached_name(db: &dyn HirDatabase, closure: &Instance) -> String {
+pub(super) fn cached_name(db: &Db, closure: &Instance) -> String {
+    // alloc: the text the cached function is given, or its error, once a cached function
     let InstanceDef::Closure(id) = closure.def else { return "?".to_owned() };
     match InternedClosureId::from_id(id).loc(db).owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
             function_name(db, func, closure.args.as_ref())
         }
+        // alloc: the text the cached function is given, or its error, once a cached function
         _ => "?".to_owned(),
     }
 }
 
-fn function_name(db: &dyn HirDatabase, func: FunctionId, args: GenericArgs<'_>) -> String {
+fn function_name(db: &Db, func: FunctionId, args: GenericArgs<'_>) -> String {
     hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice())
+        // alloc: a name is owned as `rustc_function_name` gives it: a leaf's key, or a message
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
-pub(crate) fn crate_name(db: &dyn HirDatabase, krate: Crate) -> String {
-    krate.extra_data(db).display_name.as_ref().map_or_else(|| "?".to_owned(), |it| it.to_string())
+pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
+    // alloc: the name of a static or a message; a lookup compares `crate_name_str`
+    crate_name_str(db, krate).to_owned()
+}
+
+/// [`crate_name`], borrowed.
+fn crate_name_str(db: &Db, krate: Crate) -> &str {
+    krate.extra_data(db).display_name.as_ref().map_or("?", |it| it.as_str())
 }
 
 /// What the hash goes through: the functions and statics compiled, and what has no code of
 /// ours, by its name.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 enum Node {
     Root(FunctionId),
     Instance(Instance, StoredParamEnvAndCrate),
@@ -853,7 +438,9 @@ struct Edge {
 
 struct Seen {
     node: Node,
-    edges: Vec<Edge>,
+    /// Its edges in [`Walk::edges`], pushed together while it is hashed.
+    edges: std::ops::Range<u32>,
+    /// What keeps it from being pure, a leaf's apart: that is in its [`Node::Leaf`].
     why: Option<Why>,
 }
 
@@ -861,27 +448,39 @@ struct Seen {
 struct Why {
     /// What the node does, as said of it: "dereferences a raw pointer". Of a foreign function
     /// or a static it is said of what uses it: "calls the foreign function `write`".
-    text: String,
+    text: Cow<'static, str>,
     of_user: bool,
     /// Where that is written, when that is told.
     place: Option<String>,
 }
 
 impl Why {
-    fn own(text: impl Into<String>) -> Option<Why> {
+    fn own(text: impl Into<Cow<'static, str>>) -> Option<Why> {
         Some(Why { text: text.into(), of_user: false, place: None })
     }
 
-    fn of_user(text: impl Into<String>) -> Option<Why> {
+    fn of_user(text: impl Into<Cow<'static, str>>) -> Option<Why> {
         Some(Why { text: text.into(), of_user: true, place: None })
     }
 }
 
+/// What [`Walk::library`] goes through, kept between the functions it looks into.
+#[derive(Default)]
+struct LibraryWalk<'db> {
+    parent: HashMap<LibraryBody<'db>, LibraryBody<'db>>,
+    seen: HashSet<LibraryBody<'db>>,
+    queue: std::collections::VecDeque<LibraryBody<'db>>,
+    calls: Vec<LibraryBody<'db>>,
+}
+
 struct Walk<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     homes: Homes,
     nodes: Vec<Seen>,
-    index: FxHashMap<Node, u32>,
+    /// Every node's edges, a node's together: [`Seen::edges`] says where.
+    edges: Vec<Edge>,
+    /// Where in `nodes` each node is, by the hash of the node there.
+    index: hashbrown::HashTable<u32>,
     /// What each node is when hashed, in the order the nodes were found.
     segments: Vec<u128>,
     /// Hashing for [`tests_reach`]: nothing is told of purity, every function of a crate
@@ -889,19 +488,20 @@ struct Walk<'db> {
     /// each root hashes in an order of its own.
     tests: bool,
     /// The nodes blaze can't compile, whose code tells nothing of what they do.
-    uncompiled: FxHashSet<u32>,
+    uncompiled: HashSet<u32>,
     /// For [`tests_reach`], what each node is that makes a test's end depend on more than its
     /// code: of which kind, what by name, and why.
-    kinds: FxHashMap<u32, (Kind, String, String)>,
+    kinds: HashMap<u32, (Kind, String, String)>,
     /// Where a node refers to the next by a site, as [`Walk::site_location`] found it.
-    locations: std::cell::RefCell<FxHashMap<(u32, Site), Option<String>>>,
+    locations: std::cell::RefCell<HashMap<(u32, Site), Option<String>>>,
     /// An argument holds a reference count, which what reads one gives and the key does not
     /// tell: two arguments can share a value or not.
     counted: bool,
     /// What each function of core and alloc known by its name does that is not pure.
-    library: FxHashMap<FunctionId, Option<String>>,
+    library: HashMap<FunctionId, Option<String>>,
+    library_walk: LibraryWalk<'db>,
     /// Whether a static chooses a function by the CPU, as [`dispatch`] tells.
-    dispatch: std::cell::RefCell<FxHashMap<StaticId, bool>>,
+    dispatch: std::cell::RefCell<HashMap<StaticId, bool>>,
 }
 
 /// A body of core or alloc looked through: a function's, or a closure's.
@@ -912,40 +512,59 @@ enum LibraryBody<'db> {
 }
 
 impl<'db> Walk<'db> {
-    fn new(db: &'db dyn HirDatabase, counted: bool) -> Walk<'db> {
+    fn new(db: &'db Db, counted: bool) -> Walk<'db> {
         Walk {
             db,
             homes: Homes::default(),
+            // alloc: the walk's table of nodes, grown once a node found (a walk is a miss)
             nodes: Vec::new(),
-            index: FxHashMap::default(),
+            // alloc: the walk's edges, grown once an edge found (a walk is a miss)
+            edges: Vec::new(),
+            index: hashbrown::HashTable::new(),
+            // alloc: a hash a node, grown once a node hashed (a walk is a miss)
             segments: Vec::new(),
             tests: false,
-            uncompiled: FxHashSet::default(),
-            kinds: FxHashMap::default(),
+            uncompiled: HashSet::default(),
+            kinds: HashMap::default(),
             locations: Default::default(),
             counted,
-            library: FxHashMap::default(),
+            library: HashMap::default(),
+            library_walk: LibraryWalk::default(),
             dispatch: Default::default(),
         }
     }
 
+    /// The edges of node `at`, in the order found.
+    fn edges_of(&self, at: u32) -> &[Edge] {
+        let range = &self.nodes[at as usize].edges;
+        &self.edges[range.start as usize..range.end as usize]
+    }
+
     fn reach(&mut self, node: Node) -> u32 {
-        if let Some(&at) = self.index.get(&node) {
-            return at;
+        let nodes = &self.nodes;
+        let hash = FixedState.hash_one(&node);
+        let entry = self.index.entry(
+            hash,
+            |&at| nodes[at as usize].node == node,
+            |&at| FixedState.hash_one(&nodes[at as usize].node),
+        );
+        match entry {
+            hashbrown::hash_table::Entry::Occupied(found) => *found.get(),
+            hashbrown::hash_table::Entry::Vacant(slot) => {
+                let at = self.nodes.len() as u32;
+                slot.insert(at);
+                self.nodes.push(Seen { node, edges: 0..0, why: None });
+                at
+            }
         }
-        let at = self.nodes.len() as u32;
-        let why = match &node {
-            Node::Leaf(_, Some(why)) => Why::of_user(why.clone()),
-            _ => None,
-        };
-        self.nodes.push(Seen { node: node.clone(), edges: Vec::new(), why });
-        self.index.insert(node, at);
-        at
     }
 
     fn edge(&mut self, from: u32, node: Node, site: Site, codec: bool) -> u32 {
         let to = self.reach(node);
-        self.nodes[from as usize].edges.push(Edge { to, site, codec });
+        let edges = &mut self.nodes[from as usize].edges;
+        debug_assert_eq!(edges.end as usize, self.edges.len(), "a node's edges are together");
+        self.edges.push(Edge { to, site, codec });
+        edges.end += 1;
         to
     }
 
@@ -962,19 +581,21 @@ impl<'db> Walk<'db> {
                 InstanceDef::VtableShim(func) => Site::Func(func),
                 _ => Site::None,
             };
-            return (Node::Instance(instance.clone(), env.clone()), site, false);
+            // clone: the node owns its key; a stored param env is a reference count
+            return (Node::Instance(*instance, env.clone()), site, false);
         };
         let site = Site::Func(func);
         if let Some(closure) = cached_closure(db, func) {
             // Another cached function, or this one called again: its body is what it runs
             // when its result is not kept, and what it reaches from there is the body's.
-            let closure = Instance { def: InstanceDef::Closure(closure), ..instance.clone() };
+            let closure = Instance { def: InstanceDef::Closure(closure), ..*instance };
             let env = self.homes.home(db, &closure, env);
             return (Node::Instance(closure, env), site, false);
         }
         let name = || function_name(db, func, instance.args.as_ref());
         if let Some(symbol) = link_name(db, func) {
             let why =
+                // alloc: why the function is not pure, a message, once a leaf
                 (!pure_foreign(&symbol)).then(|| format!("calls the foreign function `{symbol}`"));
             return (Node::Leaf(symbol, why), site, false);
         }
@@ -998,7 +619,8 @@ impl<'db> Walk<'db> {
             // code, which the hash has by its commit, is known by name.
             let named = instance.args.as_ref().iter().all(|it| it.region().is_some());
             if !named {
-                return (Node::Instance(instance.clone(), env.clone()), site, false);
+                // clone: the node owns its key; a stored param env is a reference count
+                return (Node::Instance(*instance, env.clone()), site, false);
             }
             return match func.krate(db).data(db).origin {
                 base_db::CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc) => {
@@ -1019,6 +641,7 @@ impl<'db> Walk<'db> {
         }
         let told = |what: &str| {
             let name = name();
+            // alloc: why the function is not pure, a message, once a leaf
             let why = format!("calls `{name}`, which {what}");
             (Node::Leaf(name, Some(why)), site, false)
         };
@@ -1044,11 +667,13 @@ impl<'db> Walk<'db> {
         let codec = is_codec(db, func);
         let named = instance.args.as_ref().iter().all(|it| it.region().is_some());
         if !named {
-            return (Node::Instance(instance.clone(), env.clone()), site, codec);
+            // clone: the node owns its key; a stored param env is a reference count
+            return (Node::Instance(*instance, env.clone()), site, codec);
         }
         match func.krate(db).data(db).origin {
             base_db::CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc) => {
                 let why =
+                    // alloc: why the function is not pure, a message, once a leaf
                     self.library(func).map(|what| format!("calls `{}`, which {what}", name()));
                 (Node::Leaf(name(), why), site, codec)
             }
@@ -1061,80 +686,75 @@ impl<'db> Walk<'db> {
     /// static that changes, a thread-local or assembly. Not looked through are what a generic
     /// body calls by a trait of its parameters, what a `dyn` calls, which the code reached
     /// makes the vtable of, and what dropping a value does.
-    fn library(&mut self, func: FunctionId) -> Option<String> {
-        if let Some(it) = self.library.get(&func) {
-            return it.clone();
+    fn library(&mut self, func: FunctionId) -> Option<&str> {
+        if self.library.contains_key(&func) {
+            return self.library[&func].as_deref();
         }
         let db = self.db;
         let start = LibraryBody::Fn(func);
-        let mut parent = FxHashMap::default();
-        let mut seen = FxHashSet::from_iter([start]);
-        let mut queue = std::collections::VecDeque::from([start]);
-        let mut calls = Vec::new();
+        let mut walk = std::mem::take(&mut self.library_walk);
+        walk.parent.clear();
+        walk.seen.clear();
+        walk.queue.clear();
+        walk.seen.insert(start);
+        walk.queue.push_back(start);
         let mut found = None;
-        while let Some(at) = queue.pop_front() {
-            calls.clear();
-            if let Some(what) = library_body(db, at, &mut calls) {
+        while let Some(at) = walk.queue.pop_front() {
+            walk.calls.clear();
+            if let Some(what) = library_body(db, at, &mut walk.calls) {
                 found = Some((at, what));
                 break;
             }
-            for &next in &calls {
-                if seen.insert(next) {
-                    parent.insert(next, at);
-                    queue.push_back(next);
+            for &next in &walk.calls {
+                if walk.seen.insert(next) {
+                    walk.parent.insert(next, at);
+                    walk.queue.push_back(next);
                 }
             }
         }
-        let Some((at, what)) = found else {
-            // What it reaches is as pure as it is.
-            for body in seen {
-                if let LibraryBody::Fn(it) = body {
-                    self.library.insert(it, None);
+        let told = match found {
+            Some((at, what)) => Some(library_told(db, &walk.parent, at, what)),
+            None => {
+                // What it reaches is as pure as it is.
+                for &body in &walk.seen {
+                    if let LibraryBody::Fn(it) = body {
+                        self.library.insert(it, None);
+                    }
                 }
-            }
-            return None;
-        };
-        let mut chain = vec![at];
-        while let Some(&up) = parent.get(chain.last().unwrap()) {
-            chain.push(up);
-        }
-        chain.pop();
-        chain.reverse();
-        let told = match chain.as_slice() {
-            [] => what,
-            _ => {
-                let names: Vec<String> = chain.iter().map(|&it| library_name(db, it)).collect();
-                let shown = match names.len() {
-                    ..=3 => names.join(" → "),
-                    _ => format!("{} → … → {}", names[0], names[names.len() - 1]),
-                };
-                format!("reaches {shown}, which {what}")
+                None
             }
         };
-        self.library.insert(func, Some(told.clone()));
-        Some(told)
+        self.library_walk = walk;
+        let told = told?;
+        self.library.entry(func).insert_entry(Some(told)).into_mut().as_deref()
     }
 
-    fn hash_node(&mut self, at: u32, node: &Node) {
+    /// Hashes node `at`, the next not hashed, and finds its edges.
+    fn hash_node(&mut self, at: u32) {
         let db = self.db;
-        if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
-            eprintln!("fn-cache: {at} {}", describe(db, node));
+        if *TRACE {
+            eprintln!("fn-cache: {at} {}", describe(db, &self.nodes[at as usize].node));
         }
+        let start = self.edges.len() as u32;
+        self.nodes[at as usize].edges = start..start;
         let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-        match node {
+        match &self.nodes[at as usize].node {
             Node::Root(func) => {
+                let func = *func;
                 0u8.hash(&mut hasher);
-                match compiled_root(db, *func) {
+                match compiled_root(db, func) {
                     Ok(compiled) => {
                         self.function_code(at, &mut hasher, compiled);
-                        self.look_into(at, InferBodyId::DefWithBodyId((*func).into()), None);
+                        self.look_into(at, InferBodyId::DefWithBodyId(func.into()), None);
                     }
                     Err(e) => self.cannot(at, &mut hasher, e),
                 }
             }
             Node::Instance(instance, env) => {
+                // clone: the query takes its key by value; a stored param env is a reference count
+                let (instance, env) = (*instance, env.clone());
                 1u8.hash(&mut hasher);
-                match compiled_instance(db, instance.clone(), env.clone()) {
+                match compiled_instance(db, instance, env) {
                     Ok(compiled) => {
                         self.function_code(at, &mut hasher, compiled);
                         match instance.def {
@@ -1152,17 +772,21 @@ impl<'db> Walk<'db> {
                 }
             }
             Node::Static(id) => {
+                let id = *id;
                 2u8.hash(&mut hasher);
-                match compiled_static(db, *id) {
+                match compiled_static(db, id) {
                     Ok(compiled) => {
                         if compiled.writable {
-                            let why = format!("reads {}, which can change", describe(db, node));
+                            let what = describe(db, &self.nodes[at as usize].node);
+                            // alloc: why the static is not pure, a message, once a static
+                            let why = format!("reads {what}, which can change");
                             self.nodes[at as usize].why = Why::of_user(why);
                         }
                         if self.tests
-                            && let Some(reason) = self.static_reason(*id, compiled.writable)
+                            && !self.kinds.contains_key(&at)
+                            && let Some(reason) = self.static_reason(id, compiled.writable)
                         {
-                            self.kinds.entry(at).or_insert(reason);
+                            self.kinds.insert(at, reason);
                         }
                         (&compiled.blob, compiled.writable).hash(&mut hasher);
                         let own = self.is_own(at);
@@ -1180,7 +804,9 @@ impl<'db> Walk<'db> {
     /// Notes that the node did not compile: nothing tells what it does then.
     fn cannot(&mut self, at: u32, hasher: &mut impl Hasher, e: &CodegenError) {
         self.uncompiled.insert(at);
+        // alloc: the error's message, on the path of a node that did not compile
         self.nodes[at as usize].why = Why::own(format!("can't be compiled by blaze ({e})"));
+        // alloc: the error's text, on the path of a node that did not compile
         e.to_string().hash(hasher);
     }
 
@@ -1230,7 +856,7 @@ impl<'db> Walk<'db> {
                 let ItemContainerId::ImplId(id) = func.lookup(db).container else { return false };
                 hasher_of(db, db.impl_self_ty(id).skip_binder()).is_some()
             }
-            base_db::CrateOrigin::Lang(_) => crate_name(db, krate) == "hashbrown",
+            base_db::CrateOrigin::Lang(_) => crate_name_str(db, krate) == "hashbrown",
             _ => false,
         }
     }
@@ -1248,11 +874,12 @@ impl<'db> Walk<'db> {
                     if own && self.nodes[at as usize].why.is_none() {
                         self.nodes[at as usize].why = Why::own("has assembly in it");
                     }
-                    if self.tests && !self.in_toolchain(at) {
+                    if self.tests && !self.in_toolchain(at) && !self.kinds.contains_key(&at) {
                         let what = describe(db, &self.nodes[at as usize].node);
+                        // alloc: what the test is told, once a node with assembly
                         let why = format!("it reaches {what}, which has assembly in it");
                         let what = without_arguments(what.trim_matches('`'));
-                        self.kinds.entry(at).or_insert((Kind::Asm, what, why));
+                        self.kinds.insert(at, (Kind::Asm, what, why));
                     }
                 }
                 FuncTarget::Instance(instance, env) => {
@@ -1261,8 +888,10 @@ impl<'db> Walk<'db> {
                     3u8.hash(hasher);
                     if !self.tests {
                         to.hash(hasher);
-                    } else if let Some(reason) = self.called_reason(instance) {
-                        self.kinds.entry(to).or_insert(reason);
+                    } else if !self.kinds.contains_key(&to)
+                        && let Some(reason) = self.called_reason(instance)
+                    {
+                        self.kinds.insert(to, reason);
                     }
                 }
             }
@@ -1277,8 +906,9 @@ impl<'db> Walk<'db> {
                     trait_ref
                         .as_ref()
                         .map(|(id, args)| {
-                            let name = TraitSignature::of(db, *id).name.as_str().to_owned();
-                            let args: Vec<_> = args
+                            let name = TraitSignature::of(db, *id).name.as_str();
+                            // alloc: `rustc_type_name` gives a name owned, once a vtable request
+                            let args: smallvec::SmallVec<[_; 4]> = args
                                 .as_ref()
                                 .iter()
                                 .map(|it| {
@@ -1286,8 +916,9 @@ impl<'db> Walk<'db> {
                                         hir_ty_mir::mir::type_name::rustc_type_name(db, ty)
                                     })
                                 })
+                                // alloc: inline up to four; the names are owned as given
                                 .collect();
-                            (crate_name(db, id.krate(db)), name, args)
+                            (crate_name_str(db, id.krate(db)), name, args)
                         })
                         .hash(hasher);
                     blob.hash(hasher);
@@ -1298,10 +929,11 @@ impl<'db> Walk<'db> {
                     2u8.hash(hasher);
                     if !self.tests {
                         to.hash(hasher);
-                    } else if foreign_static(db, *id).is_some()
+                    } else if !self.kinds.contains_key(&to)
+                        && foreign_static(db, *id).is_some()
                         && let Some(reason) = self.static_reason(*id, false)
                     {
-                        self.kinds.entry(to).or_insert(reason);
+                        self.kinds.insert(to, reason);
                     }
                 }
                 // Where code is written, which the hash leaves out.
@@ -1325,12 +957,15 @@ impl<'db> Walk<'db> {
         let db = self.db;
         if let Some(name) = foreign_static(db, id) {
             let why = (!name.starts_with("__rust_"))
+                // alloc: why the static is not pure, a message, once a leaf
                 .then(|| format!("reads the foreign static `{name}`"));
             return Node::Leaf(name, why);
         }
         if is_thread_local(db, id) {
             let name = static_name(db, id);
-            return Node::Leaf(name.clone(), Some(format!("uses the thread-local `{name}`")));
+            // alloc: why the static is not pure, a message, once a leaf
+            let why = format!("uses the thread-local `{name}`");
+            return Node::Leaf(name, Some(why));
         }
         Node::Static(id)
     }
@@ -1357,65 +992,30 @@ impl<'db> Walk<'db> {
         };
         let Ok(body) = body else { return };
         if self.tests {
+            if self.kinds.contains_key(&at) {
+                return;
+            }
             let cache = |id| self.dispatch_cache(id);
             if let Some(span) = fn_from_data(db, body, &cache) {
                 let place = location(db, body.owner, span)
+                    // alloc: what the test is told, once a node that calls such a pointer
                     .map(|it| format!(", at {it}"))
                     .unwrap_or_default();
                 let what = describe(db, &self.nodes[at as usize].node);
+                // alloc: what the test is told, once a node that calls such a pointer
                 let why = format!(
                     "it reaches {what}, which calls a function pointer made of data (a \
                      `transmute`){place}"
                 );
                 let what = without_arguments(what.trim_matches('`'));
-                self.kinds.entry(at).or_insert((Kind::Indirect, what, why));
+                self.kinds.insert(at, (Kind::Indirect, what, why));
             }
             return;
         }
         if let Some((why, span)) = raw_use(body) {
             let place = location(db, body.owner, span);
-            self.nodes[at as usize].why = Some(Why { text: why.to_owned(), of_user: false, place });
+            self.nodes[at as usize].why = Some(Why { text: why.into(), of_user: false, place });
         }
-    }
-
-    /// What node `at` is that makes a test's end depend on more than its code, for
-    /// [`tests_reach`]: of which kind, what by name, and why.
-    fn reasons(&self, at: u32) -> Vec<(Kind, String, String)> {
-        let mut reasons = Vec::new();
-        if let Some(it) = self.kinds.get(&at) {
-            reasons.push(it.clone());
-        }
-        if self.uncompiled.contains(&at) {
-            let what = describe(self.db, &self.nodes[at as usize].node);
-            let why = format!("it reaches {what}, which blaze can't compile");
-            reasons.push((Kind::Uncompiled, what.trim_matches('`').to_owned(), why));
-        }
-        reasons
-    }
-
-    /// The fewest calls from the root of `way` to its node at `at`, each by its name without
-    /// the types it is instantiated with, and where it calls the next.
-    fn path_to(&self, way: &Way, at: usize) -> Vec<Call> {
-        let mut path = vec![at];
-        while path.last().is_some_and(|&it| it != 0) {
-            path.push(way.from[path[path.len() - 1]] as usize);
-        }
-        path.reverse();
-        (0..path.len())
-            .map(|i| {
-                let node = way.order[path[i]];
-                let name = describe(self.db, &self.nodes[node as usize].node);
-                let at = path.get(i + 1).and_then(|&next| {
-                    let site = way.via[next];
-                    let mut locations = self.locations.borrow_mut();
-                    locations
-                        .entry((node, site))
-                        .or_insert_with(|| self.site_location(node, site))
-                        .clone()
-                });
-                Call { name: without_arguments(name.trim_matches('`')), at }
-            })
-            .collect()
     }
 
     /// Whether the node is code of the toolchain (std, core, alloc and the crates they are
@@ -1460,6 +1060,7 @@ impl<'db> Walk<'db> {
         let InstanceDef::Fn(func) = instance.def else { return None };
         if let Some(symbol) = link_name(db, func) {
             if let Some((kind, what)) = outside(&symbol) {
+                // alloc: what a test is told, once a node
                 let why = format!("it reaches `{symbol}`, which {what}");
                 return Some((kind, symbol, why));
             }
@@ -1470,11 +1071,13 @@ impl<'db> Walk<'db> {
                 return None;
             }
             let why =
+                // alloc: what a test is told, once a node
                 format!("it calls the foreign function `{symbol}`, whose code blaze can't see");
             return Some((Kind::Ffi, symbol, why));
         }
         if makes_seed(db, func) {
             let name = function_name(db, func, instance.args.as_ref());
+            // alloc: what a test is told, once a node
             let why = format!("it reaches `{name}`, which makes a random seed (a `HashMap`'s)");
             return Some((Kind::Random, name, why));
         }
@@ -1497,16 +1100,15 @@ impl<'db> Walk<'db> {
         let toolchain = id.krate(db).data(db).origin.is_lang();
         if let Some(symbol) = foreign_static(db, id) {
             if let Some((kind, what)) = outside(&symbol) {
-                return Some((
-                    kind,
-                    symbol.clone(),
-                    format!("it reaches `{symbol}`, which {what}"),
-                ));
+                // alloc: what a test is told, once a node
+                let why = format!("it reaches `{symbol}`, which {what}");
+                return Some((kind, symbol, why));
             }
             if toolchain || symbol.starts_with("__rust_") {
                 return None;
             }
             let why =
+                // alloc: what a test is told, once a node
                 format!("it reads the foreign static `{symbol}`, which foreign code can change");
             return Some((Kind::Ffi, symbol, why));
         }
@@ -1520,6 +1122,7 @@ impl<'db> Walk<'db> {
             return None;
         }
         let name = static_name(db, id);
+        // alloc: what a test is told, once a node
         let why = format!(
             "it uses the static `{name}`, which can change, and other tests of the process with it"
         );
@@ -1529,13 +1132,17 @@ impl<'db> Walk<'db> {
     /// Why what `from` reaches is not pure, by the shortest way to the first that is not:
     /// the edges to the codec are left out.
     fn impure(&self, from: u32) -> Option<String> {
-        let mut parent: FxHashMap<u32, (u32, usize)> = FxHashMap::default();
-        let mut seen = FxHashSet::default();
+        let mut parent: HashMap<u32, (u32, usize)> = HashMap::default();
+        let mut seen = HashSet::default();
         let mut queue = std::collections::VecDeque::from([from]);
         seen.insert(from);
         while let Some(at) = queue.pop_front() {
-            if let Some(why) = &self.nodes[at as usize].why {
-                return Some(self.told(at, &parent, why));
+            let seen_at = &self.nodes[at as usize];
+            if let Node::Leaf(_, Some(text)) = &seen_at.node {
+                return Some(self.told(at, &parent, text, true, None));
+            }
+            if let Some(why) = &seen_at.why {
+                return Some(self.told(at, &parent, &why.text, why.of_user, why.place.as_deref()));
             }
             // A `const fn` with no generic arguments that is const-pure reaches nothing that is
             // not: what a generic one calls by a trait can be a non-const `impl` at run time.
@@ -1544,7 +1151,7 @@ impl<'db> Walk<'db> {
             {
                 continue;
             }
-            for (i, edge) in self.nodes[at as usize].edges.iter().enumerate() {
+            for (i, edge) in self.edges_of(at).iter().enumerate() {
                 if !edge.codec && seen.insert(edge.to) {
                     parent.insert(edge.to, (at, i));
                     queue.push_back(edge.to);
@@ -1555,42 +1162,56 @@ impl<'db> Walk<'db> {
     }
 
     /// Says why `at`, found by way of `parent`, is not pure: "it reaches `a` → `b`, which
-    /// calls the foreign function `write`, at src/lib.rs:4:5".
-    fn told(&self, at: u32, parent: &FxHashMap<u32, (u32, usize)>, why: &Why) -> String {
+    /// calls the foreign function `write`, at src/lib.rs:4:5". `text` is what [`Why`] says,
+    /// of the user when `of_user`, at `place` when that is told.
+    fn told(
+        &self,
+        at: u32,
+        parent: &HashMap<u32, (u32, usize)>,
+        text: &str,
+        of_user: bool,
+        place: Option<&str>,
+    ) -> String {
         let db = self.db;
+        // alloc: the error, why the function is not cached
         let mut chain = vec![at];
         while let Some(&(up, _)) = parent.get(chain.last().unwrap()) {
             chain.push(up);
         }
         chain.reverse();
         // Where the last code of the workspace on the way refers to the next.
-        let place = why.place.clone().or_else(|| {
+        let place = place.map(str::to_owned).or_else(|| {
             chain.windows(2).rev().find_map(|pair| {
                 if !self.is_own(pair[0]) {
                     return None;
                 }
                 let (_, edge) = parent[&pair[1]];
-                let site = self.nodes[pair[0] as usize].edges[edge].site;
+                let site = self.edges_of(pair[0])[edge].site;
                 self.site_location(pair[0], site)
             })
         });
         // The cached function is "it", and what a foreign function or a static is said of
         // is what uses it.
-        let named = &chain[1..chain.len() - usize::from(why.of_user)];
+        let named = &chain[1..chain.len() - usize::from(of_user)];
         let mut told = match named {
-            [] => format!("it {}", why.text),
+            // alloc: the error, why the function is not cached
+            [] => format!("it {text}"),
             _ => {
                 let names: Vec<String> =
+                    // alloc: the error, why the function is not cached
                     named.iter().map(|&it| describe(db, &self.nodes[it as usize].node)).collect();
                 let shown = match names.len() {
                     ..=4 => names.join(" → "),
+                    // alloc: the error, why the function is not cached
                     _ => format!("{} → … → {}", names[..2].join(" → "), names[names.len() - 1]),
                 };
-                format!("it reaches {shown}, which {}", why.text)
+                // alloc: the error, why the function is not cached
+                format!("it reaches {shown}, which {text}")
             }
         };
         if let Some(place) = place {
-            told.push_str(&format!(", at {place}"));
+            told.push_str(", at ");
+            told.push_str(&place);
         }
         told
     }
@@ -1609,7 +1230,7 @@ impl<'db> Walk<'db> {
             _ => return None,
         };
         let refers = |operand: &Operand| match (site, &operand.kind) {
-            (Site::Func(func), _) => fn_item(operand).is_some_and(|(it, _)| it == func),
+            (Site::Func(func), _) => operand.fn_item().is_some_and(|(it, _)| it == func),
             (Site::Static(id), OperandKind::Static(it)) => *it == id,
             _ => false,
         };
@@ -1731,7 +1352,7 @@ fn locates_errno(symbol: &str) -> bool {
 /// also numbers where what it gives doesn't depend on them, as in slice iteration and `memchr`.
 /// So `addr` and `expose_provenance` count where code of the workspace calls them (`own`), as
 /// its casts do (`raw_use`): core and alloc call them to align and to tell a dangling pointer.
-fn gives_address(db: &dyn HirDatabase, func: FunctionId, own: bool) -> Option<&'static str> {
+fn gives_address(db: &Db, func: FunctionId, own: bool) -> Option<&'static str> {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Core))
     {
         return None;
@@ -1765,7 +1386,7 @@ fn gives_address(db: &dyn HirDatabase, func: FunctionId, own: bool) -> Option<&'
 /// called: the walk knows what it does by the function called, and a body built into its
 /// caller is not called. `own` is whether the caller is code of the workspace.
 pub(super) fn kept_a_call(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     args: GenericArgs<'_>,
     own: bool,
@@ -1777,7 +1398,7 @@ pub(super) fn kept_a_call(
 }
 
 /// Whether `func` makes a `RandomState`, whose seed is another in every run.
-fn makes_seed(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn makes_seed(db: &Db, func: FunctionId) -> bool {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
         return false;
     }
@@ -1798,7 +1419,7 @@ fn makes_seed(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// of its entries, which the seed decides, or gives the seed itself. What only looks up,
 /// inserts or counts gives the same whatever the seed.
 fn seeded_order(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     args: GenericArgs<'_>,
 ) -> Option<&'static str> {
@@ -1846,7 +1467,7 @@ fn seeded_order(
 }
 
 /// The hasher of std's `HashMap` or `HashSet` when `ty` is one.
-fn hasher_of<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> Option<Ty<'db>> {
+fn hasher_of<'db>(db: &Db, ty: Ty<'db>) -> Option<Ty<'db>> {
     let TyKind::Adt(def, args) = ty.kind() else { return None };
     let AdtId::StructId(id) = def.def_id() else { return None };
     if !matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
@@ -1861,7 +1482,7 @@ fn hasher_of<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> Option<Ty<'db>> {
 }
 
 /// Whether `func` is a method of std's `Backtrace`, or of a trait for it.
-fn of_backtrace(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn of_backtrace(db: &Db, func: FunctionId) -> bool {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
         return false;
     }
@@ -1872,41 +1493,38 @@ fn of_backtrace(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// Whether a static of `ty` that can change is state other tests of the process can change:
 /// all but a cell set once (`LazyLock`, `OnceLock`, once_cell's and lazy_static's), which code
 /// the test reaches sets to what that code gives, unless it holds a lock, a cell or an atomic.
-fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
+fn shared<'db>(db: &Db, ty: Ty<'db>) -> bool {
     const ONCE: &[&str] = &["LazyLock", "OnceLock", "LazyCell", "OnceCell", "Lazy", "Once"];
     const CHANGES: &[&str] =
         &["Mutex", "RwLock", "ReentrantMutex", "RefCell", "Cell", "UnsafeCell", "SyncUnsafeCell"];
     let struct_name = |ty: Ty<'db>| {
         let TyKind::Adt(def, args) = ty.kind() else { return None };
         let AdtId::StructId(id) = def.def_id() else { return None };
-        Some((StructSignature::of(db, id).name.as_str().to_owned(), args))
+        Some((StructSignature::of(db, id).name.as_str(), args))
     };
     let Some((name, args)) = struct_name(ty) else { return true };
-    if !ONCE.contains(&name.as_str()) {
+    if !ONCE.contains(&name) {
         return true;
     }
     let Some(inner) = args.iter().find_map(|it| it.ty()) else { return false };
     struct_name(inner)
-        .is_some_and(|(name, _)| CHANGES.contains(&name.as_str()) || name.starts_with("Atomic"))
+        .is_some_and(|(name, _)| CHANGES.contains(&name) || name.starts_with("Atomic"))
 }
 
 /// Where `body` makes a function pointer of data, with a `transmute`: what it calls through
 /// it is no function the code reached names, and can be any. Not one of what it loaded from a
 /// static `cache` says chooses a function ([`dispatch`]).
 fn fn_from_data(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: &MirBody<'_>,
-    cache: &dyn Fn(StaticId) -> bool,
+    cache: &impl Fn(StaticId) -> bool,
 ) -> Option<MirSpan> {
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else {
+        let TerminatorKind::Call { args, destination, intrinsic, .. } = &terminator.kind else {
             continue;
         };
-        let Some((callee, _)) = fn_item(func) else { continue };
-        let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
-        if FunctionSignature::is_intrinsic(db, callee)
-            && matches!(name.as_str(), "transmute" | "transmute_unchecked")
+        if matches!(intrinsic, Some(Intrinsic::Transmute | Intrinsic::TransmuteUnchecked))
             && destination.projection.as_slice().is_empty()
             && matches!(body.locals[destination.local].ty.as_ref().kind(), TyKind::FnPtr(..))
             && !args.first().is_some_and(|it| dispatch::loaded_from(db, body, it, cache))
@@ -1918,16 +1536,16 @@ fn fn_from_data(
 }
 
 /// Whether `func` is std's `min_stack`, which reads `RUST_MIN_STACK` for a thread's stack.
-fn sizes_stack(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn sizes_stack(db: &Db, func: FunctionId) -> bool {
     is_std_function(db, func, "min_stack")
 }
 
-fn is_std_function(db: &dyn HirDatabase, func: FunctionId, name: &str) -> bool {
+fn is_std_function(db: &Db, func: FunctionId, name: &str) -> bool {
     matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
         && FunctionSignature::of(db, func).name.as_str() == name
 }
 
-fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {
+fn is_std_struct(db: &Db, ty: Ty<'_>, name: &str) -> bool {
     let TyKind::Adt(def, _) = ty.kind() else { return false };
     let AdtId::StructId(id) = def.def_id() else { return false };
     matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
@@ -1936,7 +1554,7 @@ fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {
 
 /// What a function of alloc's `Rc`, `Arc` or their `Weak` does that depends on how many hold
 /// the value, or on whether two hold the same one.
-fn reads_count(db: &dyn HirDatabase, func: FunctionId) -> Option<&'static str> {
+fn reads_count(db: &Db, func: FunctionId) -> Option<&'static str> {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Alloc))
     {
         return None;
@@ -1959,7 +1577,7 @@ fn reads_count(db: &dyn HirDatabase, func: FunctionId) -> Option<&'static str> {
 }
 
 /// Whether `adt` is what an `Rc` or an `Arc` points to: its value with the counts.
-fn holds_counts(db: &dyn HirDatabase, adt: AdtId) -> bool {
+fn holds_counts(db: &Db, adt: AdtId) -> bool {
     let AdtId::StructId(id) = adt else { return false };
     matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Alloc))
         && matches!(StructSignature::of(db, id).name.as_str(), "RcInner" | "ArcInner")
@@ -1969,7 +1587,7 @@ fn holds_counts(db: &dyn HirDatabase, adt: AdtId) -> bool {
 /// and never compiles: `TypeId::of`, a hash only rustc computes, and the methods of `dyn Any`,
 /// which compare it. What they give is decided by the type they are instantiated with, which
 /// their name has.
-fn taken_from_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn taken_from_rustc(db: &Db, func: FunctionId) -> bool {
     use rustc_type_ir::inherent::BoundExistentialPredicates as _;
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Core))
     {
@@ -1995,37 +1613,46 @@ fn taken_from_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
     }
 }
 
-fn diverges(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn diverges(db: &Db, func: FunctionId) -> bool {
     let output = db.callable_item_signature(func.into()).skip_binder().skip_binder().output();
     matches!(output.kind(), TyKind::Never)
 }
 
-fn static_name(db: &dyn HirDatabase, id: StaticId) -> String {
-    let mut path = vec![StaticSignature::of(db, id).name.as_str().to_owned()];
+fn static_name(db: &Db, id: StaticId) -> String {
+    let mut modules = smallvec::SmallVec::<[_; 8]>::new();
     if let ItemContainerId::ModuleId(module) = id.lookup(db).container {
         let mut module = Some(module);
         while let Some(at) = module {
             if let Some(name) = at.name(db) {
-                path.push(name.as_str().to_owned());
+                modules.push(name);
             }
             module = at.containing_module(db);
         }
     }
-    path.push(crate_name(db, id.krate(db)));
-    path.reverse();
-    path.join("::")
+    // alloc: a static's name, a leaf's key or what a message says
+    let mut path = String::from(crate_name_str(db, id.krate(db)));
+    for name in modules.iter().rev() {
+        path.push_str("::");
+        path.push_str(name.as_str());
+    }
+    path.push_str("::");
+    path.push_str(StaticSignature::of(db, id).name.as_str());
+    path
 }
 
-fn describe(db: &dyn HirDatabase, node: &Node) -> String {
+fn describe(db: &Db, node: &Node) -> String {
+    // alloc: the text of a message, a trace, or what a test is told
+    let mut out = String::new();
+    let mut push = |parts: &[&str]| parts.iter().for_each(|it| out.push_str(it));
     match node {
         Node::Root(func) => {
-            format!("`{}`", function_name(db, *func, GenericArgs::new_from_slice(&[])))
+            push(&["`", function_name(db, *func, GenericArgs::new_from_slice(&[])).as_str(), "`"])
         }
         Node::Instance(instance, _) => {
             let args = instance.args.as_ref();
             match instance.def {
                 InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
-                    format!("`{}`", function_name(db, func, args))
+                    push(&["`", function_name(db, func, args).as_str(), "`"])
                 }
                 InstanceDef::Closure(id) => {
                     let at = InternedClosureId::from_id(id).loc(db);
@@ -2033,33 +1660,34 @@ fn describe(db: &dyn HirDatabase, node: &Node) -> String {
                         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func))
                             if cached_closure(db, func) == Some(id) =>
                         {
-                            format!("`{}`", function_name(db, func, args))
+                            push(&["`", function_name(db, func, args).as_str(), "`"])
                         }
                         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
-                            format!("a closure in `{}`", function_name(db, func, args))
+                            push(&["a closure in `", function_name(db, func, args).as_str(), "`"])
                         }
-                        _ => "a closure".to_owned(),
+                        _ => push(&["a closure"]),
                     }
                 }
                 InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => {
-                    "an `async` block".to_owned()
+                    push(&["an `async` block"])
                 }
                 InstanceDef::DropGlue => {
                     let ty = args.as_slice().first().and_then(|it| it.ty());
                     let ty = ty.and_then(|ty| hir_ty_mir::mir::type_name::rustc_type_name(db, ty));
-                    format!("the drop of `{}`", ty.unwrap_or_default())
+                    push(&["the drop of `", ty.as_deref().unwrap_or_default(), "`"])
                 }
-                _ => "a shim".to_owned(),
+                _ => push(&["a shim"]),
             }
         }
-        Node::Static(id) => format!("the static `{}`", static_name(db, *id)),
-        Node::Leaf(name, _) => format!("`{name}`"),
+        Node::Static(id) => push(&["the static `", static_name(db, *id).as_str(), "`"]),
+        Node::Leaf(name, _) => push(&["`", name.as_str(), "`"]),
     }
+    out
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
 pub(super) fn location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: InferBodyId<'_>,
     span: MirSpan,
 ) -> Option<String> {
@@ -2067,19 +1695,17 @@ pub(super) fn location(
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);
-    let path = root.path_for_file(&file)?.as_path()?.to_string();
-    let workspace = owner.module(db).krate(db).data(db).proc_macro_cwd.to_string();
-    let path = path
-        .strip_prefix(&workspace)
-        .map(|it| it.trim_start_matches('/').to_owned())
-        .unwrap_or(path);
+    let path = root.path_for_file(&file)?.as_path()?.as_str();
+    let workspace = owner.module(db).krate(db).data(db).proc_macro_cwd.as_str();
+    let path = path.strip_prefix(workspace).map_or(path, |it| it.trim_start_matches('/'));
+    // alloc: the place a message, or what a test is told, shows
     Some(format!("{path}:{line}:{column}"))
 }
 
 /// What `body`, of core or alloc, does itself that is not pure; else the bodies of core and
 /// alloc it calls, or makes a closure or a function pointer of, are pushed to `calls`.
 fn library_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: LibraryBody<'db>,
     calls: &mut Vec<LibraryBody<'db>>,
 ) -> Option<String> {
@@ -2092,12 +1718,14 @@ fn library_body<'db>(
     };
     let mir = match mir {
         Ok(it) => it,
+        // alloc: why the function is not pure, a message
         Err(e) => return Some(format!("has MIR blaze can't read ({e:?})")),
     };
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
     for (_, block) in mir.basic_blocks.iter() {
         for statement in &block.statements {
             match &statement.kind {
+                // alloc: why the function is not pure, a message
                 StatementKind::InlineAsm(_) => return Some("has assembly in it".to_owned()),
                 StatementKind::Assign(_, rvalue) => {
                     if let Rvalue::Aggregate(AggregateKind::Closure(ty), _) = rvalue
@@ -2130,7 +1758,7 @@ fn library_body<'db>(
 /// What an operand of a body of core or alloc reads or names that is not pure; else the
 /// function of core or alloc it names, if one, is pushed to `calls`.
 fn library_operand<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     operand: &Operand,
     calls: &mut Vec<LibraryBody<'db>>,
@@ -2139,30 +1767,41 @@ fn library_operand<'db>(
         let id = *id;
         if let Some(name) = foreign_static(db, id) {
             return (!name.starts_with("__rust_"))
+                // alloc: why the function is not pure, a message
                 .then(|| format!("reads the foreign static `{name}`"));
         }
-        let name = static_name(db, id);
+        let name = || static_name(db, id);
         if is_thread_local(db, id) {
-            return Some(format!("uses the thread-local `{name}`"));
+            // alloc: why the function is not pure, a message
+            return Some(format!("uses the thread-local `{}`", name()));
         }
         return match compiled_static(db, id) {
-            Ok(it) => it.writable.then(|| format!("reads the static `{name}`, which can change")),
-            Err(e) => Some(format!("reads the static `{name}`, which blaze can't compile ({e})")),
+            Ok(it) => it
+                .writable
+                // alloc: why the function is not pure, a message
+                .then(|| format!("reads the static `{}`, which can change", name())),
+            Err(e) => {
+                let name = name();
+                // alloc: why the function is not pure, a message
+                Some(format!("reads the static `{name}`, which blaze can't compile ({e})"))
+            }
         };
     }
-    let (func, args) = fn_item(operand)?;
+    let (func, args) = operand.fn_item()?;
     if diverges(db, func) {
         // A panic, the handler core declares as foreign among them: what it prints is no
         // result.
         return None;
     }
     if let Some(symbol) = link_name(db, func) {
+        // alloc: why the function is not pure, a message
         return (!pure_foreign(&symbol)).then(|| format!("calls the foreign function `{symbol}`"));
     }
     if FunctionSignature::is_intrinsic(db, func) {
         return None;
     }
     if let Some(what) = gives_address(db, func, false) {
+        // alloc: why the function is not pure, a message
         return Some(format!("calls `{}`, which {what}", function_name(db, func, args)));
     }
     let func = match func.lookup(db).container {
@@ -2170,7 +1809,10 @@ fn library_operand<'db>(
             if rustc_type_ir::TypeVisitableExt::has_param(&args) {
                 return None;
             }
-            let (either::Either::Left(it), _) = db.lookup_impl_method(env, func, args) else {
+            let (either::Either::Left(it), _) = (match crate::impl_method(db, env, func, args) {
+                Ok(found) => found,
+                Err(why) => return Some(why),
+            }) else {
                 return None;
             };
             if !FunctionSignature::of(db, it).has_body() {
@@ -2186,53 +1828,83 @@ fn library_operand<'db>(
     None
 }
 
-fn is_library(db: &dyn HirDatabase, krate: Crate) -> bool {
+fn is_library(db: &Db, krate: Crate) -> bool {
     matches!(
         krate.data(db).origin,
         base_db::CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc)
     )
 }
 
-fn library_name(db: &dyn HirDatabase, body: LibraryBody<'_>) -> String {
+fn library_name(db: &Db, body: LibraryBody<'_>) -> String {
+    let no_args = GenericArgs::new_from_slice(&[]);
     match body {
-        LibraryBody::Fn(func) => {
-            format!("`{}`", function_name(db, func, GenericArgs::new_from_slice(&[])))
-        }
+        // alloc: why a function is not pure, a message
+        LibraryBody::Fn(func) => format!("`{}`", function_name(db, func, no_args)),
         LibraryBody::Closure(closure) => match closure.loc(db).owner.as_function() {
-            Some(func) => {
-                format!(
-                    "a closure in `{}`",
-                    function_name(db, func, GenericArgs::new_from_slice(&[]))
-                )
-            }
+            // alloc: why a function is not pure, a message
+            Some(func) => format!("a closure in `{}`", function_name(db, func, no_args)),
+            // alloc: why a function is not pure, a message
             None => "a closure".to_owned(),
         },
     }
 }
 
+/// Says what `at`, found from a function of core or alloc by way of `parent`, does that is
+/// not pure: `what`, or "reaches `a` → `b`, which" it, by the bodies on the way.
+fn library_told<'db>(
+    db: &'db Db,
+    parent: &HashMap<LibraryBody<'db>, LibraryBody<'db>>,
+    at: LibraryBody<'db>,
+    what: String,
+) -> String {
+    // alloc: why a function is not pure, a message
+    let mut chain = vec![at];
+    while let Some(&up) = parent.get(chain.last().unwrap()) {
+        chain.push(up);
+    }
+    chain.pop();
+    chain.reverse();
+    match chain.as_slice() {
+        [] => what,
+        _ => {
+            // alloc: why a function is not pure, a message
+            let names: Vec<String> = chain.iter().map(|&it| library_name(db, it)).collect();
+            let shown = match names.len() {
+                ..=3 => names.join(" → "),
+                // alloc: why a function is not pure, a message
+                _ => format!("{} → … → {}", names[0], names[names.len() - 1]),
+            };
+            // alloc: why a function is not pure, a message
+            format!("reaches {shown}, which {what}")
+        }
+    }
+}
+
 /// The symbol a foreign static is linked by, if `id` is one.
-fn foreign_static(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+fn foreign_static(db: &Db, id: StaticId) -> Option<String> {
     super::static_link_name(db, id)
 }
 
 /// Why the arguments of the closure can't be what a result is kept by, and whether one holds
 /// the reference counts of an `Rc` or an `Arc`.
 fn arguments_trouble(
-    db: &dyn HirDatabase,
+    db: &Db,
     closure: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> (Option<String>, bool) {
-    let Ok(types) = super::body_types(db, closure.clone(), env.clone()).as_ref() else {
+    // clone: the query takes its key by value; a stored param env is a reference count
+    let Ok(types) = super::body_types(db, *closure, env.clone()).as_ref() else {
         return (None, false);
     };
     let interner = DbInterner::new_with(db, env.krate);
-    let mut seen = FxHashSet::default();
+    let mut seen = HashSet::default();
     let mut counted = false;
     // The first parameter is the closure itself, which captures nothing.
     for ty in types.params.iter().skip(1) {
         let ty = ty.as_ref();
         if let Some(why) = trouble(db, interner, ty, false, &mut seen, &mut counted) {
             let name = hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_default();
+            // alloc: the error, why the function is not cached
             return (Some(format!("an argument of type `{name}` {why}")), counted);
         }
     }
@@ -2244,13 +1916,13 @@ fn arguments_trouble(
 /// of an `Rc` or an `Arc` change behind one, but only what reads them sees that, and the walk
 /// refuses that instead (`reads_count`): `counted` is set when `ty` holds some.
 fn trouble<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     interner: DbInterner<'db>,
     ty: Ty<'db>,
     in_library: bool,
-    seen: &mut FxHashSet<Ty<'db>>,
+    seen: &mut HashSet<Ty<'db>>,
     counted: &mut bool,
-) -> Option<String> {
+) -> Option<&'static str> {
     if !seen.insert(ty) {
         return None;
     }
@@ -2268,7 +1940,7 @@ fn trouble<'db>(
         TyKind::RawPtr(pointee, _) if in_library => {
             trouble(db, interner, pointee, true, seen, counted)
         }
-        TyKind::RawPtr(..) => Some("holds a raw pointer".to_owned()),
+        TyKind::RawPtr(..) => Some("holds a raw pointer"),
         TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
             trouble(db, interner, element, in_library, seen, counted)
         }
@@ -2279,22 +1951,21 @@ fn trouble<'db>(
             let lang = interner.lang_items();
             let library = def.def_id().module(db).krate(db).data(db).origin.is_lang();
             let counts = library && holds_counts(db, def.def_id());
-            let variants: Vec<VariantId> = match def.def_id() {
+            let mut variants = match def.def_id() {
                 AdtId::StructId(id) if Some(id) == lang.UnsafeCell => {
                     return Some(
                         "can change behind a shared reference: it holds an `UnsafeCell`, as \
-                         `Cell`, `RefCell`, `Mutex` and atomics do"
-                            .to_owned(),
+                         `Cell`, `RefCell`, `Mutex` and atomics do",
                     );
                 }
-                AdtId::StructId(id) => vec![id.into()],
-                AdtId::EnumId(id) => {
-                    id.enum_variants(db).variants.iter().map(|(_, it)| it.0.into()).collect()
-                }
-                AdtId::UnionId(_) if !library => return Some("holds a union".to_owned()),
-                AdtId::UnionId(id) => vec![id.into()],
+                AdtId::StructId(id) => either::Either::Left(std::iter::once(VariantId::from(id))),
+                AdtId::EnumId(id) => either::Either::Right(
+                    id.enum_variants(db).variants.iter().map(|(_, it)| VariantId::from(it.0)),
+                ),
+                AdtId::UnionId(_) if !library => return Some("holds a union"),
+                AdtId::UnionId(id) => either::Either::Left(std::iter::once(VariantId::from(id))),
             };
-            let in_fields = variants.into_iter().find_map(|variant| {
+            let in_fields = variants.find_map(|variant| {
                 let fields = variant.fields(db).fields();
                 db.field_types(variant).iter().find_map(|(id, field)| {
                     if counts && matches!(fields[id].name.as_str(), "strong" | "weak") {
@@ -2312,29 +1983,31 @@ fn trouble<'db>(
                     .find_map(|ty| trouble(db, interner, ty, library, seen, counted))
             })
         }
-        TyKind::Dynamic(..) => Some("is a trait object".to_owned()),
+        TyKind::Dynamic(..) => Some("is a trait object"),
         TyKind::Alias(..) if in_library => None,
-        _ => Some("is of a type blaze can't see into".to_owned()),
+        _ => Some("is of a type blaze can't see into"),
     }
 }
 
 /// Hashes compiled code without what tells where it was written: the lines it is of and
 /// where its variables are.
 fn hash_code(hasher: &mut impl Hasher, code: &Code) {
-    let Code { signature, bytes, align, relocs, elf_types, unwind, lines: _, slots: _ } = code;
-    (signature, bytes, align, elf_types).hash(hasher);
-    format!("{unwind:?}").hash(hasher);
-    relocs.len().hash(hasher);
-    for reloc in relocs {
-        (reloc.offset, std::mem::discriminant(&reloc.kind), reloc.addend).hash(hasher);
-        std::mem::discriminant(&reloc.name).hash(hasher);
-        match &reloc.name {
-            ModuleRelocTarget::User { namespace, index } => (namespace, index).hash(hasher),
-            ModuleRelocTarget::LibCall(call) => call.hash(hasher),
-            ModuleRelocTarget::KnownSymbol(symbol) => symbol.hash(hasher),
-            ModuleRelocTarget::FunctionOffset(func, offset) => (func, offset).hash(hasher),
-        }
+    use std::cell::RefCell;
+    use std::fmt::Write as _;
+    thread_local! {
+        /// The text of an unwind table, hashed as text, a buffer reused by every function.
+        // alloc: one buffer a thread, grown to the longest text and kept
+        static UNWIND: RefCell<String> = const { RefCell::new(String::new()) };
     }
+    let Code { signature, bytes, align, relocs, unwind, lines: _, slots: _ } = code;
+    (signature, bytes, align).hash(hasher);
+    relocs.hash_elf_types(hasher);
+    UNWIND.with_borrow_mut(|text| {
+        text.clear();
+        write!(text, "{unwind:?}").expect("a `Debug` into a `String` does not fail");
+        text.as_str().hash(hasher);
+    });
+    relocs.hash_as_module(hasher);
 }
 
 impl<'db> FunctionCx<'_, 'db> {
@@ -2345,6 +2018,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let db = self.cg.db;
         let ty = generic_args.type_at(0);
         let TyKind::Closure(id, args) = ty.kind() else {
+            // alloc: the error's message
             return Err(CodegenError::Unsupported(format!("`{CODE}` of `{ty:?}`")));
         };
         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
@@ -2355,10 +2029,11 @@ impl<'db> FunctionCx<'_, 'db> {
             checked: self.cg.checked,
         };
         let env = Homes::default().home(db, &closure, &self.env.store());
-        let (hash, text) = match cache_code(db, closure.clone(), env) {
+        let (hash, text) = match cache_code(db, closure, env) {
             Ok(hash) => (*hash, cached_name(db, &closure)),
             Err(why) => {
                 tracing::info!(target: "blaze", "{why}");
+                // clone: the constant's bytes own the text; the query keeps its own
                 (0, why.clone())
             }
         };
@@ -2370,9 +2045,12 @@ impl<'db> FunctionCx<'_, 'db> {
         let len = self.builder.ins().iconst(ptr(), text.len() as i64);
         let data = self.cg.define_const(ConstBlob {
             bytes: text.into_bytes(),
+            // alloc: empty, allocates nothing
             relocs: Vec::new(),
+            // alloc: empty, allocates nothing
             fn_relocs: Vec::new(),
             align: 1,
+            // alloc: empty, allocates nothing
             type_ids: Vec::new(),
         })?;
         let data = self.cg.declare_data_in_func(data, self.builder.func);
@@ -2388,7 +2066,10 @@ impl<'db> FunctionCx<'_, 'db> {
 mod tests {
     use cranelift_codegen::{ir::Signature, isa::CallConv};
 
-    use super::super::debuginfo::{LineRow, SlotPlaces};
+    use super::super::{
+        debuginfo::{LineRow, SlotPlaces},
+        fragment::Relocs,
+    };
     use super::*;
 
     fn code(bytes: &[u8], lines: Vec<LineRow>) -> Code {
@@ -2396,8 +2077,7 @@ mod tests {
             signature: Signature::new(CallConv::SystemV),
             bytes: bytes.to_vec(),
             align: 16,
-            relocs: Vec::new(),
-            elf_types: Vec::new(),
+            relocs: Relocs::default(),
             unwind: None,
             lines,
             slots: SlotPlaces::default(),
@@ -2428,52 +2108,6 @@ mod tests {
         let other = code(&[0x90, 0x90, 0xc3], Vec::new());
         assert_eq!(hash(&here), hash(&moved));
         assert_ne!(hash(&here), hash(&other));
-    }
-
-    #[test]
-    fn what_is_below_a_sealed_node_reads_back_as_it_was_written() {
-        let call = |name: &str, at: Option<&str>| Call {
-            name: name.to_owned(),
-            at: at.map(str::to_owned),
-        };
-        let found = |kind, what: &str, why: &str, path| Found {
-            kind,
-            what: what.to_owned(),
-            why: why.to_owned(),
-            path,
-        };
-        let below = Below {
-            found: vec![
-                found(
-                    Kind::Fs,
-                    "open",
-                    "it reaches `open`, which reads or writes files",
-                    vec![
-                        call("std::fs::read", Some("library/std/src/fs.rs:300:5")),
-                        call("std::fs::File::open", None),
-                        call("open", None),
-                    ],
-                ),
-                found(
-                    Kind::GlobalState,
-                    "c::N",
-                    "it uses the static `c::N`",
-                    vec![call("f", None)],
-                ),
-            ],
-        };
-        let read = Below::read(below.write().as_bytes()).unwrap();
-        assert_eq!(read.found, below.found);
-        let nothing = Below::read(Below::default().write().as_bytes()).unwrap();
-        assert!(nothing.found.is_empty());
-        // A tab in what is said would start a call of its own.
-        let tabbed = Below {
-            found: vec![found(Kind::Uncompiled, "f", "a\tb", vec![call("f", Some("x\ty"))])],
-        };
-        let read = Below::read(tabbed.write().as_bytes()).unwrap();
-        assert_eq!(read.found[0].why, "a b");
-        assert_eq!(read.found[0].path, vec![call("f", Some("x y"))]);
-        assert!(Below::read(b"below 1\n").is_none());
     }
 
     #[test]

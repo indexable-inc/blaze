@@ -1,0 +1,24 @@
+{
+  "id": "01472",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script/global.rs",
+    "docs/v2/plan/lanes/fastcompile/global.md"
+  ],
+  "what": "00693 item 1 (the global cache in the v2 daemon) needs a decision before cargo wires it: docs/v2/plan/lanes/fastcompile/global.md is a plan and nothing says where a daemon gets the cache endpoint and trust (an env var such as BLAZE_GLOBAL=<https url>, a [workspace.metadata.blaze] key, or the blaze config file), or whether blaze_global::Client becomes the blaze_cas Store Remote (the doc says so) or a client the daemon steps itself (serve/unit/script/global.rs Fetch assumes the daemon steps it). Proposal: the daemon reads one typed setting at start (endpoint + pinned publisher from sign::PINNED), owns one Client on the loop, routes its completions beside the store, and steps each crates.io build script run through script/global.rs Fetch before it runs; with no setting, no fetch (not a fallback: a cache that is not configured). Answer on 00693 and cargo wires it.",
+  "state": "open",
+  "created": "2026-11-01T07:27:43Z",
+  "updated": "2026-11-01T07:27:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:27:43Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

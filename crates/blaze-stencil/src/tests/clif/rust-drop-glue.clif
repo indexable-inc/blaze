@@ -1,0 +1,206 @@
+; Shaped like what hir-ty-codegen makes for a call that may unwind past locals with drop
+; glue (its `invoke`: a `try_call` whose normal edge goes on and whose `tag0` (CLEANUP)
+; edge goes to a cleanup pad that stores the exception to a stack slot, runs the drop glue
+; with plain calls and resumes):
+;
+;     struct Guard<'a>(&'a Cell<u64>, u64);
+;     impl Drop for Guard<'_> { fn drop(&mut self) { self.0.set(self.0.get() * 10 + self.1) } }
+;     struct Pair<'a> { a: Guard<'a>, b: Guard<'a> }
+;     fn outer(c: &Cell<u64>, throws: bool) -> u64 {
+;         let pair = Pair { a: Guard(c, 1), b: Guard(c, 2) };
+;         let _c = Guard(c, 3);
+;         may_throw(20, throws)
+;     }
+;
+; so both paths drop `_c`, then `pair.a`, then `pair.b`, leaving 312 in the cell. The
+; drop glue is a chain: `drop_in_place::<Pair>` calls `drop_in_place::<Guard>` per field,
+; which calls `<Guard as Drop>::drop`. `%may_throw` panics through the host's `throw_fn`
+; (`u2:0`, raising with the tag and value it is given); the pad returns `exception + 1000`
+; where Rust would call `_Unwind_Resume`, so the run line sees the cleanup's result.
+; `%outer_tagged` adds a `default` handler and reads both exception payloads (value, tag).
+; No `test interpret`: the interpreter runs neither `try_call` nor a host function.
+test run
+target x86_64
+target aarch64
+
+function %guard_drop(i64) {
+block0(v0: i64):
+    v1 = load.i64 notrap aligned v0
+    v2 = load.i64 notrap aligned v0+8
+    v3 = load.i64 notrap aligned v1
+    v4 = iconst.i64 10
+    v5 = imul v3, v4
+    v6 = iadd v5, v2
+    store notrap aligned v6, v1
+    return
+}
+
+function %drop_in_place_guard(i64) {
+    fn0 = %guard_drop(i64)
+
+block0(v0: i64):
+    call fn0(v0)
+    return
+}
+
+function %drop_in_place_pair(i64) {
+    fn0 = %drop_in_place_guard(i64)
+
+block0(v0: i64):
+    call fn0(v0)
+    v1 = iconst.i64 16
+    v2 = iadd v0, v1
+    call fn0(v2)
+    return
+}
+
+function %may_throw(i64, i8) -> i64 {
+    sig0 = (i64, i64)
+    fn0 = u2:0 sig0
+
+block0(v0: i64, v1: i8):
+    brif v1, block2, block1
+
+block1:
+    v2 = iadd v0, v0
+    return v2
+
+block2 cold:
+    v3 = iconst.i64 0
+    v4 = iconst.i64 7
+    call fn0(v3, v4)
+    trap user1
+}
+
+function %outer(i64, i8) -> i64 {
+    ss0 = explicit_slot 32, align = 8
+    ss1 = explicit_slot 16, align = 8
+    ss2 = explicit_slot 8, align = 8
+    sig0 = (i64, i8) -> i64
+    sig1 = (i64)
+    fn0 = %may_throw sig0
+    fn1 = %drop_in_place_pair sig1
+    fn2 = %drop_in_place_guard sig1
+
+block0(v0: i64, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store notrap aligned v0, v2
+    v3 = iconst.i64 1
+    store notrap aligned v3, v2+8
+    store notrap aligned v0, v2+16
+    v4 = iconst.i64 2
+    store notrap aligned v4, v2+24
+    v5 = stack_addr.i64 ss1
+    store notrap aligned v0, v5
+    v6 = iconst.i64 3
+    store notrap aligned v6, v5+8
+    v7 = iconst.i64 20
+    try_call fn0(v7, v1), sig0, block1(ret0), [ tag0: block2(exn0) ]
+
+block1(v8: i64):
+    call fn2(v5)
+    call fn1(v2)
+    return v8
+
+block2(v9: i64) cold:
+    v10 = stack_addr.i64 ss2
+    store notrap aligned v9, v10
+    v11 = stack_addr.i64 ss1
+    call fn2(v11)
+    v12 = stack_addr.i64 ss0
+    call fn1(v12)
+    v13 = load.i64 notrap aligned v10
+    v14 = iconst.i64 1000
+    v15 = iadd v13, v14
+    return v15
+}
+
+function %run(i8) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+    fn0 = %outer(i64, i8) -> i64
+
+block0(v0: i8):
+    v1 = stack_addr.i64 ss0
+    v2 = iconst.i64 0
+    store notrap aligned v2, v1
+    v3 = call fn0(v1, v0)
+    v4 = load.i64 notrap aligned v1
+    v5 = iconst.i64 100000
+    v6 = imul v4, v5
+    v7 = iadd v6, v3
+    return v7
+}
+; run: %run(0) == 31200040
+; run: %run(1) == 31201007
+
+function %may_throw_tag(i64, i8) -> i64 {
+    sig0 = (i64, i64)
+    fn0 = u2:0 sig0
+
+block0(v0: i64, v1: i8):
+    brif v1, block2, block1
+
+block1:
+    v2 = iconst.i64 1
+    v3 = iadd v0, v2
+    return v3
+
+block2 cold:
+    v4 = iconst.i64 9
+    call fn0(v0, v4)
+    trap user1
+}
+
+function %outer_tagged(i64, i64, i8) -> i64 {
+    ss0 = explicit_slot 16, align = 8
+    sig0 = (i64, i8) -> i64
+    sig1 = (i64)
+    fn0 = %may_throw_tag sig0
+    fn1 = %drop_in_place_guard sig1
+
+block0(v0: i64, v1: i64, v2: i8):
+    v3 = stack_addr.i64 ss0
+    store notrap aligned v0, v3
+    v4 = iconst.i64 4
+    store notrap aligned v4, v3+8
+    try_call fn0(v1, v2), sig0, block1(ret0), [ tag0: block2(exn0, exn1), default: block3(exn0, exn1) ]
+
+block1(v5: i64):
+    call fn1(v3)
+    return v5
+
+block2(v6: i64, v7: i64) cold:
+    call fn1(v3)
+    v8 = iconst.i64 1000
+    v9 = iadd v6, v8
+    return v9
+
+block3(v10: i64, v11: i64) cold:
+    call fn1(v3)
+    v12 = iconst.i64 100
+    v13 = imul v11, v12
+    v14 = iadd v13, v10
+    v15 = iconst.i64 2000
+    v16 = iadd v14, v15
+    return v16
+}
+
+function %run_tagged(i64, i8) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+    fn0 = %outer_tagged(i64, i64, i8) -> i64
+
+block0(v0: i64, v1: i8):
+    v2 = stack_addr.i64 ss0
+    v3 = iconst.i64 0
+    store notrap aligned v3, v2
+    v4 = call fn0(v2, v0, v1)
+    v5 = load.i64 notrap aligned v2
+    v6 = iconst.i64 100000
+    v7 = imul v5, v6
+    v8 = iadd v7, v4
+    return v8
+}
+; run: %run_tagged(0, 0) == 400001
+; run: %run_tagged(5, 0) == 400006
+; run: %run_tagged(0, 1) == 401009
+; run: %run_tagged(5, 1) == 402509

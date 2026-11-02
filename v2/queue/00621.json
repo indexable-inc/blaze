@@ -1,0 +1,42 @@
+{
+  "id": "00621",
+  "from_lane": "db-expand-paths",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/Cargo.toml",
+    "crates/hir/src/lib.rs",
+    "vendor/salsa",
+    "crates/blaze-radix/src/csr.rs",
+    "vendor/salsa/src",
+    "vendor/salsa/src/function/execute.rs",
+    "crates/hir",
+    "v2/requests/db.md"
+  ],
+  "what": "## db-expand-paths: what I6, R8 and R10.4 leave to other owners (db, coordinator, mem; `crates/hir-def/Cargo.toml`, `crates/hir/src/lib.rs`, `vendor/salsa`, `crates/blaze-radix/src/csr.rs`)\n\n1. **`crates/hir-def/Cargo.toml` (owner's):** `fst = { version = \"0.4.7\", default-features = false }`\n   moves from `[dependencies]` to `[dev-dependencies]`, the same spec. Since mem-db-def-items' I6.2\n   (applied), only `import_map.rs`'s `mod tests` (the reference FST) uses it.\n2. **`crates/hir/src/lib.rs` `query_external_importables` (db / mem-db-def-hir R10b):**\n   `hir_def::import_map::search_dependencies_each` now exists, so R10b's body can land: items in\n   the order found, deduplicated by the per-worker seen-set.\n3. **`frame::current` inside a query (mem-db-salsa):** `ImportMap::of` now runs its build through\n   `blaze_mem::frame::current`, as `lang_item.rs`, `attrs.rs` and base-db's `input.rs` already do.\n   It needs salsa to run each query function in `frame::task` (mem-db-def-items' header). I found\n   no `frame::task` in `vendor/salsa/src` yet; until it is there, `ImportMap::of` stops with\n   \"frame::current outside any frame::task\".\n4. **Optional, `crates/blaze-radix/src/csr.rs` (dedup's):** a `Csr::build` whose cursors come from a\n   caller's allocator (say `group_into` generic over `A: Allocator` for `cursors`). Then\n   `ImportMap::build` puts its one temporary on the frame and is its nine allocations.\n   `build_is_its_columns` allows 10 until then.\n   > applied by dedup (2026-10-29 23:20): `Csr::build_in(rows, pairs, scratch: A)` (cursors in\n   > `scratch`, one block of `rows`; only the two columns on the heap; test\n   > `build_in_puts_the_cursors_in_the_scratch`), and `Csr::rebuild` takes `&mut Vec<u32, A>`.\n   > Left to hir-def's owner: `import_map.rs:116` `Csr::build(rows, pairs)` ->\n   > `Csr::build_in(rows, pairs, <the frame>)`, and `build_is_its_columns` back to 9.\n   > applied by db-expand (db-expand-next2, 2026-10-29 23:22): `ImportMap::build` calls\n   > `blaze_ids::radix::Csr::build_in(rows, pairs, frame)` (`import_map.rs:116`), and\n   > `build_is_its_columns` allows 9, its doc comment counting the cursors as the frame's. Not\n   > run (applier rules); hot lint is clean on `import_map.rs`.\n5. **R10.4 and R10.9 (`visibility.rs`):** not applied. They take `&impl DefMapRead`, and R10.1's\n   trait is not in the tree (deferred by db-expand-names). Whoever lands R10.1 changes\n   `is_visible_from_def_map`, `max` and `min` to `&impl DefMapRead` in the same change. The bodies\n   read only `krate()` and `block_id()`, plus `def_map.parent(db, from_module)` under\n   `debug_assertions` instead of `def_map.module(..)`.\n\n> forwarded to db (1 `hir-def/Cargo.toml`, 2 `hir/src/lib.rs`, 3 `vendor/salsa`'s per-query `frame::task`, 5 R10.1's `DefMapRead`; db-next3) and dedup (4, optional, `blaze-radix/src/csr.rs`; window `dedup`); told by tmux (requests, pass 25).\n> db-expand (22:45), checked in the tree:\n> - 1 is done: `fst` is only in hir-def's `[dev-dependencies]`, and only `import_map.rs`'s test\n>   reference uses it.\n> - 3 is done: salsa's `execute_query` runs every body in `frame::task(C::MEM_TAG, ..)`\n>   (`vendor/salsa/src/function/execute.rs:343`).\n> - 5 waits on R10.1 (marked under R10.4 in `mem-db-def-resolve.md`).\n> - 2 (`crates/hir`) was re-sent to db-ty-next2 and db-next6.\n> checked by db (db-next6, 22:48), item 2: already in. `Crate::query_external_importables` (`hir/src/lib.rs:401`) calls `import_map::search_dependencies_each` with the scratch `found` list and per-worker seen-set, in found order.\n> checked by db-audit-dbsub-expand (2026-10-29 22:49): every item settled. 1 applied by me (22:40, `crates/hir-def/Cargo.toml`: `fst` moved to `[dev-dependencies]`, manifest lint clean). 2 in the tree, applied by db-audit-mem (`mem-db-def-hir.md:1781`): `hir/src/lib.rs:401-415`, `scratch.rs:95-115` (`Importables`, `IMPORTABLES_SEEN`, `take/give_importables_seen`). 3 in the tree (`vendor/salsa/src/function/execute.rs:343`). 4 filed to dedup in `v2/requests/db.md` (heading \"dedup (`crates/blaze-radix/src/csr.rs`)\"), dedup told by tmux. 5 deferred with R10 (Andrew, 21:05; `mem-db-def-resolve.md` R10.4).",
+  "state": "applied",
+  "created": "2026-10-30T06:20:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-paths: what I6, R8 and R10.4 leave to other owners (db, coordinator, mem; `crates/hir-def/Cargo.toml`, `crates/hir/src/lib.rs`, `vendor/salsa`, `crates/blaze-radix/src/csr.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:2651"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-expand (2026-10-29 22:49): every item settled. 1 applied by me (22:40, `crates/hir-def/Cargo.toml`: `fst` moved to `[dev-dependencies]`, manifest lint clean). 2 in the tree, applied by db-audit-mem (`mem-db-def-hir.md:1781`): `hir/src/lib.rs:401-415`, `scratch.rs:95-115` (`Importables`, `IMPORTABLES_SEEN`, `take/give_importables_seen`). 3 in the tree (`vendor/salsa/src/fu"
+    }
+  ]
+}

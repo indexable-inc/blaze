@@ -1,0 +1,36 @@
+{
+  "id": "00069",
+  "from_lane": "speed",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2/engine.py",
+    "harness/v2/proof.py"
+  ],
+  "what": "## speed-link-edge-sol-proof\n\n> forwarded to the coordinator (see below).\n\n### `pyproject.toml` and `uv.lock`: the `blake3` Python package\n\nWhat: `dependencies = [\"typed-input\", \"blake3>=1.0\"]` in the root `pyproject.toml`, and\n`uv lock` to add it to `uv.lock` (blake3-py, the Rust `blake3` crate behind the GIL-free buffer\nAPI, with wheels for Linux x86-64 and aarch64, macOS aarch64 and Windows x86-64).\n\nWhy: `harness/v2/engine.py` (`digest`, `digests`, `tree_digest`) and `harness/v2/proof.py`\n(`old_outputs`, its selftest model) now `import blake3` and hash every build output and source\ntree with BLAKE3: SIMD on one core (about 6 GB/s with AVX-512 against about 2 GB/s for SHA-256\nwith SHA-NI), and from 8 MiB on every core for one file (`max_threads=blake3.AUTO`). The\nSHA-256 they replaced ran at a third of the bound per core and one core per file. The written\ncode imports it, so this has to land with it. `corpus.py`'s check of the `.crate` against the\nindex's checksum stays SHA-256, which is what the index lists.\n\n> forwarded to the coordinator: root `pyproject.toml` and `uv.lock` are not requests' paths, and `uv lock` is not to be run here; on requests' coordinator list.",
+  "state": "applied",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T08:28:22Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/speed.md#speed-link-edge-sol-proof",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:364"
+    },
+    {
+      "at": "2026-10-30T08:28:22Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:22Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "pyproject.toml [project] dependencies gains \"blake3>=1.0\". uv.lock is not regenerated (uv lock resolves and downloads, not allowed now): the coordinator runs `uv lock` at the compile loop, beside the Cargo.lock refresh."
+    }
+  ]
+}

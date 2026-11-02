@@ -36,6 +36,30 @@ pub(super) fn pattern_top_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
     pattern_r(p, recovery_set);
 }
 
+// test guard_pat
+// fn main() {
+//     let (a if a, [b | c if true]) = ();
+//     let S(d if d, E { f: g if g }) = ();
+// }
+/// Parses a pattern list separated by pipes `|` that may end in a guard, `pat if cond`
+/// (`guard_patterns`): rustc's `parse_pat_allow_top_guard`, for the elements of tuple, slice and
+/// tuple struct patterns, a struct pattern's field after its `:`, `builtin#deref` and a `for`
+/// loop's pattern. A match arm's guard is the arm's, not its pattern's.
+pub(crate) fn pattern_top_guard(p: &mut Parser<'_>) {
+    let pat = pattern_r(p, PAT_RECOVERY_SET);
+    if p.at(T![if]) {
+        let m = match pat {
+            Some(pat) => pat.precede(p),
+            None => p.start(),
+        };
+        let guard = p.start();
+        p.bump(T![if]);
+        expressions::expr(p);
+        guard.complete(p, MATCH_GUARD);
+        m.complete(p, GUARD_PAT);
+    }
+}
+
 // test or_pattern
 // fn main() {
 //     match () {
@@ -47,23 +71,35 @@ pub(super) fn pattern_top_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
 // }
 /// Parses a pattern list separated by pipes `|`, with no leading `|`,using the
 /// given `recovery_set`.
-fn pattern_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
+fn pattern_r(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarker> {
     let m = p.start();
     let has_leading_pipe = p.eat(T![|]);
 
-    pattern_single_r(p, recovery_set);
+    let (first, _) = pattern_single_r(p, recovery_set);
 
     if !p.at(T![|]) && !has_leading_pipe {
         m.abandon(p);
-        return;
+        return first;
     }
     while p.eat(T![|]) {
         pattern_single_r(p, recovery_set);
     }
-    m.complete(p, OR_PAT);
+    Some(m.complete(p, OR_PAT))
 }
 
-fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
+/// A pattern without a top-level `|`, and the operator of the range pattern it is, if it is
+/// one.
+fn pattern_single_r(
+    p: &mut Parser<'_>,
+    recovery_set: TokenSet,
+) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
+    stdx::ensure_sufficient_stack(|| pattern_single_r_here(p, recovery_set))
+}
+
+fn pattern_single_r_here(
+    p: &mut Parser<'_>,
+    recovery_set: TokenSet,
+) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
     // test range_pat
     // fn main() {
     //     match () {
@@ -110,8 +146,7 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
         let m = p.start();
         p.bump(T![..=]);
         atom_pat(p, recovery_set);
-        m.complete(p, RANGE_PAT);
-        return;
+        return (Some(m.complete(p, RANGE_PAT)), Some(T![..=]));
     }
 
     // test exclusive_range_pat
@@ -153,69 +188,74 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
         p.bump(T![..]);
         if p.at_ts(RANGE_PAT_END_FIRST) {
             atom_pat(p, recovery_set);
-            m.complete(p, RANGE_PAT);
-        } else {
-            m.complete(p, REST_PAT);
+            return (Some(m.complete(p, RANGE_PAT)), Some(T![..]));
         }
-        return;
+        return (Some(m.complete(p, REST_PAT)), None);
     }
 
-    if let Some(lhs) = atom_pat(p, recovery_set) {
-        for range_op in [T![...], T![..=], T![..]] {
-            if p.at(range_op) {
-                let m = lhs.precede(p);
-                p.bump(range_op);
+    let Some(lhs) = atom_pat(p, recovery_set) else { return (None, None) };
+    for range_op in [T![...], T![..=], T![..]] {
+        if p.at(range_op) {
+            let m = lhs.precede(p);
+            p.bump(range_op);
 
-                // testing if we're at one of the following positions:
-                // `0 .. =>`
-                //       ^
-                // `let 0 .. =`
-                //           ^
-                // `let 0..: _ =`
-                //         ^
-                // (1.., _)
-                //     ^
-                // `Some(0 .. )`
-                //            ^
-                // `S { t: 0.. }`
-                //             ^
-                // `[0..]`
-                //      ^
-                // `0 .. if`
-                //       ^
-                // `0 .. | _`
-                //       ^
-                // A `::` starts the path the range ends at, where a `:` ends the pattern.
-                if !p.at(T![::])
-                    && matches!(
-                        p.current(),
-                        T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | T![|] | EOF
-                    )
-                {
-                    // test half_open_range_pat
-                    // fn f() {
-                    //     let 0 .. = 1u32;
-                    //     let 0..: _ = 1u32;
-                    //
-                    //     match 42 {
-                    //         0 .. if true => (),
-                    //         _ => (),
-                    //     }
-                    //
-                    //     let &(0.. | _) = &0_i32;
-                    // }
+            // testing if we're at one of the following positions:
+            // `0 .. =>`
+            //       ^
+            // `let 0 .. =`
+            //           ^
+            // `let 0..: _ =`
+            //         ^
+            // (1.., _)
+            //     ^
+            // `Some(0 .. )`
+            //            ^
+            // `S { t: 0.. }`
+            //             ^
+            // `[0..]`
+            //      ^
+            // `0 .. if`
+            //       ^
+            // `0 .. | _`
+            //       ^
+            // A `::` starts the path the range ends at, where a `:` ends the pattern.
+            if !p.at(T![::])
+                && matches!(
+                    p.current(),
+                    T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | T![|] | EOF
+                )
+            {
+                // test half_open_range_pat
+                // fn f() {
+                //     let 0 .. = 1u32;
+                //     let 0..: _ = 1u32;
+                //
+                //     match 42 {
+                //         0 .. if true => (),
+                //         _ => (),
+                //     }
+                //
+                //     let &(0.. | _) = &0_i32;
+                // }
 
-                    // test range_pat_to_global_path
-                    // fn f() {
-                    //     if let 0..=::m::MAX = 1 {}
-                    // }
-                } else {
-                    atom_pat(p, recovery_set);
-                }
-                m.complete(p, RANGE_PAT);
-                return;
+                // test range_pat_to_global_path
+                // fn f() {
+                //     if let 0..=::m::MAX = 1 {}
+                // }
+            } else {
+                atom_pat(p, recovery_set);
             }
+            return (Some(m.complete(p, RANGE_PAT)), Some(range_op));
         }
+    }
+    (Some(lhs), None)
+}
+
+/// rustc's `ban_pat_range_if_ambiguous`, after `&` or `box`: a range pattern but one written
+/// with `...` needs parentheses. The error is at the end of the range pattern.
+fn ban_pat_range_if_ambiguous(p: &mut Parser<'_>, range_op: Option<SyntaxKind>) {
+    if matches!(range_op, Some(T![..=] | T![..])) {
+        p.error("the range pattern here has ambiguous interpretation");
     }
 }
 
@@ -227,7 +267,7 @@ fn builtin_pat(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // test deref_pat
         // fn foo() { let builtin # deref(_) = 1; }
         p.expect(T!['(']);
-        pattern(p);
+        pattern_top_guard(p);
         p.expect(T![')']);
         Some(m.complete(p, DEREF_PAT))
     } else if p.eat_contextual_kw(T![cfg]) {
@@ -378,7 +418,7 @@ fn record_pat_field(p: &mut Parser<'_>) {
             p.bump(T![:]);
             // test record_field_pat_leading_or
             // fn foo() { let R { a: | 1 | 2 } = 0; }
-            pattern(p);
+            pattern_top_guard(p);
         }
         // test_err record_pat_field_eq_recovery
         // fn main() {
@@ -396,6 +436,7 @@ fn record_pat_field(p: &mut Parser<'_>) {
         T![ref] | T![mut] | IDENT => {
             ident_pat(p, false);
         }
+        T!['}'] => p.error("expected identifier"),
         _ => {
             p.err_and_bump("expected identifier");
         }
@@ -455,12 +496,38 @@ fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let &a = ();
 //     let &mut b = ();
 // }
+
+// test ref_pat_pin
+// fn main() {
+//     let &pin mut a = ();
+//     let &pin const b = ();
+//     let &pin = ();
+// }
+
+// test_err ambiguous_range_pat
+// fn main() {
+//     let &0..=1 = ();
+//     let box ..2 = ();
+//     let &mut 0.. = ();
+//     let &0 ... 1 = ();
+//     let &(0..=1) = ();
+// }
+/// `&pat`, `&mut pat`, `&pin const pat` and `&pin mut pat` (rustc's `parse_pat_deref`, with
+/// `parse_pin_and_mut`).
 fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![&]));
     let m = p.start();
     p.bump(T![&]);
-    p.eat(T![mut]);
-    pattern_single(p);
+    if p.at_contextual_kw(T![pin]) && matches!(p.nth(1), T![mut] | T![const]) {
+        p.bump_remap(T![pin]);
+        if !p.eat(T![mut]) {
+            p.bump(T![const]);
+        }
+    } else {
+        p.eat(T![mut]);
+    }
+    let (_, range_op) = pattern_single_r(p, PAT_RECOVERY_SET);
+    ban_pat_range_if_ambiguous(p, range_op);
     m.complete(p, REF_PAT)
 }
 
@@ -508,7 +575,7 @@ fn tuple_pat(p: &mut Parser<'_>) -> CompletedMarker {
             break;
         }
         has_rest |= !p.at(T![..=]) && p.at(T![..]) && !RANGE_PAT_END_FIRST.contains(p.nth(2));
-        pattern(p);
+        pattern_top_guard(p);
         if !p.at(T![')']) {
             has_comma = true;
             p.expect(T![,]);
@@ -535,9 +602,10 @@ fn slice_pat(p: &mut Parser<'_>) -> CompletedMarker {
 
 fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
-        pattern(p);
+        pattern_top_guard(p);
         if !p.eat(T![,]) {
             if p.at_ts(PAT_TOP_FIRST) {
+                // alloc: error path only, the message names the token found
                 p.error(format!("expected {:?}, got {:?}", T![,], p.current()));
             } else {
                 break;
@@ -577,7 +645,8 @@ fn box_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![box]));
     let m = p.start();
     p.bump(T![box]);
-    pattern_single(p);
+    let (_, range_op) = pattern_single_r(p, PAT_RECOVERY_SET);
+    ban_pat_range_if_ambiguous(p, range_op);
     m.complete(p, BOX_PAT)
 }
 

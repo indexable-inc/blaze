@@ -1,0 +1,35 @@
+{
+  "id": "01127",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R9 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): add `blaze_query::db::NamesIds` (`fn names_ids(&self, out: &mut Vec<Id>)`) and `Storage::ids_of(&self, id: Id, out: &mut Vec<Id>)` (an interned row's fields' IDs: an AsId field pushes its id, a NamesIds field what it names; generated per interned ingredient). hir-firewall keys.rs:96 follows a key's fields to classify reads; impls at hir-def lib.rs:1197, hir-ty next_solver/ty.rs:97,103,109,117.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: NamesIds trait and Storage::ids_of."
+    }
+  ]
+}

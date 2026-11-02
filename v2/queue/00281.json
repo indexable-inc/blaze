@@ -1,0 +1,24 @@
+{
+  "id": "00281",
+  "from_lane": "db-ty-d-infer1",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/ide-diagnostics/src/lib.rs"
+  ],
+  "what": "## To diagnostics and ide-diagnostics: `MismatchedArgCount.args`, new `IncorrectArguments`\n\n`hir::MismatchedArgCount` now carries `args: hir::CallArgs`, and the new\n`hir::IncorrectArguments { call_expr: InFile<ExprOrPatPtr>, args: CallArgs }` is a call whose\nargument count fits but some argument does not (rustc's `report_arg_errors` reached with\n`call_appears_satisfied` false: E0308 \"arguments to this function are incorrect\"). Each such\nargument also has its own `TypeMismatch`, so ide-diagnostics may leave it silent, but both `crates/blaze-diagnostics/src/lower/mod.rs` and\n`crates/ide-diagnostics/src/lib.rs` match `AnyDiagnostic` exhaustively and need an arm.\n\n`CallArgs` is what `report_arg_errors` starts from, every type a `String` as rustc prints it at\nthe error: `callee` (rustc's `callee_ty`, the receiver's type of a method call), `method`\n(`Option<Function>`), `is_method`, `c_variadic`, `formal_inputs`, `expected_inputs`, `provided`\n(the arguments' adjusted types; of a C-variadic call only those of fixed inputs), and\n`compatible_with(i)`, `ArgMatrix::new`'s row of the `i`th provided argument (the inputs it\nfits, the diagonal as `check_argument_types` found it and the rest by `check_compatible`).\nWith it the lowering can port `ArgMatrix::find_issue`'s loop (missing, extra, swapped,\npermuted, invalid arguments) and its labels and suggestions, for both E0061/E0057 and\nE0308, in place of knowing only the counts. Tests: `argument-suggestions/extra_arguments.rs`,\n`missing_arguments.rs`, `swapped_arguments.rs`, `permuted_arguments.rs`,\n`invalid_arguments.rs`, `error-codes/E0057.rs`.\n\n> forwarded to diagnostics (from requests, pass 17; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:55:50Z",
+  "updated": "2026-10-30T02:55:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-infer1.md#To diagnostics and ide-diagnostics: `MismatchedArgCount.args`, new `IncorrectArguments`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-infer1.md:71"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "00370",
+  "from_lane": "mem-db-infer-closure",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs",
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty-borrowck/src/lib.rs",
+    "crates/hir-ty-codegen/debuginfo/types.rs",
+    "crates/blaze-items/src/form.rs",
+    "crates/blaze-diagnostics/src/lints/bodies/liveness.rs",
+    "crates/hir-ide/src/tests/closure_captures.rs",
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## The answer in short\n\n`Place.projections` is a frame value while closures are analysed and owned only in the result.\nThe analysis gets its own frame types (`PlaceBuf<'f>`, `SourceStack<'f>`, `Sources<'f>`,\n`PlaceWithOrigin<'f>`, `CaptureInfoBuf<'f>`, `CapturedPlaceBuf<'f>`, `MinCapturesBuf<'f>`); the\nresult types (`Place`, `CaptureInfo`, `CapturedPlace`, `ClosureData`) are made once, at exact\nsize, from them:\n\n- `min_captures` right after the last `compute_min_captures` call of `analyze_closure`\n  (`MinCapturesBuf::finish`), before anything reads it;\n- `fake_reads` where `analyze_closure` stores them today;\n- `kind_origin` where `analyze_closure` stores it today.\n\nThe only place analysis reads results back is `walk_captures` (a nested closure's captures and\nfake reads become the enclosing closure's): it copies them into frame values.\n\n`ClosureData`, before and after (`infer.rs`):\n\n| field | before | after |\n|---|---|---|\n| `min_captures` | `FxIndexMap<BindingId, Vec<CapturedPlace>>` (hash table + entries + a `Vec` per root, each grown then `shrink_to_fit`) | `MinCaptures { roots: Box<[(BindingId, u32)]>, captures: Box<[CapturedPlace]> }`: 2 blocks |\n| `fake_reads` | `Box<[(Place, FakeReadCause, SmallVec<[CaptureSourceStack; 2]>)]>` | `Box<[(Place, FakeReadCause, Box<[CaptureSourceStack]>)]>` |\n| `Place.projections` | `Vec<Projection>` (grown by push, then `shrink_to_fit`) | `Box<[Projection]>` |\n| `CaptureInfo.sources` | `SmallVec<[CaptureSourceStack; 2]>` | `Box<[CaptureSourceStack]>` |\n| `CaptureSourceStack` | `ThinVec` grown by push at 3 or more, `shrink_to_fit` | unchanged type, built by `from_slice` at exact length |\n| `Hash`/`Eq` | order-insensitive (`hash_unordered`, `IndexMap`'s `==`) | derived, order-sensitive |\n\nThe order of `min_captures` is observable (it is the order of the closure's upvar tuple and of\nMIR's captures), so order-sensitive `Eq`/`Hash` is the right comparison for backdating; the\norder-insensitive one let two results whose upvar tuples differ only in order compare equal.\n\nA capture's result size drops from about 96 to 56 bytes (`Place` 40 to 32, `CaptureInfo` 48 to\n24) and a closure's `min_captures` from 2 + roots blocks (plus growth and shrink reallocations) to\n2. The number of allocations of the result is exactly the number `ClosureData::clone` makes,\nwhich is what the parent's budget test 2 compares.\n\nEvery reader outside the three files and `infer.rs`/`persist.rs` compiles unchanged:\n`MinCaptures::values()` yields `&[CapturedPlace]`, `&MinCaptures` iterates `(BindingId,\n&[CapturedPlace])`, `len()` is the root count, and `&Box<[T]>` iterates and derefs to `&[T]` as\n`&Vec<T>`/`&SmallVec` did. Checked by `rg -n \"min_captures|closures_data|\\.projections|\\.sources\"\ncrates/`:\n\n| reader | use | why unchanged |\n|---|---|---|\n| `crates/hir/src/lib.rs:4325-4326` | `data.min_captures.values().flatten().find(..)`, `place.projections.starts_with(&it.place.projections)` | `values()` kept; `Box<[T]>` derefs to `[T]` |\n| `crates/hir/src/lib.rs:4372-4377` | `.min_captures.values().flatten().map(..).collect()` | same |\n| `crates/hir/src/lib.rs:4464, 4492, 4524` | `self.capture.place.projections.iter()` | `Box<[T]>` |\n| `crates/hir/src/lib.rs:4470` | `sources: &self.capture.info.sources` into `&'db [CaptureSourceStack]` | deref coercion from `&Box<[T]>` as from `&SmallVec` |\n| `crates/hir-ty-mir/src/mir/lower.rs:1903-1916` | `for (place, _, sources) in &closure_data.fake_reads`, `span(sources)`, `span(&capture.info.sources)` | `&Box<[(..)]>` iterates; `span` takes `&[CaptureSourceStack]` |\n| `crates/hir-ty-mir/src/mir/lower.rs:2784, 4338, 4615, 4623-4624` | `values().flatten().next()/collect()/take(n)`, `place.projections.iter()` | same |\n| `crates/hir-ty-borrowck/src/lib.rs:696`, `check/explain.rs:462-463`, `names.rs:100` | `values().flatten()`, `.nth(at)`, `info.sources.first()`, `place.projections.iter()` | same |\n| `crates/hir-ty-codegen/debuginfo/types.rs:547, 556` | `values().flatten()`, `for projection in &capture.place.projections` | `IntoIterator for &Box<[T]>` (std 1.80) |\n| `crates/blaze-items/src/form.rs:1623-1628, 1653-1654` | `data.min_captures.len()`, `for (binding, places) in &data.min_captures { binding.into_raw(); places.len(); for place in places }`, `&place.projections` | `len()` is the root count as `IndexMap::len`; the item is `(BindingId, &[CapturedPlace])`, and `binding.into_raw()` works on the value as on `&BindingId` |\n| `crates/blaze-diagnostics/src/lints/bodies/liveness.rs:206`, `liveness/source.rs:226, 256` | `values().flatten().collect()`, `projections.iter()`, `info.sources.first()` | same |\n| `crates/hir-ide/src/tests/closure_captures.rs:28, 94, 124-127` | `place.projections.iter()`, `values().flatten()`, `info.sources.iter()` | same |\n| `crates/hir-ty/src/infer.rs` `closure_captures_tys`, `closure_captures_captured_tys` | `.min_captures.values().flat_map(\\|captures\\| captures.iter()..)` | same |\n\nThe readers that do change are all in `infer.rs` and `persist.rs` (X2 to X4) and my files.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:38): a summary of the sections below, each applied with its own line.",
+  "state": "applied",
+  "created": "2026-10-30T03:38:22Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-closure.md#The answer in short",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-closure.md:14"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:38): a summary of the sections below, each applied with its own line."
+    }
+  ]
+}

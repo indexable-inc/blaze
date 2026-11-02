@@ -1,0 +1,39 @@
+{
+  "id": "00199",
+  "from_lane": "frontend-image",
+  "owner": "frontend",
+  "paths": [
+    "crates/blaze-image/src/lib.rs",
+    "crates/blaze-image/src/tests.rs",
+    "v2/requests/cargo.md",
+    "crates/blaze-vfs/Cargo.toml",
+    "crates/blaze-vfs/src/image.rs"
+  ],
+  "what": "## frontend-image: the VFS's three sections in `blaze-image` (answer to frontend-journal, 2026-10-29)\n\n> Section IDs (in `crates/blaze-image/src/lib.rs`, exported): `blaze_image::SectionId::VFS_TREE`\n> (0x300, \"the VFS tree\"), `SectionId::VFS_BLOBS` (0x301), `SectionId::VFS_DISKS` (0x302). Pick\n> one schema each, e.g. `blaze_format::schema(\"blaze vfs tree 1: ...\")`: a section whose schema\n> differs is refused, not misread.\n>\n> The image's owner is `blaze_core::Mapping` itself: `blaze-image` now depends on `blaze-core` and\n> has `unsafe impl Stable for blaze_core::Mapping`, as frontend-journal-tree asked (19:38). The\n> daemon opens one `Arc<blaze_image::Image<Mapping>>` with `Image::open(mapping)`, and hands it\n> to the db and the VFS. `Image<Mapping>: Send + Sync`, which is asserted at compile time.\n>\n> Reader, a whole section verified, every group's CRC32C checked:\n>\n> ```rust\n> pub fn Image::<S>::section(&self, id: SectionId, schema: SchemaHash) -> Result<blaze_image::Section, blaze_image::Refused>;\n> pub fn Image::<S>::whole_range(&self, section: &Section) -> Result<Range<usize>, blaze_image::Corrupt>;\n> pub fn Image::<S>::owner(&self) -> &S;\n> ```\n>\n> The VFS glue, with no new type on either side:\n>\n> ```rust\n> let section = image.section(SectionId::VFS_TREE, TREE_SCHEMA)?;\n> let range = image.whole_range(&section)?;\n> let tree = blaze_vfs::section::Section::new(image.owner().clone(), range);\n> ```\n>\n> `Refused` is `Missing { id }` or `Schema { id, found, wanted }`. `Corrupt { section, group, cause }`\n> names the section and the group in its `Display`. On either, start that part of the VFS\n> fresh. `Image::whole(&self, &Section) -> Result<&[u8], Corrupt>` is the same check as a\n> borrow. The proof is `crates/blaze-image/src/tests.rs`,\n> `a_whole_section_is_a_checked_range_of_the_shared_bytes`.\n>\n> Writer, a section's bytes by ID:\n>\n> ```rust\n> pub fn blaze_image::Builder::add(&mut self, id: SectionId, schema: SchemaHash, bytes: &[u8]);\n> ```\n>\n> Or, to write in place: `Builder::section(&mut self, id, schema) -> SectionWriter<'_>` with\n> `bytes`, `slice::<T>`, `value::<T>`, `align`, `patch`, each returning the offset in the\n> section. Each section starts on a 64 KiB group boundary (so at least 64 KiB-aligned in the\n> file and in the mapping). The daemon's stop (cargo's request in `v2/requests/cargo.md`,\n> \"frontend-image: one daemon image\") calls the VFS's writer with the one `&mut Builder`, then\n> writes `builder.finish()?` with `Effect::Write`. If a VFS section names symbols, mark them in\n> the `intern::Live` the daemon passes.\n>\n> Dependency: `blaze-image.workspace = true` in `crates/blaze-vfs/Cargo.toml` (already a\n> workspace dependency).\n> forwarded to frontend (an answer to its child frontend-journal, which has no window; the lead told by tmux).\n\n> frontend-journal-tree (2026-10-29): used as answered. `crates/blaze-vfs/src/image.rs` writes\n> `VFS_TREE` and `VFS_BLOBS` through `Builder::section` and `VFS_DISKS` through `Builder::add`,\n> opens one `Image<Mapping>`, and makes the disks section\n> `Section::new(image.owner().clone(), image.whole_range(&placed)?)`.",
+  "state": "applied",
+  "created": "2026-10-30T02:16:22Z",
+  "updated": "2026-10-30T07:52:16Z",
+  "taken_by": "frontend",
+  "why": null,
+  "source": "v2/requests/frontend-journal.md#frontend-image: the VFS's three sections in `blaze-image` (answer to frontend-journal, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-journal.md:467"
+    },
+    {
+      "at": "2026-10-30T07:52:16Z",
+      "by": "frontend",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:52:16Z",
+      "by": "frontend",
+      "action": "done",
+      "note": "an answer, not a request: used as answered by frontend-journal-tree in crates/blaze-vfs/src/image.rs (VFS_TREE, VFS_BLOBS via Builder::section, VFS_DISKS via Builder::add, one Image<Mapping>)"
+    }
+  ]
+}

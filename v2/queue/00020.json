@@ -1,0 +1,39 @@
+{
+  "id": "00020",
+  "from_lane": "format-hir-encode",
+  "owner": "format",
+  "paths": [
+    "docs/v2/plan/design/unsafe.md",
+    "crates/blaze-format",
+    "crates/span",
+    "crates/blaze-format/src/lib.rs",
+    "v2/requests/speed.md"
+  ],
+  "what": "## format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)\n\nFrom format-hir-encode, for the lead (`crates/blaze-format/`) and format-span (`crates/span/`).\n\nHIR buffers (`expr_store/persist.rs`, `item_tree/persist.rs`, `hir/persist.rs`) store\n`SyntaxContext`s as their `into_u32` value and rebuild them with `unsafe\nSyntaxContext::from_u32`. That function's precondition is \"a valid `SyntaxContext`\": a root, or\na salsa index this database interned. Bounds checks can't prove that. Today the `// SAFETY:`\ncomment rests on \"the database that wrote the buffer is the one reading it\". A corrupted or\nforeign buffer breaks that, and `SyntaxContext::id` then builds a `SyntaxContextImpl` from an\nindex salsa never made (span/src/hygiene.rs:92). unsafe.md says untrusted bytes are verified\nbefore any view is made of them. Two ways to close it; either is enough:\n\n1. **The lead, `blaze-format`:** make hash verification part of opening a buffer. Add\n   `pub fn open_verified<R: Record>(buffer: &[u8], schema: SchemaHash, key: ContentId) ->\n   Result<&R, FormatError>`, which checks `ContentId::of(.., buffer) == key` before `open_as`, and\n   a `FormatError::Hash` variant. `Persist::read` documents that its caller verified the bytes;\n   the daemon image and the store only call `read` on verified bytes. Then the HIR `SAFETY:`\n   comments can name that check as where the invariant is upheld.\n2. **format-span, `span`:** a safe, checked constructor, `pub fn\n   SyntaxContext::from_u32_in(db: &dyn salsa::Database, raw: u32) -> Option<SyntaxContext>`.\n   It returns `None` unless `raw` is a root id or an index the interned `SyntaxContextImpl`\n   table holds. Then the decoders take the database and need no `unsafe` at all.\n\nUntil one lands, the only `unsafe` left for this is the single function\n`hir::persist::syntax_context` (format-hir's file; edit given in\n/tmp/blaze-lanes/v2-format-hir-encode.md).\n\nStatus: 1 done by format (lead), in `crates/blaze-format/src/lib.rs`: `BUFFER_DOMAIN`\n(`\"blaze v2 buffer 1\"`), `buffer_id(buffer) -> ContentId` (the whole buffer, header included),\n`open_verified::<R>(buffer, schema, key)`, `read_verified::<P>(buffer, key)` and\n`FormatError::Hash { found, wanted }`; `Persist::read`'s doc says bytes this process did not\nwrite go through `read_verified`. For lanes store and db (they read buffers back): key stored\nHIR buffers by `blaze_format::buffer_id` and open them with `read_verified`. The `SAFETY:`\ncomment in `hir::persist::syntax_context` can now name `read_verified` as where the invariant\nis upheld (format-hir told).\n\n> forwarded to format: `crates/blaze-format/` and `crates/span/` are lane format's.\n> 1 is done (above). 2 forwarded by format to speed-span, which owns `crates/span` now (`v2/requests/speed.md`, \"requests forwarded to format that are in your crates\", 4).",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T10:03:45Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/format.md#format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:712"
+    },
+    {
+      "at": "2026-10-30T10:03:45Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:03:45Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Both ways are in, checked by speed-sol2-format 2026-10-30: (1) blaze-format open_verified / read_verified / buffer_id (format lead); (2) SyntaxContext::from_u32 is a safe fn (crates/span/src/hygiene.rs:86 and :322, queue 00792), and SyntaxContext::id checks the index bound before Id::from_bits, so a foreign or damaged value panics or names another context, never UB. No unsafe is left in hir/persist.rs, expr_store/persist.rs or item_tree/persist.rs (rg finds only field names and a test string)."
+    }
+  ]
+}

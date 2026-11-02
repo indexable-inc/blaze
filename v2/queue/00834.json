@@ -1,0 +1,35 @@
+{
+  "id": "00834",
+  "from_lane": "tree-store",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-image/src/lib.rs"
+  ],
+  "what": "blaze-image: (1) add `SectionId::SYNTAX_TREES = SectionId(0x0600)` with name \"the library syntax trees\" (lane tree-store stores library files parsed trees there, schema `base_db::trees::SCHEMA`). (2) a safe way to make a `blaze_bytes::Bytes` of a section checked by `Image::whole`, holding the `Arc<Image<Mapping>>` alive (blaze-vfs does this with a private unsafe `mapped_bytes`; one public helper in blaze-image, e.g. `Image::section_bytes(self: &Arc<Self>, id, schema) -> Result<Bytes, Refused>`, keeps one mapping layer for tree-store and graph). The bytes must start 8-aligned in the mapping.",
+  "state": "applied",
+  "created": "2026-10-30T08:40:41Z",
+  "updated": "2026-10-30T08:47:47Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:40:41Z",
+      "by": "tree-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:47:47Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:47:47Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "crates/blaze-image: SectionId::SYNTAX_TREES = 0x0600 (\"the library syntax trees\"); Image::whole_bytes(self: &Arc<Self>, &Section) -> Result<Bytes, Corrupt> (image.rs): every group checked, the Bytes hold the Arc<Image>, refused as Misaligned unless 8-aligned (an empty section is Bytes::default()). Get the Section with image.section(id, schema), which gives Refused. blaze-bytes dependency (Cargo.toml, Cargo.lock). Test whole_bytes_keep_the_image_and_are_the_section."
+    }
+  ]
+}

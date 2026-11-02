@@ -1,0 +1,70 @@
+; Follows cranelift/filetests/filetests/runtests/simd-fcvt-to-sint-sat.clif (and
+; simd-fcvt-to-uint-sat.clif, simd-fcvt-from-sint.clif, simd-fcvt-from-uint.clif,
+; simd-fvdemote.clif, simd-fvpromote-low.clif), for the stencil set: the conversions wasm SIMD
+; has between `f32x4` and `i32x4`, and between `f64x2` and `f32x4`. Left out: the `i64x2`
+; and `f64x2` integer conversions (wasm has none, and x86-64's SSE2 has no instruction for
+; them).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %fcvt_to_sint_sat_i32x4(f32x4) -> i32x4 {
+block0(v0: f32x4):
+    v1 = fcvt_to_sint_sat.i32x4 v0
+    return v1
+}
+; run: %fcvt_to_sint_sat_i32x4([0x0.0 -0x1.0p0 0x1.0p0 0x1.0p100]) == [0 -1 1 0x7fffffff]
+; run: %fcvt_to_sint_sat_i32x4([-0x1.0p100 +NaN -0x1.ccccccp-1 0x1.fffffep0]) == [0x80000000 0 0 1]
+; run: %fcvt_to_sint_sat_i32x4([0x1.0p31 -0x1.0p31 0x1.fffffep30 -NaN]) == [0x7fffffff 0x80000000 0x7fffff80 0]
+; run: %fcvt_to_sint_sat_i32x4([+Inf -Inf 0x1.8p1 -0x1.8p1]) == [0x7fffffff 0x80000000 3 -3]
+; run: %fcvt_to_sint_sat_i32x4([-0x1.04p3 -0x0.0 0x0.000002p-126 -0x1.fffffep-1]) == [-8 0 0 0]
+
+function %fcvt_to_uint_sat_i32x4(f32x4) -> i32x4 {
+block0(v0: f32x4):
+    v1 = fcvt_to_uint_sat.i32x4 v0
+    return v1
+}
+; run: %fcvt_to_uint_sat_i32x4([0x1.0p0 0x1.08p2 0x1.18p2 0x1.0p100]) == [1 4 4 0xffffffff]
+; run: %fcvt_to_uint_sat_i32x4([-0x1.0p0 -0x0.0 +NaN -0x1.ccccccp-1]) == [0 0 0 0]
+; run: %fcvt_to_uint_sat_i32x4([0x1.0p31 0x1.fffffep31 0x1.0p32 +Inf]) == [0x80000000 0xffffff00 0xffffffff 0xffffffff]
+; run: %fcvt_to_uint_sat_i32x4([0x1.65a0bcp31 -Inf 0x1.fffffep30 0x0.000002p-126]) == [3000000000 0 0x7fffff80 0]
+
+function %fcvt_from_sint_f32x4(i32x4) -> f32x4 {
+block0(v0: i32x4):
+    v1 = fcvt_from_sint.f32x4 v0
+    return v1
+}
+; run: %fcvt_from_sint_f32x4([-1 0 1 123456789]) == [-0x1.0p0 0x0.0 0x1.0p0 0x1.d6f346p26]
+; run: %fcvt_from_sint_f32x4([0x7fffffff 0x80000000 0x1000001 -16777217]) == [0x1.0p31 -0x1.0p31 0x1.0p24 -0x1.0p24]
+; run: %fcvt_from_sint_f32x4([0x1000003 0x1000005 3 -3]) == [0x1.000004p24 0x1.000004p24 0x1.8p1 -0x1.8p1]
+
+function %fcvt_from_uint_f32x4(i32x4) -> f32x4 {
+block0(v0: i32x4):
+    v1 = fcvt_from_uint.f32x4 v0
+    return v1
+}
+; run: %fcvt_from_uint_f32x4([0 0 0 0]) == [0x0.0 0x0.0 0x0.0 0x0.0]
+; run: %fcvt_from_uint_f32x4([0xffffffff 0 1 123456789]) == [0x1.0p32 0x0.0 0x1.0p0 0x1.d6f346p26]
+; run: %fcvt_from_uint_f32x4([0x80000000 0x80000001 0x7fffffff 0xffffff80]) == [0x1.0p31 0x1.0p31 0x1.0p31 0x1.0p32]
+; run: %fcvt_from_uint_f32x4([0x1000001 0x1000003 0xffffff7f 0x10000]) == [0x1.0p24 0x1.000004p24 0x1.fffffep31 0x1.0p16]
+
+function %fvdemote(f64x2) -> f32x4 {
+block0(v0: f64x2):
+    v1 = fvdemote v0
+    return v1
+}
+; run: %fvdemote([0x1.0p0 -0x1.8p1]) == [0x1.0p0 -0x1.8p1 0x0.0 0x0.0]
+; run: %fvdemote([0x1.0p128 -0x1.0p-150]) == [+Inf -0x0.0 0x0.0 0x0.0]
+; run: %fvdemote([0x1.000001p0 +NaN]) == [0x1.0p0 +NaN 0x0.0 0x0.0]
+; run: %fvdemote([0x1.0000018p0 0x1.fffffffp127]) == [0x1.000002p0 +Inf 0x0.0 0x0.0]
+; run: %fvdemote([-0x0.0 0x1.0p-149]) == [-0x0.0 0x0.000002p-126 0x0.0 0x0.0]
+
+function %fvpromote_low(f32x4) -> f64x2 {
+block0(v0: f32x4):
+    v1 = fvpromote_low v0
+    return v1
+}
+; run: %fvpromote_low([0x1.0p0 -0x0.0 0x1.8p1 0x1.0p2]) == [0x1.0p0 -0x0.0]
+; run: %fvpromote_low([0x1.fffffep127 0x0.000002p-126 0x0.0 0x0.0]) == [0x1.fffffep127 0x1.0p-149]
+; run: %fvpromote_low([+NaN -Inf 0x1.0p0 0x1.0p0]) == [+NaN -Inf]

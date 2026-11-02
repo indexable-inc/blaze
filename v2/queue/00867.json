@@ -1,0 +1,24 @@
+{
+  "id": "00867",
+  "from_lane": "speed-sol-items",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src/drop.rs"
+  ],
+  "what": "speed-sol-items: memoize drop glue per type, as rustc does (`needs_drop_raw`, `is_freeze_raw`). Today `hir_ty::drop::has_drop_glue` and `is_freeze` are plain functions: each of their 18 callers (MIR transform, borrowck, const qualifs, codegen, lints) walks the type field by field again, a `destructor` and `field_types` read and an `instantiate` per field each time, so a body of n locals of a struct of k nested fields costs n*k where the bound is once per distinct type. Exact edit: in `crates/hir-ty/src/db.rs` `kinds!`, after `STRUCT_TAIL_MAY_BE_UNSIZED = 0x2457`, add `DROP_GLUE = 0x2458, \"drop_glue_query\";` and `IS_FREEZE = 0x2459, \"is_freeze_query\";`. Then in `crates/hir-ty/src/drop.rs` (speed-sol-items will write it once the kinds exist, or db may): `#[salsa::tracked(returns(copy), mem_tag = Infer)] pub fn drop_glue_query(db: &Db, ty: StoredTy, env: StoredParamEnvAndCrate) -> DropGlue` building one `InferCtxt` in `TypingMode::non_body_analysis()` as `layout_of_ty_query` does, and `has_drop_glue` going through it when `!ty.has_infer() && !ty.has_opaque_types()` (an opaque or inference variable depends on the caller typing mode, so those keep the walk). Same for `is_freeze`. Answers are the same: the walk reads only the type, the env and the typing mode, and the memo is used only where the mode cannot change the answer.",
+  "state": "open",
+  "created": "2026-10-30T09:13:15Z",
+  "updated": "2026-10-30T09:13:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:13:15Z",
+      "by": "speed-sol-items",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

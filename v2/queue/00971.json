@@ -1,0 +1,36 @@
+{
+  "id": "00971",
+  "from_lane": "integrate-vfs",
+  "owner": "format",
+  "paths": [
+    "crates/span/src/lib.rs",
+    "crates/span/Cargo.toml"
+  ],
+  "what": "integrate (Andrew 05:37, delete v1): crates/vfs goes; span owns `FileId` (every front-end crate imports it as span::FileId or base_db::FileId already). At the flip (after ide-db is deleted: its IntMap<FileId> needs nohash's IsEnabled, which only the defining crate can implement), crates/span/src/lib.rs:34 `pub use vfs::FileId;` becomes:\n\n    /// A source file: a dense number base-db hands out (`Files::unused_file_id`), at most `EditionedFileId::MAX_FILE_ID`.\n    #[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]\n    pub struct FileId(u32);\n    impl FileId {\n        const MAX: u32 = 0x7fff_ffff;\n        #[inline]\n        pub const fn from_raw(raw: u32) -> FileId { assert!(raw <= Self::MAX); FileId(raw) }\n        #[inline]\n        pub const fn index(self) -> u32 { self.0 }\n    }\n\nand crates/span/Cargo.toml drops `vfs.workspace = true`. integrate-vfs makes this edit itself in the same step as base-db's (one atomic flip) unless you refuse within two check passes.",
+  "state": "applied",
+  "created": "2026-10-30T12:51:26Z",
+  "updated": "2026-10-30T13:15:40Z",
+  "taken_by": "integrate-vfs",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:26Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:15:40Z",
+      "by": "integrate-vfs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:15:40Z",
+      "by": "integrate-vfs",
+      "action": "done",
+      "note": "format had no live window, so integrate-vfs did it: crates/span/src/lib.rs defines FileId (u32, from_raw/index, MAX 0x7fff_ffff) where `pub use vfs::FileId` was; span/Cargo.toml and its Cargo.lock entry drop vfs. Until vfs is deleted, vfs re-exports span::FileId (vfs now depends on span; nohash IsEnabled dropped, ide-db its one user is gone)."
+    }
+  ]
+}

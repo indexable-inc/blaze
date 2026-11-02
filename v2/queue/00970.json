@@ -1,0 +1,38 @@
+{
+  "id": "00970",
+  "from_lane": "integrate-vfs",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/db.rs",
+    "crates/base-db/src/lib.rs",
+    "crates/base-db/Cargo.toml",
+    "crates/base-db/src"
+  ],
+  "what": "integrate (Andrew 05:37, delete v1): crates/vfs goes, so base-db stops depending on it.\n\n(A) now, so integrate-engine and integrate-load can drop v1 `vfs::Vfs` (a path<->FileId table) from blaze-engine and blaze-cargo/src/tree.rs: add to `Db` in crates/base-db/src/db.rs, next to `resolve_path` (line ~316):\n\n    /// The file a source root names at `path`, tracked as `resolve_path`'s lookup outside the anchor's root is.\n    pub fn file_for_path(&self, path: &VfsPath) -> Option<FileId> {\n        let file = crate::named::lookup(self, path)?;\n        let there = self.source_root(self.file_source_root(file).source_root_id(self));\n        (there.source_root_ref(self).file_for_path(path) == Some(&file)).then_some(file)\n    }\n    /// The path the file's source root has it at.\n    pub fn path_for_file(&self, file: FileId) -> Option<&VfsPath> {\n        let root = self.source_root(self.file_source_root(file).source_root_id(self));\n        root.source_root_ref(self).path_for_file(&file)\n    }\n\n(B) at the flip (once ide-db and load-cargo are deleted and nothing else uses vfs::Vfs), base-db owns the source-path types itself. Staged already, no `mod` line names them yet: crates/base-db/src/source_path.rs (VfsPath, AnchoredPath, AnchoredPathBuf, same API as vfs's, + tests source_path/tests.rs) and crates/base-db/src/file_set.rs (FileSet, FileSetConfig, FileSetConfigBuilder; FileSetConfig without `fst`: one hash probe per distinct prefix length, same longest-byte-prefix result; `partition` takes (FileId, &VfsPath) pairs; + tests file_set/tests.rs ported from vfs). The flip edits: lib.rs `mod file_set; mod source_path;`, line 62 `pub use vfs::{...}` -> `pub use paths::{AbsPath, AbsPathBuf}; pub use span::FileId; pub use crate::{file_set::{FileSet, FileSetConfig, FileSetConfigBuilder}, source_path::{AnchoredPath, AnchoredPathBuf, VfsPath}};`, line 166 `vfs::FileId` -> `FileId`; each `use vfs::...` line in content.rs:16, change.rs:9, view.rs:28, input.rs:25+1766, files.rs:28, named.rs:28, db.rs:30 (+232/345 `vfs::AbsPath*`), crate_attrs.rs:25, editioned_file_id.rs:10 (+141/151), reparse.rs:389, tests.rs:13, budget_tests.rs:8, files/tests.rs:9, maintain/tests.rs:13, trees/tests.rs:8, tests/memo_properties.rs:7 -> the same names from `crate::`; Cargo.toml `vfs` -> `paths`. integrate-vfs makes the (B) edits itself in one step at the flip (small exact edits, re-reading each file) unless you'd rather; refuse within two check passes if you object to base-db owning these types. (A) too if not taken in two passes.",
+  "state": "applied",
+  "created": "2026-10-30T12:51:26Z",
+  "updated": "2026-10-30T14:11:06Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:26Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:06Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "(A) applied as written: base-db Db::file_for_path(&VfsPath) -> Option<FileId> and Db::path_for_file(FileId) -> Option<&VfsPath> (db.rs after resolve_path; import `vfs::{AnchoredPath, VfsPath}`). No same-named method elsewhere on Db. (B): base-db owning VfsPath/AnchoredPath/FileSet is fine with db; integrate-vfs makes the flip edits itself as proposed"
+    }
+  ]
+}

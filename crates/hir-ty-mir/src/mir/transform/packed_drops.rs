@@ -2,27 +2,35 @@
 //! leaves misaligned is moved to a temporary, which is aligned, and dropped there. `Drop::drop`
 //! takes a reference, and a reference has to be aligned.
 
+use blaze_mem::Frame;
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
     mir::{
         Local, MirBody, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement,
-        StatementKind, StoredPlace, TerminatorKind,
+        StatementKind, StoredPlace, TerminatorKind, framed::block_id,
     },
     next_solver::TyKind,
 };
 
 use super::Ctx;
 
-pub(super) fn add_moves_for_packed_drops<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
-    let ids: Vec<_> = body.basic_blocks.iter().map(|(id, _)| id).collect();
-    for id in ids {
+/// `_frame` is every runtime pass's; this one needs nothing in it.
+pub(super) fn add_moves_for_packed_drops<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    _frame: &Frame,
+) {
+    let blocks = body.basic_blocks.len();
+    for index in 0..blocks {
+        let id = block_id(index);
         let Some(terminator) = &body.basic_blocks[id].terminator else { continue };
         let TerminatorKind::Drop { place, .. } = &terminator.kind else { continue };
         if !is_disaligned(ctx, body, place) {
             continue;
         }
         let span = terminator.span;
+        // clone: the dropped place, which the kept body's new move reads
         let place = place.clone();
         let ty = place.as_ref().ty(body, &ctx.infcx, ctx.env).ty;
         let temp = body.locals.alloc(Local { ty: ty.store() });
@@ -45,7 +53,7 @@ pub(super) fn add_moves_for_packed_drops<'db>(ctx: &Ctx<'db>, body: &mut MirBody
 
 /// Whether `place` is in a field of a packed struct that may leave it less aligned than its
 /// type asks for. One whose layout is not known yet, as of a type parameter, may be.
-fn is_disaligned<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, place: &StoredPlace) -> bool {
+fn is_disaligned<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, place: &StoredPlace) -> bool {
     let projection = place.projection.as_slice();
     let mut pack: Option<u64> = None;
     for (at, elem) in projection.iter().enumerate().rev() {

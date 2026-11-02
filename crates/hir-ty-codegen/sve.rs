@@ -15,13 +15,17 @@
 //! from the places it is handed (`ldr z`, `ldr p`), runs the instruction LLVM selects for the
 //! intrinsic, and stores the result (`str z`, `str p`) or returns a scalar.
 
-use std::fmt::Write;
+#![forbid(unsafe_code)]
 
+use std::fmt::{self, Write};
+
+use base_db::Db;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
 use hir_def::FunctionId;
 use hir_ty::{
     db::HirDatabase,
-    layout::Layout,
+    intrinsic::{Intrinsic, SimdOp},
+    layout::{InternedLayout, Layout, intern_layout},
     mir::{Operand, OperandKind, Rvalue, StatementKind},
     next_solver::{ConstKind, DbInterner, GenericArgs, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
@@ -29,7 +33,7 @@ use hir_ty::{
 use rustc_abi::{BackendRepr, Size};
 use rustc_type_ir::TypeVisitableExt;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
-use triomphe::Arc;
+use smallvec::SmallVec;
 
 use super::{CodegenError, FunctionCx, MEM, Result, ptr};
 
@@ -129,16 +133,26 @@ impl Shape {
         })
     }
 
-    /// LLVM's name of the type, `nxv4i32`, `nxv2f64`, `nxv16i1`, as an intrinsic's name has it.
-    pub(super) fn llvm(self) -> String {
-        let kind = if self.float { 'f' } else { 'i' };
-        format!("nxv{}{kind}{}", self.count, self.bits)
+    /// Whether `part` is LLVM's name of the type, `nxv4i32`, `nxv2f64`, `nxv16i1`, as an
+    /// intrinsic's name has it.
+    fn is_llvm(self, part: &str) -> bool {
+        self.is_named("nxv", part)
     }
 
-    /// LLVM's name of the vector of 128 bits of NEON's with its lanes: `v4i32`, `v2f64`.
-    fn llvm_fixed(self) -> String {
+    /// Whether `part` is LLVM's name of the vector of 128 bits of NEON's with its lanes:
+    /// `v4i32`, `v2f64`.
+    fn is_llvm_fixed(self, part: &str) -> bool {
+        self.is_named("v", part)
+    }
+
+    /// Whether `part` is `{prefix}{count}{i or f}{bits}`, each number in decimal.
+    fn is_named(self, prefix: &str, part: &str) -> bool {
         let kind = if self.float { 'f' } else { 'i' };
-        format!("v{}{kind}{}", self.count, self.bits)
+        part.strip_prefix(prefix)
+            .and_then(|it| strip_decimal(it, self.count))
+            .and_then(|it| it.strip_prefix(kind))
+            .and_then(|it| strip_decimal(it, self.bits))
+            .is_some_and(str::is_empty)
     }
 
     /// The letter of a load or store of one lane of memory: `ld1b` to `ld1d`.
@@ -166,13 +180,24 @@ impl Shape {
     }
 }
 
+/// The rest of `s` after the decimal digits of `n`, as `{n}` writes them (no leading zeros).
+fn strip_decimal(s: &str, n: u64) -> Option<&str> {
+    let len = s.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, rest) = s.split_at(len);
+    let canonical = len == 1 || (len > 1 && !digits.starts_with('0'));
+    (canonical && digits.parse::<u64>() == Ok(n)).then_some(rest)
+}
+
 /// The layout codegen gives a scalable type: rustc's, sized for its storage at the largest
-/// vector length rather than at the least.
-pub(super) fn storage(layout: Arc<Layout>) -> Arc<Layout> {
-    let Some(shape) = Shape::of(&layout) else { return layout };
-    let mut storage = (*layout).clone();
+/// vector length rather than at the least. Interned as the database's are, so it lives as
+/// long as they do.
+pub(super) fn storage(layout: &'static InternedLayout) -> &'static Layout {
+    let Some(shape) = Shape::of(layout) else { return layout };
+    // clone: a scalable type's layout only, once per type on the layout cache's miss
+    let mut storage = layout.0.clone();
     storage.size = Size::from_bytes(shape.storage());
-    Arc::new(storage)
+    // alloc: a scalable type's layout only, once per type on the layout cache's miss
+    intern_layout(storage).get()
 }
 
 /// What an operand of a stub is.
@@ -217,13 +242,8 @@ enum Reg {
 
 impl Reg {
     /// Its name alone: `p0` of a governing predicate, `z1` of the low bits of a float.
-    fn bare(self) -> String {
-        match self {
-            Reg::X(n, 64) => format!("x{n}"),
-            Reg::X(n, _) => format!("w{n}"),
-            Reg::F(n, _) | Reg::Z(n, _) => format!("z{n}"),
-            Reg::P(n, _) => format!("p{n}"),
-        }
+    fn bare(self) -> RegName {
+        RegName(self, View::Bare)
     }
 
     fn number(self) -> u32 {
@@ -234,43 +254,94 @@ impl Reg {
 
     /// Its name with the size of its elements, as an instruction takes it: `z1.s`, `p0.h`,
     /// `w2`, `s0`.
-    fn full(self) -> String {
-        match self {
-            Reg::X(..) => self.bare(),
-            Reg::F(n, bits) => scalar(n, bits),
-            Reg::Z(_, shape) | Reg::P(_, shape) => {
-                format!("{}.{}", self.bare(), shape.suffix().unwrap_or("?"))
-            }
-        }
+    fn full(self) -> RegName {
+        RegName(self, View::Full)
     }
 
     /// The registers of a vector or tuple as a list: `{ z0.s }`, `{ z0.s, z1.s }`,
     /// `{ z0.s - z2.s }`.
-    fn list(self) -> String {
-        let Reg::Z(n, shape) = self else { return self.full() };
-        let suffix = shape.suffix().unwrap_or("?");
-        match shape.vectors {
-            1 => format!("{{ z{n}.{suffix} }}"),
-            2 => format!("{{ z{n}.{suffix}, z{}.{suffix} }}", n + 1),
-            k => format!("{{ z{n}.{suffix} - z{}.{suffix} }}", n + k as u32 - 1),
-        }
+    fn list(self) -> RegName {
+        RegName(self, View::List)
     }
 
     /// The register taken as elements of 128 bits, or of `suffix`.
-    fn with(self, suffix: &str) -> String {
-        format!("{}.{suffix}", self.bare())
+    fn with(self, suffix: &'static str) -> RegName {
+        RegName(self, View::With(suffix))
+    }
+}
+
+/// How a register is named in an instruction's text.
+#[derive(Clone, Copy, Debug)]
+enum View {
+    Bare,
+    Full,
+    List,
+    With(&'static str),
+}
+
+/// A register's name as [`Reg::bare`], [`Reg::full`], [`Reg::list`] or [`Reg::with`] give
+/// it, written straight into the stub's text.
+#[derive(Clone, Copy, Debug)]
+struct RegName(Reg, View);
+
+impl fmt::Display for RegName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let RegName(reg, view) = *self;
+        match (view, reg) {
+            (View::Bare, Reg::X(n, 64)) => write!(f, "x{n}"),
+            (View::Bare, Reg::X(n, _)) => write!(f, "w{n}"),
+            (View::Bare, Reg::F(n, _) | Reg::Z(n, _)) => write!(f, "z{n}"),
+            (View::Bare, Reg::P(n, _)) => write!(f, "p{n}"),
+            (View::Full | View::List, Reg::X(..)) => write!(f, "{}", reg.bare()),
+            (View::Full | View::List, Reg::F(n, bits)) => write!(f, "{}", scalar(n, bits)),
+            (View::Full | View::List, Reg::P(_, shape)) | (View::Full, Reg::Z(_, shape)) => {
+                write!(f, "{}.{}", reg.bare(), shape.suffix().unwrap_or("?"))
+            }
+            (View::List, Reg::Z(n, shape)) => {
+                let suffix = shape.suffix().unwrap_or("?");
+                match shape.vectors {
+                    1 => write!(f, "{{ z{n}.{suffix} }}"),
+                    2 => write!(f, "{{ z{n}.{suffix}, z{}.{suffix} }}", n + 1),
+                    k => write!(f, "{{ z{n}.{suffix} - z{}.{suffix} }}", n + k as u32 - 1),
+                }
+            }
+            (View::With(suffix), _) => write!(f, "{}.{suffix}", reg.bare()),
+        }
+    }
+}
+
+/// A name that may be none, written as nothing then.
+#[derive(Clone, Copy, Debug)]
+struct OrEmpty<T>(Option<T>);
+
+impl<T: fmt::Display> fmt::Display for OrEmpty<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(it) => it.fmt(f),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The name of the low bits of a vector register: its view letter and number, `b0` to `d0`.
+#[derive(Clone, Copy, Debug)]
+struct Scalar(char, u32);
+
+impl fmt::Display for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.0, self.1)
     }
 }
 
 /// The name of the low `bits` of vector register `n`: `b0` to `d0`.
-fn scalar(n: u32, bits: u64) -> String {
+fn scalar(n: u32, bits: u64) -> Scalar {
     let view = match bits {
         8 => 'b',
         16 => 'h',
         32 => 's',
         _ => 'd',
     };
-    format!("{view}{n}")
+    Scalar(view, n)
 }
 
 /// The registers a stub has its operands in. The signature [`stub`] is called with has the
@@ -284,13 +355,16 @@ fn scalar(n: u32, bits: u64) -> String {
 /// in theirs.
 struct Registers {
     /// The register each operand is in.
-    operands: Vec<Reg>,
+    operands: SmallVec<[Reg; 8]>,
     /// The register of the result before it is stored or returned.
     result: Option<Reg>,
     /// The general register the result's address is in.
     address: Option<&'static str>,
-    /// What moves the floats and loads the scalable operands to their registers.
-    loads: String,
+    /// Each float's move from the vector register it arrives in to its own, in the order of
+    /// the floats.
+    moves: SmallVec<[(u32, u32); 4]>,
+    /// The general register of the first scalable or NEON operand's address.
+    first_address: u32,
 }
 
 impl Registers {
@@ -311,15 +385,16 @@ impl Registers {
             _ => None,
         }) && (shape.suffix().is_none() || (shape.predicate() && shape.vectors != 1))
         {
+            // alloc: the error's message
             return Err(format!("a result of {shape:?}"));
         }
         // The vector register next taken, the floats so far, and the P register next taken.
         let (mut v, mut floats, mut p) = (0u32, 0u32, 0u32);
         // The general register of the next integer, and of the next scalable operand's address.
-        let mut x = (x, x + args.iter().filter(|it| matches!(it, Arg::Int(..))).count() as u32);
-        let mut moves = Vec::new();
-        let mut operands = Vec::new();
-        let mut loads = String::new();
+        let first_address = x + args.iter().filter(|it| matches!(it, Arg::Int(..))).count() as u32;
+        let mut x = (x, first_address);
+        let mut moves: SmallVec<[(u32, u32); 4]> = SmallVec::new();
+        let mut operands: SmallVec<[Reg; 8]> = SmallVec::with_capacity(args.len());
         for arg in args {
             operands.push(match *arg {
                 Arg::Int(bits, _) => {
@@ -337,35 +412,24 @@ impl Registers {
                 }
                 // In the low 128 bits of the next vector register, as rustc passes it.
                 Arg::Fixed(shape) => {
-                    writeln!(loads, "ldr q{v}, [x{}]", x.1).unwrap();
                     x.1 += 1;
                     v += 1;
                     Reg::Z(v - 1, shape)
                 }
                 Arg::Vector(shape) => {
                     if shape.suffix().is_none() {
+                        // alloc: the error's message
                         return Err(format!("an operand of {shape:?}"));
                     }
-                    let address = format!("x{}", x.1);
                     x.1 += 1;
                     if shape.predicate() {
                         if shape.vectors != 1 {
+                            // alloc: the error's message
                             return Err("a tuple of predicates".to_owned());
                         }
-                        writeln!(loads, "ldr p{p}, [{address}]").unwrap();
                         p += 1;
                         Reg::P(p - 1, shape)
                     } else {
-                        for at in 0..shape.vectors {
-                            // The storage of each vector of a tuple is DATA_MAX bytes apart.
-                            let base = if at == 0 {
-                                address.clone()
-                            } else {
-                                writeln!(loads, "add x16, {address}, #{}", at * DATA_MAX).unwrap();
-                                "x16".to_owned()
-                            };
-                            writeln!(loads, "ldr z{}, [{base}]", v + at as u32).unwrap();
-                        }
                         v += shape.vectors as u32;
                         Reg::Z(v - shape.vectors as u32, shape)
                     }
@@ -374,16 +438,46 @@ impl Registers {
         }
         // Beyond z7 the registers' low halves are the callee's to keep (d8 to d15).
         if x.1 > 8 || v > 8 || p > 16 {
+            // alloc: the error's message
             return Err("more operands than registers".to_owned());
         }
+        Ok(Registers { operands, result, address, moves, first_address })
+    }
+
+    /// Writes what moves the floats and loads the scalable and NEON operands of `args` to
+    /// their registers.
+    fn write_loads(&self, args: &[Arg], out: &mut String) {
         // Each float moves up to its place, the last first, so that none is overwritten
         // before it moves.
-        let mut text = String::new();
-        for (from, to) in moves.into_iter().rev() {
-            writeln!(text, "mov z{to}.d, z{from}.d").unwrap();
+        for &(from, to) in self.moves.iter().rev() {
+            writeln!(out, "mov z{to}.d, z{from}.d").unwrap();
         }
-        text.push_str(&loads);
-        Ok(Registers { operands, result, address, loads: text })
+        let mut address = self.first_address;
+        for (arg, reg) in args.iter().zip(&self.operands) {
+            match (*arg, *reg) {
+                (Arg::Fixed(_), reg) => {
+                    writeln!(out, "ldr q{}, [x{address}]", reg.number()).unwrap();
+                    address += 1;
+                }
+                (Arg::Vector(_), Reg::P(p, _)) => {
+                    writeln!(out, "ldr p{p}, [x{address}]").unwrap();
+                    address += 1;
+                }
+                (Arg::Vector(shape), Reg::Z(v, _)) => {
+                    for at in 0..shape.vectors {
+                        // The storage of each vector of a tuple is DATA_MAX bytes apart.
+                        if at == 0 {
+                            writeln!(out, "ldr z{v}, [x{address}]").unwrap();
+                        } else {
+                            writeln!(out, "add x16, x{address}, #{}", at * DATA_MAX).unwrap();
+                            writeln!(out, "ldr z{}, [x16]", v + at as u32).unwrap();
+                        }
+                    }
+                    address += 1;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -391,16 +485,24 @@ impl Registers {
 const FEATURES: &[&str] =
     &["sve", "sve2", "sve2-aes", "sve2-sha3", "sve2-sm4", "sve2-bitperm", "f32mm", "f64mm", "i8mm"];
 
-/// The text of a stub: the moves and loads, the body, and the store of the result from `z0`
-/// or `p0` (and on, of a tuple).
-fn text(registers: &Registers, body: &str, ret: Ret) -> String {
-    let mut text = String::new();
+/// The bytes a stub's text is begun with room for: the header's 250 and a few lines.
+const STUB_CAPACITY: usize = 512;
+
+/// The start of a stub's text, which [`write_end`] finishes: the features and the label,
+/// in a buffer that takes the moves and loads and the body after it.
+fn begin() -> String {
+    // alloc: the stub's text, the output
+    let mut text = String::with_capacity(STUB_CAPACITY);
     for feature in FEATURES {
         writeln!(text, ".arch_extension {feature}").unwrap();
     }
     writeln!(text, ".globl blaze_asm_block\nblaze_asm_block:").unwrap();
-    text.push_str(&registers.loads);
-    text.push_str(body);
+    text
+}
+
+/// The end of a stub's text after its body: the store of the result from `z0` or `p0` (and
+/// on, of a tuple), and the return.
+fn write_end(text: &mut String, registers: &Registers, ret: Ret) {
     if let (Ret::Vector(shape), Some(address)) = (ret, registers.address) {
         for at in 0..shape.vectors {
             if shape.predicate() {
@@ -413,47 +515,96 @@ fn text(registers: &Registers, body: &str, ret: Ret) -> String {
         }
     }
     text.push_str("ret\n");
-    text
 }
 
 /// The name AArch64's assembler gives an `svpattern`, a 5-bit immediate.
-fn pattern(imm: i128) -> std::result::Result<String, String> {
+fn pattern(imm: i128) -> std::result::Result<Pattern, String> {
     Ok(match imm {
-        0 => "pow2".to_owned(),
-        1..=8 => format!("vl{imm}"),
-        9 => "vl16".to_owned(),
-        10 => "vl32".to_owned(),
-        11 => "vl64".to_owned(),
-        12 => "vl128".to_owned(),
-        13 => "vl256".to_owned(),
-        29 => "mul4".to_owned(),
-        30 => "mul3".to_owned(),
-        31 => "all".to_owned(),
-        14..=28 => format!("#{imm}"),
+        0 => Pattern::Named("pow2"),
+        1..=8 => Pattern::Vl(imm),
+        9 => Pattern::Named("vl16"),
+        10 => Pattern::Named("vl32"),
+        11 => Pattern::Named("vl64"),
+        12 => Pattern::Named("vl128"),
+        13 => Pattern::Named("vl256"),
+        29 => Pattern::Named("mul4"),
+        30 => Pattern::Named("mul3"),
+        31 => Pattern::Named("all"),
+        14..=28 => Pattern::Immediate(imm),
+        // alloc: the error's message
         _ => return Err(format!("pattern {imm}")),
     })
 }
 
+/// An `svpattern` as [`pattern`] names it: `all`, `vl7`, `#14`.
+#[derive(Clone, Copy, Debug)]
+enum Pattern {
+    Named(&'static str),
+    Vl(i128),
+    Immediate(i128),
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Pattern::Named(name) => f.write_str(name),
+            Pattern::Vl(imm) => write!(f, "vl{imm}"),
+            Pattern::Immediate(imm) => write!(f, "#{imm}"),
+        }
+    }
+}
+
 /// A pattern and the multiple of its count, as an instruction takes them: `vl7, mul #16`.
-fn counted(imm: i128, multiple: i128) -> std::result::Result<String, String> {
+fn counted(imm: i128, multiple: i128) -> std::result::Result<Counted, String> {
     let pattern = pattern(imm)?;
     match multiple {
-        1 => Ok(pattern),
-        2..=16 => Ok(format!("{pattern}, mul #{multiple}")),
+        1..=16 => Ok(Counted(pattern, multiple)),
+        // alloc: the error's message
         _ => Err(format!("a multiple {multiple}")),
     }
 }
 
+/// A pattern and the multiple of its count, the multiple left out when it is 1.
+#[derive(Clone, Copy, Debug)]
+struct Counted(Pattern, i128);
+
+impl fmt::Display for Counted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Counted(pattern, 1) => write!(f, "{pattern}"),
+            Counted(pattern, multiple) => write!(f, "{pattern}, mul #{multiple}"),
+        }
+    }
+}
+
 /// The name AArch64's assembler gives an `svprfop`, a 4-bit immediate.
-fn prefetch(imm: i128) -> std::result::Result<String, String> {
+fn prefetch(imm: i128) -> std::result::Result<Prefetch, String> {
     let level = |it: i128| it / 2 % 3 + 1;
     let policy = |it: i128| if it % 2 == 0 { "keep" } else { "strm" };
     Ok(match imm {
-        0..=5 => format!("pldl{}{}", level(imm), policy(imm)),
-        8..=13 => format!("pstl{}{}", level(imm - 8), policy(imm)),
-        6 | 7 | 14 | 15 => format!("#{imm}"),
+        0..=5 => Prefetch::Named("pldl", level(imm), policy(imm)),
+        8..=13 => Prefetch::Named("pstl", level(imm - 8), policy(imm)),
+        6 | 7 | 14 | 15 => Prefetch::Immediate(imm),
+        // alloc: the error's message
         _ => return Err(format!("prefetch operation {imm}")),
     })
+}
+
+/// An `svprfop` as [`prefetch`] names it: `pldl1keep`, `pstl3strm`, `#6`.
+#[derive(Clone, Copy, Debug)]
+enum Prefetch {
+    /// The kind, the cache level and the policy.
+    Named(&'static str, i128, &'static str),
+    Immediate(i128),
+}
+
+impl fmt::Display for Prefetch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Prefetch::Named(kind, level, policy) => write!(f, "{kind}{level}{policy}"),
+            Prefetch::Immediate(imm) => write!(f, "#{imm}"),
+        }
+    }
 }
 
 /// What a gather or scatter of lanes of memory size `size` (`b` to `d`) does before and the
@@ -462,38 +613,78 @@ fn prefetch(imm: i128) -> std::result::Result<String, String> {
 /// offset (`sxtw`, `uxtw`: of 32 bits, extended), in elements with `index`, or the scalar plus
 /// each address with `scalar.offset`. Of the non-temporal ones (`non_temporal`), which take
 /// only `[z0.d, x0]`, LLVM shifts the indices before: `lsl z1.d, z1.d, #3`.
-fn gathered(
+fn gathered<'a>(
     non_temporal: bool,
-    how: &[&str],
+    how: &[&'a str],
     size: &str,
-    base: &str,
+    base: RegName,
     offsets: Reg,
-) -> Option<(String, String)> {
+) -> Option<Gathered<'a>> {
     let Reg::Z(_, shape) = offsets else { return None };
     let shift = "bhwd".find(size)?;
     let z = offsets.full();
     let wide = shape.suffix() == Some("d");
     let narrow = shape.suffix() == Some("s");
-    Some(match (how, non_temporal) {
-        ([], true) if wide => (String::new(), format!("[{z}, {base}]")),
-        (["scalar", "offset"], true) if wide || narrow => (String::new(), format!("[{z}, {base}]")),
-        ([] | ["scalar", "offset"], false) if wide => (String::new(), format!("[{base}, {z}]")),
-        (["scalar", "offset"], false) if narrow => (String::new(), format!("[{base}, {z}, uxtw]")),
-        (["index"], true) if wide && shift > 0 => {
-            (format!("lsl {z}, {z}, #{shift}\n"), format!("[{z}, {base}]"))
-        }
-        (["index"], false) if wide && shift > 0 => {
-            (String::new(), format!("[{base}, {z}, lsl #{shift}]"))
-        }
-        (["uxtw"], true) if narrow => (String::new(), format!("[{z}, {base}]")),
-        ([extend @ ("sxtw" | "uxtw")], false) if narrow => {
-            (String::new(), format!("[{base}, {z}, {extend}]"))
-        }
+    let (before, address) = match (how, non_temporal) {
+        ([], true) if wide => (None, Address::VectorFirst),
+        (["scalar", "offset"], true) if wide || narrow => (None, Address::VectorFirst),
+        ([] | ["scalar", "offset"], false) if wide => (None, Address::ScalarFirst),
+        (["scalar", "offset"], false) if narrow => (None, Address::Extended("uxtw")),
+        (["index"], true) if wide && shift > 0 => (Some(shift), Address::VectorFirst),
+        (["index"], false) if wide && shift > 0 => (None, Address::Shifted("lsl", shift)),
+        (["uxtw"], true) if narrow => (None, Address::VectorFirst),
+        ([extend @ ("sxtw" | "uxtw")], false) if narrow => (None, Address::Extended(*extend)),
         ([extend @ ("sxtw" | "uxtw"), "index"], false) if narrow && shift > 0 => {
-            (String::new(), format!("[{base}, {z}, {extend} #{shift}]"))
+            (None, Address::Shifted(*extend, shift))
         }
         _ => return None,
-    })
+    };
+    Some(Gathered { before, base, z, address })
+}
+
+/// What [`gathered`] gives: the shift of the offsets done before, if any, and the address.
+#[derive(Clone, Copy, Debug)]
+struct Gathered<'a> {
+    /// The shift of the indices done before: `lsl z1.d, z1.d, #3`.
+    before: Option<usize>,
+    base: RegName,
+    z: RegName,
+    address: Address<'a>,
+}
+
+/// The form of a gather's or scatter's address.
+#[derive(Clone, Copy, Debug)]
+enum Address<'a> {
+    /// `[z, base]`.
+    VectorFirst,
+    /// `[base, z]`.
+    ScalarFirst,
+    /// `[base, z, sxtw]`.
+    Extended(&'a str),
+    /// `[base, z, sxtw #2]`.
+    Shifted(&'a str, usize),
+}
+
+impl Gathered<'_> {
+    /// Writes the shift done before, if any, as its own line.
+    fn write_before(&self, out: &mut String) {
+        if let Some(shift) = self.before {
+            let z = self.z;
+            writeln!(out, "lsl {z}, {z}, #{shift}").unwrap();
+        }
+    }
+}
+
+impl fmt::Display for Gathered<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Gathered { base, z, .. } = *self;
+        match self.address {
+            Address::VectorFirst => write!(f, "[{z}, {base}]"),
+            Address::ScalarFirst => write!(f, "[{base}, {z}]"),
+            Address::Extended(extend) => write!(f, "[{base}, {z}, {extend}]"),
+            Address::Shifted(extend, shift) => write!(f, "[{base}, {z}, {extend} #{shift}]"),
+        }
+    }
 }
 
 /// Whether `pg` is a predicate that governs the lanes of `data`, one vector of each.
@@ -545,34 +736,41 @@ fn is_type(part: &str) -> bool {
 /// One letter per operand, and after `>` one for the result: `P` a predicate, `V` a data
 /// vector, `T` a tuple of them, `N` a vector of NEON's, `I` an integer, `C` a constant one, `F`
 /// a float, `-` nothing.
-fn signature(args: &[Arg], ret: Ret) -> String {
+fn signature(args: &[Arg], ret: Ret) -> Letters {
     let vector = |shape: Shape| {
         if shape.predicate() {
-            'P'
+            b'P'
         } else if shape.vectors > 1 {
-            'T'
+            b'T'
         } else {
-            'V'
+            b'V'
         }
     };
-    let mut signature: String = args
-        .iter()
-        .map(|it| match *it {
-            Arg::Vector(shape) => vector(shape),
-            Arg::Int(_, Some(_)) => 'C',
-            Arg::Int(..) => 'I',
-            Arg::Float(_) => 'F',
-            Arg::Fixed(_) => 'N',
-        })
-        .collect();
-    signature.push('>');
-    signature.push(match ret {
-        Ret::Unit => '-',
+    let mut signature = Letters(SmallVec::with_capacity(args.len() + 2));
+    signature.0.extend(args.iter().map(|it| match *it {
+        Arg::Vector(shape) => vector(shape),
+        Arg::Int(_, Some(_)) => b'C',
+        Arg::Int(..) => b'I',
+        Arg::Float(_) => b'F',
+        Arg::Fixed(_) => b'N',
+    }));
+    signature.0.push(b'>');
+    signature.0.push(match ret {
+        Ret::Unit => b'-',
         Ret::Vector(shape) => vector(shape),
-        Ret::Int(_) => 'I',
-        Ret::Float(_) => 'F',
+        Ret::Int(_) => b'I',
+        Ret::Float(_) => b'F',
     });
     signature
+}
+
+/// The ASCII letters of a [`signature`], on the stack.
+struct Letters(SmallVec<[u8; 16]>);
+
+impl Letters {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("a signature is ASCII letters")
+    }
 }
 
 /// Each binary operation on the active lanes, the inactive ones of the first operand:
@@ -749,45 +947,74 @@ const REDUCE_FLOAT: &[&str] = &["faddv", "fmaxnmv", "fmaxv", "fminnmv", "fminv",
 /// without `llvm.`) does to operands `args`, giving `ret`. An error says what has no stub,
 /// which the caller refuses with.
 pub(super) fn stub(name: &str, args: &[Arg], ret: Ret) -> std::result::Result<String, String> {
-    let (registers, body) = selected(name, args, ret)?;
-    Ok(text(&registers, &body, ret))
+    let mut text = begin();
+    let (registers, _) = selected_into(&mut text, name, args, ret)?;
+    write_end(&mut text, &registers, ret);
+    Ok(text)
 }
 
 /// The registers of a stub's operands and the instructions LLVM selects for the intrinsic,
 /// before the store of the result.
+#[cfg(test)]
 fn selected(
     name: &str,
     args: &[Arg],
     ret: Ret,
 ) -> std::result::Result<(Registers, String), String> {
+    // alloc: test only (`#[cfg(test)]`)
+    let mut text = String::new();
+    let (registers, body) = selected_into(&mut text, name, args, ret)?;
+    Ok((registers, text.split_off(body)))
+}
+
+/// Writes to `out` the moves and loads of a stub's operands and the instructions LLVM selects
+/// for the intrinsic, before the store of the result. It gives the registers and where in
+/// `out` the instructions begin.
+fn selected_into(
+    out: &mut String,
+    name: &str,
+    args: &[Arg],
+    ret: Ret,
+) -> std::result::Result<(Registers, usize), String> {
+    // alloc: the error's message
     let unsupported = || Err(format!("LLVM intrinsic `{name}`"));
-    // LLVM's own reversal of the lanes of a vector or predicate is SVE's `rev`.
-    let reversal = name.strip_prefix("vector.reverse.").map(|it| format!("rev.{it}"));
-    let insertion = name.strip_prefix("vector.insert.").map(|it| format!("insert.{it}"));
-    let ours = reversal.as_deref().or(insertion.as_deref());
-    let Some(rest) = ours.or_else(|| name.strip_prefix("aarch64.sve.")) else {
+    // The parts of the name after `aarch64.sve.`; LLVM's own reversal of the lanes of a vector
+    // or predicate is SVE's `rev`, and its insertion of one in another our `insert`.
+    let mut parts: SmallVec<[&str; 8]> = SmallVec::new();
+    if let Some(it) = name.strip_prefix("vector.reverse.") {
+        parts.push("rev");
+        parts.extend(it.split('.'));
+    } else if let Some(it) = name.strip_prefix("vector.insert.") {
+        parts.push("insert");
+        parts.extend(it.split('.'));
+    } else if let Some(it) = name.strip_prefix("aarch64.sve.") {
+        parts.extend(it.split('.'));
+    } else {
         return unsupported();
-    };
-    let parts: Vec<&str> = rest.split('.').collect();
+    }
     let registers = Registers::new(args, ret)?;
     // Each type the name is overloaded on is of an operand or the result.
-    let shapes: Vec<String> = args
-        .iter()
-        .filter_map(|it| match it {
-            Arg::Vector(shape) => Some(shape.llvm()),
-            _ => None,
-        })
-        .chain(match ret {
-            Ret::Vector(shape) => Some(shape.llvm()),
-            _ => None,
-        })
-        .collect();
-    if parts.iter().any(|it| it.starts_with("nxv") && !shapes.iter().any(|shape| shape == it)) {
+    let shapes = || {
+        args.iter()
+            .filter_map(|it| match it {
+                Arg::Vector(shape) => Some(*shape),
+                _ => None,
+            })
+            .chain(match ret {
+                Ret::Vector(shape) => Some(shape),
+                _ => None,
+            })
+    };
+    if parts.iter().any(|it| it.starts_with("nxv") && !shapes().any(|shape| shape.is_llvm(it))) {
         return unsupported();
     }
     let n = parts[0];
-    let modifiers: Vec<&str> = parts[1..].iter().copied().filter(|it| !is_type(it)).collect();
-    let signature = signature(args, ret);
+    let mut modifiers: SmallVec<[&str; 8]> = SmallVec::new();
+    modifiers.extend(parts[1..].iter().copied().filter(|it| !is_type(it)));
+    let letters = signature(args, ret);
+    let signature = letters.as_str();
+    registers.write_loads(args, out);
+    let body_start = out.len();
     let o = |index: usize| registers.operands[index];
     let full = |index: usize| o(index).full();
     let bare = |index: usize| o(index).bare();
@@ -795,31 +1022,31 @@ fn selected(
         Arg::Int(_, Some(value)) => value,
         _ => unreachable!("the signature has a constant there"),
     };
-    let r = registers.result.map(Reg::full).unwrap_or_default();
+    let r = OrEmpty(registers.result.map(Reg::full));
     let shape_of = |index: usize| match args[index] {
         Arg::Vector(shape) => shape,
         _ => unreachable!("the signature has a vector there"),
     };
-    let body = match (n, &modifiers[..], signature.as_str()) {
+    let written: fmt::Result = match (n, &modifiers[..], signature) {
         // The elements of a vector, of a pattern of them: `cntb` to `cntd`. The count of a
         // whole vector of bytes is `rdvl x0, #1` in LLVM's code, the same number.
         // LLVM folds the count of a fixed number of elements that every vector length has.
         ("cntb" | "cnth" | "cntw" | "cntd", [], "C>I") if matches!(ret, Ret::Int(64)) => {
             let least = 16 >> "bhwd".find(&n[3..]).unwrap();
             match constant(0) {
-                count @ 1..=8 if count <= least => format!("mov w0, #{count}\n"),
-                9 if least == 16 => "mov w0, #16\n".to_owned(),
-                imm => format!("{n} x0, {}\n", pattern(imm)?),
+                count @ 1..=8 if count <= least => write!(out, "mov w0, #{count}\n"),
+                9 if least == 16 => out.write_str("mov w0, #16\n"),
+                imm => write!(out, "{n} x0, {}\n", pattern(imm)?),
             }
         }
         // A predicate of the elements a pattern picks.
-        ("ptrue", [], "C>P") => format!("ptrue {r}, {}\n", pattern(constant(0))?),
+        ("ptrue", [], "C>P") => write!(out, "ptrue {r}, {}\n", pattern(constant(0))?),
         // The lanes of a predicate of wider elements as one of bytes: each lane's bit where
         // the bit of its first byte is, and the bits between them clear, which those of the
         // image of `nxv4i1` need not be.
         ("convert", ["to", "svbool"], "P>P") => {
             let Some(suffix) = predicate_suffix(parts[3]) else { return unsupported() };
-            format!("ptrue p1.{suffix}\nand p0.b, p1/z, p0.b, p0.b\n")
+            write!(out, "ptrue p1.{suffix}\nand p0.b, p1/z, p0.b, p0.b\n")
         }
         // A predicate of bytes read as one of wider elements: an instruction on those reads
         // the bit of each element's first byte, and those between are left as they are.
@@ -827,18 +1054,18 @@ fn selected(
             if predicate_suffix(parts[3]).is_none() {
                 return unsupported();
             }
-            String::new()
+            Ok(())
         }
         // The lanes up to the first that a write through one address and a read through the
         // other could overlap at.
         ("whilerw" | "whilewr", [size @ ("b" | "h" | "s" | "d")], "II>P")
             if predicate_suffix(parts[2]) == Some(*size) =>
         {
-            format!("{n} {r}, {}, {}\n", bare(0), bare(1))
+            write!(out, "{n} {r}, {}, {}\n", bare(0), bare(1))
         }
         // The active lanes of a predicate that are also of the governing one.
         ("cntp", [], "PP>I") if shape_of(0) == shape_of(1) && matches!(ret, Ret::Int(64)) => {
-            format!("cntp x0, {}, {}\n", bare(0), full(1))
+            write!(out, "cntp x0, {}, {}\n", bare(0), full(1))
         }
         // Each active lane read from memory, the others zero: of an unpacked vector, each in
         // the low bits of its element, which the load zero-extends into.
@@ -852,7 +1079,7 @@ fn selected(
             if !lanes_of(shape_of(0), data) || (whole && size != suffix_size(suffix)) {
                 return unsupported();
             }
-            format!("{n}{size} {{ {r} }}, {}/z, [{}]\n", bare(0), bare(1))
+            write!(out, "{n}{size} {{ {r} }}, {}/z, [{}]\n", bare(0), bare(1))
         }
         // The lanes of two, three or four vectors read from memory one after another.
         ("ld2" | "ld3" | "ld4", ["sret"], "PI>T") => {
@@ -866,7 +1093,7 @@ fn selected(
             if data.vectors != vectors || size != suffix_size(suffix) {
                 return unsupported();
             }
-            format!("{n}{size} {}, {}/z, [{}]\n", result.list(), bare(0), bare(1))
+            write!(out, "{n}{size} {}, {}/z, [{}]\n", result.list(), bare(0), bare(1))
         }
         // Each active lane written to memory, of an unpacked vector the low bits of each element.
         ("st1" | "stnt1", [], "VPI>-") => {
@@ -877,7 +1104,7 @@ fn selected(
             if !lanes_of(shape_of(1), data) || (n == "stnt1" && size != suffix_size(suffix)) {
                 return unsupported();
             }
-            format!("{n}{size} {}, {}, [{}]\n", o(0).list(), bare(1), bare(2))
+            write!(out, "{n}{size} {}, {}, [{}]\n", o(0).list(), bare(1), bare(2))
         }
         // The lanes of two, three or four vectors written to memory one after another.
         ("st2" | "st3" | "st4", [], "VVPI>-" | "VVVPI>-" | "VVVVPI>-") => {
@@ -890,42 +1117,40 @@ fn selected(
                 return unsupported();
             }
             let tuple = Reg::Z(o(0).number(), Shape { vectors: vectors as u64, ..data });
-            format!("{n}{size} {}, {}, [{}]\n", tuple.list(), bare(vectors), bare(vectors + 1))
+            write!(out, "{n}{size} {}, {}, [{}]\n", tuple.list(), bare(vectors), bare(vectors + 1))
         }
         // A prefetch of the active lanes' memory.
         ("prf", [], "PIC>-") => {
             let Some(size) = shape_of(0).suffix().map(suffix_size) else { return unsupported() };
-            format!("prf{size} {}, {}, [{}]\n", prefetch(constant(2))?, bare(0), bare(1))
+            write!(out, "prf{size} {}, {}, [{}]\n", prefetch(constant(2))?, bare(0), bare(1))
         }
         // Each active lane read from an address of its own, the others zero.
         ("ld1" | "ldff1" | "ldnt1", ["gather", how @ ..], "PIV>V" | "PVI>V") => {
             let Ret::Vector(data) = ret else { return unsupported() };
             let (base, offsets) = if signature == "PIV>V" { (1, 2) } else { (2, 1) };
             let Some(size) = data.memory_size() else { return unsupported() };
-            let Some((before, address)) =
-                gathered(n == "ldnt1", how, size, &bare(base), o(offsets))
-            else {
+            let Some(address) = gathered(n == "ldnt1", how, size, bare(base), o(offsets)) else {
                 return unsupported();
             };
             if !lanes_of(shape_of(0), data) || data.suffix() != shape_of(offsets).suffix() {
                 return unsupported();
             }
-            format!("{before}{n}{size} {{ {r} }}, {}/z, {address}\n", bare(0))
+            address.write_before(out);
+            write!(out, "{n}{size} {{ {r} }}, {}/z, {address}\n", bare(0))
         }
         // Each active lane written to an address of its own.
         ("st1" | "stnt1", ["scatter", how @ ..], "VPIV>-" | "VPVI>-") => {
             let data = shape_of(0);
             let (base, offsets) = if signature == "VPIV>-" { (2, 3) } else { (3, 2) };
             let Some(size) = data.memory_size() else { return unsupported() };
-            let Some((before, address)) =
-                gathered(n == "stnt1", how, size, &bare(base), o(offsets))
-            else {
+            let Some(address) = gathered(n == "stnt1", how, size, bare(base), o(offsets)) else {
                 return unsupported();
             };
             if !lanes_of(shape_of(1), data) || data.suffix() != shape_of(offsets).suffix() {
                 return unsupported();
             }
-            format!("{before}{n}{size} {}, {}, {address}\n", o(0).list(), bare(1))
+            address.write_before(out);
+            write!(out, "{n}{size} {}, {}, {address}\n", o(0).list(), bare(1))
         }
         // A prefetch of each active lane's address, the base plus each offset in elements.
         // LLVM writes those of bytes unshifted.
@@ -939,19 +1164,20 @@ fn selected(
             if !lanes_of(shape_of(0), offsets) {
                 return unsupported();
             }
-            let shift = match ("bhwd".find(&n[3..]).unwrap(), extend) {
-                (0, "lsl") => String::new(),
-                (0, _) => format!(", {extend}"),
-                (k, _) => format!(", {extend} #{k}"),
-            };
             let operation = prefetch(constant(3))?;
-            format!("{n} {operation}, {}, [{}, {}{shift}]\n", bare(0), bare(1), full(2))
+            write!(out, "{n} {operation}, {}, [{}, {}", bare(0), bare(1), full(2)).unwrap();
+            match ("bhwd".find(&n[3..]).unwrap(), extend) {
+                (0, "lsl") => {}
+                (0, _) => write!(out, ", {extend}").unwrap(),
+                (k, _) => write!(out, ", {extend} #{k}").unwrap(),
+            }
+            out.write_str("]\n")
         }
         // A prefetch of each active lane's address, a vector of them, at no offset.
         ("prfb" | "prfh" | "prfw" | "prfd", ["gather", "scalar", "offset"], "PVCC>-")
             if lanes_of(shape_of(0), shape_of(1)) && constant(2) == 0 =>
         {
-            format!("{n} {}, {}, [{}]\n", prefetch(constant(3))?, bare(0), full(1))
+            write!(out, "{n} {}, {}, [{}]\n", prefetch(constant(3))?, bare(0), full(1))
         }
         // The same at the offset of a scalar, which LLVM writes as a prefetch of bytes at
         // the scalar plus each address of the low 32 bits, of whatever size.
@@ -959,22 +1185,24 @@ fn selected(
             if lanes_of(shape_of(0), shape_of(1)) =>
         {
             let operation = prefetch(constant(3))?;
-            format!("prfb {operation}, {}, [{}, {}, uxtw]\n", bare(0), bare(2), full(1))
+            write!(out, "prfb {operation}, {}, [{}, {}, uxtw]\n", bare(0), bare(2), full(1))
         }
         (_, [] | ["wide"], "PVV>V") if MERGING.contains(&n) => {
-            format!("{n} {r}, {}/m, {}, {}\n", bare(0), full(1), full(2))
+            write!(out, "{n} {r}, {}/m, {}, {}\n", bare(0), full(1), full(2))
         }
         // The pairs of the second operand's lanes added to the active lanes of the first.
-        ("sadalp" | "uadalp", [], "PVV>V") => format!("{n} {r}, {}/m, {}\n", bare(0), full(2)),
+        ("sadalp" | "uadalp", [], "PVV>V") => write!(out, "{n} {r}, {}/m, {}\n", bare(0), full(2)),
         // The last active lane of the second operand (or that after it) in each of the
         // first's, and the active lanes of the first followed by the second's.
         ("clasta" | "clastb" | "splice", [], "PVV>V") => {
-            format!("{n} {r}, {}, {}, {}\n", bare(0), full(1), full(2))
+            write!(out, "{n} {r}, {}, {}, {}\n", bare(0), full(1), full(2))
         }
-        ("histcnt", [], "PVV>V") => format!("{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2)),
-        ("compact", [], "PV>V") => format!("{n} {r}, {}, {}\n", bare(0), full(1)),
+        ("histcnt", [], "PVV>V") => {
+            write!(out, "{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2))
+        }
+        ("compact", [], "PV>V") => write!(out, "{n} {r}, {}, {}\n", bare(0), full(1)),
         (_, [] | ["x"], "VV>V" | "PP>P") if BINARY.contains(&n) => {
-            format!("{n} {r}, {}, {}\n", full(0), full(1))
+            write!(out, "{n} {r}, {}, {}\n", full(0), full(1))
         }
         // The products of polynomials, each twice as wide as its factors.
         ("pmullb" | "pmullt", ["pair"], "VV>V") => {
@@ -984,7 +1212,7 @@ fn selected(
                 Some("d") => "q",
                 _ => return unsupported(),
             };
-            format!("{n} {}, {}, {}\n", o(0).with(wide), full(0), full(1))
+            write!(out, "{n} {}, {}, {}\n", o(0).with(wide), full(0), full(1))
         }
         // Of predicates read as of wider elements, the size in the name.
         (
@@ -997,49 +1225,61 @@ fn selected(
                 "b32" => "s",
                 _ => "d",
             };
-            let operands: Vec<String> = (0..args.len()).map(|it| o(it).with(suffix)).collect();
-            format!("{n} p0.{suffix}, {}\n", operands.join(", "))
+            write!(out, "{n} p0.{suffix}, ").unwrap();
+            for it in 0..args.len() {
+                if it > 0 {
+                    out.push_str(", ");
+                }
+                write!(out, "{}", o(it).with(suffix)).unwrap();
+            }
+            out.write_str("\n")
         }
         // The same of the 128-bit pieces of the vectors.
         ("zip1q" | "zip2q" | "uzp1q" | "uzp2q" | "trn1q" | "trn2q", [], "VV>V") => {
             let q = |index: usize| o(index).with("q");
-            format!("{} {}, {}, {}\n", &n[..n.len() - 1], q(0), q(0), q(1))
+            write!(out, "{} {}, {}, {}\n", &n[..n.len() - 1], q(0), q(0), q(1))
         }
-        ("tbl", [], "VV>V") => format!("tbl {r}, {}, {}\n", o(0).list(), full(1)),
+        ("tbl", [], "VV>V") => write!(out, "tbl {r}, {}, {}\n", o(0).list(), full(1)),
         ("tbl2", [], "VVV>V") => {
             let tuple = Reg::Z(o(0).number(), Shape { vectors: 2, ..shape_of(0) });
-            format!("tbl {r}, {}, {}\n", tuple.list(), full(2))
+            write!(out, "tbl {r}, {}, {}\n", tuple.list(), full(2))
         }
         // Addresses of the first operand's plus the second's lanes times 1, 2, 4 or 8.
         ("adrb" | "adrh" | "adrw" | "adrd", [], "VV>V") => {
             let shift = match n {
-                "adrb" => String::new(),
-                "adrh" => ", lsl #1".to_owned(),
-                "adrw" => ", lsl #2".to_owned(),
-                _ => ", lsl #3".to_owned(),
+                "adrb" => "",
+                "adrh" => ", lsl #1",
+                "adrw" => ", lsl #2",
+                _ => ", lsl #3",
             };
-            format!("adr {r}, [{}, {}{shift}]\n", full(0), full(1))
+            write!(out, "adr {r}, [{}, {}{shift}]\n", full(0), full(1))
         }
         (_, [] | ["x"], "VVV>V") if ACCUMULATING.contains(&n) => {
-            format!("{n} {r}, {}, {}\n", full(1), full(2))
+            write!(out, "{n} {r}, {}, {}\n", full(1), full(2))
         }
         (_, [], "VVV>V") if BITWISE3.contains(&n) => {
             let d = |index: usize| o(index).with("d");
-            format!("{n} {}, {}, {}, {}\n", d(0), d(0), d(1), d(2))
+            write!(out, "{n} {}, {}, {}, {}\n", d(0), d(0), d(1), d(2))
         }
-        (_, [], "VPV>V") if UNARY.contains(&n) => format!("{n} {r}, {}/m, {}\n", bare(1), full(2)),
+        (_, [], "VPV>V") if UNARY.contains(&n) => {
+            write!(out, "{n} {r}, {}/m, {}\n", bare(1), full(2))
+        }
         (_, [] | ["wide"], "PVV>P") if COMPARE.contains(&n) => {
-            let n = n.strip_prefix("fcmp").map_or_else(|| n.to_owned(), |it| format!("fcm{it}"));
-            format!("{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2))
+            let (head, n) = match n.strip_prefix("fcmp") {
+                Some(it) => ("fcm", it),
+                None => ("", n),
+            };
+            write!(out, "{head}{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2))
         }
         (_, ["z"], "PPP>P") if PREDICATE.contains(&n) => {
-            format!("{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2))
+            write!(out, "{n} {r}, {}/z, {}, {}\n", bare(0), full(1), full(2))
         }
         // Each lane up to the first active true one (`brka` with it), on the active lanes.
-        ("brka" | "brkb", [], "PPP>P") => format!("{n} {r}, {}/m, {}\n", bare(1), full(2)),
-        ("brka" | "brkb", ["z"], "PP>P") => format!("{n} {r}, {}/z, {}\n", bare(0), full(1)),
+        ("brka" | "brkb", [], "PPP>P") => write!(out, "{n} {r}, {}/m, {}\n", bare(1), full(2)),
+        ("brka" | "brkb", ["z"], "PP>P") => write!(out, "{n} {r}, {}/z, {}\n", bare(0), full(1)),
         ("brkn", ["z"], "PPP>P") => {
-            format!(
+            write!(
+                out,
                 "brkn {}, {}/z, {}, {}\nmov p0.b, {}\n",
                 full(2),
                 bare(0),
@@ -1050,71 +1290,78 @@ fn selected(
         }
         // The first active lane set, or the next after the last set one.
         ("pfirst" | "pnext", [], "PP>P") => {
-            format!("{n} {}, {}, {}\nmov p0.b, {}\n", full(1), bare(0), full(1), o(1).with("b"))
+            write!(out, "{n} {}, {}, {}\nmov p0.b, {}\n", full(1), bare(0), full(1), o(1).with("b"))
         }
         (_, [], "PVVV>V") if FUSED.contains(&n) => {
-            format!("{n} {r}, {}/m, {}, {}\n", bare(0), full(2), full(3))
+            write!(out, "{n} {r}, {}/m, {}, {}\n", bare(0), full(2), full(3))
         }
-        (_, [], "II>P") if WHILE.contains(&n) => format!("{n} {r}, {}, {}\n", bare(0), bare(1)),
-        (_, [] | ["x"], "V>V" | "P>P") if WHOLE.contains(&n) => format!("{n} {r}, {}\n", full(0)),
-        (_, [], "VV>V") if NARROW_TOP.contains(&n) => format!("{n} {r}, {}\n", full(1)),
+        (_, [], "II>P") if WHILE.contains(&n) => {
+            write!(out, "{n} {r}, {}, {}\n", bare(0), bare(1))
+        }
+        (_, [] | ["x"], "V>V" | "P>P") if WHOLE.contains(&n) => {
+            write!(out, "{n} {r}, {}\n", full(0))
+        }
+        (_, [], "VV>V") if NARROW_TOP.contains(&n) => write!(out, "{n} {r}, {}\n", full(1)),
         (_, [], "VC>V") if SHIFT.contains(&n) => {
-            format!("{n} {r}, {}, #{}\n", full(0), constant(1))
+            write!(out, "{n} {r}, {}, #{}\n", full(0), constant(1))
         }
         (_, [], "VVC>V") if SHIFT_INTO.contains(&n) => {
-            format!("{n} {r}, {}, #{}\n", full(1), constant(2))
+            write!(out, "{n} {r}, {}, #{}\n", full(1), constant(2))
         }
         (_, [], "PVC>V") if SHIFT_MERGING.contains(&n) => {
-            format!("{n} {r}, {}/m, {}, #{}\n", bare(0), full(1), constant(2))
+            write!(out, "{n} {r}, {}/m, {}, #{}\n", bare(0), full(1), constant(2))
         }
         // The lanes of each pair rotated and added, or exclusive-or rotated right.
         ("xar" | "cadd" | "sqcadd" | "ftmad", [] | ["x"], "VVC>V") => {
-            format!("{n} {r}, {}, {}, #{}\n", full(0), full(1), constant(2))
+            write!(out, "{n} {r}, {}, {}, #{}\n", full(0), full(1), constant(2))
         }
         // The lanes of the two vectors from the given one of the first on, in bytes.
         ("ext", [], "VVC>V") => {
             let bytes = shape_of(0).container_bits() as i128 / 8 * constant(2);
-            format!("ext {}, {}, {}, #{bytes}\n", o(0).with("b"), o(0).with("b"), o(1).with("b"))
+            let b = |index: usize| o(index).with("b");
+            write!(out, "ext {}, {}, {}, #{bytes}\n", b(0), b(0), b(1))
         }
         // An operation with a lane of each 128 bits of the second operand.
-        (_, ["lane"], "VVC>V") => format!("{n} {r}, {}, {}[{}]\n", full(0), full(1), constant(2)),
+        (_, ["lane"], "VVC>V") => {
+            write!(out, "{n} {r}, {}, {}[{}]\n", full(0), full(1), constant(2))
+        }
         (_, ["lane"] | ["lane", "x"], "VVVC>V") => {
-            format!("{n} {r}, {}, {}[{}]\n", full(1), full(2), constant(3))
+            write!(out, "{n} {r}, {}, {}[{}]\n", full(1), full(2), constant(3))
         }
         // An accumulation of complex products rotated by 0 to 270 degrees.
         (_, [] | ["x"], "VVVC>V") => {
-            format!("{n} {r}, {}, {}, #{}\n", full(1), full(2), constant(3))
+            write!(out, "{n} {r}, {}, {}, #{}\n", full(1), full(2), constant(3))
         }
         (_, ["lane"] | ["lane", "x"], "VVVCC>V") => {
-            format!("{n} {r}, {}, {}[{}], #{}\n", full(1), full(2), constant(3), constant(4))
+            write!(out, "{n} {r}, {}, {}[{}], #{}\n", full(1), full(2), constant(3), constant(4))
         }
         ("fcadd", [], "PVVC>V") => {
-            format!("fcadd {r}, {}/m, {}, {}, #{}\n", bare(0), full(1), full(2), constant(3))
+            write!(out, "fcadd {r}, {}/m, {}, {}, #{}\n", bare(0), full(1), full(2), constant(3))
         }
         ("fcmla", [], "PVVVC>V") => {
-            format!("fcmla {r}, {}/m, {}, {}, #{}\n", bare(0), full(2), full(3), constant(4))
+            write!(out, "fcmla {r}, {}/m, {}, {}, #{}\n", bare(0), full(2), full(3), constant(4))
         }
         // A reduction to an integer: of the sums, to 64 bits (and of signed lanes of 64 bits
         // the same as of unsigned ones), of the others, to the elements' size.
         ("saddv" | "uaddv", [], "PV>I") if matches!(ret, Ret::Int(64)) => {
             let n = if shape_of(1).container_bits() == 64 { "uaddv" } else { n };
             let d = scalar(o(1).number(), 64);
-            format!("{n} {d}, {}, {}\nfmov x0, {d}\n", bare(0), full(1))
+            write!(out, "{n} {d}, {}, {}\nfmov x0, {d}\n", bare(0), full(1))
         }
         (_, [], "PV>I") if REDUCE.contains(&n) => {
             let bits = shape_of(1).container_bits();
             let at = o(1).number();
-            let moved = if bits == 64 { format!("x0, d{at}") } else { format!("w0, s{at}") };
-            format!("{n} {}, {}, {}\nfmov {moved}\n", scalar(at, bits), bare(0), full(1))
+            let (x, v) = if bits == 64 { ("x0", Scalar('d', at)) } else { ("w0", Scalar('s', at)) };
+            write!(out, "{n} {}, {}, {}\nfmov {x}, {v}\n", scalar(at, bits), bare(0), full(1))
         }
-        ("lasta" | "lastb", [], "PV>I") => format!("{n} {r}, {}, {}\n", bare(0), full(1)),
+        ("lasta" | "lastb", [], "PV>I") => write!(out, "{n} {r}, {}, {}\n", bare(0), full(1)),
         (_, [], "PV>F") if REDUCE_FLOAT.contains(&n) => {
             let Ret::Float(bits) = ret else { return unsupported() };
-            format!("{n} {}, {}, {}\n", scalar(o(1).number(), bits), bare(0), full(1))
+            write!(out, "{n} {}, {}, {}\n", scalar(o(1).number(), bits), bare(0), full(1))
         }
         // The last active lane, or that after it, else the scalar; a sum in order.
         ("clasta" | "clastb", ["n"], "PFV>F") | ("fadda", [], "PFV>F") => {
-            format!("{n} {}, {}, {}, {}\n", full(1), bare(0), full(1), full(2))
+            write!(out, "{n} {}, {}, {}, {}\n", full(1), bare(0), full(1), full(2))
         }
         // Of an integer, the last active lane (or that after it) else the scalar: LLVM takes
         // bytes in a general register, wider lanes through a vector register.
@@ -1122,29 +1369,34 @@ fn selected(
             let bits = shape_of(2).container_bits();
             let lanes = full(2);
             if bits == 8 {
-                format!("{n} w0, {}, w0, {lanes}\n", bare(0))
+                write!(out, "{n} w0, {}, w0, {lanes}\n", bare(0))
             } else {
                 let at = o(2).number() + 1;
                 let (x, v) =
-                    if bits == 64 { ("x0", format!("d{at}")) } else { ("w0", format!("s{at}")) };
+                    if bits == 64 { ("x0", Scalar('d', at)) } else { ("w0", Scalar('s', at)) };
                 let lane = scalar(at, bits);
-                format!("fmov {v}, {x}\n{n} {lane}, {}, {lane}, {lanes}\nfmov {x}, {v}\n", bare(0))
+                write!(
+                    out,
+                    "fmov {v}, {x}\n{n} {lane}, {}, {lane}, {lanes}\nfmov {x}, {v}\n",
+                    bare(0)
+                )
             }
         }
         // A predicated broadcast of a scalar, and one of a scalar to every lane.
-        ("dup", [], "VPI>V" | "VPF>V") => format!("mov {r}, {}/m, {}\n", bare(1), full(2)),
-        ("dup", ["x"], "I>V" | "F>V") => format!("mov {r}, {}\n", full(0)),
+        ("dup", [], "VPI>V" | "VPF>V") => write!(out, "mov {r}, {}/m, {}\n", bare(1), full(2)),
+        ("dup", ["x"], "I>V" | "F>V") => write!(out, "mov {r}, {}\n", full(0)),
         // A predicate of every lane or none, by the low bit of a `bool`.
         ("dup", ["x"], "I>P") => {
-            let x = format!("x{}", o(0).number());
-            format!("sbfx x8, {x}, #0, #1\nwhilelo {r}, xzr, x8\n")
+            let x = o(0).number();
+            write!(out, "sbfx x8, x{x}, #0, #1\nwhilelo {r}, xzr, x8\n")
         }
         // Each 128 bits of the vector the given piece of it, by a table of the lanes of 64 bits.
         ("dupq", ["lane"], "VI>V") => {
-            let index = format!("x{}", o(1).number());
-            format!(
-                "index z1.d, #0, #1\nadd x8, {index}, {index}\nmov z2.d, x8\nand z1.d, z1.d, #0x1\n\
-                 orr z1.d, z1.d, z2.d\ntbl z0.d, {{ {} }}, z1.d\n",
+            let index = o(1).number();
+            write!(
+                out,
+                "index z1.d, #0, #1\nadd x8, x{index}, x{index}\nmov z2.d, x8\n\
+                 and z1.d, z1.d, #0x1\norr z1.d, z1.d, z2.d\ntbl z0.d, {{ {} }}, z1.d\n",
                 o(0).with("d")
             )
         }
@@ -1163,14 +1415,14 @@ fn selected(
                 || data.predicate()
                 || shape_of(0) != data
                 || !same(fixed)
-                || parts.get(2) != Some(&&*fixed.llvm_fixed())
+                || !parts.get(2).is_some_and(|it| fixed.is_llvm_fixed(it))
             {
                 return unsupported();
             }
-            format!("ptrue p0.{suffix}, vl{}\nmov {r}, p0/m, {}\n", data.count, full(1))
+            write!(out, "ptrue p0.{suffix}, vl{}\nmov {r}, p0/m, {}\n", data.count, full(1))
         }
-        ("index", [], "II>V") => format!("index {r}, {}, {}\n", bare(0), bare(1)),
-        ("insr", [], "VI>V" | "VF>V") => format!("insr {r}, {}\n", full(1)),
+        ("index", [], "II>V") => write!(out, "index {r}, {}, {}\n", bare(0), bare(1)),
+        ("insr", [], "VI>V" | "VF>V") => write!(out, "insr {r}, {}\n", full(1)),
         // Whether any, the first or the last active lane is set.
         ("ptest", [test @ ("any" | "first" | "last")], "PP>I") => {
             let condition = match *test {
@@ -1178,13 +1430,13 @@ fn selected(
                 "first" => "mi",
                 _ => "lo",
             };
-            format!("ptest {}, {}\ncset w0, {condition}\n", bare(0), o(1).with("b"))
+            write!(out, "ptest {}, {}\ncset w0, {condition}\n", bare(0), o(1).with("b"))
         }
         // The first-fault register: set, written and read.
-        ("setffr", [], ">-") => "setffr\n".to_owned(),
-        ("wrffr", [], "P>-") => format!("wrffr {}\n", full(0)),
-        ("rdffr", [], ">P") => format!("rdffr {r}\n"),
-        ("rdffr", ["z"], "P>P") => format!("rdffr {r}, {}/z\n", bare(0)),
+        ("setffr", [], ">-") => out.write_str("setffr\n"),
+        ("wrffr", [], "P>-") => write!(out, "wrffr {}\n", full(0)),
+        ("rdffr", [], ">P") => write!(out, "rdffr {r}\n"),
+        ("rdffr", ["z"], "P>P") => write!(out, "rdffr {r}, {}/z\n", bare(0)),
         // The scalar or each lane moved by the number of active lanes, saturating.
         // The scalar or each lane moved by a multiple of the count of a pattern's elements,
         // saturating: of a signed 32-bit scalar, to 64 bits and back.
@@ -1195,48 +1447,55 @@ fn selected(
         {
             let by = counted(constant(1), constant(2))?;
             match (n.as_bytes()[0], *width) {
-                (b's', "n32") => format!("{n} x0, w0, {by}\n"),
-                (b'u', "n32") => format!("{n} w0, {by}\n"),
-                _ => format!("{n} x0, {by}\n"),
+                (b's', "n32") => write!(out, "{n} x0, w0, {by}\n"),
+                (b'u', "n32") => write!(out, "{n} w0, {by}\n"),
+                _ => write!(out, "{n} x0, {by}\n"),
             }
         }
         (_, [], "VCC>V")
             if matches!(&n[..n.len() - 1], "sqinc" | "sqdec" | "uqinc" | "uqdec")
                 && "hwd".contains(&n[n.len() - 1..]) =>
         {
-            format!("{n} {r}, {}\n", counted(constant(1), constant(2))?)
+            write!(out, "{n} {r}, {}\n", counted(constant(1), constant(2))?)
         }
         ("sqincp" | "sqdecp" | "uqincp" | "uqdecp", [], "VP>V") => {
-            format!("{n} {r}, {}\n", full(1))
+            write!(out, "{n} {r}, {}\n", full(1))
         }
         ("sqincp" | "sqdecp" | "uqincp" | "uqdecp", ["n64"], "IP>I") => {
-            format!("{n} x0, {}\n", full(1))
+            write!(out, "{n} x0, {}\n", full(1))
         }
-        ("sqincp" | "sqdecp", ["n32"], "IP>I") => format!("{n} x0, {}, w0\n", full(1)),
-        ("uqincp" | "uqdecp", ["n32"], "IP>I") => format!("{n} w0, {}\n", full(1)),
+        ("sqincp" | "sqdecp", ["n32"], "IP>I") => write!(out, "{n} x0, {}, w0\n", full(1)),
+        ("uqincp" | "uqdecp", ["n32"], "IP>I") => write!(out, "{n} w0, {}\n", full(1)),
         _ => return unsupported(),
     };
-    Ok((registers, body))
+    written.unwrap();
+    Ok((registers, body_start))
 }
 
 /// The stub of `simd_select` on scalable vectors: each lane of `on_true` where the mask's is
 /// set, else of `on_false`. LLVM's `select` of them is SVE's `sel`.
 pub(super) fn select(mask: Shape, value: Shape) -> std::result::Result<String, String> {
     if mask.vectors != 1 || value.vectors != 1 || mask.count != value.count || !mask.predicate() {
+        // alloc: the error's message
         return Err("`simd_select` of scalable vectors of other shapes".to_owned());
     }
     let ret = Ret::Vector(value);
     let args = [Arg::Vector(mask), Arg::Vector(value), Arg::Vector(value)];
     let registers = Registers::new(&args, ret)?;
-    let body = if value.predicate() {
-        "sel p0.b, p0, p1.b, p2.b\n".to_owned()
-    } else {
-        let Some(suffix) = value.suffix() else {
-            return Err(format!("`simd_select` of {value:?}"));
-        };
-        format!("sel z0.{suffix}, p0, z0.{suffix}, z1.{suffix}\n")
+    let suffix = match value.suffix() {
+        _ if value.predicate() => None,
+        Some(suffix) => Some(suffix),
+        // alloc: the error's message
+        None => return Err(format!("`simd_select` of {value:?}")),
     };
-    Ok(text(&registers, &body, ret))
+    let mut text = begin();
+    registers.write_loads(&args, &mut text);
+    match suffix {
+        None => text.push_str("sel p0.b, p0, p1.b, p2.b\n"),
+        Some(suffix) => write!(text, "sel z0.{suffix}, p0, z0.{suffix}, z1.{suffix}\n").unwrap(),
+    }
+    write_end(&mut text, &registers, ret);
+    Ok(text)
 }
 
 /// The stub of `simd_cast` between scalable vectors of integers with as many lanes: LLVM's
@@ -1246,47 +1505,30 @@ pub(super) fn select(mask: Shape, value: Shape) -> std::result::Result<String, S
 pub(super) fn cast(from: Shape, to: Shape) -> std::result::Result<Option<String>, String> {
     let ints = |it: Shape| !it.float && !it.predicate() && it.vectors == 1;
     if !ints(from) || !ints(to) || from.count != to.count {
+        // alloc: the error's message
         return Err(format!("`simd_cast` from {from:?} to {to:?}"));
     }
     if to.bits <= from.bits {
         return Ok(None);
     }
+    // alloc: the error's message
     let Some(suffix) = to.suffix() else { return Err(format!("`simd_cast` to {to:?}")) };
     let width = match from.bits {
         8 => "b",
         16 => "h",
         32 => "w",
+        // alloc: the error's message
         _ => return Err(format!("`simd_cast` from {from:?}")),
     };
     let extend = if from.signed { "sxt" } else { "uxt" };
     let ret = Ret::Vector(to);
-    let registers = Registers::new(&[Arg::Vector(from)], ret)?;
-    let body = format!("ptrue p0.{suffix}\n{extend}{width} z0.{suffix}, p0/m, z0.{suffix}\n");
-    Ok(Some(text(&registers, &body, ret)))
-}
-
-/// Whether the signature of `func` with `args` (its own parameters when `None`) has a
-/// scalable vector, which rustc's code passes in SVE registers.
-pub(super) fn passes_scalable(
-    db: &dyn HirDatabase,
-    func: FunctionId,
-    args: Option<GenericArgs<'_>>,
-    env: &StoredParamEnvAndCrate,
-) -> bool {
-    let interner = DbInterner::new_no_crate(db);
-    let sig = db.callable_item_signature(func.into());
-    let sig = match args {
-        Some(args) => sig.instantiate(interner, args),
-        None => sig.instantiate_identity(),
-    }
-    .skip_binder();
-    // A scalable vector type has no lifetimes nor parameters, so one with late-bound lifetimes
-    // (`&'a T`) or parameters is none.
-    let concrete = |ty: &Ty<'_>| !ty.has_escaping_bound_vars() && !ty.has_param();
-    sig.inputs_and_output.iter().filter(concrete).any(|ty| {
-        db.layout_of_ty(ty.store(), env.clone())
-            .is_ok_and(|it| matches!(it.backend_repr, BackendRepr::SimdScalableVector { .. }))
-    })
+    let args = [Arg::Vector(from)];
+    let registers = Registers::new(&args, ret)?;
+    let mut text = begin();
+    registers.write_loads(&args, &mut text);
+    write!(text, "ptrue p0.{suffix}\n{extend}{width} z0.{suffix}, p0/m, z0.{suffix}\n").unwrap();
+    write_end(&mut text, &registers, ret);
+    Ok(Some(text))
 }
 
 impl<'db> FunctionCx<'_, 'db> {
@@ -1298,56 +1540,55 @@ impl<'db> FunctionCx<'_, 'db> {
         let BackendRepr::Scalar(scalar) = layout.backend_repr else { return Ok(None) };
         let size = layout.size;
         let signed = matches!(scalar.primitive(), rustc_abi::Primitive::Int(_, true));
+        // The value of the first `size` bytes, when there are as many.
+        let read = |bytes: &[u8]| {
+            let len = size.bytes_usize();
+            (bytes.len() >= len).then(|| {
+                let mut all = [0; 16];
+                all[..len].copy_from_slice(&bytes[..len]);
+                u128::from_le_bytes(all)
+            })
+        };
         let bits = match ty.kind() {
             TyKind::Int(_) | TyKind::Uint(_) => self.immediate(operand)?,
-            TyKind::Adt(..) => {
-                let bytes = match &operand.kind {
-                    OperandKind::Constant { konst, .. } => match konst.as_ref().kind() {
-                        ConstKind::Value(value) => {
-                            let blob = self.valtree_blob(ty, value.value)?;
-                            (blob.relocs.is_empty() && blob.fn_relocs.is_empty())
-                                .then_some(blob.bytes)
+            TyKind::Adt(..) => match &operand.kind {
+                OperandKind::Constant { konst, .. } => match konst.as_ref().kind() {
+                    ConstKind::Value(value) => {
+                        let blob = self.valtree_blob(ty, value.value)?;
+                        if blob.relocs.is_empty() && blob.fn_relocs.is_empty() {
+                            read(&blob.bytes)
+                        } else {
+                            None
                         }
-                        ConstKind::Unevaluated(named) => {
-                            Some(self.eval_const(named)?.memory.to_vec())
-                        }
-                        _ => None,
-                    },
-                    OperandKind::Allocation { allocation } => {
-                        Some(allocation.as_ref().memory.to_vec())
                     }
-                    // A const generic argument is moved to a local of its own first.
-                    OperandKind::Copy(place) | OperandKind::Move(place)
-                        if place.projection.as_slice().is_empty() =>
-                    {
-                        let Some(body) = self.body else { return Ok(None) };
-                        let mut assigned = body.basic_blocks.iter().flat_map(|(_, block)| {
-                            block.statements.iter().filter_map(|it| match &it.kind {
-                                StatementKind::Assign(to, rvalue) if to.local == place.local => {
-                                    Some((to, rvalue))
-                                }
-                                _ => None,
-                            })
-                        });
-                        let (Some((to, Rvalue::Use(from))), None) =
-                            (assigned.next(), assigned.next())
-                        else {
-                            return Ok(None);
-                        };
-                        if to != place || self.operand_ty(from)? != ty {
-                            return Ok(None);
-                        }
-                        let from = from.clone();
-                        return self.sve_constant(&from, ty);
-                    }
+                    ConstKind::Alias(_, named) => read(&self.eval_const(named)?.memory),
                     _ => None,
-                };
-                bytes.filter(|it| it.len() >= size.bytes_usize()).map(|it| {
-                    let mut all = [0; 16];
-                    all[..size.bytes_usize()].copy_from_slice(&it[..size.bytes_usize()]);
-                    u128::from_le_bytes(all)
-                })
-            }
+                },
+                OperandKind::Allocation { allocation } => read(&allocation.as_ref().memory),
+                // A const generic argument is moved to a local of its own first.
+                OperandKind::Copy(place) | OperandKind::Move(place)
+                    if place.projection.as_slice().is_empty() =>
+                {
+                    let Some(body) = self.body else { return Ok(None) };
+                    let mut assigned = body.basic_blocks.iter().flat_map(|(_, block)| {
+                        block.statements.iter().filter_map(|it| match &it.kind {
+                            StatementKind::Assign(to, rvalue) if to.local == place.local => {
+                                Some((to, rvalue))
+                            }
+                            _ => None,
+                        })
+                    });
+                    let (Some((to, Rvalue::Use(from))), None) = (assigned.next(), assigned.next())
+                    else {
+                        return Ok(None);
+                    };
+                    if to != place || self.operand_ty(from)? != ty {
+                        return Ok(None);
+                    }
+                    return self.sve_constant(from, ty);
+                }
+                _ => None,
+            },
             _ => None,
         };
         Ok(bits.map(|bits| {
@@ -1364,11 +1605,11 @@ impl<'db> FunctionCx<'_, 'db> {
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<()> {
-        let mut kinds = Vec::new();
-        let mut values = Vec::new();
-        let mut params = Vec::new();
+        let mut kinds: SmallVec<[Arg; 8]> = SmallVec::with_capacity(args.len());
+        let mut values: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 1);
+        let mut params: SmallVec<[AbiParam; 8]> = SmallVec::with_capacity(args.len());
         // The stub takes the addresses of the scalable operands after the scalars.
-        let mut addresses = Vec::new();
+        let mut addresses: SmallVec<[Value; 8]> = SmallVec::new();
         for arg in args {
             let ty = self.operand_ty(arg)?;
             if let Some(shape) = self.scalable(ty)? {
@@ -1430,54 +1671,60 @@ impl<'db> FunctionCx<'_, 'db> {
     }
 
     /// The Rust intrinsics `core::arch`'s SVE functions use on scalable vectors. `false` when
-    /// `name` is none of them or has no scalable vector here.
+    /// `intrinsic` is none of them ([`on_scalable`]) or has no scalable vector here.
     pub(super) fn scalable_intrinsic(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         generic_args: GenericArgs<'db>,
         args: &[Operand],
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<bool> {
-        let ours = name.starts_with("sve_tuple_") || matches!(name, "simd_select" | "simd_cast");
+        let ours = on_scalable(intrinsic);
         let Some(to) = self.scalable(dst_ty)?.filter(|_| ours) else { return Ok(false) };
-        let mut operands = Vec::new();
+        let mut operands: SmallVec<[(Value, Option<Shape>); 4]> =
+            SmallVec::with_capacity(args.len());
         for arg in args {
             let (addr, ty) = self.operand(arg)?;
             operands.push((addr, self.scalable(ty)?));
         }
         let vector = Size::from_bytes(DATA_MAX);
-        match (name, &operands[..]) {
-            ("sve_tuple_create2" | "sve_tuple_create3" | "sve_tuple_create4", _) => {
+        match (intrinsic, &operands[..]) {
+            (
+                Intrinsic::SveTupleCreate2
+                | Intrinsic::SveTupleCreate3
+                | Intrinsic::SveTupleCreate4,
+                _,
+            ) => {
                 if operands.len() as u64 != to.vectors
                     || operands
                         .iter()
                         .any(|(_, it)| it.is_none_or(|it| it.vectors != 1 || it.predicate()))
                 {
-                    unsupported!("`{name}` of {dst_ty:?}");
+                    unsupported!("`{intrinsic}` of {dst_ty:?}");
                 }
                 for (at, &(src, _)) in operands.iter().enumerate() {
                     let place = self.builder.ins().iadd_imm(dst, at as i64 * DATA_MAX as i64);
                     self.copy(place, src, vector);
                 }
             }
-            ("sve_tuple_get" | "sve_tuple_set", _) => {
+            (Intrinsic::SveTupleGet | Intrinsic::SveTupleSet, _) => {
                 let Some(index) = generic_args.iter().nth(2).and_then(|it| it.konst()) else {
-                    unsupported!("`{name}` without its index");
+                    unsupported!("`{intrinsic}` without its index");
                 };
                 let ConstKind::Value(index) = index.kind() else {
-                    unsupported!("`{name}` with an index not evaluated");
+                    unsupported!("`{intrinsic}` with an index not evaluated");
                 };
                 let index = index.value.inner().to_leaf().to_bits(Size::from_bytes(4)) as i32;
-                match (name, &operands[..]) {
-                    ("sve_tuple_get", [(tuple, Some(of))])
+                match (intrinsic, &operands[..]) {
+                    (Intrinsic::SveTupleGet, [(tuple, Some(of))])
                         if (0..of.vectors as i32).contains(&index) && to.vectors == 1 =>
                     {
                         let place =
                             self.builder.ins().iadd_imm(*tuple, index as i64 * DATA_MAX as i64);
                         self.copy(dst, place, vector);
                     }
-                    ("sve_tuple_set", [(tuple, Some(of)), (value, Some(one))])
+                    (Intrinsic::SveTupleSet, [(tuple, Some(of)), (value, Some(one))])
                         if (0..of.vectors as i32).contains(&index)
                             && one.vectors == 1
                             && *of == to =>
@@ -1487,16 +1734,19 @@ impl<'db> FunctionCx<'_, 'db> {
                             self.builder.ins().iadd_imm(dst, index as i64 * DATA_MAX as i64);
                         self.copy(place, *value, vector);
                     }
-                    _ => unsupported!("`{name}` of {dst_ty:?} at {index}"),
+                    _ => unsupported!("`{intrinsic}` of {dst_ty:?} at {index}"),
                 }
             }
-            ("simd_select", [(mask, Some(mask_shape)), (a, Some(value)), (b, Some(_))]) => {
+            (
+                Intrinsic::Simd(SimdOp::Select),
+                [(mask, Some(mask_shape)), (a, Some(value)), (b, Some(_))],
+            ) => {
                 let text = select(*mask_shape, *value).map_err(CodegenError::Unsupported)?;
                 let mut sig = self.cg.make_signature();
                 sig.params.extend([AbiParam::new(ptr()); 4]);
                 self.call_stub(text, &sig, &[dst, *mask, *a, *b], Ret::Vector(to), dst);
             }
-            ("simd_cast", [(src, Some(from))]) => {
+            (Intrinsic::Simd(SimdOp::Cast), [(src, Some(from))]) => {
                 match cast(*from, to).map_err(CodegenError::Unsupported)? {
                     None => self.copy(dst, *src, Size::from_bytes(to.storage())),
                     Some(text) => {
@@ -1506,10 +1756,24 @@ impl<'db> FunctionCx<'_, 'db> {
                     }
                 }
             }
-            _ => unsupported!("intrinsic `{name}` on scalable vectors"),
+            _ => unsupported!("intrinsic `{intrinsic}` on scalable vectors"),
         }
         Ok(true)
     }
+}
+
+/// Whether `intrinsic` is one [`FunctionCx::scalable_intrinsic`] lowers on scalable vectors:
+/// the `sve_tuple_*` ones, `simd_select` and `simd_cast`.
+fn on_scalable(intrinsic: Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        Intrinsic::SveTupleCreate2
+            | Intrinsic::SveTupleCreate3
+            | Intrinsic::SveTupleCreate4
+            | Intrinsic::SveTupleGet
+            | Intrinsic::SveTupleSet
+            | Intrinsic::Simd(SimdOp::Select | SimdOp::Cast)
+    )
 }
 
 #[cfg(test)]
@@ -1529,6 +1793,28 @@ mod tests {
         assert!(text.contains("mov w0, #16\n"), "{text}");
         let text = stub("aarch64.sve.cntw", &[Arg::Int(32, Some(7))], Ret::Int(64)).unwrap();
         assert!(text.contains("cntw x0, vl7\n"), "{text}");
+    }
+
+    #[test]
+    fn scalable_intrinsics_are_the_tuples_select_and_cast() {
+        let named = |name: &str| {
+            let intrinsic = Intrinsic::from_symbol(&intern::Symbol::intern(name));
+            intrinsic.unwrap_or_else(|| panic!("{name}"))
+        };
+        for name in [
+            "sve_tuple_create2",
+            "sve_tuple_create3",
+            "sve_tuple_create4",
+            "sve_tuple_get",
+            "sve_tuple_set",
+            "simd_select",
+            "simd_cast",
+        ] {
+            assert!(on_scalable(named(name)), "{name}");
+        }
+        for name in ["simd_as", "simd_select_bitmask", "simd_add", "transmute"] {
+            assert!(!on_scalable(named(name)), "{name}");
+        }
     }
 
     #[test]

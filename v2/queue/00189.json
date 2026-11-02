@@ -1,0 +1,42 @@
+{
+  "id": "00189",
+  "from_lane": "requests-ide-db",
+  "owner": "cargo",
+  "paths": [
+    "crates/ide-db/src/lib.rs",
+    "crates/base-db/src/db.rs",
+    "crates/blaze-engine/src/lib.rs",
+    "crates/base-db/src/change.rs",
+    "crates/blaze-engine",
+    "crates/load-cargo",
+    "crates/blaze-cargo",
+    "crates/blaze-wasm"
+  ],
+  "what": "## From requests-ide-db (2026-10-29): what `RootDatabase = base_db::Db` needs outside ide-db\n\n`crates/ide-db/src/lib.rs` now has `pub type RootDatabase = base_db::Db;` and\n`pub trait RootDatabaseExt` (implemented for `Db`, at the crate root) with `RootDatabase`'s\nold methods under the same names and signatures: `included_files`, `included_by`,\n`included_sources`, `sources_included_by`, `set_view`, `env_read`, `env_unset`, `set_env`,\n`on_disk`, `included_is_read`, `enable_proc_attr_macros`, `apply_change`,\n`per_query_memory_usage` (frontend-db-edge.md, \"ide-db's `RootDatabase` is `base_db::Db`\").\nGone: `RootDatabase::new(lru)`, `Default`, `Clone`, `set_pool` (`Db::run_all` runs on the\nprocess's pool itself), `update_lru_capacities`, `update_base_query_lru_capacities`,\n`reload_included_file` (see 1 below) and `ide_db::executions`. A build's `Db` keeps no\nevent hook, so the `RUSTD_TRACE` counter could no longer count anything; it is deleted\nrather than left returning nothing. `with_files` and the other fixture makers are still\n`test_fixture::WithFixture`'s, implemented for `Db`. No file outside ide-db was edited.\n\n1. **base-db (db lane): `Db::reload_included_file(&mut self, path: &vfs::AbsPath) -> bool`.**\n   What: an inherent method in `crates/base-db/src/db.rs` beside `set_file_text`, with the same\n   body `RootDatabase` had: `let files = Arc::clone(&self.files); files.reload_included_file(self, path)`.\n   Why: `Files::reload_included_file` takes `&mut Db`, and `Db::files` is private, so an\n   extension trait can't hold the `Arc<Files>` across the `&mut` borrow. Callers (unchanged\n   once it exists): `crates/blaze-engine/src/lib.rs:6878`, `:10458`.\n2. **base-db (db lane): `Db::new()` creates what a change expects.** What: create the empty\n   `LibraryRoots` and `LocalRoots` inputs and the empty crate graph in `Db::new()`, as\n   `Db::for_tests()` does. Why: `RootDatabase::new` made them, and `FileChange::apply`\n   (`crates/base-db/src/change.rs:72-73`) calls `LocalRoots::get(db)`/`LibraryRoots::get(db)`,\n   which panic on a database where nothing created them. Every `Db::new()` that applies a\n   change with roots panics without this (`blaze-engine/src/lib.rs:2627` below, the\n   `load-cargo/src/lib.rs:104` load). `ProcMacros::init_default` and\n   `set_expand_proc_attr_macros`, which `RootDatabase::new` also did, are the caller's (as\n   `load-cargo/src/v2.rs` `build_db` does); `ExpandProcAttrMacros::get` panics until one sets\n   it, so a `Db::new()` user that never calls `enable_proc_attr_macros` must until hir-def\n   deletes that input (frontend/db.md, \"Test databases\").\n3. **codegen (`crates/blaze-engine/`).**\n   - `src/lib.rs:2627` `RootDatabase::new(None)` becomes `Db::new()` (a build; needs 2).\n   - `src/lib.rs:11997` `RootDatabase::new(None)` (a test) becomes `Db::for_tests()`.\n   - `src/lib.rs:9568`, `:10699`, `:10705`: `ide_db::executions::{take, order}` are gone.\n     Delete the calls, or ask base-db for a build-side event hook if the `RUSTD_TRACE` report\n     is still wanted. `Db::log` works only on a `Db::for_tests()` database.\n   - `use ide_db::RootDatabaseExt;` for the calls in `src/content.rs:185` (`included_by`),\n     `src/manifest.rs:243` (`env_read`), `:255` (`included_by`), `src/consteval.rs:98`,\n     `src/borrowck.rs:119`, `src/check.rs:465` (`apply_change`), and `src/lib.rs:4408`,\n     `:5143`, `:5202` (`included_by`), `:5160`, `:5204`, `:6131`, `:6180` (`env_read`),\n     `:6147` (`env_unset`), `:6215` (`set_env`), `:6840`, `:6871`, `:10272`, `:10377`,\n     `:10836`, `:10874` (`on_disk`), `:6852`, `:6861` (`included_files`), `:10213`\n     (`set_view`), `:10295` (`included_is_read`), `:10411`, `:12010` (`apply_change`).\n   - Database clones (frontend-db-edge's to fix, told): `src/lib.rs:7393` (an owned clone\n     moved into a `'static` `std::thread::Builder::spawn`) and `:10591` (a clone of the owned\n     `db` from `Held`/`load`, moved into the build's threads, cloned again at `:10655`) stop\n     compiling. They need an `Arc<Db>` the daemon owns, or scoped threads borrowing `&Db`.\n     `:3736` (`verify_impls`) clones a `&RootDatabase` into `scope.spawn` on a\n     `Scope<'scope, '_>` whose `'scope` the borrow is not tied to; it needs `db: &'scope Db`.\n     At `:1445`, `:3560`, `:3633`, `:3801`, `:4211`, `:4266`, `:4465`, `:4680`, `:5377`,\n     `:6525`, `:8267`, `:8293` and `:11267`, `db` is already a `&RootDatabase` (or `&mut`),\n     so `db.clone()` now copies the reference: it compiles inside `std::thread::scope` and\n     shares the one database, as intended, and the `.clone()` should just be dropped.\n4. **cargo (`crates/load-cargo/`, `crates/blaze-cargo/`).**\n   - `use ide_db::RootDatabaseExt;` for `load-cargo/src/lib.rs:440`\n     (`enable_proc_attr_macros`), `blaze-cargo/src/process.rs:78` (`env_read`) and\n     `blaze-cargo/src/tree.rs:86`, `:96`, `:106`, `:170`, `:211` (`on_disk`), `:167`, `:182`,\n     `:203` (`included_sources`), `:192` (`sources_included_by`).\n   - `load-cargo/src/lib.rs:104` already makes `Db::new()`; it needs 2.\n   - `load-cargo/src/lib.rs:140` calls `ide_db::prime_caches::parallel_prime_caches(db, ..)`\n     unchanged: its workers are now scoped threads borrowing `&Db` (not clones), joined before\n     it returns.\n   - `blaze-cargo/src/serve/job.rs:673`, `:1043`, `:1109` (`w.db.clone()`,\n     `ready.input.db.clone()`) stop compiling if that `db` is a `Db` rather than an `Arc`\n     (frontend-db-edge's, told).\n5. **coordinator (`crates/blaze-wasm/`).** `use ide_db::RootDatabaseExt;` for\n   `src/lib.rs:188`, `:216` (`apply_change`) and `:217` (`enable_proc_attr_macros`). `:149`\n   already makes `Db::new()`; it applies a change with roots, so it needs 2.\n\nNone needed in blaze-doc, blaze-lints or ide-diagnostics: they name the type only.\n\n> forwarded to cargo (`crates/load-cargo/`) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-31T20:29:32Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-ide-db (2026-10-29): what `RootDatabase = base_db::Db` needs outside ide-db",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:108"
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "ide-db and test-fixture are deleted (integration 2026-10-30); callers use base_db::Db directly; nothing left in cargo's paths"
+    }
+  ]
+}

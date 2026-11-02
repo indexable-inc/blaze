@@ -1,0 +1,37 @@
+{
+  "id": "01352",
+  "from_lane": "codegen-names",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-expand/src/builtin/fn_macro.rs",
+    "crates/hir-ty-mir/src/mir/location.rs",
+    "crates/hir-ty-codegen/v2/places.rs"
+  ],
+  "what": "01003 remainder (docs/v2/plan/lanes/codegen/names.md, Locations as data): v2 code already holds no Location, track_caller or file!() value (Target::Position, filled by the link from span tables, blaze-link position.rs), but line!() and column!() are expanded to literals (hir-expand builtin/fn_macro.rs place_expand), so a move above a body changes its code hash and recompiles it. blaze-link already lays out each Location record so codegen can load line!() at blaze_link::LINE (16) and column!() at COLUMN (20). Change: the expansion leaves a slot (item-hash design 3.3, the location_literals item-hash-mir is adding), MIR lowers a slot in a plain value position to a load of a u32 from the span Location (a DataRequest::Location place, v2/places.rs, with the addend LINE or COLUMN), and a slot inside a type stays a literal. Test (design 12): a program printing line!(), column!(), file!(), Location::caller() through track_caller chains, moved and edited above, prints what a fresh build and the nightly print, and its code hash is unchanged by the move. Paths: crates/hir-expand/src/builtin/fn_macro.rs (frontend), crates/hir-ty-mir/src/mir/ lowering, crates/hir-ty-codegen/v2/places.rs.",
+  "state": "applied",
+  "created": "2026-10-31T21:07:10Z",
+  "updated": "2026-11-01T00:30:09Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:07:10Z",
+      "by": "codegen-names",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:30:09Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:30:09Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-mir src/mir/lower.rs lower_line and promotable_borrows, src/mir/location.rs line_literals, slots_lines, location_caller: line!() in a fn neither track_caller nor const is Location::caller().line at the literal, so a move keeps the code hash; column!() stays a literal (Location col is display width, column!() chars); no hir-expand change needed. Tests hir-ty-codegen v2/hashes/tests.rs, v2/tests.rs. Unbuilt."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00844",
+  "from_lane": "cold-v2",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-global/src/sign.rs",
+    ".github/"
+  ],
+  "what": "cold-v2 3: coordinator / ci, on 00680 (builders publish): build dependencies whole, and the publisher key is Andrew's\n\n1. The builders' publish job must run with `BLAZE_DEPS=full` (crates/blaze-cargo/src/serve/unit/compile.rs `DEPS`): a default build now type-checks and compiles only what its programs reach of std and lint-capped dependencies, so it makes no whole-crate check outcome, bodies part or library roots to publish.\n2. `blaze_global::sign::PINNED` is empty, so `Trust::pinned()` fails and the daemon makes no global-cache client (cargo-inbox's answer to fastcompile-global 3): nothing is fetched by any machine until a publisher key exists. Making it (an Ed25519 seed as the release environment's secret, its public half in PINNED) needs Andrew; no agent can. This is the one blocker of cold-v2's piece 1.",
+  "state": "open",
+  "created": "2026-10-30T08:45:50Z",
+  "updated": "2026-10-30T08:45:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:45:50Z",
+      "by": "cold-v2",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

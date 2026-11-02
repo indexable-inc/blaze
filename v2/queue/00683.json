@@ -1,0 +1,39 @@
+{
+  "id": "00683",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "docs/v2/plan/design/compile-time.md",
+    "crates/blaze-inproc/src/sys/windows.rs",
+    "docs/v2/plan/lanes/fastcompile/inproc.md",
+    "crates/blaze-inproc/programs/exact.rs"
+  ],
+  "what": "## fastcompile-inproc-exec 5: coordinator: `blaze-inproc-run` gone, the `windows-sys` features, and compile-time.md change 6 (`Cargo.toml`, packaging, `docs/v2/plan/design/compile-time.md`)\n\n1. Nothing ships beside `blaze` for runs any more (`fastcompile-inproc 4` and\n   `fastcompile-inproc-macos 3` are void): drop `blaze-inproc-run` from packaging if it was added.\n2. The root `Cargo.toml`'s `windows-sys` features gain what `crates/blaze-inproc/src/sys/windows.rs`\n   uses beyond today's list: `Win32_Security_Cryptography`, `Win32_System_Diagnostics_Debug`,\n   `Win32_System_Diagnostics_ToolHelp`, `Win32_System_Kernel` (for `CONTEXT`),\n   `Win32_System_LibraryLoader`, `Win32_System_SystemInformation`.\n3. `docs/v2/plan/design/compile-time.md` change 6: \"no binary on disk\" becomes \"no link and no\n   rewrite\": the dev executable is written once per content key to cargo's path and started by\n   the kernel; its start hook lays the daemon's code memory over its code before `main`, so a\n   patch is one store, never a link or a file write\n   (`docs/v2/plan/lanes/fastcompile/inproc.md`).\n4. Once link (1) and cargo (2) land: run `crates/blaze-inproc/programs/exact.rs` (example\n   `inproc-exact`) as a dev run on Linux x86-64 and AArch64, macOS AArch64 and Windows x86-64 in\n   ix VMs, with its own path as the argument: it exits 0 when `current_exe` names that path, the\n   start hook attached, `BLAZE_INPROC` is gone from its environment, and its backtrace names its\n   own functions.\n\n> forwarded to the coordinator (from requests, pass 17; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:35:51Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-inproc-exec 5: coordinator: `blaze-inproc-run` gone, the `windows-sys` features, and compile-time.md change 6 (`Cargo.toml`, packaging, `docs/v2/plan/design/compile-time.md`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:1801"
+    },
+    {
+      "at": "2026-10-30T08:35:51Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:35:51Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "1: nothing to drop, blaze-inproc-run is in no packaging (.github/scripts, flake, tools/nix). 2: root Cargo.toml windows-sys gains Win32_Security_Cryptography, Win32_System_Diagnostics_Debug, Win32_System_Diagnostics_ToolHelp, Win32_System_Kernel (CONTEXT), Win32_System_LibraryLoader, Win32_System_SystemInformation (each checked against windows-sys 0.61.2 Cargo.toml; lock unchanged). 3: docs/v2/plan/design/compile-time.md change 6 handed to coord-apply-docs via coord-apply. 4: the inproc-exact dev runs on four hosts are the coordinator compile/test loop (ix VMs), after link and cargo land."
+    }
+  ]
+}

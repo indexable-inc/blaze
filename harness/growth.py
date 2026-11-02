@@ -14,21 +14,25 @@ Then the same of a `load` that fills a struct of FIELDS fields (default 200), ea
 while a value with a destructor is live, as x11-dl's `x11_link!` opens Xlib's 781 functions: every
 `?` leaves through what the fields before it hold. Leaving was a drop chain per `?` over every
 field before it, 3 blocks a field squared, and bevy's build with Xlib's took 364 GB. Every program
-is also run against cargo's.
+also has to print what its source says (`printed`, `fields_printed`).
 
-Both sizes are allocated by the single-pass register allocator. By default a function of more
-than SINGLE_PASS instructions (hir-ty-codegen) gets it and a smaller one the backtracking one,
-whose code is smaller: with the limit between the two sizes, the ratio measured the
-change of allocator, not the growth (Windows' load of 200 fields, under the limit since #561,
-took x2.63 the code at 400 that were over it; the 400 were the same 288 KB as before).
+Each program is built by `blaze build` in an empty home, and the size of a function is the size
+of its symbol in the executable as the pinned LLVM's `llvm-nm` reads it: the size ELF gives it,
+or on Mach-O, which gives none, the distance to the next symbol. A PE executable has no symbols
+of its own to read, so it runs on Linux and macOS.
 """
-import os, shutil, sys, tempfile
+import os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ["BLAZE_CACHE"] = "off"
-os.environ["BLAZE_REGALLOC"] = "single_pass"
-from difftest import Fixture
+from dwarf import last_part
+from rebuild import Project, scratch
+
+# The pinned LLVM's, on PATH in the flake's dev shell and in CI.
+NM = shutil.which("llvm-nm") or "llvm-nm"
+SYMBOL = re.compile(r"^([0-9a-f]+) (?:([0-9a-f]{8,}) )?([A-Za-z]) (.*)$")
+# The hash a legacy-mangled symbol keeps after demangling.
+HASH = re.compile(r"::h[0-9a-f]{16}$")
 
 CARGO_TOML = """[package]
 name = "growth"
@@ -120,6 +124,11 @@ def program(arms):
             '    println!("{out}");\n}\n')
 
 
+def printed(arms):
+    """What `program(arms)` prints."""
+    return f"{{type:a/v0,}}{{type:a/v1,id:x,n:3,}}{{type:a/v{arms - 1},id:y,n:4,}}\n"
+
+
 FIELDS_HEAD = """pub struct OpenError(pub String);
 
 pub struct Lib(Vec<u8>);
@@ -159,47 +168,55 @@ def fields_program(fields):
             "        }\n    }\n}\n")
 
 
-def code_size(shapes, function):
-    """The bytes of the last `function` the shapes log has code for."""
-    names, sizes = {}, {}
-    for line in open(shapes):
-        tag, *rest = line.rstrip("\n").split("\t")
-        if tag == "O":
-            names[rest[0]] = rest[3]
-        elif tag == "C":
-            sizes[rest[0]] = int(rest[1])
-    found = [size for symbol, size in sizes.items() if names.get(symbol) == function]
+def fields_printed(fields):
+    """What `fields_program(fields)` prints: the library is closed as each `load` leaves."""
+    return "closed 3\nerror not asked\nclosed 3\nerror missing\n"
+
+
+def code_size(executable, function):
+    """The bytes of the largest copy of `function` in the executable's symbols."""
+    listed = subprocess.run([NM, "--demangle", "--numeric-sort", "--defined-only", "--print-size", executable],
+                            capture_output=True, text=True, timeout=300)
+    if listed.returncode != 0:
+        raise SystemExit(f"{NM} {executable} failed:\n{listed.stderr[-2000:]}")
+    symbols = [m.groups() for line in listed.stdout.splitlines() if (m := SYMBOL.match(line))]
+    found = []
+    for at, (address, size, kind, name) in enumerate(symbols):
+        if kind not in "tT" or last_part(HASH.sub("", name)) != function:
+            continue
+        if size is not None:
+            found.append(int(size, 16))
+        elif at + 1 < len(symbols):
+            found.append(int(symbols[at + 1][0], 16) - int(address, 16))
     if not found:
-        raise SystemExit(f"no code for `{function}` in the shapes log")
+        raise SystemExit(f"no symbol of `{function}` in {executable}")
     return max(found)
 
 
-def build(source, function, what):
-    ws = tempfile.mkdtemp(prefix="blaze-growth-")
+def build(source, expected, function, what):
+    work = scratch("blaze-growth-")
+    ws = os.path.join(work, "ws")
     os.makedirs(os.path.join(ws, "src"))
     open(os.path.join(ws, "Cargo.toml"), "w").write(CARGO_TOML)
     open(os.path.join(ws, "src/main.rs"), "w").write(source)
-    fx = Fixture(ws, ["growth"], ["-p", "growth"])
-    # What is quadratic takes minutes and gigabytes: past this it has failed already.
-    fx.blaze_timeout = 600
-    fx.rustc_build()
-    shapes = os.path.join(fx.work, "shapes.tsv")
-    os.environ["BLAZE_SHAPES"] = shapes
+    project = Project(ws, work)
     try:
-        fx.blaze_build()
+        built = project.build("growth")
     finally:
-        del os.environ["BLAZE_SHAPES"]
-    expected, got = fx.behaviour(fx.reference), fx.behaviour(fx.binary)
-    if expected != got:
-        raise SystemExit(f"{what}: blaze's program differs from cargo's:\n  rustc: {expected}\n  blaze: {got}")
-    size = code_size(shapes, function)
-    shutil.rmtree(ws, ignore_errors=True)
+        project.stop()
+    if built.status != 0 or not built.executable:
+        raise SystemExit(f"{what}: blaze's build failed ({built.status}):\n{built.said[-3000:]}")
+    got = project.ran(built)
+    if got != (0, expected, ""):
+        raise SystemExit(f"{what}: blaze's program differs from what its source says:\n  source: {expected!r}\n  blaze:  {got}")
+    size = code_size(built.executable, function)
+    shutil.rmtree(work, ignore_errors=True)
     return size
 
 
-def grows(function, unit, n, program, limit):
-    small = build(program(n), function, f"{n} {unit}s")
-    large = build(program(2 * n), function, f"{2 * n} {unit}s")
+def grows(function, unit, n, program, printed, limit):
+    small = build(program(n), printed(n), function, f"{n} {unit}s")
+    large = build(program(2 * n), printed(2 * n), function, f"{2 * n} {unit}s")
     ratio = large / small
     print(f"{function}: {small:,} bytes for {n} {unit}s, {large:,} for {2 * n}: x{ratio:.2f} "
           f"({small // n:,} and {large // (2 * n):,} bytes a {unit})")
@@ -211,8 +228,8 @@ def main():
     arms = int(sys.argv[1]) if sys.argv[1:] else 160
     fields = int(sys.argv[2]) if sys.argv[2:] else 200
     limit = float(os.environ.get("GROWTH_RATIO", "2.6"))
-    grows("serialize", "arm", arms, program, limit)
-    grows("load", "field", fields, fields_program, limit)
+    grows("serialize", "arm", arms, program, printed, limit)
+    grows("load", "field", fields, fields_program, fields_printed, limit)
     print("ok")
 
 

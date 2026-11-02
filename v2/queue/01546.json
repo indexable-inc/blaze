@@ -1,0 +1,24 @@
+{
+  "id": "01546",
+  "from_lane": "coord-1030",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower/unplaced_diagnostic.rs"
+  ],
+  "what": "Rule 14: an unplaced MissingUnsafe diagnostic prints its reason and lint with Debug (blaze-diagnostics lower/unplaced_diagnostic.rs, {reason:?} ({lint:?})). Render it as rustc does: E0133 \"<operation> is unsafe and requires unsafe block\" or the lint name, with the operation in words, and test the text.",
+  "state": "open",
+  "created": "2026-11-02T01:22:05Z",
+  "updated": "2026-11-02T01:22:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:22:05Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

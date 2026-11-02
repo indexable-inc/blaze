@@ -3,19 +3,14 @@
 
 #[rustfmt::skip]
 mod generated;
+pub(crate) mod keywords;
+#[allow(unsafe_code)]
+mod raw;
 
 use crate::Edition;
 
 #[allow(unreachable_pub)]
 pub use self::generated::SyntaxKind;
-
-impl From<u16> for SyntaxKind {
-    #[inline]
-    fn from(d: u16) -> SyntaxKind {
-        assert!(d <= (SyntaxKind::__LAST as u16));
-        unsafe { std::mem::transmute::<u16, SyntaxKind>(d) }
-    }
-}
 
 impl From<SyntaxKind> for u16 {
     #[inline]
@@ -50,5 +45,12 @@ impl SyntaxKind {
     #[inline]
     pub fn is_delimiter(self) -> bool {
         self.is_l_delimiter() || self.is_r_delimiter()
+    }
+
+    /// The text of every identifier [`SyntaxKind::from_keyword`] or
+    /// [`SyntaxKind::from_contextual_keyword`] gives a kind for in some edition: for tables
+    /// that recognize keywords by something other than their text.
+    pub fn keyword_texts() -> impl Iterator<Item = &'static str> {
+        keywords::texts()
     }
 }

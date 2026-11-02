@@ -1,1 +1,0 @@
-{"env": {"CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS": "--cfg from_env_target -Cpanic=abort"}}

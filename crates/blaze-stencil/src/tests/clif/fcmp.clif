@@ -1,0 +1,1159 @@
+; Follows cranelift/filetests/filetests/runtests/fcmp.clif (and fcmp-eq.clif, fcmp-ne.clif,
+; fcmp-lt.clif, fcmp-le.clif, fcmp-gt.clif, fcmp-ge.clif, fcmp-ord.clif, fcmp-uno.clif,
+; fcmp-one.clif, fcmp-ueq.clif, fcmp-ult.clif, fcmp-ule.clif, fcmp-ugt.clif, fcmp-uge.clif),
+; for the stencil set: all fourteen conditions of scalar `fcmp` on f32 and f64, against NaN on
+; either side and on both, -0.0 against +0.0 (equal), infinities, the largest finite values
+; and subnormals; then each condition's result used by the `brif` right after it, which both
+; backends fuse into a branch on the flags. Vector `fcmp` is the simd files'.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %fcmp_eq_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp eq v0, v1
+    return v2
+}
+; run: %fcmp_eq_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_eq_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_eq_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_eq_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_eq_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_eq_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_eq_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_eq_f32(-Inf, +NaN) == 0
+; run: %fcmp_eq_f32(+NaN, +NaN) == 0
+; run: %fcmp_eq_f32(+Inf, +Inf) == 1
+; run: %fcmp_eq_f32(-Inf, +Inf) == 0
+; run: %fcmp_eq_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_eq_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_eq_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_eq_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_eq_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_ne_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ne v0, v1
+    return v2
+}
+; run: %fcmp_ne_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ne_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ne_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ne_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ne_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_ne_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ne_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ne_f32(-Inf, +NaN) == 1
+; run: %fcmp_ne_f32(+NaN, +NaN) == 1
+; run: %fcmp_ne_f32(+Inf, +Inf) == 0
+; run: %fcmp_ne_f32(-Inf, +Inf) == 1
+; run: %fcmp_ne_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_ne_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_ne_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_ne_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_ne_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_lt_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp lt v0, v1
+    return v2
+}
+; run: %fcmp_lt_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_lt_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_lt_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_lt_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_lt_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_lt_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_lt_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_lt_f32(-Inf, +NaN) == 0
+; run: %fcmp_lt_f32(+NaN, +NaN) == 0
+; run: %fcmp_lt_f32(+Inf, +Inf) == 0
+; run: %fcmp_lt_f32(-Inf, +Inf) == 1
+; run: %fcmp_lt_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_lt_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_lt_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_lt_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_lt_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_le_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp le v0, v1
+    return v2
+}
+; run: %fcmp_le_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_le_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_le_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_le_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_le_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_le_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_le_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_le_f32(-Inf, +NaN) == 0
+; run: %fcmp_le_f32(+NaN, +NaN) == 0
+; run: %fcmp_le_f32(+Inf, +Inf) == 1
+; run: %fcmp_le_f32(-Inf, +Inf) == 1
+; run: %fcmp_le_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_le_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_le_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_le_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_le_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_gt_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp gt v0, v1
+    return v2
+}
+; run: %fcmp_gt_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_gt_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_gt_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_gt_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_gt_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_gt_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_gt_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_gt_f32(-Inf, +NaN) == 0
+; run: %fcmp_gt_f32(+NaN, +NaN) == 0
+; run: %fcmp_gt_f32(+Inf, +Inf) == 0
+; run: %fcmp_gt_f32(-Inf, +Inf) == 0
+; run: %fcmp_gt_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_gt_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_gt_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_gt_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_gt_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_ge_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ge v0, v1
+    return v2
+}
+; run: %fcmp_ge_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ge_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ge_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ge_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ge_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_ge_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ge_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_ge_f32(-Inf, +NaN) == 0
+; run: %fcmp_ge_f32(+NaN, +NaN) == 0
+; run: %fcmp_ge_f32(+Inf, +Inf) == 1
+; run: %fcmp_ge_f32(-Inf, +Inf) == 0
+; run: %fcmp_ge_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_ge_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_ge_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_ge_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_ge_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_ord_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ord v0, v1
+    return v2
+}
+; run: %fcmp_ord_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ord_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ord_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ord_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ord_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_ord_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ord_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_ord_f32(-Inf, +NaN) == 0
+; run: %fcmp_ord_f32(+NaN, +NaN) == 0
+; run: %fcmp_ord_f32(+Inf, +Inf) == 1
+; run: %fcmp_ord_f32(-Inf, +Inf) == 1
+; run: %fcmp_ord_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_ord_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_ord_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_ord_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_ord_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_uno_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp uno v0, v1
+    return v2
+}
+; run: %fcmp_uno_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_uno_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_uno_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_uno_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_uno_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_uno_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_uno_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_uno_f32(-Inf, +NaN) == 1
+; run: %fcmp_uno_f32(+NaN, +NaN) == 1
+; run: %fcmp_uno_f32(+Inf, +Inf) == 0
+; run: %fcmp_uno_f32(-Inf, +Inf) == 0
+; run: %fcmp_uno_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_uno_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_uno_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_uno_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_uno_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_one_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp one v0, v1
+    return v2
+}
+; run: %fcmp_one_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_one_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_one_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_one_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_one_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_one_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_one_f32(+NaN, 0x1.0p0) == 0
+; run: %fcmp_one_f32(-Inf, +NaN) == 0
+; run: %fcmp_one_f32(+NaN, +NaN) == 0
+; run: %fcmp_one_f32(+Inf, +Inf) == 0
+; run: %fcmp_one_f32(-Inf, +Inf) == 1
+; run: %fcmp_one_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_one_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_one_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_one_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_one_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_ueq_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ueq v0, v1
+    return v2
+}
+; run: %fcmp_ueq_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ueq_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ueq_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ueq_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ueq_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_ueq_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ueq_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ueq_f32(-Inf, +NaN) == 1
+; run: %fcmp_ueq_f32(+NaN, +NaN) == 1
+; run: %fcmp_ueq_f32(+Inf, +Inf) == 1
+; run: %fcmp_ueq_f32(-Inf, +Inf) == 0
+; run: %fcmp_ueq_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_ueq_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_ueq_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_ueq_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_ueq_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_ult_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ult v0, v1
+    return v2
+}
+; run: %fcmp_ult_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ult_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ult_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ult_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ult_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_ult_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ult_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ult_f32(-Inf, +NaN) == 1
+; run: %fcmp_ult_f32(+NaN, +NaN) == 1
+; run: %fcmp_ult_f32(+Inf, +Inf) == 0
+; run: %fcmp_ult_f32(-Inf, +Inf) == 1
+; run: %fcmp_ult_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_ult_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_ult_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_ult_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_ult_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_ule_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ule v0, v1
+    return v2
+}
+; run: %fcmp_ule_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ule_f32(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ule_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ule_f32(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ule_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_ule_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ule_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ule_f32(-Inf, +NaN) == 1
+; run: %fcmp_ule_f32(+NaN, +NaN) == 1
+; run: %fcmp_ule_f32(+Inf, +Inf) == 1
+; run: %fcmp_ule_f32(-Inf, +Inf) == 1
+; run: %fcmp_ule_f32(+Inf, 0x1.fffffep127) == 0
+; run: %fcmp_ule_f32(-Inf, -0x1.fffffep127) == 1
+; run: %fcmp_ule_f32(0x0.000002p-126, 0x0.0) == 0
+; run: %fcmp_ule_f32(-0x0.000002p-126, -0x0.0) == 1
+; run: %fcmp_ule_f32(0x0.000002p-126, 0x0.000004p-126) == 1
+
+function %fcmp_ugt_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ugt v0, v1
+    return v2
+}
+; run: %fcmp_ugt_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ugt_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ugt_f32(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ugt_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ugt_f32(0x0.0, -0x0.0) == 0
+; run: %fcmp_ugt_f32(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ugt_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ugt_f32(-Inf, +NaN) == 1
+; run: %fcmp_ugt_f32(+NaN, +NaN) == 1
+; run: %fcmp_ugt_f32(+Inf, +Inf) == 0
+; run: %fcmp_ugt_f32(-Inf, +Inf) == 0
+; run: %fcmp_ugt_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_ugt_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_ugt_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_ugt_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_ugt_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_uge_f32(f32, f32) -> i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp uge v0, v1
+    return v2
+}
+; run: %fcmp_uge_f32(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_uge_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_uge_f32(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_uge_f32(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_uge_f32(0x0.0, -0x0.0) == 1
+; run: %fcmp_uge_f32(-0x0.0, 0x0.0) == 1
+; run: %fcmp_uge_f32(+NaN, 0x1.0p0) == 1
+; run: %fcmp_uge_f32(-Inf, +NaN) == 1
+; run: %fcmp_uge_f32(+NaN, +NaN) == 1
+; run: %fcmp_uge_f32(+Inf, +Inf) == 1
+; run: %fcmp_uge_f32(-Inf, +Inf) == 0
+; run: %fcmp_uge_f32(+Inf, 0x1.fffffep127) == 1
+; run: %fcmp_uge_f32(-Inf, -0x1.fffffep127) == 0
+; run: %fcmp_uge_f32(0x0.000002p-126, 0x0.0) == 1
+; run: %fcmp_uge_f32(-0x0.000002p-126, -0x0.0) == 0
+; run: %fcmp_uge_f32(0x0.000002p-126, 0x0.000004p-126) == 0
+
+function %fcmp_eq_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp eq v0, v1
+    return v2
+}
+; run: %fcmp_eq_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_eq_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_eq_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_eq_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_eq_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_eq_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_eq_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_eq_f64(-Inf, +NaN) == 0
+; run: %fcmp_eq_f64(+NaN, +NaN) == 0
+; run: %fcmp_eq_f64(+Inf, +Inf) == 1
+; run: %fcmp_eq_f64(-Inf, +Inf) == 0
+; run: %fcmp_eq_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_eq_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_eq_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_eq_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_eq_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_ne_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ne v0, v1
+    return v2
+}
+; run: %fcmp_ne_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ne_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ne_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ne_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ne_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_ne_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ne_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ne_f64(-Inf, +NaN) == 1
+; run: %fcmp_ne_f64(+NaN, +NaN) == 1
+; run: %fcmp_ne_f64(+Inf, +Inf) == 0
+; run: %fcmp_ne_f64(-Inf, +Inf) == 1
+; run: %fcmp_ne_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ne_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ne_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_ne_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_ne_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_lt_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp lt v0, v1
+    return v2
+}
+; run: %fcmp_lt_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_lt_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_lt_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_lt_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_lt_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_lt_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_lt_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_lt_f64(-Inf, +NaN) == 0
+; run: %fcmp_lt_f64(+NaN, +NaN) == 0
+; run: %fcmp_lt_f64(+Inf, +Inf) == 0
+; run: %fcmp_lt_f64(-Inf, +Inf) == 1
+; run: %fcmp_lt_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_lt_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_lt_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_lt_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_lt_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_le_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp le v0, v1
+    return v2
+}
+; run: %fcmp_le_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_le_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_le_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_le_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_le_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_le_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_le_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_le_f64(-Inf, +NaN) == 0
+; run: %fcmp_le_f64(+NaN, +NaN) == 0
+; run: %fcmp_le_f64(+Inf, +Inf) == 1
+; run: %fcmp_le_f64(-Inf, +Inf) == 1
+; run: %fcmp_le_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_le_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_le_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_le_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_le_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_gt_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp gt v0, v1
+    return v2
+}
+; run: %fcmp_gt_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_gt_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_gt_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_gt_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_gt_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_gt_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_gt_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_gt_f64(-Inf, +NaN) == 0
+; run: %fcmp_gt_f64(+NaN, +NaN) == 0
+; run: %fcmp_gt_f64(+Inf, +Inf) == 0
+; run: %fcmp_gt_f64(-Inf, +Inf) == 0
+; run: %fcmp_gt_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_gt_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_gt_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_gt_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_gt_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_ge_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ge v0, v1
+    return v2
+}
+; run: %fcmp_ge_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ge_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ge_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ge_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ge_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_ge_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ge_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_ge_f64(-Inf, +NaN) == 0
+; run: %fcmp_ge_f64(+NaN, +NaN) == 0
+; run: %fcmp_ge_f64(+Inf, +Inf) == 1
+; run: %fcmp_ge_f64(-Inf, +Inf) == 0
+; run: %fcmp_ge_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ge_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ge_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_ge_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_ge_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_ord_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ord v0, v1
+    return v2
+}
+; run: %fcmp_ord_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ord_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ord_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ord_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ord_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_ord_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ord_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_ord_f64(-Inf, +NaN) == 0
+; run: %fcmp_ord_f64(+NaN, +NaN) == 0
+; run: %fcmp_ord_f64(+Inf, +Inf) == 1
+; run: %fcmp_ord_f64(-Inf, +Inf) == 1
+; run: %fcmp_ord_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ord_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ord_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_ord_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_ord_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_uno_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp uno v0, v1
+    return v2
+}
+; run: %fcmp_uno_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_uno_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_uno_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_uno_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_uno_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_uno_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_uno_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_uno_f64(-Inf, +NaN) == 1
+; run: %fcmp_uno_f64(+NaN, +NaN) == 1
+; run: %fcmp_uno_f64(+Inf, +Inf) == 0
+; run: %fcmp_uno_f64(-Inf, +Inf) == 0
+; run: %fcmp_uno_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_uno_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_uno_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_uno_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_uno_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_one_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp one v0, v1
+    return v2
+}
+; run: %fcmp_one_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_one_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_one_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_one_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_one_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_one_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_one_f64(+NaN, 0x1.0p0) == 0
+; run: %fcmp_one_f64(-Inf, +NaN) == 0
+; run: %fcmp_one_f64(+NaN, +NaN) == 0
+; run: %fcmp_one_f64(+Inf, +Inf) == 0
+; run: %fcmp_one_f64(-Inf, +Inf) == 1
+; run: %fcmp_one_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_one_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_one_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_one_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_one_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_ueq_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ueq v0, v1
+    return v2
+}
+; run: %fcmp_ueq_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ueq_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ueq_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ueq_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ueq_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_ueq_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ueq_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ueq_f64(-Inf, +NaN) == 1
+; run: %fcmp_ueq_f64(+NaN, +NaN) == 1
+; run: %fcmp_ueq_f64(+Inf, +Inf) == 1
+; run: %fcmp_ueq_f64(-Inf, +Inf) == 0
+; run: %fcmp_ueq_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ueq_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ueq_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_ueq_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_ueq_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_ult_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ult v0, v1
+    return v2
+}
+; run: %fcmp_ult_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ult_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ult_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ult_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ult_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_ult_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ult_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ult_f64(-Inf, +NaN) == 1
+; run: %fcmp_ult_f64(+NaN, +NaN) == 1
+; run: %fcmp_ult_f64(+Inf, +Inf) == 0
+; run: %fcmp_ult_f64(-Inf, +Inf) == 1
+; run: %fcmp_ult_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ult_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ult_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_ult_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_ult_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_ule_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ule v0, v1
+    return v2
+}
+; run: %fcmp_ule_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %fcmp_ule_f64(0x1.0p1, 0x1.0p0) == 0
+; run: %fcmp_ule_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_ule_f64(-0x1.0p1, -0x1.0p0) == 1
+; run: %fcmp_ule_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_ule_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_ule_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ule_f64(-Inf, +NaN) == 1
+; run: %fcmp_ule_f64(+NaN, +NaN) == 1
+; run: %fcmp_ule_f64(+Inf, +Inf) == 1
+; run: %fcmp_ule_f64(-Inf, +Inf) == 1
+; run: %fcmp_ule_f64(+Inf, 0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ule_f64(-Inf, -0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ule_f64(0x0.0000000000001p-1022, 0x0.0) == 0
+; run: %fcmp_ule_f64(-0x0.0000000000001p-1022, -0x0.0) == 1
+; run: %fcmp_ule_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 1
+
+function %fcmp_ugt_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ugt v0, v1
+    return v2
+}
+; run: %fcmp_ugt_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_ugt_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_ugt_f64(0x1.0p0, 0x1.0p0) == 0
+; run: %fcmp_ugt_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_ugt_f64(0x0.0, -0x0.0) == 0
+; run: %fcmp_ugt_f64(-0x0.0, 0x0.0) == 0
+; run: %fcmp_ugt_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_ugt_f64(-Inf, +NaN) == 1
+; run: %fcmp_ugt_f64(+NaN, +NaN) == 1
+; run: %fcmp_ugt_f64(+Inf, +Inf) == 0
+; run: %fcmp_ugt_f64(-Inf, +Inf) == 0
+; run: %fcmp_ugt_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_ugt_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_ugt_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_ugt_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_ugt_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %fcmp_uge_f64(f64, f64) -> i8 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp uge v0, v1
+    return v2
+}
+; run: %fcmp_uge_f64(0x1.0p0, 0x1.0p1) == 0
+; run: %fcmp_uge_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %fcmp_uge_f64(0x1.0p0, 0x1.0p0) == 1
+; run: %fcmp_uge_f64(-0x1.0p1, -0x1.0p0) == 0
+; run: %fcmp_uge_f64(0x0.0, -0x0.0) == 1
+; run: %fcmp_uge_f64(-0x0.0, 0x0.0) == 1
+; run: %fcmp_uge_f64(+NaN, 0x1.0p0) == 1
+; run: %fcmp_uge_f64(-Inf, +NaN) == 1
+; run: %fcmp_uge_f64(+NaN, +NaN) == 1
+; run: %fcmp_uge_f64(+Inf, +Inf) == 1
+; run: %fcmp_uge_f64(-Inf, +Inf) == 0
+; run: %fcmp_uge_f64(+Inf, 0x1.fffffffffffffp1023) == 1
+; run: %fcmp_uge_f64(-Inf, -0x1.fffffffffffffp1023) == 0
+; run: %fcmp_uge_f64(0x0.0000000000001p-1022, 0x0.0) == 1
+; run: %fcmp_uge_f64(-0x0.0000000000001p-1022, -0x0.0) == 0
+; run: %fcmp_uge_f64(0x0.0000000000001p-1022, 0x0.0000000000002p-1022) == 0
+
+function %brif_eq_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_eq_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_eq_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_eq_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_eq_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_eq_f32(0x1.0p0, +NaN) == 2
+
+function %brif_ne_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ne_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ne_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ne_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_ne_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_ne_f32(0x1.0p0, +NaN) == 1
+
+function %brif_lt_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp lt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_lt_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_lt_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_lt_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_lt_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_lt_f32(0x1.0p0, +NaN) == 2
+
+function %brif_le_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp le v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_le_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_le_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_le_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_le_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_le_f32(0x1.0p0, +NaN) == 2
+
+function %brif_gt_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp gt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_gt_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_gt_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_gt_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_gt_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_gt_f32(0x1.0p0, +NaN) == 2
+
+function %brif_ge_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ge_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ge_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ge_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_ge_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_ge_f32(0x1.0p0, +NaN) == 2
+
+function %brif_ord_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ord v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ord_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ord_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ord_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_ord_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_ord_f32(0x1.0p0, +NaN) == 2
+
+function %brif_uno_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp uno v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_uno_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_uno_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_uno_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_uno_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_uno_f32(0x1.0p0, +NaN) == 1
+
+function %brif_one_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp one v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_one_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_one_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_one_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_one_f32(+NaN, 0x1.0p0) == 2
+; run: %brif_one_f32(0x1.0p0, +NaN) == 2
+
+function %brif_ueq_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ueq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ueq_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ueq_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ueq_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_ueq_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_ueq_f32(0x1.0p0, +NaN) == 1
+
+function %brif_ult_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ult_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ult_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ult_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_ult_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_ult_f32(0x1.0p0, +NaN) == 1
+
+function %brif_ule_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ule_f32(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ule_f32(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ule_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_ule_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_ule_f32(0x1.0p0, +NaN) == 1
+
+function %brif_ugt_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ugt_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ugt_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ugt_f32(-0x0.0, 0x0.0) == 2
+; run: %brif_ugt_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_ugt_f32(0x1.0p0, +NaN) == 1
+
+function %brif_uge_f32(f32, f32) -> i32 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_uge_f32(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_uge_f32(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_uge_f32(-0x0.0, 0x0.0) == 1
+; run: %brif_uge_f32(+NaN, 0x1.0p0) == 1
+; run: %brif_uge_f32(0x1.0p0, +NaN) == 1
+
+function %brif_eq_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp eq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_eq_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_eq_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_eq_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_eq_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_eq_f64(0x1.0p0, +NaN) == 2
+
+function %brif_ne_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ne v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ne_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ne_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ne_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_ne_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_ne_f64(0x1.0p0, +NaN) == 1
+
+function %brif_lt_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp lt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_lt_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_lt_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_lt_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_lt_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_lt_f64(0x1.0p0, +NaN) == 2
+
+function %brif_le_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp le v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_le_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_le_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_le_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_le_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_le_f64(0x1.0p0, +NaN) == 2
+
+function %brif_gt_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp gt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_gt_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_gt_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_gt_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_gt_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_gt_f64(0x1.0p0, +NaN) == 2
+
+function %brif_ge_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ge_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ge_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ge_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_ge_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_ge_f64(0x1.0p0, +NaN) == 2
+
+function %brif_ord_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ord v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ord_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ord_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ord_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_ord_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_ord_f64(0x1.0p0, +NaN) == 2
+
+function %brif_uno_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp uno v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_uno_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_uno_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_uno_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_uno_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_uno_f64(0x1.0p0, +NaN) == 1
+
+function %brif_one_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp one v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_one_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_one_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_one_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_one_f64(+NaN, 0x1.0p0) == 2
+; run: %brif_one_f64(0x1.0p0, +NaN) == 2
+
+function %brif_ueq_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ueq v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ueq_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ueq_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ueq_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_ueq_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_ueq_f64(0x1.0p0, +NaN) == 1
+
+function %brif_ult_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ult_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ult_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ult_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_ult_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_ult_f64(0x1.0p0, +NaN) == 1
+
+function %brif_ule_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ule v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ule_f64(0x1.0p0, 0x1.0p1) == 1
+; run: %brif_ule_f64(0x1.0p1, 0x1.0p0) == 2
+; run: %brif_ule_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_ule_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_ule_f64(0x1.0p0, +NaN) == 1
+
+function %brif_ugt_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp ugt v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_ugt_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_ugt_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_ugt_f64(-0x0.0, 0x0.0) == 2
+; run: %brif_ugt_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_ugt_f64(0x1.0p0, +NaN) == 1
+
+function %brif_uge_f64(f64, f64) -> i32 {
+block0(v0: f64, v1: f64):
+    v2 = fcmp uge v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i32 1
+    return v3
+
+block2:
+    v4 = iconst.i32 2
+    return v4
+}
+; run: %brif_uge_f64(0x1.0p0, 0x1.0p1) == 2
+; run: %brif_uge_f64(0x1.0p1, 0x1.0p0) == 1
+; run: %brif_uge_f64(-0x0.0, 0x0.0) == 1
+; run: %brif_uge_f64(+NaN, 0x1.0p0) == 1
+; run: %brif_uge_f64(0x1.0p0, +NaN) == 1

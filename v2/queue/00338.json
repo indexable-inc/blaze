@@ -1,0 +1,36 @@
+{
+  "id": "00338",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/proc_macro.rs",
+    "crates/hir-expand"
+  ],
+  "what": "## E4. `expand_proc_macro`: the expander's tree is the memo; `current_dir` borrowed\n\nThe memo is the tree the expander returns (owned, at the edge to user code). Its one hir-expand\ntemporary is `current_dir`, a `String` per proc-macro call (`proc_macro.rs`,\n`calling_crate.data(db).proc_macro_cwd.to_string()`), made because `ProcMacroExpander::expand`\ntakes `current_dir: String`. After, it takes `&str` and the native expander reads it in place; the\nIPC client copies it only where it writes it to the wire.\n\n`crates/hir-expand/src/proc_macro.rs`: in `ProcMacroExpander::expand` and `expand_in`,\n`current_dir: String,` becomes `current_dir: &str,`. In `CustomProcMacroExpander::expand`, old\n```rust\n                // FIXME: Can we avoid the string allocation here?\n                let current_dir = calling_crate.data(db).proc_macro_cwd.to_string();\n```\nnew\n```rust\n                let current_dir = calling_crate.data(db).proc_macro_cwd.as_str();\n```\n(block 7's justification for this line is then not needed). Implementations to change with it\nare X2.\n\n`reverse_fixups` on the memo (only with an error in the input) rebuilds it through\n`transform_tt` (F1 keeps that on the global allocator for a `TopSubtree<Global>`): the memo's\ncolumns once more, on the error path.\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:39): in the tree: db-apply-def's `ProcMacroCall { current_dir: &'a str, .. }` (crates/hir-expand/src/proc_macro.rs:36), filled from `proc_macro_cwd.as_str()` at :434.",
+  "state": "applied",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#E4. `expand_proc_macro`: the expander's tree is the memo; `current_dir` borrowed",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:341"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:39): in the tree: db-apply-def's `ProcMacroCall { current_dir: &'a str, .. }` (crates/hir-expand/src/proc_macro.rs:36), filled from `proc_macro_cwd.as_str()` at :434."
+    }
+  ]
+}

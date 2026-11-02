@@ -1,0 +1,25 @@
+{
+  "id": "00201",
+  "from_lane": "db-matchck",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower",
+    "crates/blaze-diagnostics/src/lints/bodies/patterns.rs",
+    "crates/ide-diagnostics/src/lib.rs"
+  ],
+  "what": "## 3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)\n\nWhat: `hir`'s match checking types now come from `hir-ty-matchck` (rustc's `check_match`).\nThe callers that read the old `uncovered_patterns: String` or match exhaustively over these\nenums need to move to these types:\n\n- `hir::MissingMatchArms<'db>` (E0004): `scrutinee_expr: InFile<AstPtr<ast::Expr>>`,\n  `scrutinee_ty: Type<'db>`, `no_arms: bool` (rustc's \"type `T` is non-empty\" for a type that is\n  not an enum with variants), `witnesses: Vec<String>` (every witness as `print_witness_pat`\n  prints it; rustc shows the first 3), `variants: Vec<EnumVariant>`\n  (`maybe_point_at_variant` of the first 5), `special_tys: Vec<(Type<'db>, SpecialTy)>`\n  (`collect_special_tys` of the first witness; only for a match with arms),\n  `would_be_exhaustive_without_guards: bool`, `ref_to_uninhabited: bool` (\"references are always\n  considered inhabited\"), `consts_like_bindings: Vec<(InFile<AstPtr<ast::Pat>>, Const)>` (arms\n  whose pattern is a constant that looks like a binding, in arm order).\n- `hir::NonExhaustiveLet<'db>` (E0005): `pat: InFile<ExprOrPatPtr>` (an expression for a\n  destructuring assignment), `origin: BindingOrigin { Let, FnParam, ClosureParam, ForLoop,\n  Assignment }` (`Assignment` prints as \"local binding\", as rustc lowers it to a `let`),\n  `has_initializer: bool`, `pattern_ty: Type<'db>`, `witnesses`, `variants` (only for an ADT of\n  this crate, `point_at_non_local` false), `special_tys` (always empty for E0005, as rustc),\n  `privately_uninhabited: bool`, `interpreted_as_const: Option<Const>`.\n- `hir::SpecialTy { Usize, Isize, Str, ForeignNonExhaustive, Uninhabited }`: which note rustc's\n  `report_non_exhaustive_match` adds for the type.\n- New `AnyDiagnostic` variants: `EmptyRangePattern { pat, inclusive }` (E0030 for `..=`, E0579\n  for `..`), `PatternComplexityLimit { at: InFile<SyntaxNodePtr> }` (\"reached pattern complexity\n  limit\"), `MixedDerefPatterns { deref_pat, normal_pat }` (\"mix of deref patterns and normal\n  constructors\").\n- `hir::MatchLint` gains `OverlappingRangeEndpoints { pat, overlap: String, overlaps_with }` and\n  `NonContiguousRangeEndpoints { pat, gap: String, suggestion: String, gapped_with }`\n  (`gapped_with` empty is rustc's `ExclusiveRangeMissingMax`; `suggestion` is the `lo..=hi` text).\n  `hir::LetSource` stays `{ IfLet, IfLetGuard, WhileLet, LetElse }` (`else if let` folds into\n  `IfLet`, as rustc words both alike).\n- `DefWithBody::match_check_failed(db)`: rustc's `check_match` returned `Err`, or the body was\n  not checked because type checking failed. In both cases rustc builds no MIR of the body, so the\n  body gets no MIR lint (`mir_tainted`).\n\nWhere: `crates/blaze-diagnostics/src/lower/{mod.rs (the three new AnyDiagnostic arms),\nmissing_match_arms.rs:34, non_exhaustive_let.rs}`, `crates/blaze-diagnostics/src/lints/bodies/patterns.rs:35`\n(the two range lints), and while it exists `crates/ide-diagnostics/src/lib.rs:531-535` and\n`handlers/{missing_match_arms,non_exhaustive_let}.rs` (`d.uncovered_patterns` becomes\n`d.witnesses.join(\", \")`; the exhaustive `AnyDiagnostic` match needs the three new arms).\nWhy: the old string came from hir-ide's `match_check.rs`, which made every literal, range and\nconstant `_`. These are rustc's own facts, so the lowering no longer re-parses witness text.\n\n> told by tmux (window `diagnostics`, 2026-10-29).\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:16:34Z",
+  "updated": "2026-10-30T02:16:34Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-matchck.md#3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-matchck.md:56"
+    }
+  ]
+}

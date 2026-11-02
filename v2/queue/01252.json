@@ -1,0 +1,30 @@
+{
+  "id": "01252",
+  "from_lane": "dedup-bumps",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/cranelift-object",
+    "vendor/cranelift-codegen"
+  ],
+  "what": "Fetch and unpack the source of cranelift-object 0.137.1 (the newest; 01151 brought cranelift-object 0.137.0 and the rest of the family at 0.137.1). Every other cranelift crate 0.137.1 has the same src as 0.137.0, so the family stays =0.137.0 (vendor/cranelift-codegen, vendor/cranelift-object) until cranelift-object 0.137.1 shows whether the point release changes anything blaze builds.",
+  "state": "applied",
+  "created": "2026-10-31T12:09:32Z",
+  "updated": "2026-10-31T14:44:54Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:09:32Z",
+      "by": "dedup-bumps",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:44:54Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "crates.io cranelift-object 0.137.0 (sha256 78f98e6d6b502fa1..., matches SOURCE.md) and 0.137.1 (sha256 c38304b64d440315...): src/ is byte-identical; Cargo.toml differs only in its own version and the four cranelift dependency versions (0.137.0 -> 0.137.1). The point release changes nothing blaze builds, so the family can move to =0.137.1 by renumbering the two vendored manifests and the pins, with no source change. Unpacked at /tmp/clo."
+    }
+  ]
+}

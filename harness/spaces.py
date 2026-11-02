@@ -2,8 +2,8 @@
 """spaces.py: a workspace under a directory whose name has a space in it, built end to end by
 `blaze build` (issue #14).
 
-usage: spaces.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc are
-                     found next to it)
+usage: spaces.py    (BLAZE_BIN names the blaze built; blaze is found next to
+                     it)
 
 The directory is also named with `$$`, `#` and a quote, which rustc's dep-info files write as
 they are, and the daemon's home is in it too. The workspace has a library and a program that

@@ -1,0 +1,34 @@
+{
+  "id": "01406",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve/job.rs",
+    "crates/blaze-cargo/src/serve/plane.rs",
+    "crates/blaze-cargo/src/serve.rs",
+    "crates/blaze-cargo/src/cli"
+  ],
+  "what": "observe: wire blaze-profile's flight recorder, stall watchdog, CPU sampler and Tracy into the daemon and the CLI (Andrew, 2026-10-31). The blaze-profile side is in the tree. A stall must turn the rayon/blaze-pool deadlock (15 min at 0% CPU) into an error within the bound.\n\n1. Cargo.toml: [features] tracy = [\"blaze-profile/tracy\"] (the blaze-profile feature itself arrives with dedup's root dep change; add this line after that lands).\n\n2. The stall watchdog, serve/daemon.rs. Add a field `watchdog: blaze_profile::Watchdog` (Watchdog::new(Watchdog::BOUND), 60 s) and a count `ended: u64` of plane tasks that ended (increase it in step_plane for each happened that ends a task). In turn(), after step_plane:\n   let running = self.plane.running();\n   let progress = blaze_profile::flight::progress() + self.ended;\n   if let Some(quiet) = self.watchdog.tick(ns(self.driver.now()), progress, running > 0) {\n       let stall = blaze_profile::watchdog::stall(quiet, running);\n       ... }\n   On a stall:\n   (a) Write stall.trace (a Chrome trace) through an Effect::Write to state/stalls/<now ns>.json.\n   (b) Fail every job that has a plane request running with ApiError::new(stall.to_string(), Some(\"stall\".to_owned())). This needs a Jobs method, e.g. `stalled(&mut World, &ApiError)`: cancel each running job's plane request (plane.cancel) and push Said::Finish(id, false, Some(error.clone()), None), as job.rs:1082 does for one job.\n   (c) self.fail(Failed::Stalled(stall.to_string())), a new Failed variant: the worker threads may be deadlocked and cannot be got back, so the daemon stops and the next request starts a fresh one.\n   The watchdog is pure (sans IO, driver clock), so it runs under the simulation as is. blaze-profile's test a_request_whose_jobs_all_wait_on_each_other_fails_with_the_stall_error_instead_of_hanging covers the watchdog. Please add the daemon-level sim test with the same name in your sim tests: a request whose plane tasks block on each other ends with the stall error at the bound, on the virtual clock.\n\n3. Plots, at most once per 10 ms of driver time in turn(): blaze_profile::plot(Plot::Queued, queued tasks), plot(Plot::Running, self.plane.running() as u64), plot(Plot::FrameBytes, blaze_mem::tag::snapshot().get(Tag::Frames).live), plot(Plot::LiveBytes, the snapshot's .live()).\n\n4. At each plane Finished { request, ok, stats }: blaze_profile::built(blaze_profile::Built { serial: u64::from(request.0), hits: stats.cached, misses: stats.ran, joined: stats.joined }). It plots the three counts, marks the build's end in the recorder and ends a Tracy frame.\n\n5. serve.rs `run` (blaze serve only, once a process): match blaze_profile::sampler::start(blaze_profile::sampler::HZ) { Ok(()) => {}, Err(why) => tracing::warn!(\"CPU sampler off: {}\", why.0) }. This is not a fallback: nothing takes another path, a diagnostic is missing, and every dump says so in its `sampler` field. On Linux the usual reason is perf_event_paranoid.\n\n6. serve/plane.rs run_measured: `let _fiber = blaze_profile::fiber(arg);` first, so with Tracy each task's spans sit on the task's fiber (a no-op without the feature).\n\n7. The session cx (daemon.rs:91, next to `memory: blaze_mem::tag::snapshot`): `profile: blaze_profile::flight::dump`, once ci adds the field (my request to ci: Request::Profile { seconds }).\n\n8. CLI `blaze debug profile [--seconds N]` (default 60): send Request::Profile { seconds } to the running daemon, write the bytes to state/profile-<unix secs>.json and print the path. With no daemon running, fail with an error saying so.\n\nQuestions to observe (window blaze-v2:observe).",
+  "state": "refused",
+  "created": "2026-11-01T01:19:26Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:19:26Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

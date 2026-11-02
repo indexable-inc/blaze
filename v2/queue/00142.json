@@ -1,0 +1,36 @@
+{
+  "id": "00142",
+  "from_lane": "usercode-macros-native",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/blaze-cargo/src/cargo/own_macro.rs"
+  ],
+  "what": "## 4. To the coordinator: register the description hook\n\n> withdrawn 2026-10-29: superseded by compile-time.md change 20. Its key for a macro library\n> (request 6) may still want `own_macro::description_of`; that is fastcompile's to ask for.\n\nWhere: `crates/blaze-engine/src/lib.rs`, `held_wide()`, beside `blaze_expand::install(…)`\n(blaze-cargo does not depend on blaze-expand; blaze-engine depends on both), and a function in\n`crates/blaze-cargo/src/cargo/own_macro.rs` that knows where it writes a description.\n\nWhy: `native::find` must know each proc-macro library's crate and dependency closure (each\npackage's name, version, the BLAKE3 of every file of its directory, its cfg and its\ndependencies' names); `own_macro.rs` writes that as the `rust-project.json` beside each module\nit builds (`described_at`: `<library dir>/blaze-wasm/<stem>-<digest>/rust-project.json`, the\nmodule `<stem>.wasm` in the same directory). Without the hook `find` returns an error for every\nmacro, which fails the load (no-fallback): it must be registered before the first load.\n\nWhat, in `own_macro.rs`:\n\n```rust\n/// Sets `into` to the `rust-project.json` blaze built the proc-macro module at `module` from,\n/// beside it ([`described_at`]), and says `true`; `false` when `module` is not a module blaze\n/// built from a description (a library it runs natively).\npub fn description_of(module: &Path, into: &mut PathBuf) -> bool {\n    let (Some(dir), Some(\"wasm\")) = (module.parent(), module.extension().and_then(OsStr::to_str))\n    else {\n        return false;\n    };\n    into.as_mut_os_string().clear();\n    into.push(dir);\n    into.push(\"rust-project.json\");\n    true\n}\n```\n\nIt allocates nothing: the buffer is blaze-expand's, kept per thread and reused.\n\nand in `held_wide()`:\n\n```rust\nblaze_expand::native::describe_with(Box::new(|dylib, into| {\n    Ok(cargo::own_macro::description_of(dylib.as_ref(), into))\n}))\n.expect(\"held_wide runs once per process\");\n```\n\n(`cargo` as blaze-engine already names `blaze_cargo::cargo`; `describe_with` errs only when\ncalled twice.) blaze-expand reads the description itself and keeps what it read by the file's\npath and stat stamp, so after the first load a library costs one `stat` of its description and\none of each file and directory of its closure; a `.wasm` module whose description is missing is\nan error naming both.\n\n> forwarded to codegen and cargo: `held_wide()` is in `crates/blaze-engine/src/lib.rs` (codegen's) and `description_of` in `crates/blaze-cargo/src/cargo/own_macro.rs` (cargo's); both lanes are still running.\n\n> not applied, by codegen (2026-10-29): this section is withdrawn (its note above, and `usercode-macros.md` 5: \"no `describe_with` hook is needed\"), and neither `blaze_expand::native::describe_with` nor `own_macro::description_of` exists, so `held_wide()` keeps `blaze_expand::install()` alone. If fastcompile's key for a macro library brings the hook back, codegen registers it once both functions land.",
+  "state": "refused",
+  "created": "2026-10-30T01:41:30Z",
+  "updated": "2026-10-31T20:30:05Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/usercode-macros-native.md#4. To the coordinator: register the description hook",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros-native.md:150"
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

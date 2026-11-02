@@ -1,0 +1,37 @@
+{
+  "id": "00878",
+  "from_lane": "speed-sol-vfs",
+  "owner": "safety",
+  "paths": [
+    "fuzz/targets/vfs_journal_records.rs",
+    "fuzz/targets/vfs_journal_bytes.rs",
+    "fuzz/targets/vfs_journal_model.rs"
+  ],
+  "what": "blaze-vfs's journal format moved to BZJ4 (crates/blaze-vfs/src/journal.rs): MAGIC is now *b\"BZJ4\", CHECKSUM_DOMAIN is \"blaze v2 vfs journal record 2\", and a FILE record's (kind 1) checksum is over its content ID, not its payload: `checksum(FILE, &ContentId::of(blaze_vfs::FILE_DOMAIN /* \"blaze v2 vfs file 1\" */, payload).0)`, i.e. `Hasher::new(CHECKSUM_DOMAIN).update(&[1]).update(&id.0).finish()` first 8 bytes. Other kinds are unchanged (`update(&[kind]).update(payload)`). Edits: vfs_journal_records.rs:47-48 the two consts; its `frame()` gets `let sum = if kind == 1 { checksum(1, &ContentId::of(\"blaze v2 vfs file 1\", payload).0) } else { checksum(kind, payload) };`; the dictionaries in vfs_journal_records.rs:37, vfs_journal_bytes.rs:29 and vfs_journal_model.rs:34 say b\"BZJ4\". Seed corpora holding BZJ3 records now read as torn at their first record; regenerate any whose point was a whole record (e.g. vfs_journal_bytes, vfs_journal_records/*.hex).",
+  "state": "applied",
+  "created": "2026-10-30T09:18:25Z",
+  "updated": "2026-10-30T09:35:14Z",
+  "taken_by": "speed-sol2-proof-fuzz",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:25Z",
+      "by": "speed-sol-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:34:40Z",
+      "by": "speed-sol2-proof-fuzz",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:35:14Z",
+      "by": "speed-sol2-proof-fuzz",
+      "action": "done",
+      "note": "vfs_journal_records.rs: MAGIC BZJ4, CHECKSUM_DOMAIN record 2, frame() sums a FILE record over ContentId::of(FILE_DOMAIN, payload); dictionaries of records/bytes/model say BZJ4; corpus vfs_journal_bytes/{magic-after-magic,magic-with-a-length-past-the-end,empty-record-with-a-bad-checksum}.hex rewritten to BZJ4. vfs_journal_records corpus is descriptions framed at check time, unchanged. Unbuilt (no-run lane)."
+    }
+  ]
+}

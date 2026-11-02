@@ -14,9 +14,10 @@ use tracing::instrument;
 use crate::data_structures::SsoHashSet;
 use crate::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeSuperFoldable};
 use crate::inherent::*;
-use crate::lift::Lift;
 use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex, Unnormalized};
+use crate::{
+    self as ty, Const, DebruijnIndex, Interner, PredicateProxy, Region, UniverseIndex, Unnormalized,
+};
 
 /// `Binder` is a binder for higher-ranked lifetimes or types. It is part of the
 /// compiler's representation for things like `for<'a> Fn(&'a isize)`
@@ -24,10 +25,8 @@ use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex, Unnormalized};
 ///
 /// See <https://rustc-dev-guide.rust-lang.org/ty_module/instantiating_binders.html>
 /// for more details.
-///
-/// `Decodable` and `Encodable` are implemented for `Binder<T>` using the `impl_binder_encode_decode!` macro.
 #[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner, T)]
-#[derive(GenericTypeVisitable)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub struct Binder<I: Interner, T> {
     value: T,
@@ -35,62 +34,6 @@ pub struct Binder<I: Interner, T> {
 }
 
 impl<I: Interner, T: Eq> Eq for Binder<I, T> {}
-
-// FIXME: We manually derive `Lift` because the `derive(Lift_Generic)` doesn't
-// understand how to turn `T` to `T::Lifted` in the output `type Lifted`.
-impl<I: Interner, U: Interner, T> Lift<U> for Binder<I, T>
-where
-    T: Lift<U>,
-    I::BoundVarKinds: Lift<U, Lifted = U::BoundVarKinds>,
-{
-    type Lifted = Binder<U, T::Lifted>;
-
-    fn lift_to_interner(self, cx: U) -> Self::Lifted {
-        Binder {
-            value: self.value.lift_to_interner(cx),
-            bound_vars: self.bound_vars.lift_to_interner(cx),
-        }
-    }
-}
-
-#[cfg(feature = "nightly")]
-macro_rules! impl_binder_encode_decode {
-    ($($t:ty),+ $(,)?) => {
-        $(
-            impl<I: Interner, E: rustc_serialize::Encoder> rustc_serialize::Encodable<E> for ty::Binder<I, $t>
-            where
-                $t: rustc_serialize::Encodable<E>,
-                I::BoundVarKinds: rustc_serialize::Encodable<E>,
-            {
-                fn encode(&self, e: &mut E) {
-                    self.bound_vars().encode(e);
-                    self.as_ref().skip_binder().encode(e);
-                }
-            }
-            impl<I: Interner, D: rustc_serialize::Decoder> rustc_serialize::Decodable<D> for ty::Binder<I, $t>
-            where
-                $t: TypeVisitable<I> + rustc_serialize::Decodable<D>,
-                I::BoundVarKinds: rustc_serialize::Decodable<D>,
-            {
-                fn decode(decoder: &mut D) -> Self {
-                    let bound_vars = rustc_serialize::Decodable::decode(decoder);
-                    ty::Binder::bind_with_vars(rustc_serialize::Decodable::decode(decoder), bound_vars)
-                }
-            }
-        )*
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl_binder_encode_decode! {
-    ty::FnSig<I>,
-    ty::FnSigTys<I>,
-    ty::TraitPredicate<I>,
-    ty::ExistentialPredicate<I>,
-    ty::TraitRef<I>,
-    ty::ExistentialTraitRef<I>,
-    ty::HostEffectPredicate<I>,
-}
 
 impl<I: Interner, T> Binder<I, T>
 where
@@ -193,6 +136,7 @@ impl<I: Interner, T> Binder<I, T> {
         self.as_ref().map_bound(f)
     }
 
+    #[inline]
     pub fn map_bound<F, U: TypeVisitable<I>>(self, f: F) -> Binder<I, U>
     where
         F: FnOnce(T) -> U,
@@ -203,6 +147,19 @@ impl<I: Interner, T> Binder<I, T> {
             let mut validator = ValidateBoundVars::new(bound_vars);
             let _ = value.visit_with(&mut validator);
         }
+        Binder { value, bound_vars }
+    }
+
+    /// There are some uses of `map_bound` which are incredibly hot and trivially
+    /// correct. Only use this if this significantly improves the performance of
+    /// builds with debug assertions.
+    #[inline]
+    pub fn map_bound_no_validate_bound_vars<F, U: TypeVisitable<I>>(self, f: F) -> Binder<I, U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        let Binder { value, bound_vars } = self;
+        let value = f(value);
         Binder { value, bound_vars }
     }
 
@@ -298,20 +255,20 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
     }
 
     fn visit_ty(&mut self, t: I::Ty) -> Self::Result {
-        if t.outer_exclusive_binder() < self.binder_index
+        if t.outer_exclusive_binder() <= self.binder_index
             || !self.visited.insert((self.binder_index, t))
         {
-            return ControlFlow::Break(());
+            return ControlFlow::Continue(());
         }
         match t.kind() {
             ty::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_ty)
                 if debruijn == self.binder_index =>
             {
                 let idx = bound_ty.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", t, self.bound_vars);
-                }
-                bound_ty.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                bound_ty.assert_eq(bound_var);
             }
             _ => {}
         };
@@ -319,19 +276,19 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
         t.super_visit_with(self)
     }
 
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
-        if c.outer_exclusive_binder() < self.binder_index {
-            return ControlFlow::Break(());
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
+        if c.outer_exclusive_binder() <= self.binder_index {
+            return ControlFlow::Continue(());
         }
         match c.kind() {
             ty::ConstKind::Bound(debruijn, bound_const)
                 if debruijn == ty::BoundVarIndexKind::Bound(self.binder_index) =>
             {
                 let idx = bound_const.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", c, self.bound_vars);
-                }
-                bound_const.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                bound_const.assert_eq(bound_var);
             }
             _ => {}
         };
@@ -339,14 +296,14 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
         c.super_visit_with(self)
     }
 
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         match r.kind() {
             ty::ReBound(index, br) if index == ty::BoundVarIndexKind::Bound(self.binder_index) => {
                 let idx = br.var().as_usize();
-                if self.bound_vars.len() <= idx {
+                let Some(bound_var) = self.bound_vars.get(idx) else {
                     panic!("Not enough bound vars: {:?} not found in {:?}", r, self.bound_vars);
-                }
-                br.assert_eq(self.bound_vars.get(idx).unwrap());
+                };
+                br.assert_eq(bound_var);
             }
 
             _ => (),
@@ -387,11 +344,41 @@ generate!(
     impl<I: Interner, T> !TypeVisitable<I> for ty::EarlyBinder<I, T> {}
 );
 
-impl<I: Interner, T> EarlyBinder<I, T> {
-    pub fn bind(value: T) -> EarlyBinder<I, T> {
+impl<I: Interner, T: TypeFoldable<I>> EarlyBinder<I, T> {
+    pub fn bind(cx: I, value: T) -> EarlyBinder<I, T> {
+        // Instantiation will require normalization.
+        let value = ty::set_aliases_to_non_rigid(cx, value).skip_normalization();
         EarlyBinder { value, _tcx: PhantomData }
     }
+}
 
+impl<I: Interner, T: IntoIterator<Item: TypeVisitable<I>> + Clone> EarlyBinder<I, T> {
+    pub fn bind_iter(value: T) -> EarlyBinder<I, T> {
+        #[cfg(debug_assertions)]
+        {
+            value.clone().into_iter().for_each(|v| assert!(!v.has_rigid_aliases()));
+        }
+
+        EarlyBinder { value, _tcx: PhantomData }
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> EarlyBinder<I, T> {
+    pub fn bind_no_rigid_aliases(value: T) -> EarlyBinder<I, T> {
+        debug_assert!(!value.has_rigid_aliases());
+        EarlyBinder { value, _tcx: PhantomData }
+    }
+}
+
+impl<I: Interner, T> EarlyBinder<I, T> {
+    /// Use `bind/bind_iter/bind_no_rigid_aliases` instead.
+    /// Don't use this unless you know what you're doing.
+    pub fn bind_unchecked(value: T) -> EarlyBinder<I, T> {
+        EarlyBinder { value, _tcx: PhantomData }
+    }
+}
+
+impl<I: Interner, T> EarlyBinder<I, T> {
     pub fn as_ref(&self) -> EarlyBinder<I, &T> {
         EarlyBinder { value: &self.value, _tcx: PhantomData }
     }
@@ -441,6 +428,12 @@ impl<I: Interner, T> EarlyBinder<I, T> {
     /// the analogous operation on [`Binder`].
     pub fn skip_binder(self) -> T {
         self.value
+    }
+}
+
+impl<I: Interner> EarlyBinder<I, ty::TraitRef<I>> {
+    pub fn def_id(&self) -> I::TraitId {
+        self.value.def_id
     }
 }
 
@@ -541,6 +534,14 @@ pub struct IterInstantiatedCopied<'a, I: Interner, Iter: IntoIterator> {
     args: &'a [I::GenericArg],
 }
 
+impl<'a, I: Interner, Iter: IntoIterator<IntoIter: Clone>> Clone
+    for IterInstantiatedCopied<'a, I, Iter>
+{
+    fn clone(&self) -> IterInstantiatedCopied<'a, I, Iter> {
+        IterInstantiatedCopied { it: self.it.clone(), cx: self.cx, args: self.args }
+    }
+}
+
 impl<I: Interner, Iter: IntoIterator> Iterator for IterInstantiatedCopied<'_, I, Iter>
 where
     Iter::Item: Deref,
@@ -583,6 +584,12 @@ where
 pub struct IterIdentityCopied<I: Interner, Iter: IntoIterator> {
     it: Iter::IntoIter,
     _tcx: PhantomData<fn() -> I>,
+}
+
+impl<I: Interner, Iter: IntoIterator<IntoIter: Clone>> Clone for IterIdentityCopied<I, Iter> {
+    fn clone(&self) -> IterIdentityCopied<I, Iter> {
+        IterIdentityCopied { it: self.it.clone(), _tcx: self._tcx }
+    }
 }
 
 impl<I: Interner, Iter: IntoIterator> Iterator for IterIdentityCopied<I, Iter>
@@ -675,7 +682,7 @@ impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
         // is unnecessary. We may want to track explicitly whether `EarlyBinder`
         // contains something that has been normalized already.
         // Also do that for other types who have `instantiate_identity` method,
-        // e.g., `GenericPredicates` and `ConstConditions`.
+        // e.g., `GenericClauses` and `ConstConditions`.
         //
         // This is annoying, as e.g. `type_of` for opaque types is normalized,
         // while `type_of` for free type aliases is not.
@@ -712,7 +719,7 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         t
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         // Note: This routine only handles regions that are bound on
         // type declarations and other outer declarations, not those
         // bound in *fn types*. Region instantiation of the bound
@@ -748,7 +755,7 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         }
     }
 
-    fn fold_const(&mut self, c: I::Const) -> I::Const {
+    fn fold_const(&mut self, c: Const<I>) -> Const<I> {
         if let ty::ConstKind::Param(p) = c.kind() {
             self.const_for_param(p, c)
         } else {
@@ -756,7 +763,7 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
         }
     }
 
-    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+    fn fold_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> P {
         if p.has_param() { p.super_fold_with(self) } else { p }
     }
 
@@ -803,7 +810,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
         )
     }
 
-    fn const_for_param(&self, p: I::ParamConst, source_ct: I::Const) -> I::Const {
+    fn const_for_param(&self, p: I::ParamConst, source_ct: Const<I>) -> Const<I> {
         // Look up the const in the args. It really should be in there.
         let opt_ct = self.args.get(p.index() as usize).map(|arg| arg.kind());
         let ct = match opt_ct {
@@ -820,7 +827,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
     fn const_param_expected(
         &self,
         p: I::ParamConst,
-        ct: I::Const,
+        ct: Const<I>,
         kind: ty::GenericArgKind<I>,
     ) -> ! {
         panic!(
@@ -835,7 +842,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
 
     #[cold]
     #[inline(never)]
-    fn const_param_out_of_range(&self, p: I::ParamConst, ct: I::Const) -> ! {
+    fn const_param_out_of_range(&self, p: I::ParamConst, ct: Const<I>) -> ! {
         panic!(
             "const parameter `{:?}` ({:?}/{}) out of range when instantiating args={:?}",
             p,
@@ -850,7 +857,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
     fn region_param_expected(
         &self,
         ebr: I::EarlyParamRegion,
-        r: I::Region,
+        r: Region<I>,
         kind: ty::GenericArgKind<I>,
     ) -> ! {
         panic!(
@@ -865,7 +872,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
 
     #[cold]
     #[inline(never)]
-    fn region_param_out_of_range(&self, ebr: I::EarlyParamRegion, r: I::Region) -> ! {
+    fn region_param_out_of_range(&self, ebr: I::EarlyParamRegion, r: Region<I>) -> ! {
         panic!(
             "region parameter `{:?}` ({:?}/{}) out of range when instantiating args={:?}",
             ebr,
@@ -926,7 +933,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
         }
     }
 
-    fn shift_region_through_binders(&self, region: I::Region) -> I::Region {
+    fn shift_region_through_binders(&self, region: Region<I>) -> Region<I> {
         if self.binders_passed == 0 || !region.has_escaping_bound_vars() {
             region
         } else {
@@ -966,12 +973,13 @@ pub enum BoundVarIndexKind {
 /// identified by both a universe, as well as a name residing within that universe. Distinct bound
 /// regions/types/consts within the same universe simply have an unknown relationship to one
 #[derive_where(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash; I: Interner, T)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct Placeholder<I: Interner, T> {
+    #[lift(identity)]
     pub universe: UniverseIndex,
     pub bound: T,
     #[type_foldable(identity)]
@@ -985,21 +993,6 @@ impl<I: Interner, T: fmt::Debug> fmt::Debug for ty::Placeholder<I, T> {
             write!(f, "!{:?}", self.bound)
         } else {
             write!(f, "!{}_{:?}", self.universe.index(), self.bound)
-        }
-    }
-}
-
-impl<I: Interner, U: Interner, T> Lift<U> for Placeholder<I, T>
-where
-    T: Lift<U>,
-{
-    type Lifted = Placeholder<U, T::Lifted>;
-
-    fn lift_to_interner(self, cx: U) -> Self::Lifted {
-        Placeholder {
-            universe: self.universe,
-            bound: self.bound.lift_to_interner(cx),
-            _tcx: PhantomData,
         }
     }
 }
@@ -1051,7 +1044,7 @@ impl<I: Interner> BoundRegionKind<I> {
         match *self {
             ty::BoundRegionKind::Named(def_id) => {
                 let name = tcx.item_name(def_id);
-                if name.is_kw_underscore_lifetime() { None } else { Some(name) }
+                if name == I::Symbol::KW_UNDERSCORE_LIFETIME { None } else { Some(name) }
             }
             ty::BoundRegionKind::NamedForPrinting(name) => Some(name),
             _ => None,
@@ -1113,12 +1106,13 @@ impl<I: Interner> BoundVariableKind<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
-#[derive(GenericTypeVisitable)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, StableHash_NoContext, Decodable_NoContext)
 )]
 pub struct BoundRegion<I: Interner> {
+    #[lift(identity)]
     pub var: ty::BoundVar,
     pub kind: BoundRegionKind<I>,
 }
@@ -1174,25 +1168,15 @@ impl<I: Interner> PlaceholderRegion<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
-#[derive(GenericTypeVisitable)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct BoundTy<I: Interner> {
+    #[lift(identity)]
     pub var: ty::BoundVar,
     pub kind: BoundTyKind<I>,
-}
-
-impl<I: Interner, U: Interner> Lift<U> for BoundTy<I>
-where
-    BoundTyKind<I>: Lift<U, Lifted = BoundTyKind<U>>,
-{
-    type Lifted = BoundTy<U>;
-
-    fn lift_to_interner(self, cx: U) -> Self::Lifted {
-        BoundTy { var: self.var, kind: self.kind.lift_to_interner(cx) }
-    }
 }
 
 impl<I: Interner> fmt::Debug for ty::BoundTy<I> {
@@ -1290,7 +1274,7 @@ impl<I: Interner> PlaceholderConst<I> {
     }
 
     pub fn find_const_ty_from_env(self, env: I::ParamEnv) -> I::Ty {
-        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+        let mut candidates = env.caller_bounds().filter_map(|clause| {
             // `ConstArgHasType` are never desugared to be higher ranked.
             match clause.kind().skip_binder() {
                 ty::ClauseKind::ConstArgHasType(placeholder_ct, ty) => {

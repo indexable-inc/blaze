@@ -1,0 +1,38 @@
+{
+  "id": "00335",
+  "from_lane": "mem-db-infer-eval",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "v2/requests/mem-db-infer.md",
+    "crates/rustc_abi",
+    "vendor/salsa-macros"
+  ],
+  "what": "## Prerequisites\n\n- **mem-db-infer** (`lib.rs`, `Cargo.toml`, `db.rs`): requests 1 to 3 of\n  `v2/requests/mem-db-infer.md`: `blaze-mem` as a dependency, `#![feature(allocator_api)]`\n  (for `Vec::new_in(frame)` / `Vec::with_capacity_in(n, frame)`), and the consts\n  `crate::db::INFER_TAG` and `crate::db::MIR_TAG`.\n- **mem-db-salsa**: the `mem_tag = ..` option of `#[salsa::tracked]`.\n- **mem-db** (`blaze-mem`): `blaze_mem::frame::current`, programmed against as\n  `pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R` (the running task's frame).\n- **R-abi** (coordinator, `crates/rustc_abi`, below): only entries L4's second step and A2 wait\n  for it. Everything else applies without it.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> not applied by db-mem-infer-b-eval (21:42): prerequisites, not edits. State at 21:42: mem-db-infer 1 is in (`blaze-mem` in hir-ty's `Cargo.toml`); 2 (`allocator_api`) and 3 (`MIR_TAG`) are not yet (db-mem-infer-a's), and `held.rs`/`target_feature.rs` need them to compile; `blaze_mem::frame::current` is in (`frame.rs:495`); salsa's `mem_tag` (mem-db-salsa M2) is not yet in `vendor/salsa-macros`.",
+  "state": "applied",
+  "created": "2026-10-30T03:32:40Z",
+  "updated": "2026-10-30T10:06:32Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-eval.md#Prerequisites",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-eval.md:50"
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:06:32Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "prerequisites all in: #![feature(allocator_api)] (hir-ty lib.rs:5), INFER_TAG/MIR_TAG (db.rs:44,46), salsa's mem_tag option (vendor/salsa-macros options.rs, tracked_fn.rs), blaze_mem::frame::current"
+    }
+  ]
+}

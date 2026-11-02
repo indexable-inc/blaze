@@ -1,6 +1,6 @@
 [package]
 name = "blaze-bench"
-description = "Microbenchmarks of blaze's hot paths, run by tango in pairs: a change against its base"
+description = "Microbenchmarks of blaze's hot paths and the runner that pairs them: a change against its base"
 publish = false
 
 version.workspace = true
@@ -10,14 +10,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blaze-rng.workspace = true
 
 [dev-dependencies]
-hir-ty-codegen.workspace = true
-blaze-store.workspace = true
-tango-bench = "0.9"
+blaze-cas.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-query.workspace = true
 
 [[bench]]
 name = "store"
+harness = false
+
+[[bench]]
+name = "query_hit"
 harness = false
 
 [lints]

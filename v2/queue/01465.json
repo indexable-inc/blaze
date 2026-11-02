@@ -1,0 +1,25 @@
+{
+  "id": "01465",
+  "from_lane": "tests-misc-lints",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/lib.rs",
+    "crates/hir-ty/src/lib.rs",
+    "crates/hir-def/src/lib.rs"
+  ],
+  "what": "01456 (bump-allocate): deny blaze::hot_alloc crate by crate: base-db first, then hir-ty, then hir-def. For each crate root add: #![feature(register_tool)] #![register_tool(blaze)] #![deny(blaze::hot_alloc)] . Before denying, fix each finding (Vec::new_in(frame), from blaze_mem::frame::current) or end its line with // alloc: <why>. hot_alloc flags a call that reaches the global allocator through std or a registry crate, and a fresh global collection (Vec::new(), vec![], String::new(), FxHashMap::default(), Box::default()). A call of a workspace function is not a finding; its own body is. Candidate lines (a superset) are in /tmp/blaze-lanes/hot-alloc-sites.txt: base-db 13, hir-ty 225, hir-def 459. The workspace-wide warn round gives the exact list.",
+  "state": "open",
+  "created": "2026-11-01T05:57:58Z",
+  "updated": "2026-11-01T05:57:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T05:57:58Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

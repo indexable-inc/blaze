@@ -1,0 +1,35 @@
+{
+  "id": "00063",
+  "from_lane": "db-ty-solver",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/tests.rs"
+  ],
+  "what": "## 3. db-ty-hir (sibling), `crates/hir/src/tests.rs`: a fixture test of the shared solver cache\n\nWhat: one test, using hir-ty's public `next_solver` API on a `TestDB`:\n\n- Fixture: `//- minicore: sized` and a crate with `trait Tr {}`, `struct A; struct B<T>(T);\n  struct C;`, `impl Tr for A {}`, `impl<T: Tr> Tr for B<T> {}`.\n- Goals: `X: Tr` for `X` in `A`, `C`, `B<A>`, `B<C>`, `B<B<A>>`, `B<B<C>>`, `B<B<B<A>>>`. Build\n  the types with `Ty::new_adt(interner, adt, GenericArgs::new_from_slice(&[..]))`.\n- Cold: for each goal, a fresh `DbInterner::new_with(&db, krate)` (so a fresh `Solved`, and an\n  empty cache) and `interner.infer_ctxt().build(TypingMode::non_body_analysis())`, then\n  `infcx.type_implements_trait(tr, [ty], ParamEnv::empty())`.\n- Warm: one interner and inference context for all goals, every goal asked twice (the second\n  answer comes from the cache), and then again from another thread inside `std::thread::scope`\n  with the same interner (needs the database to be `Sync`, which db-salsa's v2 database is).\n- Assert that the warm `EvaluationResult`s equal the cold ones at every step, and that the `A`,\n  `B<A>`, `B<B<A>>`, `B<B<B<A>>>` goals hold while the rest do not.\n\nWhy: the tests in `interner/tls_cache.rs` check the shared table with plain values (a goal is not\nreused by another query or state, a cache filled on one thread serves another, answers equal a\nper-thread cache's). This one checks the same through the real solver. hir-ty has no test\ndatabase of its own (shared rule 5).\n\n> forwarded to db: db-ty-hir's `crates/hir/src/tests.rs`, inside lane db.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:452` (`a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread`: cold per goal, warm twice, then in `std::thread::scope`).",
+  "state": "applied",
+  "created": "2026-10-30T00:38:19Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-solver.md#3. db-ty-hir (sibling), `crates/hir/src/tests.rs`: a fixture test of the shared solver cache",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-solver.md:347"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:452` (`a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread`: cold per goal, warm twice, then in `std::thread::scope`)."
+    }
+  ]
+}

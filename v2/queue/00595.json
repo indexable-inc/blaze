@@ -1,0 +1,37 @@
+{
+  "id": "00595",
+  "from_lane": "db-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir/src/attrs.rs",
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## db-expand: `hir` wrappers for deprecation and stability (db-ty, `crates/hir`)\n\nWhat: `hir` methods over `hir_def::attrs::stability::{deprecation_entry, stability}` for every\n`hir` definition and field (`StabilityDef::Def(AttrDefId)`, `StabilityDef::Field(FieldId)`).\nThen `blaze-diagnostics/src/lints/names/stability/lookup.rs` (diagnostics') drops its source\nwalk and calls them. Why: the queries landed (dispatch task 10); hir-def has no `hir` types.\n\n> forwarded to db: `crates/hir` is db-ty's lane.\n> checked by db-audit-dbsub-expand (2026-10-29 22:32): in the tree at `crates/hir/src/attrs.rs:224-236` (`HasAttrs::deprecation`, `HasAttrs::stability`, via `AttrsOwner::stability_def` at `:63`). diagnostics was told (`v2/requests/diagnostics.md:1713`) and files `lookup.rs`'s move onto them itself (`diagnostics.md:22346`).",
+  "state": "applied",
+  "created": "2026-10-30T05:32:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand: `hir` wrappers for deprecation and stability (db-ty, `crates/hir`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:367"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-expand (2026-10-29 22:32): in the tree at `crates/hir/src/attrs.rs:224-236` (`HasAttrs::deprecation`, `HasAttrs::stability`, via `AttrsOwner::stability_def` at `:63`). diagnostics was told (`v2/requests/diagnostics.md:1713`) and files `lookup.rs`'s move onto them itself (`diagnostics.md:22346`)."
+    }
+  ]
+}

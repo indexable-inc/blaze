@@ -8,12 +8,14 @@
 //! has no opcode for, code generation calls a name of [`INSTRUCTION`] whose index is the
 //! [`Instruction`], and that call is the instruction.
 
+use std::fmt;
+
 use cranelift_codegen::ir::{
     Opcode, Type, Value,
     condcodes::{FloatCC, IntCC},
     types,
 };
-use wasm_encoder::{Instruction as I, MemArg};
+use wasm_encoder::{Instruction as I, MemArg, MemArgTarget};
 
 use super::{Class, Lower, MEMORY, mem};
 
@@ -51,7 +53,7 @@ macro_rules! instructions {
 /// What an atomic instruction says of the address it is given: its natural alignment, which
 /// the format requires it to say.
 const fn atomic(align: u32) -> MemArg {
-    MemArg { offset: 0, align, memory_index: MEMORY }
+    MemArg { offset: 0, align, target: MemArgTarget::Memory(MEMORY), ordering: None }
 }
 
 instructions! {
@@ -118,6 +120,7 @@ impl Lanes {
             types::I64 if ty.lane_count() == 2 => Lanes::I64,
             types::F32 if ty.lane_count() == 4 => Lanes::F32,
             types::F64 if ty.lane_count() == 2 => Lanes::F64,
+            // alloc: the error's message
             _ => return Err(format!("wasm: vector of {ty}")),
         })
     }
@@ -133,7 +136,11 @@ impl Lanes {
 
     /// The instruction of these lanes among those given for each, in the order of the
     /// variants.
-    fn pick(self, of: [Option<I<'static>>; 6], what: &str) -> Result<I<'static>, String> {
+    fn pick(
+        self,
+        mut of: [Option<I<'static>>; 6],
+        what: impl fmt::Display,
+    ) -> Result<I<'static>, String> {
         let at = match self {
             Lanes::I8 => 0,
             Lanes::I16 => 1,
@@ -142,7 +149,8 @@ impl Lanes {
             Lanes::F32 => 4,
             Lanes::F64 => 5,
         };
-        of[at].clone().ok_or_else(|| format!("wasm: {what} of {}", self.name()))
+        // alloc: the error's message, built only on the error
+        of[at].take().ok_or_else(|| format!("wasm: {what} of {}", self.name()))
     }
 
     fn name(self) -> &'static str {
@@ -189,6 +197,7 @@ impl Lower<'_> {
         results: &[Value],
     ) -> Result<(), String> {
         let instruction =
+            // alloc: the error's message, built only on the error
             Instruction::of(index).ok_or_else(|| format!("wasm: no instruction {index}"))?;
         for &arg in args {
             self.get(arg)?;
@@ -197,6 +206,7 @@ impl Lower<'_> {
         match results {
             [] => Ok(()),
             &[result] => self.set(result),
+            // alloc: the error's message
             _ => Err(format!("wasm: {instruction:?} has one result")),
         }
     }
@@ -297,7 +307,7 @@ impl Lower<'_> {
         }
         let from = self.lanes(arg)?;
         let into = || Lanes::of(to);
-        let what = opcode.to_string();
+        let what = opcode;
         self.get(arg)?;
         let instruction = match opcode {
             Opcode::Bnot => I::V128Not,
@@ -414,10 +424,12 @@ impl Lower<'_> {
                 match self.class(result)? {
                     Class::Long => self.i(I::I64ExtendI32U),
                     class @ Class::Word(_) => self.mask_for(class),
+                    // alloc: the error's message
                     class => return Err(format!("wasm: vhigh_bits to {class:?}")),
                 }
                 return self.set(result);
             }
+            // alloc: the error's message
             _ => return Err(format!("wasm: {opcode} of {} to {to}", from.name())),
         };
         self.i(instruction);
@@ -433,7 +445,7 @@ impl Lower<'_> {
         b: Value,
     ) -> Result<(), String> {
         let lanes = self.lanes(a)?;
-        let what = opcode.to_string();
+        let what = opcode;
         let ints = |i8: Option<I<'static>>, i16, i32, i64| [i8, i16, i32, i64, None, None];
         let floats = |f32, f64| [None, None, None, None, Some(f32), Some(f64)];
         match opcode {
@@ -509,6 +521,7 @@ impl Lower<'_> {
                 let sign = match lanes {
                     Lanes::F32 => SIGNS_OF_F32,
                     Lanes::F64 => TOP_BITS,
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: {what} of {}", lanes.name())),
                 };
                 self.get(b)?;
@@ -584,6 +597,7 @@ impl Lower<'_> {
             // Both pass a NaN on and order -0 below +0, as Cranelift's `fmin` and `fmax` do.
             Opcode::Fmin => lanes.pick(floats(I::F32x4Min, I::F64x2Min), &what)?,
             Opcode::Fmax => lanes.pick(floats(I::F32x4Max, I::F64x2Max), &what)?,
+            // alloc: the error's message
             _ => return Err(format!("wasm: {what} of {}", lanes.name())),
         };
         self.get(a)?;
@@ -644,7 +658,7 @@ impl Lower<'_> {
             IntCC::UnsignedLessThanOrEqual => of(I::I8x16LeU, I::I16x8LeU, I::I32x4LeU),
             IntCC::UnsignedGreaterThanOrEqual => of(I::I8x16GeU, I::I16x8GeU, I::I32x4GeU),
         };
-        let instruction = lanes.pick(instructions, &format!("icmp {cond}"))?;
+        let instruction = lanes.pick(instructions, format_args!("icmp {cond}"))?;
         self.get(a)?;
         self.get(b)?;
         self.i(instruction);
@@ -661,6 +675,7 @@ impl Lower<'_> {
         let single = match self.lanes(a)? {
             Lanes::F32 => true,
             Lanes::F64 => false,
+            // alloc: the error's message
             lanes => return Err(format!("wasm: fcmp of {}", lanes.name())),
         };
         let pick = |f32: I<'static>, f64: I<'static>| if single { f32 } else { f64 };
@@ -686,7 +701,7 @@ impl Lower<'_> {
                 for value in [a, b] {
                     self.get(value)?;
                     self.get(value)?;
-                    self.i(eq.clone());
+                    self.i(pick(I::F32x4Eq, I::F64x2Eq));
                 }
                 self.i(I::V128And);
                 if cond == FloatCC::Unordered {

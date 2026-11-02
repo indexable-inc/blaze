@@ -1,0 +1,39 @@
+{
+  "id": "00094",
+  "from_lane": "db-ty-lower",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir/src/semantics.rs",
+    "crates/blaze-items/src/facts.rs",
+    "crates/hir-ide/src/tests.rs"
+  ],
+  "what": "## 1. db-ty-db: `crates/hir-ty/src/db.rs`, the signature accessors return `Lowered` views\n\nWhat: in `trait HirDatabase` (around lines 342-396), change four return types and their bodies'\nnothing else (the bodies already call `crate::lower::*`, which return the new types):\n\n```rust\nfn impl_self_ty_with_diagnostics<'db>(&'db self, def: ImplId)\n    -> crate::lower::Lowered<'db, StoredEarlyBinder<StoredTy>>;\nfn impl_trait_with_diagnostics<'db>(&'db self, def: ImplId)\n    -> Option<crate::lower::Lowered<'db, StoredEarlyBinder<StoredTraitRef>>>;\nfn field_types_with_diagnostics<'db>(&'db self, var: VariantId)\n    -> crate::lower::Lowered<'db, FieldTypes>;\nfn field_types(&self, var: VariantId) -> &FieldTypes;\n```\n\nand in `signature_anon_consts_and_diagnostics` (around line 709) make `push` take the view, so\nboth a per-item result and a batch row fit:\n\n```rust\nfn push<'db, T: ?Sized>(\n    result: &mut ArrayVec<(&'db [AnonConstId<'db>], &'db [TyLoweringDiagnostic]), 5>,\n    item: crate::lower::Lowered<'db, T>,\n) {\n    result.push((item.defined_anon_consts(), item.diagnostics()));\n}\n```\n\nwith each call that passes a `&TyLoweringResult` passing `.as_lowered()`\n(`db.generic_defaults_with_diagnostics(def).as_lowered()`, `const_param_types_with_diagnostics`,\n`type_for_type_alias_with_diagnostics`, `type_alias_bounds_with_diagnostics`,\n`fn_sig_for_fn_with_diagnostics`, `type_for_const_with_diagnostics`,\n`type_for_static_with_diagnostics`), and the three that return `Lowered` already\n(`GenericPredicates::query_with_diagnostics(db, def)`, `db.impl_self_ty_with_diagnostics(id)`,\n`db.impl_trait_with_diagnostics(id)`, the last one's `if let Some(trait_ref)`) passed as they are.\nThe `ArenaMap`, `LocalFieldId` and `FieldType` imports may become unused.\n\nWhy: `field_types_with_diagnostics`, `impl_self_ty_with_diagnostics`,\n`impl_trait_with_diagnostics` and `GenericPredicates::query_with_diagnostics` read a dependency\ncrate's module-level items from a per-crate batch (`lower/batch.rs`), whose diagnostics are in a\nside table: there is no `TyLoweringResult` to borrow. `Lowered` is a `Copy` view of value,\ndiagnostics and constants that both give. `FieldTypes` is a `repr(transparent)` slice\n(`[FieldType]`, one per field in `LocalFieldId` order): a range of the batch's CSR column, or a\nper-item query's `ThinVec`. It has the `ArenaMap` methods callers use (`iter()` yielding\n`(LocalFieldId, &FieldType)`, `values()`, `get(id)`, `[id]`, `len()`, `&FieldTypes:\nIntoIterator`), so the ~60 `field_types(..)` callers in hir-ty, hir, hir-ty-mir and hir-ide\ncompile unchanged; `TyLoweringResult<'db, FieldTypes>` (today's declaration) does not compile at\nall, `FieldTypes` being unsized.\n\nCallers outside db.rs that use only `.diagnostics()` and `.defined_anon_consts()` (which\n`Lowered` has) and need no change: `crates/hir/src/diagnostics.rs:1556`,\n`crates/hir/src/semantics.rs:2209`, `crates/blaze-items/src/facts.rs:578`,\n`crates/hir-ide/src/tests.rs:162`.\n\n> forwarded to db: `crates/hir-ty/src/db.rs` is inside lane db (db-ty-db); `field_types` still returns `&ArenaMap`.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/db.rs:340-366` (the four signatures return `Lowered`/`&FieldTypes`) and `:1200` (`push` takes `Lowered`, callers at :1171-1193 pass `.as_lowered()` or the `Lowered` as is).",
+  "state": "applied",
+  "created": "2026-10-30T00:56:27Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-lower.md#1. db-ty-db: `crates/hir-ty/src/db.rs`, the signature accessors return `Lowered` views",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-lower.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/db.rs:340-366` (the four signatures return `Lowered`/`&FieldTypes`) and `:1200` (`push` takes `Lowered`, callers at :1171-1193 pass `.as_lowered()` or the `Lowered` as is)."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+[package]
+name = "test_vectors"
+version = "0.0.0"
+edition = "2024"
+
+[features]
+
+[dependencies]
+blake3 = { path = "../", package = "blake3-servil" }
+hex = "0.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

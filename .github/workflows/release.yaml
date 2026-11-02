@@ -1,7 +1,7 @@
 name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS,
+# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, B3SUMS (what a pin's fetch checks, crates/blaze-engine/src/versions.rs),
 # the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
 # notes (what CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
@@ -96,12 +96,10 @@ jobs:
       # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile tools/pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
-      # since the pgo workflow last ran). The blaze it built then builds blaze's
-      # proc-macro server (`--server`), which the archive has beside it: the server that
-      # expands with the proc-macro libraries blaze links, so no user's machine builds it.
+      # since the pgo workflow last ran).
       # PGO is off for now (pgo.yaml runs by hand only): releases ship the plain `dist` build, so a
       # fix reaches users minutes after release-cut. To turn it back on, `--strict` instead of `--no-pgo`.
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --no-pgo --server
+      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --no-pgo
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - name: Archive
@@ -112,7 +110,6 @@ jobs:
           "$NAME/blaze-engine" --version | tee /dev/stderr | sed -n 1p | grep -E "^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$"
           # `blaze` runs the one beside it.
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 "$NAME/blaze-proc-macro-srv" --version | grep -F "rust-analyzer-proc-macro-srv "
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
       - uses: actions/upload-artifact@v7
@@ -120,25 +117,6 @@ jobs:
           name: ${{ env.NAME }}
           path: ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
-      # The standard library a build with nothing of rustc's starts from, made by the binary
-      # just archived for the toolchain the README pins, so that no user's first build makes
-      # it. The release's assets are the remote its builds fetch it from: each file of the
-      # remote under its path with `.` for `/`. A release without them builds it on the
-      # user's machine, so this does not hold the release up.
-      - name: Standard library
-        continue-on-error: true
-        run: |
-          shipped/blaze-engine std "$RUNNER_TEMP/std" "$(rustc +"$(cat harness/toolchain)" --print sysroot)"
-          mkdir std-assets
-          cd "$RUNNER_TEMP/std"
-          find manifests packs keys -type f ! -name '*.lock' | while read -r file; do
-            cp "$file" "$GITHUB_WORKSPACE/std-assets/${file//\//.}"
-          done
-      - uses: actions/upload-artifact@v7
-        with:
-          name: std-${{ matrix.target }}
-          path: std-assets/*
-          if-no-files-found: warn
 
   # blaze's crate and the forks it depends on (`blaze-hir`, `blaze-rustc_abi`, ...) on crates.io, as
   # its own job so it can be rerun alone: versions already published are skipped. Each crate is
@@ -179,7 +157,10 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: out
-        run: sha256sum blaze-*.tar.gz | tee SHA256SUMS
+        run: |
+          sudo apt-get install -y --no-install-recommends b3sum
+          sha256sum blaze-*.tar.gz | tee SHA256SUMS
+          b3sum blaze-*.tar.gz | tee B3SUMS
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -196,8 +177,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/library-*.tar.xz \
-            out/manifests.* out/packs.* out/keys.*
+            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
       # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
       # promote.yaml tests the archives just published and makes this same release stable when
       # they pass (docs/release.md). By dispatch, since a release this token publishes starts no

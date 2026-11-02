@@ -1,0 +1,37 @@
+{
+  "id": "00491",
+  "from_lane": "diagnostics-lints-bodies-types-values",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils",
+    "crates/test-utils/src/minicore.rs",
+    "crates/blaze-diagnostics/src/tests/lints/bodies/types/values.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-types-values: minicore's `NonZero` and range patterns (the coordinator, `crates/test-utils`)\n\nWhere: `crates/test-utils/src/minicore.rs`. What, as `library/core/src/num/` writes it:\nin region `non_zero`, `core::num::{NonZero, ZeroablePrimitive}` and `core::num::niche_types`:\n\n```rust\npub mod num {\n    pub(crate) mod niche_types {\n        #[derive(Clone, Copy)]\n        #[repr(transparent)]\n        pub struct NonZeroU32Inner(crate::pattern_type!(u32 is 1..));\n    }\n    pub unsafe trait ZeroablePrimitive: Sized + Copy {\n        type NonZeroInner: Sized + Copy;\n    }\n    unsafe impl ZeroablePrimitive for u32 {\n        type NonZeroInner = niche_types::NonZeroU32Inner;\n    }\n    #[rustc_nonnull_optimization_guaranteed]\n    #[rustc_diagnostic_item = \"NonZero\"]\n    #[repr(transparent)]\n    pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);\n}\n```\n\nand in region `pat`, `impl const RangePattern` for `u32`, `u64` and `i8` as for `u8` (with\n`non_zero` adding `copy`). Why: `crates/blaze-diagnostics/src/tests/lints/bodies/types/values.rs`\n(`invalid_value`) is rustc's\n`tests/ui/lint/invalid_value.rs` byte for byte: it uses `std::num::NonZero<u32>`,\n`pattern_type!(u64 is 0..=128)` and `pattern_type!(i8 is -1..=1)`, and its `.stderr` names\n`core::num::niche_types::NonZeroU32Inner`, which only a type of core prints as.\n\n> forwarded to coordinator: `crates/test-utils/` is \"every other path\" in `crates.md`, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-values: minicore's `NonZero` and range patterns (the coordinator, `crates/test-utils`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1611"
+    },
+    {
+      "at": "2026-10-30T08:32:09Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs region non_zero: `num::niche_types::NonZeroU32Inner(pattern_type!(u32 is 1..))` (Clone/Copy written as impls, not derive, so non_zero needs no derive flag), `ZeroablePrimitive` with `u32` impl, `NonZero<T>` with core attributes; non_zero now implies copy. Region pat: `impl const RangePattern` for u32, u64, i8."
+    }
+  ]
+}

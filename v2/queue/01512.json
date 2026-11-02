@@ -1,0 +1,27 @@
+{
+  "id": "01512",
+  "from_lane": "coordinator",
+  "owner": "blaze-mem",
+  "paths": [
+    "crates/blaze-mem/src",
+    "crates/blaze-query-macros/src",
+    "crates/blaze-radix/src",
+    "crates/paths/src",
+    "crates/blaze-alloc-count/src"
+  ],
+  "what": "clippy debt in committed code, newly visible under the uncommitted clippy.toml and lint flags (graph-clippy2 06:17): blaze-mem blocks.rs:247, chunks.rs:204/235, error.rs:66, frame.rs:887, pool.rs:526/533/538; blaze-query-macros 8x needless_pass_by_value; blaze-radix lib.rs:558/568; paths lib.rs:211/394. disallowed_methods: blaze-alloc-count lib.rs:178 env::var_os, blaze-mem huge.rs:80 env::var_os, blaze-mem pool.rs:541 mem::forget. Log /tmp/blaze-lanes/test-graph-clippy2.log",
+  "state": "open",
+  "created": "2026-11-01T14:18:12Z",
+  "updated": "2026-11-01T14:18:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T14:18:12Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

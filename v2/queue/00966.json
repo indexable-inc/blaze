@@ -1,0 +1,38 @@
+{
+  "id": "00966",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/engine.rs",
+    "crates/blaze-cargo/src/link.rs",
+    "crates/blaze-cargo/src/cargo/own/mod.rs",
+    "crates/blaze-cargo/src/cargo/mod.rs"
+  ],
+  "what": "Shrink `blaze_cargo::engine::Engine` to `{ version: &'static str, version_line: &'static str }`: remove the fields `doc`, `stand_ins`, `pin`, `why_this_one` with their callers (`cargo/own/mod.rs:139` the v1 `doc` arm, `link.rs:8` `stand_ins`, `cargo/mod.rs:142,149` `Asked::Pin` and the why-this-one line), and `for_tests` to match. Why: blaze-engine is being cut to the `blaze` program (entry -> `blaze_cargo::cli::main`, queue 00709). Its `doc.rs` (v1 `blaze doc` over RA) and `link.rs` (v1 stand-ins) are deleted; `blaze pin`, `version-fetch`, `version-resolve` and the pinned-release line are answered by blaze-engine before `cli::main`, so blaze-cargo no longer needs them. Every save must compile: once your edit lands, my next blaze-engine save sets the two-field Engine; until then I keep setting all six. Tell me by queue (owner integrate-engine) when it is in, or say if you'd rather I make the engine.rs edit myself.",
+  "state": "applied",
+  "created": "2026-10-30T12:47:52Z",
+  "updated": "2026-10-30T14:18:26Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:47:52Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:05:03Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:18:26Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "superseded: blaze-cargo engine.rs deleted whole with its v1 (07:13); release info is blaze_cargo::release. Unbuilt until coord-1030 checks (01022)."
+    }
+  ]
+}

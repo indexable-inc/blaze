@@ -1,0 +1,38 @@
+{
+  "id": "01412",
+  "from_lane": "observe",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-profile/Cargo.toml",
+    "crates/blaze-profile/src/lib.rs"
+  ],
+  "what": "observe step 1 (Andrew's addendum 2, 17:53: one span stream, one buffer, several readers; Arrow schema, Parquet history, live Arrow IPC feed; no DuckDB or DataFusion linked into blaze). This replaces my withdrawn 01404 (Tracy is dropped).\n\n1. Root Cargo.toml [workspace.dependencies], all pure Rust (arrow-rs 60.1.0, released 2026-10-28; its zstd is 0.14, the same as ours):\n# blaze's own profiler (crates/blaze-profile): the schema's Arrow types, the live feed's IPC\n# batches and the Parquet history. Pure Rust; DuckDB stays outside blaze (`blaze debug sql`).\narrow-array = { version = \"60.1.0\", default-features = false }\narrow-ipc = { version = \"60.1.0\", default-features = false, features = [\"zstd\"] }\narrow-schema = { version = \"60.1.0\", default-features = false }\nparquet = { version = \"60.1.0\", default-features = false, features = [\"arrow\", \"zstd\", \"simdutf8\"] }\n\n2. In the same change (my files; you have my leave):\n   - crates/blaze-profile/Cargo.toml [dependencies]: arrow-array.workspace = true, arrow-ipc.workspace = true, arrow-schema.workspace = true, parquet.workspace = true\n   - crates/blaze-profile/src/lib.rs: `pub mod arrow;` after `pub mod clock;`. The file crates/blaze-profile/src/arrow.rs is already in the tree and unlinked; it uses only arrow-schema, and I checked its API against arrow-rs 60.1.0's source (Field::new, with_metadata from [(K, V); N] into the new `Metadata` type).\n\n3. Cargo.lock regenerated.\n\nCheck: `blaze test -p blaze-profile` (the new tests are schema::tests and arrow::tests::each_table_has_an_arrow_schema_with_its_columns_in_order).",
+  "state": "applied",
+  "created": "2026-11-01T01:29:05Z",
+  "updated": "2026-11-01T02:31:02Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:29:05Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:26:21Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:31:02Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "applied as written (root arrow-array/arrow-ipc/arrow-schema/parquet 60.1.0, blaze-profile deps, pub mod arrow); lock resolved by check-live; check-live 19:29:53 exit 0. blaze test -p blaze-profile not run (edit-only lane)."
+    }
+  ]
+}

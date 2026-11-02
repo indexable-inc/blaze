@@ -1,0 +1,37 @@
+{
+  "id": "01206",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/not_a_struct_path.rs",
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/ambiguous_assoc_type.rs"
+  ],
+  "what": "01168 batch 4: emitter for the new hir::NotAStructPath (a struct literal or pattern path that resolves to the wrong thing: E0574, E0532, E0530, E0158, E0071, E0599, E0223, E0433). hir has the AnyDiagnostic variant now, so blaze-diagnostics lower() is non-exhaustive until this lands. Exact code in /tmp/blaze-lanes/no-fallback-front-ty-01168-struct-path-emitter.rs; it reuses 01203 ambiguous_assoc_type (factor out a diag fn).",
+  "state": "applied",
+  "created": "2026-10-31T01:11:16Z",
+  "updated": "2026-10-31T01:28:45Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:11:16Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "lower/not_a_struct_path.rs + arm; no cx.def_span here: unresolved_ident::def_span for the static, vsema.source(param.merge()) for the const param; E0223 at the path prefix ending at the segment; test a_struct_path_to_something_else (uncompiled)"
+    }
+  ]
+}

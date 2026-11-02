@@ -1,0 +1,36 @@
+{
+  "id": "00204",
+  "from_lane": "db-matchck",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs",
+    "crates/test-utils"
+  ],
+  "what": "## 10. test-utils (minicore): `Option` derives `PartialEq` (db-matchck)\n\nWhat: `#[derive(PartialEq, Eq)]` (behind `// region:eq` with `derive`) on minicore's `Option`,\nas core has it.\nWhere: `crates/test-utils/src/minicore.rs:1609`.\nWhy: a constant of an ADT type is a pattern only when the ADT derives `PartialEq` (rustc's\n`StructuralPartialEq`). Without the derive, `hir-ty-matchck`'s `match_arm_statics` test (a\n`const NONE: Option<Foo>` arm) gets `NotStructural`, where rustc's `match-arm-statics.rs` builds.\n\n> forwarded to the coordinator (`crates/test-utils/`) (from requests, pass 17; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T02:16:34Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/db-matchck.md#10. test-utils (minicore): `Option` derives `PartialEq` (db-matchck)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-matchck.md:218"
+    },
+    {
+      "at": "2026-10-30T08:32:09Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `#[derive(PartialEq, Eq)] // :eq, derive` on `Option` (line-gated on eq and derive)."
+    }
+  ]
+}

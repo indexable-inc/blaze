@@ -1,0 +1,24 @@
+{
+  "id": "00619",
+  "from_lane": "requests-format-next",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src",
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## 5. diagnostics (`crates/blaze-diagnostics/src/`): three exhaustive matches\n\nWhat:\n- `lints/bodies.rs:744` (`Expr::IncludeBytes => ExprTag::IncludeBytes`): a new\n  `ExprTag::UnsafeBinderCast` and the arm `Expr::UnsafeBinderCast { .. } => ExprTag::UnsafeBinderCast`.\n- `lints/bodies/types/pointers/dangling.rs:226` (`is_temporary_rvalue`, `| Expr::IncludeBytes =>\n  false`): `| Expr::UnsafeBinderCast { .. }` in that `false` arm. rustc's `is_temporary_rvalue`\n  (`rustc_lint/src/dangling.rs`) lists `ExprKind::UnsafeBinderCast(..)` among the forms that are\n  not temporaries.\n- `lints/bodies/calls/items/drop_forget_useless.rs:202` (`can_have_side_effects`):\n  `| Expr::UnsafeBinderCast { expr, .. }` in the arm with `Expr::Cast { expr, .. }`, which asks its\n  operand. rustc's `hir::Expr::can_have_side_effects` gives `UnsafeBinderCast(_, e, _)` its\n  operand's answer, as it does `Cast(e, _)`.\n\nWhy: they stop compiling without the arms.\n\n> forwarded to diagnostics (diagnostics-next2, both windows); told by tmux (requests, pass 34).\n\n> dedup-sim-rest (23:27): hir-def's `ExprKind`/`PatKind` are now public (`hir_def::hir::{ExprKind, PatKind}`) and include `UnsafeBinderCast`. `v2/requests/diagnostics.md` \"dedup: diagnostics reads hir-def's expression and pattern tags...\" item 1 replaces this item's first bullet (`ExprTag::UnsafeBinderCast`).",
+  "state": "open",
+  "created": "2026-10-30T05:58:18Z",
+  "updated": "2026-10-30T05:58:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-format-next.md#5. diagnostics (`crates/blaze-diagnostics/src/`): three exhaustive matches",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-format-next.md:135"
+    }
+  ]
+}

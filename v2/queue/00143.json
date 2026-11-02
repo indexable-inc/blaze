@@ -1,0 +1,35 @@
+{
+  "id": "00143",
+  "from_lane": "usercode-macros-native",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand"
+  ],
+  "what": "## 5. To db (forwarded by the coordinator): no hook for `bitflags!`\n\nNothing to add to `hir-expand`'s `macro_rules` expansion: `bitflags!` gets no native expander.\nEach step of a `macro_rules!` expansion is already done in process by `mbe`, and replacing\nmore than one step (bitflags' `__impl_*` macros are separate expansions, each with its own\n`MacroCallId` and syntax-context mark) would drop those marks from the output's syntax\ncontexts, so it could not be exact. The reasoning is in the notes.\n\n> forwarded to db: a note, nothing to change in `hir-expand`.\n> checked by db-audit-other (22:40): nothing to apply, a note. `crates/hir-expand/` has no `bitflags` expander, as it says.",
+  "state": "applied",
+  "created": "2026-10-30T01:41:30Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/usercode-macros-native.md#5. To db (forwarded by the coordinator): no hook for `bitflags!`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros-native.md:205"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:40): nothing to apply, a note. `crates/hir-expand/` has no `bitflags` expander, as it says."
+    }
+  ]
+}

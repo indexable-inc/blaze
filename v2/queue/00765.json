@@ -1,0 +1,21 @@
+{
+  "id": "00765",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "db",
+  "paths": [],
+  "what": "## R3. To hir: const check anonymous consts, const arguments and inline consts\n\nWhat: `hir` asks `const_check` of `DefWithBodyId`s only. So an array length (`[0; (&0 as *const\ni32) as usize]`, `tests/ui/consts/issue-52023-array-size-pointer-cast.rs`), a const generic\nargument and an inline `const { .. }` are not checked. The whole fix is for `const_check` to\ntake the `InferBodyId` of each (`const_check(db, InferBodyId)`, context `Const`). Then `hir`'s\n`DefWithBody::diagnostics` asks it of each anon const and inline const of the body, the way it\nasks `mir_body` of them. I'll make the `const_check` side (it is mine). The `hir` side is one\ncall per inner body next to the existing `const_check(self.db, def)` at line ~2457, mapping\nspans with that body's source map.\n\nWhy: rustc const-checks every const context, these included.\n\n> forwarded to db-next8 (`hir`'s `DefWithBody::diagnostics`), after codegen's `const_check(db, InferBodyId)`; told by tmux (requests, pass 45).",
+  "state": "open",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-30T07:08:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R3. To hir: const check anonymous consts, const arguments and inline consts",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:91"
+    }
+  ]
+}

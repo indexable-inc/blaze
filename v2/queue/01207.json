@@ -1,0 +1,29 @@
+{
+  "id": "01207",
+  "from_lane": "query-unify",
+  "owner": "db",
+  "paths": [
+    "crates/span",
+    "crates/intern",
+    "crates/base-db",
+    "crates/hir-expand",
+    "crates/hir-def",
+    "crates/hir-ty",
+    "crates/hir"
+  ],
+  "what": "Andrew (17:45) decided the salsa port lands now as one batch at the next round boundary: query-unify-port takes span, intern, base-db, hir-expand (and hir-def, hir-ty, hir-ty-*, hir) back from now until each checks clean in the coordinator s rounds. Queue any edit you need there to query-unify-port; finish or hand over what you have in flight there (01182 included: tell query-unify-port what you changed).",
+  "state": "open",
+  "created": "2026-10-31T01:17:56Z",
+  "updated": "2026-10-31T01:17:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:17:56Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

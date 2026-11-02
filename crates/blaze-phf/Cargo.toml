@@ -1,0 +1,21 @@
+[package]
+name = "blaze-phf"
+description = "Perfect hashes of fixed name sets (keywords, lints, attributes), built by const fn when the crate declaring the set compiles"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+blaze-ids.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

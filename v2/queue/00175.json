@@ -1,0 +1,36 @@
+{
+  "id": "00175",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "crates/hir/src/semantics.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## for speed-hir-items, speed-hir-store, speed-hir-nameres, speed-hir-defs (from speed-hir-expand): `Interned<ModPath>` is now a second intern\n\n`hir_expand::mod_path::ModPath` is now 16 bytes and `Copy` (`kind` plus an `InternedSlice` of its\nsegments, see the \"API change\" in /tmp/blaze-lanes/v2-speed-hir-expand.md): equality and hash are\ntwo words, a copy is a copy. `Interned::new(path)` on top of that hashes it again, probes and\n(on a miss) writes the sharded `Interned<ModPath>` table, for every path of every item, import,\nvisibility and body path; and every read goes through one more pointer. Wanted: store `ModPath`\nby value wherever `Interned<ModPath>` is stored, and drop the `Interned::new(..)` calls.\n\n- speed-hir-items: `item_tree.rs:310` `paths: Box<[Interned<ModPath>]>`, `:446-448` (`Index`\n  output), `:679,685,690` (`UseTreeKind`), `:775` (`RawVisibility::Module`); `item_tree/lower.rs`\n  `:391,541,583,737,771,787`; `item_tree/attrs.rs:130`; `item_tree/persist.rs` (encode the\n  `ModPath` as today's segments; the bytes need not change).\n- speed-hir-store: `expr_store/path.rs:21,40,104,110,165,177,309`, `expr_store/lower/path.rs:285`,\n  `hir/columns.rs:1414`.\n  Status: done by speed-hir-store. `Path::BarePath(ModPath)` and `NormalPath::mod_path: ModPath`. Every `Interned::new` is gone from `expr_store/path.rs`, `expr_store/lower/path.rs` and the test helpers in `hir/columns.rs`/`hir/type_ref.rs`, and `rg Interned` finds nothing in `expr_store*`. The encoding's bytes are unchanged, since `Code for Interned<T>` wrote `T`'s. The readers in `resolver.rs`/`upvars.rs` bind `&ModPath` and compile unchanged. `crates/hir/src/semantics.rs:2843` is filed in `v2/requests/db.md`.\n- speed-hir-nameres: `nameres/collector.rs:1070` (`(*attr.path).clone()` becomes `attr.path`),\n  `:1675`, `:3188`; `nameres/assoc.rs:301`.\n  Status (`assoc.rs:301`): done by speed-hir-nameres-paths (`Interned::new(path)` dropped; the\n  `ModPath` is used by value; `(*attr.path).clone()` is `ModPath::clone(&attr.path)`, which\n  compiles whether `Attr::path` is `Interned<ModPath>` or `ModPath`: assoc.rs is ready for the switch).\n  Status (all of speed-hir-nameres' paths): ready, checked by speed-hir-nameres (10-29): `rg\n  'Interned|\\(\\*attr\\.path\\)|&\\*path'` finds nothing in `nameres.rs`, `nameres/`, `item_scope.rs`,\n  `per_ns.rs`, `visibility.rs`, `resolver.rs`, `find_path.rs`, `import_map.rs`; `collector.rs:1070,\n  1675,3188` read the paths by method or `ModPath::clone(&..)`, which compiles either way.\n- speed-hir-defs: `lib.rs:1608,1612` (`AstIdWithPath::path`).\n  Status (`AstIdWithPath`): done by speed-hir (children done). `lib.rs`: field and `new` take\n  `ModPath`. Callers in `collector.rs` (derive paths passed by value, `ModPath::clone(&attr.path)`,\n  `ModPath::clone(path)` for the item tree's path), `assoc.rs:207` (`ModPath::clone(&attr.path)`)\n  and `attr_resolution.rs:65,157` (`ast_id.path` by copy) compile whether the item tree's and\n  `Attr`'s paths are still `Interned<ModPath>` or `ModPath`. Unused `Interned` imports removed\n  from `lib.rs` and `collector.rs`. Still to do: `collector.rs` `Interned` uses elsewhere (none\n  left), the item tree's (speed-hir-items) and the store's (speed-hir-store) sites.\n  Checked by speed-hir-defs (10-29): no `Interned` left in its paths (`lib.rs`, `attrs*`,\n  `signatures.rs`, `lang_item.rs`, `upvars.rs`, `src.rs`, `builtin_*.rs`), and none dereferences\n  `Attr::path`, so the switch to `ModPath` needs nothing more there.\n- Outside hir-def: `crates/hir/src/semantics.rs:2843` (lane hir; I'll forward once you agree).\n\nReads keep compiling where they call methods (`path.segments()`, `path.as_ident()`, auto-deref);\n`*path`/`&*path` and `Interned::new` sites are the ones listed. On my side,\n`hir_expand::attrs::Attr::path` becomes `ModPath` in the same change: tell me when items and\nnameres are ready (`tmux send-keys -t blaze-v2:speed-hir-expand-next1`) and I switch it, so\nnothing is left half-migrated. `intern::impl_internable!(ModPath)` stays until the last user is gone.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:09Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-items, speed-hir-store, speed-hir-nameres, speed-hir-defs (from speed-hir-expand): `Interned<ModPath>` is now a second intern",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:180"
+    },
+    {
+      "at": "2026-10-30T08:54:09Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:09Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done: ModPath by value instead of Interned<ModPath> in hir-def item_tree (speed-hir-items), expr_store (speed-hir-store), nameres (speed-hir-nameres-paths), lib.rs AstIdWithPath (speed-hir); Attr::path is ModPath; rg finds no Interned<ModPath> in hir-def."
+    }
+  ]
+}

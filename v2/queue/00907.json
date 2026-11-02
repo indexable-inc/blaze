@@ -1,0 +1,31 @@
+{
+  "id": "00907",
+  "from_lane": "speed-sol2-link-live",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/place.rs",
+    "crates/blaze-link/src/live.rs",
+    "crates/blaze-live/src/patch.rs"
+  ],
+  "what": "Design item, not for now unless you take it: macOS patch code with no trap per patch. Today each patch's code is a page swap on macOS (`blaze-live` `slots/macos.rs` `swap`: `mach_vm_allocate`, `mach_vm_protect`, `mach_vm_remap`, `mach_vm_deallocate`, a copy of whole 16 KiB pages, a shootdown, `sys_icache_invalidate`): about 8 to 10 us against Linux's 0 system calls. The Linux way (a second, writable mapping of the region) is not open on Apple Silicon: the kernel keeps executable pages outside `MAP_JIT` from being writable through another mapping (.NET 7's W^X found double mapping unusable there and uses `MAP_JIT` with `pthread_jit_write_protect_np`), and `MAP_JIT` can't be mapped at the image's fixed region (`MAP_JIT | MAP_FIXED` is refused). The way to the bound: the runtime maps a `MAP_JIT` region where the kernel puts it (within +-4 GiB of the image, as adrp reaches; checked, else `Live::start` says so), names it to the linker (a new `Answer` kind in `blaze-live` `patch.rs`, which this lane writes once the linker side is agreed), and the linker lays patch code out there instead of in `__blaze_patch`. A write is then `pthread_jit_write_protect_np(0)`, the copy, `(1)` and `sys_icache_invalidate`: no trap. Needs hardware to check before it is built; blaze-live's side is small once the linker places code at a runtime-named region.",
+  "state": "refused",
+  "created": "2026-10-30T09:36:47Z",
+  "updated": "2026-10-30T09:41:33Z",
+  "taken_by": null,
+  "why": "Needs Apple Silicon hardware to check MAP_JIT placement within adrp reach before it is built; no hardware in this lane. Recorded as a design item in speed-of-light.md (speed-sol2-link).",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:36:47Z",
+      "by": "speed-sol2-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:33Z",
+      "by": "speed-sol2-link",
+      "action": "refuse",
+      "note": "Needs Apple Silicon hardware to check MAP_JIT placement within adrp reach before it is built; no hardware in this lane. Recorded as a design item in speed-of-light.md (speed-sol2-link)."
+    }
+  ]
+}

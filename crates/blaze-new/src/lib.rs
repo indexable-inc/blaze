@@ -71,6 +71,7 @@ pub struct Settings<'a> {
     pub vcs: Option<VersionControl>,
     /// Why the new manifest's workspace does not read, said as cargo says it: blaze-manifest's
     /// `Workspace::new` of it.
+    // dyn: asked once per `new` or `init`.
     pub check_workspace: &'a dyn Fn(&Path) -> Option<String>,
 }
 
@@ -172,7 +173,7 @@ fn check_name(
     name: &str,
     show_name_help: bool,
     has_bin: bool,
-    shell: &mut dyn Shell,
+    shell: &mut impl Shell,
 ) -> anyhow::Result<()> {
     // If --name is already used to override, no point in suggesting it again as a fix.
     let name_help = if show_name_help {
@@ -258,7 +259,7 @@ fn validate_crate_name(name: &str) -> bool {
 }
 
 /// Warns if the path has characters that will break `env::join_paths`.
-fn check_path(path: &Path, shell: &mut dyn Shell) {
+fn check_path(path: &Path, shell: &mut impl Shell) {
     if std::env::join_paths([path]).is_err() {
         let path = path.to_string_lossy();
         shell.warn(&format!(
@@ -355,7 +356,7 @@ fn calculate_new_project_kind(
 pub fn new(
     opts: &NewOptions,
     settings: &Settings<'_>,
-    shell: &mut dyn Shell,
+    shell: &mut impl Shell,
 ) -> anyhow::Result<()> {
     let path = &opts.path;
     let name = get_name(path, opts)?;
@@ -387,7 +388,7 @@ pub fn new(
 pub fn init(
     opts: &NewOptions,
     settings: &Settings<'_>,
-    shell: &mut dyn Shell,
+    shell: &mut impl Shell,
 ) -> anyhow::Result<NewProjectKind> {
     let path = &opts.path;
     if settings.home.is_some_and(|home| path == home) {
@@ -687,25 +688,7 @@ fn find_root_manifest_for_wd(path: &Path) -> Option<PathBuf> {
     path.ancestors().map(|it| it.join("Cargo.toml")).find(|it| it.exists())
 }
 
-/// `path` with `.` and `..` taken out, as cargo's `paths::normalize_path`.
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(..) | Component::RootDir | Component::Normal(_) => {
-                out.push(component.as_os_str())
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-        }
-    }
-    out
-}
-
-fn mk(settings: &Settings<'_>, shell: &mut dyn Shell, opts: &MkOptions<'_>) -> anyhow::Result<()> {
+fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> anyhow::Result<()> {
     let path = opts.path;
     let name = opts.name;
 
@@ -756,7 +739,7 @@ fn mk(settings: &Settings<'_>, shell: &mut dyn Shell, opts: &MkOptions<'_>) -> a
         }
     }
 
-    let manifest_path = normalize_path(&path.join("Cargo.toml"));
+    let manifest_path = blaze_manifest::paths::normalize_path(&path.join("Cargo.toml"));
     if let Some(root_manifest_path) = find_root_manifest_for_wd(&manifest_path) {
         let root_manifest = std::fs::read_to_string(&root_manifest_path)
             .with_context(|| format!("failed to read `{}`", root_manifest_path.display()))?;

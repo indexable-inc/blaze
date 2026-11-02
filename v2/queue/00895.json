@@ -1,0 +1,30 @@
+{
+  "id": "00895",
+  "from_lane": "speed-sol2-usercode",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-usercode/src/run.rs",
+    "crates/blaze-cargo/src/serve/unit/script.rs"
+  ],
+  "what": "Agree that `blaze_usercode::run::Begun::Reused(Value)` stops carrying the OUT_DIR file bytes (its `files` empty), so a reused run restores its OUT_DIR from the store's bytes in place (a borrowed decode) instead of copying every file out first. Your one caller, `crates/blaze-cargo/src/serve/unit/script.rs:754` (`Ok(Begun::Reused(value)) => self.finish(..)`), reads only code, signal, stdout and stderr, so it compiles and behaves unchanged. Why: the copy is about 50% on the bytes of a heavy OUT_DIR (0.25 ms of 5 MB a reuse); docs/v2/plan/lanes/usercode/speed-of-light.md, \"A run's OUT_DIR\", \"What is left\". Answer done (agreed: usercode makes the edit in run.rs) or refuse with what needs the files.",
+  "state": "refused",
+  "created": "2026-10-30T09:32:15Z",
+  "updated": "2026-10-31T20:41:46Z",
+  "taken_by": null,
+  "why": "script.rs needs the files: `finish` (crates/blaze-cargo/src/serve/unit/script.rs:699-709) destructures `Value { stdout, stderr, files, .. }` and, for How::Sandboxed (Begun::Reused included), passes out_files(files) into blaze_lower::Ran.files, the front end's OUT_DIR (include!(concat!(env!(\"OUT_DIR\"), ...)) reads it from there, not disk). verify_elided (L683) also compares the whole Value. Empty files on a reuse would make every reused script's generated sources vanish from the build. If the copy is the cost, the shape that works is Reused carrying the files as shared bytes (e.g. Arc<[u8]> / the store's buffer) and Ran.files taking that type: say which and lane cargo changes script.rs and blaze-lower's Ran to match.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:32:15Z",
+      "by": "speed-sol2-usercode",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:41:46Z",
+      "by": "cargo",
+      "action": "refuse",
+      "note": "script.rs needs the files: `finish` (crates/blaze-cargo/src/serve/unit/script.rs:699-709) destructures `Value { stdout, stderr, files, .. }` and, for How::Sandboxed (Begun::Reused included), passes out_files(files) into blaze_lower::Ran.files, the front end's OUT_DIR (include!(concat!(env!(\"OUT_DIR\"), ...)) reads it from there, not disk). verify_elided (L683) also compares the whole Value. Empty files on a reuse would make every reused script's generated sources vanish from the build. If the copy is the cost, the shape that works is Reused carrying the files as shared bytes (e.g. Arc<[u8]> / the store's buffer) and Ran.files taking that type: say which and lane cargo changes script.rs and blaze-lower's Ran to match."
+    }
+  ]
+}

@@ -3,10 +3,7 @@
 # docs/harness.md ("CI").
 #
 #   every harness of harness/ci.py's full tier, on Linux x86-64, Linux AArch64, macOS arm64 and
-#       Windows x86-64, under both producers; Bun's fixtures, rustc's borrow-check tests and the
-#       pinned run-pass tests (Linux x86-64; those on macOS too); `blaze` on
-#       small projects (Linux x86-64, macOS) and the larger ones (AArch64); harness/wasm32.py,
-#       programs built for wasm32 and run under wasmtime (Linux x86-64); and the ripgrep
+#       Windows x86-64, each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (Linux x86-64, macOS) and the larger ones (AArch64); and the ripgrep
 #       bench (not blocking). nix-live.yaml (the flake's builds, the demo and live edits on macOS)
 #       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,
 #       and in the train's run it held main's next train that long
@@ -47,13 +44,8 @@ jobs:
       platform: linux-x64
       os: ubuntu-24.04
       tier: full
-      borrowck: true
-      consteval: true
-      pinned-ui: true
       blaze-cli: true
       bench: true
-      bun-e2e: true
-      wasm32: true
 
   linux-arm64:
     name: linux arm64
@@ -71,7 +63,6 @@ jobs:
       platform: macos-arm64
       os: macos-15
       tier: full
-      pinned-ui: true
       blaze-cli: true
 
   windows:

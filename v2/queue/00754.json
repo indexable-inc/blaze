@@ -1,0 +1,36 @@
+{
+  "id": "00754",
+  "from_lane": "db-expand-derive",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/builtin/derive_macro.rs",
+    "crates/hir-def/src/macro_expansion_tests"
+  ],
+  "what": "## db-expand-derive: hir-def derive expansion snapshots gain `#[automatically_derived]`\n\nFiled by db-expand-derive (2026-10-29 23:52). db-audit-other asked for this under\n`diagnostics.md` §11 (its 23:28 line). rustc at the pin (`16d1ffac1`) starts every derived impl\nwith `#[automatically_derived]`: `generic/mod.rs` `create_derived_impl` and `coerce_pointee.rs`,\nvia `GeneratedAttr::AutomaticallyDerived`. Blaze wrote it on none, so the readers already in the\ntree saw expanded derives as hand-written:\n- hir-ty's `in_automatically_derived_impl` (`warn_if_unreachable`);\n- hir-lint-levels' `single_use_lifetimes` allowance;\n- matchck's `is_derived`.\n\nDone in `crates/hir-expand/src/builtin/derive_macro.rs`, not built:\n- `with_automatically_derived`, run first in `BuiltinDeriveExpander::expand`, writes\n  `#[automatically_derived]` at the derive's span before each impl.\n- This covers every derive, `CoercePointee` included. The item's copied attributes\n  (`with_item_attrs`) and `derive_const`'s `const` follow it, in rustc's order.\n- Test: `derived_impls_start_with_automatically_derived` (`derive_macro/tests.rs`).\n\n**Wanted, outside `derive_macro/`, by whoever holds `crates/hir-def/src/macro_expansion_tests/`:**\nupdate the `expect![[..]]` outputs that print an expanded built-in derive. Each derived impl\nnow starts with `#[automatically_derived]`; nothing else in them changes. These are the 32\n`impl` lines in `builtin_derive_macro.rs` and the 2 in `mbe/regression.rs`. Please check the\nrest with `rg '^impl ?<' crates/hir-def/src/macro_expansion_tests/`.\n\nNot done, the same gap only for `staged_api` crates: under `derive_const` in a crate with\n`#![feature(staged_api)]` (core, std), rustc also writes\n`#[rustc_const_unstable(feature = \"derive_const\", issue = \"143874\")]` after it. That needs the\ncrate's features in `expand`. It is db-expand's to route.\n\n> forwarded to db-next8 (requests, pass 42: `crates/hir-def/src/macro_expansion_tests/` is lane db's; the `derive_const` `rustc_const_unstable` gap is db-expand's to route; told by tmux). requests' own: hir-ide expect tests that print an expanded derive go on the first-compile `UPDATE_EXPECT=1` list.",
+  "state": "applied",
+  "created": "2026-10-30T06:52:00Z",
+  "updated": "2026-10-30T10:04:43Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-derive: hir-def derive expansion snapshots gain `#[automatically_derived]`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:18271"
+    },
+    {
+      "at": "2026-10-30T10:04:43Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:04:43Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: the 34 derived-impl lines of crates/hir-def/src/macro_expansion_tests/builtin_derive_macro.rs (32 impl, 2 derive_const `const impl`) start with `#[automatically_derived] ` as the test printer lays it out (] then a keyword: one space). mbe/regression.rs needs none: its two `impl <` lines are macro_rules output, not derives. The staged_api rustc_const_unstable gap stays db-expand routing (filed in db-expand.md)."
+    }
+  ]
+}

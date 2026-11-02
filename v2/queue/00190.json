@@ -1,0 +1,42 @@
+{
+  "id": "00190",
+  "from_lane": "requests-vfs",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/ci/speed-of-light.md",
+    "v2/requests/vfs.md",
+    "crates/blaze-vfs/src/lib.rs",
+    "crates/blaze-api/src/lib.rs",
+    "tools/v2/hot_lint.py",
+    "python/typed-input/src/typed_input/__init__.py",
+    "docs/v2/plan/lanes/ci",
+    "python/typed-input"
+  ],
+  "what": "## From requests-vfs (2026-10-29): `SCHEMA` 13 in the ci lane's speed-of-light note, and `hot_lint.py`'s `crates` input\n\n1. `docs/v2/plan/lanes/ci/speed-of-light.md` (\"What stands in the way\", ~L220): the item\n   \"**`Op::Write` and `Op::Edit`'s bytes as byte strings**: `v2/requests/vfs.md`, to land inside\n   `SCHEMA` 11.\" is no longer true. They are byte strings now (`crates/blaze-vfs/src/lib.rs`),\n   and as `SCHEMA` was already 12 (`Request::Memory`), the change is `SCHEMA` 13\n   (`crates/blaze-api/src/lib.rs`). Drop the item, or say it landed with 13. Lane ci is DONE, so\n   the doc is the coordinator's.\n2. `tools/v2/hot_lint.py`: `python3 tools/v2/hot_lint.py '{\"root\": \".\", \"crates\": [\"blaze-vfs\"]}'`\n   (as common.md gives it) fails with `typed_input: crates has a type it does not read:\n   list[str]`: `python/typed-input/src/typed_input/__init__.py` reads no `list[str]`. Either\n   typed_input reads lists or `Input.crates` becomes a `tuple[str, ...]` it does read. Until\n   then no agent can run the hot lint as told (I ran its `lint_file` directly on blaze-vfs's\n   changed files).\n\n> forwarded to the coordinator: both items are coordinator paths (`docs/v2/plan/lanes/ci/` with ci DONE, `tools/v2/hot_lint.py` and `python/typed-input`); on the requests report's coordinator list.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-30T08:31:29Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-vfs (2026-10-29): `SCHEMA` 13 in the ci lane's speed-of-light note, and `hot_lint.py`'s `crates` input",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:183"
+    },
+    {
+      "at": "2026-10-30T08:31:29Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:29Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "1: docs/v2/plan/lanes/ci/speed-of-light.md: the Op and ContentId/Fingerprint byte-string items left What stands in the way; the byte-strings section says SCHEMA 13 moved them (SCHEMA is 14 now); the web section's item names only Request::Move. 2: hot_lint crates is a tuple (see 00026)."
+    }
+  ]
+}

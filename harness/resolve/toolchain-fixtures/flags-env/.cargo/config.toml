@@ -1,5 +1,0 @@
-[build]
-rustflags = "-Copt-level=s --cfg from_build"
-
-[env]
-RUSTC_BOOTSTRAP = { value = "-1", force = true }

@@ -1,0 +1,24 @@
+{
+  "id": "01078",
+  "from_lane": "integrate-tooling",
+  "owner": "coordinator",
+  "paths": [
+    ".github/scripts/build_release.py",
+    ".github/workflows/release.yaml"
+  ],
+  "what": "From integrate-tooling, for coord-1030's build: build_release.py --server now builds the proc-macro server with v2 (`blaze build --release -p proc-macro-srv-cli --bin blaze-proc-macro-srv`, BLAZE_HOME and CARGO_TARGET_DIR in a temp dir, `blaze stop` after, the binary copied from target/release) in place of the v1 `--crate ... --exe` form. Worth one run in a VM: `python3 .github/scripts/build_release.py --target <host> --out shipped --no-pgo --server`. release.yaml's `blaze-engine std` step and the std assets (out/manifests.* packs.* keys.*) are removed: std crates are units in blaze-cas, built like any other; the library-*.tar.xz source archive (crates/blaze-cargo/src/toolchain/library.rs) stays.",
+  "state": "open",
+  "created": "2026-10-30T15:39:32Z",
+  "updated": "2026-10-30T15:39:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:39:32Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

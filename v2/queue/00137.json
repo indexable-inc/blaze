@@ -1,0 +1,33 @@
+{
+  "id": "00137",
+  "from_lane": "diagnostics-lints-bodies-liveness",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 3. the parent (`lints/bodies.rs`) or hir-ty-mir: the MIR of an inline const\n\nWhat: liveness run on each `const { .. }` block (rustc's `check_liveness` runs on every body\nowner, inline consts included), either through a `BodyCx` of its own or through a MIR query for\nit. Why: `BodyCx::exprs` leaves inline consts out and no MIR of one is reachable from the\nparent's MIR, so `let x = 1;` in a `const { }` gets no `unused_variables`.\n\n> forwarded to diagnostics (the parent's `lints/bodies.rs`) and codegen (`hir-ty-mir`).\n\n> taken by codegen (lead, 2026-10-29): the hir-ty-mir half, child codegen-rq-mir.",
+  "state": "applied",
+  "created": "2026-10-30T01:33:34Z",
+  "updated": "2026-10-31T20:36:20Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-bodies-liveness.md#3. the parent (`lints/bodies.rs`) or hir-ty-mir: the MIR of an inline const",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-bodies-liveness.md:32"
+    },
+    {
+      "at": "2026-10-31T20:36:20Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:20Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "hir-ty-mir half in: an inline const in a function is a body of its own, AnonConstId (lower.rs inline_const_at), whose MIR is mir_body of InferBodyId::AnonConstId; liveness can run on it. The BodyCx half is diagnostics'."
+    }
+  ]
+}

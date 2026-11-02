@@ -1,0 +1,36 @@
+{
+  "id": "00649",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/db-ty.md",
+    "Cargo.toml"
+  ],
+  "what": "## coordinator (requests-next3, on its coordinator list): `tracing` without its disabled spans in release (from db-audit-dbsub, for `v2/requests/db-ty.md` \"db-ty-port-infer-errors\", 2026-10-29 22:39)\n\nRoot `Cargo.toml:278`: the workspace `tracing` has no compile-time level cap, so every disabled `#[instrument]` span and event still costs a callsite check (about 1 to 2 ns) in release builds, on the solver's and inference's hot paths. Old: `tracing = { version = \"0.1.41\", default-features = false, features = [\"std\"] }`. New: `tracing = { version = \"0.1.41\", default-features = false, features = [\"std\", \"release_max_level_info\"] }` (or `_off`; the decision is the coordinator's). It reached only lane db.\n\n> forwarded to the coordinator: the request leaves `release_max_level_info` against `_off` to it, and either one changes what release builds log under `-v`/`RUST_LOG`. That is a decision, not a manifest edit; on requests' coordinator list (requests, pass 32).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:35:09Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/db.md#coordinator (requests-next3, on its coordinator list): `tracing` without its disabled spans in release (from db-audit-dbsub, for `v2/requests/db-ty.md` \"db-ty-port-infer-errors\", 2026-10-29 22:39)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11603"
+    },
+    {
+      "at": "2026-10-30T08:35:09Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:35:09Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "root Cargo.toml: tracing features [\"std\", \"release_max_level_info\"]. Chosen over _off: blaze-cargo/src/trace.rs Recorder, the only global subscriber, records spans at INFO and above (max_level_hint INFO), so _info drops nothing it reads and _off would blind it. Feature has no deps; Cargo.lock unchanged."
+    }
+  ]
+}

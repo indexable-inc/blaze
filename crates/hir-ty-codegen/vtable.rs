@@ -1,8 +1,10 @@
 //! The shape of a vtable, which has to agree with rustc's `vtable_entries` slot for slot:
 //! objects cross between rustc-compiled code and ours in both directions.
 
+#![forbid(unsafe_code)]
+
+use blaze_hash::HashSet;
 use hir_def::{AssocItemId, FunctionId, TraitId};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     Binder, Interner, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
     inherent::{Clause as _, IntoKind as _},
@@ -10,7 +12,7 @@ use rustc_type_ir::{
 
 use hir_ty::{
     dyn_compatibility::generics_require_sized_self,
-    next_solver::{DbInterner, Region, TraitRef},
+    next_solver::{DbInterner, Region, RegionExt, TraitRef},
 };
 
 /// `drop_in_place`, size and align come before the slots.
@@ -35,13 +37,15 @@ impl<'db> VtableLayout<'db> {
     pub(super) fn of(
         interner: DbInterner<'db>,
         trait_ref: TraitRef<'db>,
-        plain: &dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+        plain: &impl Fn(TraitRef<'db>) -> TraitRef<'db>,
     ) -> Self {
         let mut walk = Walk {
             interner,
             plain,
-            visited: FxHashSet::from_iter([trait_ref]),
+            visited: HashSet::from_iter([trait_ref]),
+            // alloc: the layout's own lists, returned in it
             slots: Vec::new(),
+            // alloc: the layout's own lists, returned in it
             prefixes: Vec::new(),
             emit_vptr: false,
         };
@@ -79,10 +83,10 @@ pub(super) enum Upcast {
     Load(usize),
 }
 
-struct Walk<'a, 'db> {
+struct Walk<'a, 'db, P> {
     interner: DbInterner<'db>,
-    plain: &'a dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
-    visited: FxHashSet<TraitRef<'db>>,
+    plain: &'a P,
+    visited: HashSet<TraitRef<'db>>,
     slots: Vec<Slot<'db>>,
     prefixes: Vec<TraitRef<'db>>,
     /// Set once a trait with methods has been laid out: every later supertrait is no longer
@@ -90,26 +94,27 @@ struct Walk<'a, 'db> {
     emit_vptr: bool,
 }
 
-impl<'db> Walk<'_, 'db> {
+impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {
     /// Supertraits first, depth first in declaration order, then the trait's own methods.
     fn visit(&mut self, trait_ref: TraitRef<'db>, vptr: bool) {
         let interner = self.interner;
         let supertraits: Vec<_> = interner
-            .explicit_super_predicates_of(trait_ref.def_id)
+            .explicit_super_clauses_of(trait_ref.def_id)
             .iter_instantiated(interner, trait_ref.args.as_slice())
             .filter_map(|clause| clause.skip_norm_wip().0.as_trait_clause())
             .map(|pred| interner.instantiate_bound_regions_with_erased(pred).trait_ref)
             .map(self.plain)
+            // alloc: all made plain (normalized by the caller's inference) before any is visited
             .collect();
         for supertrait in supertraits {
             if self.visited.insert(supertrait) {
                 self.visit(supertrait, self.emit_vptr);
             }
         }
-        let methods = own_methods(interner, trait_ref.def_id.0);
-        let has_methods = !methods.is_empty();
+        let mut methods = own_methods(interner, trait_ref.def_id.0).peekable();
+        let has_methods = methods.peek().is_some();
         self.emit_vptr |= has_methods;
-        self.slots.extend(methods.into_iter().map(|func| Slot::Method(func, trait_ref)));
+        self.slots.extend(methods.map(|func| Slot::Method(func, trait_ref)));
         if !vptr {
             self.prefixes.push(trait_ref);
         } else if has_methods {
@@ -120,7 +125,10 @@ impl<'db> Walk<'_, 'db> {
 }
 
 /// The methods of `trait_` that can be called on a trait object, in declaration order.
-fn own_methods(interner: DbInterner<'_>, trait_: TraitId) -> Vec<FunctionId> {
+fn own_methods<'db>(
+    interner: DbInterner<'db>,
+    trait_: TraitId,
+) -> impl Iterator<Item = FunctionId> + 'db {
     let db = interner.db;
     trait_
         .trait_items(db)
@@ -130,8 +138,7 @@ fn own_methods(interner: DbInterner<'_>, trait_: TraitId) -> Vec<FunctionId> {
             AssocItemId::FunctionId(func) => Some(func),
             _ => None,
         })
-        .filter(|&func| !generics_require_sized_self(db, func.into()))
-        .collect()
+        .filter(move |&func| !generics_require_sized_self(db, func.into()))
 }
 
 /// `trait_ref` with every lifetime erased and the lifetimes of a `for<'a>` unnamed, as rustc

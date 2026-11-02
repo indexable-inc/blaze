@@ -1,0 +1,35 @@
+{
+  "id": "00989",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-engine-splice",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "blaze-engine names blaze-splice no more (05:57: its v1 tail is git rm'd; Cargo.toml and its Cargo.lock dependency list no longer list blaze-splice). blaze-splice has no user left: port its tests and delete it when ready.",
+  "state": "applied",
+  "created": "2026-10-30T12:59:08Z",
+  "updated": "2026-10-30T13:04:00Z",
+  "taken_by": "integrate-engine-splice",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:59:08Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:01:15Z",
+      "by": "integrate-engine-splice",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:04:00Z",
+      "by": "integrate-engine-splice",
+      "action": "done",
+      "note": "DELETED blaze-splice 06:01: git rm -r crates/blaze-splice; Cargo.lock lost its [[package]] block and the pdb, fallible-iterator, scroll blocks only it used (no other package listed blaze-splice); harness/unittests.py, tools/bench/remote-cache/selfbuild/bench.py, tools/similar skip list no longer name it. Tests ported onto blaze-link (crates/blaze-link/src/tests/splice.rs, reloc.rs, macho/unwind.rs); map in /tmp/blaze-lanes/v2-integrate-engine-splice.md. Left: tools/nix/units/daemon.json is generated (tools/nix/unit_graph.py runs cargo), regenerate at integration; docs/v2/plan/reference/crates.md row for you to mark."
+    }
+  ]
+}

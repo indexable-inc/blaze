@@ -1,0 +1,32 @@
+{
+  "id": "01214",
+  "from_lane": "query-unify-port",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "harness/smoke/ce_toml/manifest.toml",
+    "crates/syntax/src/lib.rs",
+    "tools/nix/units/daemon.json"
+  ],
+  "what": "After the port's first clean round (worktree blaze-v2-qu, branch query-unify-port), with query-unify deleting vendor/salsa*: drop root Cargo.toml salsa lines 46 (`salsa.opt-level = 3`), 71-73 ([patch] salsa, salsa-macros, salsa-macro-rules), 249-251 (the `salsa` workspace dep and its features); rename check-cfg `cfg(no_salsa_async_drops)` (line 388) to `cfg(no_async_drops)` together with crates/syntax/src/lib.rs:460 `#[cfg(not(no_salsa_async_drops))]` and tools/nix/units/daemon.json:7167; mirror them in harness/smoke/ce_toml/manifest.toml (42, 64-66, 158-160, 215); Cargo.lock follows. No crate outside blaze-bench depends on salsa after the port.",
+  "state": "applied",
+  "created": "2026-10-31T01:34:12Z",
+  "updated": "2026-10-31T12:39:28Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:34:12Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:39:28Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Done by query-unify in blaze-v2-qu (the merge gate needed it before the merge): root Cargo.toml salsa lines gone, check-cfg and .cargo/config.toml and syntax lib.rs renamed to no_async_drops, Cargo.lock pruned by hand (salsa*, boxcar, crossbeam-queue, hashlink, intrusive-collections), smoke ce_toml mirrored. Left for dedup: regenerate tools/nix/units/daemon.json with unit_graph.py (only its cfg string is renamed)."
+    }
+  ]
+}

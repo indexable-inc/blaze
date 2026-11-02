@@ -1,0 +1,36 @@
+{
+  "id": "00725",
+  "from_lane": "dedup",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-radix/src/csr.rs",
+    "crates/blaze-cargo/src/serve/unit/graph.rs"
+  ],
+  "what": "## dedup: the unit graph's dependents onto `blaze_ids::radix::Csr`\n\nFrom `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_radix::Csr<T>` (reached as\n`blaze_ids::radix::Csr`; `crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into\ncompressed sparse rows: `Csr::build(rows, pairs)` / `csr.rebuild(rows, pairs, &mut cursors)` walk a\ncloneable iterator of `(row: u32, item)` twice (count, then place at each row's cursor), with\n`row(r) -> &[T]`, `range(r)`, `items()`, `into_parts() -> (starts, items)` (`starts` has\n`rows + 1` entries). A warm `rebuild` allocates nothing. Its tests have the old copies as the\nproptest reference.\n\n`crates/blaze-cargo/src/serve/unit/graph.rs`, `Graph`'s build: replace from\n`let mut up_start = vec![0u32; count + 1];` through the placing loop (`up[next[dep as usize] as\nusize] = from as u32; ...`) with\n\n```rust\n        let (up_start, up) = blaze_ids::radix::Csr::build(\n            count,\n            (0..count).flat_map(|from| {\n                deps[dep_start[from] as usize..dep_start[from + 1] as usize].iter().map(move |&dep| (dep, from as u32))\n            }),\n        )\n        .into_parts();\n```\n\n(the comment above stays; `up` keeps each unit's dependents in unit order). Why: one counting\nsort in the tree; this one cloned its starts.\n\n> forwarded to cargo (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T09:09:47Z",
+  "taken_by": "unify-cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedup: the unit graph's dependents onto `blaze_ids::radix::Csr`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2950"
+    },
+    {
+      "at": "2026-10-30T08:55:48Z",
+      "by": "unify-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:09:47Z",
+      "by": "unify-cargo",
+      "action": "done",
+      "note": "unify-cargo-serve: blaze-cargo serve/unit/graph.rs dependents are blaze_ids::radix::Csr::build(count, pairs).into_parts(), pairs in from order so dependents stay in unit order. Not built."
+    }
+  ]
+}

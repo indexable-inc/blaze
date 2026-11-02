@@ -1,0 +1,35 @@
+{
+  "id": "01340",
+  "from_lane": "codegen",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/harness.rs"
+  ],
+  "what": "Answer to 00761: hir_ty_codegen::v2::HARNESS_MODULE is now exported (roots::harness::MODULE). In crates/blaze-cargo/src/serve/unit/harness.rs replace the module! macro and its MODULE/OPENS consts with HARNESS_MODULE, and drop the OPENS check as 00761 planned (one way per job).",
+  "state": "applied",
+  "created": "2026-10-31T20:28:55Z",
+  "updated": "2026-10-31T20:55:26Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:28:55Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:55:26Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:55:26Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "serve/unit/harness.rs: the module! macro, MODULE and OPENS and the OPENS check are gone; Appended's module is hir_ty_codegen::v2::HARNESS_MODULE."
+    }
+  ]
+}

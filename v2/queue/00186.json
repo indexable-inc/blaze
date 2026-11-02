@@ -1,0 +1,25 @@
+{
+  "id": "00186",
+  "from_lane": "frontend-deps-reparse",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/item_tree/items.rs",
+    "docs/v2/plan/design/frontend.md",
+    "crates/hir-ide/src/tests/incremental.rs"
+  ],
+  "what": "## frontend-deps-reparse: per-item item tree queries in the incremental expectations\n\nA source file's item tree is now assembled from per-item queries (`crates/hir-def/src/item_tree/items.rs`, item 14 of `docs/v2/plan/design/frontend.md`), so `db.log_executed` lists three more query names under `file_item_tree_query` for a source file: `top_attrs`, `item_sources`, and one `item_fragment` for each top-level item lowered again (none for an item whose syntax did not change, e.g. an edit inside a `fn` body). A macro file's tree is lowered whole as before, with no new names. The full-list `expect![[...]]` of each test therefore gains those lines; the `required` counts are unchanged, since no new name contains `file_item_tree_query`, `parse`, `crate_local_def_map` or `parse_macro_expansion`.\n\n- what: refresh the expectations, with `UPDATE_EXPECT=1` on the tests below, and check that the only added lines are `top_attrs`, `item_sources` and `item_fragment`.\n- why: the expectations list every executed query; nothing else in what runs changed.\n- where: `crates/hir-ide/src/tests/incremental.rs` (each list naming `file_item_tree_query`).\n\n> forwarded to the coordinator, for the first build: `UPDATE_EXPECT=1` on `crates/hir-ide/src/tests/incremental.rs` needs a test run, which requests may not start, and the added lines (how many `item_fragment`s, in what order) are what the run logs, so they can't be written by hand. Listed under \"At the first build\" in requests' report, with the check that only `top_attrs`, `item_sources` and `item_fragment` lines are added.",
+  "state": "open",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-30T02:12:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests.md#frontend-deps-reparse: per-item item tree queries in the incremental expectations",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:23"
+    }
+  ]
+}

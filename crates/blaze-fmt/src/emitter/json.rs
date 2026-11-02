@@ -26,15 +26,15 @@ struct MismatchedFile {
     mismatches: Vec<MismatchedBlock>,
 }
 
-impl Emitter for JsonEmitter {
-    fn emit_footer(&self, output: &mut dyn Write) -> Result<(), io::Error> {
+impl JsonEmitter {
+    pub(crate) fn emit_footer(&self, output: &mut impl Write) -> Result<(), io::Error> {
         to_json_writer(&mut *output, &self.mismatched_files)?;
         writeln!(output)
     }
 
-    fn emit_formatted_file(
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        _output: &mut dyn Write,
+        _output: &mut impl Write,
         FormattedFile {
             filename,
             original_text,

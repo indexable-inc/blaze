@@ -1,0 +1,36 @@
+{
+  "id": "00701",
+  "from_lane": "fastcompile",
+  "owner": "frontend",
+  "paths": [
+    "crates/hir-def/src/unstable_features.rs",
+    "crates/blaze-macro-eval/src/lex.rs"
+  ],
+  "what": "## fastcompile-macros 4: frontend: a crate's `#![feature]`s without its def map, for a proc macro it calls (`crates/hir-def/src/unstable_features.rs`, `item_tree.rs` `top_level_attrs`)\n\nOwner: lane frontend (hir-def). Asked by fastcompile-macros (window `fastcompile-macros-next2`).\n\nWhat: a public salsa query, say `UnstableFeatures::of_root(db: &Db, krate: Crate) ->\n&UnstableFeatures`, built from what `DefCollector::seed_with_top_level` reads\n(`file_item_tree(db, krate.root_file_id(db), krate).top_level_attrs()`, `cfg_attr` applied,\nthe `-Z crate-attr` files after them) and never from `crate_def_map(db, krate)`.\n`UnstableFeatures::query` goes through the def map, and the proc macros of a crate expand while\nits def map is being built, so calling it from an expansion is a cycle; `top_level_attrs` is\n`pub(crate)`.\n\nWhy: rustc gates every `k#ident` a proc macro lexes through `TokenStream::from_str` with the\ncalling crate's `forced_keywords` (`psess.gated_spans`, checked after expansion). blaze's server\n(`crates/blaze-macro-eval/src/lex.rs` `Emitted::finish`) reports the gate as an error always,\nso a crate with `#![feature(forced_keywords)]` gets an error rustc does not give. With the query\nthe server takes the bit (and the expansion's key gets it as a part).\n\nStatus: open\n\n> forwarded to frontend (requests, pass 42: hir-def's `unstable_features.rs`/`item_tree.rs` is lane frontend's to apply in lane db's crate; told by tmux)",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T07:56:48Z",
+  "taken_by": "frontend",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-macros 4: frontend: a crate's `#![feature]`s without its def map, for a proc macro it calls (`crates/hir-def/src/unstable_features.rs`, `item_tree.rs` `top_level_attrs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:4163"
+    },
+    {
+      "at": "2026-10-30T07:56:48Z",
+      "by": "frontend",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:56:48Z",
+      "by": "frontend",
+      "action": "done",
+      "note": "`pub fn UnstableFeatures::of_root(db: &Db, krate: Crate) -> &UnstableFeatures` (crates/hir-def/src/nameres/facts.rs): a reference into the memoized `queries::crate_data` (root item tree top-level attrs, cfg_attr applied, then the -Z crate-attr files), never `crate_def_map`; equal to `DefMap::features()`. New bool `forced_keywords` (UnstableFeatures field; `sym::forced_keywords` added in crates/intern/src/symbol/symbols.rs). Tests: nameres/facts/tests/features.rs (equality with the def map, cfg_attr on/off, crate-attr, and no def-map or resolver query executes). The server side (blaze-macro-eval lex.rs `Emitted::finish` reading `of_root(db, krate).forced_keywords`, and the expansion key part) is fastcompile's."
+    }
+  ]
+}

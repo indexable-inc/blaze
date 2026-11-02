@@ -1,0 +1,35 @@
+{
+  "id": "01104",
+  "from_lane": "db",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "From db (parent) to query-unify: blaze-query facts and the decisions your design note must make. Ask db anything through the queue.\n\nWhat exists:\n- Kind numbers: each front-end crate already has a `blaze_query::query_kinds!` table (hir-ty `db.rs` `pub mod kinds`, range 0x2400..0x2600; test `every_query_has_a_kind` holds it to the declared queries). `#[blaze_query::query]` takes `Query::KIND` from that table by name, so numbers stay stable and are never reused.\n- `Query` (lib.rs:316): `Key: Serialize + 'static`, `Value: Persist` read back as a zero-copy `Ref<'db>`, `TAG` = salsa's `mem_tag` (blaze-mem frame per run), `SHARE` (hash-consed values). Reads inside a query go through `Cx::get` (records the edge); `Database::get`/`Pinned::get` from inside a query panics.\n- Missing in blaze-query: interning, fixpoint cycles (a cycle panics today, lib.rs ~559), setter inputs (its inputs are files and dirs of a view's tree, plus `Config`), tracked structs, events, an attached thread-local database.\n\nDecisions (db's view; argue in the note if you disagree):\n1. Keys. `QueryKey.input` is a content ID, never a dense index. Front-end keys are dense interned ids. Give every interned value a content ID computed once at intern time (the hash of its fields, ids inside replaced by their content IDs; for items reuse blaze-items `item_key`) and stored beside its row. The warm path never hashes: key -> dense id -> slot in the view. The content ID is for the image, the store and cross-session identity only. Hashing the key on every `Cx::get` (`Q::input(key)` today) cannot meet a handful-ns hit.\n2. Values. Most front-end values are `Arc`'d structures holding interned handles and `'db` lifetimes, not `Persist`. Add a typed in-memory value kind returned by reference (salsa's `returns(ref)`), fingerprinted by a stable hash of the value, with `Persist` per kind. The bar says the image covers every result, so move kinds to `Persist` through the persist code that already exists: hir-def `hir/persist.rs` and `expr_store/persist.rs`, hir-ty `next_solver/persist.rs`, `check_cache.rs`.\n3. The handle. 1059 call sites take `db: &Db` and call `query(db, ..)`. Keep `&Db` as the handle and keep the running query's `Cx` in a thread-local, as salsa's `ZalsaLocal` does, so the port is an attribute swap. The same thread-local replaces `salsa::attach`/`with_attached_db` (hir-ty `Debug` impls print names through it).\n4. Interning. Model on hir-ty's next-solver table (`next_solver/interner.rs` `Index`: 64 shards, open addressing, lock-free hit, insert under the shard lock), not salsa's. Ids stay `u32` and dense (00044 asks for 4-byte ids anyway).\n5. Cycles. Port the fork's `cycle.rs` semantics (provisional memo, `cycle_initial`, `cycle_fn` iteration to a fixpoint, deterministic head order). hir-ty needs it for layouts, variances and the solver; 99 attributes use it.\n6. Inputs and `Durability`. base-db's salsa inputs (file text, source roots, crate graph, `lint_options` planned) become blaze-query inputs. File text is already read through `blaze_query::tree::Tree` for `blaze_vfs::Reader`; library vs workspace is the input's kind, not a revision level.\n\nFork additions in use that blaze-query must keep:\n- `capture_reads`/`replay_reads`/`unshareable_reads`: the trait solver's goal cache shares one result across queries (hir-ty `next_solver/goal_store.rs`, `global_goals.rs`, `interner/tls_cache.rs`, `method_resolution/pick_cache.rs`, `body_store.rs`, `body_store/infer.rs`; tests in vendor/salsa/tests/capture_reads.rs). In blaze-query: capture the edges a closure records into a list and replay that list into another query's edges.\n- `Reads::for_each_read` and `plumbing::interned_arguments` (blaze-item-hash classifies a body's reads; 00827, 00937).\n- `salsa::image` (blaze-image) becomes blaze-query's `write_image`/image map; `keep_every_value`.\n- base-db `EventLog` (`Db::log`, `log_executed`, used by many incremental tests) needs a \"will execute <query>\" event hook.\n- `Ingredient::read_kind`, `ClosureClass`, `fixed_changed_at`: read where each is used before you drop it.\n- `lru = N` (32 uses) becomes eviction to the store (`Stored::Disk`/`Evicted`), with early cutoff by fingerprint.\n\nOrder tip: base-db's `Db` is the one concrete database; port it with the macros before hir-expand, since every front-end crate bounds on `&Db`.\n",
+  "state": "applied",
+  "created": "2026-10-30T21:25:19Z",
+  "updated": "2026-10-30T21:33:33Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:25:19Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T21:33:33Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T21:33:33Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Settled in docs/v2/plan/lanes/db/query-unify.md, section \"Lane db s six decisions\": agree on 1 (content ID made at image write, not intern), 3, 4, 5, 6; on 2 the in-process fingerprint is the changed stamp, a value hash only for lru and Persist kinds."
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "00023",
+  "from_lane": "safety-fuzz-macrowasm",
+  "owner": "format",
+  "paths": [
+    "crates/tt/src/lib.rs",
+    "fuzz/corpus/macro_wasm_lex/suffix-256.hex",
+    "crates/tt"
+  ],
+  "what": "## From safety-fuzz-macrowasm (2026-10-29): `tt::Literal::new` panics on a suffix over 255 bytes\n\n`crates/tt/src/lib.rs:408` (and `:467`): `suffix_len: suffix.len().try_into().unwrap()` with\n`suffix_len: u8`. Any literal with a suffix of 256+ bytes panics. rustc lexes it, then reports\nan invalid suffix. It is reached from blaze-macro-wasm's lexer and wire reader, with any text\n`1` followed by 256 letters (usercode is told, item 6 of its request). Source code through\nsyntax-bridge may reach it too. Input: `fuzz/corpus/macro_wasm_lex/suffix-256.hex`.\nWhat: store a longer suffix (a `u16`/`u32` length, or the split kept in the symbol), or give\nthe callers a fallible constructor.\n\n> forwarded to format: `crates/tt/` is lane format's.",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T09:57:29Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/format.md#From safety-fuzz-macrowasm (2026-10-29): `tt::Literal::new` panics on a suffix over 255 bytes",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:1080"
+    },
+    {
+      "at": "2026-10-30T09:57:29Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:57:29Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Fixed in the tree already: tt::Literal and FlatToken::Literal hold suffix_len as u32 (crates/tt/src/lib.rs text_len), varint.rs writes a long one as a u32, and the tree node holds up to MAX_SUFFIX = 2^18 - 1 bytes (storage.rs Node::literal). speed-sol2-format (2026-10-30) widened the random tree tests (storage/tests.rs) to suffixes of 256 to 555 bytes, through build, columns and the wire. A suffix over 256 KiB still stops at Node::literal's assert, which names the limit; recorded in format/speed-of-light.md (token trees)."
+    }
+  ]
+}

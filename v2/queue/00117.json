@@ -1,0 +1,23 @@
+{
+  "id": "00117",
+  "from_lane": "diagnostics-items",
+  "owner": "diagnostics",
+  "paths": [
+    "v2/requests/diagnostics.md"
+  ],
+  "what": "## 6. `unresolved_ident`'s `typo` and `import_candidates` shared (parent `diagnostics`: `lower/unresolved_ident.rs`)\n\nWhat: the second half of `diagnostics-items-defs: one port of rustc's late path errors` in\n`v2/requests/diagnostics.md`. The first half is done (`checks/names/failure.rs` now uses\n`lower::unresolved_import`'s `Segment`, `ROOT` and `value_descr`; the rest of `failure::diag`\nis the signature-scope half of `report_path_resolution_error`, which `unresolved_import`'s\nimport `Resolver` cannot give). Make `typo` and `import_candidates` of `lower/unresolved_ident.rs`\n`pub(crate)`, taking the namespace and the `PathSource` expectation, so\n`checks/names/paths.rs` drops its copies.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T01:06:02Z",
+  "updated": "2026-10-30T01:06:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items.md#6. `unresolved_ident`'s `typo` and `import_candidates` shared (parent `diagnostics`: `lower/unresolved_ident.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items.md:76"
+    }
+  ]
+}

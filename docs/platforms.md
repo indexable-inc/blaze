@@ -1,10 +1,16 @@
 ---
-status: current
-summary: The state of each platform blaze runs on, from the last CI run that covered them all.
+status: record
+summary: The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
+date: 2026-10-30
 ---
 # Platforms
 
-This is the current state of each platform blaze has been run on, in one place. The
+This is the state of each platform blaze v1 was run on, as of its integration into v2 on
+2026-10-30. v1's link (rustc's link line with blaze's object first), its splice
+(`crates/blaze-splice`), `blaze-engine weaken`, `blaze-live` as described here and
+`BLAZE_STD_FROM` are gone; v2 links with its own linker (`crates/blaze-link`,
+[v2/plan/lanes/link.md](v2/plan/lanes/link.md)), and no v2 build has been run on any platform
+in CI yet. The
 numbers are from GitHub Actions run 39057174862 on commit 888e87df74, the last recorded run
 that covered all four native platforms under both backends, unless a line says otherwise.
 The report behind it is [reports/PLAT-ABI2.md](reports/PLAT-ABI2.md). The table of what is
@@ -53,9 +59,11 @@ can take its arguments otherwise than its signature says: LLVM passes the `&u16`
 `<u16 as Debug>::fmt` as a `u16`. A patch calls a local of rustc's executable only if it
 was a hidden global or is of a crate that calls by symbol; blaze builds the rest into it.
 
-On every platform the gate in CI is the corpus with layouts, programs, stress, breakers,
-unwinds, splices, asmedits, includes, worktrees, keys, storekills, storecorrupts and
-storeshared, under Cranelift and under LLVM at `-O2` with fast instruction selection.
+On every platform the gate in CI is programs, stress, unwinds, splices, asmedits, includes,
+worktrees, keys, storekills, storecorrupts and storeshared, under Cranelift and under LLVM at
+`-O2` with fast instruction selection. Until 2026-10-30 it also compared a corpus of
+functions, their type layouts and a set of breakers with rustc's build; the last counts of
+that corpus were:
 
 | Platform | Corpus functions from blaze, both backends | Layouts that differ | LLVM compiled itself |
 |---|---|---|---|
@@ -70,8 +78,8 @@ system.
 ## Linux x86-64
 
 The platform the work was done on, and the only one where everything has been run: the
-whole gate, `debuginfo.py`, `buildmodel.py`, `storefull.py`, `remote.py` against MinIO, the
-fuzzer, rustc's own test suites, the crate sweep and `blaze`. The gate was rerun for
+whole gate, `debuginfo.py`, the build-model cases (deleted 2026-10-30), `storefull.py`,
+`remote.py` against MinIO, the fuzzer, rustc's own test suites, the crate sweep and `blaze`. The gate was rerun for
 these documents at f191c6e42a under both backends; see [results.md](results.md).
 
 Objects are ELF. A full link runs rustc's link line with blaze's object first and
@@ -84,7 +92,8 @@ made while the program is running is linked in full, because the kernel refuses 
 
 Runs natively on `ubuntu-24.04-arm` in CI under both backends, including `debuginfo.py`
 (under Cranelift gdb prints 9 of 9 locals; under LLVM no locals are described),
-`buildmodel.py` (204 of 204, four rows that need an x86-64 host not run), `storefull.py`
+the build-model cases (204 of 204 when last run, four rows that need an x86-64 host not
+run), `storefull.py`
 and `farsplices.py`.
 
 A `b` or `bl` reaches 128 MB. When a function and its replacement are further apart than
@@ -188,7 +197,6 @@ Not there: debug info is not checked on macOS (the harness reads DWARF out of EL
 `blaze` serves dev and test builds;
 `harness/blaze_cli.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
 the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
-`buildmodel.py`,
 `storefull.py`, `remote.py`, `farsplices.py` and the fuzzer are not run. The first port
 noted that under LLVM the unwind rules are not exact inside prologues and epilogues;
 nothing later says that changed.
@@ -220,7 +228,6 @@ wasmtime 49.0.2, at main fdc1c53f15 (#622 for the `no_std` rows):
 | `wasm32-wasip1` corpus | MATCH, 957 of 959 functions from blaze |
 | the same with `+simd128,+relaxed-simd` | MATCH, 964 of 966 |
 | stress, splices | 100 of 100, 71 of 71 |
-| breakers | 176 of 177: `procmacro`'s `spelled` fails the same way on the aarch64 host without blaze's proc-macro server |
 | `allblaze_wasm.py`, nothing of rustc's | 3 wasip1 programs, a wasm32-unknown-unknown cdylib and a `#![no_std]` simd128 guest, each as cargo's build answers |
 | blaze-manifest + blaze-resolve over blaze's workspace and lock file (issue #458), nothing of rustc's | 45,837 functions, built and linked in 9.1 s (3.2 GB), output byte-identical to rustc's native build; 36.6 MB vs 3.9 MB, 0.30 vs 0.03 s a run |
 | the same with `blaze build --release --target wasm32-wasip1`, a store that starts empty | 64.5 s (9.6 GB at `CARGO_BUILD_JOBS=2`), its build scripts, 157 macro expansions (blaze's proc-macro server) and std unit blaze's; output byte-identical; 0.06 s again with nothing changed |
@@ -228,7 +235,8 @@ wasmtime 49.0.2, at main fdc1c53f15 (#622 for the `no_std` rows):
 | Cloudflare Workers through workers-rs 0.8.7 and wasm-bindgen 0.2.129 (`worker-build --release` with blaze as its cargo build), nothing of rustc's | under `wrangler dev` 4.148.0 the hello and a SHA-256/HMAC worker (sha2, hmac) answer as rustc's builds; 1,218,107 vs 145,034 B and 1,304,087 vs 159,091 B; p50 1.44 to 1.47 vs 1.36 to 1.37 ms, and 3.04 to 3.14 vs 1.60 to 1.64 ms hashing 10 KiB |
 | the same workers with `blaze build` as worker-build's cargo build, and the `no_std` simd128 guest of `allblaze_wasm.py` with `blaze build --release --target wasm32-unknown-unknown`, at main 2acba39f76 | std unit blaze's (18 crates for the workers, 3 for the guest); the workers answer as rustc's builds, 983,740 and 1,060,993 B, 88.8 and 81.3 s from a store that starts empty, p50 1.49 to 1.54 vs 1.41 to 1.44 ms and 3.07 to 3.16 vs 1.63 to 1.72 ms; the guest answers 7 of 7 calls as rustc's, 378,591 B vs 4,904 B, 4.4 s |
 
-The train runs the corpus, stress and `allblaze_wasm.py` on every push to main
+The corpus rows are of the comparison with rustc deleted on 2026-10-30. The train runs stress
+and `allblaze_wasm.py` on every push to main
 (`harness/wasm32.py`, [harness.md](harness.md)).
 
 Limits: no unwinding is emitted (the wasm targets are `panic=abort`), threads are not

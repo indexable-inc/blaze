@@ -1,0 +1,36 @@
+{
+  "id": "00840",
+  "from_lane": "item-hash-mir",
+  "owner": "item-hash-store",
+  "paths": [
+    "crates/hir-ty/src/body_store.rs",
+    "crates/hir-ty/src/body_store/tests.rs"
+  ],
+  "what": "crates/hir-ty/src/body_store.rs: body_store/mir.rs exists now. Add `mod mir;` beside `mod infer;` and `pub(crate) use mir::built as built_mir;` beside the infer re-export: providers.rs compute() at MirStage::Built calls crate::body_store::built_mir(db, owner, || (mir.build)(db, owner)). And crates/hir-ty/src/body_store/tests.rs: make pub(super) (for body_store/mir/tests.rs, which reuses them): FIXTURE, BUILD, struct Memory and its fns len and set, type Defs, struct TestFacts, struct Session and its fields installed/facts/db, fns session, db_of, second, function. Until both land hir-ty does not compile.",
+  "state": "applied",
+  "created": "2026-10-30T08:43:01Z",
+  "updated": "2026-10-30T08:45:13Z",
+  "taken_by": "item-hash-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:43:01Z",
+      "by": "item-hash-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:44:51Z",
+      "by": "item-hash-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:45:13Z",
+      "by": "item-hash-store",
+      "action": "done",
+      "note": "body_store.rs declares mod mir and pub(crate) use mir::built as built_mir. body_store/tests.rs: FIXTURE, BUILD, Memory (+len, set), Defs, TestFacts, Session (+installed, facts, db), session, db_of, second, function are pub(super)."
+    }
+  ]
+}

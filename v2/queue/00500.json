@@ -1,0 +1,23 @@
+{
+  "id": "00500",
+  "from_lane": "diagnostics-lints-bodies-calls-methods-asm",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/syntax/early/macros/asm.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-calls-methods-asm: drop the label lints from `lints/syntax/early/macros/asm.rs` (`diagnostics-lints-syntax-early-macros`)\n\nWhat: remove `named_asm_labels` and `binary_asm_labels` from\n`crates/blaze-diagnostics/src/lints/syntax/early/macros/asm.rs` (the label loop at the end of\n`asm_lints`, `label_lint`, `labels`, `is_hexagon_register_span`, `needs_monomorphization`, `Label`\nand their unit tests) and keep `bad_asm_style`; drop `named_labels_are_denied_outside_naked_functions`,\n`binary_labels_are_denied_on_x86` and `binary_labels_are_allowed_off_x86` (and their files in\n`tests/lints/syntax/early/macros/asm/`) from `tests/lints/syntax/early/macros/asm.rs`.\nWhy: they are rustc's late lint pass `AsmLabels` (`rustc_lint/src/builtin.rs`), now ported as\none in `lints/bodies/calls/methods/asm_labels.rs` (on `Expr::InlineAsm`, given only when nothing\nfailed, in `PASS_ORDER` with the other late passes at the same expression), with the same UI\ntests in `tests/lints/bodies/calls/methods/asm_labels.rs`. With both, every label is linted\ntwice; `check.rs` drops a copy only when the two `Diag`s are equal, and their facts differ (the\nsyntax walk's `the code of` names the item by `body_item`, the late pass by `def_path`, and a\ngeneric `naked_asm!`'s lint also reads the function's signature).\n\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-calls-methods-asm: drop the label lints from `lints/syntax/early/macros/asm.rs` (`diagnostics-lints-syntax-early-macros`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1908"
+    }
+  ]
+}

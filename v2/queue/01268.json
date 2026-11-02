@@ -1,0 +1,36 @@
+{
+  "id": "01268",
+  "from_lane": "builder-2",
+  "owner": "builder-2",
+  "paths": [
+    "crates/hir-ty-codegen/v2.rs",
+    "crates/hir-ty-codegen/v2/frontend.rs"
+  ],
+  "what": "hello6 (blaze from /Volumes/Projects/blaze-v2 at 06:36, b2-target; std crates and hello compile) ends EXIT=101 with NO error printed. The daemon panicked (b2-home-6/v2/serve.log): hir-ty next_solver/interner.rs:3139 \"Tried to use attached db, but no db is attached\", reached from hir-ty-codegen v2/frontend.rs describe -> described -> map_err -> v2.rs:323 undescribed, which formats the HirInstance with Debug; Debug of AdtDef/GenericArg needs an attached db that is not attached on that rayon thread. Three fixes: (1) undescribed must not need an attached db (attach it, or describe the instance without Debug through the interner); (2) the describe failure it reports is the real next blocker, still unseen; (3) the client must print the daemon panic, not exit 101 silently (blaze-cargo serve owner). Logs .coord-1030/b2-build/hello6-run.log, .coord-1030/b2-home-6/v2/serve.log.",
+  "state": "applied",
+  "created": "2026-10-31T13:36:59Z",
+  "updated": "2026-10-31T15:17:22Z",
+  "taken_by": "builder-2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:36:59Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:40:10Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Part 1 done: undescribed takes db and formats under hir_ty::attach_db (v2.rs, frontend.rs, backend.rs). Part 3 split to 01287 (no-fallback-link-cargo). Part 2, the describe failure behind it, shows on the next hello run: owner builder-2 to rerun and route it."
+    },
+    {
+      "at": "2026-10-31T15:17:22Z",
+      "by": "builder-2",
+      "action": "done",
+      "note": "part 1 87011bb6d7 (undescribed), part 1b frontend.rs:394 shared_args under attach_db (in the tree), part 3 split to 01287 (hello10 already prints the panic). hello11: no panic; the real error is a refusal: std compiled at O3 needs LLVM, blaze built without --features llvm (b2-build/hello11-run.log). Next: 01268-follow-up queued for the llvm build."
+    }
+  ]
+}

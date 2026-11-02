@@ -1,0 +1,126 @@
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    WHITESPACE " "
+    NAME
+      IDENT "main"
+    PARAM_LIST
+      L_PAREN "("
+      R_PAREN ")"
+    WHITESPACE " "
+    BLOCK_EXPR
+      STMT_LIST
+        L_CURLY "{"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          REF_PAT
+            AMP "&"
+            RANGE_PAT
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "0"
+              DOT2EQ "..="
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "1"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          BOX_PAT
+            BOX_KW "box"
+            WHITESPACE " "
+            RANGE_PAT
+              DOT2 ".."
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "2"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          REF_PAT
+            AMP "&"
+            MUT_KW "mut"
+            WHITESPACE " "
+            RANGE_PAT
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "0"
+              DOT2 ".."
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          REF_PAT
+            AMP "&"
+            RANGE_PAT
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "0"
+              WHITESPACE " "
+              DOT3 "..."
+              WHITESPACE " "
+              LITERAL_PAT
+                LITERAL
+                  INT_NUMBER "1"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n    "
+        LET_STMT
+          LET_KW "let"
+          WHITESPACE " "
+          REF_PAT
+            AMP "&"
+            PAREN_PAT
+              L_PAREN "("
+              RANGE_PAT
+                LITERAL_PAT
+                  LITERAL
+                    INT_NUMBER "0"
+                DOT2EQ "..="
+                LITERAL_PAT
+                  LITERAL
+                    INT_NUMBER "1"
+              R_PAREN ")"
+          WHITESPACE " "
+          EQ "="
+          WHITESPACE " "
+          TUPLE_EXPR
+            L_PAREN "("
+            R_PAREN ")"
+          SEMICOLON ";"
+        WHITESPACE "\n"
+        R_CURLY "}"
+  WHITESPACE "\n"
+error 26: the range pattern here has ambiguous interpretation
+error 48: the range pattern here has ambiguous interpretation
+error 71: the range pattern here has ambiguous interpretation

@@ -1,0 +1,35 @@
+{
+  "id": "00542",
+  "from_lane": "lints-parallel",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir"
+  ],
+  "what": "## 6. codegen (later): the effect summary as a front-end query\n\n- What: `parallel/effects.rs`'s `effects(db, func)` / `closure_effects` (a salsa query per\n  function, bottom-up, cycles start at \"no effect\" and grow) moves to `hir-ty-mir` beside\n  `mir_body`, so codegen and const checks can read the same summary.\n- Where: `crates/hir-ty-mir` (new module), blaze-lints calling it.\n- Why: semantics-in-front-end: a function's effects are a fact of its MIR, not of a lint.\n  Kept in blaze-lints for now as the only reader.\n\n> lints: kept for later, as the request says. It goes to codegen when a second reader needs the summary.\n\n> forwarded to codegen, for later as written: when a second reader needs the summary it moves to `hir-ty-mir`; lints keeps it until then (above) (requests, pass 25).",
+  "state": "refused",
+  "created": "2026-10-30T04:36:54Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": "Nothing to do yet, as written: blaze-lints stays the only reader of the effect summary. Re-file when a second reader needs it in hir-ty-mir.",
+  "source": "v2/requests/lints-parallel.md#6. codegen (later): the effect summary as a front-end query",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints-parallel.md:71"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Nothing to do yet, as written: blaze-lints stays the only reader of the effect summary. Re-file when a second reader needs it in hir-ty-mir."
+    }
+  ]
+}

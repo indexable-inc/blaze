@@ -3,26 +3,32 @@
 //! inputs to a stack slot and passes its address, and the function loads the registers from
 //! it, runs the block, and writes the outputs back.
 
+#![forbid(unsafe_code)]
+
 use std::{
+    cell::RefCell,
     fmt::Write,
+    hash::BuildHasher,
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use blaze_hash::{FixedState, HashMap};
 use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
     RelocationTarget, elf, macho, pe,
 };
-use rustc_hash::FxHashMap;
-use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 
 use super::{
     Arch, ObjectFormat, Target,
     avx512::{Load, Out},
-    store::Store,
 };
 
 mod aarch64;
@@ -38,6 +44,7 @@ const SYM: &str = "blaze_sym_";
 pub(super) fn xgetbv() -> String {
     let [number, ..] = Convention::of_target().arguments;
     let number = GPR[number][1];
+    // alloc: the stub's text, the output
     format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmov ecx, {number}\nxgetbv\nshl rdx, 32\nor rax, rdx\nret\n"
     )
@@ -45,11 +52,13 @@ pub(super) fn xgetbv() -> String {
 
 /// The hint a spin loop gives the processor between attempts.
 pub(super) fn pause() -> String {
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\npause\nret\n")
 }
 
 /// AArch64's instruction barrier, of the whole system as `__isb(SY)` asks for it.
 pub(super) fn isb() -> String {
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\nisb\nret\n")
 }
 
@@ -57,23 +66,27 @@ pub(super) fn isb() -> String {
 /// both named by their registers' letters (`h`, `s`, `d`): what LLVM converts an `f16` with
 /// on a target without the half-precision instructions.
 pub(super) fn fcvt(to: char, from: char) -> String {
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\nfcvt {to}0, {from}0\nret\n")
 }
 
 /// An AArch64 instruction of the half-precision extension on the halves passed in `h0` up,
 /// which leaves its result in `h0`: what LLVM does an `f16` with where the extension is enabled.
 pub(super) fn half(instruction: &str) -> String {
+    // alloc: the stub's text, the output
     format!(".arch_extension fp16\n.globl {SYMBOL}\n{SYMBOL}:\n{instruction}\nret\n")
 }
 
 /// An x86-64 instruction of AVX512-FP16 on the halves passed in `xmm0` up, which leaves its
 /// result in `xmm0`.
 pub(super) fn x86_half(instruction: &str) -> String {
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\n{instruction}\nret\n")
 }
 
 /// A function of the one AArch64 instruction whose word is `word`.
 pub(super) fn instruction_word(word: u32) -> String {
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\n.inst {word:#010x}\nret\n")
 }
 
@@ -82,6 +95,7 @@ pub(super) fn instruction_word(word: u32) -> String {
 /// number, which needs no extension of the assembler.
 pub(super) fn random(reseeded: bool) -> String {
     let register = if reseeded { "s3_3_c2_c4_1" } else { "s3_3_c2_c4_0" };
+    // alloc: the stub's text, the output
     format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmrs x9, {register}\ncset w10, eq\nstr x9, [x0]\n\
          strb w10, [x0, #8]\nret\n"
@@ -92,6 +106,7 @@ pub(super) fn random(reseeded: bool) -> String {
 /// (`crc32b` to `crc32cx`) says: the `x` ones read 64 bits.
 pub(super) fn crc32(instruction: &str) -> String {
     let data = if instruction.ends_with('x') { "x1" } else { "w1" };
+    // alloc: the stub's text, the output
     format!(".arch_extension crc\n.globl {SYMBOL}\n{SYMBOL}:\n{instruction} w0, w0, {data}\nret\n")
 }
 
@@ -105,6 +120,7 @@ pub(super) fn x86_crc32(bits: u32) -> String {
         16 => ("eax", GPR[crc][1], GPR[data][2]),
         _ => ("eax", GPR[crc][1], GPR[data][3]),
     };
+    // alloc: the stub's text, the output
     format!(".globl {SYMBOL}\n{SYMBOL}:\nmov {into}, {crc}\ncrc32 {into}, {data}\nret\n")
 }
 
@@ -117,9 +133,12 @@ pub(super) fn x86_crc32(bits: u32) -> String {
 /// as `.arch` sets the extensions anew.
 pub(super) fn extensions<'a>(arch: Arch, features: impl IntoIterator<Item = &'a str>) -> String {
     if arch != Arch::Aarch64 {
+        // alloc: empty, allocates nothing
         return String::new();
     }
-    let features: Vec<&str> = features.into_iter().collect();
+    let mut listed: SmallVec<[&str; 16]> = SmallVec::new();
+    listed.extend(features);
+    let features = listed;
     let versions = features.iter().filter_map(|it| aarch64_version(it));
     // Armv9.n has what Armv8.(n + 5) has.
     let version = versions.fold(None, |most: Option<(u8, u8)>, (major, minor)| {
@@ -128,14 +147,21 @@ pub(super) fn extensions<'a>(arch: Arch, features: impl IntoIterator<Item = &'a 
         let minor = later((major, minor)).max(most.map_or(0, later));
         Some(if nine { (9, minor - 5) } else { (8, minor) })
     });
-    let mut names: Vec<&str> = features.into_iter().filter_map(aarch64_extension).collect();
+    let mut names: SmallVec<[&str; 16]> = SmallVec::new();
+    names.extend(features.into_iter().filter_map(aarch64_extension));
     names.sort_unstable();
     names.dedup();
-    let version = version.map(|(major, minor)| match minor {
-        0 => format!(".arch armv{major}-a\n"),
-        _ => format!(".arch armv{major}.{minor}-a\n"),
-    });
-    version.into_iter().chain(names.iter().map(|it| format!(".arch_extension {it}\n"))).collect()
+    // alloc: the directives, the output
+    let mut out = String::new();
+    match version {
+        Some((major, 0)) => _ = writeln!(out, ".arch armv{major}-a"),
+        Some((major, minor)) => _ = writeln!(out, ".arch armv{major}.{minor}-a"),
+        None => {}
+    }
+    for it in &names {
+        _ = writeln!(out, ".arch_extension {it}");
+    }
+    out
 }
 
 /// The version of AArch64, as major and minor, that has a target feature LLVM's assembler
@@ -208,6 +234,7 @@ fn aarch64_extension(feature: &str) -> Option<&'static str> {
 pub(super) fn vcvtps2ph(register: &str) -> String {
     let [[from, ..], [to, ..], [which, which_low, ..]] =
         Convention::of_target().arguments.map(|row| GPR[row]);
+    // alloc: the stub's text, the output
     let mut text = format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [{from}]\nand {which_low}, 7\n\
          shl {which_low}, 4\nlea rax, [rip + .Lrounding]\nadd rax, {which}\njmp rax\n\
@@ -225,6 +252,7 @@ pub(super) fn vcvtps2ph(register: &str) -> String {
 /// third does, which is where `result` is written once `instruction` ran.
 pub(super) fn vector_instruction(instruction: &str, result: &str) -> String {
     let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+    // alloc: the stub's text, the output
     format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
          movdqu xmm2, [{c}]\n{instruction}\nmovdqu [{c}], {result}\nret\n"
@@ -234,6 +262,7 @@ pub(super) fn vector_instruction(instruction: &str, result: &str) -> String {
 /// The same for AArch64, with the instructions of `extension`: `v0` to `v2` are loaded from
 /// where the three arguments point, and `v0` is written where the third does.
 pub(super) fn neon_instruction(extension: &str, instruction: &str) -> String {
+    // alloc: the stub's text, the output
     format!(
         ".arch_extension {extension}\n.globl {SYMBOL}\n{SYMBOL}:\nldr q0, [x0]\nldr q1, [x1]\n\
          ldr q2, [x2]\n{instruction}\nstr q0, [x2]\nret\n"
@@ -252,6 +281,7 @@ pub(super) fn neon_function(
     text: &str,
     results: &[(u32, u32)],
 ) -> String {
+    // alloc: the stub's text, the output
     let mut out = format!("{directives}.globl {SYMBOL}\n{SYMBOL}:\n");
     let register = |bytes: u32| match bytes {
         1 => 'b',
@@ -292,8 +322,8 @@ pub(super) fn x86_register_bytes(name: &str) -> Option<u32> {
     x86_register(name).map(|(_, bytes)| bytes)
 }
 
-/// The instruction that moves the register `name` to or from `memory`.
-fn x86_move(name: &str, memory: &str, load: bool) -> String {
+/// Writes the instruction that moves the register `name` to or from `base + offset`.
+fn x86_move(out: &mut String, name: &str, base: &str, offset: u32, load: bool) {
     let (mnemonic, width) = match x86_register(name).expect("a register") {
         (Reg::Gpr(_), 1) => ("mov", "byte"),
         (Reg::Gpr(_), 2) => ("mov", "word"),
@@ -303,10 +333,10 @@ fn x86_move(name: &str, memory: &str, load: bool) -> String {
         (_, 32) => ("vmovups", "ymmword"),
         (_, _) => ("vmovups", "zmmword"),
     };
-    match load {
-        true => format!("{mnemonic} {name}, {width} ptr [{memory}]\n"),
-        false => format!("{mnemonic} {width} ptr [{memory}], {name}\n"),
-    }
+    _ = match load {
+        true => writeln!(out, "{mnemonic} {name}, {width} ptr [{base} + {offset}]"),
+        false => writeln!(out, "{mnemonic} {width} ptr [{base} + {offset}], {name}"),
+    };
 }
 
 /// A function of x86 instructions on registers, an intrinsic of LLVM's as `x86::lower` has
@@ -324,13 +354,15 @@ pub(super) fn x86_function(
 ) -> Result<String, String> {
     let convention = Convention::of_target();
     let [from, to, _] = convention.arguments.map(|row| GPR[row][0]);
+    // alloc: the stub's text, the output
     let mut out = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {from}\nmov r11, {to}\n");
     let names = args.iter().chain(results).map(|(name, _)| *name).chain(clobbers.iter().copied());
-    let mut kept = Vec::new();
-    let mut vectors = Vec::new();
+    let mut kept: SmallVec<[usize; 16]> = SmallVec::new();
+    let mut vectors: SmallVec<[usize; 16]> = SmallVec::new();
     let mut wide = text.contains("ymm") || text.contains("zmm");
     for name in names {
         let Some((reg, bytes)) = x86_register(name) else {
+            // alloc: the error's message
             return Err(format!("the register `{name}`"));
         };
         wide |= bytes > 16;
@@ -355,12 +387,12 @@ pub(super) fn x86_function(
     for (i, number) in vectors.iter().enumerate() {
         _ = writeln!(out, "movups xmmword ptr [rsp + {}], xmm{number}", i * 16);
     }
-    for (name, offset) in args {
-        out.push_str(&x86_move(name, &format!("r10 + {offset}"), true));
+    for &(name, offset) in args {
+        x86_move(&mut out, name, "r10", offset, true);
     }
     _ = writeln!(out, "{text}");
-    for (name, offset) in results {
-        out.push_str(&x86_move(name, &format!("r11 + {offset}"), false));
+    for &(name, offset) in results {
+        x86_move(&mut out, name, "r11", offset, false);
     }
     for (i, number) in vectors.iter().enumerate() {
         _ = writeln!(out, "movups xmm{number}, xmmword ptr [rsp + {}]", i * 16);
@@ -386,6 +418,7 @@ pub(super) fn x86_function(
 /// moves one without AVX512DQ.
 pub(super) fn avx512_function(loads: &[Load], text: &str, out: Out) -> String {
     let slot = GPR[Convention::of_target().arguments[0]][0];
+    // alloc: the stub's text, the output
     let mut s = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {slot}\n");
     for (i, load) in loads.iter().enumerate() {
         let (k, at) = (i + 1, 8 * (i + 1));
@@ -476,6 +509,7 @@ fn vector_width(bytes: u32) -> &'static str {
 /// the byte at the third argument says which runs, and the result is written over it.
 pub(super) fn sha1rnds4() -> String {
     let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+    // alloc: the stub's text, the output
     let mut text = format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
          movzx eax, byte ptr [{c}]\nand eax, 3\nshl eax, 4\nlea r11, [rip + .Lrounds]\n\
@@ -493,11 +527,14 @@ pub(super) fn sha1rnds4() -> String {
 /// integer registers and `stack` of them on the stack, which says where the address is.
 pub(super) fn counted_variadic(ints: usize, stack: usize) -> String {
     const ARGUMENTS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-    let callee = match ARGUMENTS.get(ints) {
-        Some(register) => format!("mov r11, {register}"),
-        None => format!("mov r11, qword ptr [rsp + {}]", 8 + stack * 8),
+    // alloc: the stub's text, the output
+    let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\n");
+    _ = match ARGUMENTS.get(ints) {
+        Some(register) => write!(text, "mov r11, {register}"),
+        None => write!(text, "mov r11, qword ptr [rsp + {}]", 8 + stack * 8),
     };
-    format!(".globl {SYMBOL}\n{SYMBOL}:\n{callee}\nmov eax, 8\njmp r11\n")
+    text.push_str("\nmov eax, 8\njmp r11\n");
+    text
 }
 
 /// One operand of a block, as the function around it sees it.
@@ -521,18 +558,44 @@ pub(super) enum Operand<'a> {
 }
 
 /// The name in the text of the function or static that is operand `index`.
-fn sym(index: usize) -> String {
-    format!("{SYM}{index}")
+fn sym(index: usize) -> Sym {
+    Sym(index)
+}
+
+#[derive(Clone, Copy)]
+struct Sym(usize);
+
+impl std::fmt::Display for Sym {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{SYM}{}", self.0)
+    }
 }
 
 /// The name in a [`Wrapper`] of the label that is operand `index`.
-fn label(format: ObjectFormat, index: usize) -> String {
-    format!("{}blaze_label_{index}", format.local_label())
+fn label(format: ObjectFormat, index: usize) -> Label {
+    Label { format, index: Some(index) }
 }
 
 /// The name in a [`Wrapper`] of where every way out of the block meets.
-fn done(format: ObjectFormat) -> String {
-    format!("{}blaze_done", format.local_label())
+fn done(format: ObjectFormat) -> Label {
+    Label { format, index: None }
+}
+
+/// A local label of a [`Wrapper`]: an operand's, or `done`'s with no index.
+#[derive(Clone, Copy)]
+struct Label {
+    format: ObjectFormat,
+    index: Option<usize>,
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let local = self.format.local_label();
+        match self.index {
+            Some(index) => write!(f, "{local}blaze_label_{index}"),
+            None => write!(f, "{local}blaze_done"),
+        }
+    }
 }
 
 /// The labels among the operands, by index.
@@ -548,6 +611,7 @@ pub(super) fn naked(
     operands: &[Operand<'_>],
 ) -> Result<String, String> {
     let att = options.contains(AsmOptions::ATT_SYNTAX) && arch == Arch::X86_64;
+    // alloc: the function's text, the output
     let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\n");
     if att {
         text.push_str(".att_syntax\n");
@@ -557,8 +621,9 @@ pub(super) fn naked(
             AsmPiece::Lit(lit) => text.push_str(lit),
             AsmPiece::Operand { index, .. } => match operands.get(*index) {
                 Some(Operand::Const(value)) => _ = write!(text, "{value}"),
-                Some(Operand::Sym) => text.push_str(&sym(*index)),
+                Some(Operand::Sym) => _ = write!(text, "{}", sym(*index)),
                 _ => {
+                    // alloc: the error's message
                     return Err("a `naked_asm!` operand that is a register or a label".to_owned());
                 }
             },
@@ -570,6 +635,7 @@ pub(super) fn naked(
     }
     match arch {
         Arch::X86_64 | Arch::Aarch64 => Ok(text),
+        // alloc: the error's message
         Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
@@ -644,6 +710,7 @@ fn named(name: &str) -> Result<Reg, String> {
     let name = name.trim_matches('"');
     if let Some(row) = GPR.iter().position(|row| row.contains(&name)) {
         if row >= OPERANDS {
+            // alloc: the error's message
             return Err(format!("inline assembly that uses `{name}`"));
         }
         return Ok(Reg::Gpr(row));
@@ -663,21 +730,49 @@ fn named(name: &str) -> Result<Reg, String> {
         name.strip_prefix(prefix)
             .is_some_and(|rest| rest.trim_matches(['(', ')']).chars().all(|it| it.is_ascii_digit()))
     });
+    // alloc: the error's message
     if scratch { Ok(Reg::Scratch) } else { Err(format!("the register `{name}`")) }
 }
 
-fn vector_name(number: usize, size: u32) -> String {
+/// A register as the text names it: a whole name, or a prefix and a number.
+#[derive(Clone, Copy)]
+struct RegName(&'static str, Option<usize>);
+
+impl std::fmt::Display for RegName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)?;
+        match self.1 {
+            Some(number) => write!(f, "{number}"),
+            None => Ok(()),
+        }
+    }
+}
+
+fn vector_name(number: usize, size: u32) -> RegName {
     let prefix = match size {
         ..=16 => "xmm",
         32 => "ymm",
         _ => "zmm",
     };
-    format!("{prefix}{number}")
+    RegName(prefix, Some(number))
+}
+
+/// A place in the slot as Intel's syntax names it: `{width} ptr [rbx + {offset}]`.
+#[derive(Clone, Copy)]
+struct Memory {
+    width: &'static str,
+    offset: u32,
+}
+
+impl std::fmt::Display for Memory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ptr [rbx + {}]", self.width, self.offset)
+    }
 }
 
 /// The instruction that moves `size` bytes between `reg` and the slot, and the two as it
 /// names them.
-fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, String), String> {
+fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, RegName, Memory), String> {
     let width = match size {
         1 => "byte",
         2 => "word",
@@ -686,12 +781,13 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
         16 => "xmmword",
         32 => "ymmword",
         64 => "zmmword",
+        // alloc: the error's message
         _ => return Err(format!("an inline assembly operand of {size} bytes")),
     };
-    let memory = format!("{width} ptr [rbx + {offset}]");
+    let memory = Memory { width, offset };
     match reg {
         Reg::Gpr(row) if size <= 8 => {
-            Ok(("mov", GPR[row][3 - size.trailing_zeros() as usize].to_owned(), memory))
+            Ok(("mov", RegName(GPR[row][3 - size.trailing_zeros() as usize], None), memory))
         }
         Reg::Vector(number) if size >= 4 => {
             let instruction = match size {
@@ -702,26 +798,35 @@ fn transfer(reg: Reg, size: u32, offset: u32) -> Result<(&'static str, String, S
             };
             Ok((instruction, vector_name(number, size), memory))
         }
+        // alloc: the error's message
         _ => Err(format!("an inline assembly operand of {size} bytes in such a register")),
     }
 }
 
-/// The instructions that move a mask of `size` bytes between `k{number}` and the slot (`load`)
-/// or back. AVX512F moves 16 bits; a byte goes through `eax`, as LLVM moves one without
-/// AVX512DQ, and 32 and 64 bits need AVX512BW, which LLVM needs for a mask of them too.
-fn mask_transfer(load: bool, number: usize, size: u32, offset: u32) -> Result<String, String> {
-    let memory = |width: &str| format!("{width} ptr [rbx + {offset}]");
-    Ok(match (load, size) {
-        (true, 1) => format!("movzx eax, {}\nkmovw k{number}, eax", memory("byte")),
-        (false, 1) => format!("kmovw eax, k{number}\nmov {}, al", memory("byte")),
-        (true, 2) => format!("kmovw k{number}, {}", memory("word")),
-        (true, 4) => format!("kmovd k{number}, {}", memory("dword")),
-        (true, 8) => format!("kmovq k{number}, {}", memory("qword")),
-        (false, 2) => format!("kmovw {}, k{number}", memory("word")),
-        (false, 4) => format!("kmovd {}, k{number}", memory("dword")),
-        (false, 8) => format!("kmovq {}, k{number}", memory("qword")),
+/// Writes the instructions that move a mask of `size` bytes between `k{number}` and the slot
+/// (`load`) or back. AVX512F moves 16 bits; a byte goes through `eax`, as LLVM moves one
+/// without AVX512DQ, and 32 and 64 bits need AVX512BW, which LLVM needs for a mask of them too.
+fn mask_transfer(
+    text: &mut String,
+    load: bool,
+    number: usize,
+    size: u32,
+    offset: u32,
+) -> Result<(), String> {
+    let memory = |width: &'static str| Memory { width, offset };
+    _ = match (load, size) {
+        (true, 1) => writeln!(text, "movzx eax, {}\nkmovw k{number}, eax", memory("byte")),
+        (false, 1) => writeln!(text, "kmovw eax, k{number}\nmov {}, al", memory("byte")),
+        (true, 2) => writeln!(text, "kmovw k{number}, {}", memory("word")),
+        (true, 4) => writeln!(text, "kmovd k{number}, {}", memory("dword")),
+        (true, 8) => writeln!(text, "kmovq k{number}, {}", memory("qword")),
+        (false, 2) => writeln!(text, "kmovw {}, k{number}", memory("word")),
+        (false, 4) => writeln!(text, "kmovd {}, k{number}", memory("dword")),
+        (false, 8) => writeln!(text, "kmovq {}, k{number}", memory("qword")),
+        // alloc: the error's message
         _ => return Err(format!("an inline assembly operand of {size} bytes in a mask register")),
-    })
+    };
+    Ok(())
 }
 
 /// The function for a block, in the assembly of the architecture.
@@ -732,12 +837,14 @@ pub(super) fn wrapper(
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
     if options.contains(AsmOptions::MAY_UNWIND) {
+        // alloc: the error's message
         return Err("inline assembly that unwinds".to_owned());
     }
     let format = target.object_format;
     match target.arch {
         Arch::X86_64 => wrapper_x86_64(format, template, options, operands),
         Arch::Aarch64 => aarch64::wrapper(format, template, options, operands),
+        // alloc: the error's message
         Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
@@ -750,13 +857,13 @@ fn wrapper_x86_64(
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
     // The registers the operands name come first: a class takes one of what is left.
-    let mut regs = vec![None; operands.len()];
+    let mut regs: SmallVec<[Option<Reg>; 8]> = SmallVec::from_elem(None, operands.len());
     for (index, operand) in operands.iter().enumerate() {
         if let Operand::Reg { reg: InlineAsmRegOrRegClass::Reg(name), .. } = operand {
             regs[index] = Some(named(name.as_str())?);
         }
     }
-    let mut classes = vec![""; operands.len()];
+    let mut classes: SmallVec<[&str; 8]> = SmallVec::from_elem("", operands.len());
     for (index, operand) in operands.iter().enumerate() {
         let Operand::Reg { reg: InlineAsmRegOrRegClass::RegClass(class), .. } = operand else {
             continue;
@@ -769,29 +876,30 @@ fn wrapper_x86_64(
             "reg_abcd" => (0..3).map(Reg::Gpr).find(|&it| free(it)),
             "xmm_reg" | "ymm_reg" | "zmm_reg" => (0..16).map(Reg::Vector).find(|&it| free(it)),
             "kreg" => (1..8).map(Reg::Mask).find(|&it| free(it)),
+            // alloc: the error's message
             _ => return Err(format!("the register class `{class}`")),
         };
         let Some(found) = found else {
+            // alloc: the error's message
             return Err(format!("inline assembly with more `{class}` operands than registers"));
         };
         regs[index] = Some(found);
     }
 
     let convention = Convention::of_target();
-    let kept: Vec<usize> = convention
-        .kept
-        .iter()
-        .copied()
-        .filter(|&row| regs.contains(&Some(Reg::Gpr(row))))
-        .collect();
-    let kept_vectors: Vec<usize> =
-        convention.kept_vectors.filter(|&it| regs.contains(&Some(Reg::Vector(it)))).collect();
+    let mut kept: SmallVec<[usize; 8]> = SmallVec::new();
+    kept.extend(convention.kept.iter().copied().filter(|&row| regs.contains(&Some(Reg::Gpr(row)))));
+    let mut kept_vectors: SmallVec<[usize; 16]> = SmallVec::new();
+    kept_vectors
+        .extend(convention.kept_vectors.filter(|&it| regs.contains(&Some(Reg::Vector(it)))));
     let kept_at = kept_vectors.len() * 16;
     let mut slot_size = (kept_at + kept.len() * 8) as u32;
+    // alloc: the wrapper's offsets, part of the output
     let mut offsets = vec![None; operands.len()];
     for (index, operand) in operands.iter().enumerate() {
         let Operand::Reg { size: Some(size), .. } = *operand else { continue };
         if !size.is_power_of_two() {
+            // alloc: the error's message
             return Err(format!("an inline assembly operand of {size} bytes"));
         }
         slot_size = slot_size.next_multiple_of(size.min(16));
@@ -808,6 +916,7 @@ fn wrapper_x86_64(
     };
 
     let slot = GPR[convention.arguments[0]][0];
+    // alloc: the wrapper's text, the output
     let mut text = format!(".globl {SYMBOL}\n{SYMBOL}:\npush rbx\nmov rbx, {slot}\n");
     for (at, &row) in kept.iter().enumerate() {
         _ = writeln!(text, "mov qword ptr [rbx + {}], {}", kept_at + at * 8, GPR[row][0]);
@@ -818,7 +927,7 @@ fn wrapper_x86_64(
     // A mask of one byte goes through `eax`, before any operand is there.
     for (reg, size, offset, input, _) in values() {
         if let (Reg::Mask(number), true) = (reg, input) {
-            _ = writeln!(text, "{}", mask_transfer(true, number, size, offset)?);
+            mask_transfer(&mut text, true, number, size, offset)?;
         }
     }
     for (reg, size, offset, input, _) in values() {
@@ -851,37 +960,40 @@ fn wrapper_x86_64(
                 continue;
             }
             (Some(Operand::Label), _) => {
-                text.push_str(&label(format, index));
+                _ = write!(text, "{}", label(format, index));
                 continue;
             }
             (_, Some(Reg::Gpr(row))) => {
                 let modifier = modifier.or((classes[index] == "reg_byte").then_some('l'));
-                match modifier {
+                let name = match modifier {
                     None | Some('r') => GPR[row][0],
                     Some('e') => GPR[row][1],
                     Some('x') => GPR[row][2],
                     Some('l') => GPR[row][3],
                     Some('h') if row < HIGH.len() => HIGH[row],
+                    // alloc: the error's message
                     Some(other) => return Err(format!("the operand modifier `{other}`")),
-                }
-                .to_owned()
+                };
+                RegName(name, None)
             }
-            (_, Some(Reg::Mask(number))) if modifier.is_none() => format!("k{number}"),
+            (_, Some(Reg::Mask(number))) if modifier.is_none() => RegName("k", Some(number)),
             (_, Some(Reg::Vector(number))) => {
                 let size = match (modifier, classes[index]) {
                     (Some('x'), _) | (None, "xmm_reg") => 16,
                     (Some('y'), _) | (None, "ymm_reg") => 32,
                     (Some('z'), _) | (None, _) => 64,
+                    // alloc: the error's message
                     (Some(other), _) => return Err(format!("the operand modifier `{other}`")),
                 };
                 vector_name(number, size)
             }
+            // alloc: the error's message
             _ => return Err("an inline assembly template that names no operand".to_owned()),
         };
         if att {
             text.push('%');
         }
-        text.push_str(&name);
+        _ = write!(text, "{name}");
     }
     text.push('\n');
     if att {
@@ -898,7 +1010,7 @@ fn wrapper_x86_64(
         // After every other output is written, as one of a byte goes through `eax`.
         for (reg, size, offset, _, output) in values() {
             if let (Reg::Mask(number), true) = (reg, output) {
-                _ = writeln!(text, "{}", mask_transfer(false, number, size, offset)?);
+                mask_transfer(&mut text, false, number, size, offset)?;
             }
         }
         if labels(operands).next().is_some() {
@@ -943,28 +1055,111 @@ pub(super) struct Inline {
     pub(super) options: AsmOptions,
 }
 
-/// The blocks given to LLVM as inline assembly, by the text of their wrappers, which is what
-/// the request of the call of one says. `None` where two blocks of one wrapper are not one
-/// block.
-static INLINE: std::sync::LazyLock<Mutex<FxHashMap<String, Option<Arc<Inline>>>>> =
-    std::sync::LazyLock::new(Mutex::default);
+/// An append-only map shared by the threads compiling, as `docs/v2/plan/design/concurrency.md`
+/// asks of one: each entry is a slot set once, with its key, in a level of slots probed from
+/// the key's hash, and a level whose probes are all taken leads to the next, of twice as many,
+/// so nothing is moved or rehashed and a lookup is acquire loads alone. Two threads that set
+/// one slot meet on it for the move of an entry, never while one computes it.
+struct Table<K, V> {
+    levels: [OnceLock<Box<[OnceLock<(K, V)>]>>; LEVELS],
+}
 
-/// Keeps `inline` as the block the wrapper of `text` is.
-pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
-    let mut known = INLINE.lock().unwrap_or_else(|e| e.into_inner());
-    match known.get_mut(text) {
-        Some(kept) => {
-            if kept.as_deref() != inline.as_ref() {
-                *kept = None;
+/// Levels of a [`Table`], the first of `FIRST` slots: room for 2^36 entries.
+const LEVELS: usize = 26;
+const FIRST: usize = 1 << 10;
+/// The slots of a level a key may be in, from the one its hash names on.
+const PROBES: usize = 16;
+
+impl<K: PartialEq, V> Table<K, V> {
+    const fn new() -> Table<K, V> {
+        Table { levels: [const { OnceLock::new() }; LEVELS] }
+    }
+
+    /// The slots `hash` may be in, in the order every lookup and insert takes them. An insert
+    /// (`make`) makes a level the first time a key gets to it; a lookup stops before one that
+    /// is not made, as no key is in it.
+    fn slots(&self, hash: u64, make: bool) -> impl Iterator<Item = &OnceLock<(K, V)>> {
+        let levels = self.levels.iter().enumerate().map_while(move |(at, level)| match make {
+            // alloc: a level, made once per process
+            true => Some(level.get_or_init(|| (0..FIRST << at).map(|_| OnceLock::new()).collect())),
+            false => level.get(),
+        });
+        levels.flat_map(move |level| {
+            let mask = level.len() - 1;
+            (0..PROBES).map(move |probe| &level[(hash as usize).wrapping_add(probe) & mask])
+        })
+    }
+
+    /// The entry of `key`. A key is in the first slot of its order that was empty when it was
+    /// added, so an empty slot before it means there is none.
+    fn get(&self, hash: u64, key: &(impl PartialEq<K> + ?Sized)) -> Option<&(K, V)> {
+        for slot in self.slots(hash, false) {
+            match slot.get() {
+                Some(entry) if *key == entry.0 => return Some(entry),
+                Some(_) => {}
+                None => return None,
             }
         }
-        None => _ = known.insert(text.to_owned(), inline.map(Arc::new)),
+        None
+    }
+
+    /// The entry of `key`: `value` if there was none, else the one there was (another thread
+    /// may have added it first), and `value` is dropped. `None` when every level is full.
+    fn insert(&self, hash: u64, key: K, value: V) -> Option<&(K, V)> {
+        let mut entry = Some((key, value));
+        for slot in self.slots(hash, true) {
+            if let Some(new) = entry.take() {
+                entry = slot.set(new).err();
+            }
+            let kept = slot.get().expect("a slot is set once it was tried");
+            match &entry {
+                None => return Some(kept),
+                Some(new) if new.0 == kept.0 => return Some(kept),
+                Some(_) => {}
+            }
+        }
+        None
     }
 }
 
-/// The block the wrapper of `text` is, as LLVM's inline assembly.
-pub(super) fn inline_of(text: &str) -> Option<Arc<Inline>> {
-    INLINE.lock().unwrap_or_else(|e| e.into_inner()).get(text).cloned().flatten()
+/// The blocks given to LLVM as inline assembly, by the text of their wrappers, which is what
+/// the request of the call of one says.
+static INLINE: Table<String, Kept> = Table::new();
+
+/// The first block kept for a wrapper, and whether another block that is not it has the same
+/// wrapper since, which makes the wrapper none of them: a flag, so the entry stays as it was
+/// published.
+struct Kept {
+    inline: Option<Arc<Inline>>,
+    other: AtomicBool,
+}
+
+/// Keeps `inline` as the block the wrapper of `text` is.
+pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
+    let hash = FixedState.hash_one(text);
+    let inline = inline.map(Arc::new);
+    let (_, found) = match INLINE.get(hash, text) {
+        Some(found) => found,
+        None => {
+            // clone: an `Arc`, once per wrapper text the process has not kept
+            let kept = Kept { inline: inline.clone(), other: false.into() };
+            // alloc: the key the process keeps, once per wrapper text
+            INLINE.insert(hash, text.to_owned(), kept).expect("2^36 blocks of assembly at most")
+        }
+    };
+    if found.inline != inline {
+        found.other.store(true, Ordering::Release);
+    }
+}
+
+/// The block the wrapper of `text` is, as LLVM's inline assembly, read with no write another
+/// core sees.
+pub(super) fn inline_block(text: &str) -> Option<&'static Inline> {
+    let (_, kept) = INLINE.get(FixedState.hash_one(text), text)?;
+    match kept.other.load(Ordering::Acquire) {
+        true => None,
+        false => kept.inline.as_deref(),
+    }
 }
 
 /// The block as LLVM's inline assembly, where it is one LLVM takes as rustc's LLVM does:
@@ -1008,7 +1203,7 @@ pub(super) fn inline(
     };
     let names_frame = |lit: &str| {
         lit.split(|it: char| !it.is_ascii_alphanumeric())
-            .any(|word| frame_pointer.contains(&word.to_ascii_lowercase().as_str()))
+            .any(|word| frame_pointer.iter().any(|it| it.eq_ignore_ascii_case(word)))
     };
     for piece in template {
         if let AsmPiece::Lit(lit) = piece
@@ -1027,42 +1222,45 @@ pub(super) fn inline(
             AsmPiece::Operand { modifier, .. } => *modifier == Some('h'),
             AsmPiece::Lit(lit) => lit
                 .split(|it: char| !it.is_ascii_alphanumeric())
-                .any(|word| ["ah", "bh", "ch", "dh"].contains(&word.to_ascii_lowercase().as_str())),
+                .any(|word| ["ah", "bh", "ch", "dh"].iter().any(|it| it.eq_ignore_ascii_case(word))),
         }) || operands.iter().any(|operand| {
             matches!(operand, Operand::Reg { reg: InlineAsmRegOrRegClass::Reg(name), .. }
                 if HIGH.contains(&name.as_str().trim_matches('"')))
         }));
-    let constraint = |reg: &InlineAsmRegOrRegClass| -> Option<String> {
+    let constraint = |reg: &InlineAsmRegOrRegClass| -> Option<Code> {
         match (arch, reg) {
             (Arch::X86_64, InlineAsmRegOrRegClass::Reg(name)) => {
                 let name = name.as_str().trim_matches('"');
                 match named(name).ok()? {
-                    Reg::Gpr(row) if !HIGH.contains(&name) => {
-                        Some(format!("{{{}}}", X86_LLVM[row]))
-                    }
+                    Reg::Gpr(row) if !HIGH.contains(&name) => Some(Code::X86(X86_LLVM[row])),
                     _ => None,
                 }
             }
             (Arch::X86_64, InlineAsmRegOrRegClass::RegClass(class)) => match class.as_str() {
-                "reg" => Some("r".to_owned()),
-                "reg_abcd" => Some("Q".to_owned()),
-                "reg_byte" if high_byte => Some("Q".to_owned()),
-                "reg_byte" => Some("q".to_owned()),
+                "reg" => Some(Code::Class("r")),
+                "reg_abcd" => Some(Code::Class("Q")),
+                "reg_byte" if high_byte => Some(Code::Class("Q")),
+                "reg_byte" => Some(Code::Class("q")),
                 _ => None,
             },
             (Arch::Aarch64, InlineAsmRegOrRegClass::Reg(name)) => {
-                aarch64::llvm_register(name.as_str())
+                aarch64::llvm_register(name.as_str()).map(Code::Aarch64)
             }
             (Arch::Aarch64, InlineAsmRegOrRegClass::RegClass(class)) => {
-                (class.as_str() == "reg").then(|| "r".to_owned())
+                (class.as_str() == "reg").then_some(Code::Class("r"))
             }
             _ => None,
         }
     };
-    let (mut outputs, mut inputs, mut clobbers) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut out_codes, mut in_codes) = (Vec::new(), Vec::new());
+    // alloc: the outputs, part of the output
+    let mut outputs = Vec::new();
+    // alloc: the inputs, part of the output
+    let mut inputs = Vec::new();
+    let mut clobbers: SmallVec<[Code; 4]> = SmallVec::new();
+    let mut out_codes: SmallVec<[Code; 8]> = SmallVec::new();
+    let mut in_codes: SmallVec<[In; 8]> = SmallVec::new();
     // What LLVM numbers each operand that is a register: the outputs first.
-    let mut numbers = vec![None; operands.len()];
+    let mut numbers: SmallVec<[Option<usize>; 8]> = SmallVec::from_elem(None, operands.len());
     for (index, operand) in operands.iter().enumerate() {
         let Operand::Reg { reg, size, output, input, written } = *operand else { continue };
         let code = constraint(reg)?;
@@ -1074,16 +1272,16 @@ pub(super) fn inline(
         match (input, output, written) {
             (_, true, _) => {
                 numbers[index] = Some(out_codes.len());
-                out_codes.push(format!("=&{code}"));
+                out_codes.push(code);
                 outputs.push((Some(offsets[index]?), size));
             }
             (false, false, _) if matches!(reg, InlineAsmRegOrRegClass::Reg(_)) => {
-                clobbers.push(format!("~{code}"));
+                clobbers.push(code);
             }
             // An output nothing reads: a register the block overwrites, an input's too.
             (false, false, _) | (true, false, true) => {
                 numbers[index] = Some(out_codes.len());
-                out_codes.push(format!("=&{code}"));
+                out_codes.push(code);
                 outputs.push((None, size));
             }
             (true, false, false) => {}
@@ -1094,20 +1292,26 @@ pub(super) fn inline(
             continue;
         };
         let code = match (output || written, numbers[index]) {
-            (true, Some(tied)) => tied.to_string(),
+            (true, Some(tied)) => In::Tied(tied),
             _ => {
                 numbers[index] = Some(out_codes.len() + in_codes.len());
-                constraint(reg)?
+                In::Code(constraint(reg)?)
             }
         };
         in_codes.push(code);
         inputs.push((offsets[index]?, size));
     }
+    // alloc: the template, the output
     let mut text = String::new();
     for piece in template {
         let (index, modifier) = match piece {
             AsmPiece::Lit(lit) => {
-                text.push_str(&lit.replace('$', "$$"));
+                for (at, part) in lit.split('$').enumerate() {
+                    if at > 0 {
+                        text.push_str("$$");
+                    }
+                    text.push_str(part);
+                }
                 continue;
             }
             AsmPiece::Operand { index, modifier } => (*index, *modifier),
@@ -1135,18 +1339,31 @@ pub(super) fn inline(
             _ => return None,
         }
     }
+    // alloc: the constraints, the output
+    let mut constraints = String::new();
+    for code in &out_codes {
+        _ = write!(constraints, "=&{code},");
+    }
+    for code in &in_codes {
+        _ = match code {
+            In::Tied(tied) => write!(constraints, "{tied},"),
+            In::Code(code) => write!(constraints, "{code},"),
+        };
+    }
+    for code in &clobbers {
+        _ = write!(constraints, "~{code},");
+    }
     if !options.contains(AsmOptions::PRESERVES_FLAGS) {
         match arch {
-            Arch::X86_64 => {
-                clobbers.extend(["~{dirflag}", "~{fpsr}", "~{flags}"].map(String::from))
-            }
-            _ => clobbers.push("~{cc}".to_owned()),
+            Arch::X86_64 => constraints.push_str("~{dirflag},~{fpsr},~{flags},"),
+            _ => constraints.push_str("~{cc},"),
         }
     }
     if !options.contains(AsmOptions::NOMEM) {
-        clobbers.push("~{memory}".to_owned());
+        constraints.push_str("~{memory},");
     }
-    let constraints = [out_codes, in_codes, clobbers].concat().join(",");
+    // Every constraint above ends in the comma that comes before the next.
+    constraints.pop();
     Some(Inline { text, constraints, outputs, inputs, options })
 }
 
@@ -1154,9 +1371,36 @@ pub(super) fn inline(
 const X86_LLVM: [&str; 13] =
     ["ax", "cx", "dx", "si", "di", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
 
+/// A constraint LLVM's inline assembly takes for an operand: a class's letter, or a register.
+#[derive(Clone, Copy)]
+enum Code {
+    Class(&'static str),
+    /// By its name in `X86_LLVM`.
+    X86(&'static str),
+    /// `x{number}`.
+    Aarch64(u8),
+}
+
+impl std::fmt::Display for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Code::Class(letter) => f.write_str(letter),
+            Code::X86(name) => write!(f, "{{{name}}}"),
+            Code::Aarch64(number) => write!(f, "{{x{number}}}"),
+        }
+    }
+}
+
+/// The constraint of an input: tied to the output LLVM numbers so, or a [`Code`] of its own.
+#[derive(Clone, Copy)]
+enum In {
+    Tied(usize),
+    Code(Code),
+}
+
 /// The machine code of a function, and where in it the operands it names go.
 #[derive(Default)]
-pub(super) struct Assembled {
+pub struct Assembled {
     pub(super) code: Vec<u8>,
     pub(super) relocs: Vec<Named>,
 }
@@ -1166,25 +1410,12 @@ pub(super) struct Named {
     pub(super) offset: u32,
     pub(super) kind: Reloc,
     /// The type ELF has for it, when Cranelift has no kind for that and `kind` stands in:
-    /// see [`Code::elf_types`](super::fragment::Code).
+    /// see [`Reloc::elf_type`](super::fragment::Reloc).
     pub(super) elf_type: Option<u32>,
     /// The index of the operand.
     pub(super) operand: u32,
     pub(super) addend: i64,
 }
-
-/// The relocations a `sym` is assembled to, each with the number it is stored as.
-const RELOCS: [Reloc; 9] = [
-    Reloc::X86PCRel4,
-    Reloc::X86CallPLTRel4,
-    Reloc::X86GOTPCRel4,
-    Reloc::Abs8,
-    Reloc::Arm64Call,
-    Reloc::Aarch64AdrPrelPgHi21,
-    Reloc::Aarch64AddAbsLo12Nc,
-    Reloc::Aarch64AdrGotPage21,
-    Reloc::Aarch64Ld64GotLo12Nc,
-];
 
 impl Named {
     /// What Cranelift calls the relocation an assembler wrote for a `sym`, by the format
@@ -1224,7 +1455,7 @@ impl Named {
                     | elf::R_AARCH64_LDST32_ABS_LO12_NC
                     | elf::R_AARCH64_LDST64_ABS_LO12_NC
                     | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
-                        return Some((Reloc::Aarch64AddAbsLo12Nc, Some(r_type)));
+                        return Some((Reloc::Aarch64AddAbsLo12Nc, Some(r_type.0)));
                     }
                     _ => return None,
                 }
@@ -1260,74 +1491,50 @@ impl Named {
     }
 }
 
-impl Assembled {
-    /// The bytes the store keeps.
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = (self.code.len() as u32).to_le_bytes().to_vec();
-        bytes.extend_from_slice(&self.code);
-        for named in &self.relocs {
-            let kind = RELOCS.iter().position(|it| *it == named.kind).unwrap_or(RELOCS.len());
-            bytes.extend_from_slice(&named.offset.to_le_bytes());
-            bytes.push(kind as u8);
-            bytes.extend_from_slice(&named.elf_type.unwrap_or(0).to_le_bytes());
-            bytes.extend_from_slice(&named.operand.to_le_bytes());
-            bytes.extend_from_slice(&named.addend.to_le_bytes());
-        }
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
-        let (len, rest) = bytes.split_first_chunk()?;
-        let (code, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
-        let (records, []) = rest.as_chunks::<21>() else { return None };
-        let relocs = records.iter().map(|record| {
-            let (offset, rest) = record.split_first_chunk()?;
-            let (&kind, rest) = rest.split_first()?;
-            let (elf_type, rest) = rest.split_first_chunk()?;
-            let (operand, rest) = rest.split_first_chunk()?;
-            Some(Named {
-                offset: u32::from_le_bytes(*offset),
-                kind: *RELOCS.get(usize::from(kind))?,
-                // No relocation that is read has the type 0.
-                elf_type: Some(u32::from_le_bytes(*elf_type)).filter(|it| *it != 0),
-                operand: u32::from_le_bytes(*operand),
-                addend: i64::from_le_bytes(rest.try_into().ok()?),
-            })
-        });
-        Some(Assembled { code: code.to_vec(), relocs: relocs.collect::<Option<_>>()? })
-    }
-}
-
 /// The machine code of the function that `text` defines. Each text is assembled once: the
-/// store keeps the code, as it does a compiled function's.
-pub(super) fn assemble(triple: &str, text: &str) -> Result<Arc<Assembled>, String> {
-    static ASSEMBLED: OnceLock<Mutex<FxHashMap<[u8; 32], Arc<Assembled>>>> = OnceLock::new();
-    let mut hasher = Sha256::new();
-    hasher.update(b"blaze asm 3");
-    hasher.update(triple);
-    hasher.update([0]);
-    hasher.update(text);
-    let key: [u8; 32] = hasher.finalize().into();
-    let assembled = ASSEMBLED.get_or_init(Mutex::default);
-    // Also after a thread panicked with it: the map is whole between any two statements.
-    let known =
-        |key: &[u8; 32]| assembled.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned();
-    if let Some(code) = known(&key) {
+/// process keeps the code for as long as it runs. A thread that asked for a text before has it from its own table, with no
+/// write another core sees and no hash of the text but `blaze_hash`'s; one that has not looks in
+/// the shared [`Table`] by its BLAKE3 hash, with loads alone.
+pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
+    thread_local! {
+        /// What this thread had assembled for the triple it names, by text.
+        static SEEN: RefCell<(String, HashMap<Box<str>, &'static Assembled>)> =
+            RefCell::default();
+    }
+    let seen = SEEN.with_borrow(|(of, seen)| match of == triple {
+        true => seen.get(text).copied(),
+        false => None,
+    });
+    if let Some(code) = seen {
         return Ok(code);
     }
-    let store = Store::global();
-    let kept = store.and_then(|it| it.get(&key)).and_then(|it| Assembled::from_bytes(&it));
-    let code = Arc::new(match kept {
-        Some(code) => code,
-        None => {
-            let code = Assembler::selected().assemble(triple, text, &key)?;
-            if let Some(store) = store {
-                store.insert(&key, &code.to_bytes());
-            }
-            code
+    let code = assembled(triple, text)?;
+    SEEN.with_borrow_mut(|(of, seen)| {
+        if of != triple {
+            triple.clone_into(of);
+            seen.clear();
         }
+        seen.insert(text.into(), code);
     });
-    assembled.lock().unwrap_or_else(|e| e.into_inner()).insert(key, code.clone());
+    Ok(code)
+}
+
+/// [`assemble`] of a text this thread has not asked for.
+fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
+    static ASSEMBLED: Table<[u8; 32], Assembled> = Table::new();
+    let mut hasher = blaze_ids::b3::Hasher::new_derive_key("blaze asm 4");
+    hasher.update(triple.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(text.as_bytes());
+    let key: [u8; 32] = hasher.finalize();
+    // A digest's bytes are as good a hash as any of them.
+    let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
+    if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
+        return Ok(code);
+    }
+    let code = Assembler::selected().assemble(triple, text, &key)?;
+    // Two threads may both have assembled it: the first one kept is the one all are given.
+    let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
     Ok(code)
 }
 
@@ -1344,7 +1551,9 @@ enum Assembler {
 
 impl Assembler {
     fn selected() -> Assembler {
-        if std::env::var("BLAZE_ASSEMBLER").as_deref() == Ok("cc") {
+        static CC: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").is_some_and(|it| it == "cc"));
+        if *CC {
             return Assembler::Cc;
         }
         #[cfg(feature = "llvm")]
@@ -1365,9 +1574,12 @@ impl Assembler {
 /// The text as rustc hands it to the assembler: `asm!` is in Intel's syntax on x86-64.
 fn as_rustc_gives_it(triple: &str, text: &str) -> String {
     if triple.starts_with("x86_64") {
+        // alloc: once per text a C compiler assembles, beside the process it spawns
         let text: Vec<String> = text.lines().map(hash_comment).collect();
+        // alloc: once per text a C compiler assembles, beside the process it spawns
         format!(".intel_syntax noprefix\n{}\n.att_syntax\n", text.join("\n"))
     } else {
+        // alloc: once per text a C compiler assembles, beside the process it spawns
         format!("{text}\n")
     }
 }
@@ -1385,6 +1597,7 @@ fn hash_comment(line: &str) -> String {
                     Some((_, '\\')) => _ = chars.next(),
                     Some((_, '"')) => break,
                     Some(_) => {}
+                    // alloc: once per line a C compiler assembles, beside the process it spawns
                     None => return line.to_owned(),
                 }
             },
@@ -1393,15 +1606,18 @@ fn hash_comment(line: &str) -> String {
                     chars.next();
                 }
                 if !matches!(chars.next(), Some((_, '\''))) {
+                    // alloc: once per line a C compiler assembles, beside the process it spawns
                     return line.to_owned();
                 }
             }
             '/' if matches!(chars.peek(), Some((_, '/'))) => {
+                // alloc: once per line a C compiler assembles, beside the process it spawns
                 return format!("{}#{}", &line[..at], &line[at + 2..]);
             }
             _ => {}
         }
     }
+    // alloc: once per line a C compiler assembles, beside the process it spawns
     line.to_owned()
 }
 
@@ -1410,10 +1626,12 @@ fn hash_comment(line: &str) -> String {
 fn c_compiler(triple: &str) -> Option<(PathBuf, Vec<String>)> {
     let paths = std::env::var_os("PATH")?;
     let find = |name: &str| {
+        // alloc: once per text a C compiler assembles, beside the process it spawns
         let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
         std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())
     };
     if let Some(clang) = find("clang") {
+        // alloc: the spawned compiler's arguments, beside the process
         return Some((clang, vec![format!("--target={triple}")]));
     }
     let host = triple.starts_with(std::env::consts::ARCH)
@@ -1422,6 +1640,7 @@ fn c_compiler(triple: &str) -> Option<(PathBuf, Vec<String>)> {
             "linux" => triple.contains("-linux-"),
             _ => false,
         };
+    // alloc: empty, allocates nothing
     Some((find("cc").filter(|_| host)?, Vec::new()))
 }
 
@@ -1431,6 +1650,7 @@ fn no_assembler(triple: &str) -> String {
     let host = triple.starts_with(std::env::consts::ARCH)
         && matches!(std::env::consts::OS, "macos" | "linux");
     let or_cc = if host { " or a C compiler (`cc`)" } else { "" };
+    // alloc: the error's message
     format!(
         "inline assembly: nothing here assembles it for {triple}. This blaze was built without \
          LLVM, so it assembles `asm!` with clang{or_cc}, and there is none on PATH: install \
@@ -1444,9 +1664,14 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name: String =
+        // alloc: the object's file name, once per text a C compiler assembles
         key[..8].iter().map(|it| format!("{it:02x}")).chain([format!("-{run}.o")]).collect();
+    // alloc: the directory's name, once per text a C compiler assembles
     let dir = std::env::temp_dir().join(format!("blaze-asm-{}", std::process::id()));
-    let failed = |what: &str, e: &dyn std::fmt::Display| format!("inline assembly: {what}: {e}");
+    fn failed(what: &str, e: impl std::fmt::Display) -> String {
+        // alloc: the error's message
+        format!("inline assembly: {what}: {e}")
+    }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Some(Err(failed("no directory to assemble in", &e)));
     }
@@ -1467,12 +1692,29 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
         drop(stdin);
         child.wait_with_output()
     });
+    // alloc: the compiler's name for an error, once per text a C compiler assembles
     let said = compiler.display().to_string();
     let code = match output {
         Ok(output) if output.status.success() => {
             std::fs::read(&object).map_err(|e| failed("no object", &e)).and_then(|it| code(&it))
         }
-        Ok(output) => Err(failed(&said, &String::from_utf8_lossy(&output.stderr).trim())),
+        // An `xcrun` shim (`/usr/bin/clang` without the command line tools) is one that runs
+        // and assembles nothing: the error names it and what would.
+        Ok(output) => {
+            // alloc: the error's message
+            let said_why = String::from_utf8_lossy(&output.stderr);
+            Err(failed(
+                // alloc: the error's message
+                &format!("{said}, the C compiler this blaze without LLVM assembles `asm!` with, failed"),
+                // alloc: the error's message
+                &format!(
+                    "{}; install a working clang or cc on PATH, or use a build of blaze with LLVM \
+                     (`--features llvm`)",
+                    said_why.trim()
+                ),
+            ))
+        }
+        // alloc: the error's message
         Err(e) => Err(failed(&format!("{said} did not run"), &e)),
     };
     _ = std::fs::remove_file(&object);
@@ -1481,7 +1723,10 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
 
 /// The function in an object that defines it alone.
 fn code(object: &[u8]) -> Result<Assembled, String> {
-    let failed = |e: &dyn std::fmt::Display| format!("inline assembly: {e}");
+    fn failed(e: impl std::fmt::Display) -> String {
+        // alloc: the error's message
+        format!("inline assembly: {e}")
+    }
     let file = object::File::parse(object).map_err(|e| failed(&e))?;
     let symbol = file
         .symbols()
@@ -1493,6 +1738,7 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
         .ok_or_else(|| failed(&"the function is in no section"))?;
     let bytes = section.data().map_err(|e| failed(&e))?;
     let start = symbol.address() - section.address();
+    // alloc: the code the process keeps, once per text assembled
     let mut code = bytes[start as usize..].to_vec();
     let format = file.format();
     // FIXME: a block that names a symbol of its own, or has data in another section.
@@ -1579,5 +1825,83 @@ mod tests {
         assert!(intel.contains("int 0x29\nmov eax, 5\n"), "{intel}");
         let att = text("movl $$7, %eax", AsmOptions::NORETURN | AsmOptions::ATT_SYNTAX);
         assert!(att.contains("movl $$7, %eax\n"), "{att}");
+    }
+
+    /// Threads that add the same keys at once, more of them than the first level holds, all
+    /// get back the one entry kept for a key, and the table then says what a `HashMap` of the
+    /// first entry of each key says: the safe model of it.
+    #[test]
+    fn a_table_keeps_one_entry_a_key_whoever_adds_it() {
+        use super::{BuildHasher, FIRST, FixedState, HashMap, Table};
+        let table: Table<u64, u64> = Table::new();
+        let keys = 4 * FIRST as u64;
+        let given = std::thread::scope(|scope| {
+            let threads = (0..8u64).map(|thread| {
+                let table = &table;
+                scope.spawn(move || {
+                    (0..keys)
+                        .map(|key| {
+                            let key = (key * 7 + thread * 13) % keys;
+                            let hash = FixedState.hash_one(key);
+                            (key, table.insert(hash, key, thread).expect("room").1)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            });
+            let threads = threads.collect::<Vec<_>>();
+            threads.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
+        });
+        let mut model = HashMap::default();
+        for (key, value) in given.into_iter().flatten() {
+            assert_eq!(*model.entry(key).or_insert(value), value, "key {key}");
+        }
+        assert_eq!(model.len() as u64, keys);
+        for key in 0..2 * keys {
+            let found = table.get(FixedState.hash_one(key), &key).map(|it| it.1);
+            assert_eq!(found, model.get(&key).copied(), "key {key}");
+        }
+    }
+
+    /// Keys of one hash fill its probes of a level and go on to the next levels, where each is
+    /// still found; a lookup of a key that is not there stops at the first empty slot.
+    #[test]
+    fn keys_of_one_hash_go_on_to_later_levels() {
+        use super::{PROBES, Table};
+        let table: Table<u32, u32> = Table::new();
+        let count = 3 * PROBES as u32 + 1;
+        for key in 0..count {
+            assert_eq!(table.insert(42, key, key + 1).map(|it| it.1), Some(key + 1));
+        }
+        assert!(table.levels[3].get().is_some() && table.levels[4].get().is_none());
+        for key in 0..count {
+            assert_eq!(table.get(42, &key).map(|it| it.1), Some(key + 1));
+        }
+        assert_eq!(table.get(42, &count), None);
+        assert!(table.levels[4].get().is_none(), "a lookup makes no level");
+    }
+
+    /// A wrapper two different blocks have is none of them, also for the first, which stays
+    /// as it was published; one block kept twice is that block.
+    #[test]
+    fn a_wrapper_of_two_blocks_is_neither() {
+        use super::{AsmOptions, Inline, inline_block, keep_inline};
+        let block = |text: &str| Inline {
+            text: text.into(),
+            constraints: "r".into(),
+            outputs: Vec::new(),
+            inputs: vec![(0, 8)],
+            options: AsmOptions::empty(),
+        };
+        let one = "a_wrapper_of_two_blocks_is_neither 1";
+        let two = "a_wrapper_of_two_blocks_is_neither 2";
+        keep_inline(one, Some(block("nop")));
+        keep_inline(one, Some(block("nop")));
+        assert_eq!(inline_block(one), Some(&block("nop")));
+        keep_inline(two, Some(block("nop")));
+        keep_inline(two, Some(block("pause")));
+        assert_eq!(inline_block(two), None);
+        keep_inline(two, Some(block("nop")));
+        assert_eq!(inline_block(two), None);
+        assert_eq!(inline_block("a_wrapper_of_two_blocks_is_neither 3"), None);
     }
 }

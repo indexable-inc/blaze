@@ -1,0 +1,40 @@
+{
+  "id": "00664",
+  "from_lane": "dedup",
+  "owner": "codegen",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/hir-ty-codegen/v2/hashes/tests.rs",
+    "crates/hir-ty-codegen/v2/refs/tests.rs",
+    "crates/hir-ty-codegen/v2/tests.rs",
+    "crates/hir-ty-mir/tests/mir/main.rs",
+    "crates/hir-ty-codegen/v2"
+  ],
+  "what": "## dedup: hir_def::test_items\n\nFrom `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). The fixture lookups\n`declarations`, `function`, `alias`, `static_named`, `constant` are written again in four test\nmodules of this lane's crates; the one copy is `hir_def::test_items` (`v2/requests/db.md`,\n`## dedup: hir_def::test_items`; same bodies, same panic messages). Each copy becomes a wrapper\nbinding the fixture's crate, so no call site changes. Apply once db lands it.\n\n- `crates/hir-ty-codegen/v2/hashes/tests.rs`: replace `fn declarations`, `fn function` and `fn alias`\n  (lines 34-74, with their `#[track_caller]`s) with\n  ```rust\n  #[track_caller]\n  fn function(db: &TestDB, name: &str) -> FunctionId {\n      hir_def::test_items::function(db, db.test_crate(), name)\n  }\n\n  #[track_caller]\n  fn alias(db: &TestDB, name: &str) -> TypeAliasId {\n      hir_def::test_items::type_alias(db, db.test_crate(), name)\n  }\n  ```\n  (nothing else in the file calls `declarations`); drop imports left unused\n  (`crate_def_map`, `FunctionSignature`, `TypeAliasSignature`, `ModuleDefId` if so).\n- `crates/hir-ty-codegen/v2/refs/tests.rs`: replace `fn declarations`, `fn function` and\n  `fn static_named` (lines 93-133) with\n  ```rust\n  #[track_caller]\n  fn function(db: &TestDB, name: &str) -> FunctionId {\n      hir_def::test_items::function(db, db.test_crate(), name)\n  }\n\n  #[track_caller]\n  fn static_named(db: &TestDB, name: &str) -> StaticId {\n      hir_def::test_items::static_item(db, db.test_crate(), name)\n  }\n  ```\n  (same import cleanup).\n- `crates/hir-ty-codegen/v2/tests.rs` 122-138: `fn function` becomes the same three-line\n  `hir_def::test_items::function(db, db.test_crate(), name)` wrapper.\n- `crates/hir-ty-mir/tests/mir/main.rs`: replace `fn declarations`, `fn function` and `fn constant`\n  (lines 25-66) with\n  ```rust\n  #[track_caller]\n  fn function(db: &TestDB, name: &str) -> FunctionId {\n      hir_def::test_items::function(db, db.test_crate(), name)\n  }\n\n  #[track_caller]\n  fn constant(db: &TestDB, name: &str) -> ConstId {\n      hir_def::test_items::constant(db, db.test_crate(), name)\n  }\n  ```\n  and drop `ModuleDefId`, `nameres::crate_def_map`, `signatures::{ConstSignature, FunctionSignature}`\n  from its `use hir_def::{..}` if nothing else there uses them.\n\nThese take `&TestDB` as `&Db`: `hir-ty-codegen`'s is already `type TestDB = base_db::Db;`;\n`hir-ty-mir/tests/mir/db.rs` is still a struct, which frontend-db-ty is turning into the same\nalias (common.md, \"The database is concrete\").\n\nStatus: open\n\n> applied by codegen-v2 (2026-10-29), the three `crates/hir-ty-codegen/v2/` items only: `hashes/tests.rs`, `refs/tests.rs` and `tests.rs` look their items up through `hir_def::test_items` as written in `v2/requests/db.md` (not yet in the tree, so they build once db lands it), with the imports left unused dropped. The `hir-ty-mir/tests/mir/main.rs` item is codegen-mir-store's.\n\n> applied by codegen-mir-store (2026-10-29): `hir-ty-mir/tests/mir/main.rs`'s `function` and `constant` are the two wrappers as written, `declarations` is gone and the `use hir_def` list is `{ConstId, FunctionId}` (builds once db lands `hir_def::test_items`).\n\n> forwarded to codegen (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:56:57Z",
+  "taken_by": "unify-front-mir",
+  "why": null,
+  "source": "v2/requests/codegen.md#dedup: hir_def::test_items",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:1665"
+    },
+    {
+      "at": "2026-10-30T08:55:35Z",
+      "by": "unify-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:57Z",
+      "by": "unify-front-mir",
+      "action": "done",
+      "note": "already in: codegen-v2 (hir-ty-codegen v2/hashes/tests.rs, v2/refs/tests.rs, v2/tests.rs) and codegen-mir-store (hir-ty-mir/tests/mir/main.rs:40,45); hir_def::test_items is in crates/hir-def/src/test_items.rs"
+    }
+  ]
+}

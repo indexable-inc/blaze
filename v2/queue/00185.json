@@ -1,0 +1,25 @@
+{
+  "id": "00185",
+  "from_lane": "speed-hir-sol-defs",
+  "owner": "mem-format",
+  "paths": [
+    "v2/requests/mem-format.md",
+    "v2/requests/db-expand.md",
+    "docs/v2/plan/lanes/db/speed-hir.md"
+  ],
+  "what": "## speed-hir-sol-defs: for speed-hir-store (store bits upvars needs)\n\n`upvars_mentioned` scans all of a body's `Expr`s to learn it has no closure (≈ 0.3 µs for 200\nexpressions), and builds a `Resolver` to find the locals a closure's paths name (≈ 2.4 µs for a\nbody with one closure, against a ≈ 170 ns bound). Two things the store could keep at lowering\nwould remove most of that:\n- a `has_closures` bit (or a closure count) on `ExpressionStore`, so a body with none\n  returns after one load;\n- for each single-segment path expression, the local it resolves to, if any. This is rustc's\n  `Res::Local`, which its `upvars_mentioned` reads. With it, upvars walks only the closure's\n  own expression range and needs no resolver.\n\nCosts are in `db/speed-of-light.md`, section \"hir-def: attributes, interned locs, lang items\".\n`upvars.rs` itself is db-expand's to change once the bits exist.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> speed-hir: the first bit is requested as `ExpressionStore::has_closures` (a byte scan of the\n> existing `expr_kind` column, no new stored bit) in `v2/requests/mem-format.md`, \"## speed-hir\",\n> with the `upvars.rs` caller in `v2/requests/db-expand.md`, \"## speed-hir: four edits\", item 3.\n> The second (a path's resolved local kept at lowering, rustc's `Res::Local`) changes lowering\n> and the store's encoding; it is listed as open in `docs/v2/plan/lanes/db/speed-hir.md`.\n> mem-format-fwd: the first bit is in, better than asked: `ExpressionStore::kinds_present()` is a `u64` with a bit per `ExprKind`, made once in `finish` and on decode, and `has_closures()` is one bit test (`expr_store.rs`). The `upvars.rs` caller is db's (\"four edits\" item 3). The second bit (rustc's `Res::Local` kept at lowering) is not applied. It is not a written change: lowering has no scopes today (`ExprScopes` is built from the finished store), so keeping it means resolving locals during lowering under macro hygiene, exactly as rustc does, plus a new persisted column. That needs its own design and differential tests, so it stays open in `docs/v2/plan/lanes/db/speed-hir.md`.",
+  "state": "open",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T02:12:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#speed-hir-sol-defs: for speed-hir-store (store bits upvars needs)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:813"
+    }
+  ]
+}

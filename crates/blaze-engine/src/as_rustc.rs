@@ -1,23 +1,27 @@
-//! blaze as the `RUSTC` a build script runs (docs/no-rustc.md, step I): what a script asks
-//! of rustc is answered here and no rustc runs. A question (`-vV`, `--print ...`) is answered
-//! from what blaze knows of the toolchain ([`crate::answers`]), and a probe, a crate on
-//! standard input or in a file that the script has "rustc" check (`autocfg`, `anyhow`,
-//! `thiserror`, `rustix`), is given blaze's verdict on it, the one `blaze check` gives
-//! ([`crate::check::once`]): it compiles, and the files asked for are written, or it does
-//! not, and the errors are said and the run fails, as rustc's would. What can't be answered
-//! that way (a flag blaze does not know, a probe that links or names a library, a feature
-//! blaze does not know the toolchain has) fails with an error that names the command, and
-//! the script sees rustc fail.
+//! blaze as the `RUSTC` a build script runs (docs/no-rustc.md): what a script asks of rustc is
+//! answered here and no rustc runs. The daemon links blaze's executable as `rustc` and `rustdoc`
+//! in its `tools` directory and gives a script those as `RUSTC` and `RUSTDOC`
+//! (`blaze-cargo/src/serve/unit.rs`, `stand_ins`); blaze runs as this whenever it is started
+//! under the name `rustc`, and as [`rustdoc`] under that one.
 //!
-//! A script is given this as `RUSTC` by [`crate::cargo::script_sandbox`], which links blaze
-//! as `rustc` in the run's directory, with the toolchain's rustc in [`TOOLCHAIN`] and no
-//! wrappers: blaze runs as this whenever it is started under the name `rustc`.
+//! A question (`-vV`, `--print ...`) is answered from what blaze knows of its release
+//! ([`blaze_cargo::answers`]). A probe, a crate on standard input or in a file that the script
+//! has "rustc" check (`autocfg`, `anyhow`, `thiserror`, `rustix`), is given the verdict `blaze
+//! check` gives it ([`probe`]): it compiles, and the files asked for are written, or it does
+//! not, and its errors are said and the run fails, as rustc's would. What can't be answered that
+//! way (a flag blaze does not know, a probe that links or names a library) fails with an error
+//! that names the command, and the script sees rustc fail.
 //!
 //! What the files written are: the metadata and the IR of a probe are only seen to be there
 //! (`autocfg` removes the `.ll` it asked for, `anyhow` the whole directory, `rustix` never
 //! reads its file), so they are empty, and the dep-info names the probe's source.
 
-pub(crate) use blaze_cargo::as_rustc::{NAME, TOOLCHAIN};
+mod probe;
+pub(crate) mod rustdoc;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use blaze_cargo::as_rustc::NAME;
 
 use std::{
     ffi::{OsStr, OsString},
@@ -25,7 +29,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, anyhow, bail};
+use blaze_diagnostics::emit;
+use blaze_units::stdlib::target;
 
 /// Whether this process was started as `rustc`, which is to be this.
 pub(crate) fn is_me() -> bool {
@@ -38,7 +44,19 @@ pub(crate) fn is_me() -> bool {
 pub(crate) fn command() -> ! {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let code = match run(&args) {
-        Ok(code) => code,
+        Ok(outcome) => {
+            let said = std::io::stderr()
+                .write_all(&outcome.stderr)
+                .and_then(|()| std::io::stdout().write_all(&outcome.stdout))
+                .and_then(|()| std::io::stdout().flush());
+            match said {
+                Ok(()) => outcome.code,
+                Err(error) => {
+                    eprintln!("error: writing rustc's answer: {error}");
+                    1
+                }
+            }
+        }
         Err(why) => {
             let shown: Vec<_> = args.iter().map(|it| it.to_string_lossy()).collect();
             let shown = shown.join(" ");
@@ -49,61 +67,117 @@ pub(crate) fn command() -> ! {
     std::process::exit(code)
 }
 
-fn run(args: &[OsString]) -> anyhow::Result<i32> {
-    let rustc = std::env::var_os(TOOLCHAIN)
-        .with_context(|| format!("`{TOOLCHAIN}` does not name blaze's rustc"))?;
-    let sysroot = Path::new(&rustc).parent().and_then(Path::parent);
-    let sysroot = sysroot.with_context(|| format!("`{TOOLCHAIN}` names no toolchain's rustc"))?;
-    crate::cargo::toolchain::known_at(sysroot.to_owned());
-    // The cargo the load asks of the standard library asks blaze's wrapper, not this.
-    // SAFETY: nothing else runs yet in this process.
-    unsafe { std::env::set_var("RUSTC", &rustc) };
+/// What a script asks of rustc that blaze does not check as rustc would.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// A crate that is not a library: `--crate-type` naming another kind, or none, for which
+    /// rustc builds a binary (and fails one with no `main`).
+    NotALibrary { crate_type: Option<String> },
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::NotALibrary { crate_type: Some(kind) } => {
+                write!(f, "blaze checks a library, not a `--crate-type {kind}`")
+            }
+            Refused::NotALibrary { crate_type: None } => f.write_str(
+                "blaze checks a library, and with no `--crate-type` rustc builds a binary: \
+                 `--crate-type lib` asks for a library",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// What rustc would have printed and ended with.
+#[derive(Debug)]
+struct Outcome {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run(args: &[OsString]) -> anyhow::Result<Outcome> {
     let mut stdin = Vec::new();
     if args.iter().any(|it| it == "-") {
         std::io::stdin().read_to_end(&mut stdin).context("reading standard input")?;
     }
-    if crate::answers::is_question(args) {
-        let answer = crate::answers::ours_told(args, &stdin)
-            .context("blaze has no answer to this question")?;
-        std::io::stderr().write_all(&answer.stderr)?;
-        std::io::stdout().write_all(&answer.stdout)?;
-        return Ok(0);
+    answer(args, &stdin, found_library)
+}
+
+/// The standard library the daemon builds against: where blaze found it, checked to be the
+/// release's.
+fn found_library() -> anyhow::Result<probe::Library> {
+    let found = blaze_cargo::toolchain::library::found()
+        .map_err(|why| anyhow!("blaze's standard library, which a probe is checked against: {why}"))?;
+    probe::Library::at(found.dir.clone())
+}
+
+/// What rustc says to `args` with `stdin`: a question answered, or a probe checked against the
+/// library `library` gives.
+fn answer(
+    args: &[OsString],
+    stdin: &[u8],
+    library: impl FnOnce() -> anyhow::Result<probe::Library>,
+) -> anyhow::Result<Outcome> {
+    if blaze_cargo::answers::is_question(args) {
+        let answer = blaze_cargo::answers::ours_told(args, stdin).context("blaze has no answer to this question")?;
+        return Ok(Outcome { code: 0, stdout: answer.stdout, stderr: answer.stderr });
     }
-    let args: Vec<&str> = args
-        .iter()
-        .map(|it| it.to_str())
-        .collect::<Option<_>>()
-        .context("an argument that is not text")?;
+    let args: Vec<&str> = args.iter().map(|it| it.to_str()).collect::<Option<_>>().context("an argument that is not text")?;
     let probe = Probe::of(&args)?;
-    probe.answer(sysroot, &stdin)
+    if std::env::var_os("RUSTC_BOOTSTRAP").is_some_and(|it| it == "-1") {
+        bail!("blaze's rustc is a nightly, and `RUSTC_BOOTSTRAP=-1` asks for a stable one, which blaze does not check as");
+    }
+    let library = library()?;
+    probe.answer(&args, stdin, &library)
 }
 
 /// What a script asked rustc to check: one crate, by itself.
 #[derive(Debug, Default, PartialEq)]
 struct Probe<'a> {
-    /// The file, or `None` for standard input.
+    /// The file, or `-` for standard input.
     input: Option<&'a str>,
     crate_name: Option<&'a str>,
     edition: Option<&'a str>,
-    /// What rustc is told that decides the crate's cfgs, asked again as `--print cfg`.
+    target: Option<&'a str>,
+    /// What rustc is told that decides the crate's cfgs, as `--print cfg` is asked with it.
     cfg_flags: Vec<&'a str>,
     /// Each kind asked for, and the path it is asked at.
     emit: Vec<(&'a str, Option<&'a str>)>,
     out_dir: Option<&'a str>,
     output: Option<&'a str>,
     extra_filename: &'a str,
+    error_format: Option<&'a str>,
+    color: Option<&'a str>,
+    width: Option<&'a str>,
 }
 
 /// The kinds of output a probe is given: what rustc writes of a crate it checks.
 const EMITTED: [&str; 3] = ["metadata", "dep-info", "llvm-ir"];
 
-/// The flags with a value that change nothing a probe is answered with.
-const IGNORED_VALUED: [&str; 8] =
-    ["-L", "--cap-lints", "-A", "-W", "--allow", "--warn", "--error-format", "--color"];
+/// The lint flags, and `--check-cfg`: read by the check from the whole command line.
+const LINTS: [&str; 12] = [
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+    "--allow",
+    "--warn",
+    "--deny",
+    "--forbid",
+    "--force-warn",
+    "--cap-lints",
+    "--check-cfg",
+    "-L",
+];
 
 impl<'a> Probe<'a> {
     fn of(args: &[&'a str]) -> anyhow::Result<Probe<'a>> {
         let mut probe = Probe::default();
+        let mut library = false;
         let mut words = args.iter().copied();
         while let Some(word) = words.next() {
             let (flag, joined) = match word.split_once('=') {
@@ -119,11 +193,15 @@ impl<'a> Probe<'a> {
                 joined.or_else(|| words.next()).with_context(|| format!("`{flag}` has no value"))
             };
             match flag {
-                "-" => probe.input_is(None)?,
+                "-" => probe.input_is("-")?,
                 "--crate-name" => probe.crate_name = Some(value()?),
                 "--edition" => probe.edition = Some(value()?),
+                "--target" => probe.target = Some(value()?),
                 "--out-dir" => probe.out_dir = Some(value()?),
                 "-o" => probe.output = Some(value()?),
+                "--error-format" => probe.error_format = Some(value()?),
+                "--color" => probe.color = Some(value()?),
+                "--diagnostic-width" => probe.width = Some(value()?),
                 "--emit" => {
                     for kind in value()?.split(',') {
                         let (kind, path) = match kind.split_once('=') {
@@ -139,30 +217,31 @@ impl<'a> Probe<'a> {
                 "--crate-type" => {
                     for kind in value()?.split(',') {
                         if !matches!(kind, "lib" | "rlib") {
-                            bail!("blaze checks a library, not a `--crate-type {kind}`");
+                            return Err(Refused::NotALibrary { crate_type: Some(kind.to_owned()) }.into());
                         }
                     }
+                    library = true;
                 }
-                "--cfg" | "--target" => {
-                    probe.cfg_flags.extend([flag, value()?]);
-                }
+                "--cfg" => probe.cfg_flags.extend([flag, value()?]),
                 "-O" | "-g" => probe.cfg_flags.push(flag),
                 "-C" | "--codegen" => {
                     let option = value()?;
-                    if let Some(extra) = option.strip_prefix("extra-filename=") {
-                        probe.extra_filename = extra;
-                    } else {
-                        probe.cfg_flags.extend(["-C", option]);
+                    match option.strip_prefix("extra-filename=") {
+                        Some(extra) => probe.extra_filename = extra,
+                        None => probe.cfg_flags.extend(["-C", option]),
                     }
                 }
                 "-Z" => probe.cfg_flags.extend(["-Z", value()?]),
-                _ if IGNORED_VALUED.contains(&flag) => _ = value()?,
-                "-D" | "-F" | "--deny" | "--forbid" | "--force-warn" => {
-                    bail!("blaze can't tell which lints rustc would find, which `{flag}` denies")
-                }
-                _ if !flag.starts_with('-') => probe.input_is(Some(word))?,
+                _ if LINTS.contains(&flag) => _ = value()?,
+                _ if !flag.starts_with('-') => probe.input_is(word)?,
                 _ => bail!("blaze does not know rustc's `{flag}`"),
             }
+        }
+        if probe.input.is_none() {
+            bail!("no input filename given");
+        }
+        if !library {
+            return Err(Refused::NotALibrary { crate_type: None }.into());
         }
         if probe.emit.is_empty() {
             bail!("rustc would link the crate, and blaze checks it");
@@ -173,11 +252,11 @@ impl<'a> Probe<'a> {
         Ok(probe)
     }
 
-    fn input_is(&mut self, input: Option<&'a str>) -> anyhow::Result<()> {
+    fn input_is(&mut self, input: &'a str) -> anyhow::Result<()> {
         if self.input.is_some() {
             bail!("more than one input");
         }
-        self.input = Some(input.unwrap_or("-"));
+        self.input = Some(input);
         Ok(())
     }
 
@@ -193,59 +272,76 @@ impl<'a> Probe<'a> {
                 let stem = Path::new(file).file_stem().and_then(OsStr::to_str);
                 Ok(stem.context("an input with no name")?.replace('-', "_"))
             }
-            None => bail!("no input"),
+            None => bail!("no input filename given"),
         }
     }
 
-    /// Checks the crate with blaze's release at `sysroot`, its source on `stdin` when that is
-    /// the input: what rustc would end with, the files asked for written when it compiles.
-    fn answer(&self, sysroot: &Path, stdin: &[u8]) -> anyhow::Result<i32> {
-        let name = self.name()?;
-        // The cfgs the crate is checked with are those rustc would print for the same flags,
-        // which blaze answers or does not.
-        let mut asked: Vec<OsString> = self.cfg_flags.iter().map(OsString::from).collect();
-        asked.extend(["--print", "cfg"].map(OsString::from));
-        crate::answers::ours(&asked, &[])
-            .context("blaze can't tell the cfgs rustc would check the crate with")?;
-        let cfg_args: Vec<String> = self.cfg_flags.iter().map(|it| (*it).to_owned()).collect();
-        let cfg = crate::cargo::own_script::cfg_of(&cfg_args);
-        let target = self.cfg_flags.windows(2).find(|it| it[0] == "--target").map(|it| it[1]);
-        let dir = Scratch::new()?;
-        let root = match self.input.context("no input")? {
-            "-" => {
-                let root = dir.path().join(format!("{name}.rs"));
-                std::fs::write(&root, stdin)?;
-                root
+    /// How rustc writes its diagnostics, and whether as JSON.
+    fn style(&self) -> anyhow::Result<(emit::Style, bool)> {
+        let mut style = emit::Style::default();
+        let json = match self.error_format {
+            None | Some("human") => false,
+            Some("short") => {
+                style.short = true;
+                false
             }
-            file => std::path::absolute(file)?,
+            Some("json") => true,
+            Some(other) => bail!("blaze writes no `--error-format={other}`"),
         };
-        let text = std::fs::read_to_string(&root)
-            .with_context(|| format!("reading {}", root.display()))?;
-        let edition = self.edition.unwrap_or("2015");
-        if let Some(unknown) = features(&text, edition).into_iter().find(|it| !known_feature(it)) {
-            bail!("blaze does not know whether the toolchain has the feature `{unknown}`");
+        style.ansi = match self.color {
+            None | Some("auto" | "never") => false,
+            Some("always") => true,
+            Some(other) => bail!("argument for `--color` must be auto, always or never (instead was `{other}`)"),
+        };
+        if let Some(width) = self.width {
+            style.width = width.parse().with_context(|| format!("`--diagnostic-width={width}` is not a number"))?;
         }
-        let project = dir.path().join("rust-project.json");
-        let described = serde_json::json!({
-            "sysroot": sysroot,
-            "sysroot_src": crate::cargo::toolchain::library::dir(),
-            "crates": [{
-                "display_name": name,
-                "root_module": root,
-                "edition": edition,
-                "deps": [],
-                "cfg": cfg,
-                "target": target,
-                "env": {},
-                "is_workspace_member": true,
-                "is_proc_macro": false,
-            }],
-        });
-        std::fs::write(&project, described.to_string())?;
-        if let Some(refused) = crate::check::once(&project, &name)? {
-            eprintln!("{refused}");
-            return Ok(1);
+        Ok((style, json))
+    }
+
+    /// The probe checked with blaze's front end over `library`, all of rustc's `args` read for
+    /// its lints: what rustc would end with, the files asked for written when it compiles.
+    fn answer(&self, args: &[&str], stdin: &[u8], library: &probe::Library) -> anyhow::Result<Outcome> {
+        let name = self.name()?;
+        let host = blaze_cargo::toolchain::host().context("blaze knows no target triple of this machine")?;
+        let triple = self.target.unwrap_or(host);
+        if triple.ends_with(".json") {
+            bail!("blaze checks a probe for the targets it knows, and `--target {triple}` is a file of its own");
         }
+        // The cfgs the crate is checked with are those rustc would print for the same flags.
+        let flags: Vec<String> = self.cfg_flags.iter().map(|it| (*it).to_owned()).collect();
+        let mut cfg_args = target::CfgArgs::from_flags(&flags).map_err(anyhow::Error::msg)?;
+        if cfg_args.target_cpu.as_deref() == Some("native") {
+            cfg_args.host_cpu = hir_ty_codegen::host_cpu().map(|(name, features)| target::HostCpu {
+                arch: target::arch(host).to_owned(),
+                name,
+                features,
+            });
+        }
+        let cfgs = target::target_cfg(triple, &cfg_args)
+            .map_err(|why| anyhow!("blaze can't tell the cfgs rustc would check the crate with: {why}"))?;
+        let (shown, source) = match self.input.context("no input filename given")? {
+            "-" => ("<anon>", String::from_utf8(stdin.to_vec()).context("the probe on standard input is not UTF-8")?),
+            file => (file, std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?),
+        };
+        let (style, json) = self.style()?;
+        let all: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+        let asked = probe::Asked {
+            name: &name,
+            edition: self.edition.unwrap_or("2015"),
+            triple,
+            host,
+            cfgs: &cfgs,
+            args: &all,
+            style,
+            json,
+        };
+        let checked = probe::check(&asked, shown, &source, library)?;
+        let stderr = checked.stderr.into_bytes();
+        if checked.failed {
+            return Ok(Outcome { code: 1, stdout: Vec::new(), stderr });
+        }
+        let mut stdout = Vec::new();
         for (kind, path) in &self.emit {
             let path = match (*path, self.output) {
                 (Some(path), _) | (None, Some(path)) => PathBuf::from(path),
@@ -259,129 +355,18 @@ impl<'a> Probe<'a> {
                     })
                 }
             };
-            let text = match *kind {
-                "dep-info" => {
-                    let root = root.display();
-                    format!("{}: {root}\n\n{root}:\n", path.display())
-                }
+            let text = match (*kind, self.input) {
+                ("dep-info", Some("-")) => format!("{}:\n", path.display()),
+                ("dep-info", Some(file)) => format!("{}: {file}\n\n{file}:\n", path.display()),
                 _ => String::new(),
             };
             // `-o -` is standard output to rustc (rustix's probes), not a file named `-`.
             if path == Path::new("-") {
-                std::io::stdout().write_all(text.as_bytes())?;
+                stdout.extend_from_slice(text.as_bytes());
                 continue;
             }
             std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
-        Ok(0)
-    }
-}
-
-/// A directory of this process's own for the probe's description, removed when dropped.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> anyhow::Result<Scratch> {
-        let dir = std::env::temp_dir().join(format!("blaze-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
-        Ok(Scratch(dir))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The features the crate root `text` names in a `#![feature(...)]`, under a `cfg_attr` or
-/// not: one that is off still has to be one blaze knows.
-fn features(text: &str, edition: &str) -> Vec<String> {
-    use syntax::{AstNode as _, ast::HasAttrs as _};
-    let edition = edition.parse().unwrap_or(syntax::Edition::CURRENT);
-    let file = syntax::SourceFile::parse(text, edition).tree();
-    let mut named = Vec::new();
-    for attr in file.attrs() {
-        let attr = attr.syntax().text().to_string();
-        if !attr.starts_with("#!") {
-            continue;
-        }
-        let mut rest = attr.as_str();
-        while let Some(at) = rest.find("feature") {
-            rest = rest[at + "feature".len()..].trim_start();
-            let Some(inside) = rest.strip_prefix('(') else { continue };
-            let end = inside.find(')').unwrap_or(inside.len());
-            let words = inside[..end].split(',').map(str::trim).filter(|it| !it.is_empty());
-            named.extend(words.map(str::to_owned));
-            rest = &inside[end..];
-        }
-    }
-    named
-}
-
-/// Whether the toolchain has the unstable feature `name`, as far as blaze knows: the features
-/// of the unstable book rust-analyzer was made with.
-fn known_feature(name: &str) -> bool {
-    ide_db::generated::lints::FEATURES.iter().any(|it| it.label == name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn probes_read() {
-        let anyhow = [
-            "--cfg=anyhow_build_probe",
-            "--edition=2018",
-            "--crate-name=anyhow",
-            "--crate-type=lib",
-            "--cap-lints=allow",
-            "--emit=dep-info,metadata",
-            "--out-dir",
-            "/o/probe",
-            "src/nightly.rs",
-            "--target",
-            "x86_64-unknown-linux-gnu",
-            "-Clinker-features=-lld",
-        ];
-        let probe = Probe::of(&anyhow).unwrap();
-        assert_eq!(probe.input, Some("src/nightly.rs"));
-        assert_eq!(probe.emit, [("dep-info", None), ("metadata", None)]);
-        assert_eq!(
-            probe.cfg_flags,
-            [
-                "--cfg",
-                "anyhow_build_probe",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "linker-features=-lld"
-            ]
-        );
-        let autocfg = "--crate-name autocfg_0 --crate-type=lib --out-dir /o --emit=llvm-ir -";
-        let autocfg: Vec<&str> = autocfg.split(' ').collect();
-        let probe = Probe::of(&autocfg).unwrap();
-        assert_eq!((probe.input, probe.name().unwrap().as_str()), (Some("-"), "autocfg_0"));
-        let rustix = ["--crate-type=rlib", "--emit=metadata", "-o", "/o/f", "-"];
-        assert_eq!(Probe::of(&rustix).unwrap().name().unwrap(), "rust_out");
-        assert!(Probe::of(&["--crate-type=bin", "--emit=metadata", "-"]).is_err());
-        assert!(Probe::of(&["--emit=link", "-"]).is_err());
-        assert!(Probe::of(&["-Dwarnings", "--emit=metadata", "-"]).is_err());
-        assert!(Probe::of(&["--extern", "a=b", "--emit=metadata", "-"]).is_err());
-        assert!(Probe::of(&["a.rs", "b.rs", "--emit=metadata"]).is_err());
-    }
-
-    #[test]
-    fn features_named() {
-        let text = "//! x\n#![cfg_attr(probe, feature(error_generic_member_access))]\n\
-                    #![feature(a, b)]\n#![allow(stable_features)]\nfn feature() {}\n";
-        assert_eq!(features(text, "2018"), ["error_generic_member_access", "a", "b"]);
-        assert!(known_feature("error_generic_member_access"));
-        assert!(!known_feature("no_such_feature_at_all"));
+        Ok(Outcome { code: 0, stdout, stderr })
     }
 }

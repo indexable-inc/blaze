@@ -100,8 +100,15 @@ fn words(bytes: &[u8]) -> [u32; 4] {
     std::array::from_fn(|i| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
 }
 
-fn from_words(words: [u32; 4]) -> Vec<u8> {
-    words.iter().flat_map(|it| it.to_le_bytes()).collect()
+/// The bytes of an intrinsic's argument or result, inline up to 512 bits.
+type Bytes = smallvec::SmallVec<[u8; 64]>;
+
+fn from_words(words: [u32; 4]) -> Bytes {
+    let mut bytes = Bytes::new();
+    for it in words {
+        bytes.extend_from_slice(&it.to_le_bytes());
+    }
+    bytes
 }
 
 /// An integer argument of up to 8 bytes.
@@ -173,7 +180,7 @@ fn arm_sha1_hash(
 /// The arguments of a call of `llvm.{name}`.
 struct Args<'a> {
     name: &'a str,
-    args: Vec<Vec<u8>>,
+    args: smallvec::SmallVec<[Bytes; 3]>,
 }
 
 impl Args<'_> {
@@ -181,6 +188,7 @@ impl Args<'_> {
         match self.args.get(i) {
             Some(it) => Ok(it),
             None => Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("llvm.{} has no argument {i}", self.name).into(),
             )),
         }
@@ -190,6 +198,7 @@ impl Args<'_> {
         match self.arg(i)?.try_into() {
             Ok(it) => Ok(it),
             Err(_) => Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("llvm.{} takes 16 bytes", self.name).into(),
             )),
         }
@@ -197,16 +206,17 @@ impl Args<'_> {
 
     /// `f` of the 128-bit lanes of the first two arguments, for the instructions that VAES
     /// and VPCLMULQDQ widen to 256 and 512 bits.
-    fn lanes<'db>(&self, f: fn(State, State) -> State) -> Result<'db, Vec<u8>> {
+    fn lanes<'db>(&self, f: fn(State, State) -> State) -> Result<'db, Bytes> {
         let (a, b) = (self.arg(0)?, self.arg(1)?);
-        Ok(a.chunks_exact(16)
-            .zip(b.chunks_exact(16))
-            .flat_map(|(a, b)| f(a.try_into().unwrap(), b.try_into().unwrap()))
-            .collect())
+        let mut out = Bytes::new();
+        for (a, b) in a.chunks_exact(16).zip(b.chunks_exact(16)) {
+            out.extend_from_slice(&f(a.try_into().unwrap(), b.try_into().unwrap()));
+        }
+        Ok(out)
     }
 }
 
-impl<'db> Evaluator<'db> {
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// `name` is the intrinsic's without `llvm.`.
     pub(super) fn exec_llvm_intrinsic(
         &mut self,
@@ -216,7 +226,10 @@ impl<'db> Evaluator<'db> {
     ) -> Result<'db, ()> {
         let args = Args {
             name,
-            args: args.iter().map(|it| Ok(it.get(self)?.to_vec())).collect::<Result<'db, _>>()?,
+            args: args
+                .iter()
+                .map(|it| Ok(Bytes::from_slice(self.read_scalar(it.interval)?)))
+                .collect::<Result<'db, _>>()?,
         };
         let arg = |i| args.arg(i);
         let state = |i| args.state(i);
@@ -225,7 +238,7 @@ impl<'db> Evaluator<'db> {
             Some((family, width @ ("256" | "512"))) => (family, Some(width)),
             _ => (name, None),
         };
-        let result: Vec<u8> = match family {
+        let result: Bytes = match family {
             "x86.aesni.aesenc" => {
                 lanes(|s, k| xor(mix_columns(sub_bytes(shift_rows(s, false), &SBOX), false), k))?
             }
@@ -236,7 +249,9 @@ impl<'db> Evaluator<'db> {
             "x86.aesni.aesdeclast" => {
                 lanes(|s, k| xor(sub_bytes(shift_rows(s, true), &INV_SBOX), k))?
             }
-            "x86.aesni.aesimc" if width.is_none() => mix_columns(state(0)?, true).to_vec(),
+            "x86.aesni.aesimc" if width.is_none() => {
+                Bytes::from_slice(&mix_columns(state(0)?, true))
+            }
             "x86.aesni.aeskeygenassist" if width.is_none() => {
                 let w = words(&state(0)?);
                 let rcon = int(arg(1)?) as u8 as u32;
@@ -254,7 +269,7 @@ impl<'db> Evaluator<'db> {
                         let b = int(&b[8 * (imm >> 4 & 1) as usize..]);
                         clmul(a, b).to_le_bytes()
                     })
-                    .collect()
+                    .collect() // alloc: inline `Bytes`, on the stack up to 512 bits
             }
             "x86.ssse3.pshuf.b.128" | "x86.avx2.pshuf.b" | "x86.avx512.pshuf.b" => {
                 let (a, b) = (arg(0)?, arg(1)?);
@@ -263,7 +278,7 @@ impl<'db> Evaluator<'db> {
                     .flat_map(|(a, b)| {
                         b.iter().map(|&i| if i & 0x80 != 0 { 0 } else { a[(i & 15) as usize] })
                     })
-                    .collect()
+                    .collect() // alloc: inline `Bytes`, on the stack up to 512 bits
             }
             "x86.sse42.crc32.32.8"
             | "x86.sse42.crc32.32.16"
@@ -271,7 +286,7 @@ impl<'db> Evaluator<'db> {
             | "x86.sse42.crc32.64.64" => {
                 let bytes = name.rsplit('.').next().unwrap().parse::<usize>().unwrap() / 8;
                 let crc = crc32(0x82f6_3b78, int(arg(0)?) as u32, int(arg(1)?), bytes);
-                u64::from(crc).to_le_bytes().to_vec()
+                Bytes::from_slice(&u64::from(crc).to_le_bytes())
             }
             "x86.sha1rnds4" => {
                 let [d, c, b, a] = words(&state(0)?);
@@ -345,13 +360,13 @@ impl<'db> Evaluator<'db> {
                 from_words([w16, w17, w18, w19])
             }
             "aarch64.crypto.aese" => {
-                sub_bytes(shift_rows(xor(state(0)?, state(1)?), false), &SBOX).to_vec()
+                Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), false), &SBOX))
             }
             "aarch64.crypto.aesd" => {
-                sub_bytes(shift_rows(xor(state(0)?, state(1)?), true), &INV_SBOX).to_vec()
+                Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), true), &INV_SBOX))
             }
-            "aarch64.crypto.aesmc" => mix_columns(state(0)?, false).to_vec(),
-            "aarch64.crypto.aesimc" => mix_columns(state(0)?, true).to_vec(),
+            "aarch64.crypto.aesmc" => Bytes::from_slice(&mix_columns(state(0)?, false)),
+            "aarch64.crypto.aesimc" => Bytes::from_slice(&mix_columns(state(0)?, true)),
             "aarch64.crc32b" | "aarch64.crc32h" | "aarch64.crc32w" | "aarch64.crc32x"
             | "aarch64.crc32cb" | "aarch64.crc32ch" | "aarch64.crc32cw" | "aarch64.crc32cx" => {
                 let (poly, size) = match name.strip_prefix("aarch64.crc32").unwrap() {
@@ -364,9 +379,9 @@ impl<'db> Evaluator<'db> {
                     "w" => 4,
                     _ => 8,
                 };
-                crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes().to_vec()
+                Bytes::from_slice(&crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes())
             }
-            "aarch64.neon.pmull64" => clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes().to_vec(),
+            "aarch64.neon.pmull64" => Bytes::from_slice(&clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes()),
             "aarch64.crypto.sha1c" | "aarch64.crypto.sha1p" | "aarch64.crypto.sha1m" => {
                 let f: fn(u32, u32, u32) -> u32 = match name {
                     "aarch64.crypto.sha1c" => ch,
@@ -376,7 +391,7 @@ impl<'db> Evaluator<'db> {
                 let e = int(arg(1)?) as u32;
                 from_words(arm_sha1_hash(words(&state(0)?), e, words(&state(2)?), f))
             }
-            "aarch64.crypto.sha1h" => (int(arg(0)?) as u32).rotate_left(30).to_le_bytes().to_vec(),
+            "aarch64.crypto.sha1h" => Bytes::from_slice(&(int(arg(0)?) as u32).rotate_left(30).to_le_bytes()),
             "aarch64.crypto.sha1su0" => {
                 let (x, y, z) = (words(&state(0)?), words(&state(1)?), words(&state(2)?));
                 let t = [x[2], x[3], y[0], y[1]];

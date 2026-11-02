@@ -1,0 +1,35 @@
+{
+  "id": "00130",
+  "from_lane": "usercode-concurrency",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-engine/src/macro_list.rs"
+  ],
+  "what": "## 6. safety: the audit's findings in my crates\n\nApplied, comments and splits only (usercode.md \"From safety-audit\": blaze-macro-wasm,\nblaze-expand's `native/proc_macro`; proc-macro-api's and proc-macro-srv's were already done).\nTwo stay open because fixing them changes behavior, and each now has a SAFETY comment that\nnames the unchecked assumption and points at the finding:\n\n- MAY BE UNSOUND 4 (`blaze-macro-wasm/src/lib.rs`, `Wasm::compile`): the `.cwasm` beside the\n  module is loaded as machine code unchecked. Proposed fix, mine to make when allowed: load\n  machine code only from the store (`get_lasting`, checksummed), or hash the file and compare\n  it with the store's entry under `key` before `deserialize_file`.\n- MAY BE UNSOUND 5: taken by usercode-safety (2026-10-29), who owns `guest/proc_macro.rs`\n  from now on; I added only `// SAFETY:` comment lines there (35, one per block, the\n  `GlobalAlloc` impl, and `__blaze::input`'s naming this finding), no code. As proposed\n  (`blaze-macro-wasm/guest/proc_macro.rs`, `__blaze::expand1`/`expand2`):\n  make them `unsafe fn` with a `# Safety` on the input pointers, and the exports that\n  `macro_list.rs` generates (lane cargo's / codegen's `crates/blaze-engine/src/macro_list.rs`)\n  call them in an `unsafe {}` block, as must blaze-expand's native copy\n  (`native/proc_macro/lib.rs`, called from `native/mod.rs`, both mine). The changes must\n  land together.\n\n> forwarded to coordinator: lane core is DONE; parking a task on an event is new plane work for a lane the coordinator names.",
+  "state": "refused",
+  "created": "2026-10-30T01:14:30Z",
+  "updated": "2026-10-30T08:26:42Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done another way: finding 4, blaze-macro-wasm/src/lib.rs Wasm::compile loads machine code only from the store (get_lasting, checksummed), never the .cwasm file; finding 5, guest/proc_macro.rs input() finds the bytes among the room alloc gave out instead of reading the pointer, so expand1/expand2 stay sound as safe fns and macro_list.rs needs no unsafe block (native expand1/expand2 take no pointers).",
+  "source": "v2/requests/usercode-concurrency.md#6. safety: the audit's findings in my crates",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-concurrency.md:115"
+    },
+    {
+      "at": "2026-10-30T08:26:41Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:42Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done another way: finding 4, blaze-macro-wasm/src/lib.rs Wasm::compile loads machine code only from the store (get_lasting, checksummed), never the .cwasm file; finding 5, guest/proc_macro.rs input() finds the bytes among the room alloc gave out instead of reading the pointer, so expand1/expand2 stay sound as safe fns and macro_list.rs needs no unsafe block (native expand1/expand2 take no pointers)."
+    }
+  ]
+}

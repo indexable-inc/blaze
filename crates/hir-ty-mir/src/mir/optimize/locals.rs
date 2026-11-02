@@ -1,13 +1,18 @@
 //! rustc's `SimplifyLocals` (`simplify.rs`) and `RemoveStorageMarkers`.
 
+use blaze_mem::Frame;
 use la_arena::Arena;
 
-use crate::mir::{CastKind, LocalId, MirBody, Rvalue, StatementKind, return_slot};
+use crate::mir::{
+    CastKind, LocalId, MirBody, Rvalue, StatementKind,
+    framed::{Bits, bits_in, block_id, local_index},
+    return_slot,
+};
 
-use super::{Location, Mention, local_index, renumber_locals, visit_body, visit_statement};
+use super::{Location, Mention, renumber_locals, visit_body, visit_statement};
 
 /// rustc's `RemoveStorageMarkers`, which runs where no lifetimes are given to LLVM.
-pub(super) fn remove_storage_markers(body: &mut MirBody<'_>) {
+pub(super) fn remove_storage_markers(body: &mut MirBody<'_>, _frame: &Frame) {
     for (_, block) in body.basic_blocks.iter_mut() {
         block.statements.retain(|it| {
             !matches!(it.kind, StatementKind::StorageLive(_) | StatementKind::StorageDead(_))
@@ -24,31 +29,32 @@ fn is_safe_to_remove(rvalue: &Rvalue) -> bool {
 /// How many times each local is used, as rustc's `UsedLocals` counts: not where an
 /// assignment that could be removed writes it as a whole, and not in storage markers. The
 /// return slot, the parameters and what a debugger is told of are always used.
-struct UsedLocals {
-    count: Vec<u32>,
-    always: Vec<bool>,
+struct UsedLocals<'f> {
+    count: &'f mut [u32],
+    always: Bits<'f>,
 }
 
-impl UsedLocals {
-    fn new(body: &MirBody<'_>) -> UsedLocals {
-        let mut always = vec![false; body.locals.len()];
-        always[local_index(return_slot())] = true;
+impl<'f> UsedLocals<'f> {
+    fn new(body: &MirBody<'_>, frame: &'f Frame) -> UsedLocals<'f> {
+        let mut always: Bits<'f> = bits_in(body.locals.len(), frame);
+        always.insert(local_index(return_slot()));
         for &local in body.param_locals.iter().chain(body.binding_locals.values()) {
-            always[local_index(local)] = true;
+            always.insert(local_index(local));
         }
         // The code generator gives each promoted local its constant, and an `async` body's
         // captures are the future's fields.
         let kept = body.promoted_locals.iter().map(|it| it.0);
         for local in kept.chain(body.upvars_in_place.iter().map(|it| it.0)) {
-            always[local_index(local)] = true;
+            always.insert(local_index(local));
         }
-        let mut used = UsedLocals { count: vec![0; body.locals.len()], always };
+        let count = frame.alloc_slice_fill_with(body.locals.len(), |_| 0u32);
+        let mut used = UsedLocals { count, always };
         visit_body(body, |local, mention, at| used.mention(body, local, mention, at, 1));
         used
     }
 
     fn is_used(&self, local: LocalId) -> bool {
-        self.always[local_index(local)] || self.count[local_index(local)] != 0
+        self.always.contains(local_index(local)) || self.count[local_index(local)] != 0
     }
 
     fn mention(
@@ -93,12 +99,13 @@ impl UsedLocals {
 
 /// rustc's `remove_unused_definitions_helper`: assignments to locals nothing reads, and their
 /// storage markers, go, until no more do.
-fn remove_unused_definitions_helper(used: &mut UsedLocals, body: &mut MirBody<'_>) {
+fn remove_unused_definitions_helper(used: &mut UsedLocals<'_>, body: &mut MirBody<'_>) {
     let mut modified = true;
     while modified {
         modified = false;
-        let blocks: Vec<_> = body.basic_blocks.iter().map(|(id, _)| id).collect();
-        for block in blocks {
+        // Removing statements never adds or removes a block.
+        for at in 0..body.basic_blocks.len() {
+            let block = block_id(at);
             let mut index = 0;
             while index < body.basic_blocks[block].statements.len() {
                 let statement = &body.basic_blocks[block].statements[index];
@@ -124,28 +131,27 @@ fn remove_unused_definitions_helper(used: &mut UsedLocals, body: &mut MirBody<'_
 }
 
 /// What rustc's `CopyProp` ends with: unused definitions removed, the locals kept.
-pub(super) fn remove_unused_definitions(body: &mut MirBody<'_>) {
-    let mut used = UsedLocals::new(body);
+pub(super) fn remove_unused_definitions(body: &mut MirBody<'_>, frame: &Frame) {
+    let mut used = UsedLocals::new(body, frame);
     remove_unused_definitions_helper(&mut used, body);
 }
 
 /// rustc's `SimplifyLocals`: what no one uses goes, and the locals left are numbered again in
 /// their order.
-pub(super) fn simplify_locals(body: &mut MirBody<'_>) {
-    let mut used = UsedLocals::new(body);
+pub(super) fn simplify_locals(body: &mut MirBody<'_>, frame: &Frame) {
+    let mut used = UsedLocals::new(body, frame);
     remove_unused_definitions_helper(&mut used, body);
-    let mut map = vec![None; body.locals.len()];
-    let mut new_locals = Arena::with_capacity(body.locals.len());
-    let mut removed = false;
-    for (local, decl) in body.locals.iter() {
-        if !used.is_used(local) {
-            removed = true;
-            continue;
-        }
-        map[local_index(local)] = Some(new_locals.alloc(decl.clone()));
-    }
-    if !removed {
+    let kept = body.locals.iter().filter(|(local, _)| used.is_used(*local)).count();
+    if kept == body.locals.len() {
         return;
     }
-    renumber_locals(body, new_locals, &map);
+    let map = frame.alloc_slice_fill_with(body.locals.len(), |_| None::<LocalId>);
+    // The kept locals moved, in their order, into an arena of exactly their number.
+    let mut new_locals = Arena::with_capacity(kept);
+    for (local, decl) in std::mem::take(&mut body.locals).into_iter() {
+        if used.is_used(local) {
+            map[local_index(local)] = Some(new_locals.alloc(decl));
+        }
+    }
+    renumber_locals(body, new_locals, map);
 }

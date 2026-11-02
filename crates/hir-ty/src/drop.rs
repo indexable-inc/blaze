@@ -1,16 +1,15 @@
 //! Utilities for computing drop info about types.
 
-use hir_def::{
-    AdtId, ImplId,
-    signatures::{StructFlags, StructSignature},
-};
-use rustc_hash::FxHashSet;
+use base_db::Db;
+use blaze_mem::Frame;
+use hir_def::{AdtId, ImplId, signatures::StructFlags};
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
 
 use crate::{
-    consteval,
+    FrameSet, consteval, frame_set,
     db::HirDatabase,
-    method_resolution::TraitImpls,
+    layout::{enum_variant_ids, struct_flags},
+    method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
         DbInterner, ParamEnv, SimplifiedType, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
@@ -18,8 +17,8 @@ use crate::{
     },
 };
 
-#[salsa::tracked]
-pub fn destructor(db: &dyn HirDatabase, adt: AdtId) -> Option<ImplId> {
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub fn destructor(db: &Db, adt: AdtId) -> Option<ImplId> {
     let module = match adt {
         AdtId::EnumId(id) => id.loc(db).container,
         AdtId::StructId(id) => id.loc(db).container,
@@ -27,11 +26,14 @@ pub fn destructor(db: &dyn HirDatabase, adt: AdtId) -> Option<ImplId> {
     };
     let interner = DbInterner::new_with(db, module.krate(db));
     let drop_trait = interner.lang_items().Drop?;
+    let self_ty = SelfTyKey(SimplifiedType::Adt(adt.into()));
     let impls = match module.block(db) {
-        Some(block) => TraitImpls::for_block(db, block)?,
-        None => TraitImpls::for_crate(db, module.krate(db)),
+        Some(block) => TraitImpls::in_block_for_trait_and_self_ty(db, block, drop_trait, self_ty),
+        None => {
+            TraitImpls::in_crate_for_trait_and_self_ty(db, module.krate(db), drop_trait, self_ty)
+        }
     };
-    impls.for_trait_and_self_ty(drop_trait, &SimplifiedType::Adt(adt.into())).0.first().copied()
+    impls.first().copied()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,38 +77,46 @@ pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -
         TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(infcx, field, env)),
         TyKind::Closure(_, args) => is_freeze(infcx, args.as_closure().tupled_upvars_ty(), env),
         TyKind::Adt(def, args) => {
-            let variants: Vec<hir_def::VariantId> = match def.def_id() {
-                AdtId::StructId(id) => {
-                    if Some(id) == interner.lang_items().UnsafeCell {
-                        return false;
-                    }
-                    vec![id.into()]
-                }
-                AdtId::EnumId(id) => {
-                    id.enum_variants(db).variants.iter().map(|(_, it)| it.0.into()).collect()
-                }
-                AdtId::UnionId(_) => return false,
-            };
-            variants.into_iter().all(|variant| {
+            let fields_freeze = |variant: hir_def::VariantId| {
                 db.field_types(variant).iter().all(|(_, field)| {
                     let ty = field.ty().instantiate(interner, args).skip_norm_wip();
                     is_freeze(infcx, ty, env)
                 })
-            })
+            };
+            match def.def_id() {
+                AdtId::StructId(id) => {
+                    Some(id) != interner.lang_items().UnsafeCell && fields_freeze(id.into())
+                }
+                AdtId::EnumId(id) => {
+                    enum_variant_ids(db, id).iter().all(|&variant| fields_freeze(variant.into()))
+                }
+                AdtId::UnionId(_) => false,
+            }
         }
         _ => false,
     }
 }
 
+/// [`has_drop_glue_in`] in a task of its own, for a caller with no frame at hand.
 pub fn has_drop_glue<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> DropGlue {
-    has_drop_glue_impl(infcx, ty, env, &mut FxHashSet::default())
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| has_drop_glue_in(frame, infcx, ty, env))
+}
+
+/// Whether dropping a `ty` runs code, its visited set in the caller's `frame`.
+pub fn has_drop_glue_in<'db>(
+    frame: &Frame,
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    env: ParamEnv<'db>,
+) -> DropGlue {
+    has_drop_glue_impl(infcx, ty, env, &mut frame_set(frame))
 }
 
 fn has_drop_glue_impl<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,
     env: ParamEnv<'db>,
-    visited: &mut FxHashSet<Ty<'db>>,
+    visited: &mut FrameSet<'_, Ty<'db>>,
 ) -> DropGlue {
     let mut ocx = ObligationCtxt::new(infcx);
     // An alias the solver can't decide under `env` comes back as the variable it was to equal,
@@ -130,54 +140,46 @@ fn has_drop_glue_impl<'db>(
             }
             match adt_id {
                 AdtId::StructId(id) => {
-                    if StructSignature::of(db, id)
-                        .flags
+                    if struct_flags(db, id)
                         .intersects(StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA)
                     {
                         return DropGlue::None;
                     }
-                    db.field_types(id.into())
-                        .iter()
-                        .map(|(_, field)| {
-                            has_drop_glue_impl(
-                                infcx,
-                                field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
-                                env,
-                                visited,
-                            )
-                        })
-                        .max()
-                        .unwrap_or(DropGlue::None)
+                    most_glue(db.field_types(id.into()).iter().map(|(_, field)| {
+                        has_drop_glue_impl(
+                            infcx,
+                            field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
+                            env,
+                            visited,
+                        )
+                    }))
                 }
                 // Unions cannot have fields with destructors.
                 AdtId::UnionId(_) => DropGlue::None,
-                AdtId::EnumId(id) => id
-                    .enum_variants(db)
-                    .variants
-                    .values()
-                    .map(|&(variant, _)| {
-                        db.field_types(variant.into())
-                            .iter()
-                            .map(|(_, field)| {
+                AdtId::EnumId(id) => {
+                    let mut most = DropGlue::None;
+                    for &variant in enum_variant_ids(db, id).iter() {
+                        most = most.max(most_glue(db.field_types(variant.into()).iter().map(
+                            |(_, field)| {
                                 has_drop_glue_impl(
                                     infcx,
                                     field.ty().instantiate(infcx.interner, subst).skip_norm_wip(),
                                     env,
                                     visited,
                                 )
-                            })
-                            .max()
-                            .unwrap_or(DropGlue::None)
-                    })
-                    .max()
-                    .unwrap_or(DropGlue::None),
+                            },
+                        )));
+                        if most == DropGlue::HasDropGlue {
+                            break;
+                        }
+                    }
+                    most
+                }
             }
         }
-        TyKind::Tuple(tys) => tys
-            .iter()
-            .map(|ty| has_drop_glue_impl(infcx, ty, env, visited))
-            .max()
-            .unwrap_or(DropGlue::None),
+        TyKind::Tuple(tys) => {
+            most_glue(tys.iter().map(|ty| has_drop_glue_impl(infcx, ty, env, visited)))
+        }
         TyKind::Array(ty, len) => {
             if consteval::try_const_usize(db, len) == Some(0) {
                 // Arrays of size 0 don't have drop glue.
@@ -229,5 +231,45 @@ fn has_drop_glue_impl<'db>(
         TyKind::Infer(..) => unreachable!("inference vars shouldn't exist out of inference"),
         TyKind::Pat(ty, _) => has_drop_glue_impl(infcx, ty, env, visited),
         TyKind::UnsafeBinder(ty) => has_drop_glue_impl(infcx, ty.skip_binder(), env, visited),
+    }
+}
+
+/// The most glue of `parts`, which stops at the first part with drop glue: no part after it
+/// can have more, so the rest are not walked.
+fn most_glue(parts: impl Iterator<Item = DropGlue>) -> DropGlue {
+    let mut most = DropGlue::None;
+    for glue in parts {
+        if glue == DropGlue::HasDropGlue {
+            return glue;
+        }
+        most = most.max(glue);
+    }
+    most
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropGlue, most_glue};
+
+    #[test]
+    fn the_most_glue_is_the_max_of_every_part() {
+        let all = [DropGlue::None, DropGlue::DependOnParams, DropGlue::HasDropGlue];
+        for len in 0..5u32 {
+            for mut code in 0..3u32.pow(len) {
+                let parts: Vec<DropGlue> = (0..len)
+                    .map(|_| {
+                        let it = all[(code % 3) as usize];
+                        code /= 3;
+                        it
+                    })
+                    .collect();
+                let max = parts.iter().copied().max().unwrap_or(DropGlue::None);
+                assert_eq!(most_glue(parts.iter().copied()), max, "{parts:?}");
+                let walked = std::cell::Cell::new(0);
+                most_glue(parts.iter().inspect(|_| walked.set(walked.get() + 1)).copied());
+                let stop = parts.iter().position(|&it| it == DropGlue::HasDropGlue);
+                assert_eq!(walked.get(), stop.map_or(parts.len(), |at| at + 1), "{parts:?}");
+            }
+        }
     }
 }

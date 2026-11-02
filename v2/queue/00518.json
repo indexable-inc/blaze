@@ -1,0 +1,36 @@
+{
+  "id": "00518",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def",
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "## diagnostics-lints-names-dead: `#[rustc_main]` and `#[rustc_canonical_symbol]` as `AttrFlags` bits (crates/hir-def `attrs.rs`)\n\nWhat: two bits in `AttrFlags` set by `match_attr_flags` for the one-segment path attributes\n`rustc_main` and `rustc_canonical_symbol`, and `AttrFlags::has_word` mapping those two names to\ntheir bits, as it already does for `rustc_nounwind`, `rustc_comptime` and `panic_handler`. Why:\nthe dead-code pass (`lints/names/dead/seed.rs`) reads every other attribute it needs from the\nmemoized `AttrFlags::query` with a bit test. For these two it calls `has_word`, which falls back\nto `has_word_in_source` and scans the item's attributes again: once per free function of the\ncrate for `rustc_main` (rustc's `entry_fn`), and once per foreign function for\n`rustc_canonical_symbol` (`has_allow_dead_code_or_lang_attr`). With the bits, both become bit\ntests and nothing changes at the call sites.\n\n> forwarded to db (`hir-def/src/attrs.rs`; window `db-next2`, told by tmux).\n> checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/attrs.rs`. `RUSTC_CANONICAL_SYMBOL` (:803) and `RUSTC_MAIN` (:811) are set by `match_attr_flags` for a one-segment path (:411-418), and `has_word` maps both names to their bits (:1571, :1574).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: `#[rustc_main]` and `#[rustc_canonical_symbol]` as `AttrFlags` bits (crates/hir-def `attrs.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2900"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/attrs.rs`. `RUSTC_CANONICAL_SYMBOL` (:803) and `RUSTC_MAIN` (:811) are set by `match_attr_flags` for a one-segment path (:411-418), and `has_word` maps both names to their bits (:1571, :1574)."
+    }
+  ]
+}

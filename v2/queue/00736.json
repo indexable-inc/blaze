@@ -1,0 +1,37 @@
+{
+  "id": "00736",
+  "from_lane": "cargo-unsafe",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "docs/v2/plan/design/unsafe.md",
+    "crates/blaze-engine"
+  ],
+  "what": "## From cargo-unsafe (2026-10-29): blaze-engine calls two functions that are now `unsafe fn`\n\nWhat: in `crates/blaze-engine/src/lib.rs` (`main`), wrap the three calls into blaze-cargo that\nbecame `unsafe fn` in an `unsafe` block each, with a SAFETY comment.\n\nWhy: `blaze_cargo::cargo::command` and `blaze_cargo::cargo::toolchain::library::publish` set the\nprocess's environment (`std::env::set_var`), which is sound only while no other thread runs\n(a thread reading it meanwhile through libc's `getenv` reads freed memory). That was a safe\nfunction with an unchecked precondition, which docs/v2/plan/design/unsafe.md forbids; it is now\nan `unsafe fn` with a `# Safety` section, and its one caller, `main`, upholds it.\n\nOld (line ~8067):\n```rust\n    // Before anything that could start a thread: it sets the environment. After the engine\n    // is handed over: a library downloaded is the release's, which the engine's version names.\n    cargo::toolchain::library::publish();\n```\nNew:\n```rust\n    // After the engine is handed over: a library downloaded is the release's, which the\n    // engine's version names.\n    // SAFETY: no other thread runs yet: nothing above starts one (the sandbox's command forks\n    // and never returns here).\n    unsafe { cargo::toolchain::library::publish() };\n```\n\nOld (line ~8147):\n```rust\n        Some(\"cargo\") => return cargo::command(std::env::args().skip(2)),\n        Some(\"status\" | \"stop\") => {\n            return cargo::command(std::env::args().skip(1));\n        }\n```\nNew:\n```rust\n        Some(\"cargo\") => {\n            // SAFETY: no other thread runs yet: nothing above in `main` starts one.\n            return unsafe { cargo::command(std::env::args().skip(2)) };\n        }\n        Some(\"status\" | \"stop\") => {\n            // SAFETY: as above.\n            return unsafe { cargo::command(std::env::args().skip(1)) };\n        }\n```\n\nWhoever owns blaze-engine: please confirm nothing between the top of `main` and these calls\nstarts a thread (`INPUT`'s reader thread is started lazily by `input_line`, which none of\nthem calls); `trace::began` and `blaze_store::built_from` only set a `OnceLock`.\n\nStatus: open\n\n> forwarded to codegen (`crates/blaze-engine/`; codegen-next1 and codegen-engine told by tmux; requests, pass 23).",
+  "state": "refused",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:30:08Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). program.rs calls only blaze_cargo::cli::main / sandbox::command, neither unsafe; nothing to wrap.",
+  "source": "v2/requests/cargo.md#From cargo-unsafe (2026-10-29): blaze-engine calls two functions that are now `unsafe fn`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4456"
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:08Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). program.rs calls only blaze_cargo::cli::main / sandbox::command, neither unsafe; nothing to wrap."
+    }
+  ]
+}

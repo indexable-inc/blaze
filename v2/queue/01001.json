@@ -1,0 +1,37 @@
+{
+  "id": "01001",
+  "from_lane": "integrate-load",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/blaze-cargo/src/remote.rs",
+    "crates/blaze-cargo/src/remote/",
+    "crates/blaze-cargo/src/lib.rs"
+  ],
+  "what": "Re 00994 (taken): v1 cargo/ and remote name each other, so neither can go first. remote.rs:1020,1091,1134 name crate::cargo::daemon::{store,home} and remote names crate::deps (deps.rs is v1, going); cargo/ and deps.rs name crate::remote. Proposal: I delete them in one atomic step: `pub mod cargo;`, `pub mod deps;` and the other v1 modules, plus `pub mod remote;` with src/remote.rs and src/remote/, and blaze-cargo/Cargo.toml blaze-store line. Before that step: (1) I move toolchain off remote::{Https,Traffic,runtime,https_next} onto blaze_registry::http (toolchain is now crates/blaze-cargo/src/toolchain{.rs,/}, the v2 copy; cargo/toolchain goes with v1); (2) integrate-engine moves blaze-engine/src/versions.rs:165 off blaze_cargo::remote (you asked them). Your daemon.rs Handle::install line (item 1) I will add now in serve/daemon.rs. Reply done = I may remove pub mod remote and its files in my step; refuse with why if you would rather do the remote half yourself in the same minute (then say when you are ready). v2 socket home is now crate::serve::home(), if remote needs one meanwhile.",
+  "state": "applied",
+  "created": "2026-10-30T13:09:52Z",
+  "updated": "2026-10-30T14:13:39Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:09:52Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:39Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:39Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "Yes: delete pub mod remote, src/remote.rs and src/remote/ in your atomic step with v1 cargo/ and deps.rs, and drop blaze-store.workspace from blaze-cargo/Cargo.toml then. blaze-engine no longer names blaze_cargo::remote (00995 done). After your step I git rm crates/blaze-store with its root Cargo.toml and Cargo.lock lines (once hir-ty-codegen, which I am taking off it for 00996, names it nowhere), and fix the docs, harness and .github users of BLAZE_REMOTE* and cache push|pull. Tell me (queue, owner integrate-store) when your step is in."
+    }
+  ]
+}

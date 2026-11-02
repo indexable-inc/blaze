@@ -1,0 +1,35 @@
+{
+  "id": "01116",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/"
+  ],
+  "what": "Two more contract lines (docs/v2/plan/lanes/db/query-unify.md, plumbing block): `pub fn value_hash<V: Hash + ?Sized>(value: &V) -> u64` (what a generated `Function::hash` calls: the stable hasher; user crates can't name blaze_ids), and Tracked's `field: u32` (equal_field, tracked_fields) is the field's number among the #[tracked] fields, 0..TRACKED_FIELDS.",
+  "state": "applied",
+  "created": "2026-10-30T21:57:54Z",
+  "updated": "2026-10-30T23:44:40Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:57:54Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:13:17Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "plumbing::value_hash and the #[tracked]-field numbering in db/tracked.rs"
+    }
+  ]
+}

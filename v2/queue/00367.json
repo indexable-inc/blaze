@@ -1,0 +1,35 @@
+{
+  "id": "00367",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine"
+  ],
+  "what": "## What stays, and why\n\n- The bodies of `Resolver::closure` (`lib.rs:1547`; only its return type changes, request 5),\n  `item`, `declared_in`, `impl_place` and `adt_at`: each is asked once per closure, per item\n  spelled, per type declared in a body or per `impl`. Their answers are built once per unit\n  that names them, and the backend keeps them. Each formatting line gets `// alloc: a\n  closure's or item's name, once per unit that names it.`\n- `function_named`, `path(FunctionId)`, `scope_path`, `type_path`, `static_named`,\n  `own_static_name`, `function_named_in`: they now run only inside the memos' `make` closures,\n  once per key per build. Their `format!`s, `Vec`s and `join`s are the misses'.\n- `content_id` (`lib.rs:1610`): `Contents` keeps its own answers (`content.rs`); `crate_root` is\n  cloned there per call for a library crate. That is the store's identity of a crate, not a\n  name, and is left to codegen with the store lane.\n- Everything outside `build`, the resolver and the watch walk (loading, `Checkouts`, linking,\n  splicing, the test harness, doc tests, the client protocol) is setup or the edge: once per\n  load, per link or per request, never per unit.\n```\n```\n\n> (requests, pass 25: the stray fence above is closed by an empty one, so the outcome lines below read as outcomes.)\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).\n> forwarded to codegen (codegen-next1: the `// alloc:` justifications it names in `blaze-engine`) (requests, pass 19; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#What stays, and why",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:1562"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

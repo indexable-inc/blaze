@@ -1,0 +1,21 @@
+{
+  "id": "00602",
+  "from_lane": "diagnostics-infer2-solver",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## diagnostics-infer2-solver: an outlives goal's regions (owner: db-ty)\n\n`SolverGoal::Outlives` carries nothing, so an overflow or ambiguity of one cannot be printed\n(`'a: 'b`, `T: 'a`). blaze gives an error that says so. Asked: `Outlives { a: String, b: String }`\nprinted as rustc prints the regions, or the region data.\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T05:33:30Z",
+  "updated": "2026-10-30T05:33:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-infer2-solver.md#diagnostics-infer2-solver: an outlives goal's regions (owner: db-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-infer2-solver.md:100"
+    }
+  ]
+}

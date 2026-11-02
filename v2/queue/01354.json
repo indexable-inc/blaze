@@ -1,0 +1,23 @@
+{
+  "id": "01354",
+  "from_lane": "codegen-names",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/"
+  ],
+  "what": "01004 (debug info off the edit path, docs/v2/plan/design/item-hash.md section 13; codegen side in docs/v2/plan/lanes/codegen/names.md): codegen already keeps no position in code (line rows are CompiledFunction::lines SpanRefs, filled from the span tables at the link), and after queue 01351 a function variables name their bindings by index, so a debug record is a pure function of (code hash, presentation of the items it spells) and the current database. What is left is the link and the daemon: the link of an edit writes only a debug map (each function address range and its debug record key, as Apple N_OSO stabs), never waiting on records; the daemon builds the records after the edit at low priority, or on demand: split DWARF .dwo materialized on first open with a debuginfod-style lookup by build ID on a user-only Unix socket on Linux, the debug map objects on macOS when lldb opens them. Records byte-identical to a fresh build; blaze build --release and dsymutil/.dwp wait for all. Tests per section 13 (an edit finishes before any record is made; lldb/gdb break on a line and print a renamed local after the edit).",
+  "state": "open",
+  "created": "2026-10-31T21:13:27Z",
+  "updated": "2026-10-31T21:13:27Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:13:27Z",
+      "by": "codegen-names",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

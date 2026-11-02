@@ -1,0 +1,35 @@
+{
+  "id": "01118",
+  "from_lane": "dedup",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query-macros/Cargo.toml"
+  ],
+  "what": "From dedup: the root `syn` should be 2 (2.0.117), not 3 as 01106 asks. crates/macros (synstructure 0.13, syn 2 only) needs syn 2, the root has one `syn` key, and both majors are compiled anyway (syn 2 by serde_derive, thiserror-impl, tracing-attributes, zerocopy-derive; syn 3 by clap_derive, async-trait, rkyv_derive), so writing blaze-query-macros against syn 2 costs nothing and keeps one key. dedup's root additions item carries `syn = \"2.0.117\"`, `quote = \"1.0.45\"`, `proc-macro2 = \"1.0.106\"`. If you need syn 3 for something syn 2 lacks, say what and I will move crates/macros off synstructure instead. Also for your interning merge: `salsa::interned`, crates/intern and crates/blaze-hashcons are three interners; the merge is yours.",
+  "state": "applied",
+  "created": "2026-10-30T21:58:36Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:58:36Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Agreed: blaze-query-macros is written against syn 2 (2.0.117), quote 1.0.45, proc-macro2 1.0.106 from dedup's root additions; 01106's syn 3 is withdrawn. query-unify-macros told."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00089",
+  "from_lane": "db-ty-borrowck",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/tests.rs",
+    "crates/hir-ty-borrowck"
+  ],
+  "what": "## 1. db-ty-hir: fixture tests of the borrow checker's diagnostics in `crates/hir/src/tests.rs`\n\nWhat: one test per fixture below, in `crates/hir/src/tests.rs` (db-ty-hir's), the pattern\n`MOVED_TWICE` and `a_build_gets_no_mir_of_a_body_whose_borrow_check_failed` already use:\n`TestDB::with_files(FIXTURE)`, `crate::attach_db`, `function(&db, name)`, then\n\n```rust\nlet found: Vec<(&str, String)> = hir_ty_borrowck::borrowck(&db, function(&db, name))\n    .diagnostics\n    .iter()\n    .map(|it| (it.code, it.message.clone()))\n    .collect();\nassert_eq!(found, expected, \"{found:?}\");\n```\n\n`expected` is the whole list, in order: the codes and order are rustc's for the same program\n(the pinned nightly's), and each message is rustc's primary message.\n\nWhy: `crates/hir-ty-borrowck` moved its dataflow (move-out, initialization, liveness, loans in\nscope) onto dense bitsets and gen/kill transfer functions, and its loans, moves and outlives\nconstraints onto columnar relations and CSRs. The diagnostics must stay the same, codes,\norder, spans and messages, and the crate's own tests (the dataflow engine against a naive\nper-statement model on generated graphs) do not see a whole body. These fixtures pin the\nuser-visible result. The crate cannot have them itself: `TestDB` and `function` are `hir`'s.\n\n```rust\nconst BORROWCK: &str = r#\"\n//- minicore: sized, copy\nstruct S;\nfn consume(_: S) {}\nfn read(_: &S) {}\nfn make() -> S { S }\n\nfn use_after_move() {\n    let s = S;\n    consume(s);\n    consume(s);\n}\nfn two_mutable_borrows() {\n    let mut s = S;\n    let a = &mut s;\n    let b = &mut s;\n    let _ = (a, b);\n}\nfn mutable_while_shared() {\n    let mut s = S;\n    let a = &s;\n    let b = &mut s;\n    read(a);\n    let _ = b;\n}\nfn move_while_borrowed() {\n    let s = S;\n    let a = &s;\n    consume(s);\n    read(a);\n}\nfn assign_while_borrowed() {\n    let mut x = 1u32;\n    let a = &x;\n    x = 2;\n    let _ = *a;\n}\nfn does_not_live_long_enough() {\n    let r;\n    {\n        let s = S;\n        r = &s;\n    }\n    read(r);\n}\nfn temporary_dropped() {\n    let r: &S;\n    r = &make();\n    read(r);\n}\nfn needless_mut() {\n    let mut s = S;\n    consume(s);\n}\nfn in_order() {\n    let mut s = S;\n    let a = &s;\n    let b = &mut s;\n    read(a);\n    let _ = b;\n    consume(s);\n    consume(s);\n}\n\"#;\n```\n\n| function | expected `(code, message)`, in order |\n| --- | --- |\n| `use_after_move` | `` (\"E0382\", \"use of moved value: `s`\") `` |\n| `two_mutable_borrows` | `` (\"E0499\", \"cannot borrow `s` as mutable more than once at a time\") `` |\n| `mutable_while_shared` | `` (\"E0502\", \"cannot borrow `s` as mutable because it is also borrowed as immutable\") `` |\n| `move_while_borrowed` | `` (\"E0505\", \"cannot move out of `s` because it is borrowed\") `` |\n| `assign_while_borrowed` | `` (\"E0506\", \"cannot assign to `x` because it is borrowed\") `` |\n| `does_not_live_long_enough` | `` (\"E0597\", \"`s` does not live long enough\") `` |\n| `temporary_dropped` | `` (\"E0716\", \"temporary value dropped while borrowed\") `` |\n| `needless_mut` | `` (\"unused_mut\", \"variable does not need to be mutable\") `` |\n| `in_order` | `(\"E0502\", ..)` then `(\"E0382\", ..)`, the messages as in the rows above |\n\n`unused_mut` is a lint (`is_error()` false), so `needless_mut` also asserts\n`hir_ty_borrowck::checked(&db, def).is_ok()`; every other function asserts\n`Err(Refused::Errors { .. })`. If a message renders the place differently from rustc (the\nbackticks of E0382's name, say), the fixture is right and the checker is wrong: say so here\nrather than change the expectation.\n\n> forwarded to db: `crates/hir/src/tests.rs` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:554` (`BORROWCK`), the helper `borrowck_gives` and one test per row, `borrowck_use_after_move` (:650) through `borrowck_in_order` (:699), `needless_mut` asserting `checked(..).is_ok()` and the rest `Refused::Errors`.",
+  "state": "applied",
+  "created": "2026-10-30T00:48:42Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-borrowck.md#1. db-ty-hir: fixture tests of the borrow checker's diagnostics in `crates/hir/src/tests.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-borrowck.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:554` (`BORROWCK`), the helper `borrowck_gives` and one test per row, `borrowck_use_after_move` (:650) through `borrowck_in_order` (:699), `needless_mut` asserting `checked(..).is_ok()` and the rest `Refused::Errors`."
+    }
+  ]
+}

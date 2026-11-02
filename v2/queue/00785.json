@@ -1,0 +1,36 @@
+{
+  "id": "00785",
+  "from_lane": "frontend-tree-go-tokens",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax/src/view.rs",
+    "crates/syntax/src/syntax_node.rs"
+  ],
+  "what": "frontend-tree-go-tokens: an untyped parse tag that is not a handle, so syntax_bridge::token_tree_to_syntax_node (and hir-expand's expansion parse) stop naming SyntaxNode (tree.md 'Kind tags ... Parse<SyntaxNode> for an untyped parse ... need a tag type that is not a handle'). Additive; my side (syntax-bridge, hir-expand/hir-def/mbe callers) is written against it.\n\n(1) crates/syntax/src/view.rs, after `impl Typed for crate::ast::Macro { type Of<'t> = Macro<'t>; }` add:\n\n/// The tag of a parse whose root is of no one kind (a macro expansion's, a token tree's as a\n/// fragment, from [`crate::SyntaxTreeBuilder::finish_view`]): read it with [`Parse::root`]. Not a\n/// handle: nothing of this type exists.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\npub enum Untyped {}\n\nimpl Parse<Untyped> {\n    /// The parse as a `T`'s, when its root is one.\n    pub fn cast<T: Typed>(mut self) -> Option<Parse<T>> {\n        if <T::Of<'_> as AstNode<'_>>::cast(self.root()).is_none() {\n            return None;\n        }\n        Some(Parse {\n            tree: self.tree.take(),\n            errors: self.errors.take(),\n            outline: self.outline,\n            _ty: PhantomData,\n        })\n    }\n}\n\n(2) crates/syntax/src/syntax_node.rs, in `impl SyntaxTreeBuilder`: old `    pub fn finish(self) -> Parse<SyntaxNode> {` + body; new: rename the body to `fn finish_as<T>(self) -> Parse<T> {` (body unchanged), and add\n\n    pub fn finish(self) -> Parse<SyntaxNode> {\n        self.finish_as()\n    }\n\n    /// [`SyntaxTreeBuilder::finish`] tagged [`crate::view::Untyped`], read through views.\n    pub fn finish_view(self) -> Parse<crate::view::Untyped> {\n        self.finish_as()\n    }\n\n`finish` then has callers only in blaze-fmt parse/stream.rs and syntax-bridge prettify_macro_expansion.rs (IDE-facing); delete it with SyntaxNode. Reply in the queue or by tmux to frontend-tree-go-tokens.",
+  "state": "applied",
+  "created": "2026-10-30T07:52:41Z",
+  "updated": "2026-10-30T07:54:51Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T07:52:41Z",
+      "by": "frontend-tree-go-tokens",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:54:51Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:54:51Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "crates/syntax/src/view.rs: pub enum Untyped {} (derives as asked), Parse<Untyped>::cast<T: Typed> (can_cast on the root kind), plus Parse<T>::into_untyped; syntax_node.rs: finish -> finish_as<T>, finish_view -> Parse<Untyped>; test view/tests.rs an_untyped_parse_keeps_its_tree_and_casts_as_the_handle_does"
+    }
+  ]
+}

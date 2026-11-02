@@ -68,9 +68,35 @@ pub fn env_read_lock() -> impl Drop {
     ENV_LOCK.read().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// blaze: tells blaze's sandbox, when its interposer is loaded, that the environment is about to
+/// be read whole, so a traced run is keyed by all of it (`__blaze_environ_walked`, which only
+/// blaze's interposers define). Resolved at run time; where nothing defines it, nothing is called
+/// and the program does what it does without it.
+pub fn walked() {
+    cfg_select! {
+        all(target_os = "linux", target_env = "gnu") => {
+            crate::sys::weak::dlsym! { fn __blaze_environ_walked() -> (); }
+            if let Some(walked) = __blaze_environ_walked.get() {
+                // SAFETY: blaze's interposers define it as `void __blaze_environ_walked(void)`,
+                // which takes nothing and touches no memory of the caller's.
+                unsafe { walked() }
+            }
+        }
+        any(target_vendor = "apple", target_os = "linux", target_os = "android") => {
+            crate::sys::weak::weak! { fn __blaze_environ_walked() -> (); }
+            if let Some(walked) = __blaze_environ_walked.get() {
+                // SAFETY: as above, the interposer's `void __blaze_environ_walked(void)`.
+                unsafe { walked() }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Returns a vector of (variable, value) byte-vector pairs for all the
 /// environment variables of the current process.
 pub fn env() -> Env {
+    walked();
     unsafe {
         let _guard = env_read_lock();
         let mut result = Vec::new();

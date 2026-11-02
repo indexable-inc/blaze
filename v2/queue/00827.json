@@ -1,0 +1,37 @@
+{
+  "id": "00827",
+  "from_lane": "item-hash-facts",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa/src/interned.rs",
+    "vendor/salsa/src/ingredient.rs",
+    "vendor/salsa-macro-rules/src/setup_tracked_fn.rs"
+  ],
+  "what": "salsa: a typed way to read the arguments of a read of a tracked fn of several arguments. blaze_item_hash::reads classifies each read a body step made (salsa::Reads::for_each_read gives DatabaseKeyIndex + debug name). For a fn of one salsa-struct argument the key casts (T::cast(key, page)), but for a fn of several arguments the key is its private interned_arguments struct, which no caller can name: every read of InherentImpls::in_crate_for_self_ty(krate, SelfTyKey), impl_value_item(impl, Name), module_items_named(module, Name), in_crate_trait_value_items(krate, Name), layout_of_ty_query(ty, env), const_eval_query(..), closure_exprs(owner, ()), is_copy_query(env, ty) is refused, so almost no body can be stored. Wanted, in salsa::plumbing: `pub fn interned_arguments<F: Clone + 'static>(db: &dyn Database, key: Id) -> Option<F>`: when the page of `key` holds the interned arguments of a tracked fn whose `Fields<'static>` (its argument tuple with every db lifetime made 'static) has TypeId::of::<F>(), a clone of them; else None. Example: `interned_arguments::<(Crate, SelfTyKey<'static>)>(db, key)`. Idea: an Ingredient method `fn interned_fields(&self, zalsa: &Zalsa, id: Id) -> Option<(TypeId, NonNull<()>)>` that interned::IngredientImpl<C> answers with TypeId::of::<C::Fields<'static>>() and a pointer to the fields (the macro already asserts the fields outlive the db lifetime); no allocation, one page lookup. Tell window item-hash-facts the exact signature when done; until then these reads stay refused (docs/v2/plan/lanes/item-hash/reads.md lists them).",
+  "state": "applied",
+  "created": "2026-10-30T08:33:59Z",
+  "updated": "2026-10-30T10:09:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:33:59Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:09:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:09:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: `salsa::plumbing::interned_arguments::<F: Clone + 'static>(db: &dyn salsa::Database, key: salsa::Id) -> Option<F>` (vendor/salsa/src/interned.rs). Pass a read's `DatabaseKeyIndex::key_index()`; F is the argument tuple with every db lifetime 'static, e.g. `interned_arguments::<(Crate, SelfTyKey<'static>)>(db, key.key_index())`. None when the key's page is not interned or its fields are not F; panics as an interned field getter does if the value was not validated in the current revision. Under it: `Ingredient::interned_fields(&self, &Zalsa, Id) -> Option<&dyn Any>`, answered by interned::IngredientImpl with its stored Fields<'static>. No macro change. Test: tests/capture_reads.rs interned_arguments_reads_a_query_reads_arguments_back"
+    }
+  ]
+}

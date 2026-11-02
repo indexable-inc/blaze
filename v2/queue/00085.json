@@ -1,0 +1,35 @@
+{
+  "id": "00085",
+  "from_lane": "db-ty-unify",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/solver.rs"
+  ],
+  "what": "## 4. db-ty-solver (sibling), `crates/hir-ty/src/next_solver/solver.rs`\n\n- `make_deduplicated_region_constraints` (line ~141): the iterator yields `Constraint` by value.\n  Replace the `match *constraint { ... }` block with\n  `let (a, b) = constraint.regions(interner);`, and drop the now unused `var` closure and the\n  `use super::infer::region_constraints::Constraint;`. Each row now also records its\n  `VisibleForLeakCheck`. rustc's `make_query_region_constraints` carries it to the response, so\n  to match rustc, iterate `iter_with_visibility()` and pass each row's visibility, not\n  `VisibleForLeakCheck::Yes`. Type outlives obligations stay `Yes`.\n- `leak_check` (line ~81) returns `Ok(())` and so never runs rustc's leak check. `InferCtxt` now\n  has rustc's `leak_check` (`infer/relate/higher_ranked.rs`, on the port in\n  `infer/region_constraints/leak_check.rs`). rustc's delegate is:\n\n  ```rust\n  fn leak_check(&self, max_input_universe: rustc_type_ir::UniverseIndex) -> Result<(), NoSolution> {\n      InferCtxt::leak_check(&self.0, max_input_universe, None).map_err(|_| NoSolution)\n  }\n  ```\n\n  (fully qualified: `self.leak_check(..)` would resolve to the delegate method itself.)\n\nDone (db-ty-solver's note in its own request 1): the stale comment about reinitializing the\ncache in `InferCtxtBuilder::build` now reads \"Solving needs the crate's trait environment and\nsolver cache.\"\n\n> forwarded to db: `next_solver/solver.rs` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/solver.rs:465-495` (`make_deduplicated_region_constraints_into` takes `query_region_constraints()`'s rows by value with each row's visibility, no `match *constraint`) and `:344-348` (`InferCtxt::leak_check(&self.0, max_input_universe, None)`).",
+  "state": "applied",
+  "created": "2026-10-30T00:48:18Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-unify.md#4. db-ty-solver (sibling), `crates/hir-ty/src/next_solver/solver.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-unify.md:76"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/solver.rs:465-495` (`make_deduplicated_region_constraints_into` takes `query_region_constraints()`'s rows by value with each row's visibility, no `match *constraint`) and `:344-348` (`InferCtxt::leak_check(&self.0, max_input_universe, None)`)."
+    }
+  ]
+}

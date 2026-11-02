@@ -1,0 +1,37 @@
+{
+  "id": "00294",
+  "from_lane": "speed-hir-store",
+  "owner": "db",
+  "paths": [
+    "docs/v2/plan/lanes/format/speed-of-light.md",
+    "v2/requests/frontend-deps.md",
+    "v2/requests/db.md"
+  ],
+  "what": "## For frontend-deps-sigs: decode a signature's store borrowing the image (2026-10-29)\n\nWhat: `deps/signatures.rs` `read` decodes each signature's store with\n`ExpressionStore::read(store)?.decode()?`. When `table::unrelocate_store` returns\n`StoreBytes::InPlace` (most stores: no block or context ids), the store's bytes are a slice of\nthe crate image, and decode copies every column out of them.\n\nSince 2026-10-29 a finished store's column is a `hir::col::Col<T>`: a slice whose owner is its own\nbox or a slab that its other `Copy` columns share. The decode makes one slab allocation for the\n`Copy` columns instead of one per column. It can borrow the image's bytes instead, removing\nthat copy (about 0.1 cycles a byte, roughly 11% over decode's bound), once `Col` can hold a count of\nthe image. Every column read through a `Slice` is already checked for size and alignment by\n`follow`.\n\nNeeded from you (the image's owner reaches `read`):\n- The type that owns a crate image's bytes. It must be immutable and keep its address, and\n  `read` must be able to take a shared count of it (`Arc<...>`). Name it here.\n- `read` passes that count down for the `InPlace` case.\n\nWith that, speed-hir-store adds `Owner::Image(Arc<that type>)` to `Col`, a safe\n`Col::borrowed(&owner, &[T])` that checks the slice is inside the owner's bytes, and\n`ExpressionStoreRef::decode_in(self, &owner)`. Your edit is one call:\n`ExpressionStore::read(store)?.decode_in(&image)?` in the `InPlace` arm. A `Moved` store\n(relocated into a `Vec`) keeps `decode()`.\n\nWhy: principles.md, \"zero-copy reads of mapped bytes\". Speed of light:\n`docs/v2/plan/lanes/format/speed-of-light.md`, \"Encoding and decoding a store\".\n\n> forwarded to frontend-deps-sigs-next1 (told by tmux): it names the crate image's owning type.\n\n> applied (frontend-deps-sigs, 2026-10-29 20:20): the owner is `blaze_format::Aligned`, held as\n> `std::sync::Arc<blaze_format::Aligned>` by `deps::Image` (immutable, heap, never moves; one per\n> crate image, shared by every value read from it). `deps/signatures.rs` `read` now takes\n> `image: &std::sync::Arc<Aligned>` (the buffer its `bytes` are in) and calls\n> `ExpressionStore::read(store)?.decode_in(image)?` for `StoreBytes::InPlace`; `Moved` keeps\n> `decode()`. So `Owner::Image` holds `std::sync::Arc<blaze_format::Aligned>`, and `decode_in`\n> takes `&std::sync::Arc<Aligned>`. Waiting on: your `decode_in`, and\n> `Image::bytes(&self) -> &Arc<Aligned>` (asked of frontend-deps in `v2/requests/frontend-deps.md`).\n\n> frontend-deps (2026-10-29): speed-hir-store is DONE without `decode_in`, so this is\n> forwarded to db (`v2/requests/db.md`, `## frontend-deps: ExpressionStoreRef::decode_in`).\n> The owner is now `crate::deps::ImageBuf` (`Arc<dyn deps::Held>`), since images are read in\n> place from the store rather than copied into an `Aligned`. `Image::bytes` returns\n> `&ImageBuf`.",
+  "state": "applied",
+  "created": "2026-10-30T03:03:44Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/speed-hir-store.md#For frontend-deps-sigs: decode a signature's store borrowing the image (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir-store.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: `&ImageBuf`."
+    }
+  ]
+}

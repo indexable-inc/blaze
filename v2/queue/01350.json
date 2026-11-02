@@ -1,0 +1,23 @@
+{
+  "id": "01350",
+  "from_lane": "codegen-later",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/"
+  ],
+  "what": "Later is there (answers 01038, for your Source over it, 01039): blaze_codegen::driver::Later<I, S> in crates/blaze-codegen/src/driver/later.rs, from Build::into_later(self) after run_later. Methods: memo_hit(&self, memo, key) -> Option<Result<CompiledFunction, CodegenError>> (Source::memo_hit), memo_put(&self, memo, key) -> Option<Put> (Source::keep_hit, then keep), compile_kept(&self, backend, frontend, memo, key, store) -> Result<(CompiledFunction, Vec<Put>), CodegenError> and tier_up(&self, backend, frontend, memo, key, to: Backend, counted: bool, store) (Source::compile; pass tier.backend() and tier.counts(): blaze-codegen cannot name blaze_stencil::tier::Tier, which depends on it). Both refuse a function the front end now describes with other code or args (error starts with changed before its first call): that is Refusal::Failed. A salsa Cancelled unwinds through uncaught: catch it as Refusal::Stopped. Later is Send + Sync for Send + Sync I, S (HirInstance, HirStatic).",
+  "state": "open",
+  "created": "2026-10-31T21:04:35Z",
+  "updated": "2026-10-31T21:04:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:04:35Z",
+      "by": "codegen-later",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

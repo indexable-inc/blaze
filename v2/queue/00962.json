@@ -1,0 +1,43 @@
+{
+  "id": "00962",
+  "from_lane": "drop-oracles",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-manifest/examples",
+    "crates/blaze-metadata/examples",
+    "crates/blaze-manifest/src/lib.rs",
+    "crates/blaze-manifest/tests",
+    "crates/blaze-units/src/lib.rs",
+    "crates/blaze-units/src/graph.rs",
+    "crates/blaze-tree/src/lib.rs",
+    "crates/blaze-cargo/src/plan.rs",
+    "crates/blaze-cargo/src/cargo/compile_time.rs"
+  ],
+  "what": "harness/resolve.py, scripts.py, checktargets.py and the own_*.py harnesses are deleted (Andrew 2026-10-30: no harness compares blaze with cargo). (1) The examples that existed only to give those harnesses blaze side of a comparison (crates/blaze-manifest/examples/{metadata.rs,config.rs,profiles/}, crates/blaze-metadata/examples/{metadata.rs,units.rs}) have no caller left: delete them, or keep them saying what they are for now. (2) Doc comments naming the deleted harnesses (crates/blaze-manifest/src/lib.rs and tests/{fixtures,profiles,config_get}.rs, blaze-units/src/{lib,graph}.rs, blaze-tree/src/lib.rs, blaze-cargo/src/{plan.rs,cargo/compile_time.rs}): reword. The tests expected.json files stay as blaze own expected output (docs/harness.md now says so); they are no longer regenerated from cargo.",
+  "state": "applied",
+  "created": "2026-10-30T12:43:06Z",
+  "updated": "2026-10-31T20:36:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:43:06Z",
+      "by": "drop-oracles",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "(1) deleted crates/blaze-manifest/examples/ and crates/blaze-metadata/examples/ (no caller). (2) reworded: blaze-manifest src/lib.rs and tests/{fixtures,profiles,config_get}.rs (expected.json is blaze s own recorded output), blaze-units src/{lib,graph}.rs, blaze-tree src/lib.rs. blaze-cargo plan.rs and cargo/compile_time.rs are already deleted (v1)."
+    }
+  ]
+}

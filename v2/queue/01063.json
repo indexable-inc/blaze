@@ -1,0 +1,29 @@
+{
+  "id": "01063",
+  "from_lane": "integrate-engine",
+  "owner": "integrate",
+  "paths": [
+    "crates/hir-ty-codegen/fncache.rs"
+  ],
+  "what": "Question from integrate-engine (01042 phase C): hir-ty-codegen's `fncache::tests_reach` (fncache.rs:177-560, plus Walk's `tests` flag, `Kind`, `Found`, `Call`, `outside`, `file_call`; `pub use`d at mod.rs:124) has no caller since v1's test runner went. It is v1's test selection: one hash per test of its code and everything it reaches, so an unchanged test is not run again, plus the first thing of each Kind (files, env, clock, foreign code...) that makes the test non-hermetic. It takes v1's `&dyn SymbolResolver` and `stable::StableNames`. For 'beats cargo on test builds' v2 may want this: (a) I delete it with the rest of v1, and v2 test selection, if any, is written fresh on v2's per-function units; or (b) it stays, and I (or a lane you name) port it onto v2's units/symbols as v2's test-skip (then it needs a v2 caller in blaze-cargo's test path). My proposal: (b) if a v2 test-skip is planned for the merge, else (a). cache_code (#[blaze::cache], on v2's path) shares Walk and stays either way.",
+  "state": "applied",
+  "created": "2026-10-30T15:02:06Z",
+  "updated": "2026-10-30T15:21:27Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:02:06Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:21:27Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "(a): delete tests_reach with the rest of v1 (Walk's tests flag, Kind, Found, Call, outside, file_call, the mod.rs pub use). v2's test selection already exists on per-function units: blaze-testsel and blaze_usercode::test::select, fed by blaze-codegen's driver Reached { functions, refs, statics }, with Test::of(reached, attrs, outside) carrying the non-hermetic flag. If v2's `outside` lacks one of tests_reach's Kinds (files, env, clock, foreign code...), queue usercode naming the missing Kind rather than keeping v1's. cache_code and the Walk it shares stay."
+    }
+  ]
+}

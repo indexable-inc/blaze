@@ -1,0 +1,36 @@
+{
+  "id": "00688",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-stencil/src/patch/select.rs",
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "## fastcompile-stencil-a64 3: fastcompile-stencil-patch: `stack_load` and `stack_store` have no `Op` (`crates/blaze-stencil/src/patch/select.rs` `op_of`)\n\nWhat: `op_of` maps `Opcode::StackAddr` but not `Opcode::StackLoad` or `Opcode::StackStore`,\nthough `shape.rs` has their shapes and the IR builder emits both\n(`crates/hir-ty-codegen/mod.rs`, e.g. lines 13551, 18702, 20131). The AArch64 glue does not\ntake them (Cranelift lowers them as a load or store at the slot's address, which is a\nstencil's), so today such a function stops with \"no stencil is of it and the glue does not\nwrite it\".\n\nWhy: every function with a `stack_load` or `stack_store` fails to compile on the stencil\nbackend until `op_of` maps them.\n\n> answered by fastcompile-stencil-patch: in Cranelift 0.136.2 they are not opcodes.\n> `InstBuilder::stack_load`/`stack_store` are builder sugar (generated `inst_builder.rs`)\n> that emit `stack_addr` and then `load`/`store` with `MemFlagsData` set, so the IR the\n> builder makes has no such instruction and `Opcode` has no `StackLoad`/`StackStore`.\n> `stack_addr`, `load` and `store` are selected already (`shape.rs` has no stack load/store\n> ops either). If a function still fails, the error names the real opcode: send it.\n> Test: `patch/tests.rs` `stack_loads_and_stores_are_an_address_and_an_access` builds both\n> with `FunctionBuilder`, checks the IR is `stack_addr`/`store`/`stack_addr`/`load`, and that it\n> compiles to those stencils with the slot's offset.\n\nStatus: wrong: builder sugar, no opcode\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:32:12Z",
+  "taken_by": "coord-apply-back",
+  "why": "wrong, as fastcompile-stencil-patch answered: Cranelift 0.136 has no StackLoad/StackStore opcodes; InstBuilder::stack_load/stack_store emit stack_addr then load/store, which select.rs op_of already maps; test patch/tests.rs stack_loads_and_stores_are_an_address_and_an_access.",
+  "source": "v2/requests/fastcompile.md#fastcompile-stencil-a64 3: fastcompile-stencil-patch: `stack_load` and `stack_store` have no `Op` (`crates/blaze-stencil/src/patch/select.rs` `op_of`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:2521"
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:12Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "wrong, as fastcompile-stencil-patch answered: Cranelift 0.136 has no StackLoad/StackStore opcodes; InstBuilder::stack_load/stack_store emit stack_addr then load/store, which select.rs op_of already maps; test patch/tests.rs stack_loads_and_stores_are_an_address_and_an_access."
+    }
+  ]
+}

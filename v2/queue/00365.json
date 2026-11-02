@@ -1,0 +1,35 @@
+{
+  "id": "00365",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine"
+  ],
+  "what": "## 10. `Settled::still`: the files outside the checkout looked at through one buffer (required)\n\n`lib.rs:10849-10860`, before:\n\n```rust\n    fn others(\n        files: &[WatchedFile],\n        base: &Path,\n        written: impl Fn(&WatchedFile) -> Option<SystemTime>,\n    ) -> u64 {\n```\n\nafter:\n\n```rust\n    fn others(\n        files: &[WatchedFile],\n        base: &Path,\n        mut written: impl FnMut(&WatchedFile) -> Option<SystemTime>,\n    ) -> u64 {\n```\n\n`lib.rs:10873-10874`, before:\n\n```rust\n        // A file outside every checkout is read from where it is.\n        let outside = |file: &WatchedFile| written(&db.on_disk(&file.path));\n```\n\nafter:\n\n```rust\n        // A file outside every checkout is read from where it is.\n        let mut lent = blaze_mem::scratch::lend_path();\n        let outside = |file: &WatchedFile| {\n            db.files().on_disk_into(&file.path, &mut lent);\n            written(&lent)\n        };\n```\n\n- Why: `still` is what answers `ok unchanged` (`lib.rs:9869`), the no-op rebuild itself; it\n  looked up every file outside the checkout with a fresh `PathBuf` each. The other caller of\n  `others` (`lib.rs:10845`, `|file| file.mtime`) is unchanged by the `FnMut` bound.\n- Budget test: `a_look_at_unchanged_files_allocates_nothing` holds `on_disk_into` and\n  `metadata` to zero; `still` adds a hash over the same files.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#10. `Settled::still`: the files outside the checkout looked at through one buffer (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:1503"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

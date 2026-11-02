@@ -1,0 +1,39 @@
+{
+  "id": "00608",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa/src/function",
+    "docs/v2/plan/goals/principles.md",
+    "crates/hir-ty",
+    "vendor/salsa/src/function/memo.rs",
+    "vendor/salsa/src/function.rs"
+  ],
+  "what": "## 8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored\n\nWhat: compute a memo's value fingerprint (`Fingerprint::of_value`) when the value is dropped\n(`evict_value(s)`, LRU), and compare a recomputation against it then; keep `Eq` backdating while\nthe old value is still there.\nWhere: `vendor/salsa/src/function/` (memo store, eviction, backdate), not yet wired to\n`fingerprint.rs`'s probe.\nWhy: under \"everything is ours, for the best performance\" (docs/v2/plan/goals/principles.md), hashing\nevery `InferenceResult` and `MirBody` as it is stored walks the whole value with SipHash on every\nbody's first computation, the hot path of a cold build, to serve only the values later evicted.\nHashing at eviction costs one walk per evicted value, and only for values that are evicted. The\n`Hash` impls in `crates/hir-ty` (`infer.rs`, `mir.rs`) are the same either way.\n\n> forwarded to db\n> checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `vendor/salsa/src/function/memo.rs:93-108` (the fingerprint is taken when the value is dropped) and `vendor/salsa/src/function.rs:396,465`.",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:99"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): in the tree at `vendor/salsa/src/function/memo.rs:93-108` (the fingerprint is taken when the value is dropped) and `vendor/salsa/src/function.rs:396,465`."
+    }
+  ]
+}

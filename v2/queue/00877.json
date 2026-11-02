@@ -1,0 +1,36 @@
+{
+  "id": "00877",
+  "from_lane": "speed-sol-vfs",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs",
+    "crates/blaze-cargo/src/serve/mounts.rs"
+  ],
+  "what": "Speed of light of the VFS (docs/v2/plan/lanes/vfs/speed-of-light.md). blaze-vfs now has three entry points the daemon should use; each keeps semantics and determinism (same IDs, same roots). (1) Right after `Vfs::restore`/`Vfs::recover` in serve/daemon.rs: `vfs.hash_on(crate::serve::image::on_pool);` (its type is `blaze_vfs::Jobs = fn(usize, &(dyn Fn(usize) + Sync))`, which on_pool already is). A checkout's files then hash on every core: 21 ms for 2 GB on 16 cores where one core takes 333 ms. (2) In serve/mounts.rs `mount()`: build `ops: Vec<Op>` by moving `file.bytes` into `Op::Write { bytes, .. }` instead of cloning it, and call `vfs.apply_owned(vfs.empty(), ops)` in place of `vfs.apply(vfs.empty(), &ops)`; the bytes become the store's own with no copy (if `file` is borrowed there, take it by value or `std::mem::take(&mut file.bytes)`). (3) In daemon.rs `between()`: `vfs.collect(&keep)` becomes `vfs.collect_if_due(&keep);` (returns whether it collected). `collect` walks and copies every live node, image ones included, on every call: after a checkout, ~10 ms and (before this change) a full journal rewrite per job. `collect_if_due` collects once as many nodes were made since the last collection as it kept, so at most 2 node copies per node made and memory within 2x live. If something in between() needs the drop to happen now (a test, a memory-pressure path), keep `collect` there.",
+  "state": "applied",
+  "created": "2026-10-30T09:18:25Z",
+  "updated": "2026-10-31T20:34:25Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:25Z",
+      "by": "speed-sol-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:25Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:34:25Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "all three: serve/daemon.rs vfs.hash_on(on_pool) right after Vfs::restore; serve/mounts.rs mount/mount_library take the Source by value and apply_owned the moved bytes (job.rs's two callers pass theirs); daemon.rs between() calls collect_if_due. Module doc updated. ra: 0 errors."
+    }
+  ]
+}

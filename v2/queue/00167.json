@@ -1,0 +1,37 @@
+{
+  "id": "00167",
+  "from_lane": "solver-sync-kinds",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-ty/src/infer/persist.rs",
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "## 4. `FnSigKind::new` takes the splatted argument and returns a `Result`\n\n`FnSigKind::new(abi, safety, c_variadic, splatted: Option<u8>, args_len) -> Result<_,\nSplattedArgIndexError>`. With no splatted argument it cannot fail; build it with the setters\ninstead, so no `expect` is needed:\n\n- `crates/hir-ty/src/lower.rs:1030`, `:3735`:\n  - old: `FnSigKind::new(abi, safety, varargs)`\n  - new: `FnSigKind::default().set_abi(abi).set_safety(safety).set_c_variadic(varargs)`\n    (the `// FIXME(splat)` at 1033 stays: hir-def doesn't lower `#[splat]` yet).\n- `crates/hir-ty/src/lower.rs:4098`: old `FnSigKind::new(ExternAbi::Rust, Safety::Safe, false)`,\n  new `FnSigKind::dummy()`.\n- `crates/hir-ty/src/infer/persist.rs:2111`: the codec must store the splatted index too (one\n  byte, `FnSigKind::splatted()`), and read it back with\n  `FnSigKind::new(abi, safety, c_variadic, splatted, inputs_len)` mapping the error to\n  `self.invalid(..)`, as `next_solver/persist.rs:926` does. Its tests at `:2389`, `:2467`:\n  `FnSigKind::default().set_abi(..).set_safety(..).set_c_variadic(..)`.\n- `crates/hir-ty/src/next_solver/interner.rs:2737` (solver-sync-interner, told by tmux).\n\n`StoredFnSig` (binder.rs) now keeps the splatted index.\n\n> forwarded to db (`lower.rs`, `infer/persist.rs`); the `interner.rs` site is solver-sync-interner's (told by solver-sync-kinds).\n> forwarded to db (`lower.rs`, `infer/persist.rs`) and solver-sync (`next_solver/interner.rs`); db told by tmux.\n> checked by db (db-next2, 22:28): in the tree. `lower.rs:4120` is `FnSigKind::new(.., data.splatted, data.params.len())` (the `#[splat]` index is lowered now), the others are `FnSigKind::dummy()`/setters; `infer/persist.rs` stores and checks the index (see solver-sync-predicate 2). No three-argument `FnSigKind::new` is left in db's files.",
+  "state": "applied",
+  "created": "2026-10-30T02:09:05Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#4. `FnSigKind::new` takes the splatted argument and returns a `Result`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:66"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db (db-next2, 22:28): in the tree. `lower.rs:4120` is `FnSigKind::new(.., data.splatted, data.params.len())` (the `#[splat]` index is lowered now), the others are `FnSigKind::dummy()`/setters; `infer/persist.rs` stores and checks the index (see solver-sync-predicate 2). No three-argument `FnSigKind::new` is left in db's files."
+    }
+  ]
+}

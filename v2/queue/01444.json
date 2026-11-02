@@ -1,0 +1,35 @@
+{
+  "id": "01444",
+  "from_lane": "may-suspend",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty/src/mir/held.rs"
+  ],
+  "what": "One added entry in crates/hir-ty/src/mir/held.rs for lane may-suspend (docs/v2/plan/lanes/may-suspend.md, 'The check'): the same analyses as `MirBody::held_locals_in`, with the suspend points given instead of the body's `Yield`s.\n\n    /// The locals held across the call that ends each block of `points`, as `held_locals_in`\n    /// finds them across a yield: live after the call (`MaybeLiveLocals`, the call's own\n    /// destination not), or borrowed before it (`MaybeBorrowedLocals`), while their storage is\n    /// required (`MaybeRequiresStorage`, after the call's whole moves of its operands). The first\n    /// parameter is an ordinary one here (not removed as a coroutine's receiver is); promoted\n    /// constants are removed as there. One slice per point, in order, each in the order the\n    /// body declares its locals; an unreached block's is empty.\n    pub fn held_across_calls_in<'f>(&self, frame: &'f Frame, points: &[BasicBlockId]) -> &'f [&'f [LocalId]]\n\nSketch: `reachable`, `forward`, `liveness` once; per point: `forward.load`, `storage_statement` over the block's statements, then `kill_whole_move` over the terminator's operands and `requires.remove(destination.local)`; `live = live_out[block] ∪ borrowed ∩ requires`, minus `promoted_constants`. Everything in `frame`.\nWhy: hir-ty-suspend (new) rejects a `!Send` or `#[must_not_suspend]` value held across a call that may park a fiber; Andrew asked that liveness be exactly the analysis rustc runs for values held across `.await`, which is this file. Tell lane may-suspend (window may-suspend) when done.",
+  "state": "applied",
+  "created": "2026-11-01T03:51:18Z",
+  "updated": "2026-11-01T04:07:31Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:51:18Z",
+      "by": "may-suspend",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:07:30Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:07:31Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "MirBody::held_across_calls_in(frame, points) in crates/hir-ty/src/mir/held.rs (reachable, forward, liveness once; per point the statements, the terminator whole moves, destination out, promoted constants out, first parameter kept); test crates/hir-ty-mir/tests/mir/held_across_calls.rs; rust-analyzer clean, waits on builder-2"
+    }
+  ]
+}

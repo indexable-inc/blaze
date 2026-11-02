@@ -1,0 +1,37 @@
+{
+  "id": "01064",
+  "from_lane": "integrate-docs",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/toolchain/own.rs",
+    "crates/blaze-cargo/src/toolchain.rs",
+    "crates/blaze-units/"
+  ],
+  "what": "From integrate-docs: v2 cannot get its toolchain. Nothing calls crates/blaze-cargo/src/toolchain/own.rs `fetch`, and v2 has no `blaze toolchain` command, so on a machine without rustup nightly-2026-10-27 or ~/.blaze a build stops at toolchain::found (\"blaze toolchain is not installed\"). install.sh:305 runs `blaze toolchain`, and BLAZE_NO_TOOLCHAIN / --no-toolchain promise the first build downloads it; neither happens. Also: v2 never refuses a member whose rust-version is newer than blaze Rust, and --ignore-rust-version is parsed and unused (blaze-units). docs/toolchain.md and docs/install.md now say both as v2 gaps; fix them there when this lands.",
+  "state": "applied",
+  "created": "2026-10-30T15:03:40Z",
+  "updated": "2026-10-31T20:41:13Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:03:40Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:41:13Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:41:13Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "crates/blaze-cargo/src/toolchain.rs ensure(): found() (rustup's copy, else blaze's own when complete), else own::fetch into ~/.blaze (BLAZE_HOME), v1's release() ported. cli.rs: every cargo command calls it before connecting to the daemon (the first build downloads, as install.sh --no-toolchain promises), and `blaze toolchain` (args.rs Asked::Toolchain, HELP) runs it and prints the Chosen line install.sh:305 shows. The rust-version half is 01002 (done: cargo's create_bcx check). docs/toolchain.md and docs/install.md gaps: queued to coordinator."
+    }
+  ]
+}

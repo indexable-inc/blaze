@@ -6,12 +6,11 @@
 //! rather than HIR: what lowering turns into another kind (`?`, `.await`, ranges, parentheses)
 //! is taken as the kind it lowers to.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
-use syntax::{
-    AstNode,
-    ast::{self, RangeItem as _},
-};
+use syntax::view as ast;
+
+use ast::{AstNode as _, RangeItem as _};
 
 /// clippy's `AssocOp`: the operator of a binary expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,10 +94,10 @@ impl Sugg {
     /// clippy's `Sugg::hir_with_context` for an expression written in the context it is
     /// suggested in; `snippet` is the source of a node, and `same_type` whether a `!` or `-`
     /// expression has the type of its operand.
-    pub(crate) fn of(
-        expr: &ast::Expr,
-        snippet: &dyn Fn(&syntax::SyntaxNode) -> String,
-        same_type: &dyn Fn(&ast::PrefixExpr) -> bool,
+    pub(crate) fn of<'t>(
+        expr: ast::Expr<'t>,
+        snippet: &impl Fn(ast::Node<'t>) -> Cow<'t, str>,
+        same_type: &impl Fn(ast::PrefixExpr<'t>) -> bool,
     ) -> Sugg {
         if let ast::Expr::PrefixExpr(prefix) = expr
             && let Some(op) = prefix.op_kind()
@@ -112,19 +111,21 @@ impl Sugg {
             if let Some(op) = op
                 && same_type(prefix)
             {
-                return Sugg::UnOp(op, Box::new(Sugg::of(&inner, snippet, same_type)));
+                return Sugg::UnOp(op, Box::new(Sugg::of(inner, snippet, same_type)));
             }
         }
         Sugg::from_snippet(expr, snippet)
     }
 
     /// clippy's `Sugg::hir_from_snippet`.
-    pub(crate) fn from_snippet(
-        expr: &ast::Expr,
-        snippet: &dyn Fn(&syntax::SyntaxNode) -> String,
+    pub(crate) fn from_snippet<'t>(
+        expr: ast::Expr<'t>,
+        snippet: &impl Fn(ast::Node<'t>) -> Cow<'t, str>,
     ) -> Sugg {
-        let text = || snippet(expr.syntax());
-        let of = |it: Option<ast::Expr>| it.map(|it| snippet(it.syntax())).unwrap_or_default();
+        let text = || snippet(expr.syntax()).into_owned();
+        let of = |it: Option<ast::Expr<'t>>| {
+            it.map(|it| snippet(it.syntax()).into_owned()).unwrap_or_default()
+        };
         match expr {
             ast::Expr::RangeExpr(range) => {
                 let limits = match range.op_kind() {
@@ -138,7 +139,7 @@ impl Sugg {
                     inner @ (ast::Expr::BinExpr(_)
                     | ast::Expr::CastExpr(_)
                     | ast::Expr::RangeExpr(_)),
-                ) => Sugg::from_snippet(&inner, snippet),
+                ) => Sugg::from_snippet(inner, snippet),
                 Some(
                     ast::Expr::RefExpr(_)
                     | ast::Expr::IfExpr(_)
@@ -167,7 +168,7 @@ impl Sugg {
                 Sugg::BinOp(op, of(bin.lhs()), of(bin.rhs()))
             }
             ast::Expr::CastExpr(cast) => {
-                let ty = cast.ty().map(|it| snippet(it.syntax())).unwrap_or_default();
+                let ty = cast.ty().map(|it| snippet(it.syntax()).into_owned()).unwrap_or_default();
                 Sugg::BinOp(Op::Cast, of(cast.expr()), ty)
             }
             _ => Sugg::NonParen(text()),
@@ -250,15 +251,18 @@ impl std::ops::Not for Sugg {
 mod tests {
     use super::*;
 
-    fn expr(text: &str) -> ast::Expr {
-        let file =
-            syntax::SourceFile::parse(&format!("fn f() {{ {text}; }}"), span::Edition::CURRENT)
-                .tree();
-        file.syntax().descendants().find_map(ast::ExprStmt::cast).and_then(|it| it.expr()).unwrap()
-    }
+    use ast::AstNode as _;
 
     fn sugg(text: &str) -> Sugg {
-        Sugg::of(&expr(text), &|it| it.text().to_string(), &|_| true)
+        let parse =
+            syntax::SourceFile::parse(&format!("fn f() {{ {text}; }}"), span::Edition::CURRENT);
+        let expr = parse
+            .root()
+            .descendants()
+            .find_map(ast::ExprStmt::cast)
+            .and_then(|it| it.expr())
+            .unwrap();
+        Sugg::of(expr, &|it| Cow::Borrowed(it.text()), &|_| true)
     }
 
     #[test]

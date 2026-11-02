@@ -1,0 +1,35 @@
+{
+  "id": "01126",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R8 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): say what `ReadKind` a tracked struct's #[tracked] field read is (the fork has ReadKind::TrackedStruct; the contract has Function, InputField(u32), Interned). Proposal: InputField(n), the field being a cell its query writes. blaze-item-hash reads.rs:282-283 classifies by it.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: ReadKind::TrackedField(u32), distinct from InputField."
+    }
+  ]
+}

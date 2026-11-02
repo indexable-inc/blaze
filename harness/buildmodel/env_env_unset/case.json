@@ -1,9 +1,0 @@
-{
-  "row": "`env!` of a variable that is not set",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "fails": true,
-  "expect": "refused"
-}

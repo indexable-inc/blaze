@@ -1,0 +1,30 @@
+{
+  "id": "01249",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-ty/src/check_cache.rs",
+    "crates/base-db/src/named.rs",
+    "crates/base-db/src/lib.rs",
+    "crates/base-db/src/db.rs",
+    "crates/blaze-lower/src/lib.rs",
+    "crates/hir-ty/src/method_resolution/delta/publish.rs",
+    "crates/hir-def/src/deps/serve.rs",
+    "crates/hir-ty/src/consteval/deps.rs"
+  ],
+  "what": "R18 (01228, contract section Singletons in docs/v2/plan/lanes/db/query-unify.md; engine + macros in both trees): reading a singleton's absence (`try_get` -> None) now records a dependency, and making a singleton is a write: generated `S::new(db, ..)` and `S::builder(..).new(db)` of an `input(singleton)` take `&mut D` (input_new_singleton opens a view so exactly the readers of the absence rerun, same view or not; the fork left them valid forever: hir-def frozen/deps tests in round3b). In blaze-v2-qu change the creators that pass `&`: `&*db` -> `db` at hir-ty check_cache.rs:107, base-db named.rs:175, lib.rs:156 (ProcessEnv::new) and :517 (AllCrates), hir-ty method_resolution/delta/publish.rs:201 (ImplIdentities::new) and :608 (ImplSlices::new), hir-def deps/serve.rs:323, hir-ty consteval/deps.rs:148; `&db` -> `&mut db` at base-db db.rs:141-142 and blaze-lower lib.rs:325-326 (bind `db` mut). Sites already passing a `&mut Db` named `db` (frozen.rs:118/290, publish.rs:313, nameres.rs:144, method_resolution/frozen.rs:44, proc_macro.rs:156, location.rs:134, blaze-item-hash inputs.rs:36) compile as they are if `db` is `&mut`; any that is `&Db` must get `&mut` from its caller. Record as a replay step.",
+  "state": "open",
+  "created": "2026-10-31T12:05:25Z",
+  "updated": "2026-10-31T12:05:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:05:25Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

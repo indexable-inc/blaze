@@ -80,8 +80,8 @@ pub(crate) mod entry {
             paths::type_path(p);
         }
         pub(crate) fn item(p: &mut Parser<'_>) {
-            // We can set `is_in_extern=true`, because it only allows `safe fn`, and there is no ambiguity here.
-            items::item_or_macro(p, true, true, false);
+            // `is_in_extern` is set: it only allows `safe fn`, and there is no ambiguity here.
+            items::item_fragment(p);
         }
         // Parse a meta item , which excluded [], e.g : #[ MetaItem ]
         pub(crate) fn meta_item(p: &mut Parser<'_>) {
@@ -113,6 +113,10 @@ pub(crate) mod entry {
             let m = p.start();
 
             while !p.at(EOF) {
+                if p.at(T!['}']) {
+                    p.err_and_bump("expected expression, item or let statement");
+                    continue;
+                }
                 expressions::stmt(p, expressions::Semicolon::Optional);
             }
 
@@ -153,8 +157,12 @@ pub(crate) mod entry {
 
         pub(crate) fn expr(p: &mut Parser<'_>) {
             let m = p.start();
-            expressions::expr(p);
-            if p.at(EOF) {
+            // With no expression, what was read (attributes of none, `/// x` alone) and its
+            // error are no one tree, so the `ERROR` node holds them. Empty input reads nothing
+            // and leaves the one `ERROR` node of its error.
+            let empty = p.at(EOF);
+            let parsed = expressions::expr(p).is_some();
+            if (parsed || empty) && p.at(EOF) {
                 m.abandon(p);
                 return;
             }
@@ -177,6 +185,11 @@ pub(crate) mod entry {
             m.complete(p, ERROR);
         }
     }
+}
+
+/// One item of a source file, as its top level parses one (`items::mod_contents`).
+pub(crate) fn top_level_item(p: &mut Parser<'_>) {
+    items::item_or_macro(p, false, true, false);
 }
 
 pub(crate) fn reparser(
@@ -350,13 +363,22 @@ fn name_any_identifier(p: &mut Parser<'_>) {
     m.complete(p, NAME);
 }
 
+/// An error at a name that is missing; a `}` there is left to close the block around it.
+fn err_name(p: &mut Parser<'_>, message: &'static str) {
+    if p.at(T!['}']) {
+        p.error(message);
+    } else {
+        p.err_and_bump(message);
+    }
+}
+
 fn name_ref_or_self(p: &mut Parser<'_>) {
     if matches!(p.current(), T![ident] | T![self]) {
         let m = p.start();
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier or `self`");
+        err_name(p, "expected identifier or `self`");
     }
 }
 
@@ -366,7 +388,7 @@ fn name_ref_or_upper_self(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier or `Self`");
+        err_name(p, "expected identifier or `Self`");
     }
 }
 
@@ -379,7 +401,7 @@ fn name_ref_mod_path(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier, `self`, `super`, `crate`, or `Self`");
+        err_name(p, "expected identifier, `self`, `super`, `crate`, or `Self`");
     }
 }
 
@@ -392,7 +414,7 @@ fn name_ref_mod_path_or_index(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected integer, identifier, `self`, `super`, `crate`, or `Self`");
+        err_name(p, "expected integer, identifier, `self`, `super`, `crate`, or `Self`");
     }
 }
 
@@ -410,7 +432,7 @@ fn lifetime(p: &mut Parser<'_>) {
     m.complete(p, LIFETIME);
 }
 
-fn error_block(p: &mut Parser<'_>, message: &str) {
+fn error_block(p: &mut Parser<'_>, message: &'static str) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.error(message);
@@ -422,7 +444,7 @@ fn error_block(p: &mut Parser<'_>, message: &str) {
 
 // test_err top_level_let
 // let ref foo: fn() = 1 + 3;
-fn error_let_stmt(p: &mut Parser<'_>, message: &str) {
+fn error_let_stmt(p: &mut Parser<'_>, message: &'static str) {
     assert!(p.at(T![let]));
     let m = p.start();
     p.error(message);
@@ -431,7 +453,9 @@ fn error_let_stmt(p: &mut Parser<'_>, message: &str) {
 }
 
 /// The `parser` passed this is required to at least consume one token if it returns `true`.
-/// If the `parser` returns false, parsing will stop.
+/// If the `parser` returns false, parsing will stop. A `{ ... }` list stopped before a `}`
+/// closing it takes the tokens up to that `}` as an error: the `}` is the list's, as in
+/// rustc's token trees, never a block's around it.
 fn delimited(
     p: &mut Parser<'_>,
     bra: SyntaxKind,
@@ -441,6 +465,7 @@ fn delimited(
     first_set: TokenSet,
     mut parser: impl FnMut(&mut Parser<'_>) -> bool,
 ) {
+    let open = p.token_index();
     p.bump(bra);
     while !p.at(ket) && !p.at(EOF) {
         if p.at(delim) {
@@ -462,11 +487,23 @@ fn delimited(
         }
         if !p.eat(delim) {
             if p.at_ts(first_set) {
+                // alloc: error path only, the message names the delimiter
                 p.error(format!("expected {delim:?}"));
             } else {
                 break;
             }
         }
+    }
+    if bra == T!['{'] && !p.at(ket) && p.curly_closes(open) {
+        let m = p.start();
+        p.error("expected R_CURLY");
+        while !p.at(EOF) && !p.at(T!['}']) {
+            match p.current() {
+                T!['{'] | T!['('] | T!['['] => items::token_tree(p),
+                _ => p.bump_any(),
+            }
+        }
+        m.complete(p, ERROR);
     }
     p.expect(ket);
 }

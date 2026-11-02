@@ -1,0 +1,36 @@
+{
+  "id": "01154",
+  "from_lane": "dedup-bumps-codegen",
+  "owner": "dedup-bumps",
+  "paths": [
+    "Cargo.toml",
+    "vendor/cranelift-object/src/backend.rs"
+  ],
+  "what": "Cranelift 0.137 (0.137.0 and 0.137.1 alike) made MachBufferInner::unwind_info pub(crate) and gives no accessor; systemv::UnwindInfo and gimli's FDE keep their rows private too. hir-ty-codegen/unwind.rs:230 (SystemV::rows, every x86-64/AArch64 frame's .eh_frame rows) and blaze-stencil/src/arch/x64/tests.rs:132 read `compiled.buffer.unwind_info` and will not compile on 0.137. Proposed: vendor cranelift-codegen 0.137.1 as vendor/cranelift-codegen with the one-word patch `pub(crate) unwind_info` -> `pub unwind_info` (exactly 0.136's visibility), add it to [patch.crates-io] beside cranelift-object, SOURCE.md as for cranelift-object; then offer upstream a `MachBufferFinalized::unwind_info()` accessor so the patch can go. My two call sites need no change with that patch. Also for the vendored cranelift-object when it moves to 0.137: vendor/cranelift-object/src/backend.rs:463 `res.buffer.alignment` -> `res.buffer.min_alignment` (upstream 0.137.1 makes the same edit and also adopts SOURCE.md change 3, the `used` reorder).",
+  "state": "applied",
+  "created": "2026-10-30T22:53:54Z",
+  "updated": "2026-10-31T01:16:08Z",
+  "taken_by": "dedup-bumps",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:53:54Z",
+      "by": "dedup-bumps-codegen",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:16:08Z",
+      "by": "dedup-bumps",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:16:08Z",
+      "by": "dedup-bumps",
+      "action": "done",
+      "note": "vendor/cranelift-codegen = 0.137.0 crate with MachBuffer unwind_info pub (SOURCE.md); root [patch] + family =0.137.0 (Andrew chose vendoring)"
+    }
+  ]
+}

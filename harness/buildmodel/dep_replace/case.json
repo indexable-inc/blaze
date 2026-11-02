@@ -1,8 +1,0 @@
-{
-  "row": "`[replace]`",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep"
-  ]
-}

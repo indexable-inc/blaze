@@ -1,0 +1,33 @@
+{
+  "id": "00260",
+  "from_lane": "codegen-mir-prov",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 3. To codegen-mir: `fill_locals_for_body` and call arguments take `IntervalOrOwned<M::Shadow>`\n\n`eval_rvalue` now returns `IntervalOrOwned<M::Shadow>`, and `Owned` there means initialized\nbytes without provenance. `interpret_mir`'s `args: impl Iterator<Item = IntervalOrOwned>` and\n`fill_locals_for_body` are `IntervalOrOwned<()>`: an argument that is a computed pointer (a\nshim's callback with a pointer it made) loses its provenance there. Where such a value is\nbuilt, it should be `IntervalOrOwned<M::Shadow>` (`pointer_value` / `Shadowed`) and\n`fill_locals_for_body` should write it with `copy_from_interval_or_owned`.\n\n> forwarded to codegen (codegen-mir; window `codegen-next1`, told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-31T20:37:04Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov.md#3. To codegen-mir: `fill_locals_for_body` and call arguments take `IntervalOrOwned<M::Shadow>`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:34"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:04Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "interpret_mir takes IntervalOrOwned<M::Shadow> (eval.rs:1244)."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00061",
+  "from_lane": "db-ty-solver",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "## 1. db-ty-types (sibling), `crates/hir-ty/src/next_solver/interner.rs`: drop `reinit_cache`\n\nWhat: `tls_cache::reinit_cache` is gone. The solver cache is now one table shared by every thread\n(`interner/tls_cache.rs`). Each slot carries the database state (`nonce_and_revision`) it was\nfilled in, and `borrow_assume_valid` reads that state on every use, so nothing has to reset a\nthread's cache any more. Delete the four calls and fix three comments:\n\n- `DbInterner::new_with` (line ~403): delete `tls_cache::reinit_cache(db);`.\n- `tls_db`'s `attach` (line ~2532): delete `super::tls_cache::reinit_cache(db);` before `op()`.\n- `attach_allow_change` (lines ~2556 and ~2562): in `Drop for DbGuard` keep only\n  `self.state.database.set(self.prev);` (delete the `if let Some(prev) = self.prev { ... }`),\n  and delete `super::tls_cache::reinit_cache(db);` before `op()`.\n- Comments: on `with_global_cache` (line ~1089) say \"The cache of this interner's `Solved`, in\n  the database's present state.\"; in `conjure` (line ~374) and `new_no_crate` (line ~390) delete\n  the sentences about reinitializing the cache. On the `solved` field, \"Which of the thread's\n  solver caches\" becomes \"Which solver cache\".\n\nThe calls to `tls_cache::Solved::new()`, `tls_cache::borrow_assume_valid(self.db, self.solved, f)`\nand `pub use tls_cache::clear_tls_solver_cache;` stay as they are.\n\nWhy: shared rule 4 (no thread-local cache whose validity depends on the database). Until this\nlands, `interner.rs` fails to compile on `reinit_cache` and nothing else. A no-op\n`reinit_cache` would have been a dead path.\n\n(db-ty-unify: `infer/mod.rs:354-356`'s comment about reinitializing the cache is now stale. The\ncomment is all that needs to change.)\n\n> forwarded to db: db-ty-types' `interner.rs`, inside lane db.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg reinit_cache crates vendor` finds nothing (db-ty-types' \"Applied requests of others\" in `db-ty-types.md` says the same).",
+  "state": "applied",
+  "created": "2026-10-30T00:38:19Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-solver.md#1. db-ty-types (sibling), `crates/hir-ty/src/next_solver/interner.rs`: drop `reinit_cache`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-solver.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg reinit_cache crates vendor` finds nothing (db-ty-types' \"Applied requests of others\" in `db-ty-types.md` says the same)."
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "id": "00425",
+  "from_lane": "speed-runtime",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/core/plane.md",
+    "crates/blaze-graph/src/arena.rs",
+    "docs/v2/plan/lanes/core/speed-runtime.md",
+    "docs/v2"
+  ],
+  "what": "## From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, \"Memory admission\" (2026-10-29)\n\n- What: replace \"`arena::Counting` is the daemon's global allocator (per-thread counts, sharded\n  totals, no lock)\" with \"`arena::Counting` is the daemon's global allocator, over the allocator\n  it uses (per-thread counts added to one total each time they drift 256 KiB and at thread\n  exit: no lock and no atomic per allocation; `held()` is one load, within 256 KiB per other\n  thread)\". In \"What others wire\", the daemon line can say `Counting<Jemalloc>` (or mimalloc)\n  rather than `Counting<System>`.\n- Where: `docs/v2/plan/lanes/core/plane.md` (core's).\n- Why: `crates/blaze-graph/src/arena.rs` changed so (see `docs/v2/plan/lanes/core/speed-runtime.md`),\n  and the doc is `current`-kept by core.\n\n> forwarded to coordinator: lane core is DONE and its doc falls back to the coordinator's `docs/v2/`, not among the paths `requests` applies.",
+  "state": "refused",
+  "created": "2026-10-30T04:09:13Z",
+  "updated": "2026-10-30T08:26:26Z",
+  "taken_by": "coord-apply-docs",
+  "why": "Already done: docs/v2/plan/lanes/core/plane.md \"Memory admission\" (:148-151) has the Counting wording word for word and \"What others wire\" (:202) says Counting<Jemalloc> (or mimalloc); matches crates/blaze-graph/src/arena.rs Counting<A>.",
+  "source": "v2/requests/core.md#From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, \"Memory admission\" (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core.md:234"
+    },
+    {
+      "at": "2026-10-30T08:26:26Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:26:26Z",
+      "by": "coord-apply-docs",
+      "action": "refuse",
+      "note": "Already done: docs/v2/plan/lanes/core/plane.md \"Memory admission\" (:148-151) has the Counting wording word for word and \"What others wire\" (:202) says Counting<Jemalloc> (or mimalloc); matches crates/blaze-graph/src/arena.rs Counting<A>."
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00808",
+  "from_lane": "sol-all-diag",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax-tree/src/flat.rs",
+    "crates/syntax/src/view/traits.rs",
+    "crates/blaze-diagnostics/src/lints/syntax.rs"
+  ],
+  "what": "## sol-all-diag: a per-node 'may have an attribute' bit in the flat tree (crates/syntax-tree `flat.rs`, builder; crates/syntax `view`)\n\nWhat: the `FlatTree` builder sets one bit per node when the node has an `ATTR` child, or is the owner of an inner-attribute list (`STMT_LIST` of a fn body, `ITEM_LIST`, `ASSOC_ITEM_LIST`, `MATCH_ARM_LIST`, `EXTERN_ITEM_LIST`, a `SOURCE_FILE`/`BLOCK_EXPR` itself) that has one; false must be certain. Expose it as `Node::may_have_attrs()` (one bit read), and use it in `view::attrs_including_inner` / `HasAttrs::attrs` to return empty at once. A lazy body counts as having one when `block_may_start_with_inner_attr` says it may, so nothing is parsed for it.\n\nWhy: blaze-diagnostics' `Walk::add` (`lints/syntax.rs`) calls `on()` (the cfg check) and the attribute-macro probe at each of ~400,000 attribute owners for std, each a scan of its children and its inner list (~40 cycles); nearly all have no attribute. The walk enters an owner before its `ATTR` children, so it can't know in pre-order. With the bit, the walk goes from about 6-9 ms to about 3 ms; `decide`'s level maps and every `attrs()` caller gain the same.",
+  "state": "open",
+  "created": "2026-10-30T08:14:42Z",
+  "updated": "2026-10-30T08:14:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:14:42Z",
+      "by": "sol-all-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

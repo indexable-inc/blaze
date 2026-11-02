@@ -56,6 +56,7 @@ impl ConfigError {
 }
 
 impl std::error::Error for ConfigError {
+    // dyn: std's error chain, read only on an error path.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.error.source()
     }

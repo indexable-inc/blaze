@@ -1,0 +1,35 @@
+{
+  "id": "00932",
+  "from_lane": "speed-sol2-link-pewasm",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/model.rs"
+  ],
+  "what": "P22: Shared::versions as an arena. On PE every import of an import library has its own \"<hint> <name>\" version, so Shared::versions: Vec<String> is one allocation per import (thousands for windows.lib), the last per-symbol String in the PE reader. Make it versions: Names plus Vec<Name> (SharedSymbol::version: Option<u16> indexing it), Shared::version unchanged for callers. Spec: /tmp/blaze-lanes/v2-link-requests.md ### P22. pe/coff.rs follows once it lands.",
+  "state": "applied",
+  "created": "2026-10-30T09:55:44Z",
+  "updated": "2026-10-30T10:01:59Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:55:44Z",
+      "by": "speed-sol2-link-pewasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:01:59Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:01:59Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "model.rs: Shared::versions is Vec<Name> into Shared::names (one arena, no second Names); Shared::version unchanged for callers. elf/read/shared.rs pushes each version once into names; pe/coff.rs add() pushes the export name into names; tests adjusted (elf/read/tests.rs compares texts, pe/tests.rs). pe/coff.rs Imported::version is still a String per import: write it straight into the arena to drop that allocation."
+    }
+  ]
+}

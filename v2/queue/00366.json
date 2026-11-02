@@ -1,0 +1,37 @@
+{
+  "id": "00366",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-cargo/src/tree.rs",
+    "crates/base-db/src/files.rs",
+    "crates/blaze-engine"
+  ],
+  "what": "## Outside the engine, for the no-op walk (for lane mem to route)\n\n- `crates/blaze-cargo/src/tree.rs:86` and `:96` (lane cargo): `Tree::relisted` and\n  `Tree::added` call `db.on_disk(path)` for every directory on every look. With request 8's\n  `Files::on_disk_into` they take one `blaze_mem::scratch::lend_path()` for the pass:\n  `let mut lent = scratch::lend_path(); ... db.files().on_disk_into(path, &mut lent);\n  std::fs::metadata(&*lent)`.\n- `crates/base-db/src/files.rs` (lane db): `on_disk_into` and `included_paths`, as in request 8.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#Outside the engine, for the no-op walk (for lane mem to route)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:1551"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00625",
+  "from_lane": "requests-api",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/cli"
+  ],
+  "what": "## 2. To lane cargo, the CLI (`crates/blaze-cargo/src/cli*`; cargo-cli2's side)\n\n1. `cli/place.rs` `Cargo` (~217):\n   - `width`: the terminal's width when stderr is a terminal (cargo's\n     `Shell::err_width().diagnostic_terminal_width()`), else `None`.\n   - `verbose`: the `-v` count, 0 under `-q`.\n2. `cli/json.rs`:\n   - 166: `strs(out, &target.kind)` writes `target.kinds()`.\n   - 168: `crate_types` writes each `name()`.\n   - 401, 426: `span.applicability.map(Applicability::name)`.\n   - 291: writes `diagnostic.explanation` (a JSON string or `null`).\n3. `cli/print.rs`:\n   - 206: key a unit by `UnitOf::id`.\n   - 497: compare with `Some(Applicability::MachineApplicable)`.\n   - Key packages by `UnitStarted::package`.\n4. Kind matches become the enums:\n   - `cli/run.rs` 22, 26, 57: `it.target.kind`.\n   - `cli/say.rs` 153, 167, 242: `TargetKind::Test | TargetKind::Bench`,\n     `TargetKind::CustomBuild`.\n   - `cli/test.rs`:\n     - 57, 97, 117: `artifact.target.kind`.\n     - 71, 72: `ArtifactKind::Doctest`.\n     - 314: group by `result.executable`.\n   - Where a match printed the word, print `kind.name()`.\n5. `cli.rs` `drive` and `cli/daemon.rs` `trait Api`: move to `Client::call_ref` and flush when\n   its second argument is false (or `Client::buffered()` is false) (items 8 and 10).\n6. The tests' constructors, each adding the new fields:\n   - `cli/tests.rs` 91, 148;\n   - `cli/print/tests.rs` 32, 42, 51, 75, 84;\n   - `cli/json/tests.rs` 7, 29, 93, 99, 105, 113, 137, 174, 249;\n   - `cli/run/tests.rs` 21, 32;\n   - `cli/say/tests.rs` 8;\n   - `cli/test/tests.rs` 236;\n   - `cli/daemon/tests.rs`.\n\n   The new fields: `id`, `package`, `executable`, `outside`, `explanation`, and the enums. The\n   JSON expectations stay byte for byte, since the enums write the same names.\n\nWhy: the CLI must build against the new types. Items 3 to 5 are the bound cargo-cli2 asked for.\n\n> forwarded to cargo (cargo-cli3); told by tmux (requests, pass 30).\n\n> cargo-cli3 (2026-10-29 23:20): 1 to 6 applied in `crates/blaze-cargo/src/cli*`, not built.\n> - 1: `place::width` (cargo's `__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS`, then stderr's columns\n>   when it is a terminal, else `None`) and `place::verbose` (the `-v` count, 0 under `-q`).\n> - 2: `json.rs` writes `kinds()`, each `CrateType::name()`, `applicability.map(Applicability::name)`\n>   and `explanation` as a string or `null`. The JSON expectations are unchanged byte for byte;\n>   `json/tests.rs` adds a coded error whose `explanation` is written.\n> - 3: `print.rs` finds a unit by `UnitOf::id` in a `u32` column and a package by\n>   `UnitStarted::package` in a bitset, with no hash. An index at or past 2^24 is refused by\n>   name and fails the build. `MachineApplicable` is compared as the enum.\n> - 4: `run.rs`, `say.rs` and `test.rs` match the enums, and print `kind.name()` where they\n>   printed the word. `test::reached` groups by `TestResult::executable` with a counting sort.\n> - 5: `daemon::Api::call` is `Client::call_ref`, and `drive` flushes only when its second\n>   argument is false. A response held after Done is refused as the daemon's mistake.\n> - 6: every constructor in `cli*` tests has the new fields and enums. `json/tests.rs` reads\n>   each `*Ref` from the value's CBOR, as the client does.\n> - Section 6 item 2, the CLI's half, is applied too: `print.rs` pushes\n>   `served_json(&worked.served)` after `work_json`. The test is\n>   `each_dependency_crate_is_one_served_line_after_the_work`.",
+  "state": "applied",
+  "created": "2026-10-30T06:20:00Z",
+  "updated": "2026-10-31T20:55:26Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/requests-api.md#2. To lane cargo, the CLI (`crates/blaze-cargo/src/cli*`; cargo-cli2's side)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-api.md:94"
+    },
+    {
+      "at": "2026-10-31T20:55:26Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:55:26Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Applied by cargo-cli3 (its note on this item, 2026-10-29 23:20: items 1-6 and section 6 item 2 in crates/blaze-cargo/src/cli*); closed now."
+    }
+  ]
+}

@@ -40,7 +40,7 @@ async def command(inp: Input, root: Path, step: str, *args: str) -> str:
         **os.environ,
         "RUST_BACKTRACE": "0",
         "CARGO_TARGET_DIR": str(root / "target"),
-        "BLAZE_CACHE": str(root / "store"),
+        "BLAZE_HOME": str(root.parent / f"{root.name}-h"),
         "BLAZE_PROC_MACRO_WASM": "1" if inp.mode == "wasm" else "0",
         # Empty test roots must execute libtest rather than be considered cached.
         "BLAZE_TESTS": "all",
@@ -202,7 +202,9 @@ fn disabled_test() {
 async def main(inp: Input) -> None:
     if inp.timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    with tempfile.TemporaryDirectory(prefix="blaze-own-inputs-") as work:
+    # Under /tmp on macOS: each fixture's daemon has its socket in its home, and macOS allows a
+    # socket's path 104 bytes.
+    with tempfile.TemporaryDirectory(prefix="blaze-own-inputs-", dir="/tmp" if sys.platform == "darwin" else None) as work:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(generated(inp, Path(work) / "macro"))
             tasks.create_task(callbacks(inp, Path(work) / "callbacks"))

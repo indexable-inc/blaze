@@ -1,0 +1,42 @@
+{
+  "id": "00148",
+  "from_lane": "solver-sync",
+  "owner": "coordinator",
+  "paths": [
+    "harness/toolchain_bump.py",
+    "tools/v2/solver_sync.py",
+    "vendor/rustc_type_ir",
+    "vendor/rustc_next_trait_solver",
+    "vendor/rustc_type_ir_macros",
+    "Cargo.toml",
+    "harness/toolchain",
+    "docs/v2/plan/design/compile-time.md"
+  ],
+  "what": "## 1. Owner of `harness/toolchain_bump.py`: run the solver sync on every bump\n\nWhat: in `bump()`, right after `await vendor(old[2], new[2])`:\n\n```python\n    await run(\"solver\", sys.executable, os.path.join(ROOT, \"tools/v2/solver_sync.py\"),\n              json.dumps({\"nightly\": name}), bound=1800)\n```\n\nand in the docstring's list, after step 3:\n\n> 3a. moves the trait solver (`tools/v2/solver_sync.py`): vendor/rustc_type_ir,\n> vendor/rustc_next_trait_solver and vendor/rustc_type_ir_macros become upstream's crates at\n> the new commit with `PATCHES.md`'s series replayed (exact context, no fuzz); a patch that no\n> longer applies, or a changed upstream `Cargo.toml`, stops the bump and names it.\n\nThe script checks `nightly` against `harness/toolchain`, so it must run after the pin is written.\nIt changes nothing unless all three crates replay, so a stopped bump leaves the solver at the old\nnightly, whole.\n\nWhy: change 18 of `docs/v2/plan/design/compile-time.md`. The solver follows the pinned nightly\ninstead of rust-analyzer's crates.io release.\n\n> forwarded to coordinator: `harness/` is its.",
+  "state": "applied",
+  "created": "2026-10-30T01:51:29Z",
+  "updated": "2026-10-30T08:29:18Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/solver-sync.md#1. Owner of `harness/toolchain_bump.py`: run the solver sync on every bump",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync.md:11"
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "harness/toolchain_bump.py bump(): runs tools/v2/solver_sync.py {\"nightly\": name} (bound 1800 s) right after vendor(new[2]), once the pin is written; docstring step 3a added. vendor(new[2]) takes the new commit only, so the call sits after it, not after vendor(old, new)."
+    }
+  ]
+}

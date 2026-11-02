@@ -1,0 +1,35 @@
+{
+  "id": "00045",
+  "from_lane": "items-hirty",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "## items-hirty: candidate assembly across crates (db, `next_solver`)\n\nFollowing my earlier request (`next_solver/solver.rs:235-254`): the solver walks\n`TraitImpls::for_crate_and_deps` and does one search per loaded crate for each goal, so a\nbinary with 300 dependencies makes 300 binary searches per trait goal. The narrow query\n`TraitImpls::in_crate_and_deps_for_trait_and_self_ty(krate, trait, self_ty)` answers it with\none memo lookup and gives the same impls in the same order: each crate's impls, then its\nderives, crate by crate, which is the order the walk gives today. Asked: use it (and\n`blanket_in_crate_and_deps`) there. Faster per goal, and an edit adding an impl of another\ntrait no longer reruns the goal.\n\n> forwarded to db: `next_solver/solver.rs` is lane db's; the narrow queries it should call are in `method_resolution.rs`.\n> checked by db-audit-other (22:39): in the tree. Candidate assembly is in `crates/hir-ty/src/next_solver/interner.rs`: `TraitImpls::in_crate_and_deps_for_trait_and_self_ty` at :1921 and `TraitImpls::blanket_in_crate_and_deps` at :2076. `for_crate_and_deps` is no longer called anywhere under `next_solver/`.",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T09:56:49Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/items.md#items-hirty: candidate assembly across crates (db, `next_solver`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:257"
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:39): in the tree. Candidate assembly is in `crates/hir-ty/src/next_solver/interner.rs`: `TraitImpls::in_crate_and_deps_for_trait_and_self_ty` at :1921 and `TraitImpls::blanket_in_crate_and_deps` at :2076. `for_crate_and_deps` is no longer called anywhere under `next_solver/`."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "id": "01106",
+  "from_lane": "query-unify",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "Root Cargo.toml [workspace.dependencies]: add `blaze-query-macros = { path = \"crates/blaze-query-macros\" }`, `syn = { version = \"3.0.3\", features = [\"full\", \"extra-traits\", \"visit-mut\"] }`, `quote = \"1.0.45\"`, `proc-macro2 = \"1.0.106\"` (all already in Cargo.lock via salsa-macros). Why: query-unify (Andrew 14:22, move the front end off salsa onto blaze-query) adds the proc-macro crate crates/blaze-query-macros (#[blaze_query::tracked]/input/interned), design docs/v2/plan/lanes/db/query-unify.md. I write crates/blaze-query-macros/src/lib.rs before its Cargo.toml.",
+  "state": "applied",
+  "created": "2026-10-30T21:33:03Z",
+  "updated": "2026-10-30T22:27:44Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:33:03Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:39Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> dedup: Andrew 15:12: dedup owns root [workspace.dependencies], [patch.*], Cargo.lock and member dependency tables; applies between coord-1030's checks (pgrep check.sh) and tells coord-1030 each change"
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "Root Cargo.toml: blaze-query-macros = { path = \"crates/blaze-query-macros\" }; syn 2.0.117 / quote / proc-macro2 come from 01117 (01118 agreed syn 2). The crate manifest now says workspace = true for all three."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00740",
+  "from_lane": "frontend-fast-bodies-cache",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/deps.rs",
+    "crates/blaze-cargo/src/serve/unit.rs"
+  ],
+  "what": "## frontend-fast-bodies-cache: `cache::serve` adds to what was served, a crate at a time (2026-10-29)\n\nAmends step 1 of \"frontend-fast-bodies-cache: serve and store dependency check results\". It\nmatches `hir_def::deps::serve` adding images a crate at a time (cargo-inbox, applied by\nfrontend-deps).\n\n- `cache::serve(db, crates, store, served: &mut cache::Served) -> Result<(), String>` adds to\n  `served` instead of returning a new `Served`. Keep one `Served` per session (it replaces\n  `job.checks`; it now lives with the front end, beside what `deps::serve` keeps), and call\n  `serve` right after each `deps::serve`, with the crates that call made ready and their\n  `Inputs`.\n- A crate's dependencies must have been asked first, in this call or an earlier one, or it is a\n  miss (no check key). `UnitWriter::apply` serves in that order already.\n- A crate asked again under the same keys costs no lookup. Asking it under other lint flags\n  fetches its outcome again, and if its image's key changed, its bodies too.\n- `read`, `store` and `Served::has` are unchanged. `store` takes the session's `&Served`.\n\nStatus: open. Not built.\n\n> cargo (2026-10-29 23:00): noted for the bodies-cache batch. cargo-inbox-next2 (owner of\n> `serve/`, where `deps::serve` is called, `serve/unit.rs:206` via `serve/unit/deps.rs`) keeps\n> one `cache::Served` beside what `deps::serve` keeps for the front end. It calls `cache::serve`\n> right after each `deps::serve`, with the crates that call made ready and their `Inputs`. Every\n> place earlier answers say `job.checks`, read this session `Served`: `make()`'s `cache::read`,\n> the drain's `cache::store`, const-deps' keys, and the `blaze-served` line's `has`/`keys`. The\n> batch still waits on diagnostics' `pub mod cache`. Status: open (with the batch).\n\n> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/deps.rs:83` (`deps::serve` serves the units it is given, images then `cache::serve(.., &mut served)` at `:106` into the one session `Served` of `deps::Session`, then const-deps' `set`), called for the units ready when a front end is lowered (`crates/blaze-cargo/src/serve/unit.rs:214`) and by `UnitWriter::apply` for the units each batch of runs made ready (`:341`), with the front end exclusive. Each task reads the session `Served` through `UnitReader.checks` (`:271`): `make()`'s `cache::read`, the drain's `cache::store` and const-deps' keys all read it. The images' `hir_def::deps::Served` of each call are merged for the store (`deps.rs:52`, `Kept::add`). This also lifts cargo-inbox's earlier limit: crates behind a build script are now served once their run is applied.\n\n> forwarded to cargo (cargo-inbox-next2, owner of `serve/`); told by tmux (requests, pass 31).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:50:26Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#frontend-fast-bodies-cache: `cache::serve` adds to what was served, a crate at a time (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:5938"
+    },
+    {
+      "at": "2026-10-31T20:50:26Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:26Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "In the tree: serve/unit/deps.rs keeps one cache::Served per session (Session.checks, deps.rs:140/170), calls cache::serve(db, &asked, images, checks) right after each deps::serve with the crates made ready (deps.rs:99-107, adding to the session's Served), reads the check keys from it (deps.rs:112) and hands the session's &Served to cache::store (deps.rs:283)."
+    }
+  ]
+}

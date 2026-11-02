@@ -1,0 +1,45 @@
+[package]
+name = "blaze-link"
+description = "blaze v2's linker: compiled functions placed in per-thread chunks of address space, relocations applied in parallel, callers through a jump table, and one atomic commit that makes the new image visible"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# The entry points and reference readers the fuzz targets call; off in every other build.
+fuzz = []
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-inproc.workspace = true
+blaze-items.workspace = true
+blaze-lazy.workspace = true
+blaze-live.workspace = true
+blaze-mem.workspace = true
+blaze-sha256.workspace = true
+gimli.workspace = true
+object.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+object = { workspace = true, features = ["write"] }
+zerocopy.workspace = true
+
+[lints]
+workspace = true

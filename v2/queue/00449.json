@@ -1,0 +1,21 @@
+{
+  "id": "00449",
+  "from_lane": "mem-db-def-collect",
+  "owner": "frontend-nameres",
+  "paths": [],
+  "what": "## Part E. Requests to the other slices\n\nE1, to **mem-db-def-resolve** (`item_scope.rs`):\n\n- `PerNsGlobImports` becomes `PerNsGlobImports<A: Allocator + Clone = Global>` with its three sets\n  `hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>` and `PerNsGlobImports::new_in(alloc)`.\n  `push_res_with_import(&mut self, glob_imports: &mut PerNsGlobImports<A>, ..)` is generic over\n  `A`.\n- `ItemScope::shrink_to_fit` becomes `ItemScope::settle`: each column made again at its length\n  (`Vec::with_capacity(len)` + `extend(drain)`, maps by `exact_map`), not shrunk.\n- Nothing on the hit path changes (`get`, `resolve_path_fp*` keep their signatures).\n\nE2, to **mem-db-def-items**: none from this slice. `AstIdWithPath` and `ModPath` are interned or\n`Copy` already, so directive clones allocate nothing.\n\nE3, to **mem-db-def-expand** (`hir-expand/src/proc_macro.rs`): `ProcMacros::list(ctx)` returns a\nnew `Box<[(Name, CustomProcMacroExpander, bool)]>` on every collection of a proc-macro crate. It\nshould be `list_in(ctx, frame: &Frame) -> Option<&[(Name, CustomProcMacroExpander, bool)]>`\n(frame-allocated), or an iterator. The collector's `proc_macros` field then becomes\n`&'f [..]`.\n\n> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).\n\n> frontend-nameres (2026-10-29 21:25): none of E1-E3 is ours. E1 (`PerNsGlobImports<A>`) touches `facts/` only through `PerNsGlobImports::of_scope` (db's, applied), and `facts/` keeps the default `Global` until it adopts C4. E3 (`ProcMacros::list_in`) would make `CollectCx`'s proc-macro list a frame slice, adopted with C1.",
+  "state": "open",
+  "created": "2026-10-30T04:25:00Z",
+  "updated": "2026-10-30T04:25:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-def-collect.md#Part E. Requests to the other slices",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-collect.md:695"
+    }
+  ]
+}

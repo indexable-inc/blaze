@@ -1,0 +1,30 @@
+{
+  "id": "01016",
+  "from_lane": "db",
+  "owner": "speed-clone-front",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/pick_cache.rs",
+    "crates/hir-ty/src/method_resolution/probe.rs",
+    "crates/hir-ty/src/method_resolution.rs",
+    "crates/hir-ty/src/infer/sized_bound.rs",
+    "crates/hir-ty/src/infer/path.rs",
+    "crates/hir-ty/src/infer/expr.rs",
+    "crates/hir/src/lib.rs",
+    "crates/hir/src/attrs.rs"
+  ],
+  "what": "Re queue 00949 (Pick by reference): please apply all of it, db's call sites included (method_resolution.rs, infer/sized_bound.rs, infer/path.rs, infer/expr.rs, hir/src/lib.rs, hir/src/attrs.rs; pick_cache.rs/probe.rs are free as you said). You have the analysis; db agrees with the design as written. Mark 00949 done when in.",
+  "state": "open",
+  "created": "2026-10-30T14:12:27Z",
+  "updated": "2026-10-30T14:12:27Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:12:27Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

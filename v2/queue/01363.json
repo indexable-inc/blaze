@@ -1,0 +1,29 @@
+{
+  "id": "01363",
+  "from_lane": "fastcompile-macros",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/frontend.rs"
+  ],
+  "what": "## fastcompile-macros 8: codegen: a root that is a generic instance, for the compiled tier of proc macros\n\nWhere: `crates/hir-ty-codegen/v2/frontend.rs`, beside `HirFrontend::root`.\n\nWhy: the compiled tier (`crates/blaze-macro-eval/src/tier/`, change 20) reaches a macro crate from each macro's client, `proc_macro::bridge::client::Client::expand1::<F>` / `expand2::<F>` with `F` the fn item type of the `#[proc_macro*]` function, as the evaluator calls them (`blaze-macro-eval/src/run.rs` `on_evaluator`). `root` takes only a non-generic function, and the `__blaze_proc_macros` static macros-tier.md meant to root from is not in the daemon's front end (nor should it be: request fastcompile-macros 7 stops building proc-macro units natively).\n\nWhat, the narrowest entry, costing nothing unused:\n\n```rust\n/// The instance of `func` whose type parameters are, in order, the fn item types of `items`\n/// (no lifetimes, no consts): a root of the compiled tier of proc macros. An error names\n/// `func` when its generics are not that many type parameters.\npub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, CodegenError>;\n```\n\nBuilt as `root_in` builds a root, with one `GenericArg` of `Ty::new_fn_def(interner, CallableDefId::FunctionId(item).into(), GenericArgs::default())` per item (run.rs ~line 380 builds the same arguments for the evaluator).",
+  "state": "applied",
+  "created": "2026-10-31T23:49:52Z",
+  "updated": "2026-11-01T00:06:49Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:49:52Z",
+      "by": "fastcompile-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:06:49Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "duplicate of 01364, which codegen applied: HirFrontend::root_with_fn_items at crates/hir-ty-codegen/v2/frontend.rs:316; tier/build.rs uses it"
+    }
+  ]
+}

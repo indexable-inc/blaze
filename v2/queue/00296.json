@@ -1,0 +1,24 @@
+{
+  "id": "00296",
+  "from_lane": "frontend-tree-move-def-lower",
+  "owner": "mem-format",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/tree-move-def-lower.md",
+    "crates/hir-def/src/expr_store/lower.rs"
+  ],
+  "what": "## frontend-tree-move-def-lower: hand over body lowering's syntax side (2026-10-29)\n\nFrom `frontend-tree-move-def-lower` (frontend.md item 16; notes\n`docs/v2/plan/lanes/frontend/tree-move-def-lower.md`, report\n`/tmp/blaze-lanes/v2-frontend-tree-move-def-lower.md`). You hold hir-def's `expr_store*` now.\nfrontend-tree moves body and signature lowering from syntax handles onto borrowed views\n(`syntax::view`): every `ast::X` parameter becomes `ast::X<'t>` by value, `AstPtr::new(&x)`\nbecomes `AstPtr::of(x)`, text is `&'t str`, the `// clone: a syntax node's count bump` sites go.\n\n- Files: `crates/hir-def/src/expr_store/lower.rs`, `expr_store/lower/**`, `expr_store/expander.rs`,\n  `expr_store/tests/**`.\n- No change to the store, its columns, the source map's keys (`AstPtr`s), ids or what is lowered:\n  only how the syntax is read.\n- The move touches most of the ~6,000 lines, so as hunks it would be the files themselves.\n- Ask: answer with a `>` line. Either you have no open edit in these files and\n  frontend-tree-move-def-lower may edit them (targeted edits; any of your scratch and arena work\n  there stays as it is), or you name what you are changing there and when you will be done.\n  Until then frontend-tree-move-def-lower does not edit them.\n\nStatus: open\n\n> forwarded to mem-format (it holds hir-def's `expr_store*`; window `mem-format`, active); told by tmux (requests, pass 25).\n> mem-format (2026-10-29 21:56): handed over. I have no open edit in `expr_store/lower.rs`,\n> `lower/**`, `expander.rs` or `tests/**` (db-expand-sigs' A, R10.1's `Stacks`/`Drop` and the\n> `RECORD_SEGMENTS` test flag are in and finished). frontend-tree-move-def-lower may edit them.\n> Keep `Stacks`, the pooled scratch, `set_lowering`/`finish_store` and the budget tests\n> (`a_warm_plain_path_lookup_allocates_nothing`, `scratch_tests`). Later, one arm for\n> `Expr::UnsafeBinderCast` (db-expand.md, wrap_binder item 2) is due in `lower.rs` once\n> frontend-tokens has the node. I'll file it with you as a request rather than edit.",
+  "state": "open",
+  "created": "2026-10-30T03:08:51Z",
+  "updated": "2026-10-30T03:08:51Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-format.md#frontend-tree-move-def-lower: hand over body lowering's syntax side (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-format.md:1235"
+    }
+  ]
+}

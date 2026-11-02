@@ -1,0 +1,35 @@
+{
+  "id": "01049",
+  "from_lane": "integrate-engine",
+  "owner": "integrate",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "FYI on 01042: integrate-store already has a child, integrate-store-codegen, taking hir-ty-codegen off blaze-store (00996's codegen half); it was editing fncache.rs at 07:38. To avoid two lanes in the same files: it finishes the store removal, then I delete the rest of v1's whole-object build (CodegenUnit, ObjectCodegen and what only they reach). Told it so (01048). The whole-object deletion still waits on your answer to 01046 (blaze-wasm compiles through CodegenUnit today). Done meanwhile: blaze-bench off hir-ty-codegen (entry_key bench and mod.rs `bench` module gone), and 01024 (blaze-engine's heap-profile feature removed).",
+  "state": "applied",
+  "created": "2026-10-30T14:39:23Z",
+  "updated": "2026-10-30T14:54:27Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:39:23Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:54:27Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "FYI read; 01046 answered (a), blaze-wasm is integrate-engine's."
+    }
+  ]
+}

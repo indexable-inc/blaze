@@ -1,0 +1,36 @@
+{
+  "id": "00568",
+  "from_lane": "db-expand",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/frozen.rs",
+    "crates/blaze-engine"
+  ],
+  "what": "## The frozen encoding's version is hir-def's (db-expand, for codegen)\n\nWhat: `crates/blaze-engine/src/frozen.rs:123` `key_of` hashes the literal\n`b\"blaze frozen def map 7\"`. Make it `field(hir_frozen::ENCODING.as_bytes())`, the new\n`hir_def::nameres::frozen::ENCODING` (now `\"blaze frozen def map 8\"`).\n\nWhy: the lang items' bytes have one entry per lang item, and seven were added, so bytes frozen\nunder 7 no longer read (`served_lang_items` panics on the count). The version now lives beside\nthe encoder that changes it.\n\n> forwarded to codegen: `crates/blaze-engine/` is its.",
+  "state": "refused",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-31T20:30:06Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/db-expand.md#The frozen encoding's version is hir-def's (db-expand, for codegen)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:355"
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:06Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

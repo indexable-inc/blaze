@@ -2,22 +2,29 @@
 //! fields let rustc infer of its parameters (`rustc_hir_analysis::outlives`, RFC 2093) and
 //! what an item knows (its where clauses and the types it may assume well-formed).
 
-use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
-use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(test)]
+pub(crate) mod tests;
+
+use base_db::Db;
+use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup as _};
+use std::alloc::Allocator;
+
+use crate::mem::{self, FMap, FVec};
+use blaze_mem::frame::Frame;
+use smallvec::SmallVec;
 use rustc_type_ir::{
-    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
-    TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
-    TypeVisitor,
+    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFlags,
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt as _, TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
-use salsa::SalsaValue;
 
 use hir_ty::{
     GenericPredicates,
     db::HirDatabase,
     next_solver::{
         AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Region,
-        SolverDefId, StoredRegion, StoredTy, Ty, TyKind, infer::InferCtxt,
+        RegionExt as _, StoredRegion, StoredTy, TraitAssocTyId, Ty, TyKind, infer::InferCtxt,
     },
 };
 
@@ -37,14 +44,19 @@ pub(crate) enum Component<'db> {
     Alias(Ty<'db>),
 }
 
-pub(crate) fn components<'db>(ty: Ty<'db>) -> Vec<Component<'db>> {
-    struct Find<'db>(Vec<Component<'db>>);
+/// At most four on the stack, which a type with more spills to the heap.
+pub(crate) type Components<'db> = SmallVec<[Component<'db>; 4]>;
+
+const _: () = assert!(size_of::<Component<'static>>() <= 16);
+
+pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
+    struct Find<'db>(Components<'db>);
     impl<'db> TypeVisitor<DbInterner<'db>> for Find<'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
                 TyKind::Param(_) => self.0.push(Component::Param(ty)),
-                TyKind::Alias(_) if !ty.has_escaping_bound_vars() => {
+                TyKind::Alias(_, _) if !ty.has_escaping_bound_vars() => {
                     self.0.push(Component::Alias(ty))
                 }
                 TyKind::Bound(..) | TyKind::Placeholder(_) | TyKind::Infer(_) => (),
@@ -57,18 +69,18 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Vec<Component<'db>> {
             }
         }
     }
-    let mut find = Find(Vec::new());
+    let mut find = Find(SmallVec::new());
     ty.visit_with(&mut find);
     find.0
 }
 
 /// The `impl Trait`s in `ty`, outermost first.
-pub(crate) fn opaques<'db>(ty: Ty<'db>, out: &mut Vec<AliasTy<'db>>) {
-    struct Find<'a, 'db>(&'a mut Vec<AliasTy<'db>>);
-    impl<'db> TypeVisitor<DbInterner<'db>> for Find<'_, 'db> {
+pub(crate) fn opaques<'db, A: Allocator>(ty: Ty<'db>, out: &mut Vec<AliasTy<'db>, A>) {
+    struct Find<'a, 'db, A: Allocator>(&'a mut Vec<AliasTy<'db>, A>);
+    impl<'db, A: Allocator> TypeVisitor<DbInterner<'db>> for Find<'_, 'db, A> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(alias) = ty.kind()
+            if let TyKind::Alias(_, alias) = ty.kind()
                 && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
             {
                 self.0.push(alias);
@@ -82,9 +94,9 @@ pub(crate) fn opaques<'db>(ty: Ty<'db>, out: &mut Vec<AliasTy<'db>>) {
 /// `ty` with what outlives a region as it does in its place, as rustc's outlives components
 /// see it: a closure or a coroutine its captures, an `impl Trait` with no outlives bound its
 /// arguments.
-pub(crate) fn outlived_as<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db> {
+pub(crate) fn outlived_as<'db>(db: &'db Db, ty: Ty<'db>) -> Ty<'db> {
     struct Fold<'db> {
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         depth: usize,
     }
     impl<'db> TypeFolder<DbInterner<'db>> for Fold<'db> {
@@ -105,14 +117,14 @@ pub(crate) fn outlived_as<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db>
                 TyKind::CoroutineClosure(_, args) => {
                     args.as_coroutine_closure().tupled_upvars_ty().fold_with(self)
                 }
-                TyKind::Alias(alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
-                        && !rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+                TyKind::Alias(_, alias)
+                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
+                        && !rustc_type_ir::Interner::item_bounds(interner, def_id.into())
                             .iter_instantiated(interner, alias.args.as_slice())
                             .any(|clause| {
                                 matches!(
                                     clause.kind().skip_binder(),
-                                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, _))
+                                    ClauseKind::TypeOutlives(OutlivesClause(bounded, _))
                                         if bounded == ty
                                 )
                             }) =>
@@ -169,22 +181,18 @@ fn is_free(region: Region<'_>) -> bool {
 
 /// The outlives bounds of an ADT, with the arguments `args`: those it declares and those its
 /// fields let rustc infer.
-fn adt_needs<'db>(
-    db: &'db dyn HirDatabase,
+fn adt_needs<'db, A: Allocator>(
+    db: &'db Db,
     inferred: &mut Inferred<'db>,
     adt: AdtId,
     args: GenericArgs<'db>,
-    out: &mut Vec<Needs<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
 ) {
     let interner = DbInterner::new_no_crate(db);
-    let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, adt.into())
-        .iter_instantiated(interner, args.as_slice())
-        .map(|it| it.skip_norm_wip())
-        .collect();
-    clause_needs(&clauses, out);
+    predicate_needs(db, adt.into(), args.as_slice(), out);
     for predicate in inferred.of(db, adt) {
-        let OutlivesPredicate(arg, region) =
-            EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
+        let OutlivesClause(arg, region) =
+            EarlyBinder::bind(interner, predicate).instantiate(interner, args).skip_norm_wip();
         out.push(match arg.kind() {
             GenericArgKind::Type(ty) => Needs::Type(ty, region),
             GenericArgKind::Lifetime(longer) => Needs::Region(longer, region),
@@ -193,14 +201,40 @@ fn adt_needs<'db>(
     }
 }
 
+fn is_outlives(clause: &Clause<'_>) -> bool {
+    matches!(
+        clause.kind().skip_binder(),
+        ClauseKind::TypeOutlives(_) | ClauseKind::RegionOutlives(_)
+    )
+}
+
+/// The outlives bounds among the predicates of `def`, with the arguments `args`. Only those are
+/// instantiated: the others, most of them (`T: Sized`, `A: Allocator`), are never folded.
+pub(crate) fn predicate_needs<'db, A: Allocator>(
+    db: &'db Db,
+    def: GenericDefId,
+    args: &[GenericArg<'db>],
+    out: &mut Vec<Needs<'db>, A>,
+) {
+    let interner = DbInterner::new_no_crate(db);
+    let clauses = GenericPredicates::query_all(db, def)
+        .map_bound(|it| it.filter(is_outlives))
+        .iter_instantiated(interner, args)
+        .map(|it| it.skip_norm_wip());
+    clause_needs(clauses, out);
+}
+
 /// The outlives bounds among `clauses`.
-pub(crate) fn clause_needs<'db>(clauses: &[Clause<'db>], out: &mut Vec<Needs<'db>>) {
+pub(crate) fn clause_needs<'db, A: Allocator>(
+    clauses: impl IntoIterator<Item = Clause<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
+) {
     for clause in clauses {
         match clause.kind().skip_binder() {
-            ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+            ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                 out.push(Needs::Type(ty, region))
             }
-            ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+            ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                 out.push(Needs::Region(longer, shorter))
             }
             _ => (),
@@ -211,35 +245,57 @@ pub(crate) fn clause_needs<'db>(clauses: &[Clause<'db>], out: &mut Vec<Needs<'db
 /// What the well-formedness of `ty` needs of what outlives what: rustc's `wf::obligations`,
 /// its outlives obligations. What names a region bound inside `ty` is left out, as rustc
 /// leaves it out.
-pub(crate) fn wf<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn wf<'db, A: Allocator>(
+    db: &'db Db,
     inferred: &mut Inferred<'db>,
     ty: Ty<'db>,
-    out: &mut Vec<Needs<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
 ) {
-    let mut found = Vec::new();
-    wf_into(db, inferred, ty, &mut found, 0);
-    out.extend(found.into_iter().filter(|it| match *it {
-        Needs::Type(ty, region) => {
-            !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
+    let start = out.len();
+    wf_into(db, inferred, ty, out, 0);
+    let mut kept = start;
+    for at in start..out.len() {
+        let need = out[at];
+        let escapes = match need {
+            Needs::Type(ty, region) => {
+                ty.has_escaping_bound_vars() || region.has_escaping_bound_vars()
+            }
+            Needs::Region(longer, shorter) => {
+                longer.has_escaping_bound_vars() || shorter.has_escaping_bound_vars()
+            }
+        };
+        if !escapes {
+            out[kept] = need;
+            kept += 1;
         }
-        Needs::Region(longer, shorter) => {
-            !longer.has_escaping_bound_vars() && !shorter.has_escaping_bound_vars()
-        }
-    }));
+    }
+    out.truncate(kept);
 }
 
-fn wf_into<'db>(
-    db: &'db dyn HirDatabase,
+/// What a type needs one of for its well-formedness to need anything that can fail, or that
+/// tells an item something: a type without a parameter, an alias, an inference variable, a
+/// placeholder, an error or a region other than `'static`, a bound one and an erased one
+/// (`u8`, `Vec<String>`, `&'static str`) only needs `'static` to outlive what it does.
+const MAY_NEED: TypeFlags = TypeFlags::HAS_PARAM
+    .union(TypeFlags::HAS_ALIAS)
+    .union(TypeFlags::HAS_INFER)
+    .union(TypeFlags::HAS_PLACEHOLDER)
+    .union(TypeFlags::HAS_ERROR)
+    .union(TypeFlags::HAS_FREE_LOCAL_REGIONS);
+
+fn wf_into<'db, A: Allocator>(
+    db: &'db Db,
     inferred: &mut Inferred<'db>,
     ty: Ty<'db>,
-    out: &mut Vec<Needs<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
     depth: usize,
 ) {
-    if depth > 32 {
+    if depth > 32 || !ty.has_type_flags(MAY_NEED) {
         return;
     }
-    let args = |inferred: &mut Inferred<'db>, args: GenericArgs<'db>, out: &mut Vec<Needs<'db>>| {
+    let args = |inferred: &mut Inferred<'db>,
+                args: GenericArgs<'db>,
+                out: &mut Vec<Needs<'db>, A>| {
         for arg in args.iter() {
             if let GenericArgKind::Type(ty) = arg.kind() {
                 wf_into(db, inferred, ty, out, depth + 1);
@@ -282,7 +338,7 @@ fn wf_into<'db>(
         TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
             wf_into(db, inferred, inner, out, depth + 1)
         }
-        TyKind::Alias(alias) => args(inferred, alias.args, out),
+        TyKind::Alias(_, alias) => args(inferred, alias.args, out),
         _ => (),
     }
 }
@@ -293,19 +349,19 @@ fn wf_into<'db>(
 /// its inference of an ADT's outlives bounds (RFC 2093) does not infer these, so a lifetime
 /// parameter can fail them too. `<T as Dummy<'a>>::Out` with only
 /// `impl<'a, T: 'a> Dummy<'a> for T` needs `T: 'a`.
-pub(crate) fn projection_needs<'db>(
-    db: &'db dyn HirDatabase,
-    wfcx: &Wfcx<'db>,
+pub(crate) fn projection_needs<'db, A: Allocator>(
+    db: &'db Db,
+    wfcx: &Wfcx<'_, 'db>,
     ty: Ty<'db>,
-    out: &mut Vec<Needs<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
 ) {
     let interner = DbInterner::new_no_crate(db);
-    let mut aliases = Vec::new();
+    let mut aliases = Vec::new_in(wfcx.frame);
     walk(ty, &mut aliases);
-    let predicates = aliases
-        .into_iter()
-        .filter_map(|it| match it.kind() {
-            TyKind::Alias(alias)
+    let predicates = mem::collect(
+        wfcx.frame,
+        aliases.into_iter().filter_map(|it| match it.kind() {
+            TyKind::Alias(_, alias)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
                     && !it.has_escaping_bound_vars()
                     && !it.references_error() =>
@@ -313,9 +369,9 @@ pub(crate) fn projection_needs<'db>(
                 Some(trait_predicate(interner, alias))
             }
             _ => None,
-        })
-        .collect();
-    prove_needs(wfcx, predicates, out);
+        }),
+    );
+    prove_needs(wfcx, &predicates, out);
 }
 
 /// What proving the trait bounds the well-formedness of `ty` asks needs of what outlives what,
@@ -324,23 +380,35 @@ pub(crate) fn projection_needs<'db>(
 /// ServiceChain<P, S>, NS>` of `struct ServiceChainBuilder<P: Service, ..>` with only
 /// `impl<P: Service, S: Service> Service for ServiceChain<P, S> where P::Error: 'static`
 /// needs `P::Error: 'static`.
-pub(crate) fn trait_needs<'db>(
-    db: &'db dyn HirDatabase,
-    wfcx: &Wfcx<'db>,
+pub(crate) fn trait_needs<'db, A: Allocator>(
+    db: &'db Db,
+    wfcx: &Wfcx<'_, 'db>,
     ty: Ty<'db>,
-    out: &mut Vec<Needs<'db>>,
+    out: &mut Vec<Needs<'db>, A>,
+) {
+    let mut predicates = Vec::new_in(wfcx.frame);
+    trait_predicates(db, wfcx.frame, ty, &mut predicates);
+    prove_needs(wfcx, &predicates, out);
+}
+
+/// The predicates [`trait_needs`] proves: the trait of each projection in `ty`, and the trait
+/// and projection predicates of each struct or enum, instantiated.
+pub(crate) fn trait_predicates<'db, A: Allocator>(
+    db: &'db Db,
+    frame: &Frame,
+    ty: Ty<'db>,
+    predicates: &mut Vec<hir_ty::next_solver::Predicate<'db>, A>,
 ) {
     use rustc_type_ir::inherent::Clause as _;
     let interner = DbInterner::new_no_crate(db);
-    let mut tys = Vec::new();
+    let mut tys = Vec::new_in(frame);
     walk(ty, &mut tys);
-    let mut predicates = Vec::new();
     for it in tys {
         if it.has_escaping_bound_vars() || it.references_error() {
             continue;
         }
         match it.kind() {
-            TyKind::Alias(alias)
+            TyKind::Alias(_, alias)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
             {
                 predicates.push(trait_predicate(interner, alias));
@@ -362,7 +430,6 @@ pub(crate) fn trait_needs<'db>(
             _ => (),
         }
     }
-    prove_needs(wfcx, predicates, out);
 }
 
 fn trait_predicate<'db>(
@@ -370,53 +437,72 @@ fn trait_predicate<'db>(
     alias: AliasTy<'db>,
 ) -> hir_ty::next_solver::Predicate<'db> {
     use rustc_type_ir::Upcast as _;
-    rustc_type_ir::TraitPredicate {
+    rustc_type_ir::TraitClause {
         trait_ref: alias.trait_ref(interner),
-        polarity: rustc_type_ir::PredicatePolarity::Positive,
+        polarity: rustc_type_ir::ClausePolarity::Positive,
     }
     .upcast(interner)
 }
 
 /// rustc's `WfCheckingCtxt`: an inference context in the environment of the item checked,
 /// which the solver's proofs and normalizations of one check share.
-pub(crate) struct Wfcx<'db> {
+pub(crate) struct Wfcx<'f, 'db> {
+    frame: &'f Frame,
+    db: &'db Db,
+    def: hir_def::GenericDefId,
     interner: DbInterner<'db>,
-    infcx: InferCtxt<'db>,
-    env: ParamEnv<'db>,
+    /// Built by the first normalization or proof: an item whose types have no alias and no
+    /// trait predicate to prove never needs one.
+    solver: std::cell::OnceCell<(InferCtxt<'db>, ParamEnv<'db>)>,
 }
 
-impl<'db> Wfcx<'db> {
-    pub(crate) fn new(db: &'db dyn HirDatabase, def: hir_def::GenericDefId) -> Self {
+impl<'f, 'db> Wfcx<'f, 'db> {
+    pub(crate) fn new(frame: &'f Frame, db: &'db Db, def: hir_def::GenericDefId) -> Self {
         use hir_def::HasModule as _;
-        use hir_ty::next_solver::{TypingMode, infer::DbInternerInferExt as _};
         let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
-        let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-        Wfcx { interner, infcx, env: db.trait_environment(def) }
+        Wfcx { frame, db, def, interner, solver: std::cell::OnceCell::new() }
+    }
+
+    fn infcx(&self) -> &InferCtxt<'db> {
+        &self.solver().0
+    }
+
+    fn env(&self) -> ParamEnv<'db> {
+        self.solver().1
+    }
+
+    fn solver(&self) -> &(InferCtxt<'db>, ParamEnv<'db>) {
+        use hir_ty::next_solver::{TypingMode, infer::DbInternerInferExt as _};
+        self.solver.get_or_init(|| {
+            let infcx = self.interner.infer_ctxt().build(TypingMode::non_body_analysis());
+            (infcx, self.db.trait_environment(self.def))
+        })
     }
 
     /// How many region obligations and constraints the solver has made so far.
     fn mark(&self) -> (usize, usize) {
-        let mut inner = self.infcx.inner.borrow_mut();
+        let mut inner = self.infcx().inner.borrow_mut();
         let obligations = inner.region_obligations().len();
         (obligations, inner.unwrap_region_constraints().region_constraint_data().constraints.len())
     }
 
     /// What the solver has needed of what outlives what since `mark`: the type outlives
     /// obligations and region constraints of the item's own regions.
-    fn needs_since(&self, mark: (usize, usize), out: &mut Vec<Needs<'db>>) {
+    fn needs_since<A: Allocator>(&self, mark: (usize, usize), out: &mut Vec<Needs<'db>, A>) {
         use hir_ty::next_solver::infer::region_constraints::Constraint;
-        let (interner, infcx) = (self.interner, &self.infcx);
+        let (interner, infcx) = (self.interner, self.infcx());
         let mut inner = infcx.inner.borrow_mut();
-        let obligations: Vec<_> = inner.region_obligations()[mark.0..]
-            .iter()
-            .map(|it| (it.sup_type, it.sub_region))
-            .collect();
-        let constraints = inner.unwrap_region_constraints().region_constraint_data().constraints
-            [mark.1..]
-            .to_vec();
+        let obligations = mem::collect(
+            self.frame,
+            inner.region_obligations()[mark.0..].iter().map(|it| (it.sup_type, it.sub_region)),
+        );
+        let constraints: FVec<'_, Constraint<'db>> = mem::collect(
+            self.frame,
+            inner.unwrap_region_constraints().region_constraint_data().constraints.iter_from(mark.1),
+        );
         drop(inner);
         // The impl's lifetimes are inference variables the solver equates with the item's.
-        let mut equal: FxHashMap<rustc_type_ir::RegionVid, Region<'db>> = FxHashMap::default();
+        let mut equal: FMap<'_, rustc_type_ir::RegionVid, Region<'db>> = mem::map(self.frame);
         for constraint in &constraints {
             if let Constraint::VarSubReg(var, region) | Constraint::RegSubVar(region, var) =
                 *constraint
@@ -475,7 +561,11 @@ impl<'db> Wfcx<'db> {
     /// `out`: the where clauses of the impls it goes through, as `T: 'b` of `impl<'b, T, U>
     /// AsRef2 for Foo<T> where T: AsRef2<Output<'b> = &'b [U]>` with `type Output<'a> where
     /// Self: 'a`, whose own where clause normalizing `<T as AsRef2>::Output<'b>` asks.
-    pub(crate) fn normalize(&self, ty: Ty<'db>, out: &mut Vec<Needs<'db>>) -> Ty<'db> {
+    pub(crate) fn normalize<A: Allocator>(
+        &self,
+        ty: Ty<'db>,
+        out: &mut Vec<Needs<'db>, A>,
+    ) -> Ty<'db> {
         use hir_ty::next_solver::{
             infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
         };
@@ -483,15 +573,15 @@ impl<'db> Wfcx<'db> {
             return ty;
         }
         let mark = self.mark();
-        let ocx = ObligationCtxt::new(&self.infcx);
-        let Ok(normalized) = ocx.deeply_normalize(&ObligationCause::dummy(), self.env, ty) else {
+        let ocx = ObligationCtxt::new(self.infcx());
+        let Ok(normalized) = ocx.deeply_normalize(&ObligationCause::dummy(), self.env(), ty) else {
             return ty;
         };
         self.needs_since(mark, out);
-        let mut inner = self.infcx.inner.borrow_mut();
+        let mut inner = self.infcx().inner.borrow_mut();
         let mut constraints = inner.unwrap_region_constraints();
         rustc_type_ir::fold_regions(self.interner, normalized, |region, _| match region.kind() {
-            RegionKind::ReVar(var) => constraints.opportunistic_resolve_var(self.interner, var),
+            RegionKind::ReVar(var) => constraints.shallow_resolve_region_var(self.interner, var),
             _ => region,
         })
     }
@@ -500,10 +590,10 @@ impl<'db> Wfcx<'db> {
 /// What proving `predicates` with the trait solver needs of what outlives what, given the
 /// where clauses of the item `wfcx` checks: the where clauses of the impls that prove them.
 /// Nothing when one is not proven.
-fn prove_needs<'db>(
-    wfcx: &Wfcx<'db>,
-    predicates: Vec<hir_ty::next_solver::Predicate<'db>>,
-    out: &mut Vec<Needs<'db>>,
+fn prove_needs<'db, A: Allocator>(
+    wfcx: &Wfcx<'_, 'db>,
+    predicates: &[hir_ty::next_solver::Predicate<'db>],
+    out: &mut Vec<Needs<'db>, A>,
 ) {
     use hir_ty::next_solver::{
         infer::traits::{Obligation, ObligationCause},
@@ -512,16 +602,22 @@ fn prove_needs<'db>(
     if predicates.is_empty() {
         return;
     }
-    let (interner, infcx) = (wfcx.interner, &wfcx.infcx);
+    let (interner, infcx, env) = (wfcx.interner, wfcx.infcx(), wfcx.env());
     let (obligations_before, constraints_before) = wfcx.mark();
-    for predicate in predicates {
+    for &predicate in predicates {
+        let obligation = Obligation::new(interner, ObligationCause::dummy(), env, predicate);
+        // A global predicate names none of the item's parameters or regions, so all its proof
+        // can need is that a global type or `'static` outlives `'static`, which holds: only
+        // whether it holds matters, which the solver's evaluation (its global cache) answers
+        // without a fulfillment context.
+        if predicate.is_global() {
+            if !infcx.predicate_must_hold_modulo_regions(&obligation) {
+                return;
+            }
+            continue;
+        }
         let mut ocx = ObligationCtxt::new(infcx);
-        ocx.register_obligation(Obligation::new(
-            interner,
-            ObligationCause::dummy(),
-            wfcx.env,
-            predicate,
-        ));
+        ocx.register_obligation(obligation);
         if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
             return;
         }
@@ -529,105 +625,128 @@ fn prove_needs<'db>(
     wfcx.needs_since((obligations_before, constraints_before), out);
 }
 
+/// [`prove_needs`] as it was: every predicate proven in a fulfillment context of its own.
+#[cfg(test)]
+pub(crate) fn prove_needs_reference<'db, A: Allocator>(
+    wfcx: &Wfcx<'_, 'db>,
+    predicates: &[hir_ty::next_solver::Predicate<'db>],
+    out: &mut Vec<Needs<'db>, A>,
+) {
+    use hir_ty::next_solver::{
+        infer::traits::{Obligation, ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    if predicates.is_empty() {
+        return;
+    }
+    let (interner, infcx, env) = (wfcx.interner, wfcx.infcx(), wfcx.env());
+    let mark = wfcx.mark();
+    for &predicate in predicates {
+        let mut ocx = ObligationCtxt::new(infcx);
+        ocx.register_obligation(Obligation::new(
+            interner,
+            ObligationCause::dummy(),
+            env,
+            predicate,
+        ));
+        if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+            return;
+        }
+    }
+    wfcx.needs_since(mark, out);
+}
+
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
-/// `'static`.
+/// `'static`. Read in place from the query's memo: a lookup allocates nothing.
 #[derive(Default)]
 pub struct Inferred<'db> {
-    memo: FxHashMap<AdtId, Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>>,
+    _db: std::marker::PhantomData<&'db ()>,
 }
 
 impl<'db> Inferred<'db> {
     pub fn of(
-        &mut self,
-        db: &'db dyn HirDatabase,
+        &self,
+        db: &'db Db,
         adt: AdtId,
-    ) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-        self.memo.entry(adt).or_insert_with(|| inferred_of(db, adt)).clone()
+    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db>
+    {
+        inferred_outlives(db, adt).0.iter().map(|it| {
+            let arg: GenericArg<'db> = match &it.arg {
+                InferredArg::Type(ty) => ty.as_ref().into(),
+                InferredArg::Region(region) => region.as_ref().into(),
+            };
+            OutlivesClause(arg, it.region.as_ref())
+        })
     }
 }
 
-/// One of an ADT's inferred outlives predicates as salsa keeps it: what outlives, a type or a
+/// One of an ADT's inferred outlives predicates as the query database keeps it: what outlives, a type or a
 /// region, and the region.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 enum InferredArg {
     Type(StoredTy),
     Region(StoredRegion),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 struct InferredPredicate {
     arg: InferredArg,
     region: StoredRegion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 struct InferredOutlives(Vec<InferredPredicate>);
-
-fn inferred_of<'db>(
-    db: &'db dyn HirDatabase,
-    adt: AdtId,
-) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-    inferred_outlives(db, adt)
-        .0
-        .iter()
-        .map(|it| {
-            let arg: GenericArg<'db> = match &it.arg {
-                InferredArg::Type(ty) => ty.as_ref().into(),
-                InferredArg::Region(region) => region.as_ref().into(),
-            };
-            OutlivesPredicate(arg, it.region.as_ref())
-        })
-        .collect()
-}
 
 /// A query, so an edit checks again only the ADTs it changes. Worked out to a fixed point, as
 /// ADTs can contain each other.
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_fn = inferred_outlives_cycle_fn,
     cycle_initial = inferred_outlives_cycle_initial,
 )]
-fn inferred_outlives(db: &dyn HirDatabase, adt: AdtId) -> InferredOutlives {
-    let mut found = Vec::new();
-    for variant in variants(db, adt) {
-        for (_, field) in db.field_types(variant).iter() {
-            let ty = field.ty().instantiate_identity().skip_norm_wip();
-            let mut subtypes = Vec::new();
-            walk(ty, &mut subtypes);
-            for ty in subtypes {
-                required(db, ty, &mut found);
+fn inferred_outlives(db: &Db, adt: AdtId) -> InferredOutlives {
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let mut found = Vec::new_in(frame);
+        let mut subtypes = Vec::new_in(frame);
+        for variant in adt.variants(db) {
+            for (_, field) in db.field_types(variant).iter() {
+                let ty = field.ty().instantiate_identity().skip_norm_wip();
+                subtypes.clear();
+                walk_with(ty, TypeFlags::HAS_RE_PARAM, &mut subtypes);
+                for &ty in &subtypes {
+                    required(db, ty, &mut found);
+                }
             }
         }
-    }
-    let mut seen = FxHashSet::default();
-    found.retain(|it| seen.insert(*it));
-    InferredOutlives(
-        found
-            .into_iter()
-            .filter_map(|OutlivesPredicate(arg, region)| {
+        let mut seen = mem::set(frame);
+        found.retain(|it| seen.insert(*it));
+        let kept = mem::collect(
+            frame,
+            found.into_iter().filter_map(|OutlivesClause(arg, region)| {
                 let arg = match arg.kind() {
                     GenericArgKind::Type(ty) => InferredArg::Type(ty.store()),
                     GenericArgKind::Lifetime(region) => InferredArg::Region(region.store()),
                     GenericArgKind::Const(_) => return None,
                 };
                 Some(InferredPredicate { arg, region: region.store() })
-            })
-            .collect(),
-    )
+            }),
+        );
+        InferredOutlives(mem::owned(kept.into_iter()))
+    })
 }
 
 fn inferred_outlives_cycle_initial(
-    _db: &dyn HirDatabase,
-    _: salsa::Id,
+    _db: &Db,
+    _: blaze_query::db::Id,
     _adt: AdtId,
 ) -> InferredOutlives {
     InferredOutlives::default()
 }
 
 fn inferred_outlives_cycle_fn(
-    _db: &dyn HirDatabase,
-    _: &salsa::Cycle<'_>,
+    _db: &Db,
+    _: &blaze_query::db::Cycle<'_>,
     _last_provisional_value: &InferredOutlives,
     value: InferredOutlives,
     _adt: AdtId,
@@ -635,25 +754,27 @@ fn inferred_outlives_cycle_fn(
     value
 }
 
-/// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's.
-fn required<'db>(
-    db: &'db dyn HirDatabase,
+/// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's. What it finds
+/// outlives a lifetime parameter, which comes from `ty`'s arguments: a type without one
+/// finds nothing.
+fn required<'db, A: Allocator + Copy>(
+    db: &'db Db,
     ty: Ty<'db>,
-    found: &mut Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>,
+    found: &mut Vec<OutlivesClause<DbInterner<'db>, GenericArg<'db>>, A>,
 ) {
+    if !ty.has_type_flags(TypeFlags::HAS_RE_PARAM) {
+        return;
+    }
     let interner = DbInterner::new_no_crate(db);
-    let mut needs = Vec::new();
+    let mut needs = Vec::new_in(*found.allocator());
     match ty.kind() {
         TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
         TyKind::Adt(def, args) => {
-            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, def.def_id().into())
-                .iter_instantiated(interner, args.as_slice())
-                .map(|it| it.skip_norm_wip())
-                .collect();
-            clause_needs(&clauses, &mut needs);
-            for predicate in inferred_of(db, def.def_id()) {
-                let OutlivesPredicate(arg, region) =
-                    EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
+            predicate_needs(db, def.def_id().into(), args.as_slice(), &mut needs);
+            for predicate in Inferred::default().of(db, def.def_id()) {
+                let OutlivesClause(arg, region) = EarlyBinder::bind(interner, predicate)
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
                 match arg.kind() {
                     GenericArgKind::Type(ty) => needs.push(Needs::Type(ty, region)),
                     GenericArgKind::Lifetime(longer) => needs.push(Needs::Region(longer, region)),
@@ -661,16 +782,12 @@ fn required<'db>(
                 }
             }
         }
-        TyKind::Alias(alias)
-            if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
-                && let SolverDefId::TypeAliasId(item) = alias.kind.def_id()
+        TyKind::Alias(_, alias)
+            if let rustc_type_ir::AliasTyKind::Projection { def_id: TraitAssocTyId(item) } =
+                alias.kind
                 && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
         {
-            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, trait_.into())
-                .iter_instantiated(interner, alias.args.as_slice())
-                .map(|it| it.skip_norm_wip())
-                .collect();
-            clause_needs(&clauses, &mut needs);
+            predicate_needs(db, trait_.into(), alias.args.as_slice(), &mut needs);
         }
         _ => (),
     }
@@ -683,11 +800,11 @@ fn required<'db>(
                         Component::Param(ty) | Component::Alias(ty) => ty.into(),
                         Component::Region(_) => continue,
                     };
-                    found.push(OutlivesPredicate(arg, region));
+                    found.push(OutlivesClause(arg, region));
                 }
             }
             Needs::Region(longer, shorter) if is_free(longer) && is_free(shorter) => {
-                found.push(OutlivesPredicate(longer.into(), shorter));
+                found.push(OutlivesClause(longer.into(), shorter));
             }
             _ => (),
         }
@@ -695,9 +812,9 @@ fn required<'db>(
 }
 
 /// Every type in `ty`, `ty` too, as rustc's `walk`.
-fn walk<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
-    struct Walk<'a, 'db>(&'a mut Vec<Ty<'db>>);
-    impl<'db> TypeVisitor<DbInterner<'db>> for Walk<'_, 'db> {
+fn walk<'db, A: Allocator>(ty: Ty<'db>, out: &mut Vec<Ty<'db>, A>) {
+    struct Walk<'a, 'db, A: Allocator>(&'a mut Vec<Ty<'db>, A>);
+    impl<'db, A: Allocator> TypeVisitor<DbInterner<'db>> for Walk<'_, 'db, A> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             self.0.push(ty);
@@ -707,35 +824,42 @@ fn walk<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
     ty.visit_with(&mut Walk(out));
 }
 
-pub(crate) fn variants(db: &dyn HirDatabase, adt: AdtId) -> Vec<VariantId> {
-    match adt {
-        AdtId::StructId(it) => vec![it.into()],
-        AdtId::UnionId(it) => vec![it.into()],
-        AdtId::EnumId(it) => {
-            it.enum_variants(db).variants.values().map(|&(it, _)| it.into()).collect()
+/// The types in `ty`, `ty` too, that have one of `flags`, in `walk`'s order: one without has
+/// none in it either, so it is not entered.
+fn walk_with<'db, A: Allocator>(ty: Ty<'db>, flags: TypeFlags, out: &mut Vec<Ty<'db>, A>) {
+    struct Walk<'a, 'db, A: Allocator>(&'a mut Vec<Ty<'db>, A>, TypeFlags);
+    impl<'db, A: Allocator> TypeVisitor<DbInterner<'db>> for Walk<'_, 'db, A> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if !ty.has_type_flags(self.1) {
+                return;
+            }
+            self.0.push(ty);
+            ty.super_visit_with(self)
         }
     }
+    ty.visit_with(&mut Walk(out, flags));
 }
 
 /// What an item knows of what outlives what: its where clauses, elaborated, and what the
 /// types it assumes well-formed imply.
-pub(crate) struct Known<'db> {
-    regions: Vec<(Region<'db>, Region<'db>)>,
-    types: Vec<(Ty<'db>, Region<'db>)>,
+pub(crate) struct Known<'f, 'db> {
+    regions: FVec<'f, (Region<'db>, Region<'db>)>,
+    types: FVec<'f, (Ty<'db>, Region<'db>)>,
 }
 
-impl<'db> Known<'db> {
-    pub(crate) fn new(clauses: &[Clause<'db>]) -> Self {
-        let mut known = Known { regions: Vec::new(), types: Vec::new() };
-        let mut needs = Vec::new();
-        clause_needs(clauses, &mut needs);
+impl<'f, 'db> Known<'f, 'db> {
+    pub(crate) fn new(frame: &'f Frame, clauses: &[Clause<'db>]) -> Self {
+        let mut known = Known { regions: Vec::new_in(frame), types: Vec::new_in(frame) };
+        let mut needs = Vec::new_in(frame);
+        clause_needs(clauses.iter().copied(), &mut needs);
         known.add(needs);
         known
     }
 
     /// Knows what `needs` says, as rustc's implied bounds: a type outlives a region when
     /// each of its components does.
-    pub(crate) fn add(&mut self, needs: Vec<Needs<'db>>) {
+    pub(crate) fn add(&mut self, needs: impl IntoIterator<Item = Needs<'db>>) {
         for need in needs {
             match need {
                 Needs::Region(longer, shorter) => self.regions.push((longer, shorter)),
@@ -773,10 +897,12 @@ impl<'db> Known<'db> {
         {
             return true;
         }
-        let mut seen = vec![longer];
-        let mut stack = vec![longer];
-        while let Some(region) = stack.pop() {
-            for &(from, to) in &self.regions {
+        let mut seen = Vec::new_in(*self.regions.allocator());
+        seen.push(longer);
+        let mut next = 0;
+        while let Some(&region) = seen.get(next) {
+            next += 1;
+            for &(from, to) in self.regions.iter() {
                 if from != region || seen.contains(&to) {
                     continue;
                 }
@@ -784,7 +910,6 @@ impl<'db> Known<'db> {
                     return true;
                 }
                 seen.push(to);
-                stack.push(to);
             }
         }
         false
@@ -795,11 +920,11 @@ impl<'db> Known<'db> {
     /// does (`type Error: 'static`), or when each of its arguments does.
     pub(crate) fn failing_aliases(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         ty: Ty<'db>,
         region: Region<'db>,
-    ) -> Vec<Ty<'db>> {
-        let mut failing = Vec::new();
+    ) -> FVec<'f, Ty<'db>> {
+        let mut failing = Vec::new_in(*self.regions.allocator());
         if !matches!(
             region.kind(),
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic
@@ -819,14 +944,14 @@ impl<'db> Known<'db> {
 
     fn alias_outlives(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         ty: Ty<'db>,
         region: Region<'db>,
         depth: usize,
     ) -> bool {
-        let TyKind::Alias(alias) = ty.kind() else { return true };
+        let TyKind::Alias(_, alias) = ty.kind() else { return true };
+        let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind else { return true };
         if depth > 8
-            || !matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
             || ty.has_non_region_infer()
             || ty.references_error()
             || self
@@ -837,18 +962,19 @@ impl<'db> Known<'db> {
             return true;
         }
         let interner = DbInterner::new_no_crate(db);
-        let declared: Vec<Region<'db>> =
-            rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+        let declared = mem::collect(
+            *self.regions.allocator(),
+            rustc_type_ir::Interner::item_bounds(interner, def_id.into())
                 .iter_instantiated(interner, alias.args.as_slice())
                 .filter_map(|clause| match clause.kind().skip_binder() {
-                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound))
+                    ClauseKind::TypeOutlives(OutlivesClause(bounded, bound))
                         if bounded == ty && !bound.has_escaping_bound_vars() =>
                     {
                         Some(bound)
                     }
                     _ => None,
-                })
-                .collect();
+                }),
+        );
         if declared.iter().any(|&bound| self.region_outlives(bound, region)) {
             return true;
         }
@@ -884,8 +1010,8 @@ impl<'db> Known<'db> {
     /// The type parameters in `ty` not known to outlive `region`. Associated types count as
     /// outliving it: what proves that of them (their bounds, the trait's) is not reasoned
     /// about here.
-    pub(crate) fn failing_params(&self, ty: Ty<'db>, region: Region<'db>) -> Vec<Ty<'db>> {
-        let mut failing = Vec::new();
+    pub(crate) fn failing_params(&self, ty: Ty<'db>, region: Region<'db>) -> FVec<'f, Ty<'db>> {
+        let mut failing = Vec::new_in(*self.regions.allocator());
         if !matches!(
             region.kind(),
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic

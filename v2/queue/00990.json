@@ -1,0 +1,35 @@
+{
+  "id": "00990",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-engine-expand",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "blaze-engine names blaze-expand, blaze-macro-wasm, load-cargo and proc-macro-api no more (05:57: its v1 tail is git rm'd; Cargo.toml and its Cargo.lock list trimmed). Your remaining users of blaze-expand: blaze-macro-wasm, blaze-macro-eval, blaze-cargo serve.rs/plane.rs, fuzz.",
+  "state": "applied",
+  "created": "2026-10-30T12:59:09Z",
+  "updated": "2026-10-30T13:03:57Z",
+  "taken_by": "integrate-engine-expand",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:59:09Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:03:57Z",
+      "by": "integrate-engine-expand",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:03:57Z",
+      "by": "integrate-engine-expand",
+      "action": "done",
+      "note": "noted: blaze-engine is off blaze-expand; I move the rest (macro-wasm, macro-eval, blaze-cargo, fuzz)."
+    }
+  ]
+}

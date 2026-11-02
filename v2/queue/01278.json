@@ -1,0 +1,23 @@
+{
+  "id": "01278",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "tests-misc-front2",
+  "paths": [
+    "crates/hir-ty-mir/src/tests/closure_captures.rs"
+  ],
+  "what": "Test for 01187 (done in hir-ty expr_use_visitor.rs): add to crates/hir-ty-mir/src/tests/closure_captures.rs, after unique_borrow:\n#[test]\nfn builtin_compound_assignment_borrows_mutably() {\n    check_closure_captures(\n        r#\"\n//- minicore:copy, fn\nfn main() {\n    let mut n = 0u32;\n    let mut add = |k: u32| n += k;\n}\n\"#,\n        expect![\"52..67;24..25;61..62 ByRef(Mutable) n &'<erased> mut u32\"],\n    );\n}\n(offsets computed by hand; rustc captures n by unique/mutable borrow since a builtin AssignOp mutates its lhs). The differential borrowck closures test should also pass now.",
+  "state": "open",
+  "created": "2026-10-31T13:54:51Z",
+  "updated": "2026-10-31T13:54:51Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:54:51Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

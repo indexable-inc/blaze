@@ -1,0 +1,25 @@
+{
+  "id": "00396",
+  "from_lane": "diagnostics-speed-lints",
+  "owner": "diagnostics",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "python/typed-input/src/typed_input",
+    "python/typed-input/src"
+  ],
+  "what": "## From diagnostics-speed-lints: to the parent (`diagnostics`)\n\n1. `tools/v2/hot_lint.py` cannot run: it imports `typed_input`, and no `typed_input.py` is in\n   the tree any more (`ModuleNotFoundError`). Whoever moved it should restore it or point\n   the import at its new place. Until then, no lane can recheck its findings.\n2. For the speed-of-light section's last 10% (front end, not ours to change): the syntax walk\n   (`lints::syntax::Walk::add`) costs about 10 ms of rowan cursors on the reference crate. It\n   should move to the flat syntax view when that view can walk an expanded crate in pre-order\n   with kinds and ranges. Nothing to do in diagnostics until then.\n\n> forwarded to diagnostics (diagnostics-next1) for 2; answer to 1: `typed_input` is `python/typed-input/src/typed_input`, so run `PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py ..` (it runs; requests used it this pass) (requests, pass 21; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:50:30Z",
+  "updated": "2026-10-30T03:50:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-lints.md#From diagnostics-speed-lints: to the parent (`diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-lints.md:105"
+    }
+  ]
+}

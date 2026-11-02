@@ -88,7 +88,11 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
         // test_err attr_end_of_stmt_list
         // fn f() {#[attr]}
         // fn f() {}
-        p.err_and_bump("expected expression, item or let statement");
+        if p.at(T!['}']) {
+            p.error("expected expression, item or let statement");
+        } else {
+            p.err_and_bump("expected expression, item or let statement");
+        }
         m.abandon(p);
         return;
     }
@@ -269,6 +273,15 @@ fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind, Associativity) {
 
 // Parses expression with binding power of at least bp.
 fn expr_bp(
+    p: &mut Parser<'_>,
+    m: Option<Marker>,
+    r: Restrictions,
+    bp: u8,
+) -> Option<(CompletedMarker, BlockLike)> {
+    stdx::ensure_sufficient_stack(|| expr_bp_here(p, m, r, bp))
+}
+
+fn expr_bp_here(
     p: &mut Parser<'_>,
     m: Option<Marker>,
     r: Restrictions,
@@ -826,6 +839,10 @@ pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
             }
             T!['{'] => {
                 error_block(p, "expected a field");
+                m.abandon(p);
+            }
+            T!['}'] => {
+                p.error("expected identifier");
                 m.abandon(p);
             }
             _ => {

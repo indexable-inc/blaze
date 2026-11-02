@@ -6,10 +6,10 @@ use std::fs;
 #[derive(Debug, Default)]
 pub(crate) struct FilesWithBackupEmitter;
 
-impl Emitter for FilesWithBackupEmitter {
-    fn emit_formatted_file(
+impl FilesWithBackupEmitter {
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        _output: &mut dyn Write,
+        _output: &mut impl Write,
         FormattedFile {
             filename,
             original_text,

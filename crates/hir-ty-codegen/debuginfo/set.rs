@@ -15,8 +15,8 @@
 
 use std::{fmt, hash::Hash, sync::Arc};
 
+use blaze_hash::{HashMap, HashSet};
 use intern::{Interned, Symbol, impl_internable};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, Variant};
 
@@ -55,14 +55,14 @@ pub(super) enum Of<'a> {
 
 /// What one type is told as, with the types it is made of by their keys: what the database
 /// keeps of each type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: holds counts; the cache of types hands out each part's key, once per type on a miss
 pub(crate) struct Own<K> {
     pub(super) told: Interned<Told>,
     pub(super) of: Box<[Made<K>]>,
 }
 
 /// A type that one of an [`Own`] is made of.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Own`
 pub(crate) enum Made<K> {
     Key(K),
     /// See [`Part::Named`].
@@ -84,7 +84,9 @@ pub(super) trait Found {
 
 /// The set of the type of `key`, as `found` has the types.
 pub(super) fn resolve<F: Found>(found: &mut F, key: &F::Key) -> Option<TypeSet> {
-    let mut search = Search { found, on: FxHashMap::default(), stack: Vec::new() };
+    // alloc: empty, allocates nothing on a hit; filled once per type no set was kept of
+    let (stack, parts) = (Vec::new(), Vec::new());
+    let mut search = Search { found, on: HashMap::default(), stack, parts };
     match search.key(key, 0).0 {
         Seen::Done(Some(Part::Type(set))) => Some(set),
         _ => None,
@@ -104,8 +106,10 @@ enum Seen {
 struct Search<'a, F: Found> {
     found: &'a mut F,
     /// The place on `stack` of each type there.
-    on: FxHashMap<F::Key, usize>,
+    on: HashMap<F::Key, usize>,
     stack: Vec<Pending<F::Key>>,
+    /// The parts of the [`Node`] being made, for [`node`].
+    parts: Vec<Option<Part>>,
 }
 
 struct Pending<K> {
@@ -136,17 +140,21 @@ impl<F: Found> Search<'_, F> {
             self.found.keep(key, None);
             return (Seen::Done(None), usize::MAX);
         };
+        // clone: a key is counts, held by the map and the stack; once per type put together
         self.on.insert(key.clone(), self.stack.len());
+        // clone: as above
         self.own(Some(key.clone()), &own, depth)
     }
 
     fn own(&mut self, key: Option<F::Key>, own: &Own<F::Key>, depth: u32) -> (Seen, usize) {
         let at = self.stack.len();
         let of = Vec::with_capacity(own.of.len());
+        // clone: the interned type's count, once per type put together
         self.stack.push(Pending { key, told: own.told.clone(), of, low: at });
         for made in &own.of {
             let (seen, low) = match made {
                 Made::Key(key) => self.key(key, depth + 1),
+                // clone: the name's count, kept in the node
                 Made::Named(name) => (Seen::Done(Some(Part::Named(name.clone()))), usize::MAX),
                 Made::Inline(own) => self.own(None, own, depth + 1),
             };
@@ -160,47 +168,50 @@ impl<F: Found> Search<'_, F> {
         }
         // The type and the ones after it on the stack are made of each other, and of no type
         // before it.
-        let group: Vec<Pending<F::Key>> = self.stack.drain(at..).collect();
-        for key in group.iter().filter_map(|it| it.key.as_ref()) {
+        for key in self.stack[at..].iter().filter_map(|it| it.key.as_ref()) {
             self.on.remove(key);
         }
         // An array of a type that is not told of is not told of either, and is a group of its
         // own: it is made of nothing else.
-        if let [array] = &group[..]
+        if let [array] = &self.stack[at..]
             && let Told::Array { .. } = &*array.told
             && !matches!(array.of.first(), Some(Seen::Done(Some(Part::Type(_)))))
         {
             if let Some(key) = &array.key {
                 self.found.keep(key, None);
             }
+            self.stack.truncate(at);
             return (Seen::Done(None), usize::MAX);
         }
-        let nodes: Arc<[Node]> = group
-            .iter()
-            .map(|it| {
-                let of = it.of.iter().map(|seen| match seen {
-                    Seen::At(on) => Some(Part::Here((on - at) as u32)),
-                    Seen::Done(part) => part.clone(),
-                });
-                node(&it.told, of.collect())
-            })
-            .collect();
-        for (nth, it) in group.iter().enumerate() {
+        let parts = &mut self.parts;
+        let nodes = self.stack[at..].iter_mut().map(|it| {
+            parts.extend(it.of.drain(..).map(|seen| match seen {
+                Seen::At(on) => Some(Part::Here((on - at) as u32)),
+                Seen::Done(part) => part,
+            }));
+            node(&it.told, parts)
+        });
+        // alloc: the group's nodes, kept as the sets of its types; once per group
+        let nodes: Arc<[Node]> = nodes.collect();
+        for (nth, it) in self.stack[at..].iter().enumerate() {
             if let Some(key) = &it.key {
+                // clone: the group's count, one for each of its types kept
                 let set = TypeSet { group: nodes.clone(), nth: nth as u32 };
                 self.found.keep(key, Some(set));
             }
         }
+        self.stack.truncate(at);
         (Seen::Done(Some(Part::Type(TypeSet { group: nodes, nth: 0 }))), usize::MAX)
     }
 }
 
 /// `told`, made of the types `of`: without the fields and the parameters of a type that is
 /// not told of (`None`), nor what a pointer points to then, as the list the store keeps has
-/// it ([`expand`]).
-fn node(told: &Interned<Told>, of: Vec<Option<Part>>) -> Node {
+/// it ([`expand`]). Leaves `of` empty.
+fn node(told: &Interned<Told>, of: &mut Vec<Option<Part>>) -> Node {
     if of.iter().all(Option::is_some) {
-        return Node { told: told.clone(), of: of.into_iter().flatten().collect() };
+        // clone: the interned type's count; alloc: the node's parts, kept in the set
+        return Node { told: told.clone(), of: of.drain(..).flatten().collect() };
     }
     fn kept<T: Clone>(
         items: &[T],
@@ -214,38 +225,52 @@ fn node(told: &Interned<Told>, of: Vec<Option<Part>>) -> Node {
             }
             None => false,
         };
+        // alloc: what is told of the items, interned with the type
         items.iter().filter(told).cloned().collect()
     }
-    type Parts = std::vec::IntoIter<Option<Part>>;
-    let shape = |it: &Shape, parts: &mut Parts, of: &mut Vec<Part>| Shape {
-        name: it.name.clone(),
-        size: it.size,
-        fields: kept(&it.fields, parts, of),
-        parameters: kept(&it.parameters, parts, of),
-    };
-    let (mut parts, mut of) = (of.into_iter(), Vec::new());
+    fn reshaped(
+        it: &Shape,
+        parts: &mut impl Iterator<Item = Option<Part>>,
+        of: &mut Vec<Part>,
+    ) -> Shape {
+        Shape {
+            // clone: the name's count, interned with the type
+            name: it.name.clone(),
+            size: it.size,
+            fields: kept(&it.fields, parts, of),
+            parameters: kept(&it.parameters, parts, of),
+        }
+    }
+    let mut parts = of.drain(..);
+    // An array of a type not told of keeps none of its parts.
+    let keeps = if let Told::Array { .. } = &**told { 0 } else { parts.len() };
+    let mut of = Vec::with_capacity(keeps);
     let told = match &**told {
         Told::Pointer { name } => {
             of.extend(parts.flatten());
+            // clone: the name's count, interned with the type
             Told::Pointer { name: name.clone() }
         }
-        Told::Struct(it) => Told::Struct(shape(it, &mut parts, &mut of)),
-        Told::Union(it) => Told::Union(shape(it, &mut parts, &mut of)),
+        Told::Struct(it) => Told::Struct(reshaped(it, &mut parts, &mut of)),
+        Told::Union(it) => Told::Union(reshaped(it, &mut parts, &mut of)),
         Told::Enum { of: it, tag, variants } => {
-            let it = shape(it, &mut parts, &mut of);
+            let it = reshaped(it, &mut parts, &mut of);
             let variants = variants
                 .iter()
                 .map(|variant| Shaped {
+                    // clone: the name's count, interned with the type
                     name: variant.name.clone(),
                     tag: variant.tag,
                     fields: kept(&variant.fields, &mut parts, &mut of),
                 })
+                // alloc: the variants, interned with the type
                 .collect();
             Told::Enum { of: it, tag: *tag, variants }
         }
         // An array of a type not told of is not told of ([`Search::own`]), and these are
         // made of no type.
         Told::Array { .. } | Told::Base { .. } | Told::Names { .. } => {
+            // clone: the interned type's count; alloc: empty, allocates nothing
             return Node { told: told.clone(), of: Box::new([]) };
         }
     };
@@ -331,7 +356,9 @@ impl TypeSet {
     /// The types it is made of, in the order [`Told`] says.
     pub(super) fn of(&self) -> impl Iterator<Item = Of<'_>> {
         self.node().of.iter().map(|part| match part {
+            // clone: a group's count, as `Of` (named in `debuginfo.rs`) holds a set owned
             Part::Type(set) => Of::Type(set.clone()),
+            // clone: as above, of this set's group
             Part::Here(nth) => Of::Type(TypeSet { group: self.group.clone(), nth: *nth }),
             Part::Named(name) => Of::Named(name),
         })
@@ -345,20 +372,25 @@ impl TypeSet {
         for (at, nth, name) in named {
             types[at as usize].1[nth] = names.get(&name).copied();
         }
+        // alloc: the list, once per set listed
         types.iter().map(|(told, of)| expand(told, of)).collect()
     }
 
     /// The set of the first of `types`, which name each other by their places among them.
     fn of_list(types: &[DebugType]) -> TypeSet {
-        let mut listed = Listed { types, sets: FxHashMap::default() };
+        let mut listed = Listed { types, sets: HashMap::default() };
         resolve(&mut listed, &0).unwrap_or_else(|| {
             let told = Told::Struct(Shape {
                 name: Symbol::intern("()"),
                 size: 0,
+                // alloc: empty, allocates nothing
                 fields: Box::new([]),
+                // alloc: empty, allocates nothing
                 parameters: Box::new([]),
             });
+            // alloc: empty, allocates nothing
             let node = Node { told: Interned::new(told), of: Box::new([]) };
+            // alloc: the set of a list of no type read from the store, once per list read
             TypeSet { group: Arc::new([node]), nth: 0 }
         })
     }
@@ -368,7 +400,7 @@ impl PartialEq for TypeSet {
     /// Whether the two tell the same: types made of each other are the same where nothing
     /// else tells them apart.
     fn eq(&self, other: &Self) -> bool {
-        fn same(one: &TypeSet, other: &TypeSet, assumed: &mut FxHashSet<(usize, usize)>) -> bool {
+        fn same(one: &TypeSet, other: &TypeSet, assumed: &mut HashSet<(usize, usize)>) -> bool {
             if one.at() == other.at() || !assumed.insert((one.at(), other.at())) {
                 return true;
             }
@@ -380,7 +412,7 @@ impl PartialEq for TypeSet {
                     _ => false,
                 })
         }
-        same(self, other, &mut FxHashSet::default())
+        same(self, other, &mut HashSet::default())
     }
 }
 
@@ -400,6 +432,7 @@ impl From<Vec<DebugType>> for TypeSet {
 
 impl fmt::Debug for TypeSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // alloc: debug dump only
         f.debug_list().entries(self.to_vec()).finish()
     }
 }
@@ -411,9 +444,9 @@ struct Flat {
     /// not looked up yet.
     types: Vec<(Interned<Told>, Vec<Option<TypeIndex>>)>,
     /// The place of each type already in the list, by where it is.
-    places: FxHashMap<usize, TypeIndex>,
+    places: HashMap<usize, TypeIndex>,
     /// The first type of each name in the list.
-    names: FxHashMap<Symbol, TypeIndex>,
+    names: HashMap<Symbol, TypeIndex>,
     /// The [`Part::Named`]s, by the type and the part, to look up once all are in.
     named: Vec<(TypeIndex, usize, Symbol)>,
 }
@@ -424,10 +457,13 @@ impl Flat {
             return at;
         }
         let at = self.types.len() as TypeIndex;
+        // clone: the interned type's count, once per type of a set written to the store
         let told = set.node().told.clone();
         if let Some(name) = told.name() {
+            // clone: the name's count, as above
             self.names.entry(name.clone()).or_insert(at);
         }
+        // alloc: empty, allocates nothing; the places are put in below
         self.types.push((told, Vec::new()));
         self.places.insert(set.at(), at);
         let mut of = Vec::with_capacity(set.node().of.len());
@@ -435,6 +471,7 @@ impl Flat {
             of.push(match part {
                 Of::Type(set) => Some(self.add(&set)),
                 Of::Named(name) => {
+                    // clone: the name's count, once per name of a set written to the store
                     self.named.push((at, nth, name.clone()));
                     None
                 }
@@ -448,15 +485,17 @@ impl Flat {
 /// A list of types read from the store, for [`resolve`] to put a set together from.
 struct Listed<'a> {
     types: &'a [DebugType],
-    sets: FxHashMap<TypeIndex, Option<TypeSet>>,
+    sets: HashMap<TypeIndex, Option<TypeSet>>,
 }
 
 impl Found for Listed<'_> {
     type Key = TypeIndex;
 
     fn own(&mut self, key: &TypeIndex) -> Option<Arc<Own<TypeIndex>>> {
+        // alloc: once per type of a list read
         let mut of = Vec::new();
         let told = Interned::new(shape(self.types.get(*key as usize)?, &mut of));
+        // alloc: as above, `Found::own` answers an `Own` counted
         Some(Arc::new(Own { told, of: of.into_iter().map(Made::Key).collect() }))
     }
 
@@ -473,11 +512,13 @@ impl Found for Listed<'_> {
 pub(super) fn shape(ty: &DebugType, of: &mut Vec<TypeIndex>) -> Told {
     let names = |fields: &[Field], of: &mut Vec<TypeIndex>| -> Box<[(Symbol, u64)]> {
         of.extend(fields.iter().map(|it| it.ty));
+        // alloc: what is told of the fields, interned; once per type on a miss or a read
         fields.iter().map(|it| (Symbol::intern(&it.name), it.offset)).collect()
     };
     let aggregate = |it: &Aggregate, of: &mut Vec<TypeIndex>| {
         let fields = names(&it.fields, of);
         of.extend(it.parameters.iter().map(|(_, ty)| *ty));
+        // alloc: as above, of the parameters
         let parameters = it.parameters.iter().map(|(name, _)| Symbol::intern(name)).collect();
         Shape { name: Symbol::intern(&it.name), size: it.size, fields, parameters }
     };
@@ -498,6 +539,7 @@ pub(super) fn shape(ty: &DebugType, of: &mut Vec<TypeIndex>) -> Told {
         DebugType::Names { name, size, names } => Told::Names {
             name: Symbol::intern(name),
             size: *size,
+            // alloc: what is told of the values, interned; once per type on a miss or a read
             names: names.iter().map(|(name, value)| (Symbol::intern(name), *value)).collect(),
         },
         DebugType::Enum { of: it, tag, variants } => {
@@ -509,6 +551,7 @@ pub(super) fn shape(ty: &DebugType, of: &mut Vec<TypeIndex>) -> Told {
                     tag: it.tag,
                     fields: names(&it.fields, of),
                 })
+                // alloc: as above, of the variants
                 .collect();
             Told::Enum { of: it, tag: *tag, variants }
         }
@@ -521,25 +564,31 @@ fn expand(told: &Told, of: &[Option<TypeIndex>]) -> DebugType {
     fn fields(names: &[(Symbol, u64)], of: &mut Places<'_>) -> Vec<Field> {
         let fields = names.iter().zip(of);
         let told = fields.filter_map(|(it, ty)| Some((it, ty?)));
+        // alloc: `DebugType`'s names are `String`s; once per type of a set written to the store
         told.map(|((name, offset), ty)| Field { name: name.to_string(), offset: *offset, ty })
+            // alloc: as above
             .collect()
     }
     fn aggregate(it: &Shape, of: &mut Places<'_>) -> Aggregate {
         let fields = fields(&it.fields, of);
         let parameters = it.parameters.iter().zip(of).filter_map(|(name, ty)| Some((name, ty?)));
         Aggregate {
+            // alloc: `DebugType`'s names are `String`s; once per type of a set written
             name: it.name.to_string(),
             size: it.size,
             fields,
+            // alloc: as above
             parameters: parameters.map(|(name, ty)| (name.to_string(), ty)).collect(),
         }
     }
     let mut of = of.iter().copied();
     match told {
         Told::Base { name, size, encoding } => {
+            // alloc: `DebugType`'s names are `String`s; once per type of a set written
             DebugType::Base { name: name.to_string(), size: *size, encoding: *encoding }
         }
         Told::Pointer { name } => {
+            // alloc: as above
             DebugType::Pointer { name: name.to_string(), to: of.next().flatten() }
         }
         Told::Array { len } => {
@@ -548,16 +597,20 @@ fn expand(told: &Told, of: &[Option<TypeIndex>]) -> DebugType {
         Told::Struct(it) => DebugType::Struct(aggregate(it, &mut of)),
         Told::Union(it) => DebugType::Union(aggregate(it, &mut of)),
         Told::Names { name, size, names } => DebugType::Names {
+            // alloc: as above
             name: name.to_string(),
             size: *size,
+            // alloc: as above
             names: names.iter().map(|(name, value)| (name.to_string(), *value)).collect(),
         },
         Told::Enum { of: it, tag, variants } => {
             let it = aggregate(it, &mut of);
             let variants = variants.iter().map(|variant| {
                 let fields = fields(&variant.fields, &mut of);
+                // alloc: as above
                 Variant { name: variant.name.to_string(), tag: variant.tag, fields }
             });
+            // alloc: as above
             DebugType::Enum { of: it, tag: *tag, variants: variants.collect() }
         }
     }
@@ -653,7 +706,7 @@ mod tests {
 
     /// Types by their names, each made of the ones it names.
     #[derive(Default)]
-    struct Named(Vec<(&'static str, Vec<&'static str>)>, FxHashMap<&'static str, Option<TypeSet>>);
+    struct Named(Vec<(&'static str, Vec<&'static str>)>, HashMap<&'static str, Option<TypeSet>>);
 
     impl Found for Named {
         type Key = &'static str;
@@ -680,7 +733,7 @@ mod tests {
     fn a_type_made_of_itself_through_a_parameter() {
         // `struct Tree { children: Vec<Tree> }`, as the parameter of the `Vec` names it.
         let types = vec![("Tree", vec!["Vec<Tree>", "u8"]), ("Vec<Tree>", vec!["Tree"])];
-        let mut found = Named(types, FxHashMap::default());
+        let mut found = Named(types, HashMap::default());
         let tree = resolve(&mut found, &"Tree").unwrap();
         assert_eq!(part(&tree, &[0, 0]).at(), tree.at());
         // The `u8`, which nothing tells of, is left out with its parameter.
@@ -707,7 +760,7 @@ mod tests {
         let names: Vec<&'static str> =
             (0..40).map(|at| &*Box::leak(format!("T{at}").into_boxed_str())).collect();
         let types = names.iter().map(|name| (*name, names.clone())).collect();
-        let mut found = Named(types, FxHashMap::default());
+        let mut found = Named(types, HashMap::default());
         let set = resolve(&mut found, &names[0]).unwrap();
         assert_eq!(set.to_vec().len(), 40);
         assert_eq!(found.1.len(), 40);

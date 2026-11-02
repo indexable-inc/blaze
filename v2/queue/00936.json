@@ -1,0 +1,35 @@
+{
+  "id": "00936",
+  "from_lane": "speed-sol2-small-mem",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/table.rs"
+  ],
+  "what": "crates/base-db/src/table.rs `Column::set` (lines 68-70): the loop `while self.words.len() <= raw { self.words.append(AtomicU64::new(0)); }` takes and drops AppendVec's writer flag (an atomic swap, about 20 cycles) and publishes once per ID; for a jump of many IDs that is 20+ cycles each against a bound of one zeroing store. blaze-mem now has `AppendVec::writer()` and `Writer::extend_with(count, make)` (crates/blaze-mem/src/append.rs), one flag swap and one publish for all of them. Exact edit: replace the `while` loop with `let len = self.words.len(); if len <= raw { self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU64::new(0)); }`. Same values, same final length, same single-writer rule (the files' writer lock still serializes it).",
+  "state": "applied",
+  "created": "2026-10-30T10:08:03Z",
+  "updated": "2026-10-30T14:11:12Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:08:03Z",
+      "by": "speed-sol2-small-mem",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:12Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:12Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied as written in base-db table.rs Column::set: one writer() and extend_with for the whole jump"
+    }
+  ]
+}

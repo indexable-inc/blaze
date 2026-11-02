@@ -1,0 +1,36 @@
+{
+  "id": "00616",
+  "from_lane": "codegen-inline",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/attrs.rs",
+    "crates/hir-def/src/attrs/tests.rs"
+  ],
+  "what": "## 2. hir-def `src/attrs.rs` (db): the attributes the inliner reads\n\nWhy: rustc's `is_inline_valid_on_fn` and `check_codegen_attributes` refuse on each. Five new\n`AttrFlags` bits (73 to 77 are free), set in the single-word match by line 336 and given the\n`Word`s they need in `intern`'s symbols:\n\n- `RUSTC_NO_MIR_INLINE`: `#[rustc_no_mir_inline]`.\n- `COLD`: `#[cold]`.\n- `OPTIMIZE_NONE`: `#[optimize(none)]` (rustc's `OptimizeAttr::DoNotOptimize`).\n- `HAS_INSTRUCTION_SET`: `#[instruction_set(..)]`, any argument.\n- `HAS_SANITIZE`: `#[sanitize(..)]` or `#[no_sanitize(..)]`, any argument.\n\nThe inliner refuses a callee with either of the last two, or a caller with `HAS_SANITIZE`,\nwhere rustc compares the sets: blaze reads neither attribute's arguments yet.\n\n> forwarded to db (window `db-next2`, told by tmux).\n\n> APPLIED by db-unblock (2026-10-29 22:55) in `crates/hir-def/src/attrs.rs`. Bits 73 to 78 were\n> taken meanwhile, and `HAS_SANITIZE` already was (bit 78, `#[sanitize(..)]` of one segment), so\n> the four new ones are `RUSTC_NO_MIR_INLINE` (86), `COLD` (87), `OPTIMIZE_NONE` (88) and\n> `HAS_INSTRUCTION_SET` (89). All are one segment, as `HAS_SANITIZE` is: `#[rustc_no_mir_inline]` and\n> `#[cold]` as words (and in `AttrFlags::has_word`'s fast path), `#[optimize(..)]` with a\n> top-level `none` token, `#[instruction_set(..)]` with any token tree. The four names are in\n> attrs' own `Word` set (a perfect hash over text; `intern` needs no new symbols). Tests in\n> `crates/hir-def/src/attrs/tests.rs`: the reference walk's `gating_flags` and `GATING` know\n> them, the corpus has `optimize`'s shapes, `gating_flags_of_known_shapes` has each, and\n> `gated_queries_read_what_the_source_says` checks `#[cold]` (also through `cfg_attr`) and\n> `#[rustc_no_mir_inline]` against the source. Not changed: the existing `HAS_SANITIZE` reads\n> `#[sanitize(..)]` only, not `#[no_sanitize(..)]` as this item asked; whoever owns it next\n> should check whether the pinned nightly still accepts `no_sanitize`.",
+  "state": "applied",
+  "created": "2026-10-30T05:55:00Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/codegen-inline.md#2. hir-def `src/attrs.rs` (db): the attributes the inliner reads",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-inline.md:82"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: should check whether the pinned nightly still accepts `no_sanitize`."
+    }
+  ]
+}

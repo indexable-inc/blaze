@@ -1,0 +1,27 @@
+{
+  "id": "01288",
+  "from_lane": "std-scripts",
+  "owner": "no-fallback-link-scripts",
+  "paths": [
+    "crates/blaze-build-script/src/unit.rs",
+    "crates/blaze-build-script/src/env.rs",
+    "crates/blaze-build-script/src/env/tests.rs",
+    "crates/blaze-build-script/src/env/tests/reference.rs",
+    "crates/blaze-cargo/src/serve/unit/script.rs"
+  ],
+  "what": "Rest of 01174 (no-fallback), part 2: make blaze_build_script::DylibSearch::sysroot_libdir (crates/blaze-build-script/src/unit.rs:294) an Option<PathBuf>, None for a toolchain with no sysroot library directory (blaze ships no dynamic std), instead of an empty PathBuf that env.rs:504 skips by emptiness. Update env.rs (if let Some), env/tests.rs:72,406,485 and env/tests/reference.rs:63. In the same save, set `sysroot_libdir: None` at crates/blaze-cargo/src/serve/unit/script.rs:301 (std-scripts owns that file and agrees to the one-line edit), so every save compiles. Parts 1 and 3 are already in the tree (UnitError::ManifestDir, named_program, UnitError::Parallelism).",
+  "state": "open",
+  "created": "2026-10-31T14:45:42Z",
+  "updated": "2026-10-31T14:45:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:45:42Z",
+      "by": "std-scripts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

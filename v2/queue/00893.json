@@ -1,0 +1,35 @@
+{
+  "id": "00893",
+  "from_lane": "speed-sol2-small",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "## speed-sol2-small (hugepages): `libmimalloc-sys` with the `extended` feature\n\n- Where: root `Cargo.toml` `[workspace.dependencies]` line 258: `libmimalloc-sys = { version = \"0.1.49\", default-features = false }` becomes `libmimalloc-sys = { version = \"0.1.49\", default-features = false, features = [\"extended\"] }`.\n- Why: `mi_option_set_enabled` and `mi_option_large_os_pages` (libmimalloc-sys `src/extended.rs:517,583`) are behind it; lane codegen needs them to put mimalloc's segments on huge pages (the request to codegen filed beside this one; docs/v2/plan/lanes/hugepages/speed-of-light.md, \"The general allocator\"). No C change: the option is in the vendored mimalloc 2.3.2.",
+  "state": "applied",
+  "created": "2026-10-30T09:31:23Z",
+  "updated": "2026-10-30T11:27:15Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:31:23Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:14Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:15Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "root Cargo.toml: libmimalloc-sys gains features = [\"extended\"]."
+    }
+  ]
+}

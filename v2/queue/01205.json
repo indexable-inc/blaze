@@ -1,0 +1,23 @@
+{
+  "id": "01205",
+  "from_lane": "tests-misc-front2",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-alloc-count/src/lib.rs"
+  ],
+  "what": "blaze_alloc_count::measure cannot say where an allocation happened, so four allocation-budget failures have no lead without running cargo (which lanes may not): hir-ty-borrowck budget a_typical_clean_body (7 allocs, 196 B) and a_large_clean_body (5079), mbe an_expansion_into_a_frame_allocates_nothing (7, 260 B, largest 64: likely a first-locked pthread mutex OnceBox on Apple), syntax-bridge inserted_leaves_allocate_nothing (2 vs 1). Ask: a typed opt-in (e.g. a measure_traced or a thread-local flag set by the test harness, not a hidden env var) that records a std::backtrace::Backtrace per allocation inside measure without recursing, and one round of those four tests with it on, logs to the round dir.",
+  "state": "open",
+  "created": "2026-10-31T01:07:41Z",
+  "updated": "2026-10-31T01:07:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:07:41Z",
+      "by": "tests-misc-front2",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

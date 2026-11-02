@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail};
 use serde_json::json;
 
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
+use crate::files::Disk;
 use crate::diagnostic::report;
 
 #[derive(Debug, Clone, Copy)]
@@ -182,7 +183,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
 
 /// `cargo config get`. The command is unstable, so the cargo that runs it reads its `unstable`
 /// table on start, which loads the files: an error in them is an error here even unmerged.
-pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
+pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
     config.ensure_loaded()?;
     if opts.show_origin && !matches!(opts.format, ConfigFormat::Toml) {
         bail!(
@@ -240,7 +241,7 @@ pub fn get(config: &Config, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
     Ok(out)
 }
 
-fn maybe_env<'a>(config: &'a Config, key: &ConfigKey, cv: &CV) -> Option<Vec<(&'a str, &'a str)>> {
+fn maybe_env<'a>(config: &'a Config<Disk>, key: &ConfigKey, cv: &CV) -> Option<Vec<(&'a str, &'a str)>> {
     if !matches!(cv, CV::Table(..)) {
         return None;
     }
@@ -338,7 +339,7 @@ fn print_json(out: &mut String, key: &ConfigKey, cv: &CV, include_key: bool) {
 }
 
 fn print_toml_unmerged(
-    config: &Config,
+    config: &Config<Disk>,
     out: &mut String,
     opts: &GetOptions<'_>,
     key: &ConfigKey,

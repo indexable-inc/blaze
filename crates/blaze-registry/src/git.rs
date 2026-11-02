@@ -543,7 +543,7 @@ impl Checkout {
     /// may be in a submodule. A manifest that does not parse is skipped, as cargo skips it.
     pub fn packages(&self) -> anyhow::Result<Vec<Found>> {
         let mut found = Vec::new();
-        let mut visited = rustc_hash::FxHashSet::default();
+        let mut visited = blaze_hash::HashSet::default();
         walk(&self.root, &self.root, &mut found, &mut visited)?;
         Ok(found)
     }
@@ -574,7 +574,7 @@ fn walk(
     root: &Path,
     dir: &Path,
     found: &mut Vec<Found>,
-    visited: &mut rustc_hash::FxHashSet<PathBuf>,
+    visited: &mut blaze_hash::HashSet<PathBuf>,
 ) -> anyhow::Result<()> {
     if dir != root {
         if dir.file_name().and_then(|it| it.to_str()).is_some_and(|it| it.starts_with('.')) {
@@ -609,7 +609,7 @@ fn walk(
     Ok(())
 }
 
-fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut rustc_hash::FxHashSet<PathBuf>) {
+fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut blaze_hash::HashSet<PathBuf>) {
     if !visited.insert(dir.to_owned()) {
         return;
     }
@@ -624,7 +624,7 @@ fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut rustc_hash::FxH
     };
     found.push(Found { name: name.to_owned(), version, dir: dir.to_owned() });
     for path in nested_paths(&manifest) {
-        read_nested(&normalize(&dir.join(path)), found, visited);
+        read_nested(&blaze_manifest::paths::normalize_path(&dir.join(path)), found, visited);
     }
 }
 
@@ -654,24 +654,41 @@ fn nested_paths(manifest: &toml::Table) -> Vec<String> {
         .collect()
 }
 
-/// `a/./b/../c` as `a/c`, without the file system, as cargo's `normalize_path`.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The copy this file had, which dropped a leading `..` of a relative path; kept to check
+    /// cargo-util's rule agrees on the absolute paths `read_nested` is given.
+    fn old_normalize(path: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_path_is_normal_as_it_was() {
+        let parts = ["a", ".", "..", "b"];
+        let mut paths = vec![PathBuf::from("/w")];
+        for _ in 0..4 {
+            let longer: Vec<PathBuf> =
+                paths.iter().flat_map(|it| parts.iter().map(move |part| it.join(part))).collect();
+            paths.extend(longer);
+        }
+        paths.push(PathBuf::from("/w/a").join("/x/../y"));
+        for path in &paths {
+            assert_eq!(blaze_manifest::paths::normalize_path(path), old_normalize(path), "{path:?}");
+        }
+    }
 
     #[test]
     fn submodule_urls() {

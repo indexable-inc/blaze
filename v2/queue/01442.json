@@ -1,0 +1,36 @@
+{
+  "id": "01442",
+  "from_lane": "one-pool",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/db.rs",
+    "crates/base-db/src/tests.rs"
+  ],
+  "what": "URGENT (self10 livelock, blocks the self-build): crates/base-db/src/db.rs `run_on_pool` retries WouldWaitOnItself tasks in new rounds of the same scope. Since scope waits are edges in the pump cycle check (one-pool, blaze-graph pump.rs), a task asking a key held by its batch caller (or a task below it on its thread) gives way every round, forever: the caller holds the key until the batch returns. Fix: use `blaze_graph::par::for_each_giving_way` (new, one-pool): one pass on the pool, returns the tasks that gave way in order, never retries them there, and raises the first other panic after every task ran. In `Db::run_all`, `Run::Pool` becomes `let again = blaze_query::db::pump_barrier(|| blaze_graph::par::for_each_giving_way(count, |at| run(self, at), |panic| matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself)))); for at in again { run(self, at) }`. The rerun is on this thread, OUTSIDE the pump barrier, as Run::Here runs a task: a cycle through the caller`s own query is then met on its own stack (the engine`s cycle handling, as sequentially), and one through a task below a pumped caller makes the caller give way (WouldWaitOnItself from its own frame, no loop). Delete `run_on_pool` (only run_all and tests.rs:913/928 use it); tests a_task_that_waited_on_itself_runs_again (runs [2,1,1,2,1,1,2,1] still) and any_other_panic_of_a_task_reaches_the_caller move to `Db::run_all` on Run::Pool. blaze-cargo deps.rs on_pool already moved (one-pool).",
+  "state": "applied",
+  "created": "2026-11-01T03:50:44Z",
+  "updated": "2026-11-01T04:41:07Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:50:44Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:37:38Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:41:07Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "applied via blaze_query::db::par_for_each (pump_barrier + for_each_giving_way + inline rerun); run_on_pool deleted; both tests on Db::new + pool.install(run_all)"
+    }
+  ]
+}

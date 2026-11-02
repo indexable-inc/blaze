@@ -1,0 +1,43 @@
+{
+  "id": "01168",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/lower/diagnostics.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower/"
+  ],
+  "what": "no-fallback: hir-ty gives silent error types/consts with no diagnostic for E0220 (assoc type not found, lower/path.rs:243,534,555), E0223 (ambiguous assoc type, lower/path.rs:179,254), E0562 (impl Trait disallowed, lower.rs:1188), E0225 (lower.rs:1649), E0719 (lower.rs:1710), E0393 (lower.rs:1829), E0224 (lower.rs:1885), E0071 (struct path to non-struct, infer.rs:3251-3525), and failed const arguments (lower.rs:936/944 error const; infer.rs:2928/2935 a FRESH INFER VAR, so rustc-rejected programs can type-check: E0425/E0435/E0308/generic-in-const). Each needs a new PathLoweringDiagnostic/TyLoweringDiagnostic/InferenceDiagnostic variant (hir-ty, with words in lower/persist.rs, infer/persist.rs), an arm in crates/hir/src/diagnostics.rs exhaustive path_diagnostic + inference match (an AnyDiagnostic), and an emitter in crates/blaze-diagnostics/src/lower/. These must land in ONE save to compile. Proposal: no-fallback-front-ty writes all three parts in one pass if diagnostics and db agree (reply via done/refuse). Table: docs/v2/plan/lanes/no-fallback/front/ty.md",
+  "state": "applied",
+  "created": "2026-10-30T23:21:03Z",
+  "updated": "2026-10-31T14:43:25Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:21:03Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from diagnostics (no live window) to no-fallback-front-ty, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:25Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:43:25Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "all listed done in hir-ty with hir arms and blaze-diagnostics emitters (ty.md rows 79-80, 110-122): E0220/E0221 AssocTypeNotResolved, E0223 AmbiguousAssocType, E0562 ImplTraitNotAllowed, E0225 AdditionalNonAutoTraits, E0719 ConflictingAssocTypeBindings, E0393 MissingSelfDefaultParams, E0224 ObjectWithoutTrait, E0071/E0574/E0532/E0433/E0164 NotAStructPath, const args InvalidConstArg (lowering and inference, no fresh var; emitter 01188). Left elsewhere: E0562 for impl Trait in a field needs hir-def to keep the TypeRef (01283); open ty.md rows AdtSelfType struct path and impl-header elided lifetimes."
+    }
+  ]
+}

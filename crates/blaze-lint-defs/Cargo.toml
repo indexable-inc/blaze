@@ -1,0 +1,24 @@
+[package]
+name = "blaze-lint-defs"
+version = "0.0.0"
+repository.workspace = true
+description = "Every lint rustc knows, its groups and names, and the lint options of the command line: rustc_lint_defs."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+# local deps
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

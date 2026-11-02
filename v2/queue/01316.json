@@ -1,0 +1,31 @@
+{
+  "id": "01316",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/int_literal_too_large.rs",
+    "crates/blaze-diagnostics/src/lints/bodies.rs"
+  ],
+  "what": "01176 blaze-diagnostics side: lower hir::IntLiteralTooLarge (rustc integer literal is too large + note value exceeds limit of `u128::MAX in the literal radix`) and add it to lints/bodies.rs lowering_failed. Exact code: section 2 of /tmp/blaze-lanes/01176-int-too-large.md. Same round as the hir arm.",
+  "state": "applied",
+  "created": "2026-10-31T16:39:44Z",
+  "updated": "2026-10-31T16:46:08Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:39:44Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:46:08Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "applied to unblock the build after the hir arm: lower/int_literal_too_large.rs (Phase::Lower), mod.rs line and arm, lints/bodies.rs lowering_failed. rust-analyzer clean."
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "01149",
+  "from_lane": "dedup-dead",
+  "owner": "dedup-next3",
+  "paths": [
+    "crates/blaze-cargo/src/cli.rs",
+    "crates/blaze-cargo/src/serve.rs",
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "blaze-profile (crates/blaze-profile) is the one profiler (BLAZE_PROFILE=<dir>: per-process parts, Chrome trace.json, phases/functions/passes.tsv; BLAZE_STATS step table) but no v2 code calls it: nothing names blaze_profile, and no member depends on it (the root line stays, unused, flagged by manifest_lint). Wire it in blaze-cargo with `blaze-profile.workspace = true`: the client (crates/blaze-cargo/src/cli.rs `main`) installs it at start and calls `blaze_profile::finish` at the end of a build; the daemon/worker (crates/blaze-cargo/src/serve.rs `main`) records and calls `write_part` after each build it answers; child processes (build scripts, proc macros) inherit VAR. Or, if v2 drops BLAZE_PROFILE, say so (and that setting it must stop blaze with an error, no-fallback) and dedup deletes the crate and its root line. From dedup-dead (one way per job: the job exists, the one implementation is unwired).",
+  "state": "applied",
+  "created": "2026-10-30T22:41:34Z",
+  "updated": "2026-10-31T15:09:56Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:41:34Z",
+      "by": "dedup-dead",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from cargo (no live window) to dedup-next3, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:45:40Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:09:56Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "v2 keeps BLAZE_PROFILE (harness realbench/rival/bench use it; docs/reports/PERF.md). Root blaze-profile line back; blaze-cargo depends on it. cli.rs main: began()+install() before the serve dispatch, so client and daemon record from start; cargo(): note client step + finish() when on(). serve/job.rs: profile_dir() reads BLAZE_PROFILE from the request env, begin() start()s the recorder (a running daemon starts at the request), Job::profiled; wind_up write_part()s before Said::Finish, or discard()s an unprofiled build (new blaze_profile::discard, tested). Children inherit through the job env (script::inherited). Test: job/tests.rs a_job_is_profiled_when_its_command_line_names_a_directory. (dedup-lexer)"
+    }
+  ]
+}

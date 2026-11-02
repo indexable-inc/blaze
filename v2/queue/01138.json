@@ -1,0 +1,35 @@
+{
+  "id": "01138",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/fulfill/watch.rs"
+  ],
+  "what": "crates/hir-ty/src/next_solver/fulfill/watch.rs: `Watches` derives Default, so `free` starts at 0 instead of NONE (u32::MAX); the first `link` then takes the free-list branch and indexes `self.nodes[0]` on an empty Vec (watch.rs:180, index out of bounds: len 0 index 0). 43 blaze-diagnostics tests (every body that runs the fulfillment loop) panic there. Fix: replace `#[derive(Debug, Default)]` with `#[derive(Debug)]` plus a manual `impl Default for Watches` that sets `free: NONE` (everything else default), or make free an Option. One line of behavior, no API change.",
+  "state": "applied",
+  "created": "2026-10-30T22:20:37Z",
+  "updated": "2026-10-30T22:21:05Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:20:37Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:05Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:05Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: watch.rs Watches has a manual Default with free: NONE (as unlink_all leaves it), every other field empty; derive is Debug only"
+    }
+  ]
+}

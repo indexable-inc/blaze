@@ -1,0 +1,37 @@
+{
+  "id": "00132",
+  "from_lane": "speed-link-edge-macho-input2",
+  "owner": "link",
+  "paths": [
+    "v2/requests/link.md",
+    "docs/v2/plan/lanes/link/speed-link-edge-macho-input.md",
+    "crates/blaze-link"
+  ],
+  "what": "## From speed-link-edge-macho-input2 (2026-10-29): what still allocates per symbol or per section in the Mach-O readers\n\n`macho/input.rs` and `macho/archive.rs` are on the zero-copy contract: no allocation per atom,\nper section or per symbol of their own. Two remain, both in `macho.rs` (yours) or `model.rs`:\n\n1. `macho.rs` `push_core_name` (~103-110): `names.push(&format!(\"\\x01{text}\"))` allocates a\n   `String` for every name without a leading underscore. In a clang object that is every\n   assembler-local label kept in the symbol table (`ltmp0`, `ltmp1`, … one per section, `l_…`),\n   and in an archive index any such name. Exact change: push the two parts into the arena as one\n   `Name`, e.g. a `Names::push_parts(&mut self, parts: &[&str]) -> Result<Name, String>` in\n   `model.rs` (lead `link`: same checks as `push`, the length the sum) and\n   `None => names.push_parts(&[\"\\x01\", text])`. Faster: no heap allocation or format machinery\n   per such symbol; the bytes go straight into the arena the reader already sized for them.\n   Status: done by speed-link-edge-macho, without a `model.rs` change: the `\\x01` and the name\n   are joined in a 256-byte stack buffer (a name of more than 255 bytes, which no clang label\n   is, still goes through `format!`); tested in `names_cross_the_edge_both_ways`.\n2. `macho.rs` `classify` (~271-277, and `compact_unwind()` ~145): `Class::Named { name:\n   format!(..) }` / `.to_owned()` allocates once per Mach-O section that is `__LD,__compact_unwind`\n   (every C object has one), `__DATA,__thread_init` or a `#[link_section]` one; the reader moves\n   that `SectionKind` into the section's last atom, but a split named section clones it into each\n   other atom. Exact change (model, lead `link`): `Class::Named`'s name interned (a `Name`-like\n   id or `Arc<str>`/`&'static str` where the name is fixed), so the clone is a copy.\n   Status: forwarded to lead `link` as `v2/requests/link.md` item 11 (a `model.rs` change).\n\nNeither blocks anything; both are what the notes\n`docs/v2/plan/lanes/link/speed-link-edge-macho-input.md` list as left.\n\n> forwarded to link: `crates/blaze-link/` is lane link's (speed-link-edge-macho is DONE).",
+  "state": "applied",
+  "created": "2026-10-30T01:27:51Z",
+  "updated": "2026-10-30T09:41:21Z",
+  "taken_by": "speed-sol2-link-inputs",
+  "why": null,
+  "source": "v2/requests/speed-link-edge-macho.md#From speed-link-edge-macho-input2 (2026-10-29): what still allocates per symbol or per section in the Mach-O readers",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-link-edge-macho.md:3"
+    },
+    {
+      "at": "2026-10-30T09:41:21Z",
+      "by": "speed-sol2-link-inputs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:21Z",
+      "by": "speed-sol2-link-inputs",
+      "action": "done",
+      "note": "item 1 done in macho.rs push_core_name (a 256-byte stack buffer; format! only past 255 bytes). Item 2 (Class::Named per section) is the core change link.md item 11, open as 00006; nothing of it is in macho/input.rs or macho/archive.rs, which allocate a constant number of times per object."
+    }
+  ]
+}

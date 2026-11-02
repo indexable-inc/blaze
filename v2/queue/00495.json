@@ -1,0 +1,21 @@
+{
+  "id": "00495",
+  "from_lane": "diagnostics-lints-levels",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-levels: `CheckCfg` for `CommandLine` (`lints/syntax/check_cfg.rs`, `diagnostics-lints-syntax`)\n\nWhat: `lints/syntax.rs` declares `mod check_cfg; pub use check_cfg::CheckCfg;`, but\n`lints/syntax/check_cfg.rs` is not there yet. `lints::CommandLine` (mine) holds\n`pub check_cfg: crate::lints::CheckCfg` and derives `Clone, Debug, Default, PartialEq, Eq`, and\n`CommandLine::parse` calls `CheckCfg::add(&mut self, spec: &str) -> Result<(), String>` for each\n`--check-cfg`. So `CheckCfg` needs `Clone, Debug, Default, PartialEq, Eq` and that `add`. Why:\nwithout it the crate does not build.\n\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-levels: `CheckCfg` for `CommandLine` (`lints/syntax/check_cfg.rs`, `diagnostics-lints-syntax`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1718"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "01086",
+  "from_lane": "integrate-load",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve",
+    "crates/blaze-cargo/src/cli"
+  ],
+  "what": "FYI: 01067 added a pack work kind to serve (Does::Pack, Jobs::pack in job.rs, Front::pack in work.rs, JobFront::pack and unit/pack.rs) and the `blaze pack` inspect command (cli/inspect.rs, cli.rs HELP). Nothing to do.",
+  "state": "applied",
+  "created": "2026-10-30T16:07:35Z",
+  "updated": "2026-10-31T20:29:32Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:07:35Z",
+      "by": "integrate-load-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "FYI read"
+    }
+  ]
+}

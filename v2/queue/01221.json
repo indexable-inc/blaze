@@ -1,0 +1,36 @@
+{
+  "id": "01221",
+  "from_lane": "query-unify",
+  "owner": "query-unify-macros",
+  "paths": [
+    "crates/blaze-query-macros/src/query.rs",
+    "crates/blaze-query-macros/tests"
+  ],
+  "what": "R15 (01212, contract in docs/v2/plan/lanes/db/query-unify.md): beside the generated `evict_values` (query.rs ~294, functions with `lru = N`) emit `#vis fn set_lru_capacity(db: &mut #db_ty, capacity: usize) { #plumbing::set_lru_capacity::<#config>(db, capacity) }` with doc `/// Replaces the query's value cap (0: none) from the next view.`; engine adds plumbing::set_lru_capacity (queued to query-unify-engine). Users: base-db `parse_::set_lru_capacity(self, next)`, hir-ty providers.rs MIR-body caps. Add a tests/ case calling it on an `lru = 3` fn.",
+  "state": "applied",
+  "created": "2026-10-31T01:51:44Z",
+  "updated": "2026-10-31T02:57:38Z",
+  "taken_by": "query-unify-macros",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:51:44Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:39:17Z",
+      "by": "query-unify-macros",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:57:38Z",
+      "by": "query-unify-macros",
+      "action": "done",
+      "note": "crates/blaze-query-macros/src/query.rs: every lru function gets `#vis fn set_lru_capacity(db: &mut Db, capacity: usize)` beside evict_values, calling plumbing::set_lru_capacity::<Configuration> (the engine added it, 01220). Test: tests/functions.rs an_lru_cap_set_at_runtime_applies_at_the_next_view (lru = 3 fn, cap 5, 6 keys, new view, one reruns; cap 0, new view, none). rust-analyzer 0 errors; fmt and hot lint clean. Callers base-db parse_::set_lru_capacity and hir-ty providers.rs match the signature."
+    }
+  ]
+}

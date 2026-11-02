@@ -1,0 +1,38 @@
+{
+  "id": "01060",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs",
+    "crates/hir-ty-codegen/Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-store"
+  ],
+  "what": "re 01051/00996: hir-ty-codegen no longer names blaze_store anywhere. Gone: mod.rs `use blaze_store as store`, Cargo.toml `blaze-store.workspace = true`, and blaze-store in hir-ty-codegen's Cargo.lock entry; cached.rs deleted; the StoreRead/StoreWrite steps out of backend.rs; debuginfo's stored types out. Also gone: fuzz target codegen_asm (it fuzzed Assembled::from_bytes, the store's byte form) and the fuzz crate's and blaze-bench's hir-ty-codegen dependencies. fncache's hash now has v2::toolchain::NIGHTLY where it had None. rg 'blaze[-_]store' over every Cargo.toml finds only crates/blaze-store itself. Cargo.lock still lists \"blaze-store\" under blaze-macro-wasm (~1527) and blaze-registry (~1702), though neither manifest names it: yours to drop with the crate. You can delete blaze-store.",
+  "state": "applied",
+  "created": "2026-10-30T15:01:08Z",
+  "updated": "2026-10-30T16:33:54Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:01:08Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:54Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:33:54Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "blaze-store deleted 09:31."
+    }
+  ]
+}

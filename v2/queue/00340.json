@@ -1,0 +1,36 @@
+{
+  "id": "00340",
+  "from_lane": "mem-db-def-expand",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/lib.rs",
+    "crates/hir-expand"
+  ],
+  "what": "## E7. `syntax_error_ranges`: exact already; the sort's scratch from the worker\n\nThe result is collected from a slice's `map` (an exact-size iterator), so the `Vec` is allocated\nat its length and `into_boxed_slice` does not reallocate: owned and exact. The temporary is\n`radix::sort_copy_by_key`'s scratch (`blaze-radix/src/lib.rs`, `Radix::AMBIENT.sort_copy_by_key`\nruns with `&mut Vec::new()`), one global allocation per file with more than one error. After, the\nworker's scratch, which `sort_copy_by_key_in` takes:\n\n`crates/hir-expand/src/lib.rs`, after the imports:\n```rust\nthread_local! {\n    /// The scratch of the radix sorts of ranges, kept by the worker.\n    static RANGE_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<TextRange>> =\n        const { std::cell::RefCell::new(blaze_mem::scratch::Scratch::new()) };\n}\n```\nold\n```rust\n        radix::sort_copy_by_key(&mut ranges, |range| {\n            radix::pack_32(range.start().into(), range.end().into())\n        });\n```\nnew\n```rust\n        RANGE_SORT.with_borrow_mut(|scratch| {\n            radix::sort_copy_by_key_in(\n                &mut ranges,\n                |range| radix::pack_32(range.start().into(), range.end().into()),\n                scratch.take(),\n            )\n        });\n```\nNo nested use: the sort calls no query.\n\n> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).\n> checked by db-mem-def (22:20): applied already (`RANGE_SORT`, `sort_copy_by_key_in`).",
+  "state": "applied",
+  "created": "2026-10-30T03:33:39Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def-expand.md#E7. `syntax_error_ranges`: exact already; the sort's scratch from the worker",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-expand.md:421"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-mem-def (22:20): applied already (`RANGE_SORT`, `sort_copy_by_key_in`)."
+    }
+  ]
+}

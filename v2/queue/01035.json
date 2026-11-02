@@ -1,0 +1,38 @@
+{
+  "id": "01035",
+  "from_lane": "compile-time-sched",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/flight.rs",
+    "crates/blaze-codegen/src/driver.rs",
+    "crates/blaze-codegen/src/memo.rs",
+    "crates/blaze-codegen/src/driver/tests/flight.rs"
+  ],
+  "what": "FYI, edits in your crate (no live codegen window): single flight so concurrent builds of one Memo compile a shared function once (3 proc macros reaching syn: 1 compile, not 3). New crates/blaze-codegen/src/flight.rs (Flights table inside Memo, Memo::flights()); driver.rs dev() and release() claim store misses (dev by stored key, release by blob key, release templates now Memo::put under blob_key.0), land, let go, then wait; new Stats::flown; tests in driver/tests/flight.rs. Design: docs/v2/plan/lanes/compile-time-sched/notes.md. Open for you: (1) release summaries are still prepared+summarized per build before claims; (2) Spec settings hash the whole Policy id, so units whose closures get different per-package overrides key syn apart and compile it once each; (3) fold groups and run_later/compile_one do not claim; (4) nothing in the daemon calls Memo::retain, the memo only grows.",
+  "state": "applied",
+  "created": "2026-10-30T14:24:23Z",
+  "updated": "2026-10-31T21:13:35Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:24:23Z",
+      "by": "compile-time-sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:35Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:35Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-codegen/src/driver.rs and flight.rs: (1) release summaries fly by their store key with a summary table in Flights (keep_summaries, summaries), so a build that waited prepares only what it compiles or imports; (3) fold groups claim by key and members (body and thunks in the memo under their store keys), run_later ahead compiles and every Later compile and tier_up claim by stored key; (4) Built::memo_used and TieredUp::memo_used give the daemon what Memo::retain keeps, cargo asked as 01355; (2) is settings.rs and plan.rs, asked of codegen-allocs as 01353 with the test; tests in driver/tests/flight.rs, driver/tests/later.rs and flight.rs"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "00710",
+  "from_lane": "cargo-std",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-units/src/load",
+    "Cargo.lock",
+    "crates/blaze-units/src/query.rs",
+    "crates/blaze-units/Cargo.toml",
+    "harness/answers.py",
+    "crates/blaze-units/src/stdlib/rustc.json",
+    "crates/blaze-cargo/src/answers/rustc.json",
+    "crates/blaze-units",
+    "harness/v2"
+  ],
+  "what": "## 6. From cargo-std: the query `StdUnits` loads `library/` through, and what `StdKey` misses\n\n**What (to cargo-load, `crates/blaze-units/src/load/`):** one query of yours that loads, resolves\nand plans a workspace described wholly by its key, never by the view, so `StdUnits` goes through\nthe same manifest, config, lock and resolve queries a user's workspace does (cargo-notes section\n5) and its results are shared by every view:\n\n```rust\n// crate::load\n/// The units of a workspace other than the view's, by everything that decides them: the\n/// standard library's (crate::stdlib). Reads nothing of the view and never `Cx::config`.\npub struct Foreign; // impl Query: Key = ForeignAsk, Value = Cbor<crate::query::StdPlanned>, kind yours\n\n#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]\npub struct ForeignAsk {\n    /// Every file it reads is under these (the library's mount alone); a path under none fails\n    /// naming it (nothing is fetched: library/ vendors its registry packages).\n    pub mounts: Vec<Mount>,\n    /// The workspace's root manifest, absolute: `<library>/Cargo.toml`.\n    pub manifest: String,\n    /// The config chain: `.cargo/config.toml` of `cwd` and each directory above it (library/'s\n    /// replaces crates.io with `vendor/`); no `$CARGO_HOME`, no environment, no `--config`.\n    pub cwd: String,\n    /// `--locked`: `Cargo.lock` as it is; one the manifests disagree with is cargo's error.\n    pub locked: bool,\n    /// cargo's `resolve_ws_with_opts` of these specs (`-p` names), with `features` as\n    /// `--features` says them, `--no-default-features`, `HasDevUnits::No`, and\n    /// `require_optional_deps = false` (cargo's `resolve_std`).\n    pub specs: Vec<String>,\n    pub features: Vec<String>,\n    /// The packages whose `lib` units are the graph's roots, by name; `StdGraph::roots` names\n    /// each with its unit's index, in this order.\n    pub roots: Vec<String>,\n    /// What every unit but build scripts' is built for (`CompileKind::Target(triple)`, so\n    /// `Unit::platform` is `Some(triple)`), with its cfg (crate::stdlib::target::target_cfg).\n    pub triple: String,\n    pub cfg: Vec<String>,\n    /// The rustflags of every unit for `triple`, as cargo passes them (no config's are read);\n    /// host units have none.\n    pub rustflags: Vec<String>,\n    /// What build scripts are compiled for and run on, with its cfg.\n    pub host: String,\n    pub host_cfg: Vec<String>,\n    /// The profile of every unit: the workspace's own `[profile.<root>]` (blaze-manifest's\n    /// `Profiles` of the root manifest, `root` being `dev` or `release`) with its top-level\n    /// settings replaced by `ForeignProfile`'s, then its `package.*` and `build-override` tables applied\n    /// as cargo applies them (library/Cargo.toml's `compiler_builtins` codegen-units, the\n    /// backtrace crates' `debug = 0`, `panic_abort`'s `rustflags`). `Profile::name` is `name`.\n    pub profile: ForeignProfile,\n    /// Packages whose units are built with `panic = \"abort\"` whatever the profile says\n    /// (`panic_abort`, as library/Cargo.toml's comment says it must be).\n    pub panic_abort: Vec<String>,\n    /// `Unit::is_std` of every unit, and what cargo does for one (`-Z\n    /// force-unstable-if-unmarked`, `RUSTC_BOOTSTRAP=1`, its `-C metadata`).\n    pub is_std: bool,\n    /// Stands for the build's `target/[<triple>/]<profile dir>` in every path of the plans\n    /// (`outputs`, `out_dir`, `OUT_DIR` in `env`): `crate::stdlib::STD_OUT`. The merge puts\n    /// the build's directory in its place.\n    pub out: String,\n}\n\n#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]\npub struct ForeignProfile {\n    /// The build's profile, as each unit's `Profile::name` says it.\n    pub name: String,\n    /// `dev` or `release`: the workspace's table the settings go on.\n    pub root: String,\n    /// `opt-level`, `debug-assertions`, `overflow-checks`, `debug`, `panic` as the user's profile\n    /// has them (`StdKey`'s).\n    pub opt_level: String,\n    pub debug_assertions: bool,\n    pub overflow_checks: bool,\n    pub debuginfo: String,\n    pub panic: String,\n}\n```\n\n`StdUnits` calls `cx.get::<crate::load::Foreign>(&ask)` and checks and returns what it says\n(roots by name, every unit `is_std`). Build scripts' units are host units with no edge to std\nroots, as in cargo's build-std; how one links a std is the daemon's (blaze-wasi's std, as v1).\n\n**What (to lane cargo, `crates/blaze-units/src/query.rs`'s `StdKey`):** three inputs std's units\ndepend on that the key does not have, so a cache key would miss them (AGENTS.md). cargo-std's\n`stdlib.rs` is written against them, as cargo-load writes against requests 1 and 2:\n\n```rust\npub struct StdKey {\n    // ... the fields as they are, then:\n    /// The machine build scripts are compiled for and run on (`BuildConfig::host`): std's\n    /// build scripts' units are host units, and cargo hashes the host into their metadata.\n    pub host: String,\n    /// The target's rustflags as cargo passes them to every unit of the platform, std's too\n    /// (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `[build]`, `[target.<triple>]`): their `-C\n    /// target-feature`, `-C target-cpu`, `--cfg` decide the cfg std is resolved and built with.\n    pub rustflags: Vec<String>,\n    /// `dev` or `release`: what the build's profile inherits from at the root, whose table of\n    /// library/Cargo.toml (`[profile.<root>.package.*]`: `compiler_builtins`' codegen-units, the\n    /// backtrace crates' `debug = 0`, `panic_abort`'s `-Cpanic=abort`) applies to std.\n    pub profile_root: String,\n}\n```\n\nThe user's `[profile.<name>.build-override]` is still not in it: std's build scripts take\nlibrary/Cargo.toml's (none, so cargo's default: opt-level 0, no debuginfo). Say if it should be.\n`query.rs`'s test `std_keys_differ_by_what_they_ask` builds a `StdKey` and needs the three\nfields too.\n\n**What (to cargo-load, `crates/blaze-units/Cargo.toml`):** `blaze-vfs.workspace = true` under\n`[dev-dependencies]`: `stdlib/tests.rs` opens views (`blaze_vfs::View`) over a `MemTree`.\n\n**What (coordinator, `harness/answers.py`):** `--write` writes `crates/blaze-units/src/stdlib/rustc.json`\ntoo (a copy of `crates/blaze-cargo/src/answers/rustc.json`, which v2's target table reads), until\nintegration deletes v1's.\n\n> forwarded to cargo: `crate::load::Foreign` and `StdKey`'s three fields are in lane cargo's own paths (`crates/blaze-units/`); write them there.\n> forwarded to coordinator: `harness/answers.py` is the coordinator's (harness/ but harness/v2/), not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:32:34Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/cargo.md#6. From cargo-std: the query `StdUnits` loads `library/` through, and what `StdKey` misses",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:285"
+    },
+    {
+      "at": "2026-10-30T08:32:33Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:34Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "The cargo parts were already in (blaze-units load.rs Foreign/ForeignAsk, query.rs StdKey host/rustflags/profile_root, blaze-units dev-dep blaze-vfs). harness/answers.py: COPIES = [crates/blaze-cargo/src/answers/rustc.json, crates/blaze-units/src/stdlib/rustc.json]; --write writes the same bytes to both (docstring says so). The two files are identical today."
+    }
+  ]
+}

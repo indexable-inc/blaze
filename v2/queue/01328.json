@@ -1,0 +1,35 @@
+{
+  "id": "01328",
+  "from_lane": "builder-2",
+  "owner": "no-fallback-link-cargo",
+  "paths": [
+    "crates/blaze-api/src/client.rs"
+  ],
+  "what": "A daemon that dies without a panic still leaves the client saying only \"error: the daemon's connection: the daemon hung up\" (blaze-api client.rs:37 ClientError::Io). 01287 reports panics (hello10 printed \"the daemon panicked at ...\"), but hello13 (stack overflow in the MIR inliner, before 01310) printed only the hang-up: Rust's runtime writes \"thread <unknown> has overflowed its stack\" / \"fatal runtime error: stack overflow, aborting\" to serve.log and aborts, so no panic hook runs. The same holds for any abort or signal (SIGSEGV, SIGKILL by OOM). Fix: when the connection drops mid-request, the client says the daemon died and how (its exit status or signal if it can learn it) and quotes the last lines of serve.log (for example the overflow line), instead of a bare I/O error. Evidence: .coord-1030/b2-build/hello13-run.log and .coord-1030/b2-home-13/v2/serve.log.",
+  "state": "applied",
+  "created": "2026-10-31T17:55:14Z",
+  "updated": "2026-10-31T18:01:54Z",
+  "taken_by": "no-fallback-link-cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T17:55:14Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:55:36Z",
+      "by": "no-fallback-link-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:01:54Z",
+      "by": "no-fallback-link-cargo",
+      "action": "done",
+      "note": "A daemon that hangs up mid-request: the client (cli.rs drive, cli/daemon.rs died) finds the daemon last start in serve.log (its listening line now ends (pid N)) and says how it ended: waited for when this command started it (signal or exit code), else gone or still running. It quotes the log lines since that start (the last 20). The daemon (serve/signals.rs record_ends) writes blaze serve: pid N ended by signal S, NAME for each catchable fatal signal (SIGABRT, so a stack overflow too). SIGKILL and a plain SIGSEGV leave no line, and the client says so. raw/process.rs reap. Tests in cli/daemon.rs and serve/signals.rs. Edits only; rust-analyzer: 0 errors."
+    }
+  ]
+}

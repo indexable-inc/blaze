@@ -1,0 +1,30 @@
+{
+  "id": "00949",
+  "from_lane": "speed-clone-front",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/pick_cache.rs",
+    "crates/hir-ty/src/method_resolution/probe.rs",
+    "crates/hir-ty/src/method_resolution.rs",
+    "crates/hir-ty/src/infer/sized_bound.rs",
+    "crates/hir-ty/src/infer/path.rs",
+    "crates/hir-ty/src/infer/expr.rs",
+    "crates/hir/src/lib.rs",
+    "crates/hir/src/attrs.rs"
+  ],
+  "what": "hir-ty pick cache: a hit copies the cached Pick (crates/hir-ty/src/method_resolution/pick_cache.rs:279 and :285, `erase::unerase_pick(pick).clone()`), once per method call or type-relative path whose probe hits: ~120 bytes plus one allocation for each non-empty list (`shadowed_candidates`, `unstable_candidates`). Rule (speed-clone-shared.md): a big type on a hot path doesn't derive Clone, so `Pick` must be handed out by reference, as `pick_cache::with_steps` already does for the autoderef steps. Exact change, one step for both lanes' files: (1) pick_cache.rs: `Cached::Answer` holds `PickResult<'static>` (store `MethodError::NoMatch`, `Ambiguity(Vec)` and `PrivateMatch(Pick)` as they come; drop `Answer::to_result`), and `pick` becomes `pick<'db, R>(ctx, mode, name, self_ty, allow_unstable, scope, probe: impl FnOnce(&mut ProbeFacts) -> PickResult<'db>, f: impl FnOnce(&PickResult<'db>) -> R) -> R`: on a hit `f(erase::unerase_result(&entry))` under the reclaim guard; on a miss insert then `f` on the entry (as with_steps:429-431), or `f(&result)` when not kept. `Answer::of`'s miss-side clone becomes a move. (2) probe.rs: `probe_for_name`/`probe_for_desugared_name` take the same `f`. (3) callers read `&Pick` inside `f` and copy out only the Copy parts they keep (item, kind, autoderefs, autoref_or_ptr_adjustment, self_ty, receiver_steps): method_resolution.rs:204-231 `lookup_method_as` (confirm_method, write_unstable_candidates, record_trait_pick, lint_edition_dependent_dot_call and push_illegal_sized_bound all take `&Pick` already), method_resolution.rs:235 `lookup_probe`, infer/sized_bound.rs:48 and :125, infer/path.rs:372-374, infer/expr.rs:2119-2132, hir/src/lib.rs:5923 and :6032, hir/src/attrs.rs:572. Then drop `Clone` from `Pick` (probe.rs:182; it carries `// clone:` naming this id) and from `MethodError`'s need of it. Items is DONE, so pick_cache.rs, probe.rs and method_resolution.rs are free to whoever applies this; speed-clone-front can do the items half on request.",
+  "state": "open",
+  "created": "2026-10-30T11:00:23Z",
+  "updated": "2026-10-30T11:00:23Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:00:23Z",
+      "by": "speed-clone-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

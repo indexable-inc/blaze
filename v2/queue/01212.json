@@ -1,0 +1,37 @@
+{
+  "id": "01212",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/function.rs",
+    "crates/blaze-query-macros/src/query.rs",
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R15 Contract + engine + macros: a runtime `lru` cap, `f::set_lru_capacity(db: &mut D, capacity: usize)` on functions with `lru = N` (an inherent fn of `struct f` like `evict_values`; `N` the initial cap, 0 no cap), applied at the next view boundary. Today `F::LRU` is a const. Users: base-db editioned_file_id.rs `Db::admit_parses` (`parse_::set_lru_capacity(self, next)`, the parse budget per revision) and hir-ty providers.rs:103-118 (12 MIR-body queries). The port (worktree blaze-v2-qu) keeps those calls as written.",
+  "state": "applied",
+  "created": "2026-10-31T01:26:31Z",
+  "updated": "2026-10-31T03:09:42Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:26:31Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:51:50Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:09:42Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "runtime lru cap: FnTable cap starts at F::LRU, every lru function swept, plumbing::set_lru_capacity (engine 01220) and generated f::set_lru_capacity(db, cap) (macros 01221, tests/functions.rs); contract updated. Also R16 (01243): public View becomes a never-reused u64, your (Nonce, View) uses unchanged."
+    }
+  ]
+}

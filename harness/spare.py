@@ -77,15 +77,15 @@ def started(side, label):
 
 def sequence(name, spec, source, variant, work):
     label, binary, variables = variant
-    home, store = os.path.join(work, f"home-{label}"), os.path.join(work, f"store-{label}")
+    home = os.path.join(work, f"home-{label}")
     first_ws, ws = os.path.join(work, f"first-{label}"), os.path.realpath(os.path.join(work, f"{name}-{label}"))
-    for path in (home, store, first_ws, ws):
+    for path in (home, first_ws, ws):
         shutil.rmtree(path, ignore_errors=True)
     os.makedirs(os.path.join(first_ws, "src"))
     open(os.path.join(first_ws, "Cargo.toml"), "w").write(FIRST_TOML)
     open(os.path.join(first_ws, "src/main.rs"), "w").write(FIRST_MAIN)
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
-    env = dict(blaze_cli.base_env(home), **spec.get("env", {}), BLAZE_CACHE=store, **variables)
+    env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **variables)
     env["PATH"] = os.path.dirname(os.path.abspath(binary)) + os.pathsep + env["PATH"]
     env.pop("RUSTC_WRAPPER", None)
     if "BLAZE_SPARE" not in variables:
@@ -109,7 +109,7 @@ def sequence(name, spec, source, variant, work):
         row["warm_mb"] = held(project)
     finally:
         first.cargo("stop")
-    for path in (home, store, first_ws, ws):
+    for path in (home, first_ws, ws):
         shutil.rmtree(path, ignore_errors=True)
     return row
 

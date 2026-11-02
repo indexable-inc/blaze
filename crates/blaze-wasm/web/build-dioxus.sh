@@ -5,6 +5,11 @@
 # parser the highlighting uses, and `wasm-bindgen` of the version `dioxus/Cargo.lock` has
 # (`cargo install wasm-bindgen-cli --version 0.2.122`).
 set -eu
+# The page's Dioxus is the module rustc builds, and the program was linked into it by rustc's
+# symbols: blaze runs no rustc, so the page's Dioxus has to be built by blaze and the pack made
+# by `blaze serve`, which neither does yet.
+echo "build-dioxus.sh: the Dioxus page needs its playground built by blaze for wasm32 and its pack made by blaze serve; neither exists yet" >&2
+exit 1
 cd "$(dirname "$0")/.."
 target=../../target
 tool="$PWD/$target/release/blaze-wasm"

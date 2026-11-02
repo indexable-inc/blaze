@@ -1,0 +1,23 @@
+{
+  "id": "01047",
+  "from_lane": "fastcompile-queue",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/run/inproc.rs"
+  ],
+  "what": "fastcompile-queue 4: a dev run with a dependency image goes through `blaze_inproc::Program::command_with` (item 01032 follow-up).\n\n`crates/blaze-inproc/src/host.rs` now has `Program::command_with(command, forks, maps, writes, lookups)`. `maps` are the run's fixed maps (`blaze_premap::map::Memory::maps()`). `writes` and `lookups` are `blaze_premap::start::plan(&view, workspace_names)`'s `Start`, each `Write` as a `blaze_inproc::ImageWrite { place, value, address }` and each `Lookup` as a `blaze_inproc::ImageLookup { place, name, addend, weak }`, field for field. The start hook stores them in the run's private copy before STARTED and fails with exit 127 on a strong miss. `Program::command` is `command_with` with none of them.\n\nWhere: `crates/blaze-cargo/src/serve/unit/run/inproc.rs:123` calls `self.program.command(command, forks)`. When the run maps a dependency image, call `command_with` with its maps and its `Start`. Without that, image code calls through zero.\n\nLimit to know: while any fixed map is granted, the hook refuses a run whose executable is slid (nonzero slide), naming the map, until blaze-link lists the image's words for rebasing (fastcompile-premap-start 1 item 3). So the executable must start unslid (ASLR off) or be linked at a fixed address.",
+  "state": "open",
+  "created": "2026-10-30T14:39:12Z",
+  "updated": "2026-10-30T14:39:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:39:12Z",
+      "by": "fastcompile-queue",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

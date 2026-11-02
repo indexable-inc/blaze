@@ -2,113 +2,172 @@
 
 mod valtree;
 
-use std::hash::Hash;
+use std::{marker::PhantomData, num::NonZeroU32};
 
 use hir_def::ConstParamId;
-use intern::{Interned, InternedRef, impl_internable};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
-use rustc_abi::TargetDataLayout;
-use rustc_ast_ir::visit::VisitorResult;
 use rustc_type_ir::{
-    BoundVar, BoundVarIndexKind, ConstVid, DebruijnIndex, FlagComputation, Flags,
-    GenericTypeVisitable, InferConst, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable,
-    TypeVisitable, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind, relate::Relate,
+    DebruijnIndex, FlagComputation, GenericTypeVisitable, TypeFlags, TypeFoldable as _,
+    TypeVisitable as _, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind,
+    intern::Interned, relate::Relate,
 };
 
 use crate::{
     ParamEnvAndCrate,
     next_solver::{
         AllocationData, ClauseKind, ParamEnv, impl_foldable_for_interned_slice,
-        impl_stored_interned, interned_slice,
+        impl_foldable_for_stored_type, interned_slice, interner::table, persist,
     },
 };
 
-use super::{DbInterner, ErrorGuaranteed, GenericArgs, Ty};
+use super::{DbInterner, GenericArgs, Ty};
 
 pub use self::valtree::*;
 
 pub type ConstKind<'db> = rustc_type_ir::ConstKind<DbInterner<'db>>;
-pub type UnevaluatedConst<'db> = rustc_type_ir::UnevaluatedConst<DbInterner<'db>>;
+pub type Const<'db> = rustc_type_ir::Const<DbInterner<'db>>;
+pub type AliasConst<'db> = rustc_type_ir::AliasConst<DbInterner<'db>>;
+pub type AliasConstKind<'db> = rustc_type_ir::AliasConstKind<DbInterner<'db>>;
 
+/// Every interned [`Const`]. A `GenericArg` holds a row in 30 bits.
+static CONSTS: table::Rows<ConstKind<'static>> = table::Rows::new("consts", table::LAST_ROW);
+table::erase!(ConstKind);
+
+/// What a [`Const`] holds: its row in [`CONSTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Const<'db> {
-    pub(super) interned: InternedRef<'db, ConstInterned>,
+#[repr(transparent)]
+pub struct InternedConst<'db> {
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[repr(align(4))] // Required for `GenericArg` bit-tagging.
-pub(super) struct ConstInterned(pub(super) WithCachedTypeInfo<ConstKind<'static>>);
+const _: () = assert!(size_of::<Option<InternedConst<'static>>>() == 4);
+const _: () = assert!(size_of::<Option<Const<'static>>>() == 4);
+// A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
+const _: () = assert!(size_of::<ConstKind<'static>>() <= 48);
 
-impl_internable!(gc; ConstInterned);
-impl_stored_interned!(ConstInterned, Const, StoredConst);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Const<'static>>();
-};
-
-impl<'db> Const<'db> {
-    /// You should avoid using this if you can, since we want `Ty` to be defined in `rustc_type_ir` and then this method
-    /// will become more difficult to use.
+impl<'db> InternedConst<'db> {
     #[inline]
-    pub fn new_without_interner(kind: ConstKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<ConstKind<'db>, ConstKind<'static>>(kind) };
-        let flags = FlagComputation::for_const_kind(&kind);
-        let cached = WithCachedTypeInfo {
-            internee: kind,
-            flags: flags.flags,
-            outer_exclusive_binder: flags.outer_exclusive_binder,
-        };
-        Self { interned: Interned::new_gc(ConstInterned(cached)) }
+    pub(crate) fn intern(kind: ConstKind<'db>) -> Self {
+        Self::at(CONSTS.intern(kind, || {
+            let computed = FlagComputation::for_const_kind(&kind);
+            table::RowInfo {
+                tag: persist::tag(&kind),
+                flags: computed.flags,
+                binder: computed.outer_exclusive_binder,
+            }
+        }))
     }
 
-    pub fn new(_interner: DbInterner<'db>, kind: ConstKind<'db>) -> Self {
-        Self::new_without_interner(kind)
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        InternedConst { index, _db: PhantomData }
     }
 
-    pub fn inner(&self) -> &WithCachedTypeInfo<ConstKind<'db>> {
-        let inner = &self.interned.0;
-        unsafe {
-            std::mem::transmute::<
-                &WithCachedTypeInfo<ConstKind<'static>>,
-                &WithCachedTypeInfo<ConstKind<'db>>,
-            >(inner)
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
+    }
+
+    /// The constant's flags, read from its row's column rather than recomputed from its kind.
+    #[inline]
+    pub fn type_flags(self) -> TypeFlags {
+        CONSTS.flags(self.index)
+    }
+
+    #[inline]
+    pub fn outer_exclusive_binder(self) -> DebruijnIndex {
+        CONSTS.binder(self.index)
+    }
+}
+
+impl<'db> Interned<DbInterner<'db>> for InternedConst<'db> {
+    type Value = WithCachedTypeInfo<ConstKind<'db>>;
+
+    /// The row's kind with the flags and binder its columns hold, computed once when it was
+    /// interned.
+    #[inline]
+    fn get(self) -> WithCachedTypeInfo<ConstKind<'db>> {
+        WithCachedTypeInfo {
+            internee: CONSTS.kind(self.index),
+            flags: CONSTS.flags(self.index),
+            outer_exclusive_binder: CONSTS.binder(self.index),
         }
     }
+}
 
-    pub fn error(interner: DbInterner<'db>) -> Self {
-        interner.default_types().consts.error
+impl std::fmt::Debug for InternedConst<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        CONSTS.kind::<ConstKind<'_>>(self.index).fmt(f)
     }
+}
 
-    pub fn new_param(interner: DbInterner<'db>, param: ParamConst) -> Self {
-        Const::new(interner, ConstKind::Param(param))
+// SAFETY: the handle holds one value, its row's kind (the flags and binder beside it are
+// computed from the kind), which this visits whenever the visitor asks to go into the row.
+unsafe impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for InternedConst<'db> {
+    fn generic_visit_with(&self, visitor: &mut V) {
+        if visitor.on_interned(CONSTS.name(), self.index.get()).is_continue() {
+            CONSTS.kind::<ConstKind<'db>>(self.index).generic_visit_with(visitor);
+        }
     }
+}
 
-    pub fn new_placeholder(interner: DbInterner<'db>, placeholder: PlaceholderConst<'db>) -> Self {
-        Const::new(interner, ConstKind::Placeholder(placeholder))
-    }
+/// hir-ty's methods on [`Const`] that `rustc_type_ir`'s lacks.
+pub trait ConstExt<'db>: Sized {
+    /// You should avoid using this if you can: it skips the interner, which a constant
+    /// otherwise always goes through.
+    fn new_without_interner(kind: ConstKind<'db>) -> Self;
 
-    pub fn new_bound(
-        interner: DbInterner<'db>,
-        index: DebruijnIndex,
-        bound: BoundConst<'db>,
-    ) -> Self {
-        Const::new(interner, ConstKind::Bound(BoundVarIndexKind::Bound(index), bound))
-    }
+    fn error(interner: DbInterner<'db>) -> Self;
 
-    pub fn new_valtree(interner: DbInterner<'db>, ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self {
-        Const::new(interner, ConstKind::Value(ValueConst { ty, value: ValTree::new(kind) }))
-    }
+    fn is_error(self) -> bool;
 
-    pub fn new_value(interner: DbInterner<'db>, valtree: ValTree<'db>, ty: Ty<'db>) -> Self {
-        Const::new(interner, ConstKind::Value(ValueConst { ty, value: valtree }))
-    }
+    fn new_valtree(interner: DbInterner<'db>, ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self;
 
-    pub fn new_from_allocation(
+    /// The value tree of an evaluated constant, or why it has none, which the caller
+    /// reports (rustc's `ValTreeCreationError`).
+    fn new_from_allocation(
         interner: DbInterner<'db>,
         allocation: &AllocationData<'db>,
         param_env: ParamEnvAndCrate<'db>,
-    ) -> Self {
+    ) -> Result<Self, ValTreeCreationError<'db>>;
+
+    /// This constant's row: the same number for the same constant, on every thread, for the
+    /// life of the process.
+    fn index(self) -> u32;
+
+    /// The constant at `index`, which [`Self::index`] gave. Panics on any other number.
+    fn from_index(interner: DbInterner<'db>, index: u32) -> Self;
+
+    fn store(self) -> StoredConst;
+}
+
+impl<'db> ConstExt<'db> for Const<'db> {
+    #[inline]
+    fn new_without_interner(kind: ConstKind<'db>) -> Self {
+        rustc_type_ir::Const(InternedConst::intern(kind))
+    }
+
+    #[inline]
+    fn error(interner: DbInterner<'db>) -> Self {
+        interner.default_types().consts.error
+    }
+
+    #[inline]
+    fn is_error(self) -> bool {
+        matches!(self.kind(), ConstKind::Error(_))
+    }
+
+    #[inline]
+    fn new_valtree(interner: DbInterner<'db>, ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self {
+        Const::new_value(interner, ValTree::new(kind), ty)
+    }
+
+    fn new_from_allocation(
+        interner: DbInterner<'db>,
+        allocation: &AllocationData<'db>,
+        param_env: ParamEnvAndCrate<'db>,
+    ) -> Result<Self, ValTreeCreationError<'db>> {
         allocation_to_const(
             interner,
             allocation.ty,
@@ -119,64 +178,46 @@ impl<'db> Const<'db> {
     }
 
     #[inline]
-    /// Creates an interned usize constant.
-    pub fn from_target_usize(interner: DbInterner<'db>, n: u64) -> Self {
-        let usize_ty = interner.default_types().types.usize;
-        let data_layout = interner.db.target_data_layout_or_default(interner.expect_crate());
-        Const::new_value(
-            interner,
-            ValTree::from_scalar_int(
-                interner,
-                ScalarInt::try_from_target_usize(n, data_layout).unwrap(),
-            ),
-            usize_ty,
-        )
+    fn index(self) -> u32 {
+        self.0.index.get()
     }
 
-    pub fn is_ct_infer(&self) -> bool {
-        matches!(self.kind(), ConstKind::Infer(_))
-    }
-
-    pub fn is_error(&self) -> bool {
-        matches!(self.kind(), ConstKind::Error(_))
-    }
-
-    pub fn is_trivially_wf(self) -> bool {
-        match self.kind() {
-            ConstKind::Param(_) | ConstKind::Placeholder(_) | ConstKind::Bound(..) => true,
-            ConstKind::Infer(_)
-            | ConstKind::Unevaluated(..)
-            | ConstKind::Value(_)
-            | ConstKind::Error(_)
-            | ConstKind::Expr(_) => false,
+    fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
+        match NonZeroU32::new(index) {
+            Some(index) if CONSTS.published(index) => rustc_type_ir::Const(InternedConst::at(index)),
+            _ => panic!("{index} is not the index of an interned constant"),
         }
     }
 
-    /// Attempts to convert to a value.
-    ///
-    /// Note that this does not normalize the constant.
-    pub fn try_to_value(self) -> Option<ValueConst<'db>> {
-        match self.kind() {
-            ConstKind::Value(cv) => Some(cv),
-            _ => None,
-        }
-    }
-
-    /// Convenience method to extract the value of a usize constant,
-    /// useful to get the length of an array type.
-    ///
-    /// Note that this does not evaluate the constant.
     #[inline]
-    pub fn try_to_target_usize(self, data_layout: &TargetDataLayout) -> Option<u64> {
-        self.try_to_value()?.try_to_target_usize(data_layout)
+    fn store(self) -> StoredConst {
+        StoredConst { index: self.0.index }
     }
 }
 
-impl<'db> std::fmt::Debug for Const<'db> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner().internee.fmt(f)
+/// A constant as kept in a query result: its row, which stays valid in every revision, as an
+/// interned value is never freed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct StoredConst {
+    index: NonZeroU32,
+}
+
+const _: () = assert!(size_of::<Option<StoredConst>>() == 4);
+
+impl StoredConst {
+    #[inline]
+    pub fn as_ref<'db>(&self) -> Const<'db> {
+        rustc_type_ir::Const(InternedConst::at(self.index))
     }
 }
+
+impl std::fmt::Debug for StoredConst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl_foldable_for_stored_type!(StoredConst);
 
 pub type PlaceholderConst<'db> = rustc_type_ir::PlaceholderConst<DbInterner<'db>>;
 
@@ -238,163 +279,6 @@ impl rustc_type_ir::inherent::ParamLike for ParamConst {
     }
 }
 
-impl<'db> IntoKind for Const<'db> {
-    type Kind = ConstKind<'db>;
-
-    fn kind(self) -> Self::Kind {
-        self.inner().internee
-    }
-}
-
-impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Const<'db> {
-    fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
-            self.kind().generic_visit_with(visitor);
-        }
-    }
-}
-
-impl<'db> TypeVisitable<DbInterner<'db>> for Const<'db> {
-    fn visit_with<V: rustc_type_ir::TypeVisitor<DbInterner<'db>>>(
-        &self,
-        visitor: &mut V,
-    ) -> V::Result {
-        visitor.visit_const(*self)
-    }
-}
-
-impl<'db> TypeSuperVisitable<DbInterner<'db>> for Const<'db> {
-    fn super_visit_with<V: rustc_type_ir::TypeVisitor<DbInterner<'db>>>(
-        &self,
-        visitor: &mut V,
-    ) -> V::Result {
-        match self.kind() {
-            ConstKind::Unevaluated(uv) => uv.visit_with(visitor),
-            ConstKind::Value(v) => v.visit_with(visitor),
-            ConstKind::Expr(e) => e.visit_with(visitor),
-            ConstKind::Error(e) => e.visit_with(visitor),
-
-            ConstKind::Param(_)
-            | ConstKind::Infer(_)
-            | ConstKind::Bound(..)
-            | ConstKind::Placeholder(_) => V::Result::output(),
-        }
-    }
-}
-
-impl<'db> TypeFoldable<DbInterner<'db>> for Const<'db> {
-    fn try_fold_with<F: rustc_type_ir::FallibleTypeFolder<DbInterner<'db>>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        folder.try_fold_const(self)
-    }
-    fn fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
-        folder.fold_const(self)
-    }
-}
-
-impl<'db> TypeSuperFoldable<DbInterner<'db>> for Const<'db> {
-    fn try_super_fold_with<F: rustc_type_ir::FallibleTypeFolder<DbInterner<'db>>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        let kind = match self.kind() {
-            ConstKind::Unevaluated(uv) => ConstKind::Unevaluated(uv.try_fold_with(folder)?),
-            ConstKind::Value(v) => ConstKind::Value(v.try_fold_with(folder)?),
-            ConstKind::Expr(e) => ConstKind::Expr(e.try_fold_with(folder)?),
-
-            ConstKind::Param(_)
-            | ConstKind::Infer(_)
-            | ConstKind::Bound(..)
-            | ConstKind::Placeholder(_)
-            | ConstKind::Error(_) => return Ok(self),
-        };
-        if kind != self.kind() { Ok(Const::new(folder.cx(), kind)) } else { Ok(self) }
-    }
-    fn super_fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(
-        self,
-        folder: &mut F,
-    ) -> Self {
-        let kind = match self.kind() {
-            ConstKind::Unevaluated(uv) => ConstKind::Unevaluated(uv.fold_with(folder)),
-            ConstKind::Value(v) => ConstKind::Value(v.fold_with(folder)),
-            ConstKind::Expr(e) => ConstKind::Expr(e.fold_with(folder)),
-
-            ConstKind::Param(_)
-            | ConstKind::Infer(_)
-            | ConstKind::Bound(..)
-            | ConstKind::Placeholder(_)
-            | ConstKind::Error(_) => return self,
-        };
-        if kind != self.kind() { Const::new(folder.cx(), kind) } else { self }
-    }
-}
-
-impl<'db> Relate<DbInterner<'db>> for Const<'db> {
-    fn relate<R: rustc_type_ir::relate::TypeRelation<DbInterner<'db>>>(
-        relation: &mut R,
-        a: Self,
-        b: Self,
-    ) -> rustc_type_ir::relate::RelateResult<DbInterner<'db>, Self> {
-        relation.consts(a, b)
-    }
-}
-
-impl<'db> Flags for Const<'db> {
-    fn flags(&self) -> rustc_type_ir::TypeFlags {
-        self.inner().flags
-    }
-
-    fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        self.inner().outer_exclusive_binder
-    }
-}
-
-impl<'db> rustc_type_ir::inherent::Const<DbInterner<'db>> for Const<'db> {
-    fn new_infer(interner: DbInterner<'db>, var: InferConst) -> Self {
-        Const::new(interner, ConstKind::Infer(var))
-    }
-
-    fn new_var(interner: DbInterner<'db>, var: ConstVid) -> Self {
-        Const::new(interner, ConstKind::Infer(InferConst::Var(var)))
-    }
-
-    fn new_bound(interner: DbInterner<'db>, debruijn: DebruijnIndex, var: BoundConst<'db>) -> Self {
-        Const::new(interner, ConstKind::Bound(BoundVarIndexKind::Bound(debruijn), var))
-    }
-
-    fn new_anon_bound(interner: DbInterner<'db>, debruijn: DebruijnIndex, var: BoundVar) -> Self {
-        Const::new(
-            interner,
-            ConstKind::Bound(BoundVarIndexKind::Bound(debruijn), BoundConst::new(var)),
-        )
-    }
-
-    fn new_canonical_bound(interner: DbInterner<'db>, var: BoundVar) -> Self {
-        Const::new(interner, ConstKind::Bound(BoundVarIndexKind::Canonical, BoundConst::new(var)))
-    }
-
-    fn new_placeholder(interner: DbInterner<'db>, param: PlaceholderConst<'db>) -> Self {
-        Const::new(interner, ConstKind::Placeholder(param))
-    }
-
-    fn new_unevaluated(
-        interner: DbInterner<'db>,
-        uv: rustc_type_ir::UnevaluatedConst<DbInterner<'db>>,
-    ) -> Self {
-        Const::new(interner, ConstKind::Unevaluated(uv))
-    }
-
-    fn new_expr(interner: DbInterner<'db>, expr: ExprConst) -> Self {
-        Const::new(interner, ConstKind::Expr(expr))
-    }
-
-    fn new_error(interner: DbInterner<'db>, _guar: ErrorGuaranteed) -> Self {
-        Const::error(interner)
-    }
-}
-
 pub type BoundConst<'db> = rustc_type_ir::BoundConst<DbInterner<'db>>;
 
 impl<'db> Relate<DbInterner<'db>> for ExprConst {
@@ -419,3 +303,74 @@ impl<'db> rustc_type_ir::inherent::ExprConst<DbInterner<'db>> for ExprConst {
 
 interned_slice!(ConstsStorage, Consts, StoredConsts, consts, Const<'db>, Const<'static>);
 impl_foldable_for_interned_slice!(Consts);
+
+#[cfg(test)]
+mod tests {
+    use rustc_type_ir::{
+        BoundVar, BoundVarIndexKind, ConstVid, Flags, InferConst, IsRigid, UniverseIndex,
+    };
+
+    use super::*;
+    use crate::next_solver::{ErrorGuaranteed, FreeConstAliasId, TyKind};
+
+    fn free_const_alias(is_rigid: IsRigid) -> ConstKind<'static> {
+        let def_id = FreeConstAliasId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)));
+        ConstKind::Alias(
+            is_rigid,
+            AliasConst::from_checked_parts(AliasConstKind::Free { def_id }, GenericArgs::empty()),
+        )
+    }
+
+    fn every_kind() -> Vec<ConstKind<'static>> {
+        let u8 = Ty::new_without_interner(TyKind::Uint(rustc_ast_ir::UintTy::U8));
+        let bound = BoundConst::new(BoundVar::from_u32(1));
+        vec![
+            ConstKind::Infer(InferConst::Var(ConstVid::from_u32(3))),
+            ConstKind::Infer(InferConst::Fresh(4)),
+            ConstKind::Bound(BoundVarIndexKind::Bound(DebruijnIndex::from_u32(2)), bound),
+            ConstKind::Bound(BoundVarIndexKind::Canonical, bound),
+            ConstKind::Placeholder(PlaceholderConst::new(UniverseIndex::from_u32(5), bound)),
+            free_const_alias(IsRigid::No),
+            free_const_alias(IsRigid::Yes),
+            ConstKind::Value(ValueConst::new(u8, ValTree::new(ValTreeKind::Leaf(7u8.into())))),
+            ConstKind::Error(ErrorGuaranteed),
+            ConstKind::Expr(ExprConst),
+        ]
+    }
+
+    #[test]
+    fn a_const_reads_back_its_kind_and_its_row_flags() {
+        for kind in every_kind() {
+            let konst = Const::new_without_interner(kind);
+            assert!(konst.kind() == kind);
+            assert!(konst.0.get().internee == kind);
+            assert!(Const::new_without_interner(kind) == konst, "interned once");
+            let computed = FlagComputation::for_const_kind(&kind);
+            assert_eq!(konst.0.type_flags(), computed.flags);
+            assert_eq!(konst.flags(), konst.0.type_flags(), "rustc's flags read the column");
+            assert_eq!(konst.outer_exclusive_binder(), computed.outer_exclusive_binder);
+            assert_eq!(konst.outer_exclusive_binder(), konst.0.outer_exclusive_binder());
+            assert!(konst.store().as_ref() == konst);
+        }
+    }
+
+    #[test]
+    fn an_alias_const_is_rigid_or_not_by_its_flag() {
+        let rigid = Const::new_without_interner(free_const_alias(IsRigid::Yes));
+        let non_rigid = Const::new_without_interner(free_const_alias(IsRigid::No));
+        assert!(rigid != non_rigid, "rigidness is part of the kind");
+        assert!(rigid.has_rigid_aliases() && !rigid.has_non_rigid_aliases());
+        assert!(non_rigid.has_non_rigid_aliases() && !non_rigid.has_rigid_aliases());
+        assert!(rigid.flags().contains(TypeFlags::HAS_CONST_ALIAS));
+    }
+
+    #[test]
+    fn a_bound_const_escapes_one_binder_past_its_index() {
+        let konst = Const::new_without_interner(ConstKind::Bound(
+            BoundVarIndexKind::Bound(DebruijnIndex::from_u32(1)),
+            BoundConst::new(BoundVar::from_u32(0)),
+        ));
+        assert_eq!(konst.outer_exclusive_binder(), DebruijnIndex::from_u32(2));
+        assert!(konst.has_escaping_bound_vars());
+    }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00277",
+  "from_lane": "db-ty-d-infer1",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/invalid_lhs_of_assignment.rs",
+    "crates/ide-diagnostics/src/handlers/invalid_lhs_of_assignment.rs"
+  ],
+  "what": "## To diagnostics (`crates/blaze-diagnostics/src/lower/invalid_lhs_of_assignment.rs`)\n\n`hir::InvalidLhsOfAssignment` now carries `assign: InFile<ExprOrPatPtr>` (the `=` or `op=`\nexpression) and `op: Option<ast::ArithOp>` (`None` for `=`, E0070; `Some` for E0067). Replace\nthe `lhs_syntax.ancestors().filter_map(ast::BinExpr::cast)` search with `cx.node(d.assign)`\n(its `left()` is the `ast::BinExpr`; take `op_token()` from it), and `compound` with\n`d.op.is_some()`. A plain `=` with a non-place left-hand side is now reported too (it was not\nbefore), so `1 = 2;` reaches this lowering.\n\nThe same change for `crates/ide-diagnostics/src/handlers/invalid_lhs_of_assignment.rs`: the code\nis `if d.op.is_some() { \"E0067\" } else { \"E0070\" }` rather than always `E0067`.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:55:50Z",
+  "updated": "2026-10-30T02:55:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-infer1.md#To diagnostics (`crates/blaze-diagnostics/src/lower/invalid_lhs_of_assignment.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-infer1.md:3"
+    }
+  ]
+}

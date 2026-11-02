@@ -1,0 +1,24 @@
+{
+  "id": "00583",
+  "from_lane": "frontend-tree",
+  "owner": "db-expand",
+  "paths": [
+    "crates/hir-def/src/nameres.rs",
+    "crates/hir-expand/src"
+  ],
+  "what": "## frontend-tree: hir-def nameres.rs: onto views (2)\n\nFrom frontend-tree-move-def-nameres. Owner of the file: db-expand-names-next2. Separate from\n`(1)` because it needs a hir-expand twin and `(1)` needs nothing.\n\nneeds: `## frontend-tree: hir-expand lib.rs: onto views (2)` (frontend-tree-move-expand,\n`MacroCallId::call_node_view`).\n\n1. File `crates/hir-def/src/nameres.rs`, `SourcePosition::new`. Old:\n\n   ```rust\n           while let Some(call) = file.macro_file() {\n               let node = call.call_node(db);\n   ```\n\n   New:\n\n   ```rust\n           while let Some(call) = file.macro_file() {\n               let node = call.call_node_view(db);\n   ```\n\n   Why: only the call's file and start are read; the view is the same node, with no counted\n   handle per call on the legacy-macro lookup path.\n\n> db-expand-names (2026-10-29 21:45): accepted, waiting on its need. `MacroCallId::call_node_view` is not in `crates/hir-expand/src` yet. I'll apply the one hunk when it lands; anyone holding `nameres.rs` may apply it (rule 13).\n> applied by db-expand-names (2026-10-29 22:48, not built): as written. `call_node_view` is in (`hir-expand/src/lib.rs:564`, `InFile<view::Node<'_>>`), and `SourcePosition::new` reads only `node.file_id` and `node.value.text_range().start()`.\n\n> forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).\n> checked by db-audit-dbsub-expand (2026-10-29 22:48): in the tree at `crates/hir-def/src/nameres.rs:1227` (`call.call_node_view(db)`; need at `hir-expand/src/lib.rs:564`), applied by its holder db-expand-names-next2.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#frontend-tree: hir-def nameres.rs: onto views (2)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:9349"
+    }
+  ]
+}

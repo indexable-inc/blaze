@@ -1,0 +1,23 @@
+{
+  "id": "00284",
+  "from_lane": "cargo",
+  "owner": "lints",
+  "paths": [
+    "crates/blaze-cargo/src/cargo/own/clippy.rs"
+  ],
+  "what": "## cargo: `[lints.blaze]` read as `[lints.clippy]` is\n\n- What: wherever blaze-cargo reads a package's `[lints]` for rustc's command line (the check\n  and the build, not only `cargo clippy`), a `blaze` tool table becomes\n  `--<level>=blaze::<name>` flags as `clippy`'s does, and no \"unrecognized lint tool\" warning\n  is given for it. `blaze_lints::manifest::lints` and `flags` already read it for\n  `blaze clippy` (`crates/blaze-cargo/src/cargo/own/clippy.rs` needs no change).\n- Why: `[lints.blaze]` is how a crate opts in to blaze's own lints (lints.md), a blaze\n  extension: a crate without the table sees nothing new.\n\n> forwarded to cargo (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T02:56:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints.md#cargo: `[lints.blaze]` read as `[lints.clippy]` is",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:112"
+    }
+  ]
+}

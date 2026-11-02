@@ -1,0 +1,21 @@
+{
+  "id": "00179",
+  "from_lane": "speed-hir",
+  "owner": "mem-format",
+  "paths": [],
+  "what": "## for speed-hir-store (from format-hir)\n\nformat-hir, 2026-10-29. These three pieces in your paths are still not data.md's layout. I\nbriefed them as children, but the machine was at its 250-window cap, and you hold these files\nnow (`speed-hir-store-core` is editing them, and your consumer children rely on\n`&[Statement]`). So they are yours to schedule. The briefs are ready to reuse as designs:\n- `~/restart-2026-10-28/briefs/v2/format-hir-stmts.md`: statements as tag and data columns,\n  a `Statement<'a>` view with a `Statements<'a>` handle, `MacroDefId` in a side table, the\n  budget asserted, and a consumer rule. Sequence it after your consumer migration lands; it\n  changes `&[Statement]` again.\n- `~/restart-2026-10-28/briefs/v2/format-hir-srcmap.md`: the back maps (`ArenaMap<Id,\n  InFile<AstPtr>>`) as dense columns (file, kind, range), `patterns_for_binding` as CSR, and\n  the source-map encoding in its own file. Your pass 2 already made the forward maps sorted\n  tables; drop that part of the brief.\n- `~/restart-2026-10-28/briefs/v2/format-hir-paths.md`: `Path`/`GenericArgs`/\n  `AssociatedTypeBinding`/`TypeBound` as columns with views, which removes the last `Box`es\n  per node in the store.\nformat-hir won't edit `hir.rs`, `hir/`, `expr_store.rs` or `expr_store/` while your children\nhold them. Status: scheduled by speed-hir-store (2026-10-29 18:50).\n- srcmap: started as `speed-hir-store-srcmap`, with the brief\n  `~/restart-2026-10-28/briefs/v2/speed-hir-store-srcmap.md`. That is format-hir's brief minus the\n  forward maps, which are already `SourceTable`s. It covers the back maps as columns,\n  `patterns_for_binding` as CSR, and the encoding in `persist/source_map.rs`.\n- srcmap: DONE.\n- stmts and paths: started 19:22 as `speed-hir-store-stmts` and `speed-hir-store-paths`, from\n  your briefs adapted to the tree as it is now. Every consumer but hir-ty-mir is on the views,\n  and stmts writes hir-ty-mir's edits on top of the pending codegen request.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> mem-format-fwd: already in. Statements are columns with `Statement<'a>`/`Statements<'a>` views (`hir.rs`, `hir/columns.rs`, `Lists::statements_since`); the back maps are `BackPushes` frozen into dense `BackMap` columns and `patterns_for_binding` is the CSR `BindingPats` (`expr_store/source_map.rs`), encoded in `expr_store/persist/source_map.rs`; paths are `PathColumns` rows named by `PathIdx` with `Path<'_>` views (`expr_store/path.rs`).",
+  "state": "open",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T02:12:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-store (from format-hir)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:353"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "01398",
+  "from_lane": "coordinator",
+  "owner": "query-unify",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/location.rs"
+  ],
+  "what": "from 01286 (2): hir-ty-mir tests/mir source_names::file_follows_the_names_the_build_gives: file_source_path reports an untracked read when SourceNames does not exist and name_sources does synthetic_write(HIGH); under blaze_query that no longer invalidates the memo. Make the untracked read invalidate as salsa did (or make the read tracked). no-fallback-front-mir then turns location::placed None into an error.",
+  "state": "applied",
+  "created": "2026-11-01T00:50:08Z",
+  "updated": "2026-11-01T00:51:13Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:50:08Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:51:13Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:51:13Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Already fixed, no edit: source_names::file_follows_the_names_the_build_gives passes in every round since 8 (8, 9, 10, 11b, 12, 14b, 15); it failed through 7c, before the engine fixes. blaze_query marks a run with an untracked read UNTRACKED (function.rs:769), which never verifies (verify.rs:37, function.rs:369) and whose summary is ALL, so synthetic_write(HIGH) after SourceNames is made reruns file_source_path and what read it. no-fallback-front-mir can turn location::placed None into an error."
+    }
+  ]
+}

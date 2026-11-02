@@ -2,22 +2,14 @@
 // cosmos.gl. Colour is the crate (dim when the build shown did not compile it), size the compile time.
 import { Graph } from "./vendor/cosmos.js";
 import { hierarchicalLayout } from "./layout.js";
-import { crateColor } from "./palette.js";
-import { HOW_COMPILED, HOW_UNIT } from "./snapshot.js";
+import { FLASH_MS, Paint } from "./paint.js";
 
 export const SPACE = 4096;
-const FLASH_MS = 1400;
-const GLOW = [1, 0.86, 0.45];
 const SPREAD_STEP_MS = 420;
-const DIM = 0.32;
 
 export function webgl2Missing() {
   const c = document.createElement("canvas");
   return c.getContext("webgl2") ? null : "This page draws the program with WebGL2, and this browser has no WebGL2 context (is hardware acceleration off?).";
-}
-
-export function nodeSize(ns) {
-  return ns > 0 ? 2 + 1.6 * Math.log10(1 + ns / 20000) : 1.6;
 }
 
 export class MainView {
@@ -27,7 +19,7 @@ export class MainView {
     this.model = model;
     this.handlers = handlers;
     this.slow = slow;
-    this.flashes = new Map();
+    this.paint = new Paint(model, slow);
     this.outlined = new Set();
     this.spreadLinks = new Set();
     this.spreadTimers = [];
@@ -96,34 +88,29 @@ export class MainView {
     this.handlers.onLayout?.(true);
   }
 
-  baseColor(i, out, at) {
-    const m = this.model;
-    const c = this.palette[m.krate[i]];
-    const lit = (m.how[i] === HOW_COMPILED || m.how[i] === HOW_UNIT) && m.nodeBuild[i] === m.current;
-    const k = lit ? 1 : DIM;
-    out[at] = c[0] * k;
-    out[at + 1] = c[1] * k;
-    out[at + 2] = c[2] * k;
-    out[at + 3] = lit ? 1 : 0.7;
+  // cosmos.gl takes whole arrays, and uploads all of each it is given: that is O(n) a frame on
+  // the GPU side, whatever changed.
+  upload(render) {
+    const { colors, sizes } = this.paint.points();
+    this.graph.setPointColors(colors);
+    this.graph.setPointSizes(sizes);
+    if (render) this.graph.render(undefined, 0);
   }
 
   restyleAll(upload = true) {
-    const m = this.model;
-    this.palette = m.crates.map(crateColor);
-    this.colors = new Float32Array(4 * m.n);
-    this.sizes = new Float32Array(m.n);
-    for (let i = 0; i < m.n; i++) {
-      this.baseColor(i, this.colors, 4 * i);
-      this.sizes[i] = nodeSize(m.ns[i]);
-    }
-    for (const [i, t0] of this.flashes) this.paintFlash(i, t0, performance.now());
-    this.graph.setPointColors(this.colors);
-    this.graph.setPointSizes(this.sizes);
-    if (upload) this.graph.render(undefined, 0);
+    this.paint.all(performance.now());
+    this.upload(upload);
   }
 
-  // New nodes from a Functions record: each starts at its module's centre, or its crate's for a new module.
-  addNodes(added, newEdges) {
+  // The points whose functions changed, and with `relit` the build shown is another.
+  restyle(points, relit, upload = true) {
+    this.paint.some(points, relit, performance.now());
+    this.upload(upload);
+  }
+
+  // New nodes from a Functions record: each starts at its module's centre, or its crate's for a
+  // new module. `touched` and `relit` are restyled as `restyle` does.
+  addNodes(added, newEdges, touched, relit) {
     const m = this.model;
     // The packing is of the program as it was: one grown by a quarter since (a cold build's,
     // which starts from nothing) is packed again.
@@ -155,7 +142,7 @@ export class MainView {
     if (added.length || newEdges) this.graph.setLinks(new Float32Array(m.edges.subarray(0, 2 * m.m)));
     this.graph.setPointClusters(Array.from(m.group.subarray(0, m.n)));
     this.graph.setClusterPositions(Array.from(grownCentres));
-    this.restyleAll(false);
+    this.restyle(touched, relit, false);
     this.graph.render(added.length ? 0.15 : undefined, 0);
     if (m.crates.length * 2 > this.crateCentres.length) this.buildLabels();
   }
@@ -163,37 +150,23 @@ export class MainView {
   // ------------------------------------------------------------------ live
   flash(nodes) {
     const t = performance.now();
-    for (const i of nodes) this.flashes.set(i, t);
+    for (const i of nodes) this.paint.flashes.set(i, t);
     this.animate();
-  }
-
-  paintFlash(i, t0, t) {
-    const f = Math.max(0, 1 - (t - t0) / (FLASH_MS * this.slow));
-    const e = f * f * (3 - 2 * f);
-    const at = 4 * i;
-    this.baseColor(i, this.colors, at);
-    for (let k = 0; k < 3; k++) this.colors[at + k] += (GLOW[k] - this.colors[at + k]) * e;
-    this.colors[at + 3] = 1;
-    this.sizes[i] = nodeSize(this.model.ns[i]) * (1 + 1.8 * e);
-    return f > 0;
   }
 
   animate() {
     if (this.animFrame) return;
     const tick = () => {
       this.animFrame = 0;
-      const t = performance.now();
-      for (const [i, t0] of this.flashes) if (!this.paintFlash(i, t0, t)) this.flashes.delete(i);
-      this.graph.setPointColors(this.colors);
-      this.graph.setPointSizes(this.sizes);
-      this.graph.render(undefined, 0);
-      if (this.flashes.size) this.animFrame = requestAnimationFrame(tick);
+      this.paint.tick(performance.now());
+      this.upload(true);
+      if (this.paint.flashes.size) this.animFrame = requestAnimationFrame(tick);
     };
     this.animFrame = requestAnimationFrame(tick);
   }
 
   get animating() {
-    return this.flashes.size > 0 || this.spreadTimers.length > 0;
+    return this.paint.flashes.size > 0 || this.spreadTimers.length > 0;
   }
 
   // An edit's spread: level by level from the edited functions out along the calls, each
@@ -295,7 +268,7 @@ export class MainView {
       const el = document.createElement("div");
       el.className = "crate-label";
       el.textContent = name;
-      el.style.color = `rgb(${this.palette[c].map((x) => Math.round(x * 255)).join(",")})`;
+      el.style.color = `rgb(${this.paint.paletteOf(c).map((x) => Math.round(x * 255)).join(",")})`;
       this.labelLayer.appendChild(el);
       return { el, c, count: counts[c] };
     });

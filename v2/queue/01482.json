@@ -1,0 +1,24 @@
+{
+  "id": "01482",
+  "from_lane": "repro",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/delta/state.rs",
+    "crates/blaze-graph/src/sched/fiber.rs"
+  ],
+  "what": "The 00:57 and 01:04 self-runs (round 26 candidate 2, blaze 00:59) STALL at 300 s before any Compiling line; the 00:49 run compiled 334. Sample b2-build/selfloop-stall.sample (01:04), last frames per worker: 12 of 18 blaze-work threads busy under hir_ty::method_resolution::delta::key::impl_key (state warm: attrs_source / signature_syntax node_at_range, builtin derive debug_expand), 3 blocked on blaze_graph::sched::fiber::global (a pthread mutex), 1 on blaze_query::db::local::take (mutex), 2 parked. Busy, not a deadlock (like self11), but slower than the runner threshold, and a global mutex in the fiber scheduler on the hot path. For the owners of method_resolution/delta (warm) and sched (fiber::global); raise the quiet threshold for this phase or measure its CPU to tell slow from stuck. Not reducible to a small crate (it is the whole workspace warm).",
+  "state": "open",
+  "created": "2026-11-01T08:10:49Z",
+  "updated": "2026-11-01T08:10:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T08:10:49Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

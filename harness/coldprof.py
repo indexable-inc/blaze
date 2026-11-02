@@ -19,7 +19,7 @@ build the daemon makes of its own after a cold start that patches what rustc lin
 the most they held at once until ready, the largest process's peak, and what the largest
 process (the worker of the project) holds once ready.
 """
-import os, re, subprocess, sys, threading, time
+import os, re, shutil, subprocess, sys, threading, time
 
 import memory
 
@@ -68,9 +68,14 @@ def main():
     for path in (home, target):
         subprocess.run(["rm", "-rf", path], check=True)
     os.makedirs(home, mode=0o700)
+    # The daemon's store is `<home>/v2/store`: DIR is copied in now and the store copied back
+    # once the daemon stops, so DIR carries from run to run while the home starts empty.
+    own_store = os.path.join(home, "v2", "store")
+    if os.path.isdir(store):
+        shutil.copytree(store, own_store, symlinks=True)
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TARGET_DIR=target,
                CARGO_TERM_COLOR="never", CARGO_NET_OFFLINE="true", BLAZE_IDLE_SECS="0",
-               BLAZE_CACHE=store, BLAZE_STATS="1")
+               BLAZE_STATS="1")
     for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "RUST_BACKTRACE"):
         env.pop(name, None)
     events, done = [], threading.Event()
@@ -162,6 +167,9 @@ def main():
     if sampler:
         sampler.stop()
     subprocess.run(["blaze", "stop"], cwd=project, env=env, capture_output=True)
+    if os.path.isdir(own_store):
+        shutil.rmtree(store, ignore_errors=True)
+        shutil.copytree(own_store, store, symlinks=True)
     quiet = None
     for at, what in sorted(events, key=lambda e: e[0]):
         # Runs of the same cpu line are folded.

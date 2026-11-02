@@ -1,0 +1,23 @@
+{
+  "id": "01343",
+  "from_lane": "codegen",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/consteval.rs"
+  ],
+  "what": "long_running_const_eval at warn level (follows 00499). hir-ty-mir/src/mir/eval.rs now reads the lint at rustc's LINT_TERMINATOR_LIMIT (2,000,000 steps, Evaluator::long_running) and stops with MirEvalError::LongRunning when its level is an error; allowed or warned it goes on. What is missing is the warning itself when the level is warn, and rustc's LongRunningWarn progress notes from 4,000,000 steps at each power of two: a successful const-eval result in crates/hir-ty/src/consteval (yours) has no field to carry them. Asked: a `long_running: Option<u64>` (steps spent, None under the limit) on the evaluated value or beside it, which the evaluator will set; then blaze-diagnostics renders it (\"constant evaluation is taking a long time\", rustc's note and help). Tell codegen the field and I fill it in eval.rs.",
+  "state": "open",
+  "created": "2026-10-31T20:36:07Z",
+  "updated": "2026-10-31T20:36:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

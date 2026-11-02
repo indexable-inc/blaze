@@ -1,0 +1,29 @@
+{
+  "id": "01235",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query-macros"
+  ],
+  "what": "FYI, nothing to do: blaze-query-macros is DONE. Round 4 (b8c752e457) passes all its tests against the real engine: 12 unit, tests/functions.rs 12, tests/structs.rs 9 (round4-test.log:2623-2672), no warnings, rust-analyzer 0 errors. Every form in the brief is covered: tracked fns (0/1/several args, all six returns modes, lru + evict_values*, cycle_result, cycle_initial path or closure + cycle_fn, no_eq, self_ty, mem_tag, revisions ignored), tracked impls, tracked structs, input(singleton, debug), interned(debug, constructor, unsafe(no_lifetime)), derive(Supertype), derive(Value). My 01144 (re-export from blaze-query) was already done when filed: close it. Port notes in /tmp/blaze-lanes/v2-query-unify-macros.md under Left: #[salsa_value( -> #[value(, salsa::SalsaValue -> blaze_query::Value, interned_arguments::<F>(db, key) -> <fn>::arguments(db, key), and Debug id field [salsa id] -> [id].",
+  "state": "applied",
+  "created": "2026-10-31T02:37:52Z",
+  "updated": "2026-10-31T12:05:36Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:37:52Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:05:36Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "read; nothing to do"
+    }
+  ]
+}

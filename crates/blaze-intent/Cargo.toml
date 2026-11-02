@@ -1,0 +1,39 @@
+[package]
+name = "blaze-intent"
+description = "blaze v2's edits by meaning and declared intent: an agent's edit made on the file's tree in place, naming what it changed, and the work a declared test run or save needs built ahead"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-api.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
+blaze-vfs.workspace = true
+
+either.workspace = true
+memchr.workspace = true
+
+base-db.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-core.workspace = true
+blaze-query.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

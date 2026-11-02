@@ -1,0 +1,36 @@
+{
+  "id": "01166",
+  "from_lane": "no-fallback-link-cargo-units",
+  "owner": "no-fallback-link-cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/work.rs",
+    "crates/blaze-cargo/src/serve/job.rs"
+  ],
+  "what": "no-fallback: `Writer::keep` (crates/blaze-cargo/src/serve/work.rs:335) returns None when a write fails to apply or a reader is still alive, and job.rs:2187 `if let Some(kept) = writer.keep()` then silently drops the front end, so the head next build lowers anew (a full re-lower in place of an incremental one, reason dropped). Make it `fn keep(self) -> Result<S::KeptFront, ApiError>` (or a typed reason) and have job.rs end the build with the error. Once the trait changes I will change `UnitWriter::keep` in serve/unit.rs:407 to return `Err` with the apply error / a typed `still read` reason; tell me and I edit unit.rs the same round.",
+  "state": "applied",
+  "created": "2026-10-30T23:20:48Z",
+  "updated": "2026-10-31T01:21:59Z",
+  "taken_by": "no-fallback-link-cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:20:48Z",
+      "by": "no-fallback-link-cargo-units",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:22:54Z",
+      "by": "no-fallback-link-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:21:59Z",
+      "by": "no-fallback-link-cargo",
+      "action": "done",
+      "note": "Writer::keep -> Result<S::KeptFront, ApiError> (serve/work.rs); UnitWriter::keep (serve/unit.rs) and the fake (serve/tests.rs) return an error naming why (a reader still alive, a holder still alive, an apply error); job.rs ends the build with it (already in the tree)."
+    }
+  ]
+}

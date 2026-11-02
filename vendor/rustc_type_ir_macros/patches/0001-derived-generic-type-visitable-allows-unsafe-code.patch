@@ -1,0 +1,27 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -426,7 +426,7 @@
+         s.add_where_predicate(wc);
+     }
+ 
+-    s.unsafe_bound_impl(
++    let generated = s.unsafe_bound_impl(
+         quote!(::rustc_type_ir::GenericTypeVisitable<__V>),
+         quote! {
+             fn generic_visit_with(
+@@ -436,7 +436,13 @@
+                 match *self { #body_visit }
+             }
+         },
+-    )
++    );
++    // SAFETY (of the generated impl): `body_visit` visits every field of every variant, the
++    // trait's contract, so a crate denying `unsafe_code` may still derive it.
++    quote! {
++        #[allow(unsafe_code)]
++        #generated
++    }
+ }
+ 
+ fn field_generic_type_visitable_bound(

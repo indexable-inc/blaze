@@ -1,0 +1,23 @@
+{
+  "id": "01289",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/lib.rs"
+  ],
+  "what": "hir-def macro_expansion_tests::mbe::tt_conversion::broken_parenthesis_sequence (round 7c): `fn f2() { m2!(x }` is a tail call, so ExpandTo::of_call_site_view (lib.rs:1660, rustc's parse_stmt_mac rule) makes it an Expr; the match fails ('expected ident') and the expansion is empty, which the Expr entry point parses with 'expected expression' on top. rustc puts a DummyResult (ExprKind::Err) in place of a failed fn-like expansion in expression position, so the only error is the macro's. An expansion that failed with an error and no tokens in Expr (and Pat/Type) position should parse to an error node of its kind without a second parse error. The test is left as is for this.",
+  "state": "open",
+  "created": "2026-10-31T14:48:38Z",
+  "updated": "2026-10-31T14:48:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:48:38Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

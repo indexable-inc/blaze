@@ -26,6 +26,7 @@ use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Summar
 
 use crate::resolver::{HashMap, HashSet};
 use anyhow::Context as _;
+use blaze_ids::radix;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -174,16 +175,27 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
     }
 }
 
+type QueryKey = (Dependency, Option<VersionOrdering>);
+type Candidates = CargoResult<Rc<[Summary]>>;
+
+/// One query of a [`RegistryQueryer`] in flight: the future of [`start_query`].
+pub(super) trait Query: Future<Output = (QueryKey, Candidates)> {}
+
+impl<Q: Future<Output = (QueryKey, Candidates)>> Query for Q {}
+
+async fn start_query<T: Registry>(
+    inner: Rc<RegistryQueryerAsync<'_, T>>,
+    key: QueryKey,
+) -> (QueryKey, Candidates) {
+    let candidates = inner.query(&key).await;
+    (key, candidates)
+}
+
 /// Wrapper around RegistryQueryerAsync that provides
 /// caching and a Poll based interface using `LocalPollAdapter`.
-pub(super) struct RegistryQueryer<'a, T: Registry> {
+pub(super) struct RegistryQueryer<'a, T: Registry, Q> {
     inner: Rc<RegistryQueryerAsync<'a, T>>,
-    poller: LocalPollAdapter<
-        'a,
-        Rc<RegistryQueryerAsync<'a, T>>,
-        (Dependency, Option<VersionOrdering>),
-        CargoResult<Rc<[Summary]>>,
-    >,
+    poller: LocalPollAdapter<Rc<RegistryQueryerAsync<'a, T>>, QueryKey, Candidates, Q>,
 
     /// a cache of `Dependency`s that are required for a `Summary`
     ///
@@ -196,20 +208,21 @@ pub(super) struct RegistryQueryer<'a, T: Registry> {
     >,
 }
 
-impl<'a, T: Registry> RegistryQueryer<'a, T> {
-    pub(super) fn new(
-        registry: &'a T,
-        replacements: &'a [(PackageIdSpec, Dependency)],
-        version_prefs: &'a VersionPreferences,
-    ) -> Self {
-        let inner = Rc::new(RegistryQueryerAsync::new(registry, replacements, version_prefs));
-        Self {
-            inner: inner.clone(),
-            poller: LocalPollAdapter::new(inner),
-            summary_cache: HashMap::default(),
-        }
+/// The [`RegistryQueryer`] over `registry`.
+pub(super) fn registry_queryer<'a, T: Registry>(
+    registry: &'a T,
+    replacements: &'a [(PackageIdSpec, Dependency)],
+    version_prefs: &'a VersionPreferences,
+) -> RegistryQueryer<'a, T, impl Query> {
+    let inner = Rc::new(RegistryQueryerAsync::new(registry, replacements, version_prefs));
+    RegistryQueryer {
+        inner: Rc::clone(&inner),
+        poller: LocalPollAdapter::new(inner, start_query::<T>),
+        summary_cache: HashMap::default(),
     }
+}
 
+impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
     pub(super) fn registry(&self) -> &T {
         self.inner.registry
     }
@@ -219,7 +232,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
         dep: &Dependency,
         first_version: Option<VersionOrdering>,
     ) -> Poll<CargoResult<Rc<[Summary]>>> {
-        self.poller.poll(RegistryQueryerAsync::query, (dep.clone(), first_version))
+        self.poller.poll((dep.clone(), first_version))
     }
 
     pub(super) fn wait(&mut self) -> CargoResult<bool> {
@@ -262,7 +275,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
         // if we have calculated a result before, then we can just return it,
         // as it is a "pure" query of its arguments.
         if let Some(out) = self.summary_cache.get(&(parent, candidate.clone(), opts.clone())) {
-            return Ok(out.0.clone());
+            return Ok(Rc::clone(&out.0));
         }
         // First, figure out our set of dependencies based on the requested set
         // of features. This also calculates what features we're going to enable
@@ -296,14 +309,14 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
         // dependencies with more candidates. This way if the dependency with
         // only one candidate can't be resolved we don't have to do a bunch of
         // work before we figure that out.
-        deps.sort_by_key(|(_, a, _)| a.len());
+        radix::sort_by_key(&mut deps, |(_, a, _)| a.len());
 
         let out = Rc::new((used_features, deps.into()));
 
         // If we succeed we add the result to the cache so we can use it again next time.
         // We don't cache the failure cases as they don't impl Clone.
         self.summary_cache
-            .insert((parent, candidate.clone(), opts.clone()), (out.clone(), all_ready));
+            .insert((parent, candidate.clone(), opts.clone()), (Rc::clone(&out), all_ready));
 
         Ok(out)
     }
@@ -419,6 +432,7 @@ struct Requirements<'a> {
     ///
     /// The resolver will activate all of these dependencies, with the given
     /// features enabled.
+    // BTreeSet: each becomes a `FeaturesSet`, part of the `DepsCache` key.
     deps: HashMap<InternedString, BTreeSet<InternedString>>,
     /// The set of features enabled on this package which is later used when
     /// compiling to instruct the code what features were enabled.

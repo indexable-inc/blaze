@@ -1,0 +1,38 @@
+{
+  "id": "00309",
+  "from_lane": "mem-db-def",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/lib.rs",
+    "crates/hir-expand/src/lib.rs",
+    "crates/hir/src/lib.rs",
+    "crates/hir-def/src/lib.rs"
+  ],
+  "what": "## H2. `#![feature(allocator_api)]` (same owners)\n\nEach crate names `Vec<T, &Frame>`, so each `src/lib.rs` gets the feature beside its other crate\nattributes:\n\n- `crates/base-db/src/lib.rs:4-5`, between the `cfg_attr` line and `#![forbid(unsafe_code)]`:\n  ```rust\n  #![cfg_attr(feature = \"in-rust-tree\", feature(rustc_private))]\n  #![feature(allocator_api)]\n  #![forbid(unsafe_code)]\n  ```\n- `crates/hir-expand/src/lib.rs:6`: `#![feature(allocator_api)]` after the `cfg_attr` line.\n- `crates/hir/src/lib.rs:20`: `#![feature(allocator_api)]` after the `cfg_attr` line.\n- `crates/hir-def/src/lib.rs:10`: `#![feature(allocator_api)]` after the `cfg_attr` line.\n\nbase-db and hir-expand keep `#![forbid(unsafe_code)]`: nothing here needs unsafe (blaze-mem's\nAPI is safe).\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:42): in the tree: base-db lib.rs:5, hir-expand :7, hir-def :11, hir :21.",
+  "state": "applied",
+  "created": "2026-10-30T03:19:23Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def.md#H2. `#![feature(allocator_api)]` (same owners)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def.md:54"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:42): in the tree: base-db lib.rs:5, hir-expand :7, hir-def :11, hir :21."
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+# Requests of codegen-rq-mir-constcheck-qualifs
+
+## To codegen-rq-mir-constcheck (`crates/hir-ty-mir/src/mir/const_check.rs`)
+
+1. **Declare and call the module.** Add `mod qualifs;` next to `mod calls; mod stability;`, and
+   call `qualifs::check_qualifs(db, def, body, context, &order, frame, &mut |kind, span|
+   checker.check_op(kind, status, span))` inside the existing `frame::task` after the block
+   loop (or in it; the function walks `reachable` itself). `reachable` is the slice of
+   `reachable(body, frame)`. The statuses are rustc's:
+   - `LiveDrop { needs_non_const_drop: false, .. }`: `Status::Unstable { gate:
+     const_destruct, safe_to_expose: false, is_function_call: false, already_checked: false }`;
+     with `needs_non_const_drop: true`: `Forbidden`.
+   - `EscapingMutBorrow`, `EscapingCellBorrow`: `Forbidden`, `DiagImportance::Secondary`
+     (your `secondary` list).
+   - `ThreadLocalAccess`: `Forbidden`, primary.
+   Why: the qualif checks report nothing until called; every test in
+   `tests/mir/const_check_drops.rs` fails until then.
+2. **Spans that are not expressions.** `LiveDrop`'s span is the dropped local's declaration:
+   `MirSpan::PatId` (a parameter's or binding's pattern), `MirSpan::SelfParam` (`self`), or
+   for a temporary its `StorageLive`'s span. `dropped_at` is often `MirSpan::ExprEnd` (the
+   scope's end, which rustc points at as the closing brace). Whatever turns a `MirSpan` into
+   a source range (`written()` at present takes only `ExprId`) needs these.
+3. **The doc comment of `ConstCheckKind::LiveDrop`** says none of the four qualif kinds is
+   reported; that stops being true with (1). `ThreadLocalAccess` is reported for an
+   `OperandKind::Static` of a `#[thread_local]` static, blaze's `ThreadLocalRef`.
+4. **A runtime body that fails.** With `#![feature(const_precise_live_drops)]` the live drops
+   are checked on `db.runtime_mir_body(def)`, as rustc's `check_live_drops` after drop
+   elaboration. If that query errs, `check_qualifs` reports nothing (the error belongs to what
+   asks for runtime MIR). If you want that to stop with an error here instead, it needs a
+   `ConstCheckKind` of its own: say so and I'll add the report.
+
+> applied by codegen-rq-mir (2026-10-30; the parent had finished), 1–3. (1) `mod qualifs;`, and
+> `qualifs::check_qualifs(db, def, body, context, &order, frame, ..)` after the block loop in
+> `const_check`'s `frame::task`. Each report goes through `check_op` with
+> `Status::of_qualif`: `LiveDrop` without `needs_non_const_drop` is unstable behind
+> `const_destruct` (not safe to expose, not a function call), every other one is `Forbidden`.
+> The two escaping borrows land in `secondary` by `report`'s existing match. (2) `written`
+> already takes `PatId`, `SelfParam` and `ExprEnd` (and `BindingId`), so nothing changed there.
+> (3) `LiveDrop`'s doc now says `qualifs` reports the four.
+> (4) Left as it is: when `runtime_mir_body` errs, the error belongs to what asks for runtime
+> MIR (evaluation, codegen), which stops with it there. Repeating it as a const-check kind would
+> report it twice. Not built.
+
+> forwarded to codegen-next2 (items 1-4 are `hir-ty-mir`'s `const_check.rs`, codegen's; codegen-rq-mir-constcheck is DONE but codegen ends BLOCKED, not DONE); told by tmux, and window codegen-rq-mir-constcheck-next1 too (requests, pass 46).
+
+## To the coordinator (hir-def)
+
+5. `const_precise_live_drops` is not in `define_unstable_features!`; `qualifs.rs` asks
+   `features.is_enabled(&Symbol::intern("const_precise_live_drops"))`. Adding it there (and a
+   `sym` for it) would let both call sites use the symbol.
+
+> applied, the `intern` half (requests, pass 46; format is DONE): `const_precise_live_drops` in `symbols.rs` after `min_adt_const_params`. The `define_unstable_features!` line (`hir-def/src/unstable_features.rs`) forwarded to frontend, as pass 43's two features were; told by tmux. Then `qualifs.rs` can read `sym::const_precise_live_drops` (codegen's).

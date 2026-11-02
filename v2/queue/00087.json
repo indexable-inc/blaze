@@ -1,0 +1,43 @@
+{
+  "id": "00087",
+  "from_lane": "concurrency",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-ids",
+    "crates/intern",
+    "crates/blaze-cas/clippy.toml",
+    "crates/blaze-ids/clippy.toml",
+    "crates/intern/clippy.toml",
+    "v2/requests/format.md",
+    "crates/blaze-graph",
+    "crates/blaze-graph/clippy.toml",
+    "v2/requests/core.md",
+    "crates/blaze-graph/src/pool.rs",
+    "Cargo.toml",
+    "crates/blaze-global/src/client.rs",
+    "crates/blaze-global",
+    "docs/v2-store.md",
+    "docs/v2/plan/lanes/concurrency/store.md"
+  ],
+  "what": "## Requests from concurrency (2026-10-29)\n\n### R1. format: the lock ban in `crates/blaze-ids/` and `crates/intern/`\n\nclippy reads only the nearest `clippy.toml`, so the hot-crate ban needs a copy per crate. Copy\n`crates/blaze-cas/clippy.toml` to `crates/blaze-ids/clippy.toml` and `crates/intern/clippy.toml`,\nlanding with the fixes for the audit findings in `v2/requests/format.md` (until then the copy\nfails clippy on the locks those findings name).\n\n> forwarded to format: `crates/blaze-ids/` and `crates/intern/` are its.\n\n### R2. core: the lock ban in `crates/blaze-graph/`, and each job a reclamation boundary\n\n- Copy `crates/blaze-cas/clippy.toml` to `crates/blaze-graph/clippy.toml`, with the fixes for the\n  findings in `v2/requests/core.md`.\n- Take `let _task = blaze_reclaim::enter();` around each job `crates/blaze-graph/src/pool.rs`\n  `Local::run` (~line 778) runs, and add `blaze-reclaim.workspace = true` to blaze-graph's\n  `Cargo.toml`. Then every plane task is a quiescent boundary, and a store read inside a job can\n  take `blaze_reclaim::enter()` for free (guards nest). Without it, values the store retires are\n  freed only when the threads that read them next leave a guard they took themselves.\n\n> applied (core DONE): `crates/blaze-graph/clippy.toml` is a copy of blaze-cas's; `Cap`'s state is pump's `Lock` (the one allowed lock) and `Lock` names `std::sync::Mutex` in place, so no import trips the ban; each test module says `#[allow(clippy::disallowed_types, reason = ..)]` as `exec.rs`' did. `Local::run` (`pool.rs`) takes `let _task = blaze_reclaim::enter();` around each job, and blaze-graph depends on `blaze-reclaim.workspace = true` (a new edge for the lock).\n\n### R3. fastcompile-global: frame the answers `blaze-global`'s `Remote` hands the store\n\n`crates/blaze-global/src/client.rs:663` and `:684` build `Done::Read(Answer::...encode())`.\nThe store now reads a fetch's `Done::Read` as the whole frame (8-byte LE length, then the\nanswer), so a remote can hand on the receive buffer without a copy (C5). Once\n`concurrency-remote` lands `Answer::encode_framed`, use it at both sites. Until then those\nanswers are refused as malformed (an error, never a wrong value).\n\n> forwarded to fastcompile: `crates/blaze-global/` is fastcompile-global's.\n> applied (fastcompile-global): both answers in `client.rs` (`fetched`, the missing and the kept value) are `Answer::encode_framed()`. A refused value stays `Done::Failed`.\n\n### R4. store (or the coordinator): `docs/v2-store.md`\n\nIt still describes `put` appending to memory under one writer, `Append`, and flags indexed by\nrow with a delta entry of 48 bytes. Describe instead: `Reader` and `Writer`, per-worker\nsegments, spots retargeted to packs after mapping, `WriteAt` pack writes, and point at\n`docs/v2/plan/lanes/concurrency/store.md`.\n\n> forwarded to coordinator: `docs/v2-store.md` is not in any lane's paths in crates.md, so it falls to the coordinator.",
+  "state": "applied",
+  "created": "2026-10-30T00:48:20Z",
+  "updated": "2026-10-30T08:26:25Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/concurrency.md#Requests from concurrency (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/concurrency.md:238"
+    },
+    {
+      "at": "2026-10-30T08:26:25Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "R1: crates/blaze-ids/clippy.toml and crates/intern/clippy.toml copied from blaze-cas (the audit fixes they waited on are in); #[allow(clippy::disallowed_types, reason)] on blaze-ids sync.rs std re-export, lib.rs crate::sync import, Shard, Sharded::new, model tests; intern sync.rs std re-export and table.rs in_chunks error Mutex (arena::lock already allowed). R2, R3 already applied (pool.rs Local::run enter, client.rs encode_framed). R4 docs/v2-store.md handed to coord-apply-docs through coord-apply (docs path)."
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00270",
+  "from_lane": "usercode-bridge",
+  "owner": "fastcompile",
+  "paths": [],
+  "what": "## What to hook into\n\n1. **Running a macro on the evaluator:** compile the macro crate against `native-proc-macro`,\n   so its `proc_macro` calls end at `__native::Host`. Call `native::expand` with an `Expander`\n   whose `fn` is the evaluator's or copy-and-patch's entry for `#[proc_macro]`,\n   `#[proc_macro_derive]` or `#[proc_macro_attribute]`.\n   - If the evaluator can't give a plain `fn` pointer, ask, and usercode makes `Expander` hold a\n     `&dyn Fn` instead.\n2. **Keeping the expansion:** `blaze_expand::given(toolchain, &Call) -> (Given, Spans)` is the key\n   of a call: the macro's name and kind, the input and attribute tokens with relative spans,\n   the crate's variables (`Given::env_keyed`), the directory, the toolchain and the ABI.\n   - The `RunKey`'s `code` should become the macro's code hash in place of its library's content\n     ID.\n   - `blaze_usercode::index::find(&Reader, &Guard, &run, inputs)` and the `puts` buffer keep and\n     find the expansion, as today.\n3. **What it read:** isolation by construction means the evaluator answers every file, directory\n   and variable read itself. Feed each read to `blaze_usercode::trace::assemble_seen(lines:\n   impl IntoIterator<Item = (Seen, &str)>, inputs)`, which takes `Seen::Read`, `Looked`, `Listed`\n   and `Env`, plus `Untraceable` for the clock and randomness, so the result is keyed by exactly\n   those reads. An expansion that reads something untraceable is not kept, as now.\n   - The sandbox and its tracing stay for build scripts, and for proc macros until the\n     evaluator runs them all.\n4. **Asking the database about a span:** answered through `Host` with `db`. An expansion that\n   asks is not kept (`blaze-expand` lib doc), and that rule carries over.\n\n> forwarded to fastcompile (with the file; see \"Asked of fastcompile\").",
+  "state": "applied",
+  "created": "2026-10-30T02:52:03Z",
+  "updated": "2026-10-30T14:24:29Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/usercode-bridge.md#What to hook into",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-bridge.md:35"
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:29Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Change 20's, taken up by crates/blaze-macro-eval/ (child fastcompile-macros): the proc-macro bridge, its evaluator and expander (src/expander.rs) live there; see docs/v2/plan/lanes/fastcompile/ and /tmp/blaze-lanes/v2-fastcompile-macros.md."
+    }
+  ]
+}

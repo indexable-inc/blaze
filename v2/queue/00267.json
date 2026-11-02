@@ -1,0 +1,23 @@
+{
+  "id": "00267",
+  "from_lane": "diagnostics-items",
+  "owner": "diagnostics",
+  "paths": [
+    "v2/requests/diagnostics-items-ast.md"
+  ],
+  "what": "## 4. Still open, needed to compile: rustc's pretty printer at `crate::lints::syntax::pretty` (parent `diagnostics`, owner of `lints/syntax*`: `diagnostics-lints-syntax-early`)\n\nWhat: the request `diagnostics-items-ast: rustc's pretty printer reachable as\n`crate::lints::syntax::pretty`` in `v2/requests/diagnostics-items-ast.md` (forwarded, not yet\napplied as of 2026-10-29 19:50): `pub(crate) mod validation;` in `lints/syntax/early.rs`,\n`pub(crate) mod pretty;` in `lints/syntax/early/validation.rs`, `pub(crate) use\nearly::validation::pretty;` in `lints/syntax.rs`, and `pretty.rs`'s `ty`, `bounds`,\n`generic_arg`, `expr` as `pub(crate)` free functions beside `where_predicate` and `ident`.\nWhy: `checks/ast_validation/{items,generics}.rs` import `crate::lints::syntax::pretty`; without\nit the crate does not compile. (`Walk::place` and `pub(crate) mod syntax;` are applied.)\n\n> forwarded to diagnostics (its `lints/syntax*`; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:50:00Z",
+  "updated": "2026-10-30T02:50:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items.md#4. Still open, needed to compile: rustc's pretty printer at `crate::lints::syntax::pretty` (parent `diagnostics`, owner of `lints/syntax*`: `diagnostics-lints-syntax-early`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items.md:47"
+    }
+  ]
+}

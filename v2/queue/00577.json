@@ -1,0 +1,23 @@
+{
+  "id": "00577",
+  "from_lane": "db-expand-macros",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/parse.rs"
+  ],
+  "what": "## db-expand-macros: cfg_select's and the parser's errors in rustc's words (diagnostics-items, `crates/blaze-diagnostics/src/lower/parse.rs`)\n\nWhat: `diagnostics-items-resolve.md` section 4: `cfg_select!`'s parse errors use the parser\ntranslation, so they wait on it being usable on a token stream.\n\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-macros: cfg_select's and the parser's errors in rustc's words (diagnostics-items, `crates/blaze-diagnostics/src/lower/parse.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:853"
+    }
+  ]
+}

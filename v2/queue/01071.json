@@ -1,0 +1,37 @@
+{
+  "id": "01071",
+  "from_lane": "integrate-docs",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/backend.rs",
+    "crates/hir-ty-codegen/v2/hashes.rs",
+    "crates/hir-ty-codegen/fncache.rs"
+  ],
+  "what": "From integrate-docs (found by its children, read from code, not run): (1) cache-key hole: BLAZE_EMIT changes LLVM output but is in neither hir-ty-codegen/v2/backend.rs CHANGES_CODE nor any unit key, so code kept under one value is reused under the other. (2) possible stale code identity: hir_ty_share::code via hir-ty-codegen/v2/hashes.rs takes callees by interface hash and does not include the __blaze_cache_code constant, so a function asking for its cached closure code may keep a stale hash after an edit to code the closure reaches (v1 recompiled via patch.rs cached_roots; docs/fn-cache.md). (3) tests_reach in hir-ty-codegen/fncache.rs has no v2 caller: delete or wire (docs/cargo.md calls hermetic tests v1).",
+  "state": "applied",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-31T20:47:34Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:47:34Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:47:34Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "All three: (1) BLAZE_EMIT added to CHANGES_CODE in v2/backend.rs, so a v2 unit refuses while it is set, like BLAZE_OPT. (2) fncache::written_code gives what a cached function instance writes for its body (the cache_code hash or why not); v2/frontend.rs code_of mixes it into the code hash of a cached function, so an edit below its closure is new code; test a_cached_function_is_new_code_when_what_its_closure_reaches_is in v2/tests.rs. (3) tests_reach is already gone (only doc mentions remain)."
+    }
+  ]
+}

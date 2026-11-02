@@ -66,10 +66,11 @@ Any of these, whoever starts the process:
 
 What it does not cover:
 
-- The harnesses' reference builds. rustc is the reference
-  ([contributing.md](contributing.md#rules-for-code), rule 1): the harnesses build with cargo
-  and rustc and compare. The oracle stays rustc's. What changes is every expectation that blaze
-  hands something to rustc or cargo.
+- How it is proven. rustc's behaviour is still the reference
+  ([contributing.md](contributing.md#rules-for-code), rule 1), but since 2026-10-30 no harness
+  builds with rustc to compare: real crates' own test suites passing under blaze, and tests
+  that state their expected result, are the bar ([harness.md](harness.md)). The harnesses that
+  did compare, named in the dated entries below, are deleted.
 - The platform's linker and C toolchain: `cc`, `ld`, `lld`, `link.exe`, and the C or C++ a
   build script compiles with the `cc` crate. They are not rustc. blaze runs the linker with a
   line it works out itself, not with rustc's.
@@ -91,7 +92,7 @@ left of the download, each piece for a rustc site this plan removes:
 |---|---|---|
 | `rustc`: `bin/rustc`, `librustc_driver` | the first build of a workspace, the functions left to rustc, the reference loads of the harnesses; its file names in the keys of what rustc built (`cargo/keyed.rs`) | K, E, M |
 | `rustc`: `lib/rustlib/<host>/bin/rust-lld`, `gcc-ld` | blaze's link on ELF targets (`link.rs` `lld_dir`, `rust_lld`) | blaze's own lld or the system linker |
-| `rustc`: `libexec/rust-analyzer-proc-macro-srv` | proc macros rustc built | J1, J2 |
+| `rustc`: `libexec/rust-analyzer-proc-macro-srv` | proc macros rustc built | J: blaze-macro-eval (2026-10-30) |
 | `cargo` | the first build, `cargo metadata` for a load, `--unit-graph` | blaze's resolver and fetcher, K, M |
 | `rust-std-<host>` | linking what rustc built; a build told ahead of cargo's reads its rlibs' metadata for its key (`built_library`, `library_identity`) | F, G |
 | `rust-std-wasm32-wasip1`: `lib/self-contained` | the WASI libc a proc macro's module links (`own_macro.rs`, `link.rs`) | blaze shipping wasi-libc |
@@ -109,10 +110,11 @@ What "100%" means, piece by piece. Each piece is where one of today's uses goes.
    `compiler_builtins`, `panic_unwind`, `panic_abort`, `unwind`, `proc_macro`, `test` and what
    they depend on, from blaze's `library/`, kept in the store per target and profile like any
    other crate. No rlib of the sysroot is read or linked.
-2. **Proc macros are compiled by blaze and loaded by blaze.** The proc-macro crate and its
-   dependencies (`syn`, `quote`, `proc-macro2`) are compiled by blaze into a library that
-   rust-analyzer's proc-macro server, running inside blaze, loads. Not the toolchain's
-   `rust-analyzer-proc-macro-srv`, and not a library rustc built.
+2. **Proc macros are compiled by blaze and run by blaze.** The proc-macro crate and its
+   dependencies (`syn`, `quote`, `proc-macro2`) run on blaze's own compiler in blaze's process
+   (`crates/blaze-macro-eval`, [compile-time.md](v2/plan/design/compile-time.md) change 20).
+   Not the toolchain's `rust-analyzer-proc-macro-srv`, no other server, and not a library rustc
+   built.
 3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` names blaze while they
    run, so that their own probes are answered by blaze, the way the pinned rustc answers them.
 4. **The cold build is entirely blaze's.** No first build by cargo and rustc, no executable
@@ -185,13 +187,12 @@ step that ends its use lands. A
 project's own pin does not change which Rust blaze builds with
 ([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry,
 resolver and unit graph (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`,
-`blaze-units`) replace `cargo metadata`, `cargo build --unit-graph` and cargo's fetching, held
-equal to cargo's by `harness/resolve.py`; with them K needs no cargo to plan a build. Since
-2026-10-27 the standard library's workspace is read by them too (`OwnMetadata.library`,
-`harness/resolve.py sysroot`), a workspace load's questions of the toolchain and configuration
+`blaze-units`) replace `cargo metadata`, `cargo build --unit-graph` and cargo's fetching (held
+equal to cargo's by `harness/resolve.py` until it was deleted, 2026-10-30); with them K needs no cargo to plan a build. Since
+2026-10-27 the standard library's workspace is read by them too (`OwnMetadata.library`), a workspace load's questions of the toolchain and configuration
 (`cargo --version`, `cargo config get` in TOML for rust-analyzer and the rustflags `plan.rs`
 reads, `cargo rustc --print cfg` and `target-spec-json`) are blaze's
-(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest, `resolve.py toolchain`), and
+(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest), and
 `plan.rs` plans each load from blaze-units' graph with no `cargo build --unit-graph`
 (`resolve.py units`); and a load's build scripts and proc macros are built and run by blaze
 over that graph, with no `cargo check --compile-time-deps` (`cargo/compile_time.rs`,
@@ -210,7 +211,7 @@ The one left is the typed `blaze` itself; `blaze build` and `blaze test` run no 
 all. The same holds with `--whole`, and none of the eight runs starts the toolchain's rustc or
 rustdoc (the `rustc` a build script is given is blaze's stand-in). What blaze still keeps of
 cargo is in the toolchain it ships, for a load into cargo's own target directory (the harness's
-reference builds) and with `BLAZE_PROC_MACRO_SERVER=off`.
+reference builds).
 
 ## While the paths remain
 
@@ -246,9 +247,8 @@ What is left starts rustc only outside a user's build. `harness/rustcsites.py` c
 | `project-model/src/` (`toolchain_info/`, `cargo_workspace.rs`, `build_dependencies.rs`, `sysroot.rs`, `workspace.rs`, `cargo_config_file.rs`) | rust-analyzer's `cargo metadata`, `cargo check --compile-time-deps` and rustc's answers | a load into cargo's own target directory (the harness's reference builds) or with `BLAZE_PROC_MACRO_SERVER=off`; blaze's own loads answer these itself (B, I, J) |
 | `blaze-cargo/src/cargo/load_wrapper.rs` | `blaze-rustc` as the `RUSTC_WRAPPER` of such a load's cargo: answers rustc's questions, and has rustc build a build script or proc macro blaze does not | the same loads only; it refuses any other caller |
 | `blaze-cargo/src/plan.rs` `cargo_in`, `cargo/state.rs` `cargo_path` | cargo, with blaze answering its questions | the same loads |
-| `blaze-cargo/src/stub.rs` | blaze standing in for rustc for a whole build (`BLAZE_WRAPS_RUSTC`) | the harness's "alone" builds (`difftest.py`, `alone.py`, `wholeprogram.py`) |
+| `blaze-cargo/src/stub.rs` | blaze standing in for rustc for a whole build (`BLAZE_WRAPS_RUSTC`) | the harness's "alone" builds (`wholeprogram.py`) |
 | `blaze-cargo/src/cargo/own_macro.rs` | `rustup target add wasm32-wasip1` for the wasi-libc a proc macro's module links | a toolchain without it |
-| `proc-macro-srv/build.rs`, `proc-macro-srv/proc-macro-test/build.rs` | build scripts of blaze's own crates | building blaze |
 
 ### How often
 
@@ -412,7 +412,7 @@ the counts of [How often](#how-often) lower, measured by step A's check, and non
 | [G](https://github.com/indexable-inc/blaze/issues/87). Every crate compiled and linked by blaze | rustc's rlibs, objects, symbols and link line, "no rustc symbol" | E, F | large | high | the no-rustc F+G lane |
 | [H](https://github.com/indexable-inc/blaze/issues/88). blaze writes the test harness | the fallback when a test is added | G | medium | medium | the `no-rustc-hl` lane: done; the `no-rustc-l2` lane: blaze's harness always, done |
 | [I](https://github.com/indexable-inc/blaze/issues/89). Build scripts compiled and run by blaze | build scripts and their probes by rustc | B, G | medium | medium | the `no-rustc-l2` lane: first part done (scripts compiled and linked by blaze, their runs kept in the store); the F+G lane consumes it for the standard library's scripts |
-| [J](https://github.com/indexable-inc/blaze/issues/90). Proc macros compiled and loaded by blaze | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first |
+| [J](https://github.com/indexable-inc/blaze/issues/90). Proc macros compiled and loaded by blaze | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first; v2 (2026-10-30): run in process by blaze-macro-eval, the server path deleted |
 | [K](https://github.com/indexable-inc/blaze/issues/91). The cold build is blaze's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | the self-contained lane, with 54301ec5's first-build lane (#310); `BLAZE_WHOLE_BUILD=1`: the build from nothing is G's whole build, no `cargo build` |
 | [L](https://github.com/indexable-inc/blaze/issues/92). Doctests by the daemon (#28) | probe and examples by rustc, rustdoc | B, G, D | medium | medium | the `no-rustc-hl` lane: first part done; the `no-rustc-l2` lane: second part (examples by blaze) done |
 | [M](https://github.com/indexable-inc/blaze/issues/93). Remove the wrapper and the fallback | `blaze-rustc`, `blaze-rustc-first`, stand-ins, dep-info, settle, `by_cargo`, `only_cargo` | all | medium | low | done: `blaze enable`, the wrapper and the rustc base are gone; `blaze-rustc` is left as the wrapper of a load into cargo's target directory, `BLAZE_WRAPS_RUSTC` to the harness |
@@ -461,8 +461,8 @@ package turns on.
 its own targets, byte for byte as the pinned rustc answers them. rust-analyzer's `toolchain_info`
 asks blaze in process. `cargo metadata`, `cargo rustc --print` and `cargo build --unit-graph`
 run with `RUSTC` naming blaze, and a load asks them once, not once per worker and spare. Risk:
-a wrong `cfg` builds the wrong code without a word; the harness compares every answer with
-rustc's on every target blaze knows.
+a wrong `cfg` builds the wrong code without a word; the answers are rustc's own, written by
+`answers.py --write` from the pinned rustc on every target blaze knows.
 
 Done in part (the `no-rustc-abc` lane, [#100](https://github.com/indexable-inc/blaze/pull/100)):
 the answers are rustc's, asked once per toolchain and kept, not blaze's own.
@@ -495,7 +495,7 @@ rustc's `UnstableFeatures::from_environment` does), `-C panic`, `--cfg`, `proc_m
 the sysroot and target libdir from where the toolchain is. A question with anything it does not
 model (`-C target-cpu`, `-C target-feature`, other `-Z` flags, a deployment target or SDK in the
 environment, a JSON target, another release, a host whose target specs it lacks) is asked of rustc
-once per toolchain as before. `harness/answers.py`, in the fast tier on Linux and macOS, compares
+once per toolchain as before. `harness/answers.py` compared (until 2026-10-30, in the fast tier on Linux and macOS)
 238 questions with rustc's answers, byte for byte, on the toolchain rustup installed and on a copy
 laid out as norustc.py's; `--write` regenerates the data after a toolchain bump, on each of x86-64
 Linux, AArch64 Linux and arm64 macOS (written for 1.99.0 on 2026-10-23, for `nightly-2026-10-25`
@@ -583,12 +583,12 @@ enable`. What stays with cargo for now: what the frontend turns down as unsuppor
 link that failed). An error in a file written before the worker loaded the workspace is blaze's
 too since 2026-10-23: the worker leaves it beside its socket and every build of the checkout
 fails with it until a source is written. The lints followed: a lint the source denies fails the
-build for the eight lints `harness/lints_ui.py` finds rust-analyzer reports only where rustc does
+build for the eight lints `harness/lints_ui.py` (deleted 2026-10-30) found rust-analyzer reports only where rustc does
 (on rustc's UI tests that deny or forbid a lint, 2026-10-23: non_snake_case 31 right, 0 wrong,
 9 missed; non_camel_case_types 22, 0, 2; unused_must_use 14, 0, 30; non_upper_case_globals 9,
 0, 4; deprecated_safe_2024 3, 0, 0; elided_lifetimes_in_paths 1, 0, 0; unsafe_op_in_unsafe_fn
 1, 0, 0; the same against 1.99.0 and the nightly of 2026-10-09). The last three have few UI
-tests, so `harness/lints_probes` has a unit for each place they apply (a parameter, a return
+tests, so `harness/lints_probes` had a unit for each place they apply (a parameter, a return
 type, a `let`, a closure, a trait method, a macro, an `unsafe fn`, editions 2021 and 2024; 85
 units with the brace lints): elided_lifetimes_in_paths 25, 0, 6; unsafe_op_in_unsafe_fn 10, 0,
 1; deprecated_safe_2024 8, 0, 2. Five had been wrong first: rust-analyzer's case rules were
@@ -597,7 +597,7 @@ rustc's of an old commit, its `unused_must_use` looked into `if` and `match` arm
 before 2024) in an `unsafe fn` for the lint, which rustc reports there only where
 `unsafe_op_in_unsafe_fn` is not allowed. The eighth, since 2026-10-24, is `unused_mut`, which
 the borrow checker gives and `BLAZE_BORROWCK_REFUSE=0` turns off with its errors. Few UI tests
-deny it, so `lints_ui.py --deny unused_mut` scores it on every UI test, each read with
+deny it, so `lints_ui.py --deny unused_mut` scored it on every UI test, each read with
 `#![deny(unused_mut)]` first: 51 right, 0 wrong, 5 missed against the nightly of 2026-10-09
 (6,446 units in scope), 49, 0, 5 against 1.99.0, and 71, 0, 3 on its 25 units in
 `harness/lints_probes` (closures, `mut self`, patterns, `ref mut`, later assignment, autoref,
@@ -609,7 +609,7 @@ its `inout` registers were not mutated, and a body whose array length fails to e
 linted, which rustc's is not. The misses are in macro expansions and that body's length.
 None of the eight is denied by default, so the level
 is the source's, which only `--cap-lints` and `--force-warn` undo; with either among the flags
-no lint fails a build. A lint in what a macro expands to does not, and `lints_ui.py` does not
+no lint fails a build. A lint in what a macro expands to does not, and `lints_ui.py` did not
 count one (rustc reports it in the macro's definition). The other lints are not blaze's
 verdict yet: a crate that denies one rust-analyzer does not find runs code rustc turns down.
 Those with the most errors in rustc's UI tests are `dead_code` (294), `explicit_outlives_requirements`
@@ -661,8 +661,8 @@ before, 41 after, 11 compiles both times).
 Owner of bun's classes: the `bun-e` lane (2026-10-22). It compiles what bun leaves to rustc
 today: `adt_const_params` constants, `core::mem::type_info`, inherent associated types,
 `lol_html`'s macros, `core`'s methods in `no_std` crates and the rest of #35's table, plus what
-bun's whole-program report finds after them. Each class lands with its `bun_repros.py` fixture
-(#75) expecting `compiled`. Done when bun's whole-program report (`runbench.py bun`) leaves no
+bun's whole-program report finds after them. Each class landed with its `bun_repros.py` fixture
+(#75, deleted 2026-10-30) expecting `compiled`. Done when bun's whole-program report (`runbench.py bun`) leaves no
 function to rustc but those step G removes ("no rustc symbol"). On Linux x86-64 it leaves none
 (2026-10-22, `857eab0e9b`: 68,315 functions compiled, the program links and each of
 `apps.json`'s runs matches cargo's); macOS arm64 is to be run again.
@@ -681,8 +681,8 @@ system libraries and start files, `-C link-arg` and the linker cargo's configura
 the shims rustc adds (the allocator's, `main`). Nothing of rustc's is linked, so symbols.rs,
 weaken.rs, `Base::of_rustc` and the "ahead of rustc's rlibs" link go, and with them "no rustc
 symbol", ABI and mangling parity, and [#52](https://github.com/indexable-inc/blaze/issues/52).
-Risk: a link line that differs from rustc's on a platform; the harness links every bench app
-on Linux, macOS, Windows and wasm and compares the programs' behaviour.
+Risk: a link line that differs from rustc's on a platform; every bench app's own tests have to
+pass on Linux, macOS, Windows and wasm.
 
 The no-rustc-fg lane owns F and G. Where they are (2026-10-22, Linux x86-64): with no rustc
 symbols blaze compiles a program together with `std`, `core`, `alloc`, `compiler_builtins`,
@@ -712,8 +712,9 @@ every call to one being the compiler's own code) is, where something calls it, a
 that says so when it runs. A program that reaches one is not built: a function of its own
 crates blaze refused (its `main`, or one only code of the object calls, its own copy of an
 `#[inline]` function of the library's among them) stops the build before the link, and a stand-in
-the link keeps, the library unit's included, fails it after; either way the error names each
-function and why it was refused (`` `p` reaches 1 function blaze could not compile, and a build
+the link keeps, the library unit's included, fails it after; either way the error names the
+functions and why each was refused, the first 16 or under `--refused N|all` as many as asked
+(`` `p` reaches 1 function blaze could not compile, and a build
 with nothing of rustc's has nothing else to compile it, so it is not built:``), and no
 executable is left. A function the library exports by name that nothing in it calls has no
 stand-in, as one exported under the name could take the place of a definition the program
@@ -809,7 +810,7 @@ scripts with `RUSTC` naming blaze, so that `autocfg`, `version_check`, `rustvers
 feature probes of `anyhow` and `proc-macro2` are answered by blaze (B for their questions, D's
 check for their test programs). rust-analyzer's `cargo check --compile-time-deps` is replaced by
 the daemon's own run. Risk: a probe answered differently from rustc turns a feature off
-silently; the harness compares every script's output with what it prints under rustc.
+silently; the crates' own tests are what catch it.
 
 First part done (the `no-rustc-l2` lane, 2026-10-23): when cargo asks rustc for a build script,
 blaze compiles and links it, and cargo runs it as it would rustc's. `crates/blaze-cargo/src/cargo/own_script.rs`
@@ -846,8 +847,7 @@ main 24be505), "cold": with a store that has the standard library's unit, ripgre
 the build scripts of the cold build: ripgrep 7 times before, 1 (crossbeam-utils, `include!`);
 nushell 50 before, 5 (crossbeam-utils and portable-atomic, `include!`; bigdecimal, `env!`;
 nu-cmd-lang and oem_cp, a proc macro). Done since (2026-10-27, the `ctdeps` lane): rust-analyzer's
-`cargo check --compile-time-deps` replaced, see K. Not done: the harness that compares every
-script's output with rustc's. For
+`cargo check --compile-time-deps` replaced, see K. For
 the F+G lane: the printed lines a library is linked with are where cargo keeps them
 (`cargo::script::printed`), whether blaze compiled the script or not, and a script blaze
 compiles is one more crate of a `rust-project.json`, so the standard library's scripts can take
@@ -895,7 +895,7 @@ Running scripts without cargo (the `blaze-scripts` lane, 2026-10-25, for K and
 `crates/blaze-build-script`, a crate that knows nothing of blaze and asks no cargo. Its
 `env` gives the whole environment cargo runs a script with, ported from cargo's
 `custom_build.rs` and `compilation.rs` at 5f94df478 (the commit `cargo 1.99.0 -vV` names, the
-pin then; `harness/scripts.py` holds it to the pinned nightly's cargo now):
+pin then):
 cargo's own environment with `OUT_DIR`, `TARGET`, `HOST`, `NUM_JOBS`, `OPT_LEVEL`, `DEBUG`,
 `PROFILE`, `RUSTC`, `RUSTDOC`, `RUSTC_LINKER`, the wrappers (the workspace's for members
 alone, taken away when cargo uses none), `CARGO`, `CARGO_MANIFEST_*`, `CARGO_PKG_*`,
@@ -936,7 +936,7 @@ caller's (`Client::configure`). `env::cargo_started` is cargo's environment once
 started: on Linux cargo's libgit2 sets `SSL_CERT_FILE` and `SSL_CERT_DIR` to the certificates
 openssl-probe finds, and every script inherits them.
 
-`harness/scripts.py` holds the crate to cargo. The pinned nightly's cargo checks each project with the
+Until 2026-10-30 `harness/scripts.py` held the crate to cargo. The pinned nightly's cargo checks each project with the
 harness as its `RUSTC_WRAPPER`, which puts the crate's program where rustc wrote each build
 script, so that cargo's run records what cargo gave it and then becomes the script. Each run
 is described from `cargo metadata`, `cargo check --unit-graph` and the configuration, and the
@@ -963,6 +963,13 @@ compiled by blaze into a library that rust-analyzer's proc-macro server, running
 loads. `proc_macro` is blaze's from F, so the bridge matches the server, which is built from the
 same rust-analyzer. [#38](https://github.com/indexable-inc/blaze/issues/38)'s expansion cache
 makes recompiling a macro rare. Risk: the bridge's ABI between the library and the server.
+
+Where J is now (2026-10-30): the server path below (J1, J2, the workspace's own server) is
+deleted. Every proc macro runs in process on blaze's evaluator (`crates/blaze-macro-eval`,
+[compile-time.md](v2/plan/design/compile-time.md) change 20), which speaks the pinned
+`library/proc_macro` bridge itself; a macro it cannot run stops the build with an error naming
+the macro and its crate ([v2/plan/lanes/dedup.md](v2/plan/lanes/dedup.md), "Proc macros: one
+engine"). What follows is the record of the server path.
 
 The plan (the `no-rustc-l3` lane, 2026-10-23). What stands in the way, read in the vendored
 rust-analyzer: the toolchain's server (`rust-analyzer-proc-macro-srv` in the sysroot's
@@ -1036,7 +1043,9 @@ a server and a library agree on the bridge only when both are built from one
 `library/proc_macro`, so `vendor/proc-macro-srv` is `src/tools/rust-analyzer`'s crates and
 `compiler/rustc_lexer` at the pinned nightly's commit (12433c307), which has
 `bridge::IdentKind`, with blaze's changes carried over, and `harness/toolchain_bump.py` takes
-it again at each bump.
+it again at each bump. Since 2026-10-30 (the last item below) the server is the workspace's own
+`crates/proc-macro-srv` and `crates/proc-macro-srv-cli`, which follow the toolchain's
+`proc_macro` bridge by hand, and nothing is re-vendored for it.
 
 Where J stands (2026-10-24):
 
@@ -1073,9 +1082,9 @@ Where J stands (2026-10-24):
 - `BLAZE_PROC_MACRO_COMPARE` (`crates/blaze-expand/src/compare.rs`) names that server, and
   `BLAZE_PROC_MACRO_LIBS` a directory of blaze's libraries: each call the toolchain's server
   expands with rustc's library is expanded again by blaze's server with blaze's library of
-  the crate, and the outputs, spans included, are compared. `harness/macroserver.py` builds
+  the crate, and the outputs, spans included, are compared. `harness/macroserver.py` (deleted 2026-10-30) built
   the server and the libraries of serde_derive, thiserror-impl, tokio-macros and clap_derive,
-  and holds every call of a package of derives with helper attributes, attributes and
+  and held every call of a package of derives with helper attributes, attributes and
   function-like macros equal (on dev-aws-11: the server linked in 10.6 s, each library in
   11-14 s). A proc-macro crate has no entry point: rust-analyzer took tokio's
   `#[proc_macro_attribute] pub fn main` for one.
@@ -1088,7 +1097,7 @@ Where J stands (2026-10-24):
   library blaze links names libc, as rustc's does. A crate rustc compiles there that links
   one (a proc macro that uses another, as `serde_with_macros` uses `darling_macro`, or a
   build script's dependency) has rustc compile the proc macro again over blaze's, as rustc
-  loads only its own; blaze's is kept beside its record. `macroserver.py all` builds fd,
+  loads only its own; blaze's is kept beside its record. `macroserver.py all` built fd,
   bat, hyperfine, just, nushell and helix whole that way and again with rustc's proc macros
   and the toolchain's server, each from an empty store, and expands every call with both
   (on dev-aws-8): 3,465 calls (3,192 derives, 149 attributes, 124 function-like), all the
@@ -1105,7 +1114,7 @@ Where J stands (2026-10-24):
   macro is compiled again by rustc. A script or proc macro blaze cannot build, or a proc
   macro with no server beside blaze, fails the load with why. A crate cargo built before the
   directory was seeded from it is described from cargo's records. `BLAZE_PROC_MACRO_SERVER=0`
-  is kept for `macroserver.py`'s reference build alone, which rustc builds whole, into a
+  was kept for `macroserver.py`'s reference build alone, which rustc built whole, into a
   directory of its own (`target/rust-analyzer-rustc`): cargo does not fingerprint the
   variable, and in one directory rustc read the empty files (#460). The variable is part of
   which build and worker it is, so the daemon never keeps the mode it was started with. On blaze's
@@ -1125,13 +1134,25 @@ Where J stands (2026-10-24):
   once) and expands with that; one blaze cannot make is said and left to rustc's library
   and the toolchain's server. A library is kept in the store by the description of what it
   was linked from and the digests of the files its dep-info names, so a second target
-  directory takes it from there. `macroserver.py all` builds each app a third time, into an
-  empty target directory over the first build's store, and fails if a library is linked
+  directory takes it from there. `macroserver.py all` built each app a third time, into an
+  empty target directory over the first build's store, and failed if a library is linked
   again: 3,465 calls the same on all three, every library from the store the third time
   (hyperfine 35.1 s to 9.5 s, nushell 123.0 s to 79.3 s). On fd, the daemon's load started
   blaze's server and no other, and made `clap_derive` in 19 s from an empty store, then took
   it from the store when it was deleted. Left: #327, and the key names the target
   directory's paths, so another checkout of the same crates links again.
+- The workspace's own server (2026-10-30, `selfbuild-srv`): `vendor/proc-macro-srv` is gone.
+  The loader that `dlopen`s a library and reads `BLAZE_PROC_MACROS` is in `crates/proc-macro-srv`
+  (`dylib.rs`), over the standard library's `proc_macro` and no other crate of rustc's tree,
+  and the executable is `blaze-proc-macro-srv` of `crates/proc-macro-srv-cli`, on the
+  workspace's `proc-macro-api`: it speaks protocol version 8, with the warm socket
+  (`BLAZE_WARM_SOCKET`, scoped expansions) and wire trees. blaze's own build has it
+  (`blaze build -p blaze-engine -p proc-macro-srv-cli`), `build_release.py --server` builds it
+  `--exe` from the workspace's root, and `harness/toolchain_bump.py` re-vendors nothing for it:
+  a bridge that changed at a bump is fixed in `crates/proc-macro-srv` by hand. Not built yet.
+- Deleted (2026-10-30, lane dedup): `crates/proc-macro-srv`, `crates/proc-macro-srv-cli`, the
+  client half of `crates/proc-macro-api`, `crates/blaze-macro-wasm` and `crates/blaze-wasi`, and
+  `build_release.py --server`. blaze-macro-eval is the one engine.
 
 J, K and M are planned together in [self-contained.md](self-contained.md#j-k-and-m), since
 what they remove is most of the toolchain blaze still keeps: rustc and the sysroot's rlibs (116
@@ -1185,7 +1206,7 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   reads what it printed as cargo does, and links each proc macro for blaze's server. It fills
   project-model's `OwnBuildScripts` hook, as `OwnMetadata` does for `cargo metadata`; what it
   cannot build or run fails the load, naming the package. `harness/resolve.py ctdeps`
-  ([resolve.md](resolve.md)) holds what the load reads (cfgs, variables, `OUT_DIR`'s files,
+  (deleted 2026-10-30) held what the load reads (cfgs, variables, `OUT_DIR`'s files,
   the proc macros) to cargo's: equal on 10 of the 14, and on fd too with the build-script
   sandbox off, whose environment is not cargo's ([resolve.md](resolve.md)); biome
   stops at a syn-1 proc macro blaze cannot compile (#327), and zed and bun fail for both, at a

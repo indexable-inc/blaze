@@ -1,0 +1,35 @@
+{
+  "id": "01124",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R6 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): add a typed key read-back: generated `f::key_of(db, id) -> Option<(A, B, ..)>` (None unless id is f's hidden key; one owner load). blaze-item-hash reads.rs:496 reads a several-argument fn's argument tuple from a read's key (`salsa::plumbing::interned_arguments::<F>(db, key) -> Option<F>`); the contract's `interned_arguments(storage, id)` gives only the name. The prose mentions `Query::key_of(db, id)` but plumbing doesn't list it.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: generated f::arguments(db, id) -> Option<(A, ..)> (the macros' name for key_of)."
+    }
+  ]
+}

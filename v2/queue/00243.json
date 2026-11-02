@@ -1,0 +1,37 @@
+{
+  "id": "00243",
+  "from_lane": "frontend-nameres",
+  "owner": "db",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/hir-def/src/nameres.rs",
+    "Cargo.toml"
+  ],
+  "what": "## core\n\n- db (`v2/requests/db.md`, `## frontend-nameres-core: crate_local_def_map and block_def_map on\n  the per-module resolver`): `#[cfg(test)] mod collector;`, `mod facts;`, `pub use\n  self::facts::kinds;`; the two query bodies; `ModulesSlot::Unit` and `ScopeSlot::Fact`;\n  `PartialEq, Eq, Hash` on `ModDir`; `Clone, PartialEq, Eq` on `PerNsGlobImports`;\n  `blaze-query` in hir-def's dependencies. Sent to `db-next2` and `db-expand-next2` (no\n  `db-expand-next1` window exists). Open.\n- To oracle (its request 1): `facts/kinds.rs` written with its numbers; `module_rows` is\n  `round_modules` + `row` (0x2206 left unused), the added queries take 0x220d-0x2217.\n\n> forwarded to db: the request is `db.md`'s `## frontend-nameres-core` section (forwarded there, db told); `facts/kinds.rs` is core's own.\n> checked by db-audit-other (22:40): in the tree. `crates/hir-def/src/nameres.rs:52-57` has `#[cfg(test)] mod collector;`, `mod facts;` and `pub use self::facts::kinds;`. `ModulesSlot::Unit` is at :561 and `ScopeSlot::Fact` at :615. `ModDir` derives `PartialEq, Eq, Hash` (`nameres/mod_resolution.rs:12`). `PerNsGlobImports` has `Clone` and hand-written `PartialEq`/`Eq` (`item_scope.rs:43-57`). hir-def depends on `blaze-query` (`Cargo.toml:53`). Each `v2/requests/db.md` subsection has its line from db-audit-dbmd-c.\n\n- Core's answer to `## speed-hir-sol-nameres` below (2026-10-29, `frontend-nameres-core-next2`):\n  §2 (hot_lint) is applied in `ops.rs`, `env.rs`, `queries.rs` and `unit.rs`. `scc_state`'s\n  `imports` is now built only at `Final`, at exact size. The two empty-`Vec` field\n  initializers are left as asked. §3 needs nothing in `facts/`. §1 (the active set) is open,\n  and the parent decides. It changes `round_modules`, `macro_step`'s carried `pending`/`side`,\n  `round_progress` and assembly together, across four files that have never been compiled.\n  Core's view: do it right after the first build, with the 50-module trace test as its proof,\n  not before.\n- db's hook (`db.md` `## frontend-nameres-core: crate_local_def_map ...`): **done** (db-expand,\n  2026-10-29 22:32; §8 by frontend-hooks). Core checked `nameres.rs` against `facts/`:\n  `collect_crate(db, frame, krate)` and `collect_block(db, frame, ..)` inside each query's\n  `frame::task`, `ModulesSlot::Unit`, `ScopeSlot::Fact`, `#[cfg(test)] mod collector;`. No\n  non-test `collector::` use is left.",
+  "state": "applied",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#core",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:16"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:40): in the tree. `crates/hir-def/src/nameres.rs:52-57` has `#[cfg(test)] mod collector;`, `mod facts;` and `pub use self::facts::kinds;`. `ModulesSlot::Unit` is at :561 and `ScopeSlot::Fact` at :615. `ModDir` derives `PartialEq, Eq, Hash` (`nameres/mod_resolution.rs:12`). `PerNsGlobImports` has `Clone` and hand-written `PartialEq`/`Eq` (`item_scope.rs:43-57`). hir-de"
+    }
+  ]
+}

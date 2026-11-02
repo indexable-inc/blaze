@@ -4,32 +4,37 @@
 //!
 //! This is only used for upvar inference.
 
+use std::mem;
+
+use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
     AdtId, VariantId,
     attrs::AttrFlags,
     hir::{
         Array, AsmOperand, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, MatchArm, Pat,
-        PatId, RecordLitField, RecordSpread, Statement,
+        PatId, RecordLitField, RecordSpread, Statement, UnsafeBinderCastKind,
     },
     resolver::ValueNs,
     upvars::UpvarsRef,
 };
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
-use smallvec::{SmallVec, smallvec};
+use rustc_type_ir::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor};
+use smallvec::SmallVec;
 use stdx::impl_from;
 use syntax::ast::{BinaryOp, UnaryOp};
 use tracing::{debug, instrument, trace};
 
 use crate::{
+    db::HirDatabase,
     Adjust, Adjustment, AutoBorrow, Span,
     infer::{
         ByRef, CaptureSourceStack, DerefPatBorrowMode, InferenceContext, PatAdjust, PatAdjustment,
         UpvarCapture, closure::analysis::BorrowKind,
     },
     method_resolution::CandidateId,
-    next_solver::{ErrorGuaranteed, StoredTy, Ty, TyKind},
+    next_solver::{DbInterner, ErrorGuaranteed, StoredTy, Ty, TyKind},
     utils::EnumerateAndAdjustIterator,
 };
 
@@ -70,7 +75,7 @@ pub enum PlaceBase {
     Upvar { closure: ExprId, var_id: BindingId },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct Projection {
     /// Type after the projection is applied.
     pub ty: StoredTy,
@@ -92,17 +97,18 @@ pub struct Place {
     #[type_visitable(ignore)]
     pub base: PlaceBase,
     /// How this place is derived from the base place.
-    pub projections: Vec<Projection>,
+    pub projections: Box<[Projection]>,
 }
 
-impl Place {
-    /// Returns an iterator of the types that have to be dereferenced to access
-    /// the `Place`.
-    ///
-    /// The types are in the reverse order that they are applied. So if
-    /// `x: &*const u32` and the `Place` is `**x`, then the types returned are
-    ///`*const u32` then `&*const u32`.
-    pub fn deref_tys<'db>(&self) -> impl Iterator<Item = Ty<'db>> {
+/// A place's base type and projections, as [`Place`] and [`PlaceBuf`] both hold them.
+#[derive(Clone, Copy)]
+struct PlaceView<'a> {
+    base_ty: StoredTy,
+    projections: &'a [Projection],
+}
+
+impl<'a> PlaceView<'a> {
+    fn deref_tys<'db>(self) -> impl Iterator<Item = Ty<'db>> {
         self.projections.iter().enumerate().rev().filter_map(move |(index, proj)| {
             if ProjectionKind::Deref == proj.kind {
                 Some(self.ty_before_projection(index))
@@ -112,14 +118,11 @@ impl Place {
         })
     }
 
-    /// Returns the type of this `Place` after all projections have been applied.
-    pub fn ty<'db>(&self) -> Ty<'db> {
+    fn ty<'db>(self) -> Ty<'db> {
         self.projections.last().map_or(self.base_ty.as_ref(), |proj| proj.ty.as_ref())
     }
 
-    /// Returns the type of this `Place` immediately before `projection_index`th projection
-    /// is applied.
-    pub fn ty_before_projection<'db>(&self, projection_index: usize) -> Ty<'db> {
+    fn ty_before_projection<'db>(self, projection_index: usize) -> Ty<'db> {
         assert!(projection_index < self.projections.len());
         if projection_index == 0 {
             self.base_ty.as_ref()
@@ -129,47 +132,308 @@ impl Place {
     }
 }
 
+impl Place {
+    fn view(&self) -> PlaceView<'_> {
+        PlaceView { base_ty: self.base_ty, projections: &self.projections }
+    }
+
+    /// Returns an iterator of the types that have to be dereferenced to access
+    /// the `Place`.
+    ///
+    /// The types are in the reverse order that they are applied. So if
+    /// `x: &*const u32` and the `Place` is `**x`, then the types returned are
+    ///`*const u32` then `&*const u32`.
+    pub fn deref_tys<'db>(&self) -> impl Iterator<Item = Ty<'db>> {
+        self.view().deref_tys()
+    }
+
+    /// Returns the type of this `Place` after all projections have been applied.
+    pub fn ty<'db>(&self) -> Ty<'db> {
+        self.view().ty()
+    }
+
+    /// Returns the type of this `Place` immediately before `projection_index`th projection
+    /// is applied.
+    pub fn ty_before_projection<'db>(&self, projection_index: usize) -> Ty<'db> {
+        self.view().ty_before_projection(projection_index)
+    }
+}
+
+/// A [`Place`] while closures are analysed: its projections are in the frame.
+#[derive(Clone, Debug)]
+pub(crate) struct PlaceBuf<'f> {
+    pub(crate) base_ty: StoredTy,
+    pub(crate) base: PlaceBase,
+    pub(crate) projections: Vec<Projection, &'f Frame>,
+}
+
+impl<'f> PlaceBuf<'f> {
+    pub(crate) fn new(base_ty: Ty<'_>, base: PlaceBase, frame: &'f Frame) -> Self {
+        PlaceBuf { base_ty: base_ty.store(), base, projections: Vec::new_in(frame) }
+    }
+
+    /// A result's place, for analysis to extend.
+    pub(crate) fn of(place: &Place, frame: &'f Frame) -> Self {
+        PlaceBuf {
+            base_ty: place.base_ty,
+            base: place.base,
+            projections: place.projections.to_vec_in(frame),
+        }
+    }
+
+    /// The result's place, at its length.
+    pub(crate) fn to_place(&self) -> Place {
+        // alloc: a result's projections, once at their number (none for a place without any)
+        Place { base_ty: self.base_ty, base: self.base, projections: Box::from(&*self.projections) }
+    }
+
+    fn view(&self) -> PlaceView<'_> {
+        PlaceView { base_ty: self.base_ty, projections: &self.projections }
+    }
+
+    pub(crate) fn deref_tys<'db>(&self) -> impl Iterator<Item = Ty<'db>> {
+        self.view().deref_tys()
+    }
+
+    pub(crate) fn ty<'db>(&self) -> Ty<'db> {
+        self.view().ty()
+    }
+
+    pub(crate) fn ty_before_projection<'db>(&self, projection_index: usize) -> Ty<'db> {
+        self.view().ty_before_projection(projection_index)
+    }
+}
+
+impl<'db> TypeVisitable<DbInterner<'db>> for PlaceBuf<'_> {
+    fn visit_with<V: TypeVisitor<DbInterner<'db>>>(&self, visitor: &mut V) -> V::Result {
+        rustc_ast_ir::try_visit!(self.base_ty.visit_with(visitor));
+        self.projections[..].visit_with(visitor)
+    }
+}
+
+/// Folds the types in place: the frame block is kept.
+impl<'db> TypeFoldable<DbInterner<'db>> for PlaceBuf<'_> {
+    fn try_fold_with<F: FallibleTypeFolder<DbInterner<'db>>>(
+        mut self,
+        folder: &mut F,
+    ) -> std::result::Result<Self, F::Error> {
+        self.base_ty = self.base_ty.try_fold_with(folder)?;
+        for projection in &mut self.projections {
+            *projection = projection.try_fold_with(folder)?;
+        }
+        Ok(self)
+    }
+
+    fn fold_with<F: TypeFolder<DbInterner<'db>>>(mut self, folder: &mut F) -> Self {
+        self.base_ty = self.base_ty.fold_with(folder);
+        for projection in &mut self.projections {
+            *projection = projection.fold_with(folder);
+        }
+        self
+    }
+}
+
+/// A source stack while closures are analysed: base first, one id per projection after it.
+#[derive(Clone, Debug)]
+pub(crate) enum SourceStack<'f> {
+    One(ExprOrPatIdPacked),
+    Two([ExprOrPatIdPacked; 2]),
+    Many(Vec<ExprOrPatIdPacked, &'f Frame>),
+}
+
+impl<'f> SourceStack<'f> {
+    pub(crate) fn of(stack: &CaptureSourceStack, frame: &'f Frame) -> Self {
+        match **stack {
+            [one] => Self::One(one),
+            [first, second] => Self::Two([first, second]),
+            ref many => Self::Many(many.to_vec_in(frame)),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ExprOrPatIdPacked] {
+        match self {
+            Self::One(it) => std::slice::from_ref(it),
+            Self::Two(it) => it,
+            Self::Many(it) => it,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub(crate) fn final_source(&self) -> ExprOrPatIdPacked {
+        *self.as_slice().last().expect("should always have a final source")
+    }
+
+    fn push(&mut self, id: ExprOrPatIdPacked, frame: &'f Frame) {
+        match self {
+            Self::One(first) => *self = Self::Two([*first, id]),
+            Self::Two([first, second]) => {
+                let mut ids = Vec::with_capacity_in(4, frame);
+                ids.extend([*first, *second, id]);
+                *self = Self::Many(ids);
+            }
+            Self::Many(ids) => ids.push(id),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        debug_assert!(len > 0);
+        match self {
+            Self::One(_) => {}
+            Self::Two([first, _]) => {
+                if len == 1 {
+                    *self = Self::One(*first)
+                }
+            }
+            Self::Many(ids) => ids.truncate(len),
+        }
+    }
+
+    pub(crate) fn to_result(&self) -> CaptureSourceStack {
+        CaptureSourceStack::from_slice(self.as_slice())
+    }
+}
+
+/// The source stacks of one place while closures are analysed: almost always one.
+#[derive(Clone, Debug)]
+pub(crate) enum Sources<'f> {
+    One(SourceStack<'f>),
+    Many(Vec<SourceStack<'f>, &'f Frame>),
+}
+
+impl<'f> Sources<'f> {
+    pub(crate) fn one(stack: SourceStack<'f>) -> Self {
+        Self::One(stack)
+    }
+
+    pub(crate) fn none(frame: &'f Frame) -> Self {
+        Self::Many(Vec::new_in(frame))
+    }
+
+    pub(crate) fn of(sources: &[CaptureSourceStack], frame: &'f Frame) -> Self {
+        match sources {
+            [one] => Self::One(SourceStack::of(one, frame)),
+            _ => {
+                let mut all = Vec::with_capacity_in(sources.len(), frame);
+                all.extend(sources.iter().map(|it| SourceStack::of(it, frame)));
+                Self::Many(all)
+            }
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[SourceStack<'f>] {
+        match self {
+            Self::One(it) => std::slice::from_ref(it),
+            Self::Many(it) => it,
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [SourceStack<'f>] {
+        match self {
+            Self::One(it) => std::slice::from_mut(it),
+            Self::Many(it) => it,
+        }
+    }
+
+    pub(crate) fn first(&self) -> Option<&SourceStack<'f>> {
+        self.as_slice().first()
+    }
+
+    pub(crate) fn push(&mut self, stack: SourceStack<'f>, frame: &'f Frame) {
+        match self {
+            Self::Many(all) => all.push(stack),
+            Self::One(_) => {
+                let mut all = Vec::with_capacity_in(2, frame);
+                all.extend(mem::replace(self, Self::none(frame)));
+                all.push(stack);
+                *self = Self::Many(all);
+            }
+        }
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&SourceStack<'f>) -> bool, frame: &'f Frame) {
+        match self {
+            Self::One(it) => {
+                if !keep(it) {
+                    *self = Self::none(frame);
+                }
+            }
+            Self::Many(all) => all.retain(keep),
+        }
+    }
+
+    /// The result's sources, at their number.
+    pub(crate) fn to_result(&self) -> Box<[CaptureSourceStack]> {
+        // alloc: a result's sources, once at their number (a slice map is `TrustedLen`)
+        self.as_slice().iter().map(SourceStack::to_result).collect()
+    }
+}
+
+impl<'f> IntoIterator for Sources<'f> {
+    type Item = SourceStack<'f>;
+    type IntoIter =
+        Either<std::iter::Once<SourceStack<'f>>, std::vec::IntoIter<SourceStack<'f>, &'f Frame>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::One(it) => Either::Left(std::iter::once(it)),
+            Self::Many(all) => Either::Right(all.into_iter()),
+        }
+    }
+}
+
 /// A `PlaceWithOrigin` represents how a value is located in memory. This does not
 /// always correspond to a syntactic place expression. For example, when
 /// processing a pattern, a `Place` can be used to refer to the sub-value
 /// currently being inspected.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PlaceWithOrigin {
+#[derive(Clone, Debug)]
+pub(crate) struct PlaceWithOrigin<'f> {
     /// `ExprId`s or `PatId`s of the expressions or patterns producing this value.
-    pub origins: SmallVec<[CaptureSourceStack; 2]>,
+    pub origins: Sources<'f>,
 
     /// Information about the `Place`.
-    pub place: Place,
+    pub place: PlaceBuf<'f>,
 }
 
-impl PlaceWithOrigin {
-    fn new_no_projections<'db>(
+impl<'f> PlaceWithOrigin<'f> {
+    fn new_no_projections(
         origin: impl Into<ExprOrPatIdPacked>,
-        base_ty: Ty<'db>,
+        base_ty: Ty<'_>,
         base: PlaceBase,
-    ) -> PlaceWithOrigin {
-        Self::new(
-            smallvec![CaptureSourceStack::from_single(origin.into())],
-            base_ty,
-            base,
-            Vec::new(),
-        )
+        frame: &'f Frame,
+    ) -> Self {
+        PlaceWithOrigin {
+            origins: Sources::one(SourceStack::One(origin.into())),
+            place: PlaceBuf::new(base_ty, base, frame),
+        }
     }
 
-    fn new<'db>(
-        origins: SmallVec<[CaptureSourceStack; 2]>,
-        base_ty: Ty<'db>,
+    /// A result's capture, as the enclosing closure's place of `base`.
+    fn of_capture(
+        place: &Place,
         base: PlaceBase,
-        projections: Vec<Projection>,
-    ) -> PlaceWithOrigin {
-        debug_assert!(origins.iter().all(|origin| origin.len() == projections.len() + 1));
-        PlaceWithOrigin { origins, place: Place { base_ty: base_ty.store(), base, projections } }
+        sources: &[CaptureSourceStack],
+        frame: &'f Frame,
+    ) -> Self {
+        let place = PlaceBuf {
+            base_ty: place.base_ty,
+            base,
+            projections: place.projections.to_vec_in(frame),
+        };
+        let origins = Sources::of(sources, frame);
+        debug_assert!(
+            origins.as_slice().iter().all(|origin| origin.len() == place.projections.len() + 1)
+        );
+        PlaceWithOrigin { origins, place }
     }
 
     fn push_projection(&mut self, projection: Projection, origin: ExprOrPatIdPacked) {
+        let frame = *self.place.projections.allocator();
         self.place.projections.push(projection);
-        for origin_stack in &mut self.origins {
-            origin_stack.push(origin);
+        for origin_stack in self.origins.as_mut_slice() {
+            origin_stack.push(origin, frame);
         }
     }
 
@@ -290,7 +554,7 @@ pub enum FakeReadCause {
 
 /// This trait defines the callbacks you can expect to receive when
 /// employing the ExprUseVisitor.
-pub(crate) trait Delegate<'db> {
+pub(crate) trait Delegate<'db, 'f> {
     /// The value found at `place` is moved, depending
     /// on `mode`. Where `diag_expr_id` is the id used for diagnostics for `place`.
     ///
@@ -301,7 +565,7 @@ pub(crate) trait Delegate<'db> {
     /// diagnostics. Around pattern matching such as `let pat = expr`, the diagnostic
     /// id will be the id of the expression `expr` but the place itself will have
     /// the id of the binding in the pattern `pat`.
-    fn consume(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>);
+    fn consume(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>);
 
     /// The value found at `place` is used, depending
     /// on `mode`. Where `diag_expr_id` is the id used for diagnostics for `place`.
@@ -316,15 +580,15 @@ pub(crate) trait Delegate<'db> {
     /// diagnostics. Around pattern matching such as `let pat = expr`, the diagnostic
     /// id will be the id of the expression `expr` but the place itself will have
     /// the id of the binding in the pattern `pat`.
-    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>);
+    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>);
 
     /// The value found at `place` is being borrowed with kind `bk`.
     /// `diag_expr_id` is the id used for diagnostics (see `consume` for more details).
     fn borrow(
         &mut self,
-        place_with_id: PlaceWithOrigin,
+        place_with_id: PlaceWithOrigin<'f>,
         bk: BorrowKind,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, 'f>,
     );
 
     /// The value found at `place` is being copied.
@@ -333,7 +597,7 @@ pub(crate) trait Delegate<'db> {
     /// If an implementation is not provided, use of a `Copy` type in a ByValue context is instead
     /// considered a use by `ImmBorrow` and `borrow` is called instead. This is because a shared
     /// borrow is the "minimum access" that would be needed to perform a copy.
-    fn copy(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn copy(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         // In most cases, copying data from `x` is equivalent to doing `*&x`, so by default
         // we treat a copy of `x` as a borrow of `x`.
         self.borrow(place_with_id, BorrowKind::Immutable, ctx)
@@ -341,12 +605,12 @@ pub(crate) trait Delegate<'db> {
 
     /// The path at `assignee_place` is being assigned to.
     /// `diag_expr_id` is the id used for diagnostics (see `consume` for more details).
-    fn mutate(&mut self, assignee_place: PlaceWithOrigin, ctx: &mut InferenceContext<'db>);
+    fn mutate(&mut self, assignee_place: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>);
 
     /// The path at `binding_place` is a binding that is being initialized.
     ///
     /// This covers cases such as `let x = 42;`
-    fn bind(&mut self, binding_place: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn bind(&mut self, binding_place: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         // Bindings can normally be treated as a regular assignment, so by default we
         // forward this to the mutate callback.
         self.mutate(binding_place, ctx)
@@ -355,47 +619,47 @@ pub(crate) trait Delegate<'db> {
     /// The `place` should be a fake read because of specified `cause`.
     fn fake_read(
         &mut self,
-        place_with_id: PlaceWithOrigin,
+        place_with_id: PlaceWithOrigin<'f>,
         cause: FakeReadCause,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, 'f>,
     );
 }
 
-impl<'db, D: Delegate<'db>> Delegate<'db> for &mut D {
-    fn consume(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+impl<'db, 'f, D: Delegate<'db, 'f>> Delegate<'db, 'f> for &mut D {
+    fn consume(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         (**self).consume(place_with_id, ctx)
     }
 
-    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         (**self).use_cloned(place_with_id, ctx)
     }
 
     fn borrow(
         &mut self,
-        place_with_id: PlaceWithOrigin,
+        place_with_id: PlaceWithOrigin<'f>,
         bk: BorrowKind,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, 'f>,
     ) {
         (**self).borrow(place_with_id, bk, ctx)
     }
 
-    fn copy(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn copy(&mut self, place_with_id: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         (**self).copy(place_with_id, ctx)
     }
 
-    fn mutate(&mut self, assignee_place: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn mutate(&mut self, assignee_place: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         (**self).mutate(assignee_place, ctx)
     }
 
-    fn bind(&mut self, binding_place: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
+    fn bind(&mut self, binding_place: PlaceWithOrigin<'f>, ctx: &mut InferenceContext<'db, 'f>) {
         (**self).bind(binding_place, ctx)
     }
 
     fn fake_read(
         &mut self,
-        place_with_id: PlaceWithOrigin,
+        place_with_id: PlaceWithOrigin<'f>,
         cause: FakeReadCause,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, 'f>,
     ) {
         (**self).fake_read(place_with_id, cause, ctx)
     }
@@ -404,26 +668,41 @@ impl<'db, D: Delegate<'db>> Delegate<'db> for &mut D {
 /// A visitor that reports how each expression is being used.
 ///
 /// See [module-level docs][self] and [`Delegate`] for details.
-pub(crate) struct ExprUseVisitor<'a, 'db, D: Delegate<'db>> {
-    cx: &'a mut InferenceContext<'db>,
+pub(crate) struct ExprUseVisitor<'a, 'db, 'f, D: Delegate<'db, 'f>> {
+    cx: &'a mut InferenceContext<'db, 'f>,
     delegate: D,
     closure_expr: ExprId,
     upvars: UpvarsRef<'db>,
+    /// rustc's `body_owner_is_closure`: false for [`ExprUseVisitor::for_body`], where what a
+    /// nested closure captures is a local of the body, not an upvar.
+    owner_is_closure: bool,
 }
 
-impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
+impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
     /// Creates the ExprUseVisitor, configuring it with the various options provided:
     ///
     /// - `delegate` -- who receives the callbacks
     /// - `param_env` --- parameter environment for trait lookups (esp. pertaining to `Copy`)
     /// - `typeck_results` --- typeck results for the code being analyzed
     pub(crate) fn new(
-        cx: &'a mut InferenceContext<'db>,
+        cx: &'a mut InferenceContext<'db, 'f>,
         closure_expr: ExprId,
         upvars: UpvarsRef<'db>,
         delegate: D,
     ) -> Self {
-        ExprUseVisitor { delegate, closure_expr, upvars, cx }
+        ExprUseVisitor { delegate, closure_expr, upvars, cx, owner_is_closure: true }
+    }
+
+    /// The visitor of a body that is no closure (rustc's `ExprUseVisitor::for_clippy` of a fn,
+    /// const or static): it has no upvars, and `root` is its root expression.
+    pub(crate) fn for_body(cx: &'a mut InferenceContext<'db, 'f>, root: ExprId, delegate: D) -> Self {
+        ExprUseVisitor {
+            delegate,
+            closure_expr: root,
+            upvars: UpvarsRef::empty(),
+            cx,
+            owner_is_closure: false,
+        }
     }
 
     pub(crate) fn consume_closure_body(&mut self, params: &[PatId], body: ExprId) -> Result {
@@ -433,6 +712,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
 
             let param_place = self.cat_rvalue(param.into(), param_ty);
 
+            // clone: an rvalue's place, read twice; it has no projections to copy
             self.fake_read_scrutinee(param_place.clone(), false);
             self.walk_pat(param_place, param, false)?;
         }
@@ -443,7 +723,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn consume_or_copy(&mut self, place_with_id: PlaceWithOrigin) {
+    fn consume_or_copy(&mut self, place_with_id: PlaceWithOrigin<'f>) {
         if self.cx.table.type_is_copy_modulo_regions(place_with_id.place.ty()) {
             self.delegate.copy(place_with_id, self.cx);
         } else {
@@ -452,7 +732,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub(crate) fn consume_clone_or_copy(&mut self, place_with_id: PlaceWithOrigin) {
+    pub(crate) fn consume_clone_or_copy(&mut self, place_with_id: PlaceWithOrigin<'f>) {
         // `x.use` will do one of the following
         // * if it implements `Copy`, it will be a copy
         // * if it implements `UseCloned`, it will be a call to `clone`
@@ -507,7 +787,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     fn walk_expr_here(&mut self, expr: ExprId) -> Result {
         self.walk_adjustment(expr)?;
 
-        match self.cx.store[expr] {
+        match self.cx.store.expr(expr) {
             Expr::Path(_) => {}
 
             Expr::UnaryOp { op: UnaryOp::Deref, expr: base } => {
@@ -520,29 +800,33 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.walk_expr(base)?;
             }
 
+            Expr::UnsafeBinderCast { expr: base, .. } => {
+                self.walk_expr(base)?;
+            }
+
             Expr::Index { base: lhs, index: rhs } => {
                 // lhs[rhs]
                 self.walk_expr(lhs)?;
                 self.consume_expr(rhs)?;
             }
 
-            Expr::Call { callee, ref args } => {
+            Expr::Call { callee, args } => {
                 // callee(args)
                 self.consume_expr(callee)?;
                 self.consume_exprs(args)?;
             }
 
-            Expr::MethodCall { receiver, ref args, .. } => {
+            Expr::MethodCall { receiver, args, .. } => {
                 // callee.m(args)
                 self.consume_expr(receiver)?;
                 self.consume_exprs(args)?;
             }
 
-            Expr::RecordLit { ref fields, spread, .. } => {
+            Expr::RecordLit { fields, spread, .. } => {
                 self.walk_struct_expr(fields, spread)?;
             }
 
-            Expr::Tuple { ref exprs } => {
+            Expr::Tuple { exprs } => {
                 self.consume_exprs(exprs)?;
             }
 
@@ -562,17 +846,22 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.walk_local(init, pat, None)?;
             }
 
-            Expr::Match { expr: discr, ref arms } => {
+            Expr::Match { expr: discr, arms } => {
                 let discr_place = self.cat_expr(discr)?;
+                // clone: frame copy, the scrutinee is read by the fake read and each arm
                 self.fake_read_scrutinee(discr_place.clone(), true);
                 self.walk_expr(discr)?;
 
-                for arm in arms {
-                    self.walk_arm(discr_place.clone(), arm)?;
+                if let Some((last, arms)) = arms.split_last() {
+                    for arm in arms {
+                        // clone: frame copy for every arm but the last
+                        self.walk_arm(discr_place.clone(), arm)?;
+                    }
+                    self.walk_arm(discr_place, last)?;
                 }
             }
 
-            Expr::Array(Array::ElementList { elements: ref exprs }) => {
+            Expr::Array(Array::ElementList { elements: exprs }) => {
                 self.consume_exprs(exprs)?;
             }
 
@@ -584,7 +873,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.borrow_expr(base, bk)?;
             }
 
-            Expr::InlineAsm(ref asm) => {
+            Expr::InlineAsm(asm) => {
                 for (_, op) in &asm.operands {
                     match *op {
                         AsmOperand::In { expr, .. } => {
@@ -634,7 +923,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.consume_expr(rhs)?;
             }
 
-            Expr::Block { ref statements, tail, .. } => {
+            Expr::Block { statements, tail, .. } => {
                 for stmt in statements {
                     self.walk_stmt(stmt)?;
                 }
@@ -667,8 +956,19 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.consume_expr(base)?;
             }
 
-            Expr::BinaryOp { lhs, rhs, op: None | Some(BinaryOp::Assignment { .. }) } => {
+            Expr::BinaryOp { lhs, rhs, op: None } => {
                 self.consume_expr(lhs)?;
+                self.consume_expr(rhs)?;
+            }
+
+            // rustc's `ExprKind::AssignOp`: an overloaded one takes its lhs by the `&mut`
+            // autoref it records, a builtin one writes it in place.
+            Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::Assignment { .. }) } => {
+                if self.cx.result.method_resolutions.contains_idx(expr) {
+                    self.consume_expr(lhs)?;
+                } else {
+                    self.mutate_expr(lhs)?;
+                }
                 self.consume_expr(rhs)?;
             }
 
@@ -691,8 +991,8 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
         Ok(())
     }
 
-    fn walk_stmt(&mut self, stmt: &Statement) -> Result {
-        match *stmt {
+    fn walk_stmt(&mut self, stmt: Statement<'_>) -> Result {
+        match stmt {
             Statement::Let { pat, initializer: Some(expr), else_branch: els, .. } => {
                 self.walk_local(expr, pat, els)?;
             }
@@ -712,7 +1012,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn fake_read_scrutinee(&mut self, discr_place: PlaceWithOrigin, refutable: bool) {
+    fn fake_read_scrutinee(&mut self, discr_place: PlaceWithOrigin<'f>, refutable: bool) {
         let closure_def_id = match discr_place.place.base {
             PlaceBase::Upvar { closure, var_id: _ } => Some(closure),
             _ => None,
@@ -730,6 +1030,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     fn walk_local(&mut self, expr: ExprId, pat: PatId, els: Option<ExprId>) -> Result {
         self.walk_expr(expr)?;
         let expr_place = self.cat_expr(expr)?;
+        // clone: frame copy, the place is read by the fake read and then the pattern
         self.fake_read_scrutinee(expr_place.clone(), els.is_some());
         self.walk_pat(expr_place, pat, false)?;
         if let Some(els) = els {
@@ -761,6 +1062,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     if !is_mentioned {
                         let field_place = self.cat_projection(
                             with_expr.into(),
+                            // clone: frame copy, each field the spread supplies extends its own
                             with_place.clone(),
                             adt_field_types[f_index]
                                 .ty()
@@ -807,6 +1109,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 Adjust::NeverToAny | Adjust::Pointer(_) => {
                     // Creating a closure/fn-pointer or unsizing consumes
                     // the input and stores it into the resulting rvalue.
+                    // clone: frame copy, the place goes on to the next adjustment
                     self.consume_or_copy(place_with_id.clone());
                 }
 
@@ -819,10 +1122,12 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 // this is an autoref of `x`.
                 Adjust::Deref(Some(ref deref)) => {
                     let bk = BorrowKind::from_mutbl(deref.0);
+                    // clone: frame copy, the place goes on to the next adjustment
                     self.delegate.borrow(place_with_id.clone(), bk, self.cx);
                 }
 
                 Adjust::Borrow(ref autoref) => {
+                    // clone: frame copy, the place goes on to the next adjustment
                     self.walk_autoref(expr, place_with_id.clone(), autoref);
                 }
             }
@@ -834,7 +1139,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     /// Walks the autoref `autoref` applied to the autoderef'd
     /// `expr`. `base_place` is `expr` represented as a place,
     /// after all relevant autoderefs have occurred.
-    fn walk_autoref(&mut self, expr: ExprId, base_place: PlaceWithOrigin, autoref: &AutoBorrow) {
+    fn walk_autoref(&mut self, expr: ExprId, base_place: PlaceWithOrigin<'f>, autoref: &AutoBorrow) {
         debug!("walk_autoref(expr={:?} base_place={:?} autoref={:?})", expr, base_place, autoref);
 
         match *autoref {
@@ -850,7 +1155,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
         }
     }
 
-    fn walk_arm(&mut self, discr_place: PlaceWithOrigin, arm: &MatchArm) -> Result {
+    fn walk_arm(&mut self, discr_place: PlaceWithOrigin<'f>, arm: &MatchArm) -> Result {
         self.walk_pat(discr_place, arm.pat, arm.guard.is_some())?;
 
         if let Some(e) = arm.guard {
@@ -875,9 +1180,9 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     /// Do note that discrepancies like these do still create obscure corners
     /// in the semantics of the language, and should be avoided if possible.
     #[instrument(skip(self), level = "debug")]
-    fn walk_pat(&mut self, discr_place: PlaceWithOrigin, pat: PatId, has_guard: bool) -> Result {
-        self.cat_pattern(discr_place.clone(), pat, &mut |this, place, pat| {
-            let walk_deref_pat = |this: &mut Self, subpattern: PatId, place: PlaceWithOrigin| {
+    fn walk_pat(&mut self, discr_place: PlaceWithOrigin<'f>, pat: PatId, has_guard: bool) -> Result {
+        self.cat_pattern(discr_place, pat, &mut |this, place, pat| {
+            let walk_deref_pat = |this: &mut Self, subpattern: PatId, place: PlaceWithOrigin<'f>| {
                 // A deref pattern is a bit special: the binding mode of its inner bindings
                 // determines whether to borrow *at the level of the deref pattern* rather than
                 // borrowing the bound place (since that inner place is inside the temporary that
@@ -902,15 +1207,12 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 }
             };
 
-            debug!("walk_pat: pat.kind={:?}", this.cx.store[pat]);
-            let read_discriminant = {
-                let place = place.clone();
-                |this: &mut Self| {
-                    this.delegate.borrow(place, BorrowKind::Immutable, this.cx);
-                }
+            debug!("walk_pat: pat.kind={:?}", this.cx.store.pat(pat));
+            let read_discriminant = |this: &mut Self, place: PlaceWithOrigin<'f>| {
+                this.delegate.borrow(place, BorrowKind::Immutable, this.cx);
             };
 
-            match this.cx.store[pat] {
+            match this.cx.store.pat(pat) {
                 Pat::Bind { id, .. } => {
                     debug!("walk_pat: binding place={:?} pat={:?}", place, pat);
                     let bm = this.cx.result.binding_modes[pat];
@@ -928,7 +1230,8 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     // binding when lowering pattern guards to ensure that the guard does not
                     // modify the scrutinee.
                     if has_guard {
-                        read_discriminant(this);
+                        // clone: frame copy, the binding is borrowed and then bound
+                        read_discriminant(this, place.clone());
                     }
 
                     // It is also a borrow or copy/move of the value being matched.
@@ -947,7 +1250,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     }
                 }
                 Pat::Deref { inner: subpattern } => walk_deref_pat(this, subpattern, place),
-                Pat::Path(ref path) => {
+                Pat::Path(path) => {
                     // A `Path` pattern is just a name like `Foo`. This is either a
                     // named constant or else it refers to an ADT variant
 
@@ -968,11 +1271,11 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                         //
                         // FIXME: Does the MIR code skip this read when matching on a ZST?
                         // If so, we can also skip it here.
-                        read_discriminant(this);
+                        read_discriminant(this, place);
                     } else if this.is_multivariant_adt(pat.into(), place.place.ty()) {
                         // Otherwise, this is a struct/enum variant, and so it's
                         // only a read if we need to read the discriminant.
-                        read_discriminant(this);
+                        read_discriminant(this, place);
                     }
                 }
                 Pat::Lit(_) | Pat::Range { .. } => {
@@ -985,23 +1288,23 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     //
                     // FIXME: What if the type being matched only has one
                     // possible value?
-                    read_discriminant(this);
+                    read_discriminant(this, place);
                 }
                 Pat::Record { .. } | Pat::TupleStruct { .. } => {
                     if this.is_multivariant_adt(pat.into(), place.place.ty()) {
-                        read_discriminant(this);
+                        read_discriminant(this, place);
                     }
                 }
-                Pat::Slice { prefix: ref lhs, slice: wild, suffix: ref rhs } => {
+                Pat::Slice { prefix: lhs, slice: wild, suffix: rhs } => {
                     // We don't need to test the length if the pattern is `[..]`
-                    if matches!((&**lhs, wild, &**rhs), (&[], Some(_), &[]))
+                    if matches!((lhs, wild, rhs), (&[], Some(_), &[]))
                         // Arrays have a statically known size, so
                         // there is no need to read their length
                         || place.place.ty().strip_references().is_array()
                     {
                         // No read necessary
                     } else {
-                        read_discriminant(this);
+                        read_discriminant(this, place);
                     }
                 }
                 Pat::Expr(expr) => {
@@ -1060,7 +1363,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
             for (fake_read, cause, origins) in closure_data.fake_reads.iter() {
                 match fake_read.base {
                     PlaceBase::Upvar { var_id, closure: _ } => {
-                        if upvar_is_local_variable(self.upvars, var_id) {
+                        if self.owner_is_closure && upvar_is_local_variable(self.upvars, var_id) {
                             // The nested closure might be fake reading the current (enclosing) closure's local variables.
                             // The only places we want to fake read before creating the parent closure are the ones that
                             // are not local to it/ defined by it.
@@ -1087,15 +1390,19 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                         );
                     }
                 };
+                let frame = self.cx.frame;
                 self.delegate.fake_read(
-                    PlaceWithOrigin { place: fake_read.clone(), origins: origins.clone() },
+                    PlaceWithOrigin {
+                        place: PlaceBuf::of(fake_read, frame),
+                        origins: Sources::of(origins, frame),
+                    },
                     *cause,
                     self.cx,
                 );
             }
 
             for (var_id, min_list) in closure_data.min_captures.iter() {
-                if !self.upvars.contains(*var_id) {
+                if self.owner_is_closure && !self.upvars.contains(var_id) {
                     // The nested closure might be capturing the current (enclosing) closure's local variables.
                     // We check if the root variable is ever mentioned within the enclosing closure, if not
                     // then for the current body (if it's a closure) these aren't captures, we will ignore them.
@@ -1105,14 +1412,17 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     let place = &captured_place.place;
                     let capture_info = &captured_place.info;
 
-                    // Mark the place to be captured by the enclosing closure
-                    let place_base =
-                        PlaceBase::Upvar { var_id: *var_id, closure: self.closure_expr };
-                    let place_with_id = PlaceWithOrigin::new(
-                        capture_info.sources.clone(),
-                        place.base_ty.as_ref(),
+                    // Mark the place to be captured by the enclosing closure, or, in a body that is
+                    // no closure, as the body's own local.
+                    let place_base = match self.owner_is_closure {
+                        true => PlaceBase::Upvar { var_id, closure: self.closure_expr },
+                        false => PlaceBase::Local(var_id),
+                    };
+                    let place_with_id = PlaceWithOrigin::of_capture(
+                        place,
                         place_base,
-                        place.projections.clone(),
+                        &capture_info.sources,
+                        self.cx.frame,
                     );
 
                     match capture_info.capture_kind {
@@ -1154,11 +1464,11 @@ impl_from!(PatId for CatPatternPat);
 /// example, auto-derefs are explicit. Also, an index `a[b]` is decomposed into
 /// two operations: a dereference to reach the array data and then an index to
 /// jump forward to the relevant item.
-impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
+impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
     fn expect_and_resolve_type(&mut self, ty: Option<Ty<'db>>) -> Result<Ty<'db>> {
         match ty {
             Some(ty) => {
-                let ty = self.cx.infcx().resolve_vars_if_possible(ty);
+                let ty = self.cx.infcx().deeply_resolve_ignoring_regions(ty);
                 self.error_reported_in_ty(ty)?;
                 Ok(ty)
             }
@@ -1198,7 +1508,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 debug!("pat_ty(pat={:?}) found adjustment `{:?}`", pat, first_adjust);
                 return Ok(first_adjust.source.as_ref());
             }
-        } else if let Pat::Ref { pat: subpat, .. } = self.cx.store[pat]
+        } else if let Pat::Ref { pat: subpat, .. } = self.cx.store.pat(pat)
             && self.cx.result.is_skipped_ref_pat(pat)
         {
             return self.pat_ty_adjusted(subpat);
@@ -1214,7 +1524,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
 
         // This code detects whether we are looking at a `ref x`,
         // and if so, figures out what the type *being borrowed* is.
-        match self.cx.store[pat] {
+        match self.cx.store.pat(pat) {
             Pat::Bind { .. } => {
                 let bm = self.cx.result.binding_mode(pat).ok_or(ErrorGuaranteed)?;
 
@@ -1241,13 +1551,13 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         }
     }
 
-    fn cat_expr(&mut self, expr: ExprId) -> Result<PlaceWithOrigin> {
+    fn cat_expr(&mut self, expr: ExprId) -> Result<PlaceWithOrigin<'f>> {
         self.cat_expr_(expr, &self.expr_adjustments(expr))
     }
 
     /// This recursion helper avoids going through *too many*
     /// adjustments, since *only* non-overloaded deref recurses.
-    fn cat_expr_(&mut self, expr: ExprId, adjustments: &[Adjustment]) -> Result<PlaceWithOrigin> {
+    fn cat_expr_(&mut self, expr: ExprId, adjustments: &[Adjustment]) -> Result<PlaceWithOrigin<'f>> {
         match adjustments.split_last() {
             None => self.cat_expr_unadjusted(expr),
             Some((adjustment, previous)) => {
@@ -1259,9 +1569,9 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     fn cat_expr_adjusted(
         &mut self,
         expr: ExprId,
-        previous: PlaceWithOrigin,
+        previous: PlaceWithOrigin<'f>,
         adjustment: &Adjustment,
-    ) -> Result<PlaceWithOrigin> {
+    ) -> Result<PlaceWithOrigin<'f>> {
         self.cat_expr_adjusted_with(expr, |_this| Ok(previous), adjustment)
     }
 
@@ -1270,11 +1580,11 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         expr: ExprId,
         previous: F,
         adjustment: &Adjustment,
-    ) -> Result<PlaceWithOrigin>
+    ) -> Result<PlaceWithOrigin<'f>>
     where
-        F: FnOnce(&mut Self) -> Result<PlaceWithOrigin>,
+        F: FnOnce(&mut Self) -> Result<PlaceWithOrigin<'f>>,
     {
-        let target = self.cx.infcx().resolve_vars_if_possible(adjustment.target.as_ref());
+        let target = self.cx.infcx().deeply_resolve_ignoring_regions(adjustment.target.as_ref());
         match adjustment.kind {
             Adjust::Deref(overloaded) => {
                 // Equivalent to *expr or something similar.
@@ -1299,11 +1609,11 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         }
     }
 
-    fn cat_expr_unadjusted(&mut self, expr: ExprId) -> Result<PlaceWithOrigin> {
+    fn cat_expr_unadjusted(&mut self, expr: ExprId) -> Result<PlaceWithOrigin<'f>> {
         let expr_ty = self.expr_ty(expr)?;
-        match self.cx.store[expr] {
+        match self.cx.store.expr(expr) {
             Expr::UnaryOp { expr: e_base, op: UnaryOp::Deref } => {
-                if self.cx.result.method_resolutions.contains_key(&expr) {
+                if self.cx.result.method_resolutions.contains_idx(expr) {
                     self.cat_overloaded_place(expr, e_base)
                 } else {
                     let base = self.cat_expr(e_base)?;
@@ -1319,7 +1629,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                     .cx
                     .result
                     .field_resolutions
-                    .get(&expr)
+                    .get(expr)
                     .map(|field| match *field {
                         Either::Left(field) => field.local_id.into_raw().into_u32(),
                         Either::Right(tuple_field) => tuple_field.index,
@@ -1334,6 +1644,16 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 ))
             }
 
+            Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr: base, ty: _ } => {
+                let base = self.cat_expr(base)?;
+                Ok(self.cat_projection(
+                    expr.into(),
+                    base,
+                    expr_ty,
+                    ProjectionKind::UnwrapUnsafeBinder,
+                ))
+            }
+
             Expr::Index { base, index: _ } => {
                 // rustc checks if this is an overloaded index, but the check is buggy and treats any indexing
                 // as overloaded, see https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/.E2.9C.94.20Is.20builtin.20indexing.20any.20special.20in.20typeck.3F/near/565881390.
@@ -1341,7 +1661,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 self.cat_overloaded_place(expr, base)
             }
 
-            Expr::Path(ref path) => {
+            Expr::Path(path) => {
                 let resolver_guard =
                     self.cx.resolver.update_to_inner_scope(self.cx.db, self.cx.store_owner, expr);
                 let resolution = self.cx.resolver.resolve_path_in_value_ns_fully(
@@ -1367,6 +1687,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                         expr,
                         expr_ty,
                         PlaceBase::StaticItem,
+                        self.cx.frame,
                     )),
                     (Some(ValueNs::LocalBinding(var_id)), None) => {
                         self.cat_local(expr.into(), expr_ty, var_id)
@@ -1388,11 +1709,16 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         id: ExprOrPatIdPacked,
         expr_ty: Ty<'db>,
         var_id: BindingId,
-    ) -> Result<PlaceWithOrigin> {
+    ) -> Result<PlaceWithOrigin<'f>> {
         if self.upvars.contains(var_id) {
             self.cat_upvar(id, var_id)
         } else {
-            Ok(PlaceWithOrigin::new_no_projections(id, expr_ty, PlaceBase::Local(var_id)))
+            Ok(PlaceWithOrigin::new_no_projections(
+                id,
+                expr_ty,
+                PlaceBase::Local(var_id),
+                self.cx.frame,
+            ))
         }
     }
 
@@ -1405,7 +1731,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         &mut self,
         hir_id: ExprOrPatIdPacked,
         var_id: BindingId,
-    ) -> Result<PlaceWithOrigin> {
+    ) -> Result<PlaceWithOrigin<'f>> {
         let var_ty = self.expect_and_resolve_type(
             self.cx.result.type_of_binding.get(var_id).map(|it| it.as_ref()),
         )?;
@@ -1414,25 +1740,26 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
             hir_id,
             var_ty,
             PlaceBase::Upvar { closure: self.closure_expr, var_id },
+            self.cx.frame,
         ))
     }
 
-    fn cat_rvalue(&self, hir_id: ExprOrPatIdPacked, expr_ty: Ty<'db>) -> PlaceWithOrigin {
-        PlaceWithOrigin::new_no_projections(hir_id, expr_ty, PlaceBase::Rvalue)
+    fn cat_rvalue(&self, hir_id: ExprOrPatIdPacked, expr_ty: Ty<'db>) -> PlaceWithOrigin<'f> {
+        PlaceWithOrigin::new_no_projections(hir_id, expr_ty, PlaceBase::Rvalue, self.cx.frame)
     }
 
     fn cat_projection(
         &self,
         node: ExprOrPatIdPacked,
-        mut base_place: PlaceWithOrigin,
+        mut base_place: PlaceWithOrigin<'f>,
         ty: Ty<'db>,
         kind: ProjectionKind,
-    ) -> PlaceWithOrigin {
+    ) -> PlaceWithOrigin<'f> {
         base_place.push_projection(Projection { kind, ty: ty.store() }, node);
         base_place
     }
 
-    fn cat_overloaded_place(&mut self, expr: ExprId, base: ExprId) -> Result<PlaceWithOrigin> {
+    fn cat_overloaded_place(&mut self, expr: ExprId, base: ExprId) -> Result<PlaceWithOrigin<'f>> {
         // Reconstruct the output assuming it's a reference with the
         // same region and mutability as the receiver. This holds for
         // `Deref(Mut)::Deref(_mut)` and `Index(Mut)::index(_mut)`.
@@ -1453,8 +1780,8 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     fn cat_deref(
         &mut self,
         node: ExprOrPatIdPacked,
-        mut base_place: PlaceWithOrigin,
-    ) -> Result<PlaceWithOrigin> {
+        mut base_place: PlaceWithOrigin<'f>,
+    ) -> Result<PlaceWithOrigin<'f>> {
         let base_curr_ty = base_place.place.ty();
         let Some(deref_ty) =
             self.cx.structurally_resolve_type(node, base_curr_ty).builtin_deref(true)
@@ -1498,12 +1825,12 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     /// to reach the value being matched.
     fn cat_pattern<F>(
         &mut self,
-        mut place_with_id: PlaceWithOrigin,
+        mut place_with_id: PlaceWithOrigin<'f>,
         pat: PatId,
         op: &mut F,
     ) -> Result
     where
-        F: FnMut(&mut Self, PlaceWithOrigin, CatPatternPat) -> Result,
+        F: FnMut(&mut Self, PlaceWithOrigin<'f>, CatPatternPat) -> Result,
     {
         // If (pattern) adjustments are active for this pattern, adjust the `PlaceWithId` correspondingly.
         // `PlaceWithId`s are constructed differently from patterns. For example, in
@@ -1548,6 +1875,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                     // borrows the scrutinee to call `Deref::deref` or `DerefMut::deref_mut`. Invoke
                     // the callback before setting `place_with_id` to the temporary storing the
                     // result of the deref.
+                    // clone: frame copy, the deref's temporary is built from the place after
                     op(self, place_with_id.clone(), CatPatternPat::DerefPat { inner: pat })?;
                     let target_ty = match adjusts.peek() {
                         Some(next_adjust) => next_adjust.source.as_ref(),
@@ -1570,10 +1898,26 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         // `Some(x)` (which matches). Recursing once more, `*&Some(3)` and the pattern `Some(x)`
         // result in the place `Downcast<Some>(*&Some(3)).0` associated to `x` and invoke `op` with
         // that (where the `ref` on `x` is implied).
+        let leaf = matches!(
+            self.cx.store.pat(pat),
+            Pat::Bind { subpat: None, .. }
+                | Pat::Expr(..)
+                | Pat::Path(_)
+                | Pat::Lit(..)
+                | Pat::Range { .. }
+                | Pat::Missing
+                | Pat::Rest
+                | Pat::NotNull
+                | Pat::Wild
+        );
+        if leaf {
+            return op(self, place_with_id, pat.into());
+        }
+        // clone: frame copy, a pattern with subpatterns extends the place after `op`
         op(self, place_with_id.clone(), pat.into())?;
 
-        match self.cx.store[pat] {
-            Pat::Tuple { args: ref subpats, ellipsis: dots_pos } => {
+        match self.cx.store.pat(pat) {
+            Pat::Tuple { args: subpats, ellipsis: dots_pos } => {
                 // (p1, ..., pN)
                 let total_fields = self.total_fields_in_tuple(pat);
 
@@ -1583,6 +1927,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                         ProjectionKind::Field { field_idx: i as u32, variant_idx: 0 };
                     let sub_place = self.cat_projection(
                         pat.into(),
+                        // clone: frame copy, each subpattern extends its own
                         place_with_id.clone(),
                         subpat_ty,
                         projection_kind,
@@ -1591,7 +1936,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::TupleStruct { args: ref subpats, ellipsis: dots_pos, .. } => {
+            Pat::TupleStruct { args: subpats, ellipsis: dots_pos, .. } => {
                 // S(p1, ..., pN)
                 let (variant_index, variant) = self.variant_index_for_adt(pat)?;
                 let total_fields = variant.fields(self.cx.db).len();
@@ -1602,6 +1947,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                         ProjectionKind::Field { variant_idx: variant_index, field_idx: i as u32 };
                     let sub_place = self.cat_projection(
                         pat.into(),
+                        // clone: frame copy, each subpattern extends its own
                         place_with_id.clone(),
                         subpat_ty,
                         projection_kind,
@@ -1610,7 +1956,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::Record { args: ref field_pats, .. } => {
+            Pat::Record { args: field_pats, .. } => {
                 // S { f1: p1, ..., fN: pN }
 
                 let (variant_index, variant) = self.variant_index_for_adt(pat)?;
@@ -1622,6 +1968,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
 
                     let field_place = self.cat_projection(
                         pat.into(),
+                        // clone: frame copy, each subpattern extends its own
                         place_with_id.clone(),
                         field_ty,
                         ProjectionKind::Field {
@@ -1633,8 +1980,9 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::Or(ref pats) => {
+            Pat::Or(pats) => {
                 for &pat in pats {
+                    // clone: frame copy, each alternative matches the same place
                     self.cat_pattern(place_with_id.clone(), pat, op)?;
                 }
             }
@@ -1656,7 +2004,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 self.cat_pattern(place, subpat, op)?;
             }
 
-            Pat::Slice { prefix: ref before, slice, suffix: ref after } => {
+            Pat::Slice { prefix: before, slice, suffix: after } => {
                 let Some(element_ty) = self
                     .cx
                     .structurally_resolve_type(pat.into(), place_with_id.place.ty())
@@ -1667,11 +2015,13 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 };
                 let elt_place = self.cat_projection(
                     pat.into(),
+                    // clone: frame copy, the subslice extends the place too
                     place_with_id.clone(),
                     element_ty,
                     ProjectionKind::Index,
                 );
                 for &before_pat in before {
+                    // clone: frame copy, each element pattern extends its own
                     self.cat_pattern(elt_place.clone(), before_pat, op)?;
                 }
                 if let Some(slice_pat) = slice {
@@ -1685,6 +2035,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                     self.cat_pattern(slice_place, slice_pat, op)?;
                 }
                 for &after_pat in after {
+                    // clone: frame copy, each element pattern extends its own
                     self.cat_pattern(elt_place.clone(), after_pat, op)?;
                 }
             }
@@ -1709,10 +2060,10 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     fn pat_deref_place(
         &mut self,
         node: ExprOrPatIdPacked,
-        base_place: PlaceWithOrigin,
+        base_place: PlaceWithOrigin<'f>,
         inner: PatId,
         target_ty: Ty<'db>,
-    ) -> Result<PlaceWithOrigin> {
+    ) -> Result<PlaceWithOrigin<'f>> {
         match self.cx.deref_pat_borrow_mode(base_place.place.ty(), inner) {
             // Deref patterns on boxes are lowered using a built-in deref.
             DerefPatBorrowMode::Box => self.cat_deref(node, base_place),
@@ -1759,5 +2110,142 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         } else {
             false
         }
+    }
+}
+
+/// The locals of `def`'s body that it moves a place based on out of, sorted: rustc's
+/// `ExprUseVisitor::for_clippy(..).consume_body(body)` with clippy's `MovedVariablesCtxt`
+/// (`needless_pass_by_value`), which records the base of each `consume` that is a local. It
+/// runs over the body's finished `result`, merged into a context of its own as an inline
+/// const's result is. `None` when the walk stops at a type error, a body rustc lints nothing of.
+pub fn moved_locals<'db>(
+    db: &'db base_db::Db,
+    def: hir_def::DefWithBodyId,
+    result: &crate::InferenceResult<'db>,
+) -> Option<Box<[BindingId]>> {
+    let body = hir_def::expr_store::Body::of(db, def);
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        let mut cx = InferenceContext::new(
+            db,
+            crate::InferBodyId::DefWithBodyId(def),
+            hir_def::ExpressionStoreOwnerId::Body(def),
+            def.generic_def(db),
+            &body.store,
+            hir_def::resolver::HasResolver::resolver(def, db),
+            true,
+            crate::lower::LoweringMode::Analysis,
+            frame,
+        );
+        cx.merge(result);
+        let mut params = Vec::with_capacity_in(body.params.len(), frame);
+        params.extend(body.params.iter().map(|it| it.formal));
+        let root = body.root_expr();
+        let mut delegate = MovedLocals { moved: Vec::new_in(frame) };
+        ExprUseVisitor::for_body(&mut cx, root, &mut delegate)
+            .consume_closure_body(&params, root)
+            .ok()?;
+        let moved = &mut delegate.moved;
+        moved.sort_unstable_by_key(|it| it.into_raw().into_u32());
+        moved.dedup();
+        // alloc: the answer, once per body asked, past the frame
+        Some(Box::from(&moved[..]))
+    })
+}
+
+/// clippy's `MovedVariablesCtxt`: what [`moved_locals`] records.
+struct MovedLocals<'f> {
+    moved: Vec<BindingId, &'f Frame>,
+}
+
+impl<'db, 'f> Delegate<'db, 'f> for MovedLocals<'f> {
+    fn consume(&mut self, place_with_id: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {
+        if let PlaceBase::Local(binding) = place_with_id.place.base {
+            self.moved.push(binding);
+        }
+    }
+
+    fn use_cloned(&mut self, _: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn borrow(&mut self, _: PlaceWithOrigin<'f>, _: BorrowKind, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn mutate(&mut self, _: PlaceWithOrigin<'f>, _: &mut InferenceContext<'db, 'f>) {}
+
+    fn fake_read(
+        &mut self,
+        _: PlaceWithOrigin<'f>,
+        _: FakeReadCause,
+        _: &mut InferenceContext<'db, 'f>,
+    ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_mem::{Tag, frame};
+    use hir_def::hir::{ExprId, ExprOrPatIdPacked};
+    use la_arena::RawIdx;
+
+    use super::{SourceStack, Sources};
+
+    fn ids(n: u32) -> Vec<ExprOrPatIdPacked> {
+        (0..n).map(|it| ExprId::from_raw(RawIdx::from_u32(it)).into()).collect()
+    }
+
+    fn finals(sources: &Sources<'_>) -> Vec<ExprOrPatIdPacked> {
+        sources.as_slice().iter().map(SourceStack::final_source).collect()
+    }
+
+    #[test]
+    fn source_stacks_push_truncate_and_convert_at_every_length() {
+        frame::task(Tag::Infer, |frame| {
+            let ids = ids(6);
+            for len in 1..=ids.len() {
+                let mut stack = SourceStack::One(ids[0]);
+                for &id in &ids[1..len] {
+                    stack.push(id, frame);
+                }
+                assert_eq!(stack.as_slice(), &ids[..len]);
+                assert_eq!(stack.len(), len);
+                assert_eq!(stack.final_source(), ids[len - 1]);
+
+                let result = stack.to_result();
+                assert_eq!(&*result, &ids[..len]);
+                assert_eq!(SourceStack::of(&result, frame).as_slice(), &ids[..len]);
+
+                for keep in 1..=len {
+                    let mut truncated = stack.clone();
+                    truncated.truncate(keep);
+                    assert_eq!(truncated.as_slice(), &ids[..keep]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn sources_keep_their_order_through_push_retain_and_results() {
+        frame::task(Tag::Infer, |frame| {
+            let ids = ids(4);
+            assert!(Sources::none(frame).first().is_none());
+
+            let mut sources = Sources::one(SourceStack::One(ids[0]));
+            sources.push(SourceStack::Two([ids[0], ids[1]]), frame);
+            sources.push(SourceStack::One(ids[2]), frame);
+            assert_eq!(finals(&sources), [ids[0], ids[1], ids[2]]);
+
+            sources.retain(|it| it.final_source() != ids[1], frame);
+            assert_eq!(finals(&sources), [ids[0], ids[2]]);
+
+            let result = sources.to_result();
+            assert_eq!(result.len(), 2);
+            assert_eq!(finals(&Sources::of(&result, frame)), [ids[0], ids[2]]);
+            assert!(Sources::of(&[], frame).as_slice().is_empty());
+
+            let mut one = Sources::one(SourceStack::One(ids[3]));
+            one.retain(|_| false, frame);
+            assert!(one.as_slice().is_empty());
+
+            let stacks: Vec<_> = sources.into_iter().map(|it| it.final_source()).collect();
+            assert_eq!(stacks, [ids[0], ids[2]]);
+        });
     }
 }

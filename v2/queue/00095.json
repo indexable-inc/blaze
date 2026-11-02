@@ -1,0 +1,35 @@
+{
+  "id": "00095",
+  "from_lane": "db-ty-lower",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lib.rs"
+  ],
+  "what": "## 2. db-ty-db: `crates/hir-ty/src/lib.rs`, re-export the new public types\n\nWhat: add to the `pub use lower::{..}` at line 97:\n\n```rust\nFieldTypes, Lowered,\nbatch::{Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable},\npersist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},\n```\n\nWhy: `mod lower` is private, so `FieldTypes` (request 3's caller), `Lowered` (request 1's\nsignatures), the batches (`CrateFieldTypes::of(db, krate)` and the like, for whoever keeps\nthem cold) and their cold form (`ColdBatch::of_field_types(interner, batch)`,\n`ColdBatch::read(buffer)?.field_types(interner)`, `blaze_format::Persist`) are not reachable\nfrom other crates.\n\n> forwarded to db: `crates/hir-ty/src/lib.rs` is inside lane db; not re-exported yet.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/lib.rs:113-125` (`FieldTypes`, `Lowered`, the five `batch::` types and the four `persist::` types).",
+  "state": "applied",
+  "created": "2026-10-30T00:56:27Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-lower.md#2. db-ty-db: `crates/hir-ty/src/lib.rs`, re-export the new public types",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-lower.md:59"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/lib.rs:113-125` (`FieldTypes`, `Lowered`, the five `batch::` types and the four `persist::` types)."
+    }
+  ]
+}

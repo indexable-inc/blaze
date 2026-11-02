@@ -1,0 +1,66 @@
+diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+--- a/src/canonical/canonicalizer.rs
++++ b/src/canonical/canonicalizer.rs
+@@ -176,7 +176,10 @@
+                         delegate,
+                         CanonicalizeMode::Input(CanonicalizeInputKind::Predicate),
+                     );
+-                    rest_canonicalizer.state.variables.clone_from(&e.variables);
++                    // Not `clone_from`: `ThinVec`'s is the default, a new clone, which would drop
++                    // the recycled state's capacity.
++                    rest_canonicalizer.state.variables.clear();
++                    rest_canonicalizer.state.variables.extend_from_slice(&e.variables);
+                     rest_canonicalizer.state.var_kinds.clone_from(&e.var_kinds);
+                     rest_canonicalizer
+                         .state
+diff -ruN a/src/placeholder.rs b/src/placeholder.rs
+--- a/src/placeholder.rs
++++ b/src/placeholder.rs
+@@ -48,7 +48,8 @@
+         IndexMap<ty::PlaceholderType<I>, ty::BoundTy<I>>,
+         IndexMap<ty::PlaceholderConst<I>, ty::BoundConst<I>>,
+     ) {
+-        let old_universes = universe_indices.clone();
++        // Read only with `assumptions_on_binders`, so copied only then.
++        let old_universes = infcx.cx().assumptions_on_binders().then(|| universe_indices.clone());
+         let mut replacer = BoundVarReplacer {
+             infcx,
+             mapped_regions: Default::default(),
+@@ -68,7 +69,7 @@
+             current_index: _,
+         } = replacer;
+ 
+-        if infcx.cx().assumptions_on_binders() {
++        if let Some(old_universes) = old_universes {
+             for (old, new) in old_universes.into_iter().zip(universe_indices.iter()) {
+                 if let (None, Some(new)) = (old, new) {
+                     // FIXME(-Zassumptions-on-binders): `replace_bound_vars` does not have enough
+diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+--- a/src/solve/eval_ctxt/mod.rs
++++ b/src/solve/eval_ctxt/mod.rs
+@@ -14,7 +14,7 @@
+ use rustc_type_ir::solve::{
+     AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
+     MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
+-    RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, TyOrConstInferVar,
++    RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, SubRoots, TyOrConstInferVar,
+ };
+ use rustc_type_ir::transmute::Answer;
+ use rustc_type_ir::{
+@@ -22,7 +22,6 @@
+     PredicateKind, PredicateProxy, Region, RegionVid, TypeFoldable, TypeSuperVisitable,
+     TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, max_universe,
+ };
+-use thin_vec::ThinVec;
+ use tracing::{Level, debug, instrument, trace, warn};
+ 
+ use super::has_only_region_constraints;
+@@ -972,7 +971,7 @@
+         previously_succeeded_in_erased: SucceededInErased<I>,
+     ) -> GoalStalledOn<I> {
+         // Remove the canonicalized universal vars, since we only care about stalled existentials.
+-        let mut sub_roots = ThinVec::new();
++        let mut sub_roots = SubRoots::new();
+         let stalled_vars = stalled_vars
+             .iter()
+             .copied()

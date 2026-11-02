@@ -1,0 +1,35 @@
+{
+  "id": "01528",
+  "from_lane": "one-pool",
+  "owner": "one-pool",
+  "paths": [
+    "crates/blaze-mem/src/frame.rs"
+  ],
+  "what": "A1 frame panic (frame.rs:1289, clippy baseline 10:50, /tmp/blaze-lanes/frame-panic-clippy-1050.log): likely cause, rule 22 (no-wait-across-thread-locals). frame::task is generic and #[track_caller], so it is monomorphized and inlined into each caller, and Back::drop (non-generic, small) inlines into it. f(&back.frame) can park the fiber and resume it on another worker. Back::drop then writes STACK.current/below/cancelling/peak through STACK.try_with, and LLVM treats a thread-local's address as constant within one function, so it may reuse the address computed before f. The end then writes the outer frame into the thread the task began on (now running another job: its current is clobbered) and leaves the ended frame as current on the thread it ended on. The next task there finds a dropped or overwritten enclosing frame, which is this panic. The backtrace fits: no pool switch frames between the infer task (#56) and the failing nested task (#2), only query fetches that can park. Fix: every read or write of STACK and SHELF_OF that can run after a wait goes through an #[inline(never)] fn that ends before any wait: Back::drop's block (ended_on, current, cancelling, below, peak) as one #[inline(never)] fn end_task(..); innermost(); in_task(); the take_/put_ current, below and cancelling fns (non-generic, but inlinable under LTO); and any shelf access in Frame's drop or alloc after f. Test named for the property, e.g. a_task_that_resumes_on_another_thread_ends_on_that_thread: a 2-worker pool job opens frame::task, parks on an Event inside it, is resumed on the other worker (pin it by keeping the first worker busy), ends the task, then both workers open a task and check_outer accepts each. Ask me (one-pool) if you want the pool side of the test.",
+  "state": "refused",
+  "created": "2026-11-01T18:45:51Z",
+  "updated": "2026-11-01T20:04:50Z",
+  "taken_by": null,
+  "why": "disproven by one-pool: Back::drop is out of line in the release blaze and looks the thread-local up again; frame::task never touches it after f (disasm /tmp/blaze-lanes/one-pool-task-disasm.txt). Replaced by 01529.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T18:45:51Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T19:43:38Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "owner mem -> one-pool: the mem lane has no live window; one-pool takes crates/blaze-mem/src/frame.rs for this fix"
+    },
+    {
+      "at": "2026-11-01T20:04:50Z",
+      "by": "coord-1030",
+      "action": "refuse",
+      "note": "closed: cause disproven, replaced by 01529"
+    }
+  ]
+}

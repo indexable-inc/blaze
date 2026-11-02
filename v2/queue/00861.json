@@ -1,0 +1,24 @@
+{
+  "id": "00861",
+  "from_lane": "pure-scripts-measure",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-ui/src/api.rs"
+  ],
+  "what": "For harness/v2/pure_scripts.py (docs/v2/plan/lanes/pure-scripts/design.md section 8; docs/v2/plan/lanes/pure-scripts/measure.md): the build report has to say, per build script run, whether its script was proved pure and the first impurity otherwise. (1) crates/blaze-api/src/lib.rs: add to `BuildScriptRan` a field `purity: ScriptPurity` with `pub enum ScriptPurity { Unproved, Impure { said: String }, Pure { identity: ContentId, hit: bool } }` (Unproved: no proof was made, e.g. BLAZE_SANDBOX=off; Impure.said: `hir_ty_pure::Impure::said()`; Pure.identity: `hir_ty_pure::Proof::identity`; hit: the value came from the store under its pure key, so the script was neither built nor run), and its Ref form for BuildScriptRanRef. (2) crates/blaze-ui/src/api.rs: `script_json(ran: BuildScriptRanRef) -> String`, one line `{\"reason\": \"blaze-script\", \"package_id\": ..., \"out_dir\": ..., \"purity\": \"unproved\"|\"impure\"|\"pure\", \"said\": str|null, \"identity\": hex|null, \"hit\": bool}`, printed under --message-format=json right after each `build-script-executed` line wherever `work_json`'s `blaze-work` line is printed (crates/blaze-cargo/src/cli/print: route to lane cargo if it is theirs). cargo's own `build-script-executed` stays byte for byte cargo's. The filling side (setting the field in blaze-cargo's script glue) is requested of lane pure-scripts separately.",
+  "state": "open",
+  "created": "2026-10-30T09:07:32Z",
+  "updated": "2026-10-30T09:07:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:07:32Z",
+      "by": "pure-scripts-measure",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

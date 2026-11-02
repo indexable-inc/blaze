@@ -3081,11 +3081,6 @@
    "exit -13 "
   ],
   [
-   "`blaze-engine cache stats` whose reader went away ends without a word",
-   true,
-   "exit -13 "
-  ],
-  [
    "`blaze --help` whose reader went away ends without a word",
    true,
    "exit -13 "
@@ -3134,26 +3129,6 @@
    "and the build once it is mended is right",
    true,
    "daemon"
-  ],
-  [
-   "BLAZE_CACHE unset: the store is on, in the user cache directory",
-   true,
-   "`blaze-engine cache stats` exit 0"
-  ],
-  [
-   "BLAZE_CACHE 'off': the store is off",
-   true,
-   "`blaze-engine cache stats` exit 1"
-  ],
-  [
-   "BLAZE_CACHE '0': the store is off",
-   true,
-   "`blaze-engine cache stats` exit 1"
-  ],
-  [
-   "BLAZE_CACHE '': the store is off",
-   true,
-   "`blaze-engine cache stats` exit 1"
   ],
   [
    "16 clients at once on 4 worktrees each run their own tree's program",

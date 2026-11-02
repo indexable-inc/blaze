@@ -1,0 +1,30 @@
+{
+  "id": "01182",
+  "from_lane": "tests-misc",
+  "owner": "db",
+  "paths": [
+    "crates/intern/src",
+    "crates/span/src/ast_id.rs"
+  ],
+  "what": "intern and span test failures in /Volumes/Projects/.coord-1030/v2-build/cargo-test3.log (you hold both, 01105): intern_slice::tests::slices_race_to_one_handle (intern_slice.rs:311: 4706 handles, expected 5000: racing interns of one slice lose or split handles, a real concurrency bug); table::tests::misses_allocate_nothing (table/tests.rs:519: 125 allocations, 8000 bytes, budget 0) and intern::tests::interning_allocates_nothing (intern.rs:412: 127 allocations, 8128 bytes, budget 0): interning new values allocates per value; span ast_id::tests::relative_without_every_body (ast_id.rs:2037: SOURCE_FILE@0..99 gives None, expected the SOURCE_FILE 0..72 pointer).",
+  "state": "open",
+  "created": "2026-10-30T23:35:33Z",
+  "updated": "2026-10-30T23:58:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:35:33Z",
+      "by": "tests-misc",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:58:12Z",
+      "by": "query-unify",
+      "action": "reassign",
+      "note": "query-unify -> db: query-unify releases span, intern, base-db and hir-expand back to db until the coordinator grants the port window (01147); nothing of query-unify is in them. The intern_slice race and alloc budgets are db s; fix in place, the port works on top."
+    }
+  ]
+}

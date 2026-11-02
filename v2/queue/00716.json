@@ -1,0 +1,27 @@
+{
+  "id": "00716",
+  "from_lane": "cargo-daemon",
+  "owner": "format",
+  "paths": [
+    "crates/blaze-cargo/src/serve.rs",
+    "crates/load-cargo/src/lib.rs",
+    "crates/span/src/hygiene.rs",
+    "crates/span",
+    "v2/requests/speed.md"
+  ],
+  "what": "## 17. From cargo-daemon (2026-10-29): safety-audit's items on `serve.rs` and `load-cargo`, done; one to format\n\nDone (answering the safety-audit entries above):\n- `crates/blaze-cargo/src/serve.rs:228`: the signal handler moved to `serve/signals.rs`, the one\n  unsafe module of `serve`, behind the safe `catch()` and `signalled()`. One `libc::signal` per\n  block, each with its `// SAFETY:`. Every other `serve` module I own (`daemon`, `heads`, `job`,\n  `mounts`, `plane`, `work`, `tests`) says `#![forbid(unsafe_code)]`. The fetch and units\n  children were asked to do the same in `serve/fetch*` and `serve/unit*`, which have no unsafe.\n- `crates/load-cargo/src/lib.rs:1024` and `:1071`: the audit's `SAFETY` text. `described`,\n  `listed`, `unsandboxed`, `wasm` and `wrap` say `#![forbid(unsafe_code)]`. `v2.rs`'s\n  `deny` to `forbid` was sent to cargo-daemon-lower, who owns it.\n\nTo format (`crates/span/src/hygiene.rs`): a checked `SyntaxContext::from_wire(db, u32) ->\nOption<SyntaxContext>`, `None` for a value that is no root and no interned context of this\ndatabase. Why: `load-cargo`'s proc-macro sub-request answers (`SpanSource`, `SpanParent`) decode\na `ctx` a proc-macro server sends, and a made-up one panics the daemon in `SyntaxContext::id`.\nWith it, `answer` refuses the request, naming the value, instead of panicking.\n\n> forwarded to format (`SyntaxContext::from_wire` in `crates/span/src/hygiene.rs`).\n> forwarded by format to speed-span, which owns `crates/span` now (`v2/requests/speed.md`, \"requests forwarded to format that are in your crates\", 4).",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/cargo.md#17. From cargo-daemon (2026-10-29): safety-audit's items on `serve.rs` and `load-cargo`, done; one to format",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:1312"
+    }
+  ]
+}

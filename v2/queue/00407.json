@@ -1,0 +1,23 @@
+{
+  "id": "00407",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## 12. What stays on the global allocator, with its `// alloc:` justification\n\nThe hot lint (`tools/v2/hot_lint.py`) reports 901 findings in this crate today. Sections 3-9\nremove the ones on per-body and per-call paths. The ones left are listed below, and each gets\nits `// alloc:` comment at the site so the lint passes them. The largest groups are:\n- `pretty.rs`, 114;\n- the string sites in `eval.rs`, 50, all errors;\n- the shims, `simd.rs` 41, `shim.rs` 33, `reflection.rs` 30, `threads.rs` 17, `arch.rs` 16;\n- `location.rs`, 20.\n\nEach of these is a setup or error path, or output that is kept. Write the comment at the site:\n\n- Every `MirLowerError`/`MirEvalError` construction with a `String` or `format!`:\n  `// alloc: the error, which ends the query`.\n- `pretty.rs` (80 sites): `// alloc: the text printed is the result (IDE and debugging only)`.\n- `location.rs` (`placed`, `concat_parts`, `line_and_column`'s collect, 26-305):\n  `// alloc: the location's text or table is the result`. Called per `file!()`/`line!()`\n  expansion and per panic location, not per statement.\n- `purity::Impure::said` and `const_check`'s messages: the diagnostic's text, kept.\n- The interpreter's `Evaluator::new` (stack, heap, the `unused_locals_store`): one evaluation's\n  setup, reused across its calls.\n- Shims (`eval/shim.rs`, `simd.rs`, `reflection.rs`, `arch.rs`, `threads.rs`, `macro_call.rs`,\n  `unwind.rs`): what a program asks the interpreter to make (a `Vec` for its allocation, a\n  thread). The two `IntervalOrOwned::Owned` sites in `shim.rs` take `OwnedBytes` (§9.1).\n- `type_name.rs`'s `dyn` paths (§9.3).\n- `monomorphization::opaque_of_impl` (§8).\n- `set_*_capacity`, the query declarations, `passes_not_ported`: no allocation.\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#12. What stays on the global allocator, with its `// alloc:` justification",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:2561"
+    }
+  ]
+}

@@ -1,41 +1,44 @@
 //! Lowering of inline assembly.
+use blaze_hash::{HashMap, HashSet};
 use hir_expand::name::Name;
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
-    AstNode, AstPtr, AstToken, T,
-    ast::{self, HasName, IsString},
+    T,
+    view::{self as ast, AstNode, AstToken, HasName, IsString},
 };
 use tt::TextRange;
 
 use crate::{
-    expr_store::lower::{ExprCollector, FxIndexSet},
+    expr_store::{
+        ExprPtr,
+        lower::{ExprCollector, FxIndexSet, ImplTraitLowering},
+    },
     hir::{
-        AsmOperand, AsmOptions, AsmPiece, Expr, ExprId, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass,
+        AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind, InlineAsmRegOrRegClass,
     },
 };
 
 impl ExprCollector<'_> {
     pub(super) fn lower_inline_asm(
         &mut self,
-        asm: ast::AsmExpr,
-        syntax_ptr: AstPtr<ast::Expr>,
+        asm: ast::AsmExpr<'_>,
+        syntax_ptr: ExprPtr,
     ) -> ExprId {
         let mut clobber_abis = FxIndexSet::default();
+        // alloc: the operand list, once per `asm!` call; it becomes the boxed slice it stores.
         let mut operands = vec![];
         let mut options = AsmOptions::empty();
 
-        let mut named_pos: FxHashMap<usize, Symbol> = Default::default();
-        let mut named_args: FxHashMap<Symbol, usize> = Default::default();
-        let mut reg_args: FxHashSet<usize> = Default::default();
+        let mut named_pos: HashMap<usize, Symbol> = Default::default();
+        let mut named_args: HashMap<Symbol, usize> = Default::default();
+        let mut reg_args: HashSet<usize> = Default::default();
         for piece in asm.asm_pieces() {
-            if !self.check_cfg(&piece) {
+            if !self.check_cfg(piece) {
                 continue;
             }
 
             let slot = operands.len();
-            let mut lower_reg = |reg: Option<ast::AsmRegSpec>| {
+            let mut lower_reg = |reg: Option<ast::AsmRegSpec<'_>>| {
                 let reg = reg?;
                 if let Some(string) = reg.string_token() {
                     reg_args.insert(slot);
@@ -73,9 +76,9 @@ impl ExprCollector<'_> {
                 }
                 ast::AsmPiece::AsmOperandNamed(op) => {
                     let name = op.name().map(|name| Symbol::intern(name.text()));
-                    if let Some(name) = &name {
-                        named_args.insert(name.clone(), slot);
-                        named_pos.insert(slot, name.clone());
+                    if let Some(name) = name {
+                        named_args.insert(name, slot);
+                        named_pos.insert(slot, name);
                     }
                     let Some(op) = op.asm_operand() else { continue };
                     (
@@ -176,9 +179,9 @@ impl ExprCollector<'_> {
                             }
                             ast::AsmOperand::AsmSym(s) => {
                                 let Some(path) = s.path().and_then(|p| {
-                                    self.lower_path(
+                                    self.lower_path_view(
                                         p,
-                                        &mut ExprCollector::impl_trait_error_allocator,
+                                        &mut ImplTraitLowering::Error,
                                     )
                                 }) else {
                                     continue;
@@ -192,12 +195,15 @@ impl ExprCollector<'_> {
             operands.push(op);
         }
 
+        let record = self.store.record;
+        // alloc: the source-map side table, once per `asm!` call.
         let mut mappings = vec![];
         let mut curarg = 0;
+        // alloc: the template it stores, once per `asm!` call.
         let mut template = Some(Vec::new());
         if options.contains(AsmOptions::RAW) {
             for it in asm.template() {
-                if !self.check_cfg(&it) {
+                if !self.check_cfg(it) {
                     continue;
                 }
                 let text = self
@@ -205,6 +211,7 @@ impl ExprCollector<'_> {
                     .and_then(|(s, _)| s.value().ok().map(|it| it.into_owned()));
                 match (&mut template, text) {
                     (Some(pieces), Some(text)) => {
+                        // alloc: the stored literal piece, once per raw template string.
                         pieces.push(AsmPiece::Lit(format!("{text}\n").into()))
                     }
                     _ => template = None,
@@ -217,13 +224,15 @@ impl ExprCollector<'_> {
             asm.template()
                 .enumerate()
                 .filter_map(|(idx, it)| {
-                    if !self.check_cfg(&it) {
+                    if !self.check_cfg(it) {
                         return None;
                     }
-                    Some((idx, it.clone(), self.expand_macros_to_string(it)?))
+                    Some((idx, it, self.expand_macros_to_string(it)?))
                 })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
-                    mappings.resize_with(idx + 1, Vec::default);
+                    if record {
+                        mappings.resize_with(idx + 1, Vec::default);
+                    }
                     let Ok(text) = s.value() else {
                         comment_only = false;
                         template = None;
@@ -235,9 +244,10 @@ impl ExprCollector<'_> {
                             .strip_prefix("/*")
                             .and_then(|it| it.strip_suffix("*/"))
                             .is_some_and(|it| !it.contains("*/"));
-                    let mappings = &mut mappings[idx];
+                    let mut mappings = mappings.get_mut(idx);
                     let template_snippet = match expr {
                         ast::Expr::Literal(literal) => match literal.kind() {
+                            // alloc: the parser takes an owned snippet, once per template string.
                             ast::LiteralKind::String(s) => Some(s.text().to_owned()),
                             _ => None,
                         },
@@ -261,6 +271,7 @@ impl ExprCollector<'_> {
                     );
                     parser.curarg = curarg;
 
+                    // alloc: the parser's pieces, once per template string.
                     let mut unverified_pieces = Vec::new();
                     while let Some(piece) = parser.next() {
                         if !parser.errors.is_empty() {
@@ -321,7 +332,8 @@ impl ExprCollector<'_> {
                                     }),
                                     _ => template = None,
                                 }
-                                if let Some(operand_idx) = operand_idx
+                                if let Some(mappings) = &mut mappings
+                                    && let Some(operand_idx) = operand_idx
                                     && let Some(position_span) = to_span(arg.position_span)
                                 {
                                     mappings.push((position_span, operand_idx));
@@ -343,22 +355,22 @@ impl ExprCollector<'_> {
             InlineAsmKind::Asm
         };
 
-        let idx = self.alloc_expr(
-            Expr::InlineAsm(InlineAsm {
-                operands: operands.into_boxed_slice(),
-                template: template.map(Vec::into_boxed_slice),
-                options,
-                kind,
-                comment_only,
-                clobber_abi: !clobber_abis.is_empty(),
-            }),
-            syntax_ptr,
-        );
-        self.store
-            .template_map
-            .get_or_insert_with(Default::default)
-            .asm_to_captures
-            .insert(idx, mappings);
+        let idx = self.store.alloc_asm_expr(InlineAsm {
+            operands: operands.into_boxed_slice(),
+            template: template.map(Vec::into_boxed_slice),
+            options,
+            kind,
+            comment_only,
+            clobber_abi: !clobber_abis.is_empty(),
+        });
+        let idx = self.map_expr(idx, syntax_ptr);
+        if record {
+            self.store
+                .template_map
+                .get_or_insert_with(Default::default)
+                .asm_to_captures
+                .push((idx, mappings));
+        }
         idx
     }
 }

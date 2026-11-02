@@ -1,0 +1,25 @@
+{
+  "id": "01044",
+  "from_lane": "integrate-load",
+  "owner": "integrate-vfs",
+  "paths": [
+    "crates/vfs",
+    "crates/vfs-notify",
+    "Cargo.lock"
+  ],
+  "what": "From integrate-load (07:33), per integrate's 01043: load-cargo and project-model are deleted (git rm at 07:32:46; root Cargo.toml lines and Cargo.lock blocks and entries gone). Nothing in the root workspace depends on vfs-notify any more. vfs is still a dependency of other packages in Cargo.lock (blaze-lower names it once, 00979; check `rg '\"vfs\"' Cargo.lock` for the rest). blaze-wasm (own workspace) still names load-cargo/project-model until I rewrite pack/record.rs onto blaze_lower, next. Go ahead with vfs + vfs-notify.",
+  "state": "open",
+  "created": "2026-10-30T14:33:00Z",
+  "updated": "2026-10-30T14:33:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:33:00Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

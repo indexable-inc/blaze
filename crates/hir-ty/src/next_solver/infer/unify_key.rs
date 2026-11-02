@@ -1,15 +1,36 @@
-//! Unification keyes for the infer context the next-trait-solver.
+//! Unification keys and values for the infer context of the next-trait-solver.
 
 use std::cmp;
-use std::marker::PhantomData;
 
-use ena::unify::{NoError, UnifyKey, UnifyValue};
-use rustc_type_ir::{ConstVid, RegionKind, RegionVid, UniverseIndex, inherent::IntoKind};
+use rustc_type_ir::{
+    ConstVid, FloatVarValue, FloatVid, IntVarValue, IntVid, RegionKind, RegionVid, TyVid,
+    UniverseIndex,
+};
 
 use crate::{
     Span,
-    next_solver::{Const, Region},
+    next_solver::{
+        Const, Region,
+        infer::union_find::{NoError, UnifyKey, UnifyValue},
+    },
 };
+
+macro_rules! vid_keys {
+    ($($vid:ty),* $(,)?) => {$(
+        impl UnifyKey for $vid {
+            #[inline(always)]
+            fn index(self) -> u32 {
+                self.as_u32()
+            }
+            #[inline(always)]
+            fn from_index(index: u32) -> Self {
+                <$vid>::from_u32(index)
+            }
+        }
+    )*};
+}
+
+vid_keys!(TyVid, IntVid, FloatVid, ConstVid, RegionVid);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RegionVariableValue<'db> {
@@ -17,34 +38,8 @@ pub(crate) enum RegionVariableValue<'db> {
     Unknown { universe: UniverseIndex, span: Span },
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
-pub(crate) struct RegionVidKey<'db> {
-    pub(crate) vid: RegionVid,
-    pub(crate) phantom: PhantomData<RegionVariableValue<'db>>,
-}
-
-impl<'db> From<RegionVid> for RegionVidKey<'db> {
-    fn from(vid: RegionVid) -> Self {
-        RegionVidKey { vid, phantom: PhantomData }
-    }
-}
-
-impl<'db> UnifyKey for RegionVidKey<'db> {
-    type Value = RegionVariableValue<'db>;
-    #[inline]
-    fn index(&self) -> u32 {
-        self.vid.as_u32()
-    }
-    #[inline]
-    fn from_index(i: u32) -> Self {
-        RegionVidKey::from(RegionVid::from_u32(i))
-    }
-    fn tag() -> &'static str {
-        "RegionVidKey"
-    }
-}
-
 pub(crate) struct RegionUnificationError;
+
 impl<'db> UnifyValue for RegionVariableValue<'db> {
     type Error = RegionUnificationError;
 
@@ -120,35 +115,10 @@ impl<'db> ConstVariableValue<'db> {
     }
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
-pub(crate) struct ConstVidKey<'db> {
-    pub(crate) vid: ConstVid,
-    pub(crate) phantom: PhantomData<Const<'db>>,
-}
-
-impl<'db> From<ConstVid> for ConstVidKey<'db> {
-    fn from(vid: ConstVid) -> Self {
-        ConstVidKey { vid, phantom: PhantomData }
-    }
-}
-
-impl<'db> UnifyKey for ConstVidKey<'db> {
-    type Value = ConstVariableValue<'db>;
-    #[inline]
-    fn index(&self) -> u32 {
-        self.vid.as_u32()
-    }
-    #[inline]
-    fn from_index(i: u32) -> Self {
-        ConstVidKey::from(ConstVid::from_u32(i))
-    }
-    fn tag() -> &'static str {
-        "ConstVidKey"
-    }
-}
-
 impl<'db> UnifyValue for ConstVariableValue<'db> {
     type Error = NoError;
+    /// rustc's `order_roots` of `ConstVidKey`.
+    const OLDER_ROOT: bool = true;
 
     fn unify_values(value1: &Self, value2: &Self) -> Result<Self, Self::Error> {
         match (value1, value2) {
@@ -173,6 +143,44 @@ impl<'db> UnifyValue for ConstVariableValue<'db> {
                 let universe = cmp::min(universe1, universe2);
                 let span = Span::pick_best(span1, span2);
                 Ok(ConstVariableValue::Unknown { span, universe })
+            }
+        }
+    }
+}
+
+// Integer and float variables: `rustc_type_ir`'s rules for `ena`.
+
+impl UnifyValue for IntVarValue {
+    type Error = NoError;
+
+    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, NoError> {
+        match (*value1, *value2) {
+            (IntVarValue::Unknown, IntVarValue::Unknown) => Ok(IntVarValue::Unknown),
+            (
+                IntVarValue::Unknown,
+                known @ (IntVarValue::UintType(_) | IntVarValue::IntType(_)),
+            )
+            | (
+                known @ (IntVarValue::UintType(_) | IntVarValue::IntType(_)),
+                IntVarValue::Unknown,
+            ) => Ok(known),
+            _ => panic!("differing ints should have been resolved first"),
+        }
+    }
+}
+
+impl UnifyValue for FloatVarValue {
+    type Error = NoError;
+
+    fn unify_values(value1: &Self, value2: &Self) -> Result<Self, NoError> {
+        match (*value1, *value2) {
+            (FloatVarValue::Unknown, FloatVarValue::Unknown) => Ok(FloatVarValue::Unknown),
+            (FloatVarValue::Unknown, FloatVarValue::Known(known))
+            | (FloatVarValue::Known(known), FloatVarValue::Unknown) => {
+                Ok(FloatVarValue::Known(known))
+            }
+            (FloatVarValue::Known(_), FloatVarValue::Known(_)) => {
+                panic!("differing floats should have been resolved first")
             }
         }
     }

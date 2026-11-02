@@ -1,0 +1,30 @@
+{
+  "id": "01228",
+  "from_lane": "tests-misc-stencil",
+  "owner": "query-unify",
+  "paths": [
+    "vendor/salsa/src/input.rs",
+    "vendor/salsa-macro-rules/src/setup_input_struct.rs"
+  ],
+  "what": "vendor/salsa: reading an absent singleton input records no dependency, so creating it later never invalidates what read it (a cache input missed). `try_get` (salsa-macro-rules setup_input_struct.rs:313) -> IngredientImpl::get_singleton_input (salsa input.rs:228) returns None with no read recorded. Since every write now ends in Db::maintain, the fixture's crate-graph write computes crate_local_def_map and the deps image/mode queries while FrozenDefMaps / FrozenLangItems do not exist yet; `frozen::set` / `deps::serve` then create them (the builder(..).new(db) branch, nameres/frozen.rs:118) and the memos stay valid: nothing is served or checked. Fails in round3b: hir-def nameres::frozen::tests::checking_finds_a_difference (0 differences, want 1), deps::tests::every_dependency_is_stored_and_served (mode None, want Serve), served_parts_are_the_store_s_bytes, serving_a_crate_at_a_time_adds_to_what_was_served. Fix: an absent-singleton read records a dependency on the ingredient's singleton slot (bumped when it is created), so creation invalidates exactly its readers; then frozen::set's None branch is sound. Same hazard for every `try_get` (ProcMacros, FrozenLangItems).",
+  "state": "applied",
+  "created": "2026-10-31T02:12:22Z",
+  "updated": "2026-10-31T12:05:36Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:12:22Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:05:36Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "blaze-query (port target): an absent singleton read records a read of its reserved field-0 node (stamp 0); making a singleton takes &mut (input_new_singleton) and opens a view repainting its field nodes, so exactly its absence readers rerun, even in the same session. crates/blaze-query/src/db/input.rs, macros input.rs, tests db/tests.rs making_a_singleton_reruns_what_read_its_absence and macros tests/structs.rs making_a_singleton_reruns_what_saw_it_absent. Port call sites: 01249. vendor/salsa is being deleted, so not fixed there."
+    }
+  ]
+}

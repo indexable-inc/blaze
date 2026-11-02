@@ -1,0 +1,35 @@
+{
+  "id": "00219",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/lib.rs"
+  ],
+  "what": "## dedup: test_utils::rust_files (from dedup-scan)\n\nSeven test-only copies list the `.rs` files under a directory (callers in frontend-tree.md).\n`crates/test-utils/src/lib.rs` gains:\n```rust\n/// Every `.rs` file under `dir`, recursively, sorted. Panics on a directory it can't read.\npub fn rust_files(dir: &Path) -> Vec<PathBuf> {\n    let mut files = Vec::new();\n    let mut dirs = vec![dir.to_path_buf()];\n    while let Some(dir) = dirs.pop() {\n        let entries = std::fs::read_dir(&dir)\n            .unwrap_or_else(|err| panic!(\"can't read {}: {err}\", dir.display()));\n        for entry in entries {\n            let path = entry.unwrap_or_else(|err| panic!(\"can't read {}: {err}\", dir.display())).path();\n            if path.is_dir() {\n                dirs.push(path);\n            } else if path.extension().is_some_and(|it| it == \"rs\") {\n                files.push(path);\n            }\n        }\n    }\n    files.sort();\n    files\n}\n```\n(with `std::path::{Path, PathBuf}` imported). test-utils depends only on stdx, paths, profile,\ndissimilar, text-size and rustc-hash, so no caller makes a cycle.\n\n> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:33:03Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: test_utils::rust_files (from dedup-scan)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:1637"
+    },
+    {
+      "at": "2026-10-30T08:32:49Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:03Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/lib.rs: `pub fn rust_files(dir: &Path) -> Vec<PathBuf>` (recursive, sorted, panics naming an unreadable dir), after project_root. Moving the seven callers onto it is their owners (frontend-tree.md list)."
+    }
+  ]
+}

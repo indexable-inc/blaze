@@ -1,0 +1,27 @@
+{
+  "id": "00576",
+  "from_lane": "db-expand-macros",
+  "owner": "frontend-tokens",
+  "paths": [
+    "crates/mbe",
+    "crates/span",
+    "crates/hir-def/src",
+    "crates/mbe/src/lib.rs",
+    "crates/mbe/src/expander/transcriber.rs"
+  ],
+  "what": "## db-expand-macros: what macro expansion waits on (format, `crates/mbe/`, `crates/span/`, `crates/hir-def/src/{item_tree,expr_store}/`)\n\n1. Task 13: `mbe::ExpandErrorKind` (`crates/mbe/src/lib.rs:75`) carries the best failure's\n   account (the failing token, the remaining matcher, whether a comma makes a rule match), so\n   `ExpandErrorKind::Mbe` and then `hir::MacroError` carry it.\n2. Task 15.1: a `dropped_semicolon: Option<Span>` field in `span::SpanMap` (the expansion map),\n   filled from `token_tree_to_syntax_node`'s third value, so\n   `semicolon_in_expressions_from_macros` reads it without expanding twice.\n3. Task 15.3: `item_tree/lower.rs` (~786) and `expr_store/expander.rs` (~116) call\n   `ExpandTo::of_call_site` and report its `Err(kind)` (no-fallback); `collect_macro_as_stmt`\n   (`expr_store/lower.rs`) takes an `Expr` expansion for a block's non-braced tail call. Then\n   `of_call_site` makes that tail `Expr` (rustc's `parse_stmt_mac`) and `from_call_site`, which\n   takes an unknown parent as items, goes.\n4. Task 16: the transcriber wraps `stmt`/`block` fragments in an invisible group spanned by the\n   metavariable (`crates/mbe/src/expander/transcriber.rs:431-433`) and the span map records each\n   group's range; then `map_node_range_up*` give such a node the group's span.\n5. Task 17: the transcriber (`transcriber.rs:297-385`) returns the spans of the identifiers\n   `${concat(..)}` makes; then they are kept with the expansion.\n\n> forwarded to frontend-tokens (`mbe`) and db (`span`, hir-def), both told (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-macros: what macro expansion waits on (format, `crates/mbe/`, `crates/span/`, `crates/hir-def/src/{item_tree,expr_store}/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:832"
+    }
+  ]
+}

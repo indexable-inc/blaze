@@ -1,0 +1,35 @@
+{
+  "id": "01367",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs"
+  ],
+  "what": "hir-ty-mir mir/lower.rs ~1909 panics with \"attempt to negate with overflow\": the `-<int literal>` shortcut computes `Literal::Int(-value, kind)` with `value: i128`, which overflows for `-170141183460469231731687303715884105728i128` (the literal 2^127 is i128::MIN as stored). rustc gives that literal its value and no error (the negation of i128::MIN as a literal is i128::MIN; `overflowing_literals` only for out-of-range ones). Use `value.wrapping_neg()` (or treat the literal as u128 and negate in the type's width). Hit by blaze-diagnostics tests::lints::bodies::types::limits::type_overflow (rustc's tests/ui/lint/type-overflow.rs), which panics instead of reporting.",
+  "state": "applied",
+  "created": "2026-10-31T23:57:34Z",
+  "updated": "2026-11-01T03:59:25Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:57:34Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:59:25Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied (mir/lower.rs wrapping_neg); round 19: limits::type_overflow ok"
+    }
+  ]
+}

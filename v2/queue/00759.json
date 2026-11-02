@@ -1,0 +1,24 @@
+{
+  "id": "00759",
+  "from_lane": "mem-db-checks",
+  "owner": "db-mem-borrowck",
+  "paths": [
+    "crates/hir-ty/src/const_param_ty.rs",
+    "crates/hir/src/diagnostics.rs"
+  ],
+  "what": "## mem-db-checks (db-mem-borrowck; from db-ty, 2026-10-29 23:58): take E0741's const-parameter check into `hir-ty-wfcheck`\n\nWhat: db-ty applied rustc's `check_param_wf` for const parameters (E0741, for diagnostics window 67) as `hir_ide::const_param_ty::const_param_ty_errors(db, GenericDefId)`, in the new `crates/hir-ty/src/const_param_ty.rs` (query kind `CONST_PARAM_TY_ERRORS = 0x243a` in `hir-ty/src/db.rs`). Its test is `hir-ty/src/tests/const_param_ty.rs`. The requester places it in `hir-ty-wfcheck`, beside `wfcheck`, since it is part of rustc's `check_well_formed`. That crate is yours, so I put it in hir-ty for now.\n\nTo move it:\n- Copy the module into `hir-ty-wfcheck`. It reads only public hir-ty API, but for `crate::lower::const_param_types`; use `db.const_param_types(def)` (`HirDatabase`) instead.\n- Copy its test too.\n- Repoint hir's one caller, `DiagnosticsCollector::collect_const_param_tys` in `crates/hir/src/diagnostics.rs`. It reads `error.param`, `error.ty` and `error.reason`, and re-exports `ConstParamTyReason` from `hir_ide::const_param_ty`. Change both paths.\n- Tell db-ty. Then db-ty deletes the hir-ty module, its `pub mod`, its test and its kind, since a kind number is never reused.\n\nAlternatively, fold it into `wfcheck`'s `WfResult::diagnostics` as a new `Site`. Why: rule 8 (semantics-in-front-end, in a crate of its own where possible). The check is item well-formedness.\n\n> forwarded to db-mem-borrowck (requests, pass 43: `hir-ty-wfcheck` and hir are db's; told by tmux)\n> not applied by db-mem-borrowck (2026-10-29 23:58): agreed (the check is `hir-ty-wfcheck`'s), waits on the coordinator's freeze (23:48); db-ty keeps the hir-ty copy until it is moved.",
+  "state": "open",
+  "created": "2026-10-30T06:58:00Z",
+  "updated": "2026-10-30T06:58:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-checks.md#mem-db-checks (db-mem-borrowck; from db-ty, 2026-10-29 23:58): take E0741's const-parameter check into `hir-ty-wfcheck`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks.md:3769"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00505",
+  "from_lane": "diagnostics-lints-bodies-calls-desugar",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## diagnostics-lints-bodies-calls-desugar: the UI harness's `std` ignores its `#[lang]` items (crates/blaze-diagnostics `tests/lints/bodies/calls.rs`, `tests/lints/bodies/calls/items.rs`)\n\nFor `diagnostics-lints-bodies-calls` and `diagnostics-lints-bodies-calls-items`.\n\nWhat: the `std` crate of `calls.rs`'s `ui` (and of `items.rs`'s `ui_std`) starts with\n`#![feature(lang_items, rustc_attrs)]`. Why: `hir_def::lang_item::crate_lang_items` returns\nnone for a crate without `#![feature(lang_items)]`, so `#[lang = \"owned_box\"]` and every other\nlang item those tests' `std` declares is not one: `Box` is no box, `?` and `for` find no\ntraits. `tests/lints/bodies/calls/desugar.rs` has its own harness with the line.\nAlso in `calls.rs`: compiletest gives `-A unused -W unused_attributes` to every UI test but\n`run-pass` (`runtest.rs`, `AllowUnused::Yes` unless `PassFailMode::RunPass`), not only to\n`check-pass` ones; `Test::Fails` should get them too (`crate::tests::compiletest(Mode::Other,\n..)` already does this).\n\n> forwarded to diagnostics: its own tests.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-calls-desugar: the UI harness's `std` ignores its `#[lang]` items (crates/blaze-diagnostics `tests/lints/bodies/calls.rs`, `tests/lints/bodies/calls/items.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2096"
+    }
+  ]
+}

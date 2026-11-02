@@ -306,7 +306,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               RUST_BACKTRACE="0", BLAZE_CACHE=os.path.join(root, "store"))
+               RUST_BACKTRACE="0")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
                  "BLAZE_TESTS", "BLAZE_SANDBOX"):
         env.pop(name, None)

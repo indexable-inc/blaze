@@ -20,31 +20,51 @@
 //     O\t<index>\t<directory>\t<upper>   an overlay (one line for each way to spell it)
 //     B\t<directory>\t<target>           a directory answered from `target`
 //     W\t<directory>                     a directory written for real
-//     L                                  record (W, N and X lines, and E and H for X)
-//     R                                  record reads (R lines) too
+//     Q\t<path>                          a path that is no input (`/dev`)
+//     L                                  record (W, N and X lines, and P and H for X)
+//     R                                  record reads (R L D E T lines) too
+//     V\t<file>                          the live record, where the lines go
+//     I                                  the network is the program's: what it reaches is a
+//                                        `T network` line
 //
-// Records are lines appended to `record` in that directory with one write each, which `macos.rs`
-// reads when the run ends:
+// The record's lines (`blaze_usercode::trace::Line`), each appended with one write before the
+// call it notes returns, to the live record when there is one and to `record` in that
+// directory otherwise:
 //
 //     R\t<test>\t<path>      a path named
+//     D\t<test>\t<path>      a directory listed
+//     E\t<test>\t<name>      a variable read by name (`getenv`), or `*` for all of them
+//                            (`_NSGetEnviron`)
+//     T\t<test>\t<what>      what can't be traced: `clock` (the realtime clock), `random`
+//                            (every test's: what a process read of it stays in it),
+//                            `network`
 //     W\t<test>\t<path>      a write the sandbox refused
 //     N\t<test>\t<address>   an address the sandbox refused
 //     X\t<test>\t<why>       the record is not whole
-//     E\t<nonce>\t<test>\t<path>   a program run, with the nonce its process is given
+//
+// and what `macos.rs` reads from `record` when the run ends, to know the programs that ran
+// without this library:
+//
+//     P\t<nonce>\t<test>\t<path>   a program run, with the nonce its process is given
 //     H\t<nonce>             a process that loaded this library, by the nonce it was given
 //     F\t<nonce>             a program that did not run after all
+//     S\t<pid>               a process that left the run's process group (`setsid`,
+//                            `setpgid`), which is not killed with it as the run ends
+//     Z\t<errno>             a line could not be added to the live record: it is not whole
 //
-// An E with no H is a program that ran without this library.
+// A P with no H is a program that ran without this library. The test of a thread is what the
+// harness's marker named last; a process starts in its parent thread's (a fork keeps the
+// thread's, a program run is told it, `__BLAZE_SANDBOX_SCOPE`).
 
 #define _DARWIN_C_SOURCE
 #include <copyfile.h>
+#include <crt_externs.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
-#include <os/lock.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -58,11 +78,13 @@
 #include <sys/clonefile.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -89,13 +111,19 @@ extern ssize_t sendmsg_nocancel(int, const struct msghdr *, int) __asm("_sendmsg
 extern int renameatx_np(int, const char *, int, const char *, unsigned int);
 extern int renamex_np(const char *, const char *, unsigned int);
 extern int getattrlistat(int, const char *, void *, void *, size_t, unsigned long);
+extern ssize_t __getdirentries64(int, void *, size_t, off_t *);
+extern int getattrlistbulk(int, void *, void *, size_t, uint64_t);
+// libcommonCrypto, part of libSystem: what Rust's `std` reads its hash maps' keys from.
+extern int32_t CCRandomGenerateBytes(void *, size_t);
 
 #define MARK "/.blaze-test/"
 #define WHITEOUT "\x01blaze-whiteout\x01"
-#define MAX_ROOTS 64
+#define SCOPE_VAR "__BLAZE_SANDBOX_SCOPE"
+#define MAX_ROOTS 128
 #define MAX_OVERLAYS 32
 
-enum kind { NONE, OVERLAY, BIND, WRITABLE, SCRATCH };
+// QUIET: seen as it is and no input (`/dev`), named in no R line.
+enum kind { NONE, OVERLAY, BIND, WRITABLE, SCRATCH, QUIET };
 
 struct root {
     char *path;
@@ -123,7 +151,10 @@ static char lists[PATH_MAX];
 static size_t lists_len;
 static struct shared *shared;
 static int record_fd = -1;
+// Where the record's lines go: the live record, or `record_fd` without one.
+static int lines_fd = -1;
 static int record_reads;
+static int network_on;
 // Whether the library is set up; until then (dyld and libSystem starting) calls go through.
 static int alive;
 static char env_insert[PATH_MAX + 32];
@@ -132,53 +163,76 @@ static char env_dir[PATH_MAX + 32];
 
 static __thread int busy;           // inside a call here: the C library's calls go through
 static __thread char test[512];     // the test the thread runs, from the marker
+// Which of the thread's scopes it is in, one more at each marker, and the one it last said
+// it read the clock in: said without a lock, as a clock may be read in a signal handler.
+static __thread unsigned scope_number = 1;
+static __thread unsigned clock_said;
+static _Atomic int random_said;
 
 // ---------------------------------------------------------------------------------------
 // Records.
 
-static os_unfair_lock seen_lock = OS_UNFAIR_LOCK_INIT;
-static uint64_t *seen;
-static size_t seen_size, seen_count;
+// The hashes of the lines this process wrote, open addressing with no lock: a slot is taken
+// once, by compare-and-swap, and never changes after. Mapped once, its pages as they are
+// first written.
+#define SEEN_SLOTS (1u << 20)
+#define SEEN_PROBES 64
+static _Atomic(_Atomic uint64_t *) seen;
 
-static uint64_t hash(const char *a, const char *b) {
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (; *a; a++) h = (h ^ (uint8_t)*a) * 0x100000001b3ull;
-    h = (h ^ 0xff) * 0x100000001b3ull;
-    for (; *b; b++) h = (h ^ (uint8_t)*b) * 0x100000001b3ull;
-    return h | 1;
+static inline uint64_t mum(uint64_t a, uint64_t b) {
+    __uint128_t r = (__uint128_t)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
 }
 
-// Whether the line is new to this process; the merge removes what several processes repeat.
-static int first_time(const char *a, const char *b) {
-    uint64_t h = hash(a, b);
-    int fresh = 0;
-    os_unfair_lock_lock(&seen_lock);
-    if (seen_count * 2 >= seen_size) {
-        size_t size = seen_size ? seen_size * 2 : 1 << 14;
-        uint64_t *grown = mmap(NULL, size * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (grown == MAP_FAILED) {
-            os_unfair_lock_unlock(&seen_lock);
+static inline uint64_t word(const char *s, size_t n) {
+    uint64_t w = 0;
+    memcpy(&w, s, n);
+    return w;
+}
+
+// `h` with `s` and its length hashed in, sixteen bytes a multiply (wyhash's mixing).
+static uint64_t hash_text(uint64_t h, const char *s) {
+    size_t n = strlen(s), len = n;
+    for (; n > 16; s += 16, n -= 16) {
+        uint64_t a = word(s, 8), b = word(s + 8, 8);
+        h ^= mum(a ^ 0xa0761d6478bd642full, b ^ h ^ 0xe7037ed1a0b428dbull);
+    }
+    uint64_t a = word(s, n > 8 ? 8 : n), b = n > 8 ? word(s + 8, n - 8) : 0;
+    return h ^ mum(a ^ 0x8ebc6af09c88c6e3ull ^ len, b ^ h ^ 0x589965cc75374cc3ull);
+}
+
+static uint64_t hash(char kind, const char *a, const char *b) {
+    return hash_text(hash_text(0x1d8e4e27c47d124full ^ (uint8_t)kind, a), b) | 1;
+}
+
+// Whether the line is new to this process; reading the record removes what several processes
+// repeat, and a line written twice when the table is that full.
+static int first_time(char kind, const char *a, const char *b) {
+    uint64_t h = hash(kind, a, b);
+    _Atomic uint64_t *table = atomic_load_explicit(&seen, memory_order_acquire);
+    if (!table) {
+        int prot = PROT_READ | PROT_WRITE;
+        void *made = mmap(NULL, SEEN_SLOTS * 8, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (made == MAP_FAILED) return 1;
+        _Atomic uint64_t *none = NULL;
+        if (atomic_compare_exchange_strong(&seen, &none, (_Atomic uint64_t *)made)) {
+            table = made;
+        } else {
+            munmap(made, SEEN_SLOTS * 8);
+            table = none;
+        }
+    }
+    size_t at = h & (SEEN_SLOTS - 1);
+    for (int probe = 0; probe < SEEN_PROBES; probe++, at = (at + 1) & (SEEN_SLOTS - 1)) {
+        uint64_t was = atomic_load_explicit(&table[at], memory_order_relaxed);
+        if (was == h) return 0;
+        if (was) continue;
+        if (atomic_compare_exchange_strong_explicit(&table[at], &was, h, memory_order_relaxed,
+                                                    memory_order_relaxed))
             return 1;
-        }
-        for (size_t i = 0; i < seen_size; i++) {
-            if (!seen[i]) continue;
-            size_t at = seen[i] & (size - 1);
-            while (grown[at]) at = (at + 1) & (size - 1);
-            grown[at] = seen[i];
-        }
-        if (seen) munmap(seen, seen_size * 8);
-        seen = grown;
-        seen_size = size;
+        if (was == h) return 0;
     }
-    size_t at = h & (seen_size - 1);
-    while (seen[at] && seen[at] != h) at = (at + 1) & (seen_size - 1);
-    if (!seen[at]) {
-        seen[at] = h;
-        seen_count++;
-        fresh = 1;
-    }
-    os_unfair_lock_unlock(&seen_lock);
-    return fresh;
+    return 1;
 }
 
 static void put(char *line, size_t *at, size_t cap, const char *text) {
@@ -188,8 +242,27 @@ static void put(char *line, size_t *at, size_t cap, const char *text) {
     }
 }
 
-static void emit(const char *kind, const char *a, const char *b, const char *c) {
+// A line could not be added to the live record, for `error`: `macos.rs` finds it in `record`.
+// Written without `snprintf`, which a signal handler may not call.
+static void lost(int error) {
     if (record_fd < 0) return;
+    char line[32] = "Z\t", digits[12];
+    size_t at = 2;
+    int n = 0;
+    unsigned value = error > 0 ? (unsigned)error : 0;
+    do digits[n++] = (char)('0' + value % 10);
+    while ((value /= 10));
+    while (n) line[at++] = digits[--n];
+    line[at++] = '\n';
+    write(record_fd, line, at);
+}
+
+// Appends a line, with one write: `P`, `H`, `F`, `S` and `Z` to `record`, the record's own
+// lines where they go. Safe in a signal handler (its own buffer, `write` alone).
+static void emit(const char *kind, const char *a, const char *b, const char *c) {
+    int own = strchr("PHFSZ", kind[0]) != NULL;
+    int fd = own ? record_fd : lines_fd;
+    if (fd < 0) return;
     char line[3 * PATH_MAX];
     size_t at = 0;
     put(line, &at, sizeof line, kind);
@@ -200,29 +273,51 @@ static void emit(const char *kind, const char *a, const char *b, const char *c) 
     }
     line[at++] = '\n';
     int saved = errno;
-    write(record_fd, line, at);
+    ssize_t wrote = write(fd, line, at);
+    if (wrote != (ssize_t)at && !own) lost(wrote < 0 ? errno : 0);
     errno = saved;
 }
 
-static void note(char kind, const char *path) {
-    if (record_fd < 0) return;
+static void note(char kind, const char *what) {
+    if (lines_fd < 0) return;
     // A tab or a line break would end the field: the record says it is not whole instead,
-    // as `Recorder` in `sandbox.rs` does.
-    if (strpbrk(path, "\t\n")) {
-        emit("X", test, "a path with a tab or a line break in it", NULL);
+    // as `blaze_usercode::trace::Line::new` does.
+    if (strpbrk(what, "\t\n")) {
+        emit("X", test, "a path or a name with a tab or a line break in it", NULL);
         return;
     }
     char k[2] = {kind, 0};
-    if (kind == 'R' && !first_time(test, path)) return;
-    emit(k, test, path, NULL);
+    if (!first_time(kind, test, what)) return;
+    emit(k, test, what, NULL);
+}
+
+// The realtime clock was read: once in each of the thread's scopes, with no lock.
+static void read_clock(void) {
+    if (!alive || !record_reads || clock_said == scope_number) return;
+    clock_said = scope_number;
+    emit("T", test, "clock", NULL);
+}
+
+// Randomness was read: once a process, every test's.
+static void read_random(void) {
+    if (!alive || !record_reads || atomic_exchange(&random_said, 1)) return;
+    emit("T", "", "random", NULL);
 }
 
 // ---------------------------------------------------------------------------------------
 // Paths.
 
-static os_unfair_lock cwd_lock = OS_UNFAIR_LOCK_INIT;
-static char cwd[PATH_MAX];
-static int cwd_known;
+// The working directory, as each thread last read it, and the number of changes to it then:
+// one more at each `chdir` of any thread. A thread reads it again only after a change, with
+// no lock and nothing shared written; a signal handler that reads it meanwhile leaves the
+// thread's copy whole or marks it unknown.
+static _Atomic uint64_t cwd_changes = 1;
+static __thread char cwd[PATH_MAX];
+static __thread uint64_t cwd_as_of;
+
+static void cwd_changed(void) {
+    atomic_fetch_add_explicit(&cwd_changes, 1, memory_order_release);
+}
 
 static void reverse(char *path);
 
@@ -249,6 +344,15 @@ static void tidy(char *path) {
     *out = 0;
 }
 
+// `a` then `b` into `out`, which has room for `PATH_MAX` bytes: -1 when they don't fit.
+static int concat(char *out, const char *a, const char *b) {
+    size_t x = strlen(a), y = strlen(b);
+    if (x + y + 1 > PATH_MAX) return -1;
+    memcpy(out, a, x);
+    memcpy(out + x, b, y + 1);
+    return 0;
+}
+
 static int join(char *out, const char *base, const char *rest) {
     size_t a = strlen(base), b = strlen(rest);
     if (a + b + 2 > PATH_MAX) return -1;
@@ -266,15 +370,23 @@ static int absolute(int dirfd, const char *path, char *out) {
         strcpy(out, path);
     } else if (dirfd == AT_FDCWD) {
         char base[PATH_MAX];
-        os_unfair_lock_lock(&cwd_lock);
-        if (!cwd_known && getcwd(cwd, sizeof cwd)) {
-            reverse(cwd);
-            cwd_known = 1;
+        uint64_t now = atomic_load_explicit(&cwd_changes, memory_order_acquire);
+        int known = 0;
+        if (cwd_as_of == now) {
+            strcpy(base, cwd);
+            atomic_signal_fence(memory_order_seq_cst);
+            known = cwd_as_of == now;
         }
-        int known = cwd_known;
-        if (known) strcpy(base, cwd);
-        os_unfair_lock_unlock(&cwd_lock);
-        if (!known || join(out, base, path) < 0) return -1;
+        if (!known) {
+            if (!getcwd(base, sizeof base)) return -1;
+            reverse(base);
+            cwd_as_of = 0;
+            atomic_signal_fence(memory_order_seq_cst);
+            strcpy(cwd, base);
+            atomic_signal_fence(memory_order_seq_cst);
+            cwd_as_of = now;
+        }
+        if (join(out, base, path) < 0) return -1;
     } else {
         char base[PATH_MAX];
         if (fcntl(dirfd, F_GETPATH, base) < 0) return -1;
@@ -315,8 +427,7 @@ static void reverse(char *path) {
         struct root *it = &roots[i];
         if ((it->kind == OVERLAY || it->kind == BIND) &&
             under(path, it->target, it->target_len)) {
-            if (snprintf(out, sizeof out, "%s%s", it->path, path + it->target_len) < PATH_MAX)
-                strcpy(path, out);
+            if (concat(out, it->path, path + it->target_len) == 0) strcpy(path, out);
             return;
         }
     }
@@ -574,7 +685,7 @@ static int listing(const char *virt, const char *lower, const char *upper, char 
 static enum answer overlay(struct root *it, const char *virt, const char *rest, enum how how,
                            char *real) {
     char upper[PATH_MAX];
-    if (snprintf(upper, sizeof upper, "%s%s", it->target, rest) >= PATH_MAX) {
+    if (concat(upper, it->target, rest) < 0) {
         errno = ENAMETOOLONG;
         return FAIL;
     }
@@ -628,6 +739,19 @@ static enum answer overlay(struct root *it, const char *virt, const char *rest, 
     return USE;
 }
 
+// Whether what is under `it` is an input: not the run's own directories, not a quiet path.
+static int input(const struct root *it) {
+    return !it || (it->kind != SCRATCH && it->kind != BIND && it->kind != QUIET);
+}
+
+// Notes `virt`, under `it`, read as `kind` says (`R`, or `D` for a listing, which is seen
+// where the names are read, as `getdents` is on Linux): the random devices are randomness,
+// and what is no input is not noted.
+static void noted(const char *virt, const struct root *it, char kind) {
+    if (!strcmp(virt, "/dev/random") || !strcmp(virt, "/dev/urandom")) read_random();
+    else if (input(it)) note(kind, virt);
+}
+
 // What a call naming `path` from `dirfd` is to name for `how`: PASS for what it named
 // (outside the overlays and the bound directories), USE for `real`, FAIL with `errno` set.
 // `virt` is the whole path as the program sees it, or empty.
@@ -642,11 +766,11 @@ static enum answer resolve(int dirfd, const char *path, enum how how, char *real
     const char *rest;
     struct root *it = where(virt, &rest);
     *root = it;
-    if (record_reads && (!it || (it->kind != SCRATCH && it->kind != BIND))) note('R', virt);
+    if (record_reads) noted(virt, it, 'R');
     if (!it) return PASS;
     switch (it->kind) {
     case BIND:
-        if (snprintf(real, PATH_MAX, "%s%s", it->target, rest) >= PATH_MAX) return PASS;
+        if (concat(real, it->target, rest) < 0) return PASS;
         return USE;
     case OVERLAY: return overlay(it, virt, rest, how, real);
     default: return PASS;
@@ -656,7 +780,7 @@ static enum answer resolve(int dirfd, const char *path, enum how how, char *real
 // Notes a write the sandbox refused: `errno` says so, and it was outside the run's own.
 static void refused(int r, const char *virt, struct root *root) {
     if (r < 0 && (errno == EPERM || errno == EACCES) && virt[0] &&
-        (!root || root->kind == WRITABLE || root->kind == NONE))
+        (!root || root->kind == WRITABLE || root->kind == NONE || root->kind == QUIET))
         note('W', virt);
 }
 
@@ -665,23 +789,6 @@ static void refused(int r, const char *virt, struct root *root) {
 
 static int configured(void) {
     return alive && !busy;
-}
-
-static void fork_prepare(void) {
-    os_unfair_lock_lock(&seen_lock);
-    os_unfair_lock_lock(&cwd_lock);
-}
-
-static void fork_after(void) {
-    os_unfair_lock_unlock(&cwd_lock);
-    os_unfair_lock_unlock(&seen_lock);
-}
-
-// The child's thread is another Mach thread than the one that took the locks, and an unfair
-// lock aborts the process that unlocks one it does not own: the child starts them afresh.
-static void fork_child(void) {
-    cwd_lock = OS_UNFAIR_LOCK_INIT;
-    seen_lock = OS_UNFAIR_LOCK_INIT;
 }
 
 static void image_added(const struct mach_header *header, intptr_t slide) {
@@ -697,7 +804,7 @@ static void image_added(const struct mach_header *header, intptr_t slide) {
     if (absolute(AT_FDCWD, info.dli_fname, virt) == 0) {
         const char *rest;
         struct root *it = where(virt, &rest);
-        if (!it || (it->kind != SCRATCH && it->kind != BIND)) note('R', virt);
+        if (input(it)) note('R', virt);
     }
     busy = was;
 }
@@ -744,6 +851,7 @@ __attribute__((constructor)) static void start(void) {
     snprintf(path, sizeof path, "%s/config", scratch);
     FILE *config = fopen(path, "r");
     char line[3 * PATH_MAX];
+    char live[PATH_MAX] = "";
     int record = 0;
     while (config && fgets(line, sizeof line, config)) {
         line[strcspn(line, "\n")] = 0;
@@ -761,10 +869,16 @@ __attribute__((constructor)) static void start(void) {
             add_root(field[1], BIND, 0, field[2]);
         } else if (!strcmp(field[0], "W") && field[1]) {
             add_root(field[1], WRITABLE, 0, NULL);
+        } else if (!strcmp(field[0], "Q") && field[1]) {
+            add_root(field[1], QUIET, 0, NULL);
         } else if (!strcmp(field[0], "L")) {
             record = 1;
         } else if (!strcmp(field[0], "R")) {
             record_reads = 1;
+        } else if (!strcmp(field[0], "V") && field[1] && strlen(field[1]) < sizeof live) {
+            strcpy(live, field[1]);
+        } else if (!strcmp(field[0], "I")) {
+            network_on = 1;
         }
     }
     if (config) fclose(config);
@@ -779,6 +893,26 @@ __attribute__((constructor)) static void start(void) {
             if (record_fd < 0) record_fd = fd;
             else close(fd);
         }
+        lines_fd = record_fd;
+        if (live[0]) {
+            fd = open(live, O_WRONLY | O_APPEND | O_CLOEXEC);
+            if (fd < 0) {
+                // No line of this process can be added: the run's record is not whole.
+                lost(errno);
+                lines_fd = -1;
+            } else {
+                lines_fd = fcntl(fd, F_DUPFD_CLOEXEC, 512);
+                if (lines_fd < 0) lines_fd = fd;
+                else close(fd);
+            }
+        }
+    }
+    const char *scope = getenv(SCOPE_VAR);
+    if (scope) {
+        size_t len = strlen(scope);
+        if (len >= sizeof test) len = sizeof test - 1;
+        memcpy(test, scope, len);
+        test[len] = 0;
     }
     Dl_info info;
     if (dladdr((const void *)start, &info) && info.dli_fname)
@@ -795,7 +929,7 @@ __attribute__((constructor)) static void start(void) {
     else if (theirs) unsetenv("DYLD_INSERT_LIBRARIES");
     unsetenv("__BLAZE_SANDBOX");
     unsetenv("__BLAZE_SANDBOX_EXEC");
-    pthread_atfork(fork_prepare, fork_after, fork_child);
+    unsetenv(SCOPE_VAR);
     alive = 1;
     if (record_reads) _dyld_register_func_for_add_image(image_added);
     busy = 0;
@@ -977,6 +1111,34 @@ PATH_CALL(mkfifo, CREATE, (const char *p, mode_t m), AT_FDCWD, p, mkfifo(p, m), 
 PATH_CALL(fclonefileat, CREATE, (int s, int d, const char *p, uint32_t f), d, p,
           fclonefileat(s, d, p, f), fclonefileat(s, AT_FDCWD, real, f), 1)
 
+// A thread starts in the scope of the thread that made it, as a process starts in its parent
+// thread's: what a test's own threads read is that test's, not every test's.
+struct started {
+    void *(*start)(void *);
+    void *arg;
+    char test[sizeof test];
+};
+
+static void *in_scope(void *it) {
+    struct started s = *(struct started *)it;
+    free(it);
+    memcpy(test, s.test, sizeof test);
+    return s.start(s.arg);
+}
+
+static int my_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*start)(void *),
+                             void *arg) {
+    if (!alive || !test[0]) return pthread_create(t, a, start, arg);
+    struct started *s = malloc(sizeof *s);
+    if (!s) return EAGAIN;
+    s->start = start;
+    s->arg = arg;
+    memcpy(s->test, test, sizeof test);
+    int r = pthread_create(t, a, in_scope, s);
+    if (r) free(s);
+    return r;
+}
+
 // `access`, which is also the harness's marker: `/.blaze-test/<name>` names the test the
 // thread runs from now on, `/.blaze-test/` none.
 static int my_access(const char *p, int m) {
@@ -986,6 +1148,7 @@ static int my_access(const char *p, int m) {
         if (len >= sizeof test) len = sizeof test - 1;
         memcpy(test, name, len);
         test[len] = 0;
+        scope_number++;
         errno = ENOENT;
         return -1;
     }
@@ -996,6 +1159,118 @@ static int my_access(const char *p, int m) {
     END(r);
 }
 INTERPOSE(my_access, access)
+
+// A directory listed through a descriptor (`readdir` of a `DIR` from `fdopendir`, a walk by
+// `getattrlistbulk`): the path it is open on, as the program knows it.
+static void listed(int fd) {
+    if (!configured() || !record_reads) return;
+    busy = 1;
+    char path[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, path) < 0) {
+        emit("X", test, "a directory listed the sandbox could not follow", NULL);
+    } else {
+        reverse(path);
+        const char *rest;
+        noted(path, where(path, &rest), 'D');
+    }
+    busy = 0;
+}
+static ssize_t my___getdirentries64(int fd, void *buf, size_t n, off_t *at) {
+    int saved = errno;
+    listed(fd);
+    errno = saved;
+    return __getdirentries64(fd, buf, n, at);
+}
+static int my_getattrlistbulk(int fd, void *list, void *buf, size_t n, uint64_t options) {
+    int saved = errno;
+    listed(fd);
+    errno = saved;
+    return getattrlistbulk(fd, list, buf, n, options);
+}
+INTERPOSE(my___getdirentries64, __getdirentries64)
+INTERPOSE(my_getattrlistbulk, getattrlistbulk)
+
+// ---------------------------------------------------------------------------------------
+// The environment, the clock and randomness.
+
+// A variable read by name. What reads the C library makes itself (`getenv("TZ")` in
+// `localtime`) are not seen: the launcher keys every traced run by the whole environment.
+//
+// The hooks test `alive` alone and leave the rest out of line: libSystem's initializer reads
+// the environment (malloc's settings) before thread-locals can be read, and with `busy` in
+// the hook the compiler may compute its address ahead of the test, which aborts there in
+// `_tlv_bootstrap_error`.
+__attribute__((noinline)) static void env_read(const char *name) {
+    if (busy || !record_reads) return;
+    busy = 1;
+    int saved = errno;
+    note('E', name);
+    errno = saved;
+    busy = 0;
+}
+static char *my_getenv(const char *name) {
+    if (alive && name) env_read(name);
+    return getenv(name);
+}
+// The whole environment, which Rust's `env::vars` and a `Command` that keeps it walk.
+static char ***my__NSGetEnviron(void) {
+    if (alive) env_read("*");
+    return _NSGetEnviron();
+}
+INTERPOSE(my_getenv, getenv)
+INTERPOSE(my__NSGetEnviron, _NSGetEnviron)
+
+static int my_clock_gettime(clockid_t clock, struct timespec *ts) {
+    if (clock == CLOCK_REALTIME) read_clock();
+    return clock_gettime(clock, ts);
+}
+static uint64_t my_clock_gettime_nsec_np(clockid_t clock) {
+    if (clock == CLOCK_REALTIME) read_clock();
+    return clock_gettime_nsec_np(clock);
+}
+static int my_gettimeofday(struct timeval *tv, void *tz) {
+    read_clock();
+    return gettimeofday(tv, tz);
+}
+static time_t my_time(time_t *t) {
+    read_clock();
+    return time(t);
+}
+static int my_timespec_get(struct timespec *ts, int base) {
+    if (base == TIME_UTC) read_clock();
+    return timespec_get(ts, base);
+}
+INTERPOSE(my_clock_gettime, clock_gettime)
+INTERPOSE(my_clock_gettime_nsec_np, clock_gettime_nsec_np)
+INTERPOSE(my_gettimeofday, gettimeofday)
+INTERPOSE(my_time, time)
+INTERPOSE(my_timespec_get, timespec_get)
+
+static int my_getentropy(void *buf, size_t n) {
+    read_random();
+    return getentropy(buf, n);
+}
+static uint32_t my_arc4random(void) {
+    read_random();
+    return arc4random();
+}
+static void my_arc4random_buf(void *buf, size_t n) {
+    read_random();
+    arc4random_buf(buf, n);
+}
+static uint32_t my_arc4random_uniform(uint32_t bound) {
+    read_random();
+    return arc4random_uniform(bound);
+}
+static int32_t my_CCRandomGenerateBytes(void *buf, size_t n) {
+    read_random();
+    return CCRandomGenerateBytes(buf, n);
+}
+INTERPOSE(my_getentropy, getentropy)
+INTERPOSE(my_arc4random, arc4random)
+INTERPOSE(my_arc4random_buf, arc4random_buf)
+INTERPOSE(my_arc4random_uniform, arc4random_uniform)
+INTERPOSE(my_CCRandomGenerateBytes, CCRandomGenerateBytes)
 
 // Makes a directory; one made again where the lower had one that was removed is empty.
 static int made(int d, const char *p, mode_t m) {
@@ -1035,7 +1310,10 @@ static int removed(int d, const char *p, int dir) {
     }
     const char *rest = virt + root->len;
     char upper[PATH_MAX];
-    snprintf(upper, sizeof upper, "%s%s", root->target, rest);
+    if (concat(upper, root->target, rest) < 0) {
+        errno = ENAMETOOLONG;
+        END(-1);
+    }
     struct stat ust, lst;
     int error;
     if (parents(root, rest) < 0) END(-1);
@@ -1179,18 +1457,12 @@ static int my_chdir(const char *p) {
     BEGIN
     enum answer a = resolve(AT_FDCWD, p, READ, real, virt, &root);
     int r = a == FAIL ? -1 : a == USE ? chdir(real) : chdir(p);
-    os_unfair_lock_lock(&cwd_lock);
-    cwd_known = 0;
-    os_unfair_lock_unlock(&cwd_lock);
+    cwd_changed();
     END(r);
 }
 static int my_fchdir(int fd) {
     int r = fchdir(fd);
-    if (alive) {
-        os_unfair_lock_lock(&cwd_lock);
-        cwd_known = 0;
-        os_unfair_lock_unlock(&cwd_lock);
-    }
+    if (alive) cwd_changed();
     return r;
 }
 static char *my_getcwd(char *buf, size_t size) {
@@ -1244,22 +1516,34 @@ INTERPOSE(my_fcntl_nocancel, fcntl_nocancel)
 
 static _Atomic uint32_t execs;
 
+static void left_group(pid_t pid);
+
+// The spawn flags that start the program in a process group of its own.
+#ifdef POSIX_SPAWN_SETSID
+#define LEAVES_GROUP (POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSID)
+#else
+#define LEAVES_GROUP POSIX_SPAWN_SETPGROUP
+#endif
+
 // How many entries `environment` adds to those it keeps: `DYLD_INSERT_LIBRARIES`, the
-// directory and the nonce.
-#define ADDED 3
+// directory, the nonce and the scope.
+#define ADDED 4
+// How long the scope's entry may be: its name, `=`, the test and the nul.
+#define SCOPE_ENTRY (sizeof SCOPE_VAR + sizeof test + 1)
 
 // `envp` with this library's variables in it, which a program that clears its child's
-// environment would otherwise take away, and the nonce `nonce` for the child to say it loaded.
-// `out` has `room` entries, which is `count(envp) + ADDED + 1`: every entry of `envp` kept, the
-// ones added and the terminator.
+// environment would otherwise take away, the nonce `nonce` for the child to say it loaded,
+// and the thread's test, which the child starts in. `out` has `room` entries, which is
+// `count(envp) + ADDED + 1`: every entry of `envp` kept, the ones added and the terminator.
 static void environment(char *const envp[], char **out, size_t room, char *nonce_var,
-                        char *insert_var, const char *nonce) {
+                        char *insert_var, char *scope_var, const char *nonce) {
     size_t n = 0;
     const char *theirs = NULL;
     // Never more than `count(envp)` are kept, so the guard holds for the room it is given; it
     // keeps the additions and the terminator in bounds should it not.
     for (char *const *it = envp; it && *it && n + ADDED + 1 < room; it++) {
-        if (!strncmp(*it, "__BLAZE_SANDBOX=", 17) || !strncmp(*it, "__BLAZE_SANDBOX_EXEC=", 22))
+        if (!strncmp(*it, "__BLAZE_SANDBOX=", 16) || !strncmp(*it, "__BLAZE_SANDBOX_EXEC=", 21) ||
+            !strncmp(*it, SCOPE_VAR "=", sizeof SCOPE_VAR))
             continue;
         if (!strncmp(*it, "DYLD_INSERT_LIBRARIES=", 22)) {
             theirs = *it + 22;
@@ -1273,9 +1557,11 @@ static void environment(char *const envp[], char **out, size_t room, char *nonce
     else
         snprintf(insert_var, PATH_MAX * 2, "%s", env_insert);
     snprintf(nonce_var, 64, "__BLAZE_SANDBOX_EXEC=%s", nonce);
+    snprintf(scope_var, SCOPE_ENTRY, SCOPE_VAR "=%s", test);
     out[n++] = insert_var;
     out[n++] = env_dir;
     out[n++] = nonce_var;
+    out[n++] = scope_var;
     out[n] = NULL; // n + 1 <= room: the loop left ADDED + 1 entries
 }
 
@@ -1299,10 +1585,10 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
     if (a == FAIL) END(-1);
     size_t room = count(envp) + ADDED + 1;
     char *env[room];
-    char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2];
+    char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2], scope_var[SCOPE_ENTRY];
     new_nonce(nonce);
-    environment(envp, env, room, nonce_var, insert_var, nonce);
-    emit("E", nonce, test, virt[0] ? virt : path);
+    environment(envp, env, room, nonce_var, insert_var, scope_var, nonce);
+    emit("P", nonce, test, virt[0] ? virt : path);
     int r = execve(a == USE ? real : path, argv, env);
     emit("F", nonce, NULL, NULL);
     END(r);
@@ -1317,13 +1603,16 @@ static int spawned(pid_t *pid, const char *path, const posix_spawn_file_actions_
     if (a == FAIL) return errno;
     size_t room = count(envp) + ADDED + 1;
     char *env[room];
-    char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2];
+    char nonce[32], nonce_var[64], insert_var[PATH_MAX * 2], scope_var[SCOPE_ENTRY];
     new_nonce(nonce);
-    environment(envp, env, room, nonce_var, insert_var, nonce);
+    environment(envp, env, room, nonce_var, insert_var, scope_var, nonce);
     pid_t child;
     int r = posix_spawn(&child, a == USE ? real : path, actions, attr, argv, env);
     if (r == 0) {
-        emit("E", nonce, test, virt[0] ? virt : path);
+        emit("P", nonce, test, virt[0] ? virt : path);
+        short flags = 0;
+        if (attr && posix_spawnattr_getflags(attr, &flags) == 0 && (flags & LEAVES_GROUP))
+            left_group(child);
         if (pid) *pid = child;
     }
     return r;
@@ -1385,6 +1674,27 @@ static int my_posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_
 INTERPOSE(my_posix_spawn, posix_spawn)
 INTERPOSE(my_posix_spawnp, posix_spawnp)
 
+// A process that leaves the run's process group, which is not killed with it as the run
+// ends: `macos.rs` looks whether it still runs then.
+static void left_group(pid_t pid) {
+    if (!alive || record_fd < 0) return;
+    char number[16];
+    snprintf(number, sizeof number, "%d", pid);
+    emit("S", number, NULL, NULL);
+}
+static pid_t my_setsid(void) {
+    pid_t r = setsid();
+    if (r >= 0) left_group(getpid());
+    return r;
+}
+static int my_setpgid(pid_t pid, pid_t group) {
+    int r = setpgid(pid, group);
+    if (r == 0) left_group(pid ? pid : getpid());
+    return r;
+}
+INTERPOSE(my_setsid, setsid)
+INTERPOSE(my_setpgid, setpgid)
+
 // ---------------------------------------------------------------------------------------
 // The network.
 
@@ -1428,14 +1738,41 @@ static int outside(const struct sockaddr *addr, socklen_t len, char *out) {
     return 0;
 }
 
+// Whether what comes back from `addr` is the network's, with the network on: any address of
+// the internet's, the loopback too (the machine's own then), and the system's resolver, whose
+// answers are.
+static int networked(const struct sockaddr *addr, socklen_t len) {
+    if (!network_on || !addr) return 0;
+    if (addr->sa_family == AF_INET || addr->sa_family == AF_INET6) return 1;
+    if (addr->sa_family != AF_UNIX || len <= offsetof(struct sockaddr_un, sun_path)) return 0;
+    const struct sockaddr_un *un = (const void *)addr;
+    size_t most = len - offsetof(struct sockaddr_un, sun_path);
+    if (most > sizeof un->sun_path) most = sizeof un->sun_path;
+    const char *path = un->sun_path;
+    size_t n = strnlen(path, most);
+    if (n > 8 && !strncmp(path, "/private", 8)) path += 8, n -= 8;
+    return n == strlen("/var/run/mDNSResponder") && !strncmp(path, "/var/run/mDNSResponder", n);
+}
+
 static void reached(int r, const struct sockaddr *addr, socklen_t len) {
     char where_[WHERE];
-    if (r < 0 && (errno == EPERM || errno == EACCES) && alive && outside(addr, len, where_)) {
-        int saved = errno;
+    if (!alive) return;
+    int saved = errno;
+    if (r < 0 && (saved == EPERM || saved == EACCES) && outside(addr, len, where_)) {
         note('N', where_);
-        errno = saved;
+    } else if (record_reads && networked(addr, len)) {
+        // A call refused for another reason or not, what it reached may answer.
+        note('T', "network");
     }
+    errno = saved;
 }
+
+static int my_bind(int s, const struct sockaddr *a, socklen_t n) {
+    int r = bind(s, a, n);
+    reached(r, a, n);
+    return r;
+}
+INTERPOSE(my_bind, bind)
 
 static int my_connect(int s, const struct sockaddr *a, socklen_t n) {
     int r = connect(s, a, n);
@@ -1475,3 +1812,4 @@ INTERPOSE(my_sendto, sendto)
 INTERPOSE(my_sendto_nocancel, sendto_nocancel)
 INTERPOSE(my_sendmsg, sendmsg)
 INTERPOSE(my_sendmsg_nocancel, sendmsg_nocancel)
+INTERPOSE(my_pthread_create, pthread_create)

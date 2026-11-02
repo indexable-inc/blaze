@@ -1,0 +1,35 @@
+{
+  "id": "01180",
+  "from_lane": "query-unify",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db"
+  ],
+  "what": "Andrew 15:56 (reached query-unify only at 16:28): add a 128-bit transitive-input summary per node, spec now in docs/v2/plan/lanes/db/query-unify.md section \"Transitive-input summaries\" (read it whole: column by node, input field = two hashed bits, memo = OR of edges summaries at run, tracked field = its creator s, REFRESH after a walk-verify (load-bearing for soundness), suffix-OR masks of the last 64 views, all-ones for untracked/provisional/synthetic_write, check order durability -> summary -> walk, Reads grows to 32 bytes with its summary). Tests: a memo green by summary runs nothing and walks nothing; the refresh case (dependency reruns, reads a new input B, then B changes: the reader must rerun); a Hegel property with summaries on equals from-scratch. Also: no cargo from now (Andrew 15:21; the coordinator builds and sends errors), and AGENTS.md rule 3 is stricter: no fallback, even a logged one.",
+  "state": "applied",
+  "created": "2026-10-30T23:31:11Z",
+  "updated": "2026-10-30T23:44:41Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:31:11Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:41Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "summaries column (storage.rs), input bits (n*K1)>>57,(n*K2)>>57, memo = OR of edges + replayed Reads, tracked field = creator so far, ALL for untracked/cycle/synthetic_write, 64-view suffix masks, order durability->summary->walk at all three sites, Reads 32 bytes. One difference: a walk ORs the new summary into the old (fetch_or) rather than storing it, so two racing walkers cannot drop bits; a superset, sound, at most an extra walk. Tests: a_memo_green_by_its_summary_walks_nothing, a_walk_refreshes_the_summary_with_a_dependencys_new_reads, an_unrelated_write_of_the_same_durability_passes_the_summary, and the Hegel graph property"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+; Follows cranelift/filetests/filetests/runtests/simd-vanytrue.clif (and
+; simd-vanytrue-64bit.clif), for the stencil set: `vany_true` of each integer vector type, on
+; all lanes zero, one nonzero lane in each position class (first, middle, last), lanes with
+; only a high or only a low byte set (which a byte-wise or 32-bit-wise test gets wrong), all
+; lanes nonzero, and of an `icmp` mask, branched on and selected on. Upstream's
+; `vany_true.f32x4`/`f64x2` are a `bitcast` to the integer vector here: the stencil set has
+; `vany_true` of integer vectors only.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %vany_true_i8x16(i8x16) -> i8 {
+block0(v0: i8x16):
+    v1 = vany_true v0
+    return v1
+}
+; run: %vany_true_i8x16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 0
+; run: %vany_true_i8x16([-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) == 1
+; run: %vany_true_i8x16([-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1]) == 1
+; run: %vany_true_i8x16([0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1]) == 1
+; run: %vany_true_i8x16([0 0 0 0 0 0 0 0x80 0 0 0 0 0 0 0 0]) == 1
+; run: %vany_true_i8x16(0x00000000000000000100000000000000) == 1
+; run: %vany_true_i8x16(0x80000000000000000000000000000000) == 1
+
+function %vany_true_i16x8(i16x8) -> i8 {
+block0(v0: i16x8):
+    v1 = vany_true v0
+    return v1
+}
+; run: %vany_true_i16x8([0 0 0 0 0 0 0 0]) == 0
+; run: %vany_true_i16x8([-1 0 0 0 0 0 0 0]) == 1
+; run: %vany_true_i16x8([-1 -1 -1 -1 -1 -1 -1 -1]) == 1
+; run: %vany_true_i16x8([0 0 0 0 0 0 0 0x100]) == 1
+; run: %vany_true_i16x8([0 0 0 1 0 0 0 0]) == 1
+; run: %vany_true_i16x8([0 0 0 0 0x8000 0 0 0]) == 1
+
+function %vany_true_i32x4(i32x4) -> i8 {
+block0(v0: i32x4):
+    v1 = vany_true v0
+    return v1
+}
+; run: %vany_true_i32x4([0 0 0 0]) == 0
+; run: %vany_true_i32x4([-1 0 0 0]) == 1
+; run: %vany_true_i32x4([-1 -1 -1 -1]) == 1
+; run: %vany_true_i32x4([0 0 0 0x1000000]) == 1
+; run: %vany_true_i32x4([0 0x10000 0 0]) == 1
+; run: %vany_true_i32x4([0 0 0x80000000 0]) == 1
+
+function %vany_true_i64x2(i64x2) -> i8 {
+block0(v0: i64x2):
+    v1 = vany_true v0
+    return v1
+}
+; run: %vany_true_i64x2([0 0]) == 0
+; run: %vany_true_i64x2([-1 0]) == 1
+; run: %vany_true_i64x2([-1 -1]) == 1
+; run: %vany_true_i64x2([0 0x100000000]) == 1
+; run: %vany_true_i64x2([0x8000000000000000 0]) == 1
+; run: %vany_true_i64x2([0 1]) == 1
+
+function %vany_true_f32x4(f32x4) -> i8 {
+block0(v0: f32x4):
+    v1 = bitcast.i32x4 little v0
+    v2 = vany_true v1
+    return v2
+}
+; run: %vany_true_f32x4([0x0.0 0x0.0 0x0.0 0x0.0]) == 0
+; run: %vany_true_f32x4([0x0.0 -0x0.0 0x0.0 0x0.0]) == 1
+; run: %vany_true_f32x4([-0x0.0 -0x0.0 -0x0.0 -0x0.0]) == 1
+; run: %vany_true_f32x4([0x0.0 0x0.0 0x0.0 0x0.000002p-126]) == 1
+
+function %vany_true_f64x2(f64x2) -> i8 {
+block0(v0: f64x2):
+    v1 = bitcast.i64x2 little v0
+    v2 = vany_true v1
+    return v2
+}
+; run: %vany_true_f64x2([0x0.0 0x0.0]) == 0
+; run: %vany_true_f64x2([0x0.0 -0x0.0]) == 1
+; run: %vany_true_f64x2([-0x0.0 -0x0.0]) == 1
+; run: %vany_true_f64x2([0x1.0p0 0x0.0]) == 1
+
+function %vany_true_icmp_eq_i32x4(i32x4, i32x4) -> i8 {
+block0(v0: i32x4, v1: i32x4):
+    v2 = icmp eq v0, v1
+    v3 = vany_true v2
+    return v3
+}
+; run: %vany_true_icmp_eq_i32x4([1 2 3 4], [5 6 7 8]) == 0
+; run: %vany_true_icmp_eq_i32x4([1 2 3 4], [5 6 7 4]) == 1
+; run: %vany_true_icmp_eq_i32x4([0 0 0 0], [0 0 0 0]) == 1
+
+function %vany_true_icmp_ugt_i8x16(i8x16, i8x16) -> i8 {
+block0(v0: i8x16, v1: i8x16):
+    v2 = icmp ugt v0, v1
+    v3 = vany_true v2
+    return v3
+}
+; run: %vany_true_icmp_ugt_i8x16([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 0x7f], [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 0x80]) == 0
+; run: %vany_true_icmp_ugt_i8x16([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 0x80], [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 0x7f]) == 1
+
+function %vany_true_brif_i16x8(i16x8) -> i32 {
+block0(v0: i16x8):
+    v1 = vany_true v0
+    brif v1, block1, block2
+
+block1:
+    v2 = iconst.i32 100
+    return v2
+
+block2:
+    v3 = iconst.i32 200
+    return v3
+}
+; run: %vany_true_brif_i16x8([0 0 0 0 0 0 0 0]) == 200
+; run: %vany_true_brif_i16x8([0 0 0 0 0 0 0 0x100]) == 100
+; run: %vany_true_brif_i16x8([0 0 1 0 0 0 0 0]) == 100
+
+function %vany_true_select_i64x2(i64x2, i64, i64) -> i64 {
+block0(v0: i64x2, v1: i64, v2: i64):
+    v3 = vany_true v0
+    v4 = select v3, v1, v2
+    return v4
+}
+; run: %vany_true_select_i64x2([0 0x100000000], 7, 9) == 7
+; run: %vany_true_select_i64x2([0 0], 7, 9) == 9

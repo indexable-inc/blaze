@@ -1,0 +1,99 @@
+(PATH, 3..22): is `Clone` false, one segment Some("rustc_builtin_macro"), up to two Some(("rustc_builtin_macro", None)), qualifier's one None
+(NAME_REF, 3..22): Name { symbol: "rustc_builtin_macro", ctx: () }
+(NAME, 37..46): Name { symbol: "stringify", ctx: () }
+(PATH, 62..81): is `Clone` false, one segment Some("rustc_builtin_macro"), up to two Some(("rustc_builtin_macro", None)), qualifier's one None
+(NAME_REF, 62..81): Name { symbol: "rustc_builtin_macro", ctx: () }
+(NAME, 96..100): Name { symbol: "line", ctx: () }
+(PATH, 116..135): is `Clone` false, one segment Some("rustc_builtin_macro"), up to two Some(("rustc_builtin_macro", None)), qualifier's one None
+(NAME_REF, 116..135): Name { symbol: "rustc_builtin_macro", ctx: () }
+(NAME, 150..156): Name { symbol: "concat", ctx: () }
+(PATH, 215..221): is `Clone` false, one segment Some("derive"), up to two Some(("derive", None)), qualifier's one None
+(NAME_REF, 215..221): Name { symbol: "derive", ctx: () }
+(PATH, 230..235): is `Clone` false, one segment Some("allow"), up to two Some(("allow", None)), qualifier's one None
+(NAME_REF, 230..235): Name { symbol: "allow", ctx: () }
+(PATH, 251..255): is `Clone` false, one segment Some("repr"), up to two Some(("repr", None)), qualifier's one None
+(NAME_REF, 251..255): Name { symbol: "repr", ctx: () }
+(KEY_VALUE_META, 262..274): value Some("more")
+(PATH, 262..265): is `Clone` false, one segment Some("doc"), up to two Some(("doc", None)), qualifier's one None
+(NAME_REF, 262..265): Name { symbol: "doc", ctx: () }
+(NAME, 287..288): Name { symbol: "S", ctx: () }
+(NAME, 295..296): Name { symbol: "a", ctx: () }
+(PATH, 298..301): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 298..301): Name { symbol: "u32", ctx: () }
+(NAME, 303..304): Name { symbol: "b", ctx: () }
+(PATH, 307..309): is `Clone` false, one segment Some("u8"), up to two Some(("u8", None)), qualifier's one None
+(NAME_REF, 307..309): Name { symbol: "u8", ctx: () }
+(PATH, 311..314): is `Clone` false, one segment Some("i16"), up to two Some(("i16", None)), qualifier's one None
+(NAME_REF, 311..314): Name { symbol: "i16", ctx: () }
+(NAME, 323..324): Name { symbol: "m", ctx: () }
+(PATH, 330..335): is `Clone` false, one segment Some("allow"), up to two Some(("allow", None)), qualifier's one None
+(NAME_REF, 330..335): Name { symbol: "allow", ctx: () }
+(NAME, 353..354): Name { symbol: "g", ctx: () }
+(NAME, 364..369): Name { symbol: "try", ctx: () }
+(NAME, 370..371): Name { symbol: "T", ctx: () }
+(NAME, 373..374): Name { symbol: "x", ctx: () }
+(PATH, 376..379): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 376..379): Name { symbol: "u32", ctx: () }
+(PATH, 384..387): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 384..387): Name { symbol: "u32", ctx: () }
+(PATH, 390..391): is `Clone` false, one segment Some("x"), up to two Some(("x", None)), qualifier's one None
+(NAME_REF, 390..391): Name { symbol: "x", ctx: () }
+(NAME, 402..403): Name { symbol: "f", ctx: () }
+(NAME, 404..405): Name { symbol: "x", ctx: () }
+(PATH, 407..410): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 407..410): Name { symbol: "u32", ctx: () }
+(NAME, 412..413): Name { symbol: "v", ctx: () }
+(PATH, 415..416): is `Clone` false, one segment Some("S"), up to two Some(("S", None)), qualifier's one None
+(NAME_REF, 415..416): Name { symbol: "S", ctx: () }
+(PATH, 421..424): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 421..424): Name { symbol: "u32", ctx: () }
+(NAME, 435..436): Name { symbol: "s", ctx: () }
+(PATH, 439..448): is `Clone` false, one segment Some("stringify"), up to two Some(("stringify", None)), qualifier's one None
+(NAME_REF, 439..448): Name { symbol: "stringify", ctx: () }
+(NAME, 470..471): Name { symbol: "l", ctx: () }
+(PATH, 474..478): is `Clone` false, one segment Some("line"), up to two Some(("line", None)), qualifier's one None
+(NAME_REF, 474..478): Name { symbol: "line", ctx: () }
+(NAME, 491..492): Name { symbol: "c", ctx: () }
+(PATH, 495..501): is `Clone` false, one segment Some("concat"), up to two Some(("concat", None)), qualifier's one None
+(NAME_REF, 495..501): Name { symbol: "concat", ctx: () }
+(PATH, 567..568): is `Clone` false, one segment Some("S"), up to two Some(("S", None)), qualifier's one None
+(NAME_REF, 567..568): Name { symbol: "S", ctx: () }
+(RECORD_PAT_FIELD, 571..572): field Some(Name { symbol: "a", ctx: () })
+(NAME, 571..572): Name { symbol: "a", ctx: () }
+(RECORD_PAT_FIELD, 574..583): field Some(Name { symbol: "b", ctx: () })
+(NAME_REF, 574..575): Name { symbol: "b", ctx: () }
+(NAME, 578..579): Name { symbol: "y", ctx: () }
+(PATH, 588..589): is `Clone` false, one segment Some("v"), up to two Some(("v", None)), qualifier's one None
+(NAME_REF, 588..589): Name { symbol: "v", ctx: () }
+(PATH, 595..619): is `Clone` false, one segment None, up to two Some(("try", None)), qualifier's one None
+(PATH, 595..606): is `Clone` false, one segment None, up to two Some(("g", None)), qualifier's one None
+(PATH, 595..603): is `Clone` false, one segment None, up to two Some(("crate", Some("m"))), qualifier's one Some("crate")
+(PATH, 595..600): is `Clone` false, one segment Some("crate"), up to two Some(("crate", None)), qualifier's one None
+(NAME_REF, 595..600): Name { symbol: "crate", ctx: () }
+(NAME_REF, 602..603): Name { symbol: "m", ctx: () }
+(NAME_REF, 605..606): Name { symbol: "g", ctx: () }
+(NAME_REF, 608..613): Name { symbol: "try", ctx: () }
+(PATH, 616..618): is `Clone` false, one segment Some("u8"), up to two Some(("u8", None)), qualifier's one None
+(NAME_REF, 616..618): Name { symbol: "u8", ctx: () }
+(PATH, 620..621): is `Clone` false, one segment Some("x"), up to two Some(("x", None)), qualifier's one None
+(NAME_REF, 620..621): Name { symbol: "x", ctx: () }
+(PATH, 625..632): is `Clone` false, one segment None, up to two Some(("self", Some("h"))), qualifier's one Some("self")
+(PATH, 625..629): is `Clone` false, one segment Some("self"), up to two Some(("self", None)), qualifier's one None
+(NAME_REF, 625..629): Name { symbol: "self", ctx: () }
+(NAME_REF, 631..632): Name { symbol: "h", ctx: () }
+(FIELD_EXPR, 637..640): field Some(Name { symbol: "a", ctx: () })
+(PATH, 637..638): is `Clone` false, one segment Some("v"), up to two Some(("v", None)), qualifier's one None
+(NAME_REF, 637..638): Name { symbol: "v", ctx: () }
+(NAME_REF, 639..640): Name { symbol: "a", ctx: () }
+(FIELD_EXPR, 643..648): field Some(Name { symbol: "0", ctx: () })
+(FIELD_EXPR, 643..646): field Some(Name { symbol: "b", ctx: () })
+(PATH, 643..644): is `Clone` false, one segment Some("v"), up to two Some(("v", None)), qualifier's one None
+(NAME_REF, 643..644): Name { symbol: "v", ctx: () }
+(NAME_REF, 645..646): Name { symbol: "b", ctx: () }
+(NAME_REF, 647..648): Name { symbol: "0", ctx: () }
+(PATH, 652..655): is `Clone` false, one segment Some("u32"), up to two Some(("u32", None)), qualifier's one None
+(NAME_REF, 652..655): Name { symbol: "u32", ctx: () }
+(PATH, 658..666): is `Clone` false, one segment None, up to two Some(("super", Some("k"))), qualifier's one Some("super")
+(PATH, 658..663): is `Clone` false, one segment Some("super"), up to two Some(("super", None)), qualifier's one None
+(NAME_REF, 658..663): Name { symbol: "super", ctx: () }
+(NAME_REF, 665..666): Name { symbol: "k", ctx: () }

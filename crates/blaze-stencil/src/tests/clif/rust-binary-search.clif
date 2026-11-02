@@ -1,0 +1,128 @@
+; Shaped like what hir-ty-codegen makes for `<[u32]>::binary_search` (core's
+; `binary_search_by`: `size` halves each turn with `base = if a[mid] > x { base } else {
+; mid }`, a `select`, then one last compare of `a[base]`). The result `Result<usize, usize>`
+; is a scalar pair (discriminant, index): `Ok` is 0, `Err` is 1. `%search` searches the
+; first `len` of `[1, 3, 5, 7, 9, 11, 13, 15]` (compared unsigned), `%search_dups` all of
+; `[2, 2, 2, 4, 4, 8, 8, 8]` (for duplicates std returns the index this algorithm finds).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %binary_search(i64, i64, i32) -> i64, i64 {
+block0(v0: i64, v1: i64, v2: i32):
+    v3 = iconst.i64 0
+    brif v1, block1(v3, v1), block4
+
+block1(v4: i64, v5: i64):
+    v6 = iconst.i64 1
+    v7 = icmp ugt v5, v6
+    brif v7, block2, block3
+
+block2:
+    v8 = ushr v5, v6
+    v9 = iadd v4, v8
+    v10 = iconst.i64 2
+    v11 = ishl v9, v10
+    v12 = iadd v0, v11
+    v13 = load.i32 notrap aligned v12
+    v14 = icmp ugt v13, v2
+    v15 = select v14, v4, v9
+    v16 = isub v5, v8
+    jump block1(v15, v16)
+
+block3:
+    v17 = iconst.i64 2
+    v18 = ishl v4, v17
+    v19 = iadd v0, v18
+    v20 = load.i32 notrap aligned v19
+    v21 = icmp eq v20, v2
+    brif v21, block5, block6
+
+block4:
+    v22 = iconst.i64 1
+    v23 = iconst.i64 0
+    return v22, v23
+
+block5:
+    v24 = iconst.i64 0
+    return v24, v4
+
+block6:
+    v25 = icmp ult v20, v2
+    v26 = uextend.i64 v25
+    v27 = iadd v4, v26
+    v28 = iconst.i64 1
+    return v28, v27
+}
+
+function %search(i64, i32) -> i64, i64 {
+    ss0 = explicit_slot 32, align = 4
+    fn0 = %binary_search(i64, i64, i32) -> i64, i64
+
+block0(v0: i64, v1: i32):
+    v2 = stack_addr.i64 ss0
+    v3 = iconst.i32 1
+    store notrap aligned v3, v2
+    v4 = iconst.i32 3
+    store notrap aligned v4, v2+4
+    v5 = iconst.i32 5
+    store notrap aligned v5, v2+8
+    v6 = iconst.i32 7
+    store notrap aligned v6, v2+12
+    v7 = iconst.i32 9
+    store notrap aligned v7, v2+16
+    v8 = iconst.i32 11
+    store notrap aligned v8, v2+20
+    v9 = iconst.i32 13
+    store notrap aligned v9, v2+24
+    v10 = iconst.i32 15
+    store notrap aligned v10, v2+28
+    v11, v12 = call fn0(v2, v0, v1)
+    return v11, v12
+}
+; run: %search(8, 7) == [0, 3]
+; run: %search(8, 1) == [0, 0]
+; run: %search(8, 15) == [0, 7]
+; run: %search(8, 0) == [1, 0]
+; run: %search(8, 16) == [1, 8]
+; run: %search(8, 8) == [1, 4]
+; run: %search(8, 6) == [1, 3]
+; run: %search(8, 0xffffffff) == [1, 8]
+; run: %search(8, 0x80000000) == [1, 8]
+; run: %search(0, 5) == [1, 0]
+; run: %search(1, 1) == [0, 0]
+; run: %search(1, 2) == [1, 1]
+; run: %search(1, 0) == [1, 0]
+; run: %search(3, 4) == [1, 2]
+; run: %search(5, 9) == [0, 4]
+; run: %search(7, 14) == [1, 7]
+
+function %search_dups(i32) -> i64, i64 {
+    ss0 = explicit_slot 32, align = 4
+    fn0 = %binary_search(i64, i64, i32) -> i64, i64
+
+block0(v0: i32):
+    v1 = stack_addr.i64 ss0
+    v2 = iconst.i32 2
+    store notrap aligned v2, v1
+    store notrap aligned v2, v1+4
+    store notrap aligned v2, v1+8
+    v3 = iconst.i32 4
+    store notrap aligned v3, v1+12
+    store notrap aligned v3, v1+16
+    v4 = iconst.i32 8
+    store notrap aligned v4, v1+20
+    store notrap aligned v4, v1+24
+    store notrap aligned v4, v1+28
+    v5 = iconst.i64 8
+    v6, v7 = call fn0(v1, v5, v0)
+    return v6, v7
+}
+; run: %search_dups(2) == [0, 2]
+; run: %search_dups(4) == [0, 4]
+; run: %search_dups(8) == [0, 7]
+; run: %search_dups(1) == [1, 0]
+; run: %search_dups(3) == [1, 3]
+; run: %search_dups(5) == [1, 5]
+; run: %search_dups(9) == [1, 8]

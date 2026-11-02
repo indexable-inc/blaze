@@ -1,0 +1,23 @@
+{
+  "id": "00847",
+  "from_lane": "firewall",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "docs/v2/plan/reference/crates.md: add lane `firewall` owning `crates/hir-firewall/` (new crate: harness that edits one function body at a time and asserts only that function's queries and code re-run; member via the crates/* glob, no root Cargo.toml change needed) and `docs/v2/plan/lanes/firewall/`. Its manifest uses only existing workspace deps (blaze-store is new to it, already a workspace dep).",
+  "state": "open",
+  "created": "2026-10-30T08:49:13Z",
+  "updated": "2026-10-30T08:49:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:49:13Z",
+      "by": "firewall",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

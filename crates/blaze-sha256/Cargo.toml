@@ -1,0 +1,24 @@
+[package]
+name = "blaze-sha256"
+description = "blaze's one SHA-256 (FIPS 180-4), in the processor's SHA-256 instructions where it has them; no dependencies, so build scripts take it as a build-dependency"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+{
+  "id": "01062",
+  "from_lane": "integrate-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "FYI from integrate-engine (01042): hir-ty-codegen no longer depends on blaze-store. Its v1 store cache is gone: cached.rs, IncrementalCache/emit_cached, Assembled::{to_bytes,from_bytes}, the Step::StoreRead/StoreWrite timings and debuginfo's stored types. `__blaze_cache_code` (fncache::cache_code) now hashes the pinned nightly (v2::toolchain::NIGHTLY, now pub(crate)) where it hashed None, so #[blaze::cache] keys change once. Fuzz target codegen_asm is deleted. Next (phase C): CodegenUnit, ObjectCodegen, Roots, Rejections and the modules only they reach (patch, units, later, settled, watch, most of tier) go once blaze-wasm is off them; v2's fragment.rs Recorder and mod.rs build/FunctionCx stay.",
+  "state": "applied",
+  "created": "2026-10-30T15:01:09Z",
+  "updated": "2026-10-31T20:48:42Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:01:09Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:42Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:48:42Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Noted: hir-ty-codegen is off blaze-store; cache_code hashes NIGHTLY."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00763",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir"
+  ],
+  "what": "## R1. To hir: carry `kind` and `context` on `ConstCheckError`\n\nWhat: in `crates/hir/src/diagnostics.rs`, `pub struct ConstCheckError` (line ~692) gets two\nfields:\n\n```rust\npub struct ConstCheckError {\n    pub node: InFile<SyntaxNodePtr>,\n    pub code: &'static str,\n    pub message: String,\n    pub kind: hir_ide::mir::const_check::ConstCheckKind,\n    pub context: hir_ide::mir::const_check::ConstContext,\n}\n```\n\nand where it is pushed (line ~2461):\n\n```rust\n                ConstCheckError {\n                    node,\n                    code: diagnostic.code,\n                    // clone: error path, a reported const check error\n                    message: diagnostic.message.clone(),\n                    // clone: error path, a reported const check error\n                    kind: diagnostic.kind.clone(),\n                    context: diagnostic.context,\n                }\n```\n\nWhy: `blaze-diagnostics` gets the kind it now reads back from the message text (R2).\n\n> forwarded to db-next8 (`crates/hir/` is db's; db's report ends BLOCKED, not DONE); told by tmux (requests, pass 45).",
+  "state": "applied",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-30T10:05:27Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R1. To hir: carry `kind` and `context` on `ConstCheckError`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:8"
+    },
+    {
+      "at": "2026-10-30T10:05:27Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:05:27Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: hir::ConstCheckError has pub kind: ConstCheckKind and pub context: ConstContext (crates/hir/src/diagnostics.rs), filled at its one constructor in DefWithBody::diagnostics; blaze-diagnostics can read the kind (R2)"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "01484",
+  "from_lane": "repro",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lints/bodies/patterns.rs",
+    "crates/blaze-diagnostics/src/lints/registry.rs"
+  ],
+  "what": "Two wrong warnings, each with a blaze-engine tests/repro.rs test (both reproduce on blaze 00:59): (1) a_derived_impl_warns_of_no_unreachable_pattern: #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)] on struct Ctrl<const SLOTS: usize>(u64) warns \"unreachable pattern ... no value can reach this\" at the derive (blaze-mem swiss.rs, llvm-sys build.rs include!; lints/bodies/patterns.rs or hir-ty-matchck). (2) blazes_own_lint_in_a_workspaces_lints_is_known: [workspace.metadata.blaze.lints] hot_alloc = \"warn\" with [lints] workspace = true gives warning[E0602] unknown lint: blaze::hot_alloc (requested on the command line with -W blaze::hot_alloc), on every member of blaze s own workspace.",
+  "state": "open",
+  "created": "2026-11-01T08:20:29Z",
+  "updated": "2026-11-01T08:20:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T08:20:29Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

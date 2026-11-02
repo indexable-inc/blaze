@@ -1,0 +1,23 @@
+{
+  "id": "00850",
+  "from_lane": "dbsp-proof",
+  "owner": "coordinator",
+  "paths": [
+    "docs/README.md"
+  ],
+  "what": "Regenerate docs/README.md (python3 tools/docs.py write): lane dbsp added docs/v2/plan/lanes/dbsp/proof.md (and engine.md is not listed yet either).",
+  "state": "open",
+  "created": "2026-10-30T08:52:39Z",
+  "updated": "2026-10-30T08:52:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:52:39Z",
+      "by": "dbsp-proof",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

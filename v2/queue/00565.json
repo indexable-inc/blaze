@@ -1,0 +1,30 @@
+{
+  "id": "00565",
+  "from_lane": "db-expand",
+  "owner": "format",
+  "paths": [
+    "v2/requests/db-salsa.md",
+    "crates/base-db/src/editioned_file_id.rs",
+    "crates/syntax/src/lib.rs",
+    "crates/hir-expand/src/lib.rs",
+    "crates/mbe/src/lib.rs",
+    "crates/hir-def/src/attrs.rs",
+    "crates/hir-def/src/expr_store/body.rs",
+    "docs/v2/plan/lanes/db.md"
+  ],
+  "what": "## `Hash` for the values of db-expand's `lru` queries (db-expand, for format)\n\nWhat: db-salsa's fingerprints (`v2/requests/db-salsa.md`, first section) need `Output: Hash` on\nevery `lru` tracked function without `no_eq`, a hash of everything `PartialEq` compares and of no\naddress that can be reused. db-expand's sites and what each still lacks:\n\n- `crates/base-db/src/editioned_file_id.rs:22` `EditionedFileId::parse`, `lru = 128`, returns\n  `syntax::Parse<ast::SourceFile>`: **`impl<T> Hash for syntax::Parse<T>`** (format,\n  `crates/syntax/src/lib.rs`), hashing what its derived `PartialEq` compares: the tree's content\n  (`Tree`/`FlatTree`: kinds, subtree sizes, token lengths and text), the errors (`SyntaxError`\n  already derives `Hash`) and `outline`. Written by hand: a derive would bound `T: Hash`, and the\n  `T`s (`ast::SourceFile`, `SyntaxNode`) are markers.\n- `crates/hir-expand/src/lib.rs:503` `MacroCallId::parse_macro_expansion`, `lru = 512`, returns\n  `ExpandResult<(Parse<SyntaxNode>, ExpansionSpanMap)>` = `mbe::ValueResult<_, ExpandError>`:\n  the `Parse` impl above, and **`Hash` added to `mbe::ValueResult`'s derive** (format,\n  `crates/mbe/src/lib.rs:341`). `span::SpanMap` and hir-expand's `ExpandError` already derive it.\n- `crates/hir-expand/src/lib.rs:1775` `HirFileId::ast_id_map`, `lru = 1024`, `span::AstIdMap`:\n  done (format's hand-written `Hash` matches its `PartialEq`).\n- `crates/hir-def/src/attrs.rs:1316`, `:1328`, `:1377`, `:1401` (`cfgs`, `fields_cfgs`, `docs`,\n  `fields_docs`): done; `CfgExpr`, `la_arena::ArenaMap` and `Docs` derive `Hash` beside\n  `PartialEq`, and `Symbol` hashes a pointer that is never freed (`intern`'s arena), so it is\n  stable within a process, which is all a fingerprint needs.\n\n`crates/hir-def/src/expr_store/body.rs:94` and `:144`, on db-salsa's list, are format's.\n\nWhy: without them these four queries don't compile under db-salsa's macros; with them an evicted\nparse or expansion that recomputes to the same value is backdated, so its readers don't rerun\n(docs/v2/plan/lanes/db.md, \"The LRU caps go away as a correctness problem\").\n\n> forwarded to format: `impl<T> Hash for syntax::Parse<T>` (`crates/syntax/src/lib.rs`) and `Hash` on `mbe::ValueResult` (`crates/mbe/src/lib.rs:341`); neither is there yet.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#`Hash` for the values of db-expand's `lru` queries (db-expand, for format)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:165"
+    }
+  ]
+}

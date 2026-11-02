@@ -1,0 +1,38 @@
+{
+  "id": "00730",
+  "from_lane": "dedyn",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs",
+    "v2/requests/codegen-v2.md",
+    "crates/hir-ty-codegen/v2",
+    "crates/blaze-codegen"
+  ],
+  "what": "## dedyn: crates/blaze-cargo/src/serve/unit/codegen.rs: `HirFrontend::new` takes a `HashSource` (from dedyn-codegen, 2026-10-29)\n\n> applied by dedyn-codegen (2026-10-29): the call and the import, as written.\n\n> APPLIED (checked in the tree by dedyn-cargo 2026-10-29 22:10): `HashSource::Items(..)` and its import are in `serve/unit/codegen.rs`.\n\nFrom `dedyn-codegen` (report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). `hir-ty-codegen`'s v2 front\nend stops holding `Box<dyn Hashes>` and holds an enum `hir_ty_codegen::v2::HashSource` (the items\nlane's `ItemHashes`, or a test's), asked in `v2/requests/codegen-v2.md` under\n\"## dedyn: crates/hir-ty-codegen/v2 and crates/blaze-codegen\", item dedyn-v2 3. Apply together with\nit. In `fn frontend`:\n\n```rust\n    HirFrontend::new(Databases::new(reader.db()), Box::new(ItemHashes::new(Box::new(names))), build_time(job))\n```\n\nbecomes\n\n```rust\n    HirFrontend::new(Databases::new(reader.db()), HashSource::Items(ItemHashes::new(Box::new(names))), build_time(job))\n```\n\nand the import\n\n```rust\nuse hir_ty_codegen::v2::{\n    Backends, BuildTime, Databases, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,\n};\n```\n\ngains `HashSource` (`Backends, BuildTime, Databases, HashSource, HirFrontend, ..`). Nothing else\nin `blaze-cargo` names `Hashes`. `Reading` (this file's `Lookup`) is unchanged: the driver takes\n`&impl Lookup` now (dedyn-v2 1), and `&store` passes as before.\n\n> forwarded to cargo (requests, pass 20; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedyn: crates/blaze-cargo/src/serve/unit/codegen.rs: `HirFrontend::new` takes a `HashSource` (from dedyn-codegen, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4022"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "applied by dedyn-codegen, checked by dedyn-cargo"
+    }
+  ]
+}

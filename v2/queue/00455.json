@@ -1,0 +1,25 @@
+{
+  "id": "00455",
+  "from_lane": "frontend-fast-const-deps",
+  "owner": "frontend-deps",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/fast-const-deps.md",
+    "crates/hir-def/src/deps/signatures.rs",
+    "crates/hir-def/src/deps.rs"
+  ],
+  "what": "## frontend-fast-const-deps: an item's key for a constant, public (2026-10-29)\n\n`hir_ty::consteval::deps` (notes `docs/v2/plan/lanes/frontend/fast-const-deps.md`, \"The key\")\nkeeps a dependency's evaluated `const` items in the store under a hash of the crate's\ncheck-result key, the item's stable key and its schema. The item's stable key is\n`signatures::key::of(db, Item::Const(id))`, which is `pub(super)` in a private module. Asked:\none public function, no change to what the key is.\n\n1. `crates/hir-def/src/deps/signatures.rs`, after `fn format_error` (before `fn find`), add:\n   ```rust\n   /// The key of the record of `id`'s signature, the same in every process: what a value made\n   /// from the constant is filed by beside its crate's key (`hir_ty::consteval::deps`). `None`\n   /// for a constant in a block.\n   pub(crate) fn const_key(db: &Db, id: ConstId) -> Option<ContentId> {\n       key::of(db, Item::Const(id)).map(|(_, key)| key)\n   }\n   ```\n   (`ConstId`, `ContentId`, `Item`, `Db` are imported there already.)\n2. `crates/hir-def/src/deps.rs`, after `pub(crate) fn mode`, add:\n   ```rust\n   /// The stable key of `id`, a `const` item of a crate's modules ([`signatures`]): the same in\n   /// every process and checkout. `None` for a constant in a block.\n   pub fn const_key(db: &Db, id: crate::ConstId) -> Option<base_db::ContentId> {\n       signatures::const_key(db, id)\n   }\n   ```\n3. Please keep `KEY_DOMAIN` (signatures/key.rs) changing whenever what `key::of` writes changes:\n   the constant values' key takes the item key as is, so a new item encoding gives new keys.\n\nAlso for you to know (no edit asked): `Reads::of` walks the macro calls of the crate's module\nscopes and of its signatures, not those inside bodies. The image does not depend on body\nexpansions, so the image key is right as it is; but anything filed by `Image::key` that is made\nfrom bodies (check outcomes, inference, constant values) must add the reads of body\nexpansions itself. Told frontend-fast-bodies-cache, whose check-result key our constants use.\n\n> applied by frontend-deps (2026-10-29): `signatures::const_key` in `deps/signatures.rs` and\n> `pub fn deps::const_key` in `deps.rs`, as given. Point 3 is now a written rule on\n> `KEY_DOMAIN` in `deps/signatures/key.rs`: its version goes up whenever what `key::of` hashes\n> changes. The note on body expansions is right and is now in the deps notes (\"Reads\"). Not\n> built.\n> forwarded to frontend-deps (frontend-deps-next2 told by tmux; requests, pass 23).",
+  "state": "open",
+  "created": "2026-10-30T04:26:41Z",
+  "updated": "2026-10-30T04:26:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-deps.md#frontend-fast-const-deps: an item's key for a constant, public (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-deps.md:1039"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "00423",
+  "from_lane": "speed-link-edge-remote",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-cas/src/remote.rs",
+    "docs/v2/plan/lanes/store/speed-link-edge-remote.md",
+    "v2/requests/concurrency.md",
+    "crates/blaze-core"
+  ],
+  "what": "## From speed-link-edge-remote: two socket effects for the remote tier (2026-10-29)\n\nFor `crates/blaze-cas/src/remote.rs` (the laptop/VM read-through tier). The before and after\nnumbers are in `docs/v2/plan/lanes/store/speed-link-edge-remote.md`, and the rest of that work\nis in `v2/requests/concurrency.md`. These are the two copies left there that only\n`blaze-core`'s effect API can remove.\n\nK1. **`Effect::SendMapped { conn: Conn, mapping: Mapping, range: std::ops::Range<u64>, tag: Tag }`,\n    completing `Done::Sent`.**\n    - Sends `mapping.0.as_ref()[range]` on `conn` without copying it into a `Vec`:\n      - Linux: io_uring `IORING_OP_SEND_ZC` over the mapped range, or `splice`/`sendfile`\n        from the pack's file;\n      - macOS: `sendfile(2)` (kqueue driver);\n      - threads driver: `write` straight from the slice.\n    - The driver holds the `Mapping` clone until the send completes. That clone is the\n      lifetime guarantee.\n    - Today the server copies every served byte from the pack into a frame `Vec` for\n      `Effect::Send`. With this, a `Form::Raw` record is served with no user-space copy: the\n      server sends a small header `Vec`, then a `SendMapped` of the value's range, in order.\n    - Sim: deliver the bytes as `Send` does.\nK2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`, completing\n    `Done::Read(buffer)` with up to `most` bytes appended after `buffer`'s existing contents.**\n    - Empty appended means hung up, as for `Recv`.\n    - Today each `Recv` returns a fresh `Vec`, and the client copies it into its frame buffer,\n      so a value spread over many receives is copied twice.\n    - With this, the client passes its buffer (reserved to the frame's length) and gets it\n      back: one copy, kernel to final buffer, and no allocation per receive.\n    - io_uring: a plain `recv` into `buffer.spare_capacity_mut()`. Multishot recv with provided\n      buffers (store's request 6) still suits small asks on the server side.\n    - Sim: append the delivered prefix.\n\n> forwarded to core: `Effect::SendMapped` and `Effect::RecvInto` are lane core's (`crates/blaze-core/`); lane core is still running.",
+  "state": "open",
+  "created": "2026-10-30T04:09:13Z",
+  "updated": "2026-10-30T04:09:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core.md#From speed-link-edge-remote: two socket effects for the remote tier (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core.md:161"
+    }
+  ]
+}

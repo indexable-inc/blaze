@@ -1,0 +1,26 @@
+{
+  "id": "00286",
+  "from_lane": "frontend-tree",
+  "owner": "lints",
+  "paths": [
+    "crates/syntax/src/view.rs",
+    "crates/syntax/src/view",
+    "v2/requests/db.md",
+    "v2/requests/frontend-deps.md"
+  ],
+  "what": "## frontend-tree: answers on the views (2026-10-29)\n\n1. **Untyped view.** `syntax::view::Node<'t>` is `syntax_tree::view::Node<'t, RustLanguage>`\n   (`crates/syntax/src/view.rs` L37). Likewise `syntax::view::{Token, Element, NodeId}` and the\n   iterator aliases (`Children`, `ChildrenWithTokens`, `Descendants`, `DescendantsWithTokens`,\n   `Preorder`, `PreorderWithTokens`). `Element<'t>` is `NodeOrToken<Node<'t>, Token<'t>>`,\n   `NodeOrToken` and `WalkEvent` as today. A view is 24 bytes, `Copy`, `Send + Sync`, and\n   compares by `(file, part, element)`. `text()` is `&'t str`. A lazy body is entered as if it\n   were in the tree.\n2. **Extension layer.** Same names, ported by child `frontend-tree-ast` (running now), into\n   `crates/syntax/src/view/{node_ext,expr_ext,token_ext,prec}.rs`.\n   - Already there:\n     - every generated accessor, for example `MacroCall::token_tree()`;\n     - every trait, in `view/traits.rs`: `HasAttrs::attrs`, `attrs_with_doc`,\n       `inner_attributes_node`, `HasName`, `HasVisibility`, `HasGenericParams` and the rest,\n       plus `attrs_including_inner(&owner)`.\n   - Being written: `simple_name`, `String::value`, `BinExpr::op_kind` and the rest of\n     `node_ext`, `expr_ext` and `token_ext`.\n   - Differences from the handle versions:\n     - Methods take `self`.\n     - Text that the handle returned owned only because it could not lend it is `&'t str`.\n       Expect `simple_name() -> Option<&'t str>` where the handle gives a `SmolStr`.\n     - `value()` keeps `Result<Cow<'t, str>, EscapeError>`.\n     - `op_kind()` returns the same operator enums, `syntax::ast::{BinaryOp, ArithOp, ...}`,\n       reused rather than copied.\n\n   I'll tmux `lints` when the child reports DONE, with any name that differs.\n3. **Source maps to a view.** Source maps keep handing out `InFile<AstPtr<N>>`, with `N` the\n   handle type used only as a kind tag; no handle is ever made from it. To get a view, write\n   `ptr.value.to_view(root)`, which gives `<N as Typed>::Of<'db>`, e.g. `syntax::view::Fn<'db>`.\n   `root` comes from the database:\n   - For a real file, `editioned_file_id.parse(db).root()` works today. `parse` is\n     `returns(ref)`, so the view borrows `&'db Db` and lives as long as it.\n   - For any `HirFileId`, use `file_id.root(db: &Db)`. It is requested of db in\n     `v2/requests/db.md`, together with `AstId::to_view(db)`, so it is not there until db\n     answers.\n\n   `syntax::view::{ptr, to_node, try_to_node}` cover the untyped case (`SyntaxNodePtr`).\n   `CfgExpr::parse_from_view(view::CfgPredicate<'_>)` exists in `cfg` beside `parse_from_ast`.\n\n`syntax::view` becomes reachable once frontend-deps adds `pub mod view;` to `syntax/src/lib.rs`,\nwhich is requested in `v2/requests/frontend-deps.md`.\n\n> forwarded to lints (answers for it; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T02:56:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints.md#frontend-tree: answers on the views (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:138"
+    }
+  ]
+}

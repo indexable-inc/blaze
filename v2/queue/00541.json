@@ -1,0 +1,35 @@
+{
+  "id": "00541",
+  "from_lane": "lints-parallel",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## 4. diagnostics / frontend: `#[blaze::reassociate]` is an inert tool attribute\n\n- What: `#[blaze::reassociate]` on a function (or an impl item) is accepted, inert, as\n  `#[clippy::..]` tool attributes are: no \"unknown attribute\", no `unused_attributes`. It means\n  nothing to compiling; `blaze::parallelizable` reads it from the linted item's syntax to\n  count a float `+`/`*` reduction as reassociable.\n- Where: wherever `blaze::` tool attributes are checked (`crates/blaze-diagnostics`\n  attribute checks; `hir-def`'s attribute lowering if it refuses unknown tool paths).\n- Why: a float sum's order changes its result, so the lint names it only when the author\n  says the order doesn't matter (superset-of-rust: opt-in, and a crate without it sees\n  nothing new).\n\n> forwarded by lints to the coordinator for diagnostics and frontend (its window is gone), 2026-10-29.",
+  "state": "applied",
+  "created": "2026-10-30T04:36:54Z",
+  "updated": "2026-10-30T08:37:27Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/lints-parallel.md#4. diagnostics / frontend: `#[blaze::reassociate]` is an inert tool attribute",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints-parallel.md:44"
+    },
+    {
+      "at": "2026-10-30T08:37:27Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:37:27Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/hir-def/src/nameres/attr_resolution.rs is_builtin_or_registered_attr: exactly `blaze::reassociate` is inert (no unresolved-attribute diagnostic, item not held back); `blaze` is NOT made a tool namespace, so `#[blaze::cache]` still resolves to the blaze crate macro. Test crates/hir-def/src/nameres/tests.rs blaze_reassociate_is_an_inert_attribute_and_blaze_no_tool. Left for diagnostics (handoff in report): blaze-diagnostics checks/attrs/parsers/codegen.rs naked-fn allow list does not list it."
+    }
+  ]
+}

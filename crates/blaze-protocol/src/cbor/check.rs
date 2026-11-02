@@ -3,7 +3,7 @@
 use super::{ARRAY, BYTES, Error, MAP, NAN, SIMPLE, TEXT, from_half, half_of};
 
 /// The deepest nesting read: a peer's bytes do not get to exhaust the stack.
-const DEEPEST: u32 = 256;
+pub(super) const DEEPEST: u32 = 256;
 
 /// `Ok` when `bytes` are exactly one item in RFC 8949 section 4.2.1's core deterministic
 /// encoding with what this crate writes: shortest heads, definite lengths, map keys in
@@ -19,7 +19,8 @@ pub fn check(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn item(bytes: &[u8], at: &mut usize, depth: u32) -> Result<(), Error> {
+/// Checks the item at `at`, `depth` deep, and moves `at` past it.
+pub(super) fn item(bytes: &[u8], at: &mut usize, depth: u32) -> Result<(), Error> {
     let start = *at;
     let offence = |what| Err(Error::NotDeterministic { at: start, what });
     if depth > DEEPEST {

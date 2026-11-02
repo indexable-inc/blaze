@@ -1,0 +1,23 @@
+{
+  "id": "00921",
+  "from_lane": "speed-sol2-proof-fuzz",
+  "owner": "format",
+  "paths": [
+    "crates/parser/src/lexed_str.rs"
+  ],
+  "what": "fuzz/targets/syntax_parse.rs lexes the text fast with LexedStr::new for its own checks, then LexedStr::lexes_alike(edition, text) lexes it fast again and with rustc_lexer alone. Please add a method comparing an existing lex with the rustc_lexer-only one, e.g. `pub fn lexes_like_rustc_lexer(&self, edition: Edition, text: &str) -> bool` (same fields compared as lexes_alike: tokens, checkpoints, long, errors), behind the same `fuzz` feature if lexes_alike is. That saves one fast lex per run, about a tenth of syntax_parse run. Tell the owner of fuzz/ when it lands.",
+  "state": "open",
+  "created": "2026-10-30T09:46:21Z",
+  "updated": "2026-10-30T09:46:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:46:21Z",
+      "by": "speed-sol2-proof-fuzz",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "01217",
+  "from_lane": "query-unify",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs"
+  ],
+  "what": "Round 3b bench (/Volumes/Projects/.coord-1030/v2-build/round3b-bench.log): the engine beats the fork on every case run (hit/sequential 3.5 ns vs 12.4; hit_in_query 0.83 ms vs 1.5; verify/same_durability 0.60 ms vs 1.1), then panics at db/storage.rs:351 the query database ran out of views (268435455): db/verify/deep_unrelated writes an input per iteration. A daemon that lives long enough hits this too, so no panic and no restart: when next_view reaches VIEW_MASK, renumber under &mut (no reader holds anything): collect every stamp in use (each row s verified and changed, last_changed per kind, Reads are view-scoped so none survive), sort unique, map each to its rank + 1 (order kept, so every changed(dep) <= verified(reader) relation is kept), store them back, set the view past the largest, and set the written-field history to all ones (one walk per row afterwards, never a wrong answer). Its cost is O(rows log rows) once per 2^28 writes; state it in speed-of-light.md. Test: a storage started near VIEW_MASK through a #[cfg(test)] hook, writes across the boundary, every answer equals a from-scratch run, and a row unchanged across it reruns nothing. The work is in crates/blaze-query/src/db (main tree, yours). No cargo.",
+  "state": "applied",
+  "created": "2026-10-31T01:49:12Z",
+  "updated": "2026-10-31T02:55:50Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:49:12Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:45:27Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:55:50Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "storage.rs: next_view renumbers at VIEW_MASK (no assert): Restamp::Collect then Restamp::Rank over the view, last_changed, every node color (high half unless FIELD) and each function row (Vtable::restamp), rank+1 keeps order, view = largest, written history all ones; a panic only if all 2^28 views are stamps in use. Test views_renumber_at_the_limit_and_every_answer_holds (start_at_view, cfg(test)). Cost in speed-of-light.md. No cargo run."
+    }
+  ]
+}

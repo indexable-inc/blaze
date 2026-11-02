@@ -1,6 +1,8 @@
 ---
-status: current
-summary: Live edits: what happens between a save and the new code running in a program, and what is refused.
+status: superseded
+summary: Live edits as blaze v1 did them (the engine's live.rs and blaze-splice): what happened between a save and the new code running in a program, and what was refused.
+date: 2026-10-30
+superseded_by: v2/plan/lanes/link.md
 ---
 # Live edits
 

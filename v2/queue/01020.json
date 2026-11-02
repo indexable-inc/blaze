@@ -1,0 +1,35 @@
+{
+  "id": "01020",
+  "from_lane": "integrate-engine",
+  "owner": "integrate",
+  "paths": [
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "Update to 00997 (crates.md \"replaced\" rows), final: blaze-expand DELETED 06:11 (code now proc_macro_api::{kept, bridge} and blaze_macro_wasm::native), blaze-splice DELETED 06:01 (tests ported to blaze-link), blaze-in-place DELETED 07:16 (v2 needs no `unwritten`: blaze-link's Image::commit writes `<to>.blaze-next` and renames). blaze-engine's line: \"stays as the `blaze` program only: program.rs (sandbox launcher, build-script rustc/rustdoc stand-ins on v2's front end, the pinned release, pin/version-*) in front of blaze_cargo::cli; it stays because it is the binary the release ships, and the stand-ins and pins run before the client.\"",
+  "state": "applied",
+  "created": "2026-10-30T14:17:49Z",
+  "updated": "2026-10-30T14:54:27Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:17:49Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:54:27Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "crates.md rows: blaze-engine (the program only, the release's binary), blaze-expand (code now in proc_macro_api::{kept,bridge}, blaze_macro_wasm::native), blaze-splice, blaze-in-place marked deleted 2026-10-30; ownership table pruned."
+    }
+  ]
+}

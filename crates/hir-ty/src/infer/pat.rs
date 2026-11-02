@@ -1,11 +1,8 @@
 //! Type inference for patterns.
 
-use std::{
-    cmp,
-    collections::hash_map::Entry::{Occupied, Vacant},
-    iter,
-};
+use std::{cmp, iter};
 
+use hashbrown::hash_map::Entry::{Occupied, Vacant};
 use hir_def::{
     AdtId, LocalFieldId, VariantId,
     expr_store::path::Path,
@@ -13,29 +10,32 @@ use hir_def::{
         BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, Literal, Pat,
         PatId, RecordFieldPat,
     },
-    resolver::ValueNs,
+    resolver::{TypeNs, ValueNs},
     signatures::VariantFields,
 };
+use rustc_abi::HasDataLayout as _;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use blaze_hash::FixedState;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{IntoKind as _, Ty as _},
 };
 use span::Edition;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, trace};
 
 use crate::{
+    db::HirDatabase,
     BindingMode, InferenceDiagnostic, Span,
     infer::{
-        AllowTwoPhase, ByRef, Expectation, InferenceContext, PatAdjust, PatAdjustment,
-        expr::ExprIsRead,
+        AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
+        PatAdjustment, StructPathDef, StructPathFound,
+        expr::ExprIsRead, function_struct_path_def,
     },
     next_solver::{
-        Const, TraitRef, Ty, TyKind, Tys,
+        Const, ConstExt, IsRigid, TraitRef, Ty, TyKind, Tys,
         infer::{
             InferOk,
-            traits::{Obligation, ObligationCause},
+            traits::{Obligation, ObligationCause, ObligationCauseCode},
         },
     },
     utils::EnumerateAndAdjustIterator,
@@ -237,7 +237,7 @@ impl<'db> ResolvedPat<'db> {
     }
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Experimental pattern feature: after matching against a shared reference, do we limit the
     /// default binding mode in subpatterns to be `ref` when it would otherwise be `ref mut`?
     /// This corresponds to Rule 3 of RFC 3627.
@@ -298,11 +298,10 @@ impl<'db> InferenceContext<'db> {
     ///
     /// Outside of this module, `check_pat_top` should always be used.
     /// Conversely, inside this module, `check_pat_top` should never be used.
-    #[instrument(level = "debug", skip(self, pat_info))]
     fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
         // For patterns containing paths, we need the path's resolution to determine whether to
         // implicitly dereference the scrutinee before matching.
-        let pat = &self.store[pat_id];
+        let pat = self.store.pat(pat_id);
         let opt_path_res = match pat {
             Pat::Path(path) => Some(self.resolve_pat_path(pat_id, path)),
             Pat::Record { path, .. } => Some(self.resolve_record_pat(pat_id, path)),
@@ -399,7 +398,7 @@ impl<'db> InferenceContext<'db> {
             expected
         };
 
-        match self.store[pat] {
+        match self.store.pat(pat) {
             // Peel off a `&` or `&mut`from the scrutinee type. See the examples in
             // `tests/ui/rfcs/rfc-2005-default-binding-mode`.
             _ if let AdjustMode::Peel { kind: peel_kind } = adjust_mode
@@ -411,10 +410,10 @@ impl<'db> InferenceContext<'db> {
 
                 debug!("current discriminant is Ref, inserting implicit deref");
                 // Preserve the reference type. We'll need it later during THIR lowering.
-                self.result.pat_adjustments.entry(pat).or_default().push(PatAdjustment {
-                    kind: PatAdjust::BuiltinDeref,
-                    source: expected.store(),
-                });
+                self.result.pat_adjustments.push(
+                    pat,
+                    PatAdjustment { kind: PatAdjust::BuiltinDeref, source: expected.store() },
+                );
 
                 // Use the old pat info to keep `current_depth` to its old value.
                 let new_pat_info = self.adjust_pat_info(inner_mutability, pat_info);
@@ -466,7 +465,7 @@ impl<'db> InferenceContext<'db> {
             Pat::Bind { id: var_id, subpat } => {
                 self.infer_bind_pat(pat, var_id, subpat, expected, pat_info)
             }
-            Pat::TupleStruct { args: ref subpats, ellipsis: ddpos, .. } => match opt_path_res
+            Pat::TupleStruct { args: subpats, ellipsis: ddpos, .. } => match opt_path_res
                 .unwrap()
             {
                 Ok(ResolvedPat { ty, kind: ResolvedPatKind::TupleStruct { variant } }) => self
@@ -480,7 +479,7 @@ impl<'db> InferenceContext<'db> {
                 }
                 Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
             },
-            Pat::Record { args: ref fields, ellipsis: has_rest_pat, .. } => {
+            Pat::Record { args: fields, ellipsis: has_rest_pat, .. } => {
                 match opt_path_res.unwrap() {
                     Ok(ResolvedPat { ty, kind: ResolvedPatKind::Struct { variant } }) => self
                         .infer_record_pat(
@@ -507,13 +506,13 @@ impl<'db> InferenceContext<'db> {
             //     self.check_expr_has_type_or_error(cond, self.tcx.types.bool, |_| {});
             //     expected
             // }
-            Pat::Or(ref pats) => {
+            Pat::Or(pats) => {
                 for &pat in pats {
                     self.infer_pat(pat, expected, pat_info);
                 }
                 expected
             }
-            Pat::Tuple { args: ref elements, ellipsis: ddpos } => {
+            Pat::Tuple { args: elements, ellipsis: ddpos } => {
                 self.infer_tuple_pat(pat, elements, ddpos, expected, pat_info)
             }
             Pat::Box { inner } => self.infer_box_pat(pat, inner, expected, pat_info),
@@ -526,7 +525,7 @@ impl<'db> InferenceContext<'db> {
                 expected,
                 pat_info,
             ),
-            Pat::Slice { prefix: ref before, slice, suffix: ref after } => {
+            Pat::Slice { prefix: before, slice, suffix: after } => {
                 self.infer_slice_pat(pat, before, slice, after, expected, pat_info)
             }
             Pat::Expr(expr) => self.infer_destructuring_assignment_expr(expr, expected),
@@ -578,18 +577,21 @@ impl<'db> InferenceContext<'db> {
             "unexpected deref pattern for builtin reference type {expected:?}",
         );
 
-        let pat_adjustments = self.result.pat_adjustments.entry(pat).or_default();
+        let pat_adjustments = &mut self.result.pat_adjustments;
+        pat_adjustments.ensure(pat);
         // We may reach the recursion limit if a user matches on a type `T` satisfying
         // `T: Deref<Target = T>`; error gracefully in this case.
         // FIXME(deref_patterns): If `deref_patterns` stabilizes, it may make sense to move
         // this check out of this branch. Alternatively, this loop could be implemented with
         // autoderef and this check removed. For now though, don't break code compiling on
         // stable with lots of `&`s and a low recursion limit, if anyone's done that.
-        if pat_adjustments.len() < self.resolver.top_level_def_map().recursion_limit() as usize {
+        if pat_adjustments.len_of(&pat) < self.resolver.top_level_def_map().recursion_limit() as usize
+        {
             // Preserve the smart pointer type for THIR lowering and closure upvar analysis.
-            pat_adjustments.push(PatAdjustment { kind: pat_adjust_kind, source: expected.store() });
+            pat_adjustments
+                .push(pat, PatAdjustment { kind: pat_adjust_kind, source: expected.store() });
         } else {
-            // FIXME: Emit an error.
+            self.table.recursion_limit_errors.report(&self.table.infer_ctxt, pat.into(), expected);
             inner_ty = self.types.types.error;
         }
 
@@ -604,7 +606,7 @@ impl<'db> InferenceContext<'db> {
     fn calc_adjust_mode(
         &mut self,
         pat_id: PatId,
-        pat: &Pat,
+        pat: Pat<'_>,
         opt_path_res: Option<Result<ResolvedPat<'db>, ()>>,
     ) -> AdjustMode {
         match pat {
@@ -631,9 +633,9 @@ impl<'db> InferenceContext<'db> {
             // All other literals result in non-reference types.
             // As a result, we allow `if let 0 = &&0 {}` but not `if let "foo" = &&"foo" {}` unless
             // `deref_patterns` is enabled.
-            &Pat::Lit(expr) => {
+            Pat::Lit(expr) => {
                 let lit_ty = self.infer_expr_pat_unadjusted(expr);
-                let lit_ty = self.infcx().resolve_vars_if_possible(lit_ty);
+                let lit_ty = self.infcx().deeply_resolve_ignoring_regions(lit_ty);
                 // If `deref_patterns` is enabled, allow `if let "foo" = &&"foo" {}`.
                 if self.features.deref_patterns {
                     let mut peeled_ty = lit_ty;
@@ -745,7 +747,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn infer_lit_pat(&mut self, expr: ExprId, expected: Ty<'db>) -> Ty<'db> {
-        let literal = match &self.store[expr] {
+        let literal = match self.store.expr(expr) {
             Expr::Literal(literal) => literal,
             _ => panic!("expected a literal"),
         };
@@ -841,19 +843,19 @@ impl<'db> InferenceContext<'db> {
         if let (Some((true, ..)), _) | (_, Some((true, ..))) = (lhs, rhs) {
             // There exists a side that didn't meet our criteria that the end-point
             // be of a numeric or char type, as checked in `calc_side` above.
-            self.push_diagnostic(InferenceDiagnostic::InvalidRangePatType { pat });
+            self.push_invalid_range_pat_type(pat, lhs, rhs);
             return self.types.types.error;
         }
 
         // Unify each side with `expected`.
         // Subtyping doesn't matter here, as the value is some kind of scalar.
-        let mut demand_eqtype = |x: &mut _| {
-            if let Some((_, x_ty, x_expr)) = *x {
-                _ = self.demand_eqtype(ExprOrPatIdPacked::from(x_expr), expected, x_ty);
+        for side in [&mut lhs, &mut rhs] {
+            if let Some((fail, x_ty, x_expr)) = side
+                && self.demand_eqtype(ExprOrPatIdPacked::from(*x_expr), expected, *x_ty).is_err()
+            {
+                *fail = true;
             }
-        };
-        demand_eqtype(&mut lhs);
-        demand_eqtype(&mut rhs);
+        }
 
         if let (Some((true, ..)), _) | (_, Some((true, ..))) = (lhs, rhs) {
             return self.types.types.error;
@@ -868,10 +870,30 @@ impl<'db> InferenceContext<'db> {
             expected,
         );
         if !(ty.is_numeric() || ty.is_char() || ty.references_error()) {
-            // FIXME: Emit an error.
+            for (fail, ..) in [&mut lhs, &mut rhs].into_iter().flatten() {
+                *fail = true;
+            }
+            self.push_invalid_range_pat_type(pat, lhs, rhs);
             return self.types.types.error;
         }
         ty
+    }
+
+    /// rustc's `emit_err_pat_range`, E0029, which says nothing when an end's type has an error.
+    fn push_invalid_range_pat_type(
+        &mut self,
+        pat: PatId,
+        lhs: Option<(bool, Ty<'db>, ExprId)>,
+        rhs: Option<(bool, Ty<'db>, ExprId)>,
+    ) {
+        if [lhs, rhs].iter().flatten().any(|(_, ty, _)| ty.references_error()) {
+            return;
+        }
+        let end = |side: Option<(bool, Ty<'db>, ExprId)>| {
+            side.map(|(fail, ty, _)| (self.type_at_error(ty), fail))
+        };
+        let (lhs, rhs) = (end(lhs), end(rhs));
+        self.push_diagnostic(InferenceDiagnostic::InvalidRangePatType { pat, lhs, rhs });
     }
 
     fn infer_bind_pat(
@@ -948,6 +970,13 @@ impl<'db> InferenceContext<'db> {
             self.write_binding_ty(var_id, local_ty);
         }
 
+        // rustc's `GatherLocalsVisitor`: a parameter's top binding has the parameter's own
+        // `Sized` (`collect_fn`, `infer_closure`), which `unsized_fn_params` lifts alike; every
+        // other binding, a parameter's nested ones too, is a local.
+        if self.param_top_pat != Some(pat) {
+            self.require_type_is_sized(local_ty, pat.into(), ObligationCauseCode::LetType);
+        }
+
         if let Some(p) = sub {
             self.infer_pat(p, expected, pat_info);
         }
@@ -961,7 +990,7 @@ impl<'db> InferenceContext<'db> {
         pat: PatId,
         inner: PatId,
     ) -> Result<(), ()> {
-        if let Pat::Bind { .. } = self.store[inner]
+        if let Pat::Bind { .. } = self.store.pat(inner)
             && let Some(pointee_ty) = self.shallow_resolve(expected).builtin_deref(true)
             && let TyKind::Dynamic(..) = pointee_ty.kind()
         {
@@ -976,9 +1005,10 @@ impl<'db> InferenceContext<'db> {
         Ok(())
     }
 
-    fn resolve_record_pat(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {
+    fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, false) else {
+            self.report_unresolved_pat_path(pat, path);
             return Err(());
         };
         self.write_variant_resolution(pat.into(), variant);
@@ -1003,18 +1033,52 @@ impl<'db> InferenceContext<'db> {
         pat_ty
     }
 
-    fn resolve_pat_path(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {
-        let (res, pat_ty) = self.infer_path(path, pat.into()).ok_or(())?;
+    fn report_unresolved_pat_path(&mut self, pat: PatId, path: Path<'_>) {
+        if let Some(segment) = self.first_unresolved_segment(path, pat.into()) {
+            self.push_diagnostic(InferenceDiagnostic::UnresolvedPath { id: pat.into(), segment });
+        }
+    }
+
+    fn resolve_pat_path(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
+        let Some((res, pat_ty)) = self.infer_path(path, pat.into()) else {
+            self.report_unresolved_pat_path(pat, path);
+            return Err(());
+        };
         match res {
             ValueNs::FunctionId(_)
             | ValueNs::GenericParam(_)
-            | ValueNs::ImplSelf(_)
             | ValueNs::LocalBinding(_)
             | ValueNs::StaticId(_) => {
-                // FIXME: Emit an error.
+                let def = match res {
+                    ValueNs::FunctionId(func) => function_struct_path_def(self.db, func),
+                    ValueNs::GenericParam(_) => StructPathDef::ConstParam,
+                    ValueNs::LocalBinding(_) => StructPathDef::Local,
+                    _ => StructPathDef::Static,
+                };
+                // rustc's resolver takes a path to an item whole (E0532) and leaves one through
+                // a type to type checking (`check_pat_path`'s E0533).
+                let type_relative = path.type_anchor().is_some()
+                    || self
+                        .result
+                        .qualifier_resolutions
+                        .get(pat.into())
+                        .is_some_and(|(qualifier, _)| !matches!(qualifier, TypeNs::TraitId(_)));
+                let found = match type_relative {
+                    true => StructPathFound::TypeRelative(def),
+                    false => StructPathFound::Def(def),
+                };
+                self.push_diagnostic(InferenceDiagnostic::NotAStructPath {
+                    node: pat.into(),
+                    found,
+                    ty: None,
+                });
                 return Err(());
             }
-            ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::StructId(_) => {} // OK
+            // `infer_path` takes a `Self` in a pattern for a unit struct only.
+            ValueNs::ImplSelf(_)
+            | ValueNs::ConstId(_)
+            | ValueNs::EnumVariantId(_)
+            | ValueNs::StructId(_) => {} // OK
         }
 
         Ok(ResolvedPat { ty: pat_ty, kind: ResolvedPatKind::Path { res } })
@@ -1033,10 +1097,11 @@ impl<'db> InferenceContext<'db> {
     fn resolve_tuple_struct_pat(
         &mut self,
         pat: PatId,
-        path: &Path,
+        path: Path<'_>,
     ) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, true) else {
+            self.report_unresolved_pat_path(pat, path);
             return Err(());
         };
         self.write_variant_resolution(pat.into(), variant);
@@ -1084,16 +1149,14 @@ impl<'db> InferenceContext<'db> {
                 pat,
                 expected: variant_fields.len(),
                 found: subpats.len(),
+                variant,
+                had_err: had_err.is_err(),
             });
 
-            for (i, &pat) in subpats.iter().enumerate() {
-                let field_id = LocalFieldId::from_raw(la_arena::RawIdx::from_u32(i as u32));
-                let expected = match variant_field_tys.get(field_id) {
-                    Some(field_ty) => field_ty.ty().instantiate(interner, args).skip_norm_wip(),
-                    None => self.types.types.error,
-                };
-                self.infer_pat(pat, expected, pat_info);
+            for &pat in subpats {
+                self.infer_pat(pat, self.types.types.error, pat_info);
             }
+            return self.types.types.error;
         }
         pat_ty
     }
@@ -1168,21 +1231,23 @@ impl<'db> InferenceContext<'db> {
 
         // Index the struct fields' types.
         let variant_fields = variant.fields(self.db);
-        let field_map = variant_fields
-            .fields()
-            .iter()
-            .map(|(i, field)| (field.name.clone(), i))
-            .collect::<FxHashMap<_, _>>();
+        let mut field_map = hashbrown::HashMap::with_capacity_and_hasher_in(
+            variant_fields.len(),
+            FixedState,
+            self.frame,
+        );
+        field_map.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
         let variant_field_tys = self.db.field_types(variant);
         let variant_fields_vis = VariantFields::field_visibilities(self.db, variant);
 
         // Keep track of which fields have already appeared in the pattern.
-        let mut used_fields = FxHashMap::default();
+        let mut used_fields =
+            hashbrown::HashMap::with_capacity_and_hasher_in(fields.len(), FixedState, self.frame);
 
-        let mut inexistent_fields = vec![];
+        let mut inexistent_fields = Vec::new_in(self.frame);
         // Typecheck each field.
         for (field_idx, field) in fields.iter().enumerate() {
-            match used_fields.entry(field.name.clone()) {
+            match used_fields.entry(&field.name) {
                 Occupied(_occupied) => {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {
                         field: field.pat.into(),
@@ -1215,11 +1280,21 @@ impl<'db> InferenceContext<'db> {
             self.infer_pat(field.pat, field_ty, pat_info);
         }
 
-        let unmentioned_fields = variant_fields
-            .fields()
-            .iter()
-            .filter(|(_, field)| !used_fields.contains_key(&field.name))
-            .collect::<Vec<_>>();
+        // Require `..` if struct has non_exhaustive attribute.
+        let non_exhaustive = self.has_applicable_non_exhaustive(variant.into());
+        if non_exhaustive && !has_rest_pat {
+            self.push_diagnostic(InferenceDiagnostic::NonExhaustiveRecordPat { pat, variant });
+        }
+
+        // rustc emits a union's errors as it finds them and E0026 after them, then E0027.
+        if matches!(variant, VariantId::UnionId(_)) {
+            if fields.len() != 1 {
+                self.push_diagnostic(InferenceDiagnostic::UnionPatMustHaveExactlyOneField { pat });
+            }
+            if has_rest_pat {
+                self.push_diagnostic(InferenceDiagnostic::UnionPatHasRest { pat });
+            }
+        }
 
         for inexistent_field in inexistent_fields {
             self.push_diagnostic(InferenceDiagnostic::NoSuchField {
@@ -1229,26 +1304,21 @@ impl<'db> InferenceContext<'db> {
             });
         }
 
-        // Require `..` if struct has non_exhaustive attribute.
-        let non_exhaustive = self.has_applicable_non_exhaustive(variant.into());
-        if non_exhaustive && !has_rest_pat {
-            self.push_diagnostic(InferenceDiagnostic::NonExhaustiveRecordPat { pat, variant });
-        }
-
         // Report an error if an incorrect number of fields was specified.
-        if matches!(variant, VariantId::UnionId(_)) {
-            if fields.len() != 1 {
-                self.push_diagnostic(InferenceDiagnostic::UnionPatMustHaveExactlyOneField { pat });
+        if !matches!(variant, VariantId::UnionId(_)) && !has_rest_pat {
+            let missed_fields: Vec<LocalFieldId> = variant_fields
+                .fields()
+                .iter()
+                .filter(|(_, field)| !used_fields.contains_key(&field.name))
+                .map(|(id, _)| id)
+                .collect(); // alloc: the diagnostic's own list, only when fields are missing
+            if !missed_fields.is_empty() {
+                self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
+                    record: ExprOrPatId::PatId(pat),
+                    variant,
+                    missed_fields,
+                })
             }
-            if has_rest_pat {
-                self.push_diagnostic(InferenceDiagnostic::UnionPatHasRest { pat });
-            }
-        } else if !unmentioned_fields.is_empty() && !has_rest_pat {
-            self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
-                record: ExprOrPatId::PatId(pat),
-                variant,
-                missed_fields: unmentioned_fields.into_iter().map(|f| f.0).collect(),
-            })
         }
     }
 
@@ -1302,7 +1372,7 @@ impl<'db> InferenceContext<'db> {
         let interner = self.interner();
         self.table.register_bound(source_ty, deref_pure, ObligationCause::new(pat));
         // The expected type for the deref pat's inner pattern is `<expected as Deref>::Target`.
-        let target_ty = Ty::new_projection(interner, deref_target.into(), [source_ty]);
+        let target_ty = Ty::new_projection(interner, IsRigid::No, deref_target.into(), [source_ty]);
         self.table.try_structurally_resolve_type(pat.into(), target_ty)
     }
 
@@ -1316,6 +1386,7 @@ impl<'db> InferenceContext<'db> {
         inner: PatId,
         derefed_tys: impl IntoIterator<Item = Ty<'db>>,
     ) -> InferOk<'db, ()> {
+        // alloc: empty unless a deref pattern binds `ref mut`
         let mut infer_ok = InferOk { value: (), obligations: Vec::new() };
         if self.pat_has_ref_mut_binding(inner) {
             let Some(deref_mut) = self.lang_items.DerefMut else { return infer_ok };
@@ -1341,15 +1412,9 @@ impl<'db> InferenceContext<'db> {
     /// sure to apply any match-ergonomics adjustments, which we cannot
     /// determine from the HIR alone.
     pub(super) fn pat_has_ref_mut_binding(&self, pat: PatId) -> bool {
-        let mut has_ref_mut = false;
-        self.store.walk_pats(pat, &mut |pat| {
-            if let Some(BindingMode(ByRef::Yes(Mutability::Mut), _)) =
-                self.result.binding_modes.get(pat)
-            {
-                has_ref_mut = true;
-            }
-        });
-        has_ref_mut
+        crate::utils::pat_has_ref_mut_binding(self.store, pat, |pat| {
+            self.result.binding_modes.get(pat).copied()
+        })
     }
 
     // Precondition: Pat is Ref(inner)
@@ -1383,7 +1448,9 @@ impl<'db> InferenceContext<'db> {
                         // (RFC 3627, Rule 5). If we implement a pattern typing ruleset with Rule 4E
                         // but not Rule 5, we'll need to check that here.
                         debug_assert!(ref_pat_matches_mut_ref);
-                        // FIXME: Emit an error.
+                        self.push_diagnostic(InferenceDiagnostic::InheritedRefMutabilityMismatch {
+                            pat,
+                        });
                     }
 
                     pat_info.binding_mode = ByRef::No;
@@ -1421,7 +1488,9 @@ impl<'db> InferenceContext<'db> {
                             // falling back to the inherited reference didn't work. This should be
                             // the same error as the old-Edition version below.
                             debug_assert!(ref_pat_matches_mut_ref);
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::InheritedRefMutabilityMismatch { pat },
+                            );
                         }
 
                         pat_info.binding_mode = ByRef::No;
@@ -1458,7 +1527,9 @@ impl<'db> InferenceContext<'db> {
                         // inherited reference.
                         if pat_mutbl > inh_mut {
                             // We can't match a lone inherited shared reference with `&mut`.
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::InheritedRefMutabilityMismatch { pat },
+                            );
                         }
 
                         self.result.skipped_ref_pats.insert(pat);
@@ -1662,7 +1733,9 @@ impl<'db> InferenceContext<'db> {
     ) -> (Option<Ty<'db>>, Ty<'db>) {
         let len = self.table.try_structurally_resolve_const(pat.into(), len);
 
-        if let Some(len) = len.try_to_target_usize(self.data_layout()) {
+        let interner = self.interner();
+        let data_layout = interner.data_layout();
+        if let Some(len) = len.try_to_value().and_then(|it| it.try_to_target_usize(data_layout)) {
             // Now we know the length...
             if slice.is_none() {
                 // ...and since there is no variable-length pattern,
@@ -1722,8 +1795,10 @@ impl<'db> InferenceContext<'db> {
                 expected
             }
         };
-        if let Some(coercion) = self.result.expr_adjustments.remove(&expr) {
-            self.result.assignment_coercions.insert(expr, coercion);
+        let InferenceTables { expr_adjustments, assignment_coercions, .. } = &mut self.result;
+        if let Some(coercion) = expr_adjustments.get(&expr) {
+            assignment_coercions.insert(expr, coercion.iter().cloned());
+            expr_adjustments.remove_in_place(&expr);
         }
         ty
     }

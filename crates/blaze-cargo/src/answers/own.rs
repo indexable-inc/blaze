@@ -1,201 +1,36 @@
 //! blaze's answers to rustc's questions, from what it knows of its own release of rustc and of
-//! the targets that release has: no rustc runs. The data of the release is what its rustc
-//! printed for every target blaze has (`harness/answers.py --write`, when the pin moves), and
-//! the cfgs that follow from the arguments are added here, as rustc adds them. A question this
-//! does not understand whole is answered `None`, and fails.
+//! the targets that release has: no rustc runs. This reads rustc's command line; what the
+//! release says of each target, and the cfgs that follow from the arguments, are
+//! `blaze_units::stdlib::target`'s (its `rustc.json`, what the pinned rustc printed, written by
+//! `harness/answers.py --write` when the pin moves). A question this does not understand whole
+//! is answered `None`, and fails.
 
 use std::{
-    collections::BTreeMap,
     ffi::OsString,
-    path::{Path, PathBuf},
-    sync::OnceLock,
+    path::Path,
 };
 
-use serde_derive::Deserialize;
+use blaze_units::stdlib::target;
 
-/// What the rustc of the toolchain in `harness/toolchain` says (`harness/answers.py --write`
-/// writes it when the toolchain moves).
-const RELEASES: [&str; 1] = [include_str!("rustc.json")];
-
-#[derive(Deserialize)]
-struct Release {
-    /// As the first line of `-V` has it, after `rustc `.
-    version: String,
-    /// What `-vV` prints, with `{host}` for the host's tuple.
-    verbose: String,
-    /// The warning of `-C target-feature=+{feature}` of a feature neither rustc nor LLVM has
-    /// of the target, with `{feature}` for its name.
-    #[serde(default)]
-    unknown_feature: Option<String>,
-    targets: BTreeMap<String, Target>,
-}
-
-#[derive(Deserialize)]
-struct Target {
-    /// The cfgs of the target, but those the arguments decide.
-    cfg: Vec<String>,
-    /// The cfgs printed besides those when unstable features are allowed.
-    nightly_cfg: Vec<String>,
-    /// The strategy of `-C panic` when none is given.
-    panic: String,
-    split_debuginfo: Vec<String>,
-    /// The name of the file of each kind of crate named `___`; `None` for a kind the target
-    /// does not have.
-    file_names: BTreeMap<String, Option<String>>,
-    /// By the host rustc runs on, whose build decides some of it.
-    target_spec_json: BTreeMap<String, String>,
-    /// The `target_feature`s each feature rustc has turns on beside the target's own, with
-    /// itself: `-C target-feature=+<name>` on the nightly. One rustc warns of is not here.
-    #[serde(default)]
-    features: BTreeMap<String, Vec<String>>,
-    /// The same of the features only LLVM names, which `target-cpu=native` turns on.
-    #[serde(default)]
-    llvm_features: BTreeMap<String, Vec<String>>,
-    /// Of each feature the target has, the features turning it off turns off: itself and
-    /// those that need it.
-    #[serde(default)]
-    features_off: BTreeMap<String, Vec<String>>,
-    /// Each CPU of `-C target-cpu`, by the index of its `target_feature`s in `cpu_features`.
-    #[serde(default)]
-    cpus: BTreeMap<String, usize>,
-    #[serde(default)]
-    cpu_features: Vec<Vec<String>>,
-    /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
-    #[serde(default)]
-    feature_cfgs: BTreeMap<String, Vec<String>>,
-    /// The other features rustc or LLVM lists of the target (`--print target-features`).
-    /// One of none of these turns nothing on or off, with a warning.
-    #[serde(default)]
-    other_features: Vec<String>,
-}
-
-impl Target {
-    /// Whether `-C target-feature=crt-static` changes how the target links, as its spec says.
-    fn respects_crt_static(&self) -> Option<bool> {
-        let spec: serde_json::Value =
-            serde_json::from_str(self.target_spec_json.values().next()?).ok()?;
-        Some(spec.get("crt-static-respected").and_then(|it| it.as_bool()).unwrap_or(false))
-    }
-
-    /// The spec rustc on `host` prints: its own, or on a host not recorded (Windows) the one
-    /// every recorded host prints. A spec the hosts differ on (the -linux-gnu ones, whose own
-    /// rustc links with its lld) is the build's, so not known for another host.
-    fn spec_on(&self, host: &str) -> Option<&str> {
-        if let Some(spec) = self.target_spec_json.get(host) {
-            return Some(spec);
-        }
-        let mut specs = self.target_spec_json.values();
-        let spec = specs.next()?;
-        specs.all(|it| it == spec).then_some(spec)
-    }
-
-    /// Whether rustc or LLVM lists `name` as a feature of the target.
-    fn lists(&self, name: &str) -> bool {
-        self.features.contains_key(name)
-            || self.llvm_features.contains_key(name)
-            || self.features_off.contains_key(name)
-            || self.other_features.iter().any(|it| it == name)
-    }
-
-    /// The `target_feature`s of `cpu` with `features` turned on (`true`) and off in order,
-    /// starting from `have`, the target's own, and the features of `features` neither rustc
-    /// nor LLVM has, which change nothing and which rustc warns of, in order; `None` for a
-    /// CPU or feature rustc warns of otherwise or does not have, and where what is listed is
-    /// not recorded.
-    fn tuned<'a>(
-        &self,
-        have: Vec<String>,
-        cpu: Option<(&str, Option<&str>)>,
-        features: &[(bool, &'a str)],
-    ) -> Option<(Vec<String>, Vec<&'a str>)> {
-        let own: Vec<String> = have.clone();
-        let mut have: std::collections::BTreeSet<String> = match cpu {
-            Some((name, _)) => {
-                self.cpu_features.get(*self.cpus.get(name)?)?.iter().cloned().collect()
-            }
-            None => have.into_iter().collect(),
-        };
-        // `target-cpu=native`: LLVM's features of the host, which name what rustc does not too.
-        let host: Vec<(bool, String)> = cpu
-            .and_then(|(_, host)| host)
-            .map(|it| {
-                it.split(',')
-                    .filter_map(|it| Some((it.starts_with('+'), it.get(1..)?.to_owned())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let on = |name: &str| self.features.get(name).or_else(|| self.llvm_features.get(name));
-        let mut apply = |enable: bool, name: &str, host: bool| -> Option<()> {
-            match (enable, on(name)) {
-                (true, Some(turned)) => {
-                    have.extend(turned.iter().cloned());
-                    // The target's own features it needs, should they be off.
-                    have.extend(
-                        self.features_off
-                            .iter()
-                            .filter(|(_, off)| off.iter().any(|it| it == name))
-                            .map(|(it, _)| it.clone()),
-                    );
-                }
-                (false, _) if self.features_off.contains_key(name) => {
-                    self.features_off[name].iter().for_each(|it| _ = have.remove(it));
-                }
-                (false, Some(turned)) if !own.iter().any(|it| it == name) => {
-                    // Off with it go the features that turn it on.
-                    let needs = |other: &Vec<String>| turned.iter().all(|it| other.contains(it));
-                    if !turned.is_empty() {
-                        have.retain(|it| !self.features.get(it).is_some_and(needs));
-                    }
-                }
-                // A feature only LLVM has, of no `target_feature`, changes none of them.
-                _ if host => {}
-                _ => return None,
-            }
-            Some(())
-        };
-        for (enable, name) in &host {
-            apply(*enable, name, true)?;
-        }
-        let mut unknown = Vec::new();
-        for &(enable, name) in features {
-            if !self.other_features.is_empty() && !self.lists(name) {
-                unknown.push(name);
-                continue;
-            }
-            apply(enable, name, false)?;
-        }
-        Some((have.into_iter().collect(), unknown))
-    }
-}
-
-fn releases() -> &'static [Release] {
-    static RELEASES_READ: OnceLock<Vec<Release>> = OnceLock::new();
-    RELEASES_READ.get_or_init(|| {
-        RELEASES
-            .iter()
-            .map(|it| serde_json::from_str(it).expect("the answers of a release"))
-            .collect()
-    })
-}
-
-/// blaze's own release, the one every rustc is answered as: its data, and the host this blaze
-/// runs on. Where its files are ([`sysroot`]) is looked for only when asked.
+/// blaze's own release, the one every rustc is answered as, on the host this blaze runs on.
+/// Where its files are ([`sysroot`]) is looked for only when asked.
 struct Toolchain {
     host: &'static str,
-    release: &'static Release,
 }
 
 impl Toolchain {
+    /// `None` when the data of targets is not of the pinned toolchain's rustc.
     fn ours() -> Option<Toolchain> {
-        let version = crate::cargo::toolchain::ours_says();
-        let release = releases().iter().find(|it| it.version == version)?;
-        Some(Toolchain { host: crate::cargo::toolchain::host()?, release })
+        if target::rustc_version() != crate::toolchain::ours_says() {
+            return None;
+        }
+        Some(Toolchain { host: crate::toolchain::host()? })
     }
 }
 
 /// Where blaze's release is, found with nothing run.
-fn sysroot() -> Option<PathBuf> {
-    crate::cargo::toolchain::sysroot()
+fn sysroot() -> Option<&'static Path> {
+    crate::toolchain::sysroot()
 }
 
 /// What `cargo --version` says after `cargo ` for the toolchain at `sysroot`, from rustup's
@@ -403,55 +238,43 @@ impl<'a> Given<'a> {
             _ => {}
         }
     }
-
-    fn debug_assertions(&self) -> bool {
-        self.debug_assertions.unwrap_or(matches!(self.opt_level, None | Some("0")))
-    }
-}
-
-/// The architecture of a target's tuple: what is before its first `-`.
-fn arch(tuple: &str) -> &str {
-    tuple.split('-').next().unwrap_or(tuple)
 }
 
 /// The variables rustc reads for any question, which blaze answers only when they are unset.
 const UNSET: [&str; 2] = ["RUSTC_OVERRIDE_VERSION_STRING", "RUST_TARGET_PATH"];
 
-/// The cfgs rustc sets itself, which it refuses as `--cfg`, by name or by what it starts with.
-const BUILTIN_CFGS: [&str; 13] = [
-    "debug_assertions",
-    "overflow_checks",
-    "ub_checks",
-    "contract_checks",
-    "fmt_debug",
-    "relocation_model",
-    "panic",
-    "unix",
-    "windows",
-    "test",
-    "emscripten_wasm_eh",
-    "sanitize",
-    "sanitizer_",
-];
-
-/// Whether `cfg` is `name` or `name="value"` as rustc prints it back: a plain name of no
-/// builtin cfg, a value with nothing to escape.
-fn is_plain_cfg(cfg: &str) -> bool {
-    let (name, value) = match cfg.split_once('=') {
-        Some((name, value)) => (name, Some(value)),
-        None => (cfg, None),
+/// What `--print cfg` prints for `tuple` on `host` with unstable features allowed or not
+/// (`nightly`), and the features of `-C target-feature` neither rustc nor LLVM has of it, which
+/// change nothing and which rustc warns of, in order. `None` for what `target_cfg` refuses, and
+/// for a feature rustc warns of in words blaze does not have.
+fn cfg_printed(given: &Given<'_>, tuple: &str, host: &str, nightly: bool) -> Option<(Vec<String>, Vec<String>)> {
+    let host_cpu = match given.target_cpu {
+        // LLVM's host CPU, for any target of the host's architecture.
+        Some("native") => {
+            let (name, features) = hir_ty_codegen::host_cpu()?;
+            Some(target::HostCpu { arch: target::arch(host).to_owned(), name, features })
+        }
+        _ => None,
     };
-    let plain_name = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    let builtin = name.starts_with("target_")
-        || BUILTIN_CFGS.iter().any(|it| name == *it || (it.ends_with('_') && name.starts_with(it)));
-    let plain_value = value.is_none_or(|value| {
-        let inner = value.strip_prefix('"').and_then(|it| it.strip_suffix('"'));
-        inner.is_some_and(|it| {
-            it.chars().all(|c| c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ')
-        })
-    });
-    plain_name && !builtin && plain_value
+    let args = target::CfgArgs {
+        opt_level: given.opt_level.map(str::to_owned),
+        debug_assertions: given.debug_assertions,
+        overflow_checks: given.overflow_checks,
+        panic: given.panic.map(str::to_owned),
+        target_cpu: given.target_cpu.map(str::to_owned),
+        host_cpu,
+        target_features: given.features.iter().map(|&(enable, name)| (enable, name.to_owned())).collect(),
+        cfgs: given.cfgs.iter().map(|it| (*it).to_owned()).collect(),
+        proc_macro: given.crate_types.contains(&"proc-macro"),
+        sanitizer: None,
+        stable: !nightly,
+    };
+    let (cfgs, skipped) = target::target_cfg_told(tuple, &args).ok()?;
+    if !skipped.listed.is_empty() {
+        return None;
+    }
+    let unknown = skipped.unknown.iter().map(|it| (*it).to_owned()).collect();
+    Some((cfgs, unknown))
 }
 
 /// Whether rustc allows unstable features with `RUSTC_BOOTSTRAP` at `bootstrap`, for the crate
@@ -478,6 +301,37 @@ fn unstable_allowed(
     })
 }
 
+/// The variables rustc is asked with.
+#[derive(Clone, Copy)]
+pub enum Vars<'a> {
+    /// This process's.
+    Process,
+    /// What the command sets or removes, else this process's.
+    Command(&'a std::process::Command),
+    /// What the list sets (`Some`) or removes (`None`), the last for a name winning, else this
+    /// process's.
+    Over(&'a [(OsString, Option<OsString>)]),
+    /// These, and no other.
+    Only(&'a [(&'a str, &'a str)]),
+}
+
+impl Vars<'_> {
+    pub fn get(self, name: &str) -> Option<OsString> {
+        match self {
+            Vars::Process => std::env::var_os(name),
+            Vars::Command(command) => match command.get_envs().find(|(it, _)| *it == name) {
+                Some((_, value)) => value.map(OsString::from),
+                None => std::env::var_os(name),
+            },
+            Vars::Over(set) => match set.iter().rev().find(|(it, _)| it.as_os_str() == name) {
+                Some((_, value)) => value.clone(),
+                None => std::env::var_os(name),
+            },
+            Vars::Only(set) => set.iter().find(|(it, _)| *it == name).map(|(_, value)| OsString::from(*value)),
+        }
+    }
+}
+
 /// What rustc prints, answering.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -487,43 +341,35 @@ pub struct Answer {
 }
 
 /// What rustc of blaze's release prints to standard output for `args` with `stdin`, with
-/// the variables `var` reads; `None` for what this does not answer, and for an answer with
+/// the variables `vars`; `None` for what this does not answer, and for an answer with
 /// warnings, which only [`answered`] tells.
-pub fn answer(
-    args: &[OsString],
-    stdin: &[u8],
-    var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<Vec<u8>> {
-    answered(args, stdin, var).filter(|it| it.stderr.is_empty()).map(|it| it.stdout)
+pub fn answer(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Vec<u8>> {
+    answered(args, stdin, vars).filter(|it| it.stderr.is_empty()).map(|it| it.stdout)
 }
 
-/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
-/// reads; `None` for what this does not answer.
-pub fn answered(
-    args: &[OsString],
-    stdin: &[u8],
-    var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<Answer> {
-    if UNSET.iter().any(|it| var(it).is_some()) {
+/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `vars`;
+/// `None` for what this does not answer.
+pub fn answered(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Answer> {
+    if UNSET.iter().any(|it| vars.get(it).is_some()) {
         return None;
     }
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
     let toolchain = Toolchain::ours()?;
-    let release = toolchain.release;
     if !args.is_empty()
         && args.iter().all(|it| matches!(*it, "-V" | "-v" | "-vV" | "--version" | "--verbose"))
     {
         let verbose = args.iter().any(|it| matches!(*it, "-v" | "-vV" | "--verbose"));
         let text = if verbose {
-            release.verbose.replace("{host}", toolchain.host)
+            target::rustc_verbose_version(toolchain.host)
         } else {
-            format!("rustc {}\n", release.version)
+            format!("rustc {}\n", target::rustc_version())
         };
         return Some(Answer { stdout: text.into_bytes(), stderr: Vec::new() });
     }
     let given = Given::of(&args)?;
-    let channel_nightly = release.version.contains("-nightly") || release.version.contains("-dev");
-    let nightly = unstable_allowed(var("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
+    let version = target::rustc_version();
+    let channel_nightly = version.contains("-nightly") || version.contains("-dev");
+    let nightly = unstable_allowed(vars.get("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -531,10 +377,10 @@ pub fn answered(
         return None;
     }
     let tuple = given.target.unwrap_or(toolchain.host);
-    let target = release.targets.get(tuple)?;
+    target::known(tuple).ok()?;
     let mut out = String::new();
     let mut dropped: Vec<&str> = Vec::new();
-    let mut unknown: Vec<&str> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
     for print in &given.prints {
         match *print {
             // Beside another print rustc stops before it links.
@@ -546,7 +392,7 @@ pub fn answered(
             }
             "host-tuple" => out += &format!("{}\n", toolchain.host),
             "split-debuginfo" => {
-                target.split_debuginfo.iter().for_each(|it| out += &format!("{it}\n"))
+                target::split_debuginfo(tuple).ok()?.iter().for_each(|it| out += &format!("{it}\n"))
             }
             "crate-name" => out += &format!("{}\n", given.crate_name.unwrap_or("rust_out")),
             "file-names" => {
@@ -569,8 +415,8 @@ pub fn answered(
                 // A kind the target does not have is dropped with a warning, which cargo reads
                 // to tell it from the others.
                 for kind in &kinds {
-                    match target.file_names.get(*kind)? {
-                        Some(file) => out += &format!("{}\n", file.replace("___", name)),
+                    match target::file_name(tuple, kind, name).ok()? {
+                        Some(file) => out += &format!("{file}\n"),
                         None => dropped.push(*kind),
                     }
                 }
@@ -583,89 +429,15 @@ pub fn answered(
                 }
             }
             "cfg" => {
-                let mut cfgs: Vec<String> = target.cfg.clone();
-                if nightly {
-                    cfgs.extend(target.nightly_cfg.iter().cloned());
-                }
-                // Whether a target respects `crt-static` is its spec's, so only asking for
-                // what it has already is answered.
-                let static_default = cfgs.iter().any(|it| it == "target_feature=\"crt-static\"");
-                // Only a target's own `crt-static`, asked for again, changes nothing.
-                let as_it_is = given
-                    .features
-                    .iter()
-                    .all(|&(enable, name)| name == "crt-static" && enable == static_default);
-                if given.target_cpu.is_some() || !as_it_is {
-                    // The features rustc has without unstable ones allowed are not recorded.
-                    if !nightly {
-                        return None;
-                    }
-                    let cpu = match given.target_cpu {
-                        // LLVM's host CPU, for any target of the host's architecture.
-                        Some("native") if arch(tuple) == arch(toolchain.host) => {
-                            let (name, features) = hir_ty_codegen::host_cpu()?;
-                            Some((name, Some(features)))
-                        }
-                        Some("native") => return None,
-                        Some(name) => Some((name.to_owned(), None)),
-                        None => None,
-                    };
-                    let feature = |it: &String| {
-                        let name = it.strip_prefix("target_feature=\"")?.strip_suffix('"')?;
-                        Some(name.to_owned())
-                    };
-                    let own = cfgs.iter().filter_map(feature).collect();
-                    let cpu = cpu.as_ref().map(|(name, host)| (name.as_str(), host.as_deref()));
-                    let (tuned, unlisted) = target.tuned(own, cpu, &given.features)?;
-                    unknown = unlisted;
-                    cfgs.retain(|it| feature(it).is_none());
-                    for feature in &tuned {
-                        cfgs.extend(
-                            target.feature_cfgs.get(feature).into_iter().flatten().cloned(),
-                        );
-                    }
-                    cfgs.extend(tuned.iter().map(|it| format!("target_feature=\"{it}\"")));
-                }
-                let debug_assertions = given.debug_assertions();
-                if debug_assertions {
-                    cfgs.push("debug_assertions".to_owned());
-                }
-                if nightly && given.overflow_checks.unwrap_or(debug_assertions) {
-                    cfgs.push("overflow_checks".to_owned());
-                }
-                if nightly && debug_assertions {
-                    cfgs.push("ub_checks".to_owned());
-                }
-                let panic = given.panic.unwrap_or(&target.panic);
-                if panic != target.panic && panic != "abort" {
-                    return None;
-                }
-                cfgs.push(format!("panic=\"{panic}\""));
-                if given.crate_types.contains(&"proc-macro") {
-                    cfgs.push("proc_macro".to_owned());
-                    // A proc macro is a dynamic library, which a target that respects
-                    // `crt-static` builds without it unless it is asked for.
-                    if !given.features.iter().any(|&(_, name)| name == "crt-static")
-                        && target.respects_crt_static()?
-                    {
-                        cfgs.retain(|it| it != "target_feature=\"crt-static\"");
-                    }
-                }
-                for cfg in &given.cfgs {
-                    if !is_plain_cfg(cfg) {
-                        return None;
-                    }
-                    cfgs.push((*cfg).to_owned());
-                }
-                cfgs.sort();
-                cfgs.dedup();
+                let (cfgs, unlisted) = cfg_printed(&given, tuple, toolchain.host, nightly)?;
+                unknown = unlisted;
                 cfgs.iter().for_each(|it| out += &format!("{it}\n"));
             }
             // Apple's SDKROOT and *_DEPLOYMENT_TARGET, which a shell of nixpkgs on macOS sets,
             // are read to link: an Apple target's spec names no deployment target
             // (`"llvm-target": "arm64-apple-macosx"`).
             "target-spec-json" if given.unstable_options && nightly => {
-                out += target.spec_on(toolchain.host)?;
+                out += target::target_spec_json(tuple, toolchain.host).ok()??;
             }
             _ => return None,
         }
@@ -677,7 +449,7 @@ pub fn answered(
             return None;
         }
         for feature in &unknown {
-            warned += &release.unknown_feature.as_ref()?.replace("{feature}", feature);
+            warned += &target::unknown_feature_warning(feature)?;
         }
         for kind in &dropped {
             warned += &format!(
@@ -694,16 +466,42 @@ pub fn answered(
 mod tests {
     use super::*;
 
+    /// A `--cfg` is printed back when it is a plain name of no builtin cfg, with a value with
+    /// nothing to escape; another is not answered.
     #[test]
     fn cfgs_given() {
-        assert!(is_plain_cfg("foo"));
-        assert!(is_plain_cfg("feature=\"serde derive\""));
-        assert!(!is_plain_cfg("feature=serde"));
-        assert!(!is_plain_cfg("feature=\"a\\\"b\""));
-        assert!(!is_plain_cfg("debug_assertions"));
-        assert!(!is_plain_cfg("target_os=\"linux\""));
-        assert!(!is_plain_cfg("sanitizer_cfi_generalize_pointers"));
-        assert!(!is_plain_cfg("9lives"));
+        let printed = |cfg: &str| {
+            let args: Vec<OsString> = ["--print", "cfg", "--cfg", cfg].iter().map(OsString::from).collect();
+            answered(&args, &[], Vars::Only(&[]))
+                .map(|it| String::from_utf8(it.stdout).unwrap().lines().any(|line| line == cfg))
+        };
+        assert_eq!(printed("foo"), Some(true));
+        assert_eq!(printed("feature=\"serde derive\""), Some(true));
+        for refused in [
+            "feature=serde",
+            "feature=\"a\\\"b\"",
+            "debug_assertions",
+            "target_os=\"linux\"",
+            "sanitizer_cfi_generalize_pointers",
+            "9lives",
+        ] {
+            assert_eq!(printed(refused), None, "{refused}");
+        }
+    }
+
+    /// A feature neither rustc nor LLVM has of the target changes nothing, with rustc's
+    /// warning; one LLVM lists, whose warning blaze does not have, is not answered.
+    #[test]
+    fn a_feature_the_target_lacks_is_warned_of() {
+        let plain = told("--print cfg --target x86_64-unknown-linux-gnu").expect("an answer");
+        let unknown = told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted")
+            .expect("an answer with a warning");
+        assert_eq!(unknown.stdout, plain.stdout);
+        let warning = target::unknown_feature_warning("blazeunlisted").unwrap();
+        assert_eq!(String::from_utf8(unknown.stderr).unwrap(), format!("{warning}warning: 1 warning emitted\n\n"));
+        assert!(told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+64bit").is_none());
+        let hidden = told("--print cfg --target x86_64-unknown-linux-gnu -C target-feature=+blazeunlisted -A warnings");
+        assert_eq!(hidden.map(|it| (it.stdout, it.stderr)), Some((plain.stdout, Vec::new())));
     }
 
     #[test]
@@ -715,10 +513,11 @@ mod tests {
         assert_eq!(given.panic, Some("abort"));
         assert_eq!(given.prints, ["cfg"]);
         assert_eq!(given.cfgs, ["foo"]);
-        assert!(!given.debug_assertions());
-        assert!(Given::of(&["-O"]).is_some_and(|it| !it.debug_assertions()));
-        assert!(Given::of(&["-C", "opt-level=0"]).is_some_and(|it| it.debug_assertions()));
-        // The features and the CPU, in order, which `Target::tuned` answers from rustc's.
+        assert_eq!(given.debug_assertions, None);
+        assert!(Given::of(&["-O"]).is_some_and(|it| it.opt_level == Some("2")));
+        assert!(Given::of(&["-C", "debug_assertions=off"]).is_some_and(|it| it.debug_assertions == Some(false)));
+        assert!(Given::of(&["-C", "debug-assertions=maybe"]).is_none());
+        // The features and the CPU, in order, which `target_cfg` answers from rustc's.
         let given =
             Given::of(&["-C", "target-cpu=x86-64-v3", "-Ctarget-feature=-crt-static,+avx2"]);
         let given = given.unwrap();
@@ -739,7 +538,7 @@ mod tests {
 
     fn told(args: &str) -> Option<Answer> {
         let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
-        answered(&args, &[], &|_| None)
+        answered(&args, &[], Vars::Only(&[]))
     }
 
     /// uitest.py's RUSTFLAGS: a print of what is linked and kept files change nothing that is
@@ -778,7 +577,7 @@ mod tests {
              warning: 2 warnings emitted\n\n"
         );
         let args: Vec<OsString> = probe.split_whitespace().map(OsString::from).collect();
-        assert_eq!(answer(&args, &[], &|_| None), None);
+        assert_eq!(answer(&args, &[], Vars::Only(&[])), None);
         for hidden in ["-A warnings", "--cap-lints allow", "-Wwarnings -Awarnings"] {
             let said = told(&format!("{probe} {hidden}")).expect("an answer with no warnings");
             assert_eq!(said.stderr, b"");
@@ -804,16 +603,40 @@ mod tests {
             let args =
                 ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            let var = |name: &str| {
-                (sdk && matches!(name, "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET"))
-                    .then(|| OsString::from(if name == "SDKROOT" { "/sdk" } else { "14.0" }))
+            let vars: &[(&str, &str)] = match sdk {
+                true => &[("SDKROOT", "/sdk"), ("MACOSX_DEPLOYMENT_TARGET", "14.0")],
+                false => &[],
             };
-            answer(&args, &[], &var)
+            answer(&args, &[], Vars::Only(vars))
         };
         let wasm = spec("wasm32-wasip1", true).expect("wasm32-wasip1's spec under SDKROOT");
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    #[test]
+    fn each_kind_of_vars_reads_its_own_then_the_process() {
+        let unset = format!("BLAZE_OWN_VARS_TEST_{}", std::process::id());
+        let path = std::env::var_os("PATH");
+        assert_eq!(Vars::Process.get("PATH"), path);
+        assert_eq!(Vars::Process.get(&unset), None);
+        let mut command = std::process::Command::new("rustc");
+        command.env(&unset, "set").env_remove("PATH");
+        assert_eq!(Vars::Command(&command).get(&unset), Some("set".into()));
+        assert_eq!(Vars::Command(&command).get("PATH"), None);
+        assert_eq!(Vars::Command(&std::process::Command::new("rustc")).get("PATH"), path);
+        let over = [
+            (OsString::from(&unset), Some(OsString::from("first"))),
+            (OsString::from(&unset), Some(OsString::from("last"))),
+            (OsString::from("PATH"), None),
+        ];
+        assert_eq!(Vars::Over(&over).get(&unset), Some("last".into()));
+        assert_eq!(Vars::Over(&over).get("PATH"), None);
+        assert_eq!(Vars::Over(&[]).get("PATH"), path);
+        let only = [("A", "1")];
+        assert_eq!(Vars::Only(&only).get("A"), Some("1".into()));
+        assert_eq!(Vars::Only(&only).get("PATH"), None);
     }
 
     /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
@@ -822,7 +645,7 @@ mod tests {
     fn a_list_of_crates_bootstrapped_is_rustcs() {
         let told = |args: &str, bootstrap: &str| {
             let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
-            answered(&args, &[], &|name| (name == "RUSTC_BOOTSTRAP").then(|| bootstrap.into()))
+            answered(&args, &[], Vars::Only(&[("RUSTC_BOOTSTRAP", bootstrap)]))
         };
         let servo = "crown,script,mozjs_sys";
         for args in ["--version", "-vV"] {
@@ -851,11 +674,16 @@ mod tests {
 
     #[test]
     fn a_spec_the_hosts_agree_on_is_answered_on_any_host() {
-        let release = &releases()[0];
-        let wasm = &release.targets["wasm32-wasip1"];
-        let windows = wasm.spec_on("x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
-        assert_eq!(Some(windows), wasm.spec_on("aarch64-apple-darwin"));
-        let linux = &release.targets["x86_64-unknown-linux-gnu"];
-        assert_eq!(linux.spec_on("x86_64-pc-windows-msvc"), None);
+        let spec = |triple: &str, host: &str| target::target_spec_json(triple, host).unwrap();
+        let windows = spec("wasm32-wasip1", "x86_64-pc-windows-msvc").expect("wasm32-wasip1's spec");
+        assert_eq!(Some(windows), spec("wasm32-wasip1", "aarch64-apple-darwin"));
+        assert_eq!(spec("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"), None);
+    }
+
+    /// The print of a target blaze has no data of is not answered, even one that needs none.
+    #[test]
+    fn a_target_blaze_has_no_data_of_is_not_answered() {
+        assert!(told("--print crate-name --target riscv64gc-unknown-plan9").is_none());
+        assert!(told("--print crate-name --target x86_64-unknown-linux-gnu").is_some());
     }
 }

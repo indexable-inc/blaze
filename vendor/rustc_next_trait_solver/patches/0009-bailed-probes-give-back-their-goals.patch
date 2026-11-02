@@ -1,0 +1,16 @@
+diff -ruN a/src/solve/eval_ctxt/probe.rs b/src/solve/eval_ctxt/probe.rs
+--- a/src/solve/eval_ctxt/probe.rs
++++ b/src/solve/eval_ctxt/probe.rs
+@@ -75,7 +75,11 @@
+     ) -> Result<T, NoSolutionOrRerunNonErased> {
+         let ProbeCtxt { ecx: outer, probe_kind, _result } = self;
+ 
+-        outer.opaque_accesses.should_bail()?;
++        if let Err(rerun) = outer.opaque_accesses.should_bail() {
++            // Back to the pool: dropped, each bail would leave the pool a warm list short.
++            outer.search_graph.scratch().give_nested_goals(propagated_nested_goals);
++            return Err(rerun.into());
++        }
+ 
+         let delegate = outer.delegate;
+         let max_input_universe = outer.max_input_universe;

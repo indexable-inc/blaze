@@ -8,18 +8,16 @@
 //! are bounds whose arguments are the callee's parameters.
 
 use hir::{GenericParam, PathResolution};
-use ide_db::famous_defs::FamousDefs;
-use syntax::{
-    AstNode, SyntaxNode,
-    ast::{self, HasGenericArgs as _},
-};
+use syntax::view as ast;
+
+use ast::{AstNode as _, HasGenericArgs as _};
 
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "needless_borrows_for_generic_args";
+const LINT: super::Implemented = super::Implemented::NeedlessBorrowsForGenericArgs;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) || cx.expansion.is_some() {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT) || cx.expansion().is_some() {
         return;
     }
     let ast::Expr::RefExpr(_) = expr else { return };
@@ -28,9 +26,9 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if count == 0 {
         return;
     }
-    let mut peeled = expr.clone();
+    let mut peeled = expr;
     for _ in 0..count {
-        let ast::Expr::RefExpr(reference) = &peeled else { break };
+        let ast::Expr::RefExpr(reference) = peeled else { break };
         let Some(inner) = reference.expr() else { return };
         peeled = inner;
     }
@@ -51,19 +49,19 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
 /// The function `node` is an argument of, and which of its parameters it is: clippy's
 /// `ExprUseNode::FnArg` of a path with no generic arguments, or `MethodArg` other than the
 /// receiver of a call with none.
-fn callee(cx: &Cx<'_, '_, '_>, node: &SyntaxNode) -> Option<(hir::Function, usize)> {
-    let mut arg = node.clone();
+fn callee<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<(hir::Function, usize)> {
+    let mut arg = node;
     while let Some(paren) = arg.parent().and_then(ast::ParenExpr::cast) {
-        arg = paren.syntax().clone();
+        arg = paren.syntax();
     }
     let list = ast::ArgList::cast(arg.parent()?)?;
-    let index = list.args().position(|it| *it.syntax() == arg)?;
+    let index = list.args().position(|it| it.syntax() == arg)?;
     let call = list.syntax().parent()?;
-    if let Some(call) = ast::MethodCallExpr::cast(call.clone()) {
+    if let Some(call) = ast::MethodCallExpr::cast(call) {
         if call.generic_arg_list().is_some() {
             return None;
         }
-        let function = cx.sema().resolve_method_call(&call)?;
+        let function = cx.method(call)?;
         return Some((function, index + 1));
     }
     let call = ast::CallExpr::cast(call)?;
@@ -72,17 +70,17 @@ fn callee(cx: &Cx<'_, '_, '_>, node: &SyntaxNode) -> Option<(hir::Function, usiz
     if path.segment()?.generic_arg_list().is_some() {
         return None;
     }
-    match cx.sema().resolve_path(&path)? {
+    match cx.path(path)? {
         PathResolution::Def(hir::ModuleDef::Function(function)) => Some((function, index)),
         _ => None,
     }
 }
 
-fn needless_borrow_count(
-    cx: &Cx<'_, '_, '_>,
+fn needless_borrow_count<'t>(
+    cx: &Cx<'_, 't>,
     function: hir::Function,
     index: usize,
-    expr: &ast::Expr,
+    expr: ast::Expr<'t>,
 ) -> usize {
     let db = cx.db();
     let params = function.assoc_fn_params(db);
@@ -111,18 +109,20 @@ fn needless_borrow_count(
     if elsewhere {
         return 0;
     }
-    let into_iter = FamousDefs(cx.sema(), krate).core_iter_IntoIterator();
+    let into_iter = cx.famous().core_iter_IntoIterator();
     let drop = lang(hir::LangItem::Drop);
-    let holds = |referent: &ast::Expr| -> bool {
-        let inner = peel_parens(referent);
-        if let ast::Expr::FieldExpr(field) = &inner
-            && let Some(base) = field.expr().and_then(|it| cx.ty(&it))
+    // The type arguments of the bound being asked of, past its `Self`.
+    let mut args = Vec::new();
+    let mut holds = |referent: ast::Expr<'t>| -> bool {
+        let inner = referent.peel_parens();
+        if let ast::Expr::FieldExpr(field) = inner
+            && let Some(base) = field.expr().and_then(|it| cx.ty(it))
             && drop.is_some_and(|it| base.impls_trait(db, it, &[]))
         {
             return false;
         }
         let Some(ty) = cx.ty(referent) else { return false };
-        if !(ty.is_copy(db) || is_call(cx, &inner)) {
+        if !(ty.is_copy(db) || is_call(cx, inner)) {
             return false;
         }
         if ref_mut_self && !ty.is_mutable_reference() {
@@ -136,7 +136,7 @@ fn needless_borrow_count(
             {
                 return false;
             }
-            let mut args = Vec::new();
+            args.clear();
             for at in 1.. {
                 let Some(arg) = bound.get_type_argument(at) else { break };
                 let Some(arg) = arg.without_params(db) else { return false };
@@ -146,10 +146,10 @@ fn needless_borrow_count(
         })
     };
     let mut count = 0;
-    let mut at = expr.clone();
-    while let ast::Expr::RefExpr(reference) = &at {
+    let mut at = expr;
+    while let ast::Expr::RefExpr(reference) = at {
         let Some(referent) = reference.expr() else { break };
-        if !holds(&referent) {
+        if !holds(referent) {
             break;
         }
         at = referent;
@@ -158,7 +158,7 @@ fn needless_borrow_count(
     count
 }
 
-fn has_ref_mut_self_method(db: &dyn hir::db::HirDatabase, trait_: hir::Trait) -> bool {
+fn has_ref_mut_self_method(db: &base_db::Db, trait_: hir::Trait) -> bool {
     trait_.items(db).into_iter().any(|it| match it {
         hir::AssocItem::Function(function) => {
             function.self_param(db).is_some_and(|it| it.access(db) == hir::Access::Exclusive)
@@ -167,26 +167,15 @@ fn has_ref_mut_self_method(db: &dyn hir::db::HirDatabase, trait_: hir::Trait) ->
     })
 }
 
-fn peel_parens(expr: &ast::Expr) -> ast::Expr {
-    let mut expr = expr.clone();
-    while let ast::Expr::ParenExpr(paren) = &expr {
-        let Some(inner) = paren.expr() else { break };
-        expr = inner;
-    }
-    expr
-}
-
 /// Whether `expr` is a call, or a macro call that expands to one, as `format!` does.
-fn is_call(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> bool {
+fn is_call<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
     match expr {
         ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) => true,
         ast::Expr::MacroExpr(mac) => {
             let Some(call) = mac.macro_call() else { return false };
-            let Some(expanded) = cx.sema().expand_macro_call(&call) else { return false };
-            let root = expanded.value;
-            let expr =
-                ast::Expr::cast(root.clone()).or_else(|| root.children().find_map(ast::Expr::cast));
-            expr.is_some_and(|it| is_call(cx, &peel_parens(&it)))
+            let Some(root) = cx.expand(call) else { return false };
+            let expr = ast::Expr::cast(root).or_else(|| root.children().find_map(ast::Expr::cast));
+            expr.is_some_and(|it| is_call(cx, it.peel_parens()))
         }
         _ => false,
     }

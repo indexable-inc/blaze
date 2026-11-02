@@ -1,0 +1,30 @@
+{
+  "id": "01158",
+  "from_lane": "speed",
+  "owner": "coordinator",
+  "paths": [
+    "harness/bench.py",
+    "harness/blaze_cli.py"
+  ],
+  "what": "Andrew 15:56 bench, run 41028904903 job 124054549939: all six 'WRONG <edit>: the program says (0, 'cargo 1.91.0', 'blaze time: 44.6 ms ...')' are a harness false positive. bench.py:710 sets BLAZE_STATS=1 for every `ours` command, so `ours.cargo(\"run\", ..)` (bench.py:741 and the `expected` at :800) gets blaze-profile's 'blaze time: N ms' table on stderr, and N differs between runs. The program's own output (code 0, 'cargo 1.91.0') matched. Fix in harness/blaze_cli.py `program_output` (:341): drop lines matching `^blaze ` from stderr before comparing, or run `runs_right` and `expected` with BLAZE_STATS removed from the env. Also: v2 prints none of the lines bench.py parses (`link: .. (..)`, `timeline-us:`, `cold: compiled`, `load workspace:`, `resolve:`; rg finds none in crates/), so a v2 bench round will show no link kind and no step times. The link line is requested of cargo (same batch); the step lines need v2's equivalents, or bench.py reading v2's API events.",
+  "state": "applied",
+  "created": "2026-10-30T23:03:23Z",
+  "updated": "2026-10-31T12:06:58Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:03:23Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:06:58Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "bench.py runs the program for `expected` and `runs_right` without BLAZE_STATS (helper `program()`), so the profile table no longer reaches the comparison. The step lines (timeline-us, cold, load workspace, resolve) are still missing in v2; the link line is 01156."
+    }
+  ]
+}

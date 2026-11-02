@@ -1,0 +1,44 @@
+{
+  "id": "00225",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/dedup/sim-rest.md",
+    "crates/hir-def/src/hir/persist.rs",
+    "crates/hir-ty/src/check_cache/ids.rs",
+    "crates/stdx/src/lend.rs",
+    "crates/stdx/src/lib.rs",
+    "v2/requests/db.md",
+    "crates/blaze-lints/src/lints/needless_borrow.rs",
+    "v2/requests/diagnostics.md",
+    "crates/stdx",
+    "crates/blaze-lints"
+  ],
+  "what": "## dedup: `stdx::lend` for the two `relocating` scopes; `needless_borrow::unambiguous` onto syntax's precedence (from dedup-sim-rest, 2026-10-29)\n\nFrom `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes\n`docs/v2/plan/lanes/dedup/sim-rest.md`). `stdx` and `blaze-lints` are the coordinator's.\n\n### 1. `stdx::lend`, and hir-def's `relocating` onto it\n\n`crates/hir-def/src/hir/persist.rs` `relocating` and `crates/hir-ty/src/check_cache/ids.rs`\n`relocating` are one function over two table types: move the table into a thread-local\n`RefCell<Option<_>>` for the length of `f`, assert the slot was empty, and move it back on return\nor unwind with a drop guard. Both crates depend on `stdx`.\n\nNew `crates/stdx/src/lend.rs`, with `pub mod lend;` after `pub mod assert;` and\n`pub use lend::lend;` after `pub use itertools;` in `crates/stdx/src/lib.rs`:\n\n```rust\n//! A value lent to a thread-local for the length of a call.\n\nuse std::{cell::RefCell, thread::LocalKey};\n\n/// Runs `f` with `*value` moved into `slot`, and moves what `slot` holds back into `*value` when\n/// `f` returns or unwinds: state that the code `f` calls reads and adds to through the\n/// thread-local rather than a parameter. Lends of one slot do not nest.\npub fn lend<T: Default + 'static, R>(\n    slot: &'static LocalKey<RefCell<Option<T>>>,\n    value: &mut T,\n    f: impl FnOnce() -> R,\n) -> R {\n    struct Return<'v, T: 'static> {\n        slot: &'static LocalKey<RefCell<Option<T>>>,\n        value: &'v mut T,\n    }\n\n    impl<T: 'static> Drop for Return<'_, T> {\n        fn drop(&mut self) {\n            if let Some(lent) = self.slot.with(|slot| slot.borrow_mut().take()) {\n                *self.value = lent;\n            }\n        }\n    }\n\n    slot.with(|slot| {\n        let mut slot = slot.borrow_mut();\n        assert!(slot.is_none(), \"scopes lending one thread-local do not nest\");\n        *slot = Some(std::mem::take(value));\n    });\n    let _return = Return { slot, value };\n    f()\n}\n\n#[cfg(test)]\nmod tests {\n    use std::{cell::RefCell, panic};\n\n    use super::lend;\n\n    thread_local! {\n        static SLOT: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };\n    }\n\n    fn push(it: u32) {\n        SLOT.with(|slot| slot.borrow_mut().as_mut().expect(\"in a lend\").push(it));\n    }\n\n    #[test]\n    fn what_is_added_in_the_lend_comes_back() {\n        let mut value = vec![1];\n        assert_eq!(lend(&SLOT, &mut value, || { push(2); 7 }), 7);\n        assert_eq!(value, [1, 2]);\n        assert!(SLOT.with(|slot| slot.borrow().is_none()));\n    }\n\n    #[test]\n    fn what_is_added_before_an_unwind_comes_back() {\n        let mut value = Vec::new();\n        let unwound = panic::catch_unwind(panic::AssertUnwindSafe(|| {\n            lend(&SLOT, &mut value, || -> () {\n                push(3);\n                panic!(\"unwinds\")\n            })\n        }));\n        assert!(unwound.is_err());\n        assert_eq!(value, [3]);\n        assert!(SLOT.with(|slot| slot.borrow().is_none()));\n    }\n\n    #[test]\n    #[should_panic(expected = \"do not nest\")]\n    fn lends_do_not_nest() {\n        let (mut outer, mut inner) = (Vec::new(), Vec::new());\n        lend(&SLOT, &mut outer, || lend(&SLOT, &mut inner, || ()));\n    }\n}\n```\n\nWith it, in `crates/hir-def/src/hir/persist.rs` (format's, which is DONE), `relocating`'s body\n(today 214-232: the `Scope` struct, its `Drop`, the `RELOCATION.with` and `f()`) becomes\n`stdx::lend(&RELOCATION, table, f)`, the doc comment unchanged; and its test\n`relocating_scopes_do_not_nest` (1262-1263) expects `\"do not nest\"` instead of `\"relocating\nscopes do not nest\"`. hir-ty's half is `v2/requests/db.md`, same heading, item 1.\n\n### 2. `crates/blaze-lints/src/lints/needless_borrow.rs` `unambiguous`\n\nclippy's `needless_borrow` (`check_local_usage`) asks `parent.precedence() ==\nExprPrecedence::Unambiguous`. rustc has no `Postfix` level: calls, method calls, fields, indexes,\n`?` and `.await` are its `Unambiguous`, which is syntax's `Postfix` and `Unambiguous`\n(`syntax::view::prec`, checked against the handle version by `syntax/src/view/tests.rs`\n`precedence_and_parens`). The copy's list has drifted: it calls `a..b` and `do yeet` unambiguous,\nand a closure with a return type ambiguous. Replace `unambiguous` (292-310, doc comment kept) with:\n\n```rust\nfn unambiguous(expr: ast::Expr<'_>) -> bool {\n    expr.precedence() >= ast::prec::ExprPrecedence::Postfix\n}\n```\n\n(`ast` is `syntax::view` there.) blaze-diagnostics' `type_mismatch::needs_parens` goes onto the\nsame function (`v2/requests/diagnostics.md`, same heading, item 4).\n\n> forwarded to the coordinator: `crates/stdx` and `crates/blaze-lints` are its; on requests' coordinator list. Once `stdx::lend` is in, hir-def's `hir/persist.rs` half is requests' (lane format is DONE) and hir-ty's `check_cache/ids.rs` half is db's (requests, pass 35).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:35:19Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: `stdx::lend` for the two `relocating` scopes; `needless_borrow::unambiguous` onto syntax's precedence (from dedup-sim-rest, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:2768"
+    },
+    {
+      "at": "2026-10-30T08:34:32Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:35:19Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "New crates/stdx/src/lend.rs (`stdx::lend`, with its three tests), `pub mod lend;` and `pub use lend::lend;` in stdx lib.rs. Both halves applied: crates/hir-def/src/hir/persist.rs and crates/hir-ty/src/check_cache/ids.rs `relocating` bodies are `stdx::lend(&RELOCATION|&TABLE, table, f)`, and persist.rs test expects \"do not nest\". crates/blaze-lints/src/lints/needless_borrow.rs `unambiguous` is `expr.precedence() >= ast::prec::ExprPrecedence::Postfix`. blaze-diagnostics needs_parens (diagnostics.md item 4) is diagnostics lane."
+    }
+  ]
+}

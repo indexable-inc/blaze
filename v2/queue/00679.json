@@ -1,0 +1,30 @@
+{
+  "id": "00679",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    ".github/scripts/llvm.py",
+    "crates/hir-ty-codegen/llvm.json",
+    "tools/pgo/pgo.py",
+    "tools/pgo/profiles.json",
+    ".github/scripts/build_release.py",
+    ".github/workflows/pgo.yaml",
+    "tools/pgo",
+    "tools/pgo/test_pgo.py"
+  ],
+  "what": "## fastcompile-sched 5: coordinator: the PGO and BOLT pipeline in the release train (`.github/`, `flake.nix`, `pyproject.toml`)\n\nWhat:\n- `.github/scripts/llvm.py`: add to `COMPONENTS` `llvm-profdata`, and with\n  `LLVM_ENABLE_PROJECTS` including `bolt`, `llvm-bolt`, `merge-fdata` and `perf2bolt` (Linux\n  hosts), and compiler-rt's profile runtime; rebuild and re-pin `crates/hir-ty-codegen/llvm.json`.\n- A release-train job per target in an ix VM: `uv run --frozen python tools/pgo/pgo.py\n  '{\"kind\": \"build\", \"target\": \"<T>\", \"builder\": \"<blaze of this commit>\", \"out\": \"pgo-<T>\"}'`\n  (`\"bolt\": \"none\"` on macOS and Windows; Linux must BOLT), then one job `pgo.py '{\"kind\":\n  \"publish\", \"dirs\": [...]}'` that uploads to `pgo-profiles` and commits\n  `tools/pgo/profiles.json` through a pull request.\n- `flake.nix` and `.github/scripts/build_release.py`: an entry with `\"builder\": \"blaze\"` gives the\n  release its binaries (`binaries`, checked by sha256) instead of a cargo `-Cprofile-use`\n  build; the cargo-PGO path of `build_release.py` and `.github/workflows/pgo.yaml` go once every\n  target has a blaze entry (a blaze LLVM 23 profile is not rustc's LLVM's format).\n- `pyproject.toml`: `tools/pgo` in ruff's and pyright's `include`, and the scripts job runs\n  `uv run --frozen python -m unittest tools/pgo/test_pgo.py`.\n\nWhy: idea 12, every release built with PGO and, on ELF, BOLT, from profiles of blaze's own\ndaemon doing real builds, each artifact named by content.\n\n> forwarded to coordinator: `.github/` and `flake.nix` are its.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sched 5: coordinator: the PGO and BOLT pipeline in the release train (`.github/`, `flake.nix`, `pyproject.toml`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:357"
+    }
+  ]
+}

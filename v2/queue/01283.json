@@ -1,0 +1,30 @@
+{
+  "id": "01283",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-front-def",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower/generics.rs",
+    "crates/hir-def/src/expr_store/lower.rs"
+  ],
+  "what": "Two silent error types in hir-def that hir-ty cannot report (round 7c hir-ty tests::lowering_errors impl_trait_in_a_field_is_e0562 and a_pattern_type_blaze_does_not_lower_is_an_error_naming_why). (1) generics.rs:65 `ImplTraitLowering::Error` allocates TypeRef::Error, so `struct V { f: impl A }` has no E0562: allocate the TypeRef::ImplTrait as the Opaque arm does (with_lists over the bounds) and let hir-ty report it; its lowering of a field, a path generic arg or any non-Opaque position is ImplTraitLoweringMode::Disallowed, which pushes TyLoweringDiagnostic::ImplTraitNotAllowed (rustc E0562 from ast lowering). (2) lower.rs:3744 collect_ty_pat `_ => { // FIXME: Emit an error. self.alloc_pat(Pat::Missing, ptr) }`: a pattern rustc rejects with \"pattern not supported in pattern types\" (`u8 is _`) must not be Pat::Missing, which hir-ty reads as a parse error and leaves silent; allocate `Pat::Wild` (or the pattern lowered as usual) so hir-ty lower_pattern_type reports PatternTypeNotLowered { reason: Pattern }.",
+  "state": "applied",
+  "created": "2026-10-31T14:24:57Z",
+  "updated": "2026-10-31T15:00:42Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:24:57Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:00:42Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "uncompiled, rust-analyzer clean. (1) expr_store/lower/generics.rs ImplTraitLowering::Error now allocates TypeRef::ImplTrait like Opaque; hir-ty lowers those positions Disallowed and reports E0562. Note for hir-ty: impl Bar<impl Foo> gets E0562 where rustc says E0666, and an impl Trait in a fn pointer or Fn() argument inside a return type was already lowered Opaque by hir-def (it passes the parent mode down), so hir-ty makes an opaque type where rustc says E0562; that one was there before this change. (2) lower.rs collect_ty_pat: an unsupported pattern is Pat::Wild, so lower_pattern_type reports PatternTypeNotLowered { reason: Pattern }."
+    }
+  ]
+}

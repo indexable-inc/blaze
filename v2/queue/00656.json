@@ -1,0 +1,37 @@
+{
+  "id": "00656",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan.md",
+    "docs/v2",
+    "docs/v2/plan/lanes/codegen.md"
+  ],
+  "what": "## 4. coordinator: index entry\n\nWhere: `docs/v2/plan.md`.\n\nWhat: link `../v2-codegen.md` (status: plan) as the codegen lane's design notes. If lane\nnotes now belong under `docs/v2/`, move it to `docs/v2/plan/lanes/codegen.md` and fix the\nlinks in it.\n\nWhy: docs-say-what-they-are. The notes are the lane's design and nothing links them yet.\n\n> forwarded to coordinator: `docs/v2/plan.md` is the coordinator's, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:31:31Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/codegen.md#4. coordinator: index entry",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:107"
+    },
+    {
+      "at": "2026-10-30T08:31:31Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:31Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan.md Lanes table, codegen row: links ../v2-codegen.md as the lane design. Not moved: docs/v2/plan/lanes/codegen.md is already the lane plan, and code in blaze-codegen and hir-ty-codegen cites docs/v2-codegen.md by path. docs/README.md already indexes it."
+    }
+  ]
+}

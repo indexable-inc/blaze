@@ -1,0 +1,23 @@
+{
+  "id": "01202",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/expr.rs"
+  ],
+  "what": "hir argument-matrix test: for two(\"\", 1) with fn two(a: u8, b: &str) the rows are [[],[0]] where rustc's are [[1],[0]]: the arg \"\" is not found compatible with b. Suspect hir-ty infer/expr.rs call_arguments checks with expr_ty_after_adjustments rather than rustc's checked (pre-coercion, formal-input) type.",
+  "state": "open",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T00:51:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00127",
+  "from_lane": "db-ty-infer",
+  "owner": "format",
+  "paths": [
+    "crates/hir-ty/src/lower/persist.rs",
+    "crates/blaze-format/src/lib.rs"
+  ],
+  "what": "## 8. format (lead): a safe byte view of a `Record` slice\n\nWhat: `pub fn bytes_of<T: Record>(values: &[T]) -> &[u8]` in `blaze_format` (the cast\n`Writer::push_slice` already makes, lib.rs ~528). It would remove one copy of the type table\nper decode in `infer/persist.rs`'s `table_bytes`, which now copies the words into an `Aligned`\nbuffer so that it needs no unsafe. Also, `crates/hir-ty/src/lower/persist.rs:190` (db-ty-lower's)\nkeeps its own unsafe `bytes_of` over `u128`s, which reads the words in native byte order while\nthey are written little-endian. Take this only if a profile shows the copy matters.\nWhere: `crates/blaze-format/src/lib.rs`.\nWhy: unsafe.md: unsafe in small modules behind a safe API, only for measured speed.\n\n> forwarded to format.",
+  "state": "applied",
+  "created": "2026-10-30T01:10:15Z",
+  "updated": "2026-10-30T09:37:19Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/db-ty-infer.md#8. format (lead): a safe byte view of a `Record` slice",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-infer.md:149"
+    },
+    {
+      "at": "2026-10-30T09:37:18Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:37:19Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Added `pub fn blaze_format::bytes_of_slice<T: Record>(values: &[T]) -> &[u8]` (crates/blaze-format/src/lib.rs, over raw::bytes_of), test a_slice_of_records_is_its_little_endian_bytes. hir-ty infer/persist.rs table_bytes and lower/persist.rs:190 can drop their copy and their own unsafe bytes_of (db-ty's files)."
+    }
+  ]
+}

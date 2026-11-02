@@ -1,0 +1,35 @@
+{
+  "id": "00300",
+  "from_lane": "mem-db-checks",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/mem.rs"
+  ],
+  "what": "## B1. `crates/hir-ty-borrowck/src/mem.rs` (new)\n\n```rust\n//! The run's frame: every temporary of a borrow check is in it, and goes in one store when the\n//! task that runs the check ends. What a check returns to the database is owned instead.\n\npub(crate) use blaze_mem::frame::Frame;\nuse rustc_hash::FxBuildHasher;\n\npub(crate) type FVec<'f, T> = Vec<T, &'f Frame>;\npub(crate) type FMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;\npub(crate) type FSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;\npub(crate) type FDeque<'f, T> = std::collections::VecDeque<T, &'f Frame>;\n\n#[inline]\npub(crate) fn map<'f, K, V>(frame: &'f Frame) -> FMap<'f, K, V> {\n    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)\n}\n\n#[inline]\npub(crate) fn set<'f, T>(frame: &'f Frame) -> FSet<'f, T> {\n    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)\n}\n\n/// `len` copies of `value` in one allocation of exactly `len`.\n#[inline]\npub(crate) fn filled<'f, T: Clone>(frame: &'f Frame, len: usize, value: T) -> FVec<'f, T> {\n    let mut out = Vec::with_capacity_in(len, frame);\n    out.resize(len, value);\n    out\n}\n\n/// The items of `iter` in a frame vector, its room the iterator's lower bound to start.\n#[inline]\npub(crate) fn collect<'f, T>(frame: &'f Frame, iter: impl IntoIterator<Item = T>) -> FVec<'f, T> {\n    let iter = iter.into_iter();\n    let mut out = Vec::with_capacity_in(iter.size_hint().0, frame);\n    out.extend(iter);\n    out\n}\n\n/// The items of `iter`, which says its length, as an owned vector of exactly that length: a\n/// memoized result built from frame values.\n#[inline]\npub(crate) fn owned<T>(iter: impl ExactSizeIterator<Item = T>) -> Vec<T> {\n    let mut out = Vec::with_capacity(iter.len()); // alloc: the memoized result, owned\n    out.extend(iter);\n    out\n}\n\n#[cfg(test)]\nmod tests {\n    use blaze_mem::{Tag, frame};\n\n    #[test]\n    fn frame_collections_hold_what_global_ones_do() {\n        frame::task(Tag::Mir, |frame| {\n            let mut map = super::map(frame);\n            let mut set = super::set(frame);\n            for it in 0..1000u32 {\n                map.insert(it, it * 2);\n                set.insert(it % 37);\n            }\n            assert_eq!(map.len(), 1000);\n            assert_eq!(map[&999], 1998);\n            assert_eq!(set.len(), 37);\n            let filled = super::filled(frame, 70, 7u64);\n            assert_eq!((filled.len(), filled.capacity()), (70, 70));\n            let owned = super::owned(filled.iter().copied());\n            assert_eq!((owned.len(), owned.capacity()), (70, 70));\n            assert!(frame.contains(filled.as_ptr().cast()));\n            assert!(!frame.contains(owned.as_ptr().cast()));\n        });\n    }\n}\n```\n\nWhy `hashbrown` and not `std::collections::HashMap`: std's map takes no allocator. Iteration\norder: hashbrown 0.17 and std's copy of it may probe differently, so every map whose iteration\norder reaches the output is named in its part and turned into a vector in insertion order (with\na frame map of indices where it is looked up), which is rustc's own `FxIndexMap` order; a map\nonly looked up changes nothing.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/mem.rs (every alias and helper, plus `ExactLen`).",
+  "state": "applied",
+  "created": "2026-10-30T03:15:09Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks.md#B1. `crates/hir-ty-borrowck/src/mem.rs` (new)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks.md:78"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/mem.rs (every alias and helper, plus `ExactLen`)."
+    }
+  ]
+}

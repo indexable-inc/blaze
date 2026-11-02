@@ -1,0 +1,36 @@
+{
+  "id": "00428",
+  "from_lane": "usercode-hot-macros",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/lib.rs",
+    "crates/load-cargo"
+  ],
+  "what": "## usercode-hot-macros, 2026-10-29: the answer to a span question owns its text\n\nWhere: `crates/load-cargo/src/lib.rs`, `SubResponse` (`FilePathResult { name: String }`,\n`SourceTextResult { text: Option<String> }`, `LocalFilePathResult { name: Option<String> }`),\nwhich `blaze-macro-wasm`'s `answer` gets from the database. Owner: not this lane's.\n\nWhat, and why: nothing to do now. A hit whose key asked a span's file or source text allocates\nthat answer's `String` once per question in `answer`, before it is hashed (`keyed::hex` into\nreused room). A `SubResponse` lending `&str` from the database would make those hits allocate\nnothing; noted so the owner can weigh it, not asked for.\n\n> forwarded to cargo (`crates/load-cargo/`; it says nothing to do now: noted) (requests, pass 23).",
+  "state": "applied",
+  "created": "2026-10-30T04:09:33Z",
+  "updated": "2026-10-31T20:29:32Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode-hot-macros.md#usercode-hot-macros, 2026-10-29: the answer to a span question owns its text",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-hot-macros.md:459"
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "noted, nothing asked (and load-cargo is now blaze-lower)"
+    }
+  ]
+}

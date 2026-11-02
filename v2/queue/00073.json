@@ -1,0 +1,36 @@
+{
+  "id": "00073",
+  "from_lane": "db-ty-db",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir-ty/src/db.rs"
+  ],
+  "what": "## 1. db-ty: `blaze-query` in `crates/hir-ty/Cargo.toml`\n\nWhat: add `blaze-query.workspace = true` under `[dependencies]` of `crates/hir-ty/Cargo.toml`.\nWhy: `hir_ty::db::kinds` (shared rule 2) gives hir-ty's query kinds as\n`blaze_query::QueryKind`, and its test checks them against `blaze_query::kinds::FRONT`.\nblaze-query depends on no front-end crate (blaze-core, -format, -graph, -ids, -protocol, -vfs),\nso there is no cycle. `crates/hir-ty/src/db.rs` does not compile without it.\n\n> forwarded to db: `crates/hir-ty/Cargo.toml` is lane db's own (`blaze-query` is a workspace dependency already); not there yet.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/Cargo.toml:49` (`blaze-query.workspace = true`).",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#1. db-ty: `blaze-query` in `crates/hir-ty/Cargo.toml`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/Cargo.toml:49` (`blaze-query.workspace = true`)."
+    }
+  ]
+}

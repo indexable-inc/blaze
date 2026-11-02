@@ -1,0 +1,23 @@
+{
+  "id": "00872",
+  "from_lane": "dbsp-impls",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.lock"
+  ],
+  "what": "crates/hir-ty/Cargo.toml now depends on blaze-dbsp (workspace); the Cargo.lock entry for hir-ty needs \"blaze-dbsp\" in its dependencies list",
+  "state": "open",
+  "created": "2026-10-30T09:16:14Z",
+  "updated": "2026-10-30T09:16:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:16:14Z",
+      "by": "dbsp-impls",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

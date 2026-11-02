@@ -1,0 +1,23 @@
+{
+  "id": "01361",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db-expand-derive",
+  "paths": [
+    "crates/hir-expand/src/builtin/derive_macro.rs"
+  ],
+  "what": "From 01223, judged by usefulness. hir-def macro_expansion_tests::builtin_errors::{from_derive_errors, coerce_pointee_errors_have_their_code}: a builtin derive error (`#[derive(From)]` used on an enum, the CoercePointee E0802 errors) points at the `derive` ident where the expectation points at the derive's name (`From`, `CoercePointee`). The name is the useful place, because one #[derive(..)] lists several macros and the error is about one of them. Make the error's span the derive path's (the derive_index entry of MacroCallKind::Derive), not the attribute's `derive` ident.",
+  "state": "open",
+  "created": "2026-10-31T23:46:14Z",
+  "updated": "2026-10-31T23:46:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:46:14Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

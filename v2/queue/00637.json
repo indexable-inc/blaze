@@ -1,0 +1,38 @@
+{
+  "id": "00637",
+  "from_lane": "dedup",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa",
+    "vendor/salsa/Cargo.toml",
+    "vendor/salsa/src/capture.rs",
+    "Cargo.toml"
+  ],
+  "what": "## dedup: bits: vendor/salsa `capture.rs` `Frame::old` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)\n\nFrom `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.\n\nWhy: `Frame::old` is a growable `u64`-word set of edge positions with its own bit logic; it is\n`blaze_ids::bits::BitSet<u32>`. The hot path costs the same: `read_old` is one capacity compare,\nthen `insert` (one load, test and store, as before); `recycle` clears each bit it set with\n`remove` instead of storing zero over its word, which is the same result because every bit set\nin `old` is a position in `read`. The buffer is still grown once, to the frame's `base`, and\nreused by later captures. `blaze-ids` depends on nothing of salsa's (blake3, blaze-radix, serde,\nsmallvec, thin-vec), so the edge is acyclic; salsa already has it as a dev-dependency.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbmd-f (22:32): both subsections in the tree (lines under each).\n\n### `vendor/salsa/Cargo.toml`\n\nMove `blaze-ids` from the dev-dependencies to the dependencies. Before:\n\n```toml\n[dev-dependencies.blaze-ids]\npath = \"../../crates/blaze-ids\"\n```\n\nAfter: that entry deleted, and beside the other `[dependencies.*]` entries (alphabetically,\nbefore `[dependencies.salsa-macros]`'s neighbours as the file orders them):\n\n```toml\n[dependencies.blaze-ids]\npath = \"../../crates/blaze-ids\"\n```\n\n(The tests that used it as a dev-dependency keep working: a normal dependency is visible to\ntests.)\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbmd-f (22:32): in the tree at `vendor/salsa/Cargo.toml:648-649` (`[dependencies.blaze-ids]`); no `[dev-dependencies.blaze-ids]` left.\n\n### `vendor/salsa/src/capture.rs`\n\nImports, before:\n\n```rust\nuse std::fmt;\n\nuse crate::Revision;\n```\n\nAfter:\n\n```rust\nuse std::fmt;\n\nuse blaze_ids::bits::BitSet;\n\nuse crate::Revision;\n```\n\nField, before:\n\n```rust\n    /// Bits of the positions below `base` that `read` holds; all clear in a spare frame.\n    old: Vec<u64>,\n```\n\nAfter:\n\n```rust\n    /// The positions below `base` that `read` holds; empty in a spare frame.\n    old: BitSet<u32>,\n```\n\n`read_old`, before:\n\n```rust\n    fn read_old(&mut self, position: u32) {\n        let (word, bit) = ((position / 64) as usize, 1u64 << (position % 64));\n        if self.old.len() <= word {\n            self.old.resize(self.base.div_ceil(64) as usize, 0);\n        }\n        if self.old[word] & bit == 0 {\n            self.old[word] |= bit;\n            self.read.push(position);\n        }\n    }\n```\n\nAfter:\n\n```rust\n    fn read_old(&mut self, position: u32) {\n        if self.old.capacity() <= position as usize {\n            self.old.grow(self.base as usize);\n        }\n        if self.old.insert(position) {\n            self.read.push(position);\n        }\n    }\n```\n\n`recycle`, before:\n\n```rust\n            if position < self.base {\n                self.old[(position / 64) as usize] = 0;\n            }\n```\n\nAfter:\n\n```rust\n            if position < self.base {\n                self.old.remove(position);\n            }\n```\n\nIn `Captures::open`, before:\n\n```rust\n                // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures\n                old: Vec::new(),\n```\n\nAfter:\n\n```rust\n                // alloc: an empty set allocates nothing; a frame's buffers are reused by later captures\n                old: BitSet::default(),\n```\n\nTest, before:\n\n```rust\n        assert!(inner.old.iter().all(|&word| word == 0));\n```\n\nAfter:\n\n```rust\n        assert!(inner.old.is_empty());\n```\n\nStatus: open\n\n> applied by speed-salsa (window 17, 2026-10-29 21:55): `capture.rs` as written; the\n> `Cargo.toml` move was already done by dedup-codec. Not built.\n\n> sent by db (db-next3, 21:05) to speed-salsa-next3 (window 22), which holds `vendor/salsa` now, with the `Sip` section above.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> checked by db-audit-dbmd-f (22:32): in the tree at `vendor/salsa/src/capture.rs:27` (import), `:263` (`old: BitSet<u32>`), `:282-285` (`read_old`), `:309` (`recycle`'s `remove`), `:339` (`BitSet::default()`), `:514` (test `is_empty`).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:55:31Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/db.md#dedup: bits: vendor/salsa `capture.rs` `Frame::old` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:7155"
+    },
+    {
+      "at": "2026-10-30T08:55:31Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:31Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied by speed-salsa: vendor/salsa/src/capture.rs:27,299,375 BitSet<u32>; Cargo.toml:721 [dependencies.blaze-ids], no dev-dep left. Checked by unify-front-def."
+    }
+  ]
+}

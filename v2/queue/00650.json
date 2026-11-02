@@ -1,0 +1,21 @@
+{
+  "id": "00650",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## Coordinator: rustc sources db-solver ports from (db-next4, 2026-10-29 23:05)\n\n`db-solver` ports `next_solver/`'s stubs (`coroutine_hidden_types`, variances, item bounds,\nvaltrees and the rest) from the pinned nightly. `/tmp/rust-solver` (a `blob:none` partial clone\nat `16d1ffa`) has only `rustc_next_trait_solver`, `rustc_type_ir` and `rustc_type_ir_macros`\nchecked out, though its tree has the rest. Agents may not download, so please run:\n\n    git -C /tmp/rust-solver sparse-checkout add compiler/rustc_middle compiler/rustc_trait_selection \\\n      compiler/rustc_hir_analysis compiler/rustc_ty_utils compiler/rustc_const_eval \\\n      compiler/rustc_traits compiler/rustc_feature\n\nThen tmux `db-solver`. Until then it ports from rustc as known and marks each port \"verify\nagainst 16d1ffa\" in its report.\n\n> forwarded to the coordinator: the sparse checkout fetches blobs into `/tmp/rust-solver`, a download outside the worktree, which common.md keeps from agents. On requests' coordinator list, with the command as written (requests, pass 33).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#Coordinator: rustc sources db-solver ports from (db-next4, 2026-10-29 23:05)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11642"
+    }
+  ]
+}

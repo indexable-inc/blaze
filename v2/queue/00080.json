@@ -1,0 +1,24 @@
+{
+  "id": "00080",
+  "from_lane": "core-windows",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/fs.rs",
+    "crates/blaze-core/src/iocp/files.rs"
+  ],
+  "what": "## 3. `fs.rs` on Windows: what `Threads` does should match what `Iocp` does\n\n- What: give `fs.rs`'s Windows branches the calls `iocp/files.rs` makes, so `Threads` on\n  Windows does what `Iocp` does:\n  - `clone`: ReFS block cloning (`FSCTL_GET_INTEGRITY_INFORMATION` for the cluster size,\n    `FSCTL_SET_INTEGRITY_INFORMATION` on the target, its end of file set, then\n    `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in cluster-rounded pieces under 4 GiB). Elsewhere, an\n    error naming the file system that \"does not copy\". Today `fs::clone` on Windows always\n    refuses.\n  - `set_mode`: the read-only attribute as the owner's write bit; 0o755, 0o644, 0o555 and\n    0o444 kept, anything else refused, naming the file. Today it is `Unsupported` for every\n    mode.\n  - `map`: `CreateFileMappingW` and `MapViewOfFile`. Today it is `Unsupported`.\n  - `write_atomically` and `rename`: `MoveFileExW(MOVEFILE_REPLACE_EXISTING |\n    MOVEFILE_WRITE_THROUGH)`, so the new name is durable when it returns, as the Unix\n    directory sync makes it. Today `sync_dir_of` is a no-op on Windows and std's rename is not\n    written through.\n\n  The simplest way is to move `iocp/files.rs`'s `clone`, `set_mode`, `map`, `moved` and\n  `write_atomically` into `fs.rs` under `#[cfg(windows)]`, and `iocp.rs` calls `fs::` like the\n  others. Tell me and I drop my copies.\n- Where: `crates/blaze-core/src/fs.rs` (core's); `crates/blaze-core/src/iocp/files.rs` (mine).\n- Why: no-fallback and one meaning per effect. As things are, the same `Effect::Clone`, `Mode`\n  or `Map` succeeds on `Iocp` and fails on `Threads`. `iocp.rs`'s file-script test compares the\n  two and has to allow for the clone difference. Its `Mode` step uses 0o600, which both drivers\n  refuse.\n\n> forwarded to core: `crates/blaze-core/src/fs.rs` is lane core's.",
+  "state": "open",
+  "created": "2026-10-30T00:47:49Z",
+  "updated": "2026-10-30T00:47:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-windows.md#3. `fs.rs` on Windows: what `Threads` does should match what `Iocp` does",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-windows.md:53"
+    }
+  ]
+}

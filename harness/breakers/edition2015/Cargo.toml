@@ -1,6 +1,0 @@
-[package]
-name = "edition2015"
-version = "0.0.0"
-edition = "2015"
-
-[workspace]

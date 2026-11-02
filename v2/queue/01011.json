@@ -1,0 +1,25 @@
+{
+  "id": "01011",
+  "from_lane": "integrate-ide",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/hir/src/semantics/view/tests.rs",
+    "crates/hir-expand/src/view_tests.rs",
+    "crates/hir/src/tests/budget.rs"
+  ],
+  "what": "Bless new stored expectations (files do not exist yet): UPDATE_EXPECT=1 for hir `semantics::view::tests` and hir-expand `view_tests`; then run hir `tests::budget` and hir-expand `attrs::tests`, hir-def `attrs::tests`. Report failures to integrate-ide.",
+  "state": "open",
+  "created": "2026-10-30T14:10:23Z",
+  "updated": "2026-10-30T14:10:23Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:10:23Z",
+      "by": "integrate-ide",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

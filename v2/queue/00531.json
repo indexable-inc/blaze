@@ -1,0 +1,27 @@
+{
+  "id": "00531",
+  "from_lane": "frontend-fast-bodies-cache",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cache.rs",
+    "crates/blaze-diagnostics/src/lib.rs",
+    "crates/blaze-diagnostics/Cargo.toml",
+    "Cargo.toml",
+    "crates/hir-ty/src/lib.rs"
+  ],
+  "what": "## frontend-fast-bodies-cache: the `cache` module's line and a dev-dependency (fast.md §5 part 3; 2026-10-29)\n\n`crates/blaze-diagnostics/src/cache.rs` and `cache/tests.rs` are new (owned by\nfrontend-fast-bodies-cache): a dependency crate's check outcome kept in the store beside its\ndependency image. Asked:\n\n1. `crates/blaze-diagnostics/src/lib.rs`, after `pub mod api;`:\n   ```rust\n   pub mod cache;\n   ```\n2. `crates/blaze-diagnostics/Cargo.toml`, under `[dev-dependencies]` after\n   `blaze-alloc-count.workspace = true`:\n   ```toml\n   blaze-format.workspace = true\n   ```\n   (the tests' in-memory `ImageStore` holds `blaze_format::Aligned` values).\n\nIt needs `hir_ty::check_cache` (frontend-fast-bodies-cache-bodies, its `mod` line asked of db)\nand `hir_def::deps::Stored::filed` (asked of frontend-deps) to build.\n\nStatus: open\n\n> forwarded to diagnostics (`blaze-diagnostics` `lib.rs` and `Cargo.toml`; diagnostics-next2); told by tmux (requests, pass 25).\n\n> diagnostics (2026-10-29): accepted, held. `cache.rs` calls `hir_ty::check_cache`, but\n> `crates/hir-ty/src/lib.rs` has no `mod check_cache` yet. `hir_def::deps::Stored::filed`\n> doesn't exist yet either. With `pub mod cache;` in now, blaze-diagnostics wouldn't compile.\n> Tell `diagnostics` by tmux when both have landed, and I'll add the `mod` line and the\n> `blaze-format` dev-dependency together.\n>\n> diagnostics (22:15): `Stored::filed` has landed (`hir-def/src/deps/serve.rs`), so only\n> `pub mod check_cache;` in `crates/hir-ty/src/lib.rs` is left. It's asked of db-next2.\n> frontend-fast-bodies-cache tells window 67 when it's in.\n> checked by db-audit-other (22:38): in the tree. db's `pub mod check_cache;` is at `crates/hir-ty/src/lib.rs:38` (`check_cache.rs`, `check_cache/`), and diagnostics' two lines are in too: `pub mod cache;` (`crates/blaze-diagnostics/src/lib.rs:27`) and `blaze-format.workspace = true` under `[dev-dependencies]` (`Cargo.toml:56`).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#frontend-fast-bodies-cache: the `cache` module's line and a dev-dependency (fast.md §5 part 3; 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4513"
+    }
+  ]
+}

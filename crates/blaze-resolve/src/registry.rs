@@ -3,7 +3,7 @@
 //! (`src/sources/registry/index/mod.rs`).
 
 use anyhow::Result;
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 
 use crate::dependency::Dependency;
 use crate::interning::InternedString;
@@ -98,7 +98,7 @@ pub trait Registry {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()>;
 
     async fn query_vec(&self, dep: &Dependency, kind: QueryKind) -> Result<Vec<IndexSummary>> {
@@ -116,7 +116,7 @@ pub trait Registry {
 /// A registry held in memory: the resolver's tests, and sources already read.
 #[derive(Default, Debug, Clone)]
 pub struct MemRegistry {
-    packages: FxHashMap<InternedString, Vec<IndexSummary>>,
+    packages: HashMap<InternedString, Vec<IndexSummary>>,
 }
 
 impl MemRegistry {
@@ -144,7 +144,7 @@ impl Registry for MemRegistry {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let normalized = |s: &str| s.replace('-', "_");
         for (name, summaries) in &self.packages {
@@ -180,6 +180,41 @@ impl Registry for MemRegistry {
     fn is_replaced(&self, _source: SourceId) -> bool {
         false
     }
+}
+
+/// Asks `pinned` first when `dep` is exact and its source has no registry or its version is
+/// locked. `Ok(true)` when that answered (or `dep` is a path), so the caller asks no further;
+/// an unregistered source `pinned` does not hold is refused.
+pub async fn query_pinned(
+    pinned: &impl Registry,
+    registered: bool,
+    dep: &Dependency,
+    kind: QueryKind,
+    f: &mut impl FnMut(IndexSummary),
+    describe: impl FnOnce(SourceId) -> String,
+) -> Result<bool> {
+    if kind != QueryKind::Exact || (registered && !dep.version_req().is_locked()) {
+        return Ok(false);
+    }
+    let mut found = false;
+    pinned
+        .query(dep, kind, &mut |it| {
+            found = true;
+            f(it)
+        })
+        .await?;
+    if found || dep.source_id().is_path() {
+        return Ok(true);
+    }
+    if !registered {
+        anyhow::bail!(
+            "`{}` of {} is not pinned by Cargo.lock, and blaze reads that source only at the \
+             versions Cargo.lock pins",
+            dep.package_name(),
+            describe(dep.source_id())
+        );
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -239,7 +274,7 @@ mod tests {
             &self,
             dep: &Dependency,
             kind: QueryKind,
-            f: &mut dyn FnMut(IndexSummary),
+            f: &mut impl FnMut(IndexSummary),
         ) -> Result<()> {
             let mut fetched = false;
             std::future::poll_fn(|_| {
@@ -271,5 +306,57 @@ mod tests {
         assert!(query.as_mut().poll(cx).is_pending());
         let std::task::Poll::Ready(Ok(found)) = query.as_mut().poll(cx) else { panic!() };
         assert_eq!(found.len(), 1);
+    }
+
+    /// `query_pinned` of `dep` against `pinned`, polled once: its answer and what it gave `f`.
+    fn pinned_answer(
+        pinned: &MemRegistry,
+        registered: bool,
+        dep: &Dependency,
+        kind: QueryKind,
+    ) -> (Result<bool>, Vec<String>) {
+        let mut given = Vec::new();
+        let mut f = |it: IndexSummary| given.push(it.package_id().version().to_string());
+        let describe = |it: SourceId| format!("the source `{it}`");
+        let answer = {
+            let mut query =
+                std::pin::pin!(query_pinned(pinned, registered, dep, kind, &mut f, describe));
+            let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(answer) = query.as_mut().poll(cx) else { panic!() };
+            answer
+        };
+        (answer, given)
+    }
+
+    #[test]
+    fn the_lock_file_answers_first() {
+        let pinned: MemRegistry = [summary("foo", "1.0.0")].into_iter().collect();
+        let exact =
+            |name: &str| Dependency::parse(name, Some("=1.0.0"), SourceId::crates_io()).unwrap();
+
+        let (answer, given) = pinned_answer(&pinned, false, &exact("foo"), QueryKind::Exact);
+        assert!(answer.unwrap(), "an unregistered exact ask it holds is answered");
+        assert_eq!(given, ["1.0.0"]);
+
+        let (answer, given) = pinned_answer(&pinned, false, &exact("bar"), QueryKind::Exact);
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            format!(
+                "`bar` of the source `{}` is not pinned by Cargo.lock, and blaze reads that source \
+                 only at the versions Cargo.lock pins",
+                SourceId::crates_io()
+            )
+        );
+        assert!(given.is_empty());
+
+        let unlocked = Dependency::parse("foo", Some("1"), SourceId::crates_io()).unwrap();
+        let (answer, given) = pinned_answer(&pinned, true, &unlocked, QueryKind::Exact);
+        assert!(!answer.unwrap(), "a registered unlocked ask goes to the registry");
+        assert!(given.is_empty(), "and asks nothing pinned");
+
+        let alternative = QueryKind::AlternativeNames;
+        let (answer, given) = pinned_answer(&pinned, false, &exact("foo"), alternative);
+        assert!(!answer.unwrap(), "only an exact ask is pinned");
+        assert!(given.is_empty());
     }
 }

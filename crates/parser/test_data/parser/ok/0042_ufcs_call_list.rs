@@ -4,7 +4,7 @@ struct Foo;
 
 impl Foo {
     fn bar() -> bool {
-        unimplemented!()
+        not_supported!()
     }
 }
 

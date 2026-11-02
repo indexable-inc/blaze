@@ -1,0 +1,33 @@
+{
+  "id": "00188",
+  "from_lane": "requests-db-fixture",
+  "owner": "cargo",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "v2/requests/db-matchck.md",
+    "crates/hir-ide/src/diagnostics/expr.rs",
+    "Cargo.lock",
+    "crates/load-cargo"
+  ],
+  "what": "## From requests-db-fixture (2026-10-29): hir's arms for the deleted match-check variants (`crates/hir/src/diagnostics.rs` ~L2280-2283)\n\nWhat: in `crates/hir/src/diagnostics.rs` (db's file), delete the arm and its comment\n```rust\n            // rustc's check_match, in `hir-ty-matchck`, gives these\n            // (`crate::match_lints::match_check_diagnostics`).\n            BodyValidationDiagnostic::MissingMatchArms { .. }\n            | BodyValidationDiagnostic::NonExhaustiveLet { .. } => {}\n```\nWhy: `v2/requests/db-matchck.md` item 4 is applied in hir-ide: `BodyValidationDiagnostic` has no\n`MissingMatchArms`/`NonExhaustiveLet` now (`crates/hir-ide/src/diagnostics/expr.rs`), and\n`diagnostics/match_check{.rs,/}` is gone. hir's `match_lints.rs` (hir-ty-matchck) already\ngives both diagnostics. The arm names variants that don't exist, so it must go in the same\ncompile. Lock: hir-ide no longer depends on `typed-arena` or `ra-ap-rustc_pattern_analysis`\n(Cargo.lock's hir-ide entry, for the first compile).\n\n> forwarded to cargo (`crates/load-cargo/`) (from requests, pass 16; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-31T20:29:32Z",
+  "taken_by": null,
+  "why": "crates/hir/src/diagnostics.rs is lane db s, and hir-ide/load-cargo are deleted; nothing of it is in cargo s paths",
+  "source": "v2/requests/requests.md#From requests-db-fixture (2026-10-29): hir's arms for the deleted match-check variants (`crates/hir/src/diagnostics.rs` ~L2280-2283)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:90"
+    },
+    {
+      "at": "2026-10-31T20:29:32Z",
+      "by": "cargo",
+      "action": "refuse",
+      "note": "crates/hir/src/diagnostics.rs is lane db s, and hir-ide/load-cargo are deleted; nothing of it is in cargo s paths"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00965",
+  "from_lane": "enum-discriminants",
+  "owner": "item-hash",
+  "paths": [
+    "crates/blaze-item-hash/src/reads.rs",
+    "crates/blaze-item-hash/src/tests/classify.rs"
+  ],
+  "what": "Classify three new hir-ty queries in crates/blaze-item-hash/src/reads.rs RULES (and REFUSALS in src/tests/classify.rs if refused), all in hir-ty/src/consteval/discriminants.rs. Why: const_eval_discriminant_variant (same name, same file, still Rule::ConstValue) is now a lookup that reads them, and utils.rs detect_variant_from_bytes (called from valtree, matchck, codegen, the MIR interpreter) now reads enum_discriminants directly, so a step that reaches it would be refused as an unlisted read. Suggested: (1) `explicit_discriminant` keyed by EnumVariantId: Rule::ConstValue, the same fact as const_eval_discriminant_variant of that variant; (2) `explicit_discriminant_indices` keyed by EnumId (which variants are written with `= expr`, read off the syntax, the same data EnumVariants::of holds): Rule::Fields(Of::Enum); (3) `enum_discriminants` keyed by EnumId (every variant's discriminant at once): no single fact names it today; the enum's ConstValue facts of all its variants, or its Layout fact, or a REFUSALS entry with that reason. Your call.",
+  "state": "open",
+  "created": "2026-10-30T12:47:03Z",
+  "updated": "2026-10-30T12:47:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:47:03Z",
+      "by": "enum-discriminants",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

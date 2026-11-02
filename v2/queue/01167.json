@@ -1,0 +1,24 @@
+{
+  "id": "01167",
+  "from_lane": "no-fallback-link-cargo-cli",
+  "owner": "coordinator",
+  "paths": [
+    "harness/norustc/sites.json",
+    "docs/no-rustc.md"
+  ],
+  "what": "crates/blaze-cargo/src/stub.rs (v1 RUSTC_WORKSPACE_WRAPPER that ran rustc, no caller) is deleted: drop its entry from harness/norustc/sites.json (python3 harness/rustcsites.py --record lowers it); docs/no-rustc.md:250,1359 (a dated plan) still names it",
+  "state": "open",
+  "created": "2026-10-30T23:20:57Z",
+  "updated": "2026-10-30T23:20:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:20:57Z",
+      "by": "no-fallback-link-cargo-cli",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

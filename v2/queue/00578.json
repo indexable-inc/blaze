@@ -1,0 +1,24 @@
+{
+  "id": "00578",
+  "from_lane": "db-expand-items",
+  "owner": "frontend-nameres",
+  "paths": [
+    "crates/hir-def/src/nameres.rs",
+    "v2/requests/mem-db-def-collect.md"
+  ],
+  "what": "## db-expand-items: I11.1 waits on A5 (mem-db-def-collect / frontend-nameres, `crates/hir-def/src/nameres.rs`)\n\nWhat: `mem-db-def-items.md` I11.1 replaces `UnstableFeatures::shrink_to_fit` with `reserve` and\n`#[cfg(test)] owned_allocations` in `unstable_features.rs` (db-expand's file). Its one caller,\n`DefMapCrateData::shrink_to_fit` (`nameres.rs:352`, `unstable_features.shrink_to_fit();`), goes\nin mem-db-def-collect's A5 (it becomes `settle`), and the collector's H4 then calls\n`crate_data.unstable_features.reserve(features.len())`. Neither has landed.\nWhy: applied first, I11.1 would stop `nameres.rs` building. When A5 and H4 land, say so here and\ndb-expand applies I11.1 as written.\nStatus: open.\n\n> forwarded to frontend-nameres (A5 and H4 are its; told by tmux; requests, pass 24).\n> frontend-nameres (2026-10-29 21:36): not this lane's. A5 (`DefMapCrateData::shrink_to_fit` to `settle`, `nameres.rs:352`) and H4 (the collector's `unstable_features.reserve`, `collector.rs`) are in db-expand-names' files: Part H's owners line in `mem-db-def-collect.md` gives `nameres.rs` and `collector.rs` to db-expand-names. `facts/` has one call of its own: `Arc::make_mut(&mut crate_ops.data).shrink_to_fit()` in `facts/driver.rs` `collect_crate` is `DefMapCrateData::shrink_to_fit`. When A5 renames it to `settle`, this lane changes that call in the same pass (tell `frontend-nameres-next1`). So I11.1 waits on A5 landing in `nameres.rs` plus that one facts line.\n> not applied by db-audit-dbsub-expand (2026-10-29 22:45): deferred, not lost. A5's owner, db-expand-names-next2, holds it deferred with Part H (Andrew's decision at 21:05; `v2/requests/mem-db-def-collect.md:252`) and asked me to wait. In the tree, `DefMapCrateData::shrink_to_fit` (`nameres.rs:372`) still calls `unstable_features.shrink_to_fit()`, and so does `facts/driver.rs:655`. The live path's features are enabled in `facts/collect.rs:178`, not the test-only `collector.rs`, so H4's reserve belongs there (frontend-nameres's) when Part H is lifted. I11.1 goes in with A5 then.\n> db-expand-names (2026-10-29 22:42): A5 is mine and deferred with Part H (Andrew, 21:05). I11.1 also needs H4 (`unstable_features.reserve` where the features are read, now in `facts/`), which is Part H too. Still waiting; db-audit-dbsub-expand was told by tmux.\n> db-audit-dbsub-expand (2026-10-29 22:54): frontend-nameres-core-next2 asked me to apply A5 (`DefMapCrateData::settle`, `registered_tools: Box<[Symbol]>`, `LocalDefMap::shrink_to_fit` removed, `collector.rs:862`). Declined: still deferred with Part H, and db-expand-names-next2 holds it. Core's `facts/` side is not in the tree yet (`facts/collect.rs:182,190`, `facts/driver.rs:655,759-760` still use `push`/`shrink_to_fit`); core was told to hold it until A5 is lifted, and db-expand-names-next2 was told.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-items: I11.1 waits on A5 (mem-db-def-collect / frontend-nameres, `crates/hir-def/src/nameres.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:2551"
+    }
+  ]
+}

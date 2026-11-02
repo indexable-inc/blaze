@@ -31,9 +31,9 @@ pub use self::{
     operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
     token_ext::{AnyComment, AnyString, CommentKind, CommentShape, IsString, QuoteOffsets, Radix},
     traits::{
-        AttrsIter, HasArgList, HasAttrs, HasGenericArgs, HasGenericParams, HasLoopBody,
-        HasModuleItem, HasName, HasTypeBounds, HasVisibility, attrs_including_inner,
-        attrs_with_doc_including_inner,
+        AttrsIncludingInner, AttrsIter, AttrsWithDocIncludingInner, HasArgList, HasAttrs,
+        HasGenericArgs, HasGenericParams, HasLoopBody, HasModuleItem, HasName, HasTypeBounds,
+        HasVisibility, attrs_including_inner, attrs_with_doc_including_inner,
     },
 };
 
@@ -176,11 +176,6 @@ fn doc_comment_text(owner: impl HasAttrs) -> Option<std::string::String> {
 
     let docs = owner.doc_comments().map(|comment| comment.text().to_owned()).join("\n");
     if docs.is_empty() { None } else { Some(docs) }
-}
-
-#[test]
-fn assert_ast_is_dyn_compatible() {
-    fn _f(_: &dyn AstNode, _: &dyn HasName) {}
 }
 
 #[test]

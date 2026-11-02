@@ -1,0 +1,23 @@
+{
+  "id": "00810",
+  "from_lane": "hugepages",
+  "owner": "format",
+  "paths": [
+    "crates/syntax-tree/src/flat/block.rs"
+  ],
+  "what": "Syntax trees have no arena: each FlatTree block is one global-allocator allocation (crates/syntax-tree/src/flat/block.rs Block::new, std::alloc), so tree reads walk base pages. Put tree blocks on huge pages: a slab or size-class arena over blaze_mem::Region::reserve_huge (or blaze_mem::chunks, 2 MiB huge chunks) that blocks are returned to when an edit replaces a tree. Audit: docs/v2/plan/lanes/hugepages/design.md.",
+  "state": "open",
+  "created": "2026-10-30T08:17:33Z",
+  "updated": "2026-10-30T08:17:33Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:17:33Z",
+      "by": "hugepages",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -90,6 +90,7 @@ impl<L: Language> SyntaxNodePtr<L> {
         if let Some(found) = root.flat_node_at_range(self.range, L::kind_to_raw(self.kind)) {
             return found;
         }
+        // clone: the walk's owned first cursor, for an empty range only; a count bump
         successors(Some(root.clone()), |node| node.child_or_token_at_range(self.range)?.into_node())
             .find(|it| it.text_range() == self.range && it.kind() == self.kind)
     }
@@ -137,7 +138,7 @@ impl<N: AstNode> AstPtr<N> {
 
     /// Returns the underlying [`SyntaxNodePtr`].
     pub fn syntax_node_ptr(&self) -> SyntaxNodePtr<N::Language> {
-        self.raw.clone()
+        self.raw
     }
 
     /// Casts this to an [`AstPtr`] to the given node type if possible.
@@ -157,7 +158,7 @@ impl<N: AstNode> fmt::Debug for AstPtr<N> {
 
 impl<N: AstNode> Clone for AstPtr<N> {
     fn clone(&self) -> Self {
-        Self { raw: self.raw.clone() }
+        Self { raw: self.raw }
     }
 }
 

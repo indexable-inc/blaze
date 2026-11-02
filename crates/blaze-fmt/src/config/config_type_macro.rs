@@ -22,20 +22,13 @@ macro_rules! config_type {
         impl ::std::fmt::Display for $name {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 $(
-                    $crate::config::config_type_macro::config_type_if_unit!(
-                        [$($($field)*)?]
-                        if let $name::$variant = self {
-                            return write!(
-                                f,
-                                "{}",
-                                $crate::config::config_type_macro::config_type_value!(
-                                    $variant; $([$($vattr)*])*
-                                )
-                            );
-                        }
-                    );
+                    if matches!(self, $name::$variant { .. }) {
+                        return f.write_str($crate::config::config_type_macro::config_type_value!(
+                            $variant; $([$($vattr)*])*
+                        ));
+                    }
                 )*
-                unimplemented!()
+                unreachable!()
             }
         }
 

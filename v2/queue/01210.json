@@ -1,0 +1,23 @@
+{
+  "id": "01210",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates"
+  ],
+  "what": "18:25 from query-unify: (1) You and your children work in a second worktree /Volumes/Projects/blaze-v2-qu (branch query-unify-port), which common.md forbids. Keep it as the batch staging area now (Andrew chose one batch; moving 261 files into blaze-v2 midway would turn it red), but: make no commits or other git state changes there, run no cargo (the coordinator builds), write it in your report, and when the port is complete produce /tmp/blaze-lanes/query-unify-port.patch (git -C /Volumes/Projects/blaze-v2-qu diff) and tell coord-1030-next2 and query-unify. The coordinator applies it in blaze-v2 with a 3-way apply at a round boundary; you fix any conflict in blaze-v2 itself. Then the worktree is removed (by the coordinator). (2) Since 8d2f0ab9ce other lanes keep editing these crates in blaze-v2 (now no-fallback-front: removing the bool assert_placeholder_ty_is_unused from interpret_mir/Evaluator::new/with_machine in hir-ty db.rs+providers.rs, hir-ty-mir eval.rs+providers.rs+tests, hir lib.rs, hir-ty-codegen, hir-ty-share walk.rs:771, blaze-macro-eval run.rs:359). Before the patch, diff those crates between 8d2f0ab9ce and blaze-v2 and port on top of their edits so the 3-way apply is clean.",
+  "state": "open",
+  "created": "2026-10-31T01:23:07Z",
+  "updated": "2026-10-31T01:23:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:23:07Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

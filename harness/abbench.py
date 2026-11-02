@@ -5,9 +5,8 @@
                [--rounds R] [--runs N] [--kinds body,leaf,signature,no-op] [--out FILE]
                [--work DIR] [--pause SECS] [--train]
 
-Each DIR holds a `blaze` and the programs it runs from next to itself (`blaze`,
-`blaze-rustc`). A round goes through the builds in turn, in an order that rotates from round to
-round; each build gets a copy of the project and a home and store of its own that live for the
+Each DIR holds a `blaze` and the program it runs from next to itself (`blaze-engine`). A round
+goes through the builds in turn, in an order that rotates from round to round; each build gets a copy of the project and a home and store of its own that live for the
 whole run, and in its turn it stops any daemon of its own, starts one from nothing, waits until
 it is warm (the cold start), and makes every edit `--runs` times and takes it back. So a machine
 that is busier for a while is busier for all of them alike, and every number is a median over
@@ -85,7 +84,7 @@ class Build:
         self.home = os.path.join(work, f"home-{project}-{name}")
         self.env = base_env(self.home)
         self.env["PATH"] = self.bindir + os.pathsep + self.env["PATH"]
-        self.env.update(extra, BLAZE_BACKEND="cranelift", BLAZE_STATS="1", BLAZE_CACHE=os.path.join(work, f"store-{project}-{name}"))
+        self.env.update(extra, BLAZE_STATS="1")
         self.env.pop("RUSTC_WRAPPER", None)
         self.side = Side(self.ws, self.env, True)
         self.samples, self.train = {}, False
@@ -97,9 +96,8 @@ class Build:
         """Starts a daemon from nothing, waits for it to be warm, then makes every edit."""
         side, build = self.side, self.spec.get("build", [])
         side.cargo("stop")
-        # A store and home from nothing: the cold start is a first start.
-        for path in (self.home, self.env["BLAZE_CACHE"]):
-            shutil.rmtree(path, ignore_errors=True)
+        # A home, and with it its store, from nothing: the cold start is a first start.
+        shutil.rmtree(self.home, ignore_errors=True)
         daemon = Daemon(side)
         took, ran = side.cargo("build", *build)
         if ran.returncode != 0:

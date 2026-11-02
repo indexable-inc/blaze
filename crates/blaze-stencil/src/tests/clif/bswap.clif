@@ -1,0 +1,72 @@
+; Follows cranelift/filetests/filetests/runtests/bswap.clif, for the stencil set: `bswap` of
+; `i16` to `i64` (it has no `i8` form). The `i128` form is i128-bitops.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %bswap_i16(i16) -> i16 {
+block0(v0: i16):
+    v1 = bswap v0
+    return v1
+}
+; run: %bswap_i16(0) == 0
+; run: %bswap_i16(1) == 256
+; run: %bswap_i16(-1) == -1
+; run: %bswap_i16(0x8000) == 128
+; run: %bswap_i16(0x7fff) == -129
+; run: %bswap_i16(0x8001) == 384
+; run: %bswap_i16(0x7ffe) == -385
+; run: %bswap_i16(2) == 512
+; run: %bswap_i16(0x3039) == 0x3930
+; run: %bswap_i16(0xa460) == 0x60a4
+; run: %bswap_i16(128) == 0x8000
+; run: %bswap_i16(256) == 1
+; run: %bswap_i16(0x4000) == 64
+; run: %bswap_i16(255) == -256
+; run: %bswap_i16(-256) == 255
+; run: %bswap_i16(0x5678) == 0x7856
+
+function %bswap_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = bswap v0
+    return v1
+}
+; run: %bswap_i32(0) == 0
+; run: %bswap_i32(1) == 0x01000000
+; run: %bswap_i32(-1) == -1
+; run: %bswap_i32(0x80000000) == 128
+; run: %bswap_i32(0x7fffffff) == -129
+; run: %bswap_i32(0x80000001) == 0x01000080
+; run: %bswap_i32(0x7ffffffe) == 0xfeffff7f
+; run: %bswap_i32(2) == 0x02000000
+; run: %bswap_i32(0x075bcd15) == 0x15cd5b07
+; run: %bswap_i32(0xc521974f) == 0x4f9721c5
+; run: %bswap_i32(0x00008000) == 0x00800000
+; run: %bswap_i32(0x00010000) == 256
+; run: %bswap_i32(0x40000000) == 64
+; run: %bswap_i32(0x0000ffff) == 0xffff0000
+; run: %bswap_i32(0xffff0000) == 0x0000ffff
+; run: %bswap_i32(0x12345678) == 0x78563412
+
+function %bswap_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = bswap v0
+    return v1
+}
+; run: %bswap_i64(0) == 0
+; run: %bswap_i64(1) == 0x0100000000000000
+; run: %bswap_i64(-1) == -1
+; run: %bswap_i64(0x8000000000000000) == 128
+; run: %bswap_i64(0x7fffffffffffffff) == -129
+; run: %bswap_i64(0x8000000000000001) == 0x0100000000000080
+; run: %bswap_i64(0x7ffffffffffffffe) == 0xfeffffffffffff7f
+; run: %bswap_i64(2) == 0x0200000000000000
+; run: %bswap_i64(0x123456789abcdef0) == 0xf0debc9a78563412
+; run: %bswap_i64(0xf0123456789abcdf) == 0xdfbc9a78563412f0
+; run: %bswap_i64(0x0000000080000000) == 0x0000008000000000
+; run: %bswap_i64(0x0000000100000000) == 0x0000000001000000
+; run: %bswap_i64(0x4000000000000000) == 64
+; run: %bswap_i64(0x00000000ffffffff) == 0xffffffff00000000
+; run: %bswap_i64(0xffffffff00000000) == 0x00000000ffffffff
+; run: %bswap_i64(0x1234567812345678) == 0x7856341278563412

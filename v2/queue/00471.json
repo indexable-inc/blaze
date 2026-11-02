@@ -1,0 +1,23 @@
+{
+  "id": "00471",
+  "from_lane": "diagnostics-lints-bodies-types",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/tests.rs"
+  ],
+  "what": "## diagnostics-lints-bodies-types: `crate::tests::normalized` visible to the crate's tests (the parent, `diagnostics`)\n\nWhere: `crates/blaze-diagnostics/src/tests.rs`: `fn normalized` -> `pub(crate) fn normalized`.\nWhy: `tests/lints/bodies/types.rs` (`ui_std`) checks UI tests that use std against a fixture\n`std` crate beside minicore, as `ui_with` does but with more crates, and normalizes the output as\ncompiletest does with the same function.\n\n> forwarded to diagnostics: `crates/blaze-diagnostics/src/tests.rs` is the parent's own.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types: `crate::tests::normalized` visible to the crate's tests (the parent, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:341"
+    }
+  ]
+}

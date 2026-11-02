@@ -1,0 +1,25 @@
+{
+  "id": "01304",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "crates/hir-def/src/visibility.rs",
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "hir-firewall tests/exceptions.rs (all 5 edit tests, round 7c and round 8 alike): a body edit re-executes per-item queries of every other item in the edited file because each reads the file's parse (source_view / def syntax) or gives file positions. db's part, from round8-test.log's tally (see the format request filed beside this, and /tmp/blaze-lanes/front1-fw-each.txt): (1) every *Signature::with_source_map (signatures.rs:158 macro) is asked for each item by hir's module item checks, which need only ExpressionStoreSourceMap::diagnostics; give the signature store's diagnostics position-free with Signature::of, as asked of format for bodies, so a check reads the positional map only to place one. (2) AssocItemId::assoc_visibility and visibility_from_ast_view (visibility.rs:370,393) read the item's syntax through loc.source_view, so each re-executes on any edit of the file; give a per-item visibility from the item tree's RawVisibilityId (position-free, already per item), e.g. a tracked `item_visibility(db, ItemLoc)`, and move assoc_visibility to it. blaze-items form.rs item_visibility_uncached (tests-misc-front1) moves to it once it exists. (3) AttrFlags::query and signature_syntax re-run per item on any file edit (14 each). Acceptance: hir-firewall exceptions an_edit_of_each_function_reaches_only_it goes clean.",
+  "state": "open",
+  "created": "2026-10-31T15:01:31Z",
+  "updated": "2026-10-31T15:01:31Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:01:31Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

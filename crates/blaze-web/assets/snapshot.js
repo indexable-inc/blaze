@@ -1,5 +1,6 @@
 // The snapshot, the websocket's first message (docs/web.md, "The snapshot"). It comes from
 // the peer, so every length and index is checked against what is there.
+import { KeyIndex } from "./keys.js";
 
 export class SnapshotError extends Error {
   constructor(offset, what) {
@@ -60,17 +61,19 @@ export function parseSnapshot(bytes) {
   for (let i = 0; i < nCrates; i++) crates[i] = str(`crate ${i}'s name`);
 
   const n = count("nodes", NODE_FIXED + 4);
-  const key = new BigUint64Array(n);
+  const keyHi = new Uint32Array(n);
+  const keyLo = new Uint32Array(n);
   const krate = new Uint32Array(n);
   const how = new Uint8Array(n);
   const ns = new Float64Array(n);
   const nodeBuild = new Float64Array(n);
   const names = new Array(n);
-  const byKey = new Map();
+  const keys = new KeyIndex(n);
   for (let i = 0; i < n; i++) {
     const at = pos;
     need(NODE_FIXED, `node ${i}`);
-    key[i] = v.getBigUint64(pos, true);
+    keyLo[i] = v.getUint32(pos, true);
+    keyHi[i] = v.getUint32(pos + 4, true);
     krate[i] = v.getUint32(pos + 8, true);
     how[i] = v.getUint8(pos + 12);
     const t = v.getBigUint64(pos + 13, true);
@@ -81,8 +84,9 @@ export function parseSnapshot(bytes) {
     if (how[i] > 3) throw new SnapshotError(at + 12, `node ${i} has how ${how[i]}, not 0 to 3`);
     if (how[i] !== HOW_COMPILED && t !== 0n) throw new SnapshotError(at + 13, `node ${i} is ${HOW[how[i]]} but has a compile time`);
     ns[i] = Number(t);
-    if (byKey.has(key[i])) throw new SnapshotError(at, `node ${i} has the key of node ${byKey.get(key[i])}`);
-    byKey.set(key[i], i);
+    const same = keys.get(keyHi[i], keyLo[i]);
+    if (same >= 0) throw new SnapshotError(at, `node ${i} has the key of node ${same}`);
+    keys.set(keyHi[i], keyLo[i], i);
   }
 
   const m = count("edges", 8);
@@ -97,5 +101,5 @@ export function parseSnapshot(bytes) {
     pos += 8;
   }
   if (pos !== bytes.length) throw new SnapshotError(pos, `${bytes.length - pos} bytes after the edges`);
-  return { root, build, crates, n, key, krate, how, ns, nodeBuild, names, edges, byKey };
+  return { root, build, crates, n, keyHi, keyLo, krate, how, ns, nodeBuild, names, edges, keys };
 }

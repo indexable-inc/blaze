@@ -1,0 +1,29 @@
+{
+  "id": "01461",
+  "from_lane": "observe",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-profile/Cargo.toml"
+  ],
+  "what": "blaze-profile gains a normal dependency on blaze-graph: add `blaze-graph.workspace = true` to [dependencies] of crates/blaze-profile/Cargo.toml, after `arrow-schema.workspace = true` (sorted). Why: blaze-profile::install now registers its per-thread span state with blaze_graph::sched::fiber::carry (so a fiber job's open spans move with it across a wait) and observes the driver's switches (blaze_graph::sched::fiber::observe) to record the `switches` table. No cycle: blaze-graph and its dependencies do not depend on blaze-profile. Uses in crates/blaze-profile/src/lib.rs (carry_with_fiber_jobs, observed) and the flight test a_span_opened_before_a_wait_closes_after_its_job_resumes_on_another_worker.",
+  "state": "applied",
+  "created": "2026-11-01T04:36:36Z",
+  "updated": "2026-11-01T04:44:31Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:36:36Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:44:31Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "applied by the coordinator in b13d9cba03 (HEAD did not build)"
+    }
+  ]
+}

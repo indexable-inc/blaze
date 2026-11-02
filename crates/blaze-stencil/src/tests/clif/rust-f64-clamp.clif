@@ -1,0 +1,108 @@
+; Shaped like what hir-ty-codegen makes for `f64::clamp` and `f32::clamp`:
+; `assert!(min <= max, ...)` (false for a NaN bound) branches to a cold block calling
+; `core::panicking::panic_fmt` (here a function that traps); then
+; `if self < min { self = min }` and `if self > max { self = max }`, each a compare and a
+; branch to a block that reassigns, the value carried in a block parameter. A NaN `self`
+; passes both compares and comes out as itself; a zero keeps its sign unless a bound
+; replaces it.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %panic_fmt(i64) {
+block0(v0: i64):
+    trap user1
+}
+
+function %f64_clamp(f64, f64, f64) -> f64 {
+    fn0 = %panic_fmt(i64)
+
+block0(v0: f64, v1: f64, v2: f64):
+    v3 = fcmp le v1, v2
+    brif v3, block1, block6
+
+block1:
+    v4 = fcmp lt v0, v1
+    brif v4, block2, block3(v0)
+
+block2:
+    jump block3(v1)
+
+block3(v5: f64):
+    v6 = fcmp gt v5, v2
+    brif v6, block4, block5(v5)
+
+block4:
+    jump block5(v2)
+
+block5(v7: f64):
+    return v7
+
+block6 cold:
+    v8 = iconst.i64 0
+    call fn0(v8)
+    trap user1
+}
+; run: %f64_clamp(0x1.8p0, 0x1.0p0, 0x1.0p1) == 0x1.8p0
+; run: %f64_clamp(0x1.8p1, 0x1.0p0, 0x1.0p1) == 0x1.0p1
+; run: %f64_clamp(0x0.0, 0x1.0p0, 0x1.0p1) == 0x1.0p0
+; run: %f64_clamp(0x1.0p0, 0x1.0p0, 0x1.0p0) == 0x1.0p0
+; run: %f64_clamp(0x1.0p1, 0x1.0p0, 0x1.0p0) == 0x1.0p0
+; run: %f64_clamp(-Inf, -0x1.0p0, 0x1.0p0) == -0x1.0p0
+; run: %f64_clamp(+Inf, -0x1.0p0, 0x1.0p0) == 0x1.0p0
+; run: %f64_clamp(0x1.0p0, -Inf, +Inf) == 0x1.0p0
+; run: %f64_clamp(+Inf, -Inf, +Inf) == +Inf
+; run: %f64_clamp(+NaN, 0x1.0p0, 0x1.0p1) == +NaN
+; run: %f64_clamp(-NaN, -Inf, +Inf) == -NaN
+; run: %f64_clamp(-0x0.0, 0x0.0, 0x1.0p0) == -0x0.0
+; run: %f64_clamp(0x0.0, -0x0.0, 0x0.0) == 0x0.0
+; run: %f64_clamp(-0x0.0, -0x0.0, 0x0.0) == -0x0.0
+; run: %f64_clamp(0x0.0, -0x0.0, -0x0.0) == 0x0.0
+; run: %f64_clamp(-0x0.0000000000001p-1022, 0x0.0, 0x1.0p0) == 0x0.0
+; run: %f64_clamp(0x0.0000000000001p-1022, 0x0.0, 0x0.0000000000001p-1022) == 0x0.0000000000001p-1022
+; run: %f64_clamp(0x1.0000000000001p0, 0x1.0p0, 0x1.0p0) == 0x1.0p0
+; run: %f64_clamp(0x1.fffffffffffffp1023, -0x1.fffffffffffffp1023, 0x1.0p0) == 0x1.0p0
+; trap: %f64_clamp(0x1.0p0, 0x1.0p1, 0x1.0p0)
+; trap: %f64_clamp(0x1.0p0, +NaN, 0x1.0p1)
+; trap: %f64_clamp(0x1.0p0, 0x0.0, +NaN)
+; trap: %f64_clamp(0x1.0p0, +Inf, -Inf)
+; trap: %f64_clamp(0x0.0, 0x0.0, -0x0.0000000000001p-1022)
+
+function %f32_clamp(f32, f32, f32) -> f32 {
+    fn0 = %panic_fmt(i64)
+
+block0(v0: f32, v1: f32, v2: f32):
+    v3 = fcmp le v1, v2
+    brif v3, block1, block6
+
+block1:
+    v4 = fcmp lt v0, v1
+    brif v4, block2, block3(v0)
+
+block2:
+    jump block3(v1)
+
+block3(v5: f32):
+    v6 = fcmp gt v5, v2
+    brif v6, block4, block5(v5)
+
+block4:
+    jump block5(v2)
+
+block5(v7: f32):
+    return v7
+
+block6 cold:
+    v8 = iconst.i64 0
+    call fn0(v8)
+    trap user1
+}
+; run: %f32_clamp(0x1.8p0, 0x1.0p0, 0x1.0p1) == 0x1.8p0
+; run: %f32_clamp(-0x1.0p100, 0x1.0p0, 0x1.0p1) == 0x1.0p0
+; run: %f32_clamp(0x1.0p100, 0x1.0p0, 0x1.0p1) == 0x1.0p1
+; run: %f32_clamp(+NaN, 0x1.0p0, 0x1.0p1) == +NaN
+; run: %f32_clamp(-0x0.0, 0x0.0, 0x1.0p0) == -0x0.0
+; run: %f32_clamp(0x0.000002p-126, 0x0.0, 0x0.000002p-126) == 0x0.000002p-126
+; trap: %f32_clamp(0x1.0p0, 0x1.0p1, 0x1.0p0)
+; trap: %f32_clamp(0x1.0p0, 0x0.0, +NaN)

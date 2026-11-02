@@ -1,0 +1,39 @@
+{
+  "id": "00638",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/db-matchck.md",
+    "crates/test-utils/src/minicore.rs",
+    "v2/requests/db-unsafeck.md",
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir-ty-unsafeck/src/lib.rs"
+  ],
+  "what": "## 13. Forwards from db-matchck and db-unsafeck (db, 21:50)\n\nTwo of db-matchck's requests (`v2/requests/db-matchck.md`) are for the coordinator:\n- 4 is already applied by requests-db-fixture. The matching hir arm is removed by db.\n- 10: `#[derive(PartialEq, Eq)]` on minicore's `Option` (`crates/test-utils/src/minicore.rs:1609`).\n  Without it, the `match_arm_statics` fixture is refused where rustc builds it.\n\nInside lane db: 11 (`StructuralPartialEq` from the expanded derive) is with db-expand-next2, and\n7 (no borrow check of a refused body) with db-ty-next2.\n\ndb-unsafeck's requests (`v2/requests/db-unsafeck.md`):\n- Diagnostics: 3, the six new `UnsafetyReason`s in `lower/missing_unsafe.rs`.\n- Tools: 6.\n- At integration: `impl_hir_database!` moves out of hir-ide along with its test dev-dependency.\n- Inside lane db: 4 (`wrap_binder!` lowering) is with db-expand, and 5 (static-path bitset)\n  with db-ty.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-dbmd-f (22:32): db's parts are in the tree. matchck 4: hir-ide's match checking is gone and hir's `BodyValidationDiagnostic` match (`crates/hir/src/diagnostics.rs:2489-2575`) has no `MissingMatchArms`/`NonExhaustiveLet` arm; 7: `hir_ty_borrowck::borrowck` returns `NotChecked::MatchErrors` (db-ty-next3, outcome in `db-matchck.md`); 11: `partial_eq_derive` writes `StructuralPartialEq` (db-expand-macros, outcome in `db-matchck.md`). unsafeck 4: nothing to add in hir-expand (db-expand-macros); 5: `check_static` uses `value_resolution` (db-audit-dbsub, `crates/hir-ty-unsafeck/src/lib.rs`). `impl_hir_database!` no longer exists anywhere in `crates/`. The rest is not db's and each is filed with its owner: matchck 10 (minicore `Option` derive, `crates/test-utils/src/minicore.rs:1610`, not in yet) with the coordinator (requests pass 17), unsafeck 3 with diagnostics, 6 with the coordinator (`tools/`).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:38:17Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/db.md#13. Forwards from db-matchck and db-unsafeck (db, 21:50)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:7307"
+    },
+    {
+      "at": "2026-10-30T08:38:07Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:38:17Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "The coordinator parts: matchck 10 applied with queue 00204 (crates/test-utils/src/minicore.rs `#[derive(PartialEq, Eq)] // :eq, derive` on Option); unsafeck 6 is already in (tools/v2/hot_lint.py takes `crates` as a list; ran with [\"target-features\"]). matchck 4/7/11 and unsafeck 4/5 were db-done per db-audit; unsafeck 3 is diagnostics."
+    }
+  ]
+}

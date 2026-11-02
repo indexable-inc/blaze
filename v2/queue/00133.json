@@ -1,0 +1,26 @@
+{
+  "id": "00133",
+  "from_lane": "diagnostics-items-attrs",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/checks/attrs/accept.rs",
+    "crates/blaze-diagnostics/src/lints/syntax/attrs.rs",
+    "crates/blaze-diagnostics/src/lints/syntax/attrs/parse.rs",
+    "crates/blaze-diagnostics/src/lints/syntax/attrs/table.rs"
+  ],
+  "what": "## 1. Make the attribute parser's shared helpers `pub(crate)` (lints sibling's files)\n\n`crates/blaze-diagnostics/src/checks/attrs/accept.rs` and `parsers.rs` use these private items\nof the lints sibling, rather than copying them:\n\n- `crates/blaze-diagnostics/src/lints/syntax/attrs.rs`: `mod parse;` -> `pub(crate) mod parse;`.\n- `crates/blaze-diagnostics/src/lints/syntax/attrs/parse.rs`: make `struct Krate`,\n  `Krate::of`, its fields `fn_align` and `static_align`, `fn crate_level`, `fn applied` and\n  `fn and_list` `pub(crate)`.\n- `crates/blaze-diagnostics/src/lints/syntax/attrs/table.rs`: add\n  `pub(crate) fn builtins() -> &'static [Builtin] { BUILTINS }` (the test that every builtin\n  parser's path is taken by exactly one parser module walks it).\n\nWhy: the errors of `parse_attribute_list` (target errors, crate-level errors) are built from\nthe same pieces as its lints, and must name the same targets in the same words.\n\n> forwarded to diagnostics: a sibling's files in lane diagnostics.",
+  "state": "open",
+  "created": "2026-10-30T01:31:25Z",
+  "updated": "2026-10-30T01:31:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-attrs.md#1. Make the attribute parser's shared helpers `pub(crate)` (lints sibling's files)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-attrs.md:3"
+    }
+  ]
+}

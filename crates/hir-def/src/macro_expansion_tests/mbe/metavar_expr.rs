@@ -355,7 +355,7 @@ macro_rules! m {
 }
 
 fn test() {
-    m!()
+    m!();
 }
 "#,
         expect![[r#"
@@ -366,7 +366,7 @@ macro_rules! m {
 }
 
 fn test() {
-    /* error: macro definition has parse errors */
+    /* error: macro definition has parse errors */;
 }
 "#]],
     );
@@ -384,7 +384,7 @@ macro_rules! m {
 }
 
 fn test() {
-    m!()
+    m!();
 }
 "#,
         expect![[r#"
@@ -395,7 +395,7 @@ macro_rules! m {
 }
 
 fn test() {
-    /* error: `${concat(..)}` is not generating a valid identifier */let __ra_concat_dummy;
+    /* error: `${concat(..)}` is not generating a valid identifier */let __ra_concat_dummy;;
 }
 "#]],
     );
@@ -413,7 +413,7 @@ macro_rules! m {
 }
 
 fn test() {
-    m!(())
+    m!(());
 }
 "#,
         expect![[r#"
@@ -424,7 +424,7 @@ macro_rules! m {
 }
 
 fn test() {
-    /* error: metavariables of `${concat(..)}` must be of type `ident`, `literal` or `tt` */let abc;
+    /* error: metavariables of `${concat(..)}` must be of type `ident`, `literal` or `tt` */let abc;;
 }
 "#]],
     );
@@ -442,7 +442,7 @@ macro_rules! m {
 }
 
 fn test() {
-    m!(a b c)
+    m!(a b c);
 }
 "#,
         expect![[r#"
@@ -453,7 +453,7 @@ macro_rules! m {
 }
 
 fn test() {
-    /* error: expected simple binding, found nested binding `i` */let abc;
+    /* error: expected simple binding, found nested binding `i` */let abc;;
 }
 "#]],
     );

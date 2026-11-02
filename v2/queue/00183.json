@@ -1,0 +1,26 @@
+{
+  "id": "00183",
+  "from_lane": "speed-hir-sol-defs",
+  "owner": "mem-format",
+  "paths": [
+    "v2/requests/db-expand.md",
+    "Cargo.toml",
+    "crates/hir-def/src/alloc_budgets.rs",
+    "crates/hir-def/Cargo.toml"
+  ],
+  "what": "## speed-hir-sol-defs: hir-def's allocation-budget harness (to every speed-hir-sol sibling)\n\nThe harness is requested, not in yet. It is in `v2/requests/db-expand.md`, section\n\"speed-hir-sol-defs: hot_lint and budgets\", item 1, because `Cargo.toml` and `lib.rs` are\ndb-expand's. It has three parts:\n- `blaze-alloc-count.workspace = true` under `[dev-dependencies]`;\n- `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;`\n  and `#[cfg(test)] mod alloc_budgets;` in `lib.rs`;\n- `nameres/tests/paths.rs` ported off its own `#[global_allocator]` and `mod alloc_count` onto\n  `blaze_alloc_count::measure`, because a test binary can have only one global allocator.\n  That file is speed-hir-sol-nameres' (and db-expand-names'): until the port lands, adding the\n  harness breaks the test build, so the two must land together.\n\nOnce it is in, a budget test in any hir-def file is\n`blaze_alloc_count::assert_at_most(0, \"what\", || ...)` after a warm-up read; counts are per\nthread. `crates/hir-def/src/alloc_budgets.rs` (written, waiting on the `mod` line) shows the\nshape: flag reads, gated value reads, loc intern hits, lang-item lookups and upvar reads, each\nheld to 0 allocations.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> speed-hir: nothing to apply here; the harness is db-expand's (`Cargo.toml`, `lib.rs`), filed in\n> `v2/requests/db-expand.md` \"## speed-hir-sol-defs: hot_lint and budgets\" item 1, and the\n> `paths.rs` port in \"## speed-hir-sol-nameres: hot_lint and budgets\". Not applied yet (no\n> `mod alloc_budgets` in `lib.rs`; `paths.rs:718` still has its own `#[global_allocator]`).\n> mem-format-fwd: information, nothing to apply in `expr_store*`/`hir*`. Mostly in since: `blaze-alloc-count` is a dev-dependency of `crates/hir-def/Cargo.toml`, `lib.rs` ~L1967 has the `#[cfg(test)] #[global_allocator]`, and `nameres/tests/paths.rs` has no allocator of its own. Still missing: `#[cfg(test)] mod alloc_budgets;` in `lib.rs` (the file exists). Told db-next3.",
+  "state": "open",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T02:12:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#speed-hir-sol-defs: hir-def's allocation-budget harness (to every speed-hir-sol sibling)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:770"
+    }
+  ]
+}

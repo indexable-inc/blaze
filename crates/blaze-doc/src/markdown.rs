@@ -5,21 +5,22 @@
 //! The code block attributes and hidden lines follow `html/markdown.rs` in librustdoc at rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (`LangString::parse`, `map_line`).
 
+use blaze_hash::HashMap;
 use pulldown_cmark::{
-    BrokenLink, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser, Tag,
+    BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser,
+    Tag, TagEnd,
 };
-use rustc_hash::FxHashMap;
 
 use crate::{
-    html::escape,
+    html::{Writer, escape},
     links,
-    model::{Doc, Target},
+    model::Doc,
 };
 
 /// The ids a page has used, so a heading in docs gets one of its own.
 #[derive(Default)]
 pub(crate) struct Ids {
-    used: FxHashMap<String, usize>,
+    used: HashMap<String, usize>,
 }
 
 impl Ids {
@@ -40,24 +41,20 @@ impl Ids {
 }
 
 /// How links and headings in one block of docs render.
-pub(crate) struct Context<'a> {
-    /// The URL of a target from the page, `None` where it has no documentation to point at.
-    pub(crate) url: &'a dyn Fn(&Target) -> Option<String>,
-    /// The title a resolved link shows on hover: `struct serde::Serialize`.
-    pub(crate) title: &'a dyn Fn(&Target) -> String,
+pub(crate) struct Context<'a, 'w> {
+    /// The page: a target's URL from it ([`Writer::url`], `None` where it has no documentation
+    /// to point at) and the title a resolved link shows on hover ([`Writer::title`]).
+    pub(crate) writer: &'a Writer<'w>,
     /// How far down a `#` heading goes: 1 makes it an `<h2>`.
     pub(crate) heading_offset: u32,
 }
 
-fn parser<'a, 'b>(
-    markdown: &'a str,
-    callback: &'b mut dyn FnMut(BrokenLink<'a>) -> Option<(CowStr<'a>, CowStr<'a>)>,
-) -> Parser<'a, 'b> {
+fn parser<'a, F: BrokenLinkCallback<'a>>(markdown: &'a str, callback: F) -> Parser<'a, F> {
     Parser::new_with_broken_link_callback(markdown, links::options(), Some(callback))
 }
 
 /// The docs as a block of HTML.
-pub(crate) fn render(doc: &Doc, cx: &Context<'_>, ids: &mut Ids) -> String {
+pub(crate) fn render(doc: &Doc, cx: &Context<'_, '_>, ids: &mut Ids) -> String {
     let mut callback =
         |broken: BrokenLink<'_>| Some((broken.reference.to_string().into(), "".into()));
     let events: Vec<Event<'_>> = parser(&doc.markdown, &mut callback).collect();
@@ -68,7 +65,7 @@ pub(crate) fn render(doc: &Doc, cx: &Context<'_>, ids: &mut Ids) -> String {
 }
 
 /// The first paragraph as one line of HTML, for lists of items.
-pub(crate) fn summary(doc: &Doc, cx: &Context<'_>) -> String {
+pub(crate) fn summary(doc: &Doc, cx: &Context<'_, '_>) -> String {
     let first = crate::model::first_paragraph(&doc.markdown);
     // A reference link of the first paragraph is often defined further down.
     let mut none = |_: BrokenLink<'_>| None;
@@ -114,7 +111,7 @@ pub(crate) fn plain_summary(markdown: &str, limit: usize) -> String {
 fn rewrite<'a>(
     events: Vec<Event<'a>>,
     doc: &Doc,
-    cx: &Context<'_>,
+    cx: &Context<'_, '_>,
     mut ids: Option<&mut Ids>,
     inline: bool,
 ) -> Vec<Event<'a>> {
@@ -122,10 +119,10 @@ fn rewrite<'a>(
     let mut iter = events.into_iter().peekable();
     while let Some(event) = iter.next() {
         match event {
-            Event::Start(Tag::Link(kind, dest, title)) => {
+            Event::Start(Tag::Link { link_type: kind, dest_url: dest, title, id }) => {
                 let mut inner = vec![];
                 for event in iter.by_ref() {
-                    if matches!(event, Event::End(Tag::Link(..))) {
+                    if matches!(event, Event::End(TagEnd::Link)) {
                         break;
                     }
                     inner.push(event);
@@ -142,20 +139,16 @@ fn rewrite<'a>(
                             }
                             _ => inner,
                         };
-                        match (cx.url)(target) {
+                        match cx.writer.url(target) {
                             Some(url) => {
-                                let title: CowStr<'a> = (cx.title)(target).into();
-                                out.push(Event::Start(Tag::Link(
-                                    LinkType::Inline,
-                                    url.clone().into(),
-                                    title.clone(),
-                                )));
+                                out.push(Event::Start(Tag::Link {
+                                    link_type: LinkType::Inline,
+                                    dest_url: url.into(),
+                                    title: Writer::title(target).into(),
+                                    id: "".into(),
+                                }));
                                 out.extend(inner);
-                                out.push(Event::End(Tag::Link(
-                                    LinkType::Inline,
-                                    url.into(),
-                                    title,
-                                )));
+                                out.push(Event::End(TagEnd::Link));
                             }
                             None => out.extend(inner),
                         }
@@ -176,16 +169,21 @@ fn rewrite<'a>(
                         }
                     }
                     None => {
-                        out.push(Event::Start(Tag::Link(kind, dest.clone(), title.clone())));
+                        out.push(Event::Start(Tag::Link {
+                            link_type: kind,
+                            dest_url: dest,
+                            title,
+                            id,
+                        }));
                         out.extend(inner);
-                        out.push(Event::End(Tag::Link(kind, dest, title)));
+                        out.push(Event::End(TagEnd::Link));
                     }
                 }
             }
-            Event::Start(Tag::Heading(level, _, _)) => {
+            Event::Start(Tag::Heading { level, .. }) => {
                 let mut inner = vec![];
                 for event in iter.by_ref() {
-                    if matches!(event, Event::End(Tag::Heading(..))) {
+                    if matches!(event, Event::End(TagEnd::Heading(_))) {
                         break;
                     }
                     inner.push(event);
@@ -219,7 +217,7 @@ fn rewrite<'a>(
                 let mut text = String::new();
                 for event in iter.by_ref() {
                     match event {
-                        Event::End(Tag::CodeBlock(_)) => break,
+                        Event::End(TagEnd::CodeBlock) => break,
                         Event::Text(it) => text.push_str(&it),
                         _ => {}
                     }
@@ -229,24 +227,24 @@ fn rewrite<'a>(
                 }
                 out.push(Event::Html(code_block(&kind, &text).into()));
             }
-            Event::Start(Tag::Paragraph) | Event::End(Tag::Paragraph) if inline => {}
-            Event::Start(Tag::Image(..)) if inline => {
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) if inline => {}
+            Event::Start(Tag::Image { .. }) if inline => {
                 // An image in a summary line shows as its text.
                 for event in iter.by_ref() {
                     match event {
-                        Event::End(Tag::Image(..)) => break,
+                        Event::End(TagEnd::Image) => break,
                         Event::Text(it) => out.push(Event::Text(it)),
                         _ => {}
                     }
                 }
             }
             Event::SoftBreak if inline => out.push(Event::Text(" ".into())),
-            Event::Html(html) if inline => {
+            Event::Html(ref html) | Event::InlineHtml(ref html) if inline => {
                 // Block HTML (`<details>`, `<div>`) does not belong in a line.
                 if !html.trim_start().starts_with("<div")
                     && !html.trim_start().starts_with("<details")
                 {
-                    out.push(Event::Html(html));
+                    out.push(event);
                 }
             }
             other => out.push(other),
@@ -385,16 +383,6 @@ fn shown_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
-/// `a`, `a or b`, `a, b, or c`.
-fn or_list(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [first, second] => format!("{first} or {second}"),
-        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
-    }
-}
-
 fn code_block(kind: &CodeBlockKind<'_>, text: &str) -> String {
     let lang = match kind {
         CodeBlockKind::Fenced(info) => LangString::parse(info),
@@ -418,7 +406,7 @@ fn code_block(kind: &CodeBlockKind<'_>, text: &str) -> String {
     let (wrap, tooltip) = if lang.ignore {
         (" ignore", Some("This example is not tested".to_owned()))
     } else if !lang.ignore_on.is_empty() {
-        (" ignore", Some(format!("This example is not tested on {}", or_list(&lang.ignore_on))))
+        (" ignore", Some(format!("This example is not tested on {}", stdx::list::list(&lang.ignore_on, stdx::list::Join::Or, false))))
     } else if lang.compile_fail {
         (" compile_fail", Some("This example deliberately fails to compile".to_owned()))
     } else if lang.should_panic {

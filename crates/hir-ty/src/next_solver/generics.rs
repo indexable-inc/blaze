@@ -1,13 +1,13 @@
 //! Things related to generics in the next-trait-solver.
 
+use base_db::Db;
 use hir_def::{
     FunctionId, GenericDefId, GenericParamId, TypeParamId,
     hir::generics::{GenericParamDataRef, LifetimeParamData},
 };
 
-use crate::db::HirDatabase;
 
-use super::{Ctor, DbInterner, SolverDefId};
+use super::{Ctor, DbInterner, EarlyParamRegion, SolverDefId};
 
 pub(crate) fn generics<'db>(interner: DbInterner<'db>, def: SolverDefId<'db>) -> Generics<'db> {
     let db = interner.db;
@@ -75,7 +75,7 @@ pub struct Generics<'db> {
 
 impl<'db> Generics<'db> {
     pub(crate) fn from_generic_def(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
         consider_late_bound: bool,
     ) -> Generics<'db> {
@@ -88,7 +88,7 @@ impl<'db> Generics<'db> {
     }
 
     pub(crate) fn from_generic_def_plus_one(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
         additional_param: TypeParamId,
         consider_late_bound: bool,
@@ -126,6 +126,11 @@ impl<'db> Generics<'db> {
             .chain(self.additional_param.map(|param| (param, None)))
             .chain(elided)
     }
+
+    /// The parameters the item declares itself, without its parent's.
+    pub(super) fn iter_own(&self) -> impl Iterator<Item = GenericParamId> {
+        self.generics.iter_self().map(|(id, _)| id)
+    }
 }
 
 impl<'db> rustc_type_ir::inherent::GenericsOf<DbInterner<'db>> for Generics<'db> {
@@ -133,5 +138,20 @@ impl<'db> rustc_type_ir::inherent::GenericsOf<DbInterner<'db>> for Generics<'db>
         self.generics.len(self.consider_late_bound)
             + usize::from(self.additional_param.is_some())
             + self.elided.map_or(0, |(_, _, len)| len as usize)
+    }
+
+    /// rustc's `region_param(ebr).def_id`. A lifetime parameter has no `SolverDefId` of its
+    /// own, so this is the item declaring it, the id `BoundRegionKind::Named` holds too.
+    fn param_region_def_id(
+        self,
+        _interner: DbInterner<'db>,
+        ebr: EarlyParamRegion,
+    ) -> SolverDefId<'db> {
+        match self.iter().nth(ebr.index as usize) {
+            Some((GenericParamId::LifetimeParamId(param), _)) if param == ebr.id => {
+                param.parent.into()
+            }
+            param => panic!("expected lifetime parameter {ebr:?} at its index, found {param:?}"),
+        }
     }
 }

@@ -1,0 +1,23 @@
+{
+  "id": "00898",
+  "from_lane": "speed-sol2-proof",
+  "owner": "unify-front",
+  "paths": [
+    "crates/hir-ty-ub/src/memory.rs"
+  ],
+  "what": "hir-ty-ub memory.rs: Memory.live (and zsts) is a sorted Vec<(Addr, AllocId)>, so alloc at a lower address (Vec::insert) and free of any but the last (Vec::remove, line ~576) shift the tail: O(N) 16-byte moves per hook with N live allocations (10^4 live heap blocks freed FIFO: ~80 KB memmove, ~3 us a free, ~30x the O(log N) bound; Miri int_to_ptr_map has the same cost). Exact edit once the crate is free (speed-sol2-proof found it while unify-front holds hir-ty-ub; hand to lane safety or speed if not yours): live: BTreeMap<Addr, AllocId>; alloc overlap check = self.live.range(..end).next_back() then base + size > addr; insert = self.live.insert(addr, id); free = self.live.remove(&info.base); sized_at = self.live.range(..=addr).next_back().filter(|(b, id)| addr - b < size). zsts stays a Vec (several share an address; keep its order) or becomes BTreeMap<(Addr, AllocId), ()> with zsts_at = range((addr, MIN)..=(addr, MAX)). Concrete-provenance accesses never touch this map, so the hot access path is unchanged. Test: a seeded model test of alloc/free/live_at/exposed_at against the Vec version over 10^4 random ops, same answers and errors.",
+  "state": "open",
+  "created": "2026-10-30T09:33:17Z",
+  "updated": "2026-10-30T09:33:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:33:17Z",
+      "by": "speed-sol2-proof",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

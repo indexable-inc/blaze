@@ -1,0 +1,36 @@
+{
+  "id": "00144",
+  "from_lane": "usercode-macros-native",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-expand/src/native",
+    "docs/v2/plan/lanes/usercode/macros-native.md"
+  ],
+  "what": "## 6. To fastcompile (forwarded by the coordinator): what this lane has on the proc-macro bridge\n\nWhat: take what is useful of `crates/blaze-expand/src/native/` for change 20's proc-macro\nbridge. The list, with what each piece gives, is the section \"For fastcompile: the proc-macro\nbridge\" of `docs/v2/plan/lanes/usercode/macros-native.md`. In short:\n- the bridge's whole surface as one 20-function `Host` trait (`proc_macro/lib.rs`, the wasm\n  guest's `proc_macro` with its imports routed to a thread-local host);\n- `host.rs`, which answers those 20 exactly as the wasm host does, span numbering included;\n- reentrancy-safe host installation and panic capture;\n- a one-pass reader from the wire encoding into `TopSubtree`;\n- `difference`, a differential check against the wasm modules or rustc;\n- `native::expand(Expander, …)`, the bridge's entry for a macro compiled against the shim, with\n  tests that run small macros through it (spans, sites, parsed streams, attributes, panics,\n  an expansion within an expansion);\n- a design for the output cache's \"macro version\": a stat-cached content identity of a macro\n  library's whole closure. It was `closure.rs`, removed from the tree and kept in git at\n  `df97d0934a`. The key also has to cover the environment variables and files the macro read.\n\nWhy: change 20 runs the macro's own code, so none of the vendored-copy matching applies, and\nthat part is deleted. The bridge has to answer the same 20 questions the same way the wasm host\ndoes, or the outputs differ. What is left in `native/` depends on no vendored crate. It is\nwritten, not built.\n\n> forwarded to fastcompile.",
+  "state": "applied",
+  "created": "2026-10-30T01:41:30Z",
+  "updated": "2026-10-30T14:24:28Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/usercode-macros-native.md#6. To fastcompile (forwarded by the coordinator): what this lane has on the proc-macro bridge",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros-native.md:216"
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Change 20's, taken up by crates/blaze-macro-eval/ (child fastcompile-macros): the proc-macro bridge, its evaluator and expander (src/expander.rs) live there; see docs/v2/plan/lanes/fastcompile/ and /tmp/blaze-lanes/v2-fastcompile-macros.md."
+    }
+  ]
+}

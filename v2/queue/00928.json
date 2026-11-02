@@ -1,0 +1,30 @@
+{
+  "id": "00928",
+  "from_lane": "speed-sol2-usercode-wasm",
+  "owner": "store",
+  "paths": [
+    "crates/blaze-cas/src/",
+    "crates/blaze-store/src/lib.rs"
+  ],
+  "what": "A zero-copy load of machine code from the store. blaze-macro-wasm (lib.rs `Wasm::compile`, key `code_key`) and blaze-wasi (run.rs `compile_in`, key `code_key`) load Wasmtime machine code with `Store::get_lasting` (a pread into a fresh Vec, then a checksum pass) and `Module::deserialize`, which copies it again into its own executable mapping: two copies and a page fault per page of code, about 3 ms for a 10 MB module (a syn-based macro), against about 0.1 ms for a mapping (Wasmtime `Module::deserialize_open_file`, copy-on-write, pages faulted only as code runs). Asked: in blaze-cas (blaze-store is deleted at integration), a lasting value whose bytes start on a page boundary of a sealed pack and can be had as an open `File` (or a page-aligned read-only mapping that lives as long as the process), checked against its checksum once when the pack is opened or the value is first read, so blaze-macro-wasm and blaze-wasi pass it to `Module::deserialize_open_file` (or `deserialize_raw`). Also carry both callers over from blaze-store when it goes: they use `get_lasting`, `insert_lasting`, `has_lasting`, `flush`, `Store::global`, `toolchain`. Section `Loading a module (speed-sol2-usercode-wasm)` of docs/v2/plan/lanes/usercode/speed-of-light-wasm.md has the arithmetic.",
+  "state": "applied",
+  "created": "2026-10-30T09:52:31Z",
+  "updated": "2026-10-30T13:04:44Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:52:31Z",
+      "by": "speed-sol2-usercode-wasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:04:44Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "Done in blaze-cas by integrate-store (the store lane has no live window). `Kind::Machine`: a module of machine code is always a file of its own (`store/file-<content>`, exactly its bytes, so page-aligned at 0), never compressed or demoted by settle. `Pinned::file()` names that file once committed (`Handle::path_of` gives its path), verified against its content hash at the first read and memoized (the slot`s Verified flag). blaze-macro-wasm (`kept_module`) and blaze-wasi (`run.rs` `kept::load`) pass it to `Module::deserialize_open_file` (Windows: opened FILE_GENERIC_READ|EXECUTE); code put since the last commit is loaded from its bytes with `deserialize`. Both callers moved off blaze-store onto `blaze_cas::Handle::installed()` (new: the process-wide handle, installed by the daemon, asked of integrate-load in 00994) with `Key::of(schema, producer = ARCH + Wasmtime precompile_compatibility_hash, [module bytes])`. Tests: blaze-cas `a_module_of_machine_code_is_a_file_of_its_own_that_its_pin_names`, `a_driven_store_keeps_machine_code_as_a_file_on_disk`; blaze-macro-wasm `a_prepared_module_is_loaded_without_compiling_or_reading_it`; blaze-wasi `a_scripts_machine_code_is_compiled_once_and_loaded_from_the_store_after`. Not built here (integration lanes run nothing expensive): the check loop is the compiler."
+    }
+  ]
+}

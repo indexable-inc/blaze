@@ -1,0 +1,23 @@
+{
+  "id": "01186",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/demand.rs"
+  ],
+  "what": "crates/hir-def/src/nameres/demand.rs crate_body_owners (line 120) and every_body (177) grow their Vec by push from empty, so a crate of n bodies reallocates each ~log2(n) times. blaze-diagnostics lints::bodies::tests::late_passes_per_crate (the late passes allocate the same at 4 bodies as at 64) fails: 10 allocations at 4 bodies, 19 at 64. Fix: every_body takes `let roots = crate_body_owners(db, krate); let mut bodies = Vec::with_capacity(roots.len());` before walk_bodies; crate_body_owners reserves per module from its scope (e.g. `owners.reserve(scope.declarations().len() + scope.impls().len())`, whatever push_scope_body_owners walks) or counts first, so neither grows with the body count.",
+  "state": "open",
+  "created": "2026-10-30T23:47:02Z",
+  "updated": "2026-10-30T23:47:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:47:02Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

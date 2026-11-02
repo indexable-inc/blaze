@@ -1,0 +1,388 @@
+diff -ruN a/src/delegate.rs b/src/delegate.rs
+--- a/src/delegate.rs
++++ b/src/delegate.rs
+@@ -2,7 +2,7 @@
+ use std::ops::Deref;
+ 
+ use rustc_type_ir::solve::{
+-    ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
++    ComputeGoalFastPathOutcome, FastPathDepth, FetchEligibleAssocItemResponse, Goal, NoSolution,
+     VisibleForLeakCheck,
+ };
+ use rustc_type_ir::transmute::Answer;
+@@ -46,6 +46,7 @@
+         &self,
+         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
+         span: <Self::Interner as Interner>::Span,
++        depth: FastPathDepth,
+     ) -> ComputeGoalFastPathOutcome<Self::Interner>;
+ 
+     fn fresh_var_for_kind(
+diff -ruN a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
+--- a/src/solve/eval_ctxt/fast_path.rs
++++ b/src/solve/eval_ctxt/fast_path.rs
+@@ -7,8 +7,8 @@
+ 
+ use rustc_type_ir::inherent::*;
+ use rustc_type_ir::solve::{
+-    Certainty, ComputeGoalFastPathOutcome, Goal, GoalStalledOn, GoalStalledOnOpaques, MaybeInfo,
+-    SucceededInErased,
++    Certainty, ComputeGoalFastPathOutcome, FastPathDepth, Goal, GoalStalledOn,
++    GoalStalledOnOpaques, MaybeInfo, SucceededInErased,
+ };
+ use rustc_type_ir::{InferCtxtLike, Interner};
+ 
+@@ -134,21 +134,25 @@
+     delegate: &D,
+     goal: Goal<I, I::Predicate>,
+     origin_span: I::Span,
+-) -> Option<GoalEvaluation<I>>
++    depth: FastPathDepth,
++) -> Option<(GoalEvaluation<I>, Option<usize>)>
+ where
+     D: SolverDelegate<Interner = I>,
+     I: Interner,
+ {
+-    compute_goal_fast_path(delegate, goal, origin_span)
++    compute_goal_fast_path(delegate, goal, origin_span, depth)
+ }
+ 
+ /// This is a fast path optimization:
+-/// See the docs on [`ComputeGoalFastPathOutcome`]
++/// See the docs on [`ComputeGoalFastPathOutcome`] and [`FastPathDepth`]. Beside the
++/// evaluation, the levels a `HoldsWithin` answer needs below the goal, which the caller
++/// charges to the parent goal.
+ pub fn compute_goal_fast_path<D, I>(
+     delegate: &D,
+     goal: Goal<I, I::Predicate>,
+     origin_span: I::Span,
+-) -> Option<GoalEvaluation<I>>
++    depth: FastPathDepth,
++) -> Option<(GoalEvaluation<I>, Option<usize>)>
+ where
+     D: SolverDelegate<Interner = I>,
+     I: Interner,
+@@ -157,19 +161,36 @@
+         return None;
+     }
+ 
+-    match delegate.compute_goal_fast_path(goal, origin_span) {
++    let holds = GoalEvaluation {
++        goal,
++        certainty: Certainty::Yes,
++        has_changed: HasChanged::No,
++        stalled_on: None,
++    };
++    match delegate.compute_goal_fast_path(goal, origin_span, depth) {
+         ComputeGoalFastPathOutcome::NoFastPath => None,
+-        ComputeGoalFastPathOutcome::TriviallyHolds => Some(GoalEvaluation {
+-            goal,
+-            certainty: Certainty::Yes,
+-            has_changed: HasChanged::No,
+-            stalled_on: None,
+-        }),
+-        ComputeGoalFastPathOutcome::TriviallyStalled { stalled_on } => Some(GoalEvaluation {
+-            goal,
+-            certainty: Certainty::AMBIGUOUS,
+-            has_changed: HasChanged::No,
+-            stalled_on: Some(stalled_on),
+-        }),
++        ComputeGoalFastPathOutcome::TriviallyHolds => {
++            assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
++            Some((holds, None))
++        }
++        ComputeGoalFastPathOutcome::HoldsWithin { required_depth } => {
++            assert!(
++                depth.available().is_some_and(|available| required_depth <= available),
++                "an answer needing {required_depth} levels at {depth:?}",
++            );
++            Some((holds, Some(required_depth)))
++        }
++        ComputeGoalFastPathOutcome::TriviallyStalled { stalled_on } => {
++            assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
++            Some((
++                GoalEvaluation {
++                    goal,
++                    certainty: Certainty::AMBIGUOUS,
++                    has_changed: HasChanged::No,
++                    stalled_on: Some(stalled_on),
++                },
++                None,
++            ))
++        }
+     }
+ }
+diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+--- a/src/solve/eval_ctxt/mod.rs
++++ b/src/solve/eval_ctxt/mod.rs
+@@ -12,8 +12,8 @@
+     CandidateHeadUsages, LowerAvailableDepth, PathKind, RequiredDepth,
+ };
+ use rustc_type_ir::solve::{
+-    AccessedOpaques, ExternalRegionConstraints, FetchEligibleAssocItemResponse, MaybeInfo,
+-    NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
++    AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
++    MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
+     RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, TyOrConstInferVar,
+ };
+ use rustc_type_ir::transmute::Answer;
+@@ -252,7 +252,12 @@
+         // immediately when adding new goals. If we didn't check `stalled_on` here we'd be trying
+         // the fast path twice for some goals.
+         if stalled_on.is_some()
+-            && let Some(res) = compute_goal_fast_path_cold(self, goal, span)
++            && let Some((res, _)) = compute_goal_fast_path_cold(
++                self,
++                goal,
++                span,
++                FastPathDepth::Any(Some(self.cx().recursion_limit())),
++            )
+         {
+             return Ok(res);
+         }
+@@ -611,12 +616,25 @@
+             });
+         }
+ 
+-        // No need to try the fast path if stalled_on is `None`, since we already try the fast path
+-        // immediately when adding new goals. If we didn't check `stalled_on` here we'd be trying
+-        // the fast path twice for some goals.
+-        if stalled_on.is_some()
+-            && let Some(res) = compute_goal_fast_path_cold(self.delegate, goal, self.origin_span)
++        // `add_goal` already asked for the answers that cost no depth. Only here is the
++        // depth the goal is evaluated with known, so the answers that cost depth are asked
++        // here, and a stalled goal's rerun asks for both.
++        let available = if self.inspect.is_noop() {
++            self.search_graph.nested_available_depth(self.lower_available_depth(goal.predicate))
++        } else {
++            None
++        };
++        let depth = match stalled_on {
++            Some(_) => FastPathDepth::Any(available),
++            None => FastPathDepth::Evaluating(available),
++        };
++        if let Some((res, required_depth)) =
++            compute_goal_fast_path_cold(self.delegate, goal, self.origin_span, depth)
+         {
++            if let Some(required_depth) = required_depth {
++                let available = available.expect("`compute_goal_fast_path` checked it");
++                self.search_graph.charge_answered_nested(available, required_depth);
++            }
+             return Ok(res);
+         }
+ 
+@@ -636,105 +654,110 @@
+         Ok(goal_evaluation)
+     }
+ 
++    /// Whether a nested goal with this predicate is evaluated one level deeper.
++    fn lower_available_depth(&self, predicate: I::Predicate) -> LowerAvailableDepth {
++        match predicate.kind().skip_binder() {
++            // We don't lower the available depth for the `NormalizesTo` goal, as evaluating
++            // it is an extra step only exists in the new solver that behaves like a function
++            // call rather than an independent nested goal evaluation. So, decreasing the
++            // available depth may end up regressions which hit the recursion limits for crates
++            // compiled well with the old solver.
++            ty::PredicateKind::NormalizesTo(_) => LowerAvailableDepth::No,
++            // We also don't lower depth for witness and rigid opaque when proving auto traits.
++            // This is to mitigate the overflow FCW warnings in deeply nested async calls.
++            // See #159228.
++            //
++            // We're eventually going to remove the witness type so it's okay to ignore the
++            // depth.
++            // For rigid opaques, revealing hidden types can be viewed as normalization so it's
++            // consistent with the `NormalizesTo` reasoning above.
++            ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
++                if self.cx().trait_is_auto(pred.trait_ref.def_id) {
++                    match pred.self_ty().kind() {
++                        ty::CoroutineWitness(..) => LowerAvailableDepth::No,
++                        ty::Alias(
++                            ty::IsRigid::Yes,
++                            ty::AliasTy { kind: ty::Opaque { def_id, .. }, .. },
++                        ) => {
++                            // We only want to skip lowering depth when the proving is done via
++                            // auto trait leakage. If the goal can be proved via item bounds,
++                            // we should lower depth faithfully.
++                            //
++                            // FIXME: We can have param env candidates via TAIT or RTN.
++                            // Ideally we'd instead lower the depth for the nested goal instead.
++                            // Implementing this is a bit harder.
++                            if self
++                                .cx()
++                                .item_self_bounds(def_id.into())
++                                .skip_binder()
++                                .into_iter()
++                                .any(|bound| {
++                                    bound
++                                        .as_trait_clause()
++                                        .is_some_and(|b| b.def_id() == pred.def_id())
++                                })
++                            {
++                                LowerAvailableDepth::Yes
++                            } else {
++                                LowerAvailableDepth::No
++                            }
++                        }
++                        ty::Bool
++                        | ty::Char
++                        | ty::Int(..)
++                        | ty::Uint(..)
++                        | ty::Float(..)
++                        | ty::Str
++                        | ty::Pat(..)
++                        | ty::FnPtr(..)
++                        | ty::Array(..)
++                        | ty::Slice(..)
++                        | ty::RawPtr(..)
++                        | ty::Never
++                        | ty::Tuple(..)
++                        | ty::UnsafeBinder(_)
++                        | ty::Param(..)
++                        | ty::Placeholder(..)
++                        | ty::Bound(..)
++                        | ty::Infer(..)
++                        | ty::Alias(_, _)
++                        | ty::Ref(_, _, _)
++                        | ty::Adt(_, _)
++                        | ty::Foreign(_)
++                        | ty::Dynamic(..)
++                        | ty::Error(_)
++                        | ty::FnDef(..)
++                        | ty::Closure(..)
++                        | ty::CoroutineClosure(..)
++                        | ty::Coroutine(..) => LowerAvailableDepth::Yes,
++                    }
++                } else {
++                    LowerAvailableDepth::Yes
++                }
++            }
++            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(_))
++            | ty::PredicateKind::Clause(ty::ClauseKind::Projection(_))
++            | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(_))
++            | ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(_))
++            | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(_, _))
++            | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
++            | ty::PredicateKind::Subtype(_)
++            | ty::PredicateKind::Coerce(_)
++            | ty::PredicateKind::DynCompatible(_)
++            | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_))
++            | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(_))
++            | ty::PredicateKind::ConstEquate(_, _)
++            | ty::PredicateKind::Ambiguous => LowerAvailableDepth::Yes,
++        }
++    }
++
+     fn evaluate_in_search_graph(
+         &mut self,
+         canonical_goal: I::CanonicalInput,
+         step_kind: PathKind,
+     ) -> (Result<CanonicalResponse<I>, NoSolution>, AccessedOpaques<I>) {
+         let increase_depth_for_nested =
+-            match canonical_goal.canonical.value.goal.predicate.kind().skip_binder() {
+-                // We don't lower the available depth for the `NormalizesTo` goal, as evaluating
+-                // it is an extra step only exists in the new solver that behaves like a function
+-                // call rather than an independent nested goal evaluation. So, decreasing the
+-                // available depth may end up regressions which hit the recursion limits for crates
+-                // compiled well with the old solver.
+-                ty::PredicateKind::NormalizesTo(_) => LowerAvailableDepth::No,
+-                // We also don't lower depth for witness and rigid opaque when proving auto traits.
+-                // This is to mitigate the overflow FCW warnings in deeply nested async calls.
+-                // See #159228.
+-                //
+-                // We're eventually going to remove the witness type so it's okay to ignore the
+-                // depth.
+-                // For rigid opaques, revealing hidden types can be viewed as normalization so it's
+-                // consistent with the `NormalizesTo` reasoning above.
+-                ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
+-                    if self.cx().trait_is_auto(pred.trait_ref.def_id) {
+-                        match pred.self_ty().kind() {
+-                            ty::CoroutineWitness(..) => LowerAvailableDepth::No,
+-                            ty::Alias(
+-                                ty::IsRigid::Yes,
+-                                ty::AliasTy { kind: ty::Opaque { def_id, .. }, .. },
+-                            ) => {
+-                                // We only want to skip lowering depth when the proving is done via
+-                                // auto trait leakage. If the goal can be proved via item bounds,
+-                                // we should lower depth faithfully.
+-                                //
+-                                // FIXME: We can have param env candidates via TAIT or RTN.
+-                                // Ideally we'd instead lower the depth for the nested goal instead.
+-                                // Implementing this is a bit harder.
+-                                if self
+-                                    .cx()
+-                                    .item_self_bounds(def_id.into())
+-                                    .skip_binder()
+-                                    .into_iter()
+-                                    .any(|bound| {
+-                                        bound
+-                                            .as_trait_clause()
+-                                            .is_some_and(|b| b.def_id() == pred.def_id())
+-                                    })
+-                                {
+-                                    LowerAvailableDepth::Yes
+-                                } else {
+-                                    LowerAvailableDepth::No
+-                                }
+-                            }
+-                            ty::Bool
+-                            | ty::Char
+-                            | ty::Int(..)
+-                            | ty::Uint(..)
+-                            | ty::Float(..)
+-                            | ty::Str
+-                            | ty::Pat(..)
+-                            | ty::FnPtr(..)
+-                            | ty::Array(..)
+-                            | ty::Slice(..)
+-                            | ty::RawPtr(..)
+-                            | ty::Never
+-                            | ty::Tuple(..)
+-                            | ty::UnsafeBinder(_)
+-                            | ty::Param(..)
+-                            | ty::Placeholder(..)
+-                            | ty::Bound(..)
+-                            | ty::Infer(..)
+-                            | ty::Alias(_, _)
+-                            | ty::Ref(_, _, _)
+-                            | ty::Adt(_, _)
+-                            | ty::Foreign(_)
+-                            | ty::Dynamic(..)
+-                            | ty::Error(_)
+-                            | ty::FnDef(..)
+-                            | ty::Closure(..)
+-                            | ty::CoroutineClosure(..)
+-                            | ty::Coroutine(..) => LowerAvailableDepth::Yes,
+-                        }
+-                    } else {
+-                        LowerAvailableDepth::Yes
+-                    }
+-                }
+-                ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(_))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::Projection(_))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(_))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(_))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(_, _))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
+-                | ty::PredicateKind::Subtype(_)
+-                | ty::PredicateKind::Coerce(_)
+-                | ty::PredicateKind::DynCompatible(_)
+-                | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_))
+-                | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(_))
+-                | ty::PredicateKind::ConstEquate(_, _)
+-                | ty::PredicateKind::Ambiguous => LowerAvailableDepth::Yes,
+-            };
++            self.lower_available_depth(canonical_goal.canonical.value.goal.predicate);
+         self.search_graph.evaluate_goal(
+             self.cx(),
+             canonical_goal,
+@@ -1134,8 +1157,8 @@
+             self.normalize(goal.param_env, ty::Unnormalized::new_wip(goal.predicate))?;
+         self.inspect.add_goal(self.delegate, self.max_input_universe, source, goal);
+ 
+-        if let Some(GoalEvaluation { goal, certainty, has_changed: _, stalled_on }) =
+-            compute_goal_fast_path(self.delegate, goal, self.origin_span)
++        if let Some((GoalEvaluation { goal, certainty, has_changed: _, stalled_on }, _)) =
++            compute_goal_fast_path(self.delegate, goal, self.origin_span, FastPathDepth::Added)
+         {
+             match certainty {
+                 // We're done here

@@ -1,0 +1,37 @@
+{
+  "id": "00980",
+  "from_lane": "integrate-engine-rustc",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/cargo/toolchain/library.rs",
+    "crates/blaze-cargo/src/answers.rs",
+    "crates/blaze-cargo/src/as_rustc.rs"
+  ],
+  "what": "integrate-engine-rustc is porting crates/blaze-engine/src/as_rustc.rs (blaze as a build script rustc) onto v2: it loads the probe as a one-package view through blaze_units Plan + blaze_lower::lower + blaze_diagnostics. It will call, from blaze-cargo: (1) blaze_cargo::cargo::toolchain::library::found() -> &Library{dir,commit,digest} (to find library/ on disk; v2 serve already uses library::fetch), (2) blaze_cargo::answers::{is_question, ours_told, ours} and answers::own, (3) blaze_cargo::as_rustc::NAME. Please tell me by queue (owner integrate-engine-rustc) if any of these moves or goes, and where to; if library::found moves out of the v1 cargo module, name its new path. No change needed otherwise.",
+  "state": "applied",
+  "created": "2026-10-30T12:52:30Z",
+  "updated": "2026-10-30T13:09:52Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:30Z",
+      "by": "integrate-engine-rustc",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:05:04Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:09:52Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "Paths for your v2 as_rustc: library::found is now blaze_cargo::toolchain::library::found (crates/blaze-cargo/src/toolchain/library.rs; v1 cargo::toolchain goes with cargo/ soon, so use the new path now). answers::{is_question, ours, ours_told, own} and as_rustc::{NAME, TOOLCHAIN} stay where they are. What goes from answers with v1: ask, ready_cargo, reply, answer, own_answer, ONLY_ASKS and the answers::cargo submodule (rust-analyzer and cargo-wrapper paths). Tell me if you need any of those."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "00776",
+  "from_lane": "diagnostics-constcheck",
+  "owner": "codegen-rq-mir-constcheck",
+  "paths": [],
+  "what": "## <a id=\"dcc-1\"></a>DCC1. To codegen-rq-mir-constcheck (`hir-ty-mir` `const_check`): the `Deref` impl's `Target` of a deref coercion\n\nWhat: `ConstCheckKind::NonConstDerefCoercion` gets `deref_target: Option<TypeAliasId>`, the\n`type Target` of the `Deref` impl the call resolves to. That is rustc's `call_kind`\n`deref_target_span`: `Instance::try_resolve(deref, args)`, its parent an impl, and\n`specialization_graph::assoc_def(impl, deref_target)` final, else `None`\n(`compiler/rustc_trait_selection/src/error_reporting/traits/call_kind.rs`). `callee` is\n`Deref::deref` itself, so blaze-diagnostics can't find the impl without solving.\n\nWhy: rustc's `NonConstDerefCoercion` has the span note \"deref defined here\" at it. The lowering\nwrites \"attempting to deref into `{target}`\" and, once this lands, the span note at\n`def_range_view` of the alias's source.",
+  "state": "open",
+  "created": "2026-10-30T07:23:53Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-constcheck.md#<a id=\"dcc-1\"></a>DCC1. To codegen-rq-mir-constcheck (`hir-ty-mir` `const_check`): the `Deref` impl's `Target` of a deref coercion",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-constcheck.md:7"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> codegen-rq-mir-constcheck: addressed to codegen-rq-mir-constcheck (hir-ty-mir const_check, lane codegen), which is live"
+    }
+  ]
+}

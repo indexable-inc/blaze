@@ -1,39 +1,53 @@
 //! Interning of slices, potentially with a header.
 //!
-//! See [`crate::intern`] for an explanation of interning modes. Note that slice interning is currently
-//! available only in GC mode (there is no other need).
+//! See [`crate::intern`] for how interned values live. [`InternedSlice`] and
+//! [`InternedSliceRef`] are essentially [`Interned<(Header, Box<[SliceType]>)>`][crate::Interned]
+//! and [`InternedRef`][crate::InternedRef] with the same types, but more optimized: the header,
+//! the length and the slice are stored once, together, and the pointer is thin.
 //!
-//! [`InternedSlice`] and [`InternedSliceRef`] are essentially [`Interned<(Header, Box<[SliceType]>)>`][crate::Interned]
-//! and [`InternedRef`][crate::InternedRef] with the same types, but more optimized. There is only one
-//! allocation and the pointer is thin.
+//! Safe code: the typed store, the value's layout and the handle's pointer are
+//! [`crate::typed`]'s.
 
 use std::{
-    ffi::c_void,
     fmt::{self, Debug},
     hash::{BuildHasher, Hash, Hasher},
     marker::PhantomData,
-    mem::ManuallyDrop,
     ops::Deref,
-    ptr::{self, NonNull},
-    sync::OnceLock,
 };
 
-use dashmap::{DashMap, SharedValue};
-use rustc_hash::FxBuildHasher;
-use triomphe::{HeaderSlice, HeaderWithLength, ThinArc};
+use blaze_hash::FixedState;
 
-type InternMap<T> = DashMap<
-    ThinArc<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>,
-    (),
-    FxBuildHasher,
->;
-type Pointee<T> = HeaderSlice<
-    HeaderWithLength<<T as SliceInternable>::Header>,
-    [<T as SliceInternable>::SliceType],
->;
+use crate::{
+    sync::OnceLock,
+    typed::{SlicePtr, Slices},
+};
 
+/// A header followed by a slice, laid out as one value.
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct HeaderSlice<H, S: ?Sized> {
+    pub header: H,
+    pub slice: S,
+}
+
+/// A header with the length of the slice after it.
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct HeaderWithLength<H> {
+    pub header: H,
+    pub length: usize,
+}
+
+type Pointee<T> =
+    crate::typed::Pointee<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>;
+
+type Ptr<T> = SlicePtr<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>;
+
+/// `Send` and `Sync`, as its header and items are.
 pub struct InternedSlice<T: SliceInternable> {
-    arc: ThinArc<T::Header, T::SliceType>,
+    /// The start of a value of `T::storage()`, never moved or freed.
+    ptr: Ptr<T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: SliceInternable> InternedSlice<T> {
@@ -42,119 +56,22 @@ impl<T: SliceInternable> InternedSlice<T> {
         header: T::Header,
         slice: &[T::SliceType],
     ) -> InternedSliceRef<'a, T> {
-        const { assert!(T::USE_GC) };
-
-        let storage = T::storage().get();
-        let hash = Self::hash(storage, &header, slice);
-        let id = ptr::from_ref(storage).addr();
-        let same = |ptr: *const c_void| {
-            // SAFETY: What this thread interned in this epoch is not freed yet, and the pointer
-            // is a `ThinArc`'s.
-            let other = unsafe {
-                InternedSliceRef::<T> {
-                    ptr: NonNull::new_unchecked(ptr.cast_mut()),
-                    _marker: PhantomData,
-                }
-            };
-            let other = other.get();
-            other.header.header == header && other.slice == *slice
-        };
-        if let Some(mine) = crate::local::find(id, hash, |it| same(it.cast())) {
-            // SAFETY: As in `same`.
-            return unsafe {
-                InternedSliceRef {
-                    ptr: NonNull::new_unchecked(mine.cast_mut().cast()),
-                    _marker: PhantomData,
-                }
-            };
-        }
-        let shard = &storage.shards()[storage.determine_shard(hash as usize)];
-        // Nearly every slice interned already is, and is asked for from many threads at once:
-        // looking under a lock other readers share finds it without waiting on them.
-        {
-            let read = shard.read();
-            let found = read
-                .find(hash, |(other, _)| other.header.header == header && other.slice == *slice);
-            if let Some(bucket) = found {
-                // SAFETY: The bucket is read while its shard is locked; a collection, which frees
-                // it, runs only when no reference to one is alive. The pointer is a `ThinArc`'s.
-                let ptr = unsafe { ThinArc::as_ptr(&bucket.as_ref().0) };
-                crate::local::remember(id, hash, ptr.cast());
-                return unsafe {
-                    InternedSliceRef {
-                        // INVARIANT: We create it from a `ThinArc`.
-                        ptr: NonNull::new_unchecked(ptr.cast_mut()),
-                        _marker: PhantomData,
-                    }
-                };
-            }
-        }
-        let mut shard = shard.write();
-        // Atomically,
-        // - check if `obj` is already in the map
-        //   - if so, clone its `Arc` and return it
-        //   - if not, box it up, insert it, and return a clone
-        // This needs to be atomic (locking the shard) to avoid races with other thread, which could
-        // insert the same object between us looking it up and inserting it.
-        let bucket = match shard.find_or_find_insert_slot(
-            hash,
-            |(other, _)| other.header.header == header && other.slice == *slice,
-            |(x, _)| storage.hasher().hash_one(x),
-        ) {
-            Ok(bucket) => bucket,
-            // SAFETY: The slot came from `find_or_find_insert_slot()`, and the table wasn't modified since then.
-            Err(insert_slot) => unsafe {
-                shard.insert_in_slot(
-                    hash,
-                    insert_slot,
-                    (ThinArc::from_header_and_slice(header, slice), SharedValue::new(())),
-                )
-            },
-        };
-        // SAFETY: We just retrieved/inserted this bucket.
-        let ptr = unsafe { ThinArc::as_ptr(&bucket.as_ref().0) };
-        crate::local::remember(id, hash, ptr.cast());
-        // `NonNull::new_unchecked()` is safe because the pointer originates from a `ThinArc`.
-        unsafe {
-            InternedSliceRef {
-                // INVARIANT: We create it from a `ThinArc`.
-                ptr: NonNull::new_unchecked(ptr.cast_mut()),
-                _marker: PhantomData,
-            }
-        }
-    }
-
-    #[inline]
-    fn hash(storage: &'static InternMap<T>, header: &T::Header, slice: &[T::SliceType]) -> u64 {
-        storage.hasher().hash_one(HeaderSlice {
-            header: HeaderWithLength { header, length: slice.len() },
-            slice,
-        })
-    }
-
-    #[inline(always)]
-    fn ptr(&self) -> *const c_void {
-        self.arc.as_ptr()
+        let hash = FixedState.hash_one((&header, slice));
+        let ptr = T::storage().get().intern(hash, header, slice);
+        InternedSliceRef { ptr, _marker: PhantomData }
     }
 
     #[inline]
     pub fn as_ref(&self) -> InternedSliceRef<'_, T> {
-        InternedSliceRef {
-            // SAFETY: `self.ptr` comes from a valid `ThinArc`, so non null.
-            // INVARIANT: We create it from a `ThinArc`.
-            ptr: unsafe { NonNull::new_unchecked(self.ptr().cast_mut()) },
-            _marker: PhantomData,
-        }
+        InternedSliceRef { ptr: self.ptr, _marker: PhantomData }
     }
 }
 
 /// Compares interned `Ref`s using pointer equality.
 impl<T: SliceInternable> PartialEq for InternedSlice<T> {
-    // NOTE: No `?Sized` because `ptr_eq` doesn't work right with trait objects.
-
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.arc.as_ptr() == other.arc.as_ptr()
+        self.ptr == other.ptr
     }
 }
 
@@ -163,7 +80,7 @@ impl<T: SliceInternable> Eq for InternedSlice<T> {}
 impl<T: SliceInternable> Hash for InternedSlice<T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.ptr().addr())
+        state.write_usize(self.ptr.addr())
     }
 }
 
@@ -172,16 +89,18 @@ impl<T: SliceInternable> Deref for InternedSlice<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.arc
+        self.ptr.get()
     }
 }
 
 impl<T: SliceInternable> Clone for InternedSlice<T> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { arc: self.arc.clone() }
+        *self
     }
 }
+
+impl<T: SliceInternable> Copy for InternedSlice<T> {}
 
 impl<T> Debug for InternedSlice<T>
 where
@@ -190,86 +109,50 @@ where
     T::Header: Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (*self.arc).fmt(f)
+        (**self).fmt(f)
     }
 }
 
+/// `Send` and `Sync`, as its header and items are.
 #[repr(transparent)]
-pub struct InternedSliceRef<'a, T> {
-    /// # Invariant
-    ///
-    /// There is no `ThinArcBorrow` unfortunately, so this is basically a `ManuallyDrop<ThinArc>`,
-    /// except that can't be `Copy`, so we store a raw pointer instead.
-    ptr: NonNull<c_void>,
-    _marker: PhantomData<&'a T>,
+pub struct InternedSliceRef<'a, T: SliceInternable> {
+    /// The start of a value of `T::storage()`, never moved or freed.
+    ptr: Ptr<T>,
+    _marker: PhantomData<(fn() -> T, &'a ())>,
 }
-
-// SAFETY: This is essentially a `ThinArc`, implemented as a raw pointer because there is no `ThinArcBorrowed`.
-unsafe impl<T: Send + Sync> Send for InternedSliceRef<'_, T> {}
-unsafe impl<T: Send + Sync> Sync for InternedSliceRef<'_, T> {}
 
 impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {
-    #[inline(always)]
-    fn arc(self) -> ManuallyDrop<ThinArc<T::Header, T::SliceType>> {
-        // SAFETY: `self.ptr`'s invariant.
-        unsafe { ManuallyDrop::new(ThinArc::from_raw(self.ptr.as_ptr())) }
-    }
-
     #[inline]
     pub fn to_owned(self) -> InternedSlice<T> {
-        InternedSlice { arc: (*self.arc()).clone() }
+        InternedSlice { ptr: self.ptr, _marker: PhantomData }
     }
 
     #[inline]
     pub fn get(self) -> &'a Pointee<T> {
-        // SAFETY: This is a lifetime extension, valid because we live for `'a`.
-        unsafe { &*ptr::from_ref::<Pointee<T>>(&*self.arc()) }
+        self.ptr.get()
     }
 
-    /// # Safety
-    ///
-    /// You have to make sure the data is not referenced after the refcount reaches zero; beware the interning
-    /// map also keeps a reference to the value.
-    #[inline]
-    pub unsafe fn decrement_refcount(self) {
-        drop(ManuallyDrop::into_inner(self.arc()));
-    }
-
-    #[inline]
-    pub(crate) fn strong_count(self) -> usize {
-        ThinArc::strong_count(&self.arc())
-    }
-
-    #[inline]
-    pub(crate) fn as_raw(self) -> *const c_void {
-        self.arc().as_ptr()
-    }
-
-    /// **Available only on GC mode**.
-    ///
-    /// Changes the attached lifetime, as in GC mode, the lifetime is more kind of a lint to prevent misuse
-    /// than actual soundness check.
+    /// Changes the attached lifetime: interned values live for the process, so the lifetime is
+    /// only a lint against misuse, not a soundness check.
     #[inline]
     pub fn change_lifetime<'b>(self) -> InternedSliceRef<'b, T> {
-        const { assert!(T::USE_GC) };
-        // SAFETY: The lifetime on `InternedSliceRef` is essentially advisory only for GCed types.
-        unsafe { std::mem::transmute::<InternedSliceRef<'a, T>, InternedSliceRef<'b, T>>(self) }
+        InternedSliceRef { ptr: self.ptr, _marker: PhantomData }
     }
 }
 
-impl<T> Clone for InternedSliceRef<'_, T> {
+impl<T: SliceInternable> Clone for InternedSliceRef<'_, T> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T> Copy for InternedSliceRef<'_, T> {}
+impl<T: SliceInternable> Copy for InternedSliceRef<'_, T> {}
 
 impl<T: SliceInternable> Hash for InternedSliceRef<'_, T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.ptr.as_ptr().addr());
+        state.write_usize(self.ptr.addr());
     }
 }
 
@@ -303,7 +186,7 @@ where
 }
 
 pub struct InternSliceStorage<T: SliceInternable> {
-    map: OnceLock<InternMap<T>>,
+    store: OnceLock<Slices<T::Header, T::SliceType>>,
 }
 
 #[allow(
@@ -312,37 +195,34 @@ pub struct InternSliceStorage<T: SliceInternable> {
 )]
 impl<T: SliceInternable> InternSliceStorage<T> {
     pub const fn new() -> Self {
-        Self { map: OnceLock::new() }
+        Self { store: OnceLock::new() }
     }
 }
 
 impl<T: SliceInternable> InternSliceStorage<T> {
-    pub(crate) fn get(&self) -> &InternMap<T> {
-        self.map.get_or_init(|| {
-            DashMap::with_capacity_and_hasher(
-                (64 * 1024) / std::mem::size_of::<T::SliceType>(),
-                Default::default(),
-            )
-        })
+    pub(crate) fn get(&self) -> &Slices<T::Header, T::SliceType> {
+        self.store.get_or_init(Slices::new)
     }
 }
 
 pub trait SliceInternable: Sized + 'static {
-    const USE_GC: bool;
     type Header: Eq + Hash + Send + Sync;
     type SliceType: Eq + Hash + Send + Sync + Copy + 'static;
     fn storage() -> &'static InternSliceStorage<Self>;
 }
 
 /// Implements `SliceInternable` for a given list of types, making them usable with `InternedSlice`.
+/// `gc;` is accepted and means the same: every interned slice lives for the process.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _impl_slice_internable {
     ( gc; $tag:ident, $h:ty, $t:ty $(,)? ) => {
+        $crate::_impl_slice_internable!($tag, $h, $t);
+    };
+    ( $tag:ident, $h:ty, $t:ty $(,)? ) => {
         #[allow(unreachable_pub)]
         pub struct $tag;
         impl $crate::SliceInternable for $tag {
-            const USE_GC: bool = true;
             type Header = $h;
             type SliceType = $t;
             fn storage() -> &'static $crate::InternSliceStorage<Self> {
@@ -354,3 +234,255 @@ macro_rules! _impl_slice_internable {
     };
 }
 pub use crate::_impl_slice_internable as impl_slice_internable;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    crate::impl_slice_internable!(gc; Numbers, String, u32);
+    type NumbersSlice = InternedSlice<Numbers>;
+
+    const _: () = assert!(size_of::<InternedSlice<Numbers>>() == size_of::<usize>());
+    const _: () = assert!(size_of::<InternedSliceRef<'static, Numbers>>() == size_of::<usize>());
+
+    #[test]
+    fn simple_slices() {
+        let d = NumbersSlice::from_header_and_slice("abc".to_owned(), &[123, 456]);
+        let e = NumbersSlice::from_header_and_slice("abc".to_owned(), &[123, 456]);
+        assert_eq!(d, e);
+        assert_eq!(d.to_owned(), e.to_owned());
+        assert_eq!(d.header.length, 2);
+        assert_eq!(d.header.header, "abc");
+        assert_eq!(d.slice, [123, 456]);
+        let other_header = NumbersSlice::from_header_and_slice("abd".to_owned(), &[123, 456]);
+        let longer = NumbersSlice::from_header_and_slice("abc".to_owned(), &[123, 456, 0]);
+        let empty = NumbersSlice::from_header_and_slice("abc".to_owned(), &[]);
+        assert_ne!(d, other_header);
+        assert_ne!(d, longer);
+        assert_ne!(d, empty);
+        assert!(empty.slice.is_empty());
+        assert_eq!(empty.header.length, 0);
+        assert_eq!(empty, NumbersSlice::from_header_and_slice("abc".to_owned(), &[]));
+        assert_eq!(d.to_owned().as_ref(), d);
+        let longer_life: InternedSliceRef<'static, Numbers> = d.change_lifetime();
+        assert_eq!(longer_life, d);
+    }
+
+    crate::impl_slice_internable!(Wide, u8, u128);
+
+    /// A header smaller than the slice's alignment: the elements are still aligned.
+    #[test]
+    fn slices_are_aligned() {
+        for len in 0..64u128 {
+            let slice: Vec<u128> = (0..len).collect();
+            let interned = InternedSlice::<Wide>::from_header_and_slice(len as u8, &slice);
+            assert_eq!(interned.slice.as_ptr().addr() % align_of::<u128>(), 0);
+            assert_eq!(interned.slice, slice[..]);
+            assert_eq!(interned.header.header, len as u8);
+        }
+    }
+
+    #[cfg(not(blaze_check))]
+    crate::impl_slice_internable!(Racing, (), u64);
+
+    /// Threads interning overlapping new slices in different orders get pointer-equal handles.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn slices_race_to_one_handle() {
+        const THREADS: u64 = 16;
+        const VALUES: u64 = 5_000;
+        let slice = |n: u64| -> Vec<u64> { (0..n % 17).map(|i| n * 31 + i).collect() };
+        let seen: Vec<Vec<InternedSlice<Racing>>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        (0..VALUES)
+                            .map(|n| {
+                                let n = (n + worker * 331) % VALUES;
+                                InternedSlice::<Racing>::from_header_and_slice((), &slice(n))
+                                    .to_owned()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        // Every `n` a multiple of 17 makes the one empty slice.
+        let distinct: std::collections::HashSet<Vec<u64>> = (0..VALUES).map(slice).collect();
+        assert_eq!(<Racing as SliceInternable>::storage().get().len(), distinct.len());
+        for (worker, handles) in seen.iter().enumerate() {
+            for (i, handle) in handles.iter().enumerate() {
+                let n = (i as u64 + worker as u64 * 331) % VALUES;
+                assert_eq!(handle.slice, slice(n)[..]);
+                assert_eq!(
+                    handle.as_ref(),
+                    InternedSlice::<Racing>::from_header_and_slice((), &slice(n))
+                );
+            }
+        }
+    }
+
+    #[cfg(not(blaze_check))]
+    crate::impl_slice_internable!(Kept, String, u16);
+
+    /// Enough slices to fill many chunks of every shard: the first still read their contents.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn slice_handles_stay_valid() {
+        let early: Vec<_> = (0..256u16)
+            .map(|n| {
+                InternedSlice::<Kept>::from_header_and_slice(format!("early {n}"), &[n, n + 1])
+                    .to_owned()
+            })
+            .collect();
+        for n in 0..100_000u32 {
+            InternedSlice::<Kept>::from_header_and_slice(format!("later {n}"), &[n as u16; 5]);
+        }
+        for (n, handle) in (0..256u16).zip(&early) {
+            assert_eq!(handle.header.header, format!("early {n}"));
+            assert_eq!(handle.slice, [n, n + 1]);
+            assert_eq!(
+                handle.as_ref(),
+                InternedSlice::<Kept>::from_header_and_slice(format!("early {n}"), &[n, n + 1])
+            );
+        }
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
+/// model_`): a slice type's first interns racing to make its store, against a set: the header
+/// kept is the first intern's of each value, every other header is dropped once, equal slices
+/// get one handle, and a handle reads its header, length and items whole.
+#[cfg(all(test, blaze_check))]
+#[allow(unsafe_code, reason = "each execution's storage is reached through a pointer the test sets and clears")]
+mod model {
+    use std::{
+        ptr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+        },
+    };
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
+    use super::*;
+
+    /// A header that says when it is dropped. An interned header never is, so one dropped by
+    /// the time `from_header_and_slice` returns was found there already.
+    struct Counted {
+        value: u64,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Counted {
+        fn new(value: u64) -> (Counted, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (Counted { value, dropped: dropped.clone() }, dropped)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            assert!(!self.dropped.swap(true, Relaxed), "a header dropped twice");
+        }
+    }
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Counted) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl Hash for Counted {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
+        }
+    }
+
+    struct Modeled;
+
+    /// This execution's storage. A `static` one would keep the store the first execution made,
+    /// whose atomics each later execution starts again from null while its values stay.
+    static CURRENT: AtomicPtr<InternSliceStorage<Modeled>> = AtomicPtr::new(ptr::null_mut());
+
+    impl SliceInternable for Modeled {
+        type Header = Counted;
+        type SliceType = u64;
+
+        fn storage() -> &'static InternSliceStorage<Modeled> {
+            // SAFETY: `model_first_slices_race` points `CURRENT` at a storage it frees only after
+            // joining every thread that interns, and clears it first. The model's threads are
+            // coroutines on its one OS thread, so this `Relaxed` load sees that store.
+            unsafe { CURRENT.load(Relaxed).as_ref() }.expect("a model's storage")
+        }
+    }
+
+    /// `value`'s items: one more than the value, so each value has its own layout.
+    fn items(value: u64) -> Vec<u64> {
+        (0..=value).map(|i| value * 100 + i).collect()
+    }
+
+    /// The sequential interner: bit `v` is set when value `v`'s slice is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u8);
+
+    impl Spec for Set {
+        /// The value whose header and items are interned.
+        type Op = u64;
+        /// Whether this call's header is the one kept: the slice was not there.
+        type Ret = bool;
+
+        fn apply(&mut self, &value: &u64) -> bool {
+            let new = self.0 & (1 << value) == 0;
+            self.0 |= 1 << value;
+            new
+        }
+    }
+
+    fn intern(history: &History<Set>, value: u64) -> InternedSlice<Modeled> {
+        let mut handle = None;
+        history.record(value, |&value| {
+            let (header, dropped) = Counted::new(value);
+            let items = items(value);
+            let interned = InternedSlice::<Modeled>::from_header_and_slice(header, &items);
+            assert!(
+                interned.header.header.value == value
+                    && interned.header.length == items.len()
+                    && interned.slice == items[..],
+                "a handle reads its header, length and items whole"
+            );
+            handle = Some(interned.to_owned());
+            !dropped.load(Relaxed)
+        });
+        handle.expect("a recorded intern")
+    }
+
+    #[test]
+    fn model_first_slices_race() {
+        blaze_check::model(|| {
+            let storage = Box::new(InternSliceStorage::<Modeled>::new());
+            CURRENT.store(ptr::from_ref(&*storage).cast_mut(), Relaxed);
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let history = history.clone();
+                thread::spawn(move || [1, 2].map(|value| intern(&history, value)))
+            };
+            let two = intern(&history, 2);
+            let one = intern(&history, 1);
+            let [one_there, two_there] = other.join().unwrap();
+            history.check(Set::default());
+            assert!(one == one_there && two == two_there, "equal slices, one handle");
+            assert!(one != two, "two slices, two handles");
+            assert_eq!(storage.get().len(), 2, "one store, made once");
+            CURRENT.store(ptr::null_mut(), Relaxed);
+            drop(storage);
+        });
+    }
+}

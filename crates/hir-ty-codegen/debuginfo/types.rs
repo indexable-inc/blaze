@@ -9,19 +9,21 @@
 //! vtable. Whatever else there is is told by name and size alone, which a debugger shows as
 //! a value without fields.
 
+use base_db::Db;
 use hir_def::{
     AdtId, EnumId, GenericDefId, VariantId, expr_store::ExpressionStore,
     hir::generics::GenericParamDataRef, item_tree::FieldsShape as Written,
 };
 
+use blaze_hash::{Equivalent, HashMap, SharedMap};
 use rustc_abi::{TagEncoding, Variants};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     UintTy,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 use intern::{Interned, Symbol};
 
@@ -38,15 +40,14 @@ use hir_ty::{
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
-    mir::is_by_move_coroutine,
+    mir::{MirOwner, MirStage},
     next_solver::{
         DbInterner, GenericArgs, StoredTy, Ty, TyKind, TypingMode,
-        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
-        obligation_ctxt::ObligationCtxt,
+        infer::{DbInternerInferExt, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_mir::mir::type_name::rustc_debug_name;
+use hir_ty_mir::mir::{normalize_or_keep, type_name::rustc_debug_name};
 
 /// A type of the program, and how many more pointers are followed from it.
 pub(crate) type Key = (StoredTy, u32);
@@ -56,9 +57,9 @@ pub(crate) type Key = (StoredTy, u32);
 /// (layouts, names, captures, discriminants) mostly stays as it was. It is of the type alone,
 /// with the types it is made of by their keys, so that it is kept once for every type that is
 /// made of it, and depends on nothing of theirs.
-#[salsa::tracked(returns(clone))]
+#[blaze_query::tracked(returns(clone))]
 pub(crate) fn told_type(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: StoredParamEnvAndCrate,
     ty: StoredTy,
     pointers: u32,
@@ -72,37 +73,52 @@ pub(crate) fn told_type(
 pub(crate) struct Sets(ByEnv<Key, Option<TypeSet>>);
 
 /// What is known of types by the environment they are in, which every thread that compiles
-/// asks of every variable it tells of: in shards by the type, each locked apart, and looked up
-/// without a copy of the environment or the type, whose counts every thread would write to.
-pub(crate) struct ByEnv<K, V>(Box<[Mutex<FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>>]>);
+/// asks of every variable it tells of: one lock-free table, looked up with no lock and without
+/// a copy of the environment or the type, whose counts every thread would write to.
+pub(crate) struct ByEnv<K, V>(SharedMap<(StoredParamEnvAndCrate, K), V>);
 
 impl<K, V> Default for ByEnv<K, V> {
     fn default() -> Self {
-        ByEnv((0..64).map(|_| Mutex::default()).collect())
+        ByEnv(SharedMap::default())
+    }
+}
+
+/// A key of [`ByEnv`], borrowed: hashed as the pair is, so a lookup counts nothing.
+struct Of<'a, K>(&'a StoredParamEnvAndCrate, &'a K);
+
+impl<K: std::hash::Hash> std::hash::Hash for Of<'_, K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+impl<K: Eq> Equivalent<(StoredParamEnvAndCrate, K)> for Of<'_, K> {
+    fn equivalent(&self, (env, key): &(StoredParamEnvAndCrate, K)) -> bool {
+        self.0 == env && self.1 == key
     }
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> ByEnv<K, V> {
-    fn shard(&self, key: &K) -> MutexGuard<'_, FxHashMap<StoredParamEnvAndCrate, FxHashMap<K, V>>> {
-        use std::hash::BuildHasher as _;
-        let hash = rustc_hash::FxBuildHasher.hash_one(key);
-        let shard = &self.0[(hash >> 32) as usize % self.0.len()];
-        shard.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub(crate) fn get(&self, env: &StoredParamEnvAndCrate, key: &K) -> Option<V> {
-        self.shard(key).get(env)?.get(key).cloned()
+        self.0.pin().get(&Of(env, key)).cloned()
     }
 
     pub(crate) fn insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) {
-        let mut shard = self.shard(key);
-        shard.entry(env.clone()).or_default().insert(key.clone(), value);
+        // clone: the environment and the key kept, counts; once per type kept
+        self.0.pin().insert((env.clone(), key.clone()), value);
     }
 
     /// What was kept of `key` before, or else `value`, kept now.
     pub(crate) fn or_insert(&self, env: &StoredParamEnvAndCrate, key: &K, value: V) -> V {
-        let mut shard = self.shard(key);
-        shard.entry(env.clone()).or_default().entry(key.clone()).or_insert(value).clone()
+        let types = self.0.pin();
+        if let Some(kept) = types.get(&Of(env, key)) {
+            // clone: a count of what was kept, which the caller takes owned
+            return kept.clone();
+        }
+        // clone: the environment and the key kept, counts; once per type kept. Of two threads
+        // that keep one key at once, the first's value is what both return.
+        types.get_or_insert((env.clone(), key.clone()), value).clone()
     }
 }
 
@@ -110,7 +126,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> ByEnv<K, V> {
 /// from [`told_type`] of each. `None` is a type that has no layout or no name rustc would
 /// spell.
 pub(crate) fn described(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: &StoredParamEnvAndCrate,
     ty: &StoredTy,
     sets: &Sets,
@@ -120,7 +136,7 @@ pub(crate) fn described(
 }
 
 struct InDatabase<'a> {
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     env: &'a StoredParamEnvAndCrate,
     sets: &'a Sets,
 }
@@ -129,6 +145,7 @@ impl set::Found for InDatabase<'_> {
     type Key = Key;
 
     fn own(&mut self, (ty, pointers): &Key) -> Option<Arc<Own<Key>>> {
+        // clone: the query takes its keys owned, counts; once per type no set was kept of
         told_type(self.db, self.env.clone(), ty.clone(), *pointers)
     }
 
@@ -158,29 +175,30 @@ const POINTERS: u32 = 2;
 /// nothing but the type, so it is found once for every function with a variable of it: the
 /// layouts and the names are most of what telling of variables costs.
 struct Types<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     interner: DbInterner<'db>,
     infcx: InferCtxt<'db>,
     /// The types the one being told of is made of so far, by the places the [`DebugType`] it
     /// is told as names them by.
     parts: Vec<Made<Key>>,
-    names: FxHashMap<Ty<'db>, Option<String>>,
-    normalized: FxHashMap<Ty<'db>, Ty<'db>>,
+    names: HashMap<Ty<'db>, Option<String>>,
+    normalized: HashMap<Ty<'db>, Ty<'db>>,
 }
 
 impl<'db> Types<'db> {
-    fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>) -> Self {
+    fn new(db: &'db Db, env: ParamEnvAndCrate<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
-        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
         Types {
             db,
             env,
             interner,
             infcx,
+            // alloc: empty until a type is told of; its parts end in the `Own` kept
             parts: Vec::new(),
-            names: FxHashMap::default(),
-            normalized: FxHashMap::default(),
+            names: HashMap::default(),
+            normalized: HashMap::default(),
         }
     }
 
@@ -198,15 +216,18 @@ impl<'db> Types<'db> {
     /// no layout or no name rustc would spell.
     fn own(&mut self, ty: Ty<'db>, pointers: u32) -> Option<Own<Key>> {
         let layout = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
-        let name = self.name(ty)?;
+        // alloc: the type's name, kept in what it is told as
+        let name = self.name(ty)?.to_owned();
         let told = self.told_as(ty, name, &layout, pointers)?;
         Some(self.owned(&told))
     }
 
     /// `told`, made of the types it names among [`Self::parts`].
     fn owned(&self, told: &DebugType) -> Own<Key> {
+        // alloc: the places of the types it is made of, once per type told of on a miss
         let mut of = Vec::new();
         let told = Interned::new(set::shape(told, &mut of));
+        // clone: a part's key is counts; alloc: the `Own`'s parts, kept; once per type on a miss
         Own { told, of: of.into_iter().map(|at| self.parts[at as usize].clone()).collect() }
     }
 
@@ -228,9 +249,9 @@ impl<'db> Types<'db> {
     }
 
     /// What rustc calls the type, which is asked of every variable the type is part of.
-    fn name(&mut self, ty: Ty<'db>) -> Option<String> {
+    fn name(&mut self, ty: Ty<'db>) -> Option<&str> {
         let db = self.db;
-        self.names.entry(ty).or_insert_with(|| rustc_debug_name(db, ty)).clone()
+        self.names.entry(ty).or_insert_with(|| rustc_debug_name(db, ty)).as_deref()
     }
 
     fn told_as(
@@ -262,10 +283,12 @@ impl<'db> Types<'db> {
                 return Some(DebugType::Array { of: self.ty(element, pointers)?, len });
             }
             TyKind::Tuple(tys) => {
+                of.fields.reserve(tys.len());
                 for (index, ty) in tys.iter().enumerate() {
                     let offset = layout.fields.offset(index).bytes();
                     // A field of a type that is not told of is left out.
                     if let Some(ty) = self.ty(ty, pointers) {
+                        // alloc: `Field`'s name is a `String`, interned by `set::shape`
                         of.fields.push(Field { name: format!("__{index}"), offset, ty });
                     }
                 }
@@ -324,14 +347,16 @@ impl<'db> Types<'db> {
     ) -> Option<Vec<Field>> {
         let written = variant.fields(self.db);
         let tuple = written.shape == Written::Tuple;
-        let mut fields = Vec::new();
-        for (id, ty) in self.db.field_types(variant).iter() {
+        let types = self.db.field_types(variant);
+        let mut fields = Vec::with_capacity(types.len());
+        for (id, ty) in types.iter() {
             let index = u32::from(id.into_raw()) as usize;
-            let name = written.fields()[id].name.as_str();
-            let name = if tuple { format!("__{name}") } else { name.to_owned() };
             let ty = ty.ty().instantiate(self.interner, args).skip_norm_wip();
             let offset = offset_of(index);
             if let Some(ty) = self.ty(ty, pointers) {
+                let name = written.fields()[id].name.as_str();
+                // alloc: `Field`'s name is a `String`, interned by `set::shape`
+                let name = if tuple { format!("__{name}") } else { name.to_owned() };
                 fields.push(Field { name, offset, ty });
             }
         }
@@ -346,22 +371,17 @@ impl<'db> Types<'db> {
         args: GenericArgs<'db>,
         pointers: u32,
     ) -> Vec<(String, TypeIndex)> {
-        let names: Vec<Option<String>> = generics(self.db, def)
-            .iter_self()
-            .map(|(_, parameter)| match parameter {
-                GenericParamDataRef::TypeParamData(it) => {
-                    it.name.as_ref().map(|name| name.as_str().to_owned())
-                }
-                _ => None,
-            })
-            .collect();
+        let generics = generics(self.db, def);
+        // alloc: empty until a parameter is told of; the parameters are kept in the type
         let mut parameters = Vec::new();
-        for (name, arg) in names.into_iter().zip(args.iter()) {
-            if let Some(name) = name
+        for ((_, parameter), arg) in generics.iter_self().zip(args.iter()) {
+            if let GenericParamDataRef::TypeParamData(it) = parameter
+                && let Some(name) = &it.name
                 && let Some(ty) = arg.ty()
                 && let Some(ty) = self.ty(ty, pointers)
             {
-                parameters.push((name, ty));
+                // alloc: the parameter's name, a `String` of `Aggregate`'s
+                parameters.push((name.as_str().to_owned(), ty));
             }
         }
         parameters
@@ -384,7 +404,9 @@ impl<'db> Types<'db> {
                 let (name, (variant, _)) = written.get_index(index.0)?;
                 let offset_of = |it| layout.fields.offset(it).bytes();
                 let fields = self.fields((*variant).into(), args, offset_of, pointers)?;
+                // alloc: the variant's name, a `String` of `Variant`'s
                 let variant = Variant { name: name.as_str().to_owned(), tag: None, fields };
+                // alloc: the one variant, kept in the type
                 return Some(DebugType::Enum { of, tag: None, variants: vec![variant] });
             }
             Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
@@ -399,7 +421,7 @@ impl<'db> Types<'db> {
             size @ 1..8 => (1 << (size * 8)) - 1,
             _ => return Some(DebugType::Struct(of)),
         };
-        let mut variants = Vec::new();
+        let mut variants = Vec::with_capacity(layouts.len());
         let mut fieldless = true;
         for (index, layout) in layouts.iter_enumerated() {
             let (name, (variant, _)) = written.get_index(index.0)?;
@@ -416,9 +438,11 @@ impl<'db> Types<'db> {
             let offset_of = |it| layout.field_offsets[RustcFieldIdx::new(it)].bytes();
             let fields = self.fields((*variant).into(), args, offset_of, pointers)?;
             fieldless &= fields.is_empty();
+            // alloc: the variant's name, a `String` of `Variant`'s
             variants.push(Variant { name: name.as_str().to_owned(), tag: value, fields });
         }
         if fieldless && matches!(encoding, TagEncoding::Direct) {
+            // alloc: the names of the values, kept in the type
             let names = variants.into_iter().filter_map(|it| Some((it.name, it.tag?))).collect();
             return Some(DebugType::Names { name: of.name, size: of.size, names });
         }
@@ -454,6 +478,7 @@ impl<'db> Types<'db> {
                 };
                 let first = match first == to {
                     true => {
+                        // alloc: the pointer's name, a `String` of `DebugType`'s
                         let name = format!("*const {}", self.name(to)?);
                         let whole = DebugType::Pointer { name, to: self.followed(to, pointers) };
                         self.unnamed(whole)
@@ -464,6 +489,7 @@ impl<'db> Types<'db> {
             }
             TyKind::Dynamic(bounds, _) => {
                 let value = DebugType::Pointer {
+                    // alloc: the pointer's name, a `String` of `DebugType`'s
                     name: format!("*mut {}", self.name(to)?),
                     to: self.followed(to, pointers),
                 };
@@ -484,33 +510,31 @@ impl<'db> Types<'db> {
                 let len = (HEADER + slots) as u64;
                 let table = DebugType::Array { of: self.ty(usize, pointers)?, len };
                 let table = self.unnamed(table);
-                let table =
-                    DebugType::Pointer { name: format!("&[usize; {len}]"), to: Some(table) };
+                // alloc: the pointer's name, a `String` of `DebugType`'s
+                let name = format!("&[usize; {len}]");
+                let table = DebugType::Pointer { name, to: Some(table) };
                 (["pointer", "vtable"], self.unnamed(value), self.unnamed(table))
             }
             _ => return Some(DebugType::Struct(of)),
         };
-        let fields = vec![
-            Field { name: names[0].to_owned(), offset: 0, ty: first },
-            Field { name: names[1].to_owned(), offset: word, ty: second },
-        ];
+        // alloc: a field's name, a `String` of `Field`'s
+        let field = |nth: usize, offset, ty| Field { name: names[nth].to_owned(), offset, ty };
+        // alloc: the two fields of a wide pointer, kept in the type
+        let fields = vec![field(0, 0, first), field(1, word, second)];
         Some(DebugType::Struct(Aggregate { fields, ..of }))
     }
 
     /// The part of a type whose size is not known until the program runs: the type, or the
     /// last field of a struct or a tuple, down to one that is neither.
     fn tail(&self, of: Ty<'db>) -> Ty<'db> {
-        let normalize = |ty| {
-            ObligationCtxt::new(&self.infcx)
-                .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
-                .unwrap_or(ty)
-        };
+        let normalize = |ty| normalize_or_keep(&self.infcx, self.env.param_env, ty);
         struct_tail_erasing_lifetimes(self.db, of, &normalize)
     }
 
     /// A type that is part of the one being told of and is no type of the program's.
     fn unnamed(&mut self, ty: DebugType) -> TypeIndex {
         let own = self.owned(&ty);
+        // alloc: kept in the `Own` of the type it is part of; a wide pointer's halves only
         self.part(Made::Inline(Box::new(own)))
     }
 
@@ -525,15 +549,16 @@ impl<'db> Types<'db> {
         offset_of: impl Fn(usize) -> u64,
         pointers: u32,
     ) -> Vec<Field> {
+        // alloc: empty, allocates nothing
         let TyKind::Tuple(upvars) = upvars.kind() else { return Vec::new() };
         let names = self.capture_names(closure).filter(|names| names.len() == upvars.len());
-        let mut fields = Vec::new();
+        let mut names = names.map(Vec::into_iter);
+        let mut fields = Vec::with_capacity(upvars.len());
         for (index, ty) in upvars.iter().enumerate() {
-            let name = match &names {
-                Some(names) => names[index].clone(),
-                None => format!("__{index}"),
-            };
+            let name = names.as_mut().and_then(Iterator::next);
             if let Some(ty) = self.ty(ty, pointers) {
+                // alloc: `Field`'s name is a `String`, interned by `set::shape`
+                let name = name.unwrap_or_else(|| format!("__{index}"));
                 fields.push(Field { name, offset: offset_of(index), ty });
             }
         }
@@ -546,6 +571,7 @@ impl<'db> Types<'db> {
         let captured = infer.closures_data.get(&closure.expr)?.min_captures.values().flatten();
         captured
             .map(|capture| {
+                // alloc: the capture's name, a `String` of `Field`'s
                 let mut name = String::new();
                 if capture.is_by_ref() {
                     name.push_str("_ref__");
@@ -555,18 +581,21 @@ impl<'db> Types<'db> {
                 for projection in &capture.place.projections {
                     if let ProjectionKind::Field { field_idx, variant_idx } = projection.kind {
                         name.push_str("__");
-                        name.push_str(&self.field_name(base, variant_idx, field_idx)?);
+                        self.field_name(base, variant_idx, field_idx, &mut name)?;
                     }
                     base = projection.ty.as_ref();
                 }
                 Some(name)
             })
+            // alloc: the names of a closure's captures, once per closure type on a miss
             .collect()
     }
 
-    /// The name of a field of a tuple, a struct or a variant of an enum.
-    fn field_name(&self, of: Ty<'db>, variant: u32, field: u32) -> Option<String> {
-        let TyKind::Adt(def, _) = of.kind() else { return Some(field.to_string()) };
+    /// Writes the name of a field of a tuple, a struct or a variant of an enum to `name`.
+    fn field_name(&self, of: Ty<'db>, variant: u32, field: u32, name: &mut String) -> Option<()> {
+        let TyKind::Adt(def, _) = of.kind() else {
+            return write!(name, "{field}").ok();
+        };
         let variant: VariantId = match def.def_id() {
             AdtId::StructId(id) => id.into(),
             AdtId::UnionId(id) => id.into(),
@@ -577,7 +606,8 @@ impl<'db> Types<'db> {
         };
         let fields = variant.fields(self.db);
         let (_, field) = fields.fields().iter().nth(field as usize)?;
-        Some(field.name.as_str().to_owned())
+        name.push_str(field.name.as_str());
+        Some(())
     }
 
     /// An `async` block, as rustc tells of one: an enum of not started, returned, panicked
@@ -601,31 +631,25 @@ impl<'db> Types<'db> {
         let captured =
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
         let parent_args = GenericArgs::new_from_slice(args.parent_args());
-        let body = match is_by_move_coroutine(self.db, id.0, args) {
-            true => self.db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-            false => self.db.monomorphized_runtime_mir_body_for_coroutine(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-        }
-        .ok()?;
+        let owner = MirOwner::coroutine(self.db, id.0, args);
+        let body = self
+            .db
+            .monomorphized_mir(owner, MirStage::Runtime, parent_args.store(), self.env.store())
+            .ok()?;
         let held = body.locals_held_across_yields();
         let closure = id.0.loc(self.db);
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
         let bindings = body.local_to_binding_map();
-        let mut told = Vec::new();
+        let mut told = Vec::with_capacity(CoroutineFrame::SUSPENDED + held.yields.len());
         for (state, name) in ["Unresumed", "Returned", "Panicked"].into_iter().enumerate() {
+            // clone: every state keeps what the block captured, as its fields
             let fields = captured.clone();
+            // alloc: the state's name, a `String` of `Variant`'s
             told.push(Variant { name: name.to_owned(), tag: Some(state as u64), fields });
         }
         let waiting = variants.iter().skip(CoroutineFrame::SUSPENDED);
         for (nth, (point, kept)) in held.yields.iter().zip(waiting).enumerate() {
-            let mut fields = Vec::new();
+            let mut fields = Vec::with_capacity(point.kept.len() + captured.len());
             let awaited = body.awaited(point);
             for (field, &local) in point.kept.iter().enumerate() {
                 let local = held.locals[local];
@@ -638,11 +662,13 @@ impl<'db> Types<'db> {
                 };
                 let offset = kept.field_offsets[RustcFieldIdx::new(field)].bytes();
                 if let Some(ty) = self.ty(body.locals[local].ty.as_ref(), pointers) {
+                    // alloc: `Field`'s name is a `String`, interned by `set::shape`
                     fields.push(Field { name: name.to_owned(), offset, ty });
                 }
             }
             fields.extend(captured.iter().cloned());
             let tag = Some((CoroutineFrame::SUSPENDED + nth) as u64);
+            // alloc: the state's name, a `String` of `Variant`'s
             told.push(Variant { name: format!("Suspend{nth}"), tag, fields });
         }
         Some(DebugType::Enum { of, tag: Some(Tag { offset, size, states: true }), variants: told })
@@ -655,8 +681,8 @@ impl<'db> Types<'db> {
             Some(pointers) => self.ty(to, pointers),
             None => {
                 let to = self.normalize(to);
-                let name = self.name(to)?;
-                Some(self.part(Made::Named(Symbol::intern(&name))))
+                let name = Symbol::intern(self.name(to)?);
+                Some(self.part(Made::Named(name)))
             }
         }
     }
@@ -669,9 +695,7 @@ impl<'db> Types<'db> {
         if let Some(&normalized) = self.normalized.get(&ty) {
             return normalized;
         }
-        let normalized = ObligationCtxt::new(&self.infcx)
-            .structurally_normalize_ty(&ObligationCause::dummy(), self.env.param_env, ty)
-            .unwrap_or(ty);
+        let normalized = normalize_or_keep(&self.infcx, self.env.param_env, ty);
         self.normalized.insert(ty, normalized);
         normalized
     }
@@ -680,6 +704,7 @@ impl<'db> Types<'db> {
 impl Aggregate {
     /// A type nothing is told of but its name and its size.
     fn opaque(name: String, size: u64) -> Aggregate {
+        // alloc: empty, allocates nothing until a field or a parameter is told of
         Aggregate { name, size, fields: Vec::new(), parameters: Vec::new() }
     }
 }

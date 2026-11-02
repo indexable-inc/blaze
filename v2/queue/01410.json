@@ -1,0 +1,31 @@
+{
+  "id": "01410",
+  "from_lane": "observe",
+  "owner": "coord-1030",
+  "paths": [
+    "flake.nix",
+    "nix/tracy.nix",
+    "docs/profiling.md"
+  ],
+  "what": "observe, addendum to 01405 (Andrew, 17:49): flake apps for Tracy beside apps.blaze. `nix run .#tracy` on macOS and Linux opens the viewer, ready to connect to a blaze built with --features tracy.\n\n1. nix/tracy.nix: copy docs/v2/plan/lanes/observe/tracy.nix (in the tree; it supersedes the /tmp/tracy-nix/tracy.nix named in 01405). It is Tracy v0.14.1, the exact version the fork's client speaks (tracing-tracy 0.12.0 / tracy-client-sys 0.30.0), with the source pinned by hash: fetchFromGitHub wolfpld/tracy rev v0.14.1, sha256-vcLI9jb7eYcR162LgBQ2P4A0oiZuYRfYRQiDhlAk5TI=. Its CPM sources are pinned by hash too. Our nixpkgs (e513db7b) only has tracy_0_13 = 0.13.1, so the file overrides that package's src rather than using it. Since 01405 one thing changed: on Linux the file now builds the X11/GLFW viewer (withWayland = false, Tracy's LEGACY, plus libx11), because nixpkgs' default Wayland-only viewer does not open on an X11 desktop; X11 also runs under Wayland through XWayland. On macOS that changes nothing. Built and run on aarch64-darwin before this change (/nix/store/3ckii861nny2asabf41xwv73ia77z6bc-tracy-0.14.1, tracy-capture and tracy-csvexport print 0.14.1). Linux is unbuilt: please build `.#tracy` on x86_64-linux and aarch64-linux. If find_package(X11) or GL fails there, those are the inputs to look at.\n\n2. flake.nix, in the `let` (next to `run`/`life`):\n        # Tracy v0.14.1, the version the client of blaze's feature `tracy` speaks (tracing-tracy\n        # 0.12.0; other versions refuse to connect): the viewer, tracy-capture and tracy-csvexport\n        # (docs/profiling.md).\n        tracy = import ./nix/tracy.nix { inherit pkgs; };\n   in packages: `inherit tracy;`\n   and beside apps.blaze:\n        # `nix run .#tracy`: Tracy's viewer, to connect to a blaze built with `--features tracy`.\n        apps.tracy = {\n          type = \"app\";\n          program = \"${tracy}/bin/tracy\";\n        };\n        apps.tracy-capture = {\n          type = \"app\";\n          program = \"${tracy}/bin/tracy-capture\";\n        };\n        apps.tracy-csvexport = {\n          type = \"app\";\n          program = \"${tracy}/bin/tracy-csvexport\";\n        };\n   and `tracy` in devShells.default's packages (01405 item 1).\n\n3. docs/profiling.md now leads with `nix run .#tracy` (draft: docs/v2/plan/lanes/observe/profiling.md, moved as 01405 item 2 says). One caveat it states: on a non-NixOS Linux the viewer needs the host's OpenGL driver (nixGL); `nix run` cannot fix that from inside the flake.\n\nCheck: `nix run .#tracy` opens the viewer on the Mac; `nix run .#tracy-capture -- -h` and `nix run .#tracy-csvexport -- -h` print 0.14.1; `nix flake check`.",
+  "state": "refused",
+  "created": "2026-11-01T01:22:54Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:22:54Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

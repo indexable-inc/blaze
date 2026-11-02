@@ -1,0 +1,46 @@
+{
+  "id": "00708",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/reference/crates.md",
+    "crates/blaze-manifest",
+    "crates/blaze-metadata",
+    "crates/blaze-resolve",
+    "crates/blaze-registry",
+    "crates/blaze-source",
+    "docs/v2/plan/process/building.md",
+    "docs/v2/plan.md",
+    "crates/blaze-manifest/src/files.rs",
+    "crates/blaze-units/src/load",
+    "docs/v2/plan/lanes/cargo/notes.md",
+    "harness/resolve.py"
+  ],
+  "what": "## 1. Ownership: blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry, blaze-source to lane cargo\n\nAPPLIED by the coordinator 2026-10-29 21:08 (crates.md). Use a closed set for `Files`, not\n`&dyn Files`: an enum `{ Disk, View(..) }` or a generic `F: Files` (lane dedyn).\n\nWhat: in `docs/v2/plan/reference/crates.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,\n`crates/blaze-resolve/`, `crates/blaze-registry/` and `crates/blaze-source/` to lane cargo's\npaths, and take `blaze-tree` and `blaze-units` out of the \"Every other path\" paragraph (the table\nalready gives them to cargo; the paragraph says they are the coordinator's).\n\nWhy: `docs/v2/plan/process/building.md` section 18 gives cargo \"everything cargo-shaped that no lane had\", and the workspace\nload as queries over a view can't be written without changing these crates. Today they read the\nmachine's disk directly: `blaze_manifest::manifest::read_manifest` (`std::fs::read`), target\nautodiscovery (`targets.rs`: `exists`, `is_file`, `read_dir`), workspace member globs\n(`manifest.rs`: `glob::glob`, `is_dir`), config discovery (`config/mod.rs`:\n`read_to_string`, `exists`), blaze-metadata's reads of registry packages, and blaze-registry's\nfetches. A query must read every file through `blaze_query::Cx` (so each read is an edge and\nthe result is keyed by what it read, docs/v2/plan.md section 2), and a view is a Merkle root,\nnot the disk (a what-if or a PR view has no directory). The change is one trait threaded\nthrough `blaze_manifest::Context`:\n\n```rust\n// crates/blaze-manifest/src/files.rs\n/// Every file the manifest, workspace and config readers look at, by absolute path as cargo\n/// names it. `Disk` reads the machine's (today's behavior); the workspace-load queries\n/// (crates/blaze-units/src/load/) read a view's through `blaze_query::Cx`.\npub trait Files {\n    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;\n    /// `None` for nothing there.\n    fn kind(&self, path: &Path) -> Option<FileKind>;\n    /// The names in a directory, sorted, each with whether it is a directory.\n    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>>;\n}\npub enum FileKind { File, Dir }\npub struct Disk;\n```\n\nwith `Context::with_files(config, files: Rc<dyn Files>)` and glob expansion done over `list`\n(cargo's `glob` semantics kept). blaze-metadata's registry reads take the same `Files`; fetching\nmoves to the daemon (effects), which mounts each fetched package as a VFS root\n(`docs/v2/plan/lanes/cargo/notes.md`, \"Sources\"). No behavior changes for a `Disk` context, which every\nv1 caller keeps; `harness/resolve.py` still holds them to cargo. Lane cargo writes all of it once\ngranted; until then its child cargo-load writes everything else.\n\n> forwarded to coordinator: the grant changes `docs/v2/plan/reference/crates.md` and five crates that are the coordinator's, neither among the paths `requests` applies; building.md section 18 (\"everything cargo-shaped that no lane had\") supports it.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:33:38Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/cargo.md#1. Ownership: blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry, blaze-source to lane cargo",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6"
+    },
+    {
+      "at": "2026-10-30T08:33:38Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:38Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "The grant was already in docs/v2/plan/reference/crates.md (cargo row lists blaze-manifest, -metadata, -resolve, -registry, -source; Every other path no longer names blaze-tree or blaze-units; coordinator 2026-10-29 21:08). Added the five crates to lane cargo bullet in docs/v2/plan/process/building.md so it matches. The code (Files enum or generic, lane dedyn) is lane cargo work."
+    }
+  ]
+}

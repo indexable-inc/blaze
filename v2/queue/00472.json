@@ -1,0 +1,21 @@
+{
+  "id": "00472",
+  "from_lane": "diagnostics-lints",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints: `crate::tests::ui` passes compiletest's flags (the parent, `diagnostics`, `src/tests.rs`)\n\nWhat: `ui` and `ui_with` give the crate, before the options' own lint flags, what compiletest\ngives a UI test that is not `run-pass` (`src/tools/compiletest/src/runtest.rs`,\n`make_compile_args`): `-A unused -W unused_attributes -A internal_features -A\nincomplete_features -A unused_parens -A unused_braces`. Why: every `.stderr` of rustc's was\nmade with them, so a test whose source has an unused variable or an `unsafe` block with nothing\nunsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-18294.rs`).\n\n> forwarded to diagnostics: its own parent's `src/tests.rs`.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints: `crate::tests::ui` passes compiletest's flags (the parent, `diagnostics`, `src/tests.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:618"
+    }
+  ]
+}

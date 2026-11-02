@@ -25,6 +25,10 @@ impl SyntaxError {
         self.1 = range;
         self
     }
+
+    pub(crate) fn into_parts(self) -> (String, TextRange) {
+        (self.0, self.1)
+    }
 }
 
 impl fmt::Display for SyntaxError {

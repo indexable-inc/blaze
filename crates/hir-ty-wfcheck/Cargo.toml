@@ -13,14 +13,25 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
-salsa.workspace = true
+intern.workspace = true
+la-arena.workspace = true
+blaze-query.workspace = true
+smallvec.workspace = true
 
 rustc_type_ir.workspace = true
 
 # local deps
+base-db.workspace = true
+blaze-format.workspace = true
+blaze-mem.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+# The tests' database links hir-ty-mir for the MIR providers.
+hir-ty-mir.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

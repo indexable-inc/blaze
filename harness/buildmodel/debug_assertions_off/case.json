@@ -1,9 +1,0 @@
-{
-  "row": "`debug-assertions = false` in dev",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "cargo": [],
-  "blaze": []
-}

@@ -1,0 +1,36 @@
+{
+  "id": "00641",
+  "from_lane": "dedyn",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query"
+  ],
+  "what": "## dedyn: crates/blaze-query/src/lib.rs: `KeySource::Typed` stays `dyn`, its comment says why it is cold (2026-10-29)\n\n> APPLIED by dedyn 2026-10-29 21:20.\n\nChecked: the `&dyn Any` is downcast only in `run_query`, i.e. when a query runs (`execute`, in\n`resolve_held` after every kept memo failed to verify, and `value_of` refilling an evicted\nvalue). A lookup that finds its memo (`state.results`, a verified memo) passes the reference on\nand never touches the vtable. A run also writes and fingerprints the value, so one `TypeId`\ncompare is noise there, and the `Runner` table (fn pointers, kinds registered at run time) is\nwhy the key is erased. No code change; only the comment, which today splits its reason from the\n`dyn:` tag:\n\nBefore (lines 298–300):\n\n```rust\n    // Kinds register at run time, so a typed key is erased once a run and read back by one\n    // dyn: `TypeId` compare.\n    Typed(&'a (dyn Any + Send + Sync)),\n```\n\nAfter:\n\n```rust\n    // dyn: kinds register at run time into a table of `Runner` fn pointers, so the caller's\n    // key is erased; read back by one `TypeId` compare when the query runs, never on a lookup\n    // that finds its memo.\n    Typed(&'a (dyn Any + Send + Sync)),\n```\n\nLines 1609, 1646 and 1747 (`// dyn: see `KeySource::Typed``) stay.\n\n> forwarded to db (`crates/blaze-query/`; told db-next3 by tmux; requests, pass 22).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db.md#dedyn: crates/blaze-query/src/lib.rs: `KeySource::Typed` stays `dyn`, its comment says why it is cold (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:7871"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: forwarded to db (`crates/blaze-query/`; told db-next3 by tmux; requests, pass 22)."
+    }
+  ]
+}

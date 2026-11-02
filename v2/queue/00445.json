@@ -1,0 +1,21 @@
+{
+  "id": "00445",
+  "from_lane": "mem-db-def-collect",
+  "owner": "frontend-nameres",
+  "paths": [],
+  "what": "## Tags\n\n| Query (file) | Tag |\n|---|---|\n| `crate_local_def_map`, `block_def_map` (`nameres.rs`) | `Tag::Nameres` |\n| `Modules::module`, `ModuleScope::{name, legacy_macro, traits}` (`nameres.rs`) | `Tag::Nameres` |\n| `TraitItems::query_with_diagnostics`, `ImplItems::of` (`assoc.rs`) | `Tag::Nameres` |\n| `used_imports` (`uses.rs`) | `Tag::Nameres` |\n| `macros_declaring_roots`, `macros_writing_diagnostic_items` (`demand.rs`) | `Tag::Nameres` |\n| every `#[salsa::tracked]` fn in `facts/queries.rs`, `facts/driver.rs`, `facts/macros.rs`, `facts/impls.rs` (`module_decls`, `legacy_exports`, `subtree_macro_exports`, `round_modules`, `module_round`, `import_shape`, `partition`, `round_env`, `scc_state`, `fact_handle`, `unresolved_named`, `macro_step`, `round_progress`, `round_kind`, `round_row`, `module_impls`, ...) | `Tag::Nameres` |\n\nEach query passes its tag to `frame::task(tag, ..)`, which sets the frame's tag.\n\nShared aliases, added at the top of `nameres.rs` (used by `collector.rs`, `facts/`, `assoc.rs`,\n`uses.rs`, `demand.rs`, `frozen.rs`, and requested of `item_scope.rs` in Part E):\n\n```rust\nuse blaze_mem::Frame;\nuse rustc_hash::FxBuildHasher;\n\n/// A per-run vector, in the query's frame.\npub(crate) type FrameVec<'f, T> = Vec<T, &'f Frame>;\n/// A per-run map, in the query's frame.\npub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;\n/// A per-run set, in the query's frame.\npub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;\n\npub(crate) fn frame_map<'f, K, V>(frame: &'f Frame) -> FrameMap<'f, K, V> {\n    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)\n}\npub(crate) fn frame_set<'f, T>(frame: &'f Frame) -> FrameSet<'f, T> {\n    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)\n}\n```\n\n`hashbrown`'s `Entry` has the same `Occupied`/`Vacant`/`or_insert`/`or_insert_with` as std's;\n`.entry(k).or_default()` on a map whose values are frame vectors becomes\n`.entry(k).or_insert_with(|| Vec::new_in(frame))`.\n\n> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).\n\n> frontend-nameres (2026-10-29 21:25): the facts side uses `Tag::Nameres` and these aliases, copied as written, when it adopts C1-C4. That waits on H2, where the queries open the task (see C5). Nothing applies before then.",
+  "state": "open",
+  "created": "2026-10-30T04:25:00Z",
+  "updated": "2026-10-30T04:25:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-def-collect.md#Tags",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-collect.md:37"
+    }
+  ]
+}

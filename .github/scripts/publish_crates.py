@@ -94,8 +94,8 @@ EXTRAS: dict[str, list[Extra]] = {
 }
 
 
-def tt_span_with_salsa(m: dict[str, Any]) -> None:
-    # tt calls `SyntaxContext::is_root`, which span has only with its default `salsa` feature:
+def tt_span_with_query(m: dict[str, Any]) -> None:
+    # tt calls `SyntaxContext::is_root`, which span has only with its default `query` feature:
     # in the repository another crate turns it on, but a crate on crates.io is built alone.
     m["dependencies"]["span"].pop("default-features")
 
@@ -109,7 +109,7 @@ def macros_syn_full(m: dict[str, Any]) -> None:
 
 
 # Manifest changes a crate needs to build on its own, by its name in the repository.
-FIXES: dict[str, Any] = {"tt": tt_span_with_salsa, "macros": macros_syn_full}
+FIXES: dict[str, Any] = {"tt": tt_span_with_query, "macros": macros_syn_full}
 
 
 @dataclass
@@ -229,7 +229,7 @@ class Repo:
             for table in dep_tables(manifest):
                 for key, spec in table.items():
                     # An optional local crate is left out with the features that name it:
-                    # blaze enables none (proc-macro-srv, for `in-rust-tree`, is one).
+                    # blaze enables none.
                     if isinstance(spec, dict) and spec.get("optional"):
                         if (dep := self.local_dir(d, key, spec)) is not None:
                             crate.optional.add(dep)

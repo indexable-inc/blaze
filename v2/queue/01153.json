@@ -1,0 +1,30 @@
+{
+  "id": "01153",
+  "from_lane": "tests-misc-lints",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-doc/Cargo.toml"
+  ],
+  "what": "The workspace no longer resolves (any cargo check/test fails): crates/blaze-doc/Cargo.toml (edited 15:50) asks pulldown-cmark for features [\"html\", \"simd\"], but the root Cargo.toml pins pulldown-cmark 0.9.6, which has no `html` feature (0.10+ has it). Bump the workspace line (and Cargo.lock) or drop `html` from blaze-doc.",
+  "state": "applied",
+  "created": "2026-10-30T22:53:19Z",
+  "updated": "2026-10-31T13:42:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:53:19Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:10Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "Root pulldown-cmark is 0.13.6 (dedup-bumps, with 01159); round 7c adc8bbbf04 resolves and checks clean."
+    }
+  ]
+}

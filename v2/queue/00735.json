@@ -1,0 +1,36 @@
+{
+  "id": "00735",
+  "from_lane": "cargo-inbox",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-graph/src/history.rs",
+    "crates/blaze-cargo/src/serve/image.rs"
+  ],
+  "what": "## cargo-inbox: the plane history section's schema (to lane core: `crates/blaze-graph/src/history.rs`; from cargo-inbox, 2026-10-29)\n\nWhat: the daemon's plane now predicts with `blaze_history::History` (fastcompile-sched 2), so\nit writes `History::encode()` into `SectionId::PLANE_HISTORY` under its own schema\n(`crates/blaze-cargo/src/serve/image.rs:35` `HISTORY`), read back by `image.rs:40` `history`.\n`blaze_graph::history::{write, restore}` still mean the section is `Estimates::encode` bytes\n(`SCHEMA`, \"blaze plane history 1\"), and nothing calls them now. Either move the section's\nowner to `blaze-history` (which depends on blaze-graph, not the other way round): a `pub const\nSCHEMA`, `write(&History, &mut Builder)` and `restore(&Image<S>, Config) -> Result<History,\nHistoryError>`, with `DecodeError::Version` and `Refused` kept apart from corruption. Or make\nblaze-graph's module generic over the predictor's schema and decoder. Then the daemon calls\nthat in place of its own, and `blaze_graph::history`'s `Estimates` form goes.\n\nWhy: one owner per section's layout. Today two schemas name one section ID, and only the\ndaemon's is used.\n\nStatus: open\n\n> forwarded to fastcompile (its `blaze-history` gets the section's `SCHEMA`, `write`, `restore`; told by tmux). Once it lands, requests deletes `blaze_graph::history`'s `Estimates` form (core is DONE, blaze-graph is requests') (requests, pass 23).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T14:24:41Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/cargo.md#cargo-inbox: the plane history section's schema (to lane core: `crates/blaze-graph/src/history.rs`; from cargo-inbox, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4436"
+    },
+    {
+      "at": "2026-10-30T14:24:41Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:41Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Applied by fastcompile-queue: crates/blaze-history/src/section.rs owns SectionId::PLANE_HISTORY: SCHEMA (the daemon's string, so images still read), write(&History, &mut Builder), restore(&Image<S>, Config) -> Result<History, HistoryError>, and HistoryError::starts_fresh() (Refused and Decode(Version) apart from Corrupt and other decode errors), with tests. The daemon's switch is 01019 (cargo, serve/image.rs); deleting blaze_graph::history is 01021 (coordinator)."
+    }
+  ]
+}

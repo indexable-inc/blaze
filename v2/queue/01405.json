@@ -1,0 +1,32 @@
+{
+  "id": "01405",
+  "from_lane": "observe",
+  "owner": "coord-1030",
+  "paths": [
+    "flake.nix",
+    "nix/tracy.nix",
+    "docs/profiling.md",
+    "docs/README.md"
+  ],
+  "what": "observe: the Tracy v0.14.1 viewer in the dev shells, docs/profiling.md, and builds of blaze-profile.\n\n1. Copy /tmp/tracy-nix/tracy.nix to nix/tracy.nix and add `(import ./nix/tracy.nix { inherit pkgs; })` to each dev shell's packages. It puts tracy (the GUI), tracy-capture and tracy-csvexport on PATH at exactly v0.14.1, the version tracing-tracy 0.12.0 bundles; other versions refuse to connect. It was built once on aarch64-darwin with the flake's nixpkgs e513db7b (/nix/store/3ckii861nny2asabf41xwv73ia77z6bc-tracy-0.14.1). x86_64-linux and aarch64-linux evaluate but were not built, because the child lane had no Linux builder. Details: /tmp/blaze-lanes/v2-observe-tracy-viewer.md.\n\n2. docs/profiling.md: the draft is docs/v2/plan/lanes/observe/profiling.md. Move it there with `status: current` once the wiring it describes has landed (the root dep request to dedup, cargo's daemon and CLI request, ci's Profile request); until then it stays a plan in my folder. When you move it, fix its link to speed-of-light.md (it becomes v2/plan/lanes/observe/speed-of-light.md), and change the path in crates/blaze-profile/src/lib.rs's module doc (line 29) to docs/profiling.md (my file; you have my leave).\n\n3. Run `python3 tools/docs.py write`: docs/README.md is stale only because of my two new docs, docs/v2/plan/lanes/observe/{speed-of-light,profiling}.md.\n\n4. Batch ready, crates/blaze-profile: new modules clock, flight (the flight recorder), watchdog, sampler (with sampler/linux.rs and sampler/macos.rs), symbols and tracy; lib.rs reworked; Cargo.toml gains object and rustc-demangle (both already workspace deps). Run `blaze test -p blaze-profile` and clippy on macOS aarch64 and on Linux x86_64. rust-analyzer on the Mac finds 0 errors, but it cannot see sampler/linux.rs or tracy.rs (cfg'd out there). hot_lint and the manifest lint are clean for the crate.\n\n5. The overhead measurement the brief asks for: the steps under 'How to measure it' in docs/v2/plan/lanes/observe/speed-of-light.md. The first is `blaze test -p blaze-profile --release -- --ignored --nocapture what_a_span_and_a_plot_cost`.",
+  "state": "refused",
+  "created": "2026-11-01T01:19:26Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:19:26Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

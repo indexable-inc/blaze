@@ -1,0 +1,38 @@
+{
+  "id": "00507",
+  "from_lane": "diagnostics-lints-bodies-liveness",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir",
+    "v2/requests/diagnostics-lints-bodies-liveness.md",
+    "crates/hir-ty/src/mir.rs",
+    "v2/requests/codegen-rq-mir.md"
+  ],
+  "what": "## diagnostics-lints-bodies-liveness: guard references and capture copies marked in `MirBody`; liveness of inline consts (crates/hir-ty-mir `lower.rs`, `lints/bodies.rs`)\n\nWhat, in full in `v2/requests/diagnostics-lints-bodies-liveness.md`:\n1. hir-ty-mir records the locals of guard references (rustc's `RefForGuard`, local to its binding).\n2. hir-ty-mir records the statements that copy a capture out of the closure at its start.\n3. Liveness runs on each inline const (`const { .. }`), through a `BodyCx` of its own or a MIR\n   query for it.\n\nWhy: liveness finds 1 and 2 by the shape of what the lowering emits today, which is correct but\nbreaks silently if the lowering changes. Without 3, an inline const gets no `unused_variables`\nor `unused_assignments`.\n\n> for: codegen/hir-ty-mir (1, 2), diagnostics-lints-bodies (3).\n> forwarded to codegen (`hir-ty-mir`) and diagnostics (`lints/bodies.rs`).\n> not applied, by codegen-rq-mir (2026-10-29), items 1 and 2: waits on db. `MirBody` is\n> hir-ty's (`crates/hir-ty/src/mir.rs`). Asked of db in `v2/requests/codegen-rq-mir.md` R4:\n> `guard_refs: Vec<(LocalId, BindingId)>` and `capture_copies: Vec<(LocalId, FieldIndex)>`\n> (each listed local's first `Assign` in `start_block` is the copy). The two pushes in\n> `pattern_matching.rs` (after `self.guard_refs.insert`) and `lower.rs` (after the capture\n> copy's `push_assignment`) are written out there, and go in when the fields do.\n> codegen-rq-mir (2026-10-30): db's fields are in (`MirBody::guard_refs`, `capture_copies`). The\n> two pushes go in `lower/pattern_matching.rs` and `lower.rs`, which frontend-fast-mir-next2\n> holds (told by tmux, with the exact lines in R4).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-31T20:36:20Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-liveness: guard references and capture copies marked in `MirBody`; liveness of inline consts (crates/hir-ty-mir `lower.rs`, `lints/bodies.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2289"
+    },
+    {
+      "at": "2026-10-31T20:36:20Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:20Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "1 and 2: MirBody::guard_refs / capture_copies are in and filled. 3: inline consts have their own MIR (inline_const_at); the lints/bodies.rs half is diagnostics'."
+    }
+  ]
+}

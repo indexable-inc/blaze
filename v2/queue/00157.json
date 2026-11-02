@@ -1,0 +1,21 @@
+{
+  "id": "00157",
+  "from_lane": "diagnostics-items-ast",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-ast: `missing_abi` in a future edition\n\nWhat: none to do now. rustc's `handle_missing_abi` gives the error `MissingAbi` instead of\nthe lint when the span's edition is the future one and `explicit_extern_abis` is enabled.\nblaze's `Edition` has no future edition, so `lints/syntax/early/validation.rs`' `missing_abi`\nis right as it is; when one is added, that error is the validator's and belongs here.\n\n> for: diagnostics-items (note).\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:52:14Z",
+  "updated": "2026-10-30T01:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-ast.md#diagnostics-items-ast: `missing_abi` in a future edition",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-ast.md:79"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 [package]
 name = "blaze-lints"
-description = "clippy's lints, owned by blaze: computed from rust-analyzer's analysis, with clippy's names, levels, groups, configuration and messages"
+description = "clippy's lints and blaze's own, owned by blaze: per-body queries over the front end's database, with clippy's names, levels, groups, configuration and messages"
 publish = false
 
 version.workspace = true
@@ -14,15 +14,24 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-# The version rustc 1.101 renders its diagnostics with (`rustc_errors`'s
-# `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as clippy's do.
-annotate-snippets = "=0.12.16"
+base-db.workspace = true
+blaze-diagnostics.workspace = true
+blaze-hash.workspace = true
+blaze-intent.workspace = true
+blaze-mem.workspace = true
+blaze-phf.workspace = true
 cfg.workspace = true
+either.workspace = true
 hir.workspace = true
+hir-def.workspace = true
 hir-expand.workspace = true
-ide-db.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+hir-ty-suspend.workspace = true
 intern.workspace = true
-rustc-hash.workspace = true
+memchr.workspace = true
+rustc_type_ir.workspace = true
+blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 span.workspace = true
@@ -30,8 +39,11 @@ syntax.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
 expect-test.workspace = true
-test-fixture.workspace = true
+hegeltest.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]
 workspace = true

@@ -13,7 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
+blaze-hash.workspace = true
 tracing.workspace = true
 
 # locals deps
@@ -22,15 +22,14 @@ syntax = { workspace = true, optional = true }
 intern.workspace = true
 
 [dev-dependencies]
-expect-test = "1.5.1"
-oorandom = "11.1.5"
-arbitrary = { version = "1.4.1", features = ["derive"] }
+expect-test.workspace = true
+hegeltest.workspace = true
 
 # local deps
 syntax-bridge.workspace = true
 
 # tt and syntax are needed for testing
-cfg = { path = ".", default-features = false, features = ["tt", "syntax"] }
+cfg = { workspace = true, features = ["tt", "syntax"] }
 
 [features]
 default = []

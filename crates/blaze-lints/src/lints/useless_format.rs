@@ -4,40 +4,40 @@
 //! Follows clippy's `clippy_lints/src/format.rs` at rust-lang/rust
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
-use syntax::{AstNode, SyntaxNode, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use super::{
     format::{self, Arg, Trait},
     utils,
 };
-use crate::{check::Cx, diag::Applicability};
+use crate::{check::Cx, diag::Applicability, sugg::Sugg};
 
-const LINT: &str = "useless_format";
+const LINT: super::Implemented = super::Implemented::UselessFormat;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, call: ast::MacroCall<'t>) {
     if !cx.on(LINT) {
         return;
     }
-    let Some(format) = format::of(cx, call) else { return };
     let Some(macro_expr) = call.syntax().parent().filter(|it| ast::MacroExpr::can_cast(it.kind()))
     else {
         return;
     };
+    let Some(format) = format::of(cx, call) else { return };
     let Some(call_site) = cx.range(call.syntax()) else { return };
     if !format.std || format.name != "format" {
         return;
     }
     // `&format!(..)`, which the argument or the literal itself would serve.
-    let borrowed = past_parens(&macro_expr)
+    let borrowed = past_parens(macro_expr)
         .parent()
         .and_then(ast::RefExpr::cast)
         .filter(|it| it.raw_token().is_none() && it.mut_token().is_none())
         .and_then(|it| cx.range(it.syntax()));
-    let (span, expl, sugg) = match (&format.placeholders[..], &format.args[..]) {
-        ([], []) if format.template.is_empty() => {
+    let (span, expl, sugg) = match (format.placeholder_count, format.arg_count) {
+        (0, 0) if format.template.is_empty() => {
             (call_site, "`String::new()`", "String::new()".to_owned())
         }
-        ([], []) => {
+        (0, 0) => {
             let snippet = cx.snippet(format.template_range);
             let expanded = snippet.replace("{{", "{").replace("}}", "}");
             match borrowed {
@@ -45,7 +45,8 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
                 None => (call_site, "`.to_string()`", format!("{expanded}.to_string()")),
             }
         }
-        ([placeholder], args) if args.len() <= 1 => {
+        (1, args) if args <= 1 => {
+            let Some(placeholder) = format.placeholders().next() else { return };
             if placeholder.format_trait != Trait::Display
                 || placeholder.width.is_some()
                 || placeholder.precision.is_some()
@@ -53,9 +54,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
             {
                 return;
             }
-            let value = match (&placeholder.arg, args) {
-                (Arg::Index(0), [value]) => Value::Expr(value.clone()),
-                (Arg::Captured(name), []) => Value::Captured(name.clone()),
+            let value = match (placeholder.arg, args) {
+                (Arg::Index(0), 1) => match format.arg(0) {
+                    Some(value) => Value::Expr(value),
+                    None => return,
+                },
+                (Arg::Captured(name), 0) => Value::Captured(name),
                 _ => return,
             };
             let Some(ty) = value.ty(cx, call.syntax()) else { return };
@@ -67,24 +71,24 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
             if !(peeled.is_str() || (string.is_some() && peeled.as_adt() == string)) {
                 return;
             }
-            let is_new_string = match &value {
+            let is_new_string = match value {
                 Value::Expr(ast::Expr::BinExpr(_)) => true,
                 Value::Expr(ast::Expr::MethodCallExpr(it)) => {
                     it.name_ref().is_some_and(|it| it.text() == "to_string")
                 }
                 _ => false,
             };
-            let text = |cx: &Cx<'_, '_, '_>| match &value {
+            let text = |cx: &Cx<'_, 't>| match value {
                 Value::Expr(expr) => utils::sugg(cx, expr),
-                Value::Captured(name) => crate::sugg::Sugg::NonParen(name.clone()),
+                Value::Captured(name) => Sugg::NonParen(name.to_owned()),
             };
             match borrowed {
                 Some(parent) if !is_new_string && peeled.is_str() => {
                     (parent, "the argument directly", text(cx).to_string())
                 }
                 _ if is_new_string => {
-                    let Value::Expr(expr) = &value else { return };
-                    (call_site, "`.to_string()`", cx.source_of(expr.syntax()))
+                    let Value::Expr(expr) = value else { return };
+                    (call_site, "`.to_string()`", cx.source_of(expr.syntax()).into_owned())
                 }
                 _ => {
                     (call_site, "`.to_string()`", format!("{}.to_string()", text(cx).maybe_paren()))
@@ -94,7 +98,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
         _ => return,
     };
     let span = cx.span(span);
-    cx.lint(LINT, &macro_expr, span.clone(), "useless use of `format!`").suggestion(
+    cx.lint(LINT, macro_expr, span.clone(), "useless use of `format!`").suggestion(
         span,
         format!("consider using {expl}"),
         sugg,
@@ -103,23 +107,21 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
 }
 
 /// What the one placeholder of a `format!` formats.
-enum Value {
-    Expr(ast::Expr),
+#[derive(Clone, Copy)]
+enum Value<'t, 'a> {
+    Expr(ast::Expr<'t>),
     /// A name the template captures from the scope.
-    Captured(String),
+    Captured(&'a str),
 }
 
-impl Value {
-    fn ty<'db>(&self, cx: &Cx<'_, '_, 'db>, call: &SyntaxNode) -> Option<hir::Type<'db>> {
+impl<'t> Value<'t, '_> {
+    fn ty<'q>(self, cx: &Cx<'q, 't>, call: ast::Node<'t>) -> Option<hir::Type<'q>> {
         match self {
             Value::Expr(expr) => cx.ty(expr),
-            Value::Captured(name) => {
-                let path = syntax::ast::make::path_from_text(name);
-                match cx.sema().scope(call)?.speculative_resolve(&path)? {
-                    hir::PathResolution::Local(local) => Some(local.ty(cx.db())),
-                    _ => None,
-                }
-            }
+            Value::Captured(name) => match cx.resolve_name(call, name)? {
+                hir::PathResolution::Local(local) => Some(local.ty(cx.db())),
+                _ => None,
+            },
         }
     }
 }
@@ -135,8 +137,7 @@ fn only_placeholder(template: &str) -> bool {
     inner.split_once(':').is_none_or(|(_, spec)| spec.is_empty())
 }
 
-fn past_parens(node: &SyntaxNode) -> SyntaxNode {
-    let mut node = node.clone();
+fn past_parens(mut node: ast::Node<'_>) -> ast::Node<'_> {
     while let Some(parent) = node.parent()
         && ast::ParenExpr::can_cast(parent.kind())
     {

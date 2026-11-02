@@ -26,12 +26,13 @@ from dataclasses import dataclass, fields
 # What the build of blaze and the unit tests (blaze-platform.yaml's `build` and `tests` jobs,
 # tiers gate and warm) read. A path ending in `/` is the directory and everything under it.
 CODE = (
-    # The workspace's crates, with their test data, crates/hir-ty-codegen/llvm.json (the LLVM
-    # the blaze action fetches) and blaze-cargo's toolchain pins.txt (the commit of rustc's
-    # tests the rust-tests action fetches).
+    # The workspace's crates, with their test data and crates/hir-ty-codegen/llvm.json (the LLVM
+    # the blaze action fetches).
     "crates/",
     # The patched crates of [patch.crates-io], hashed into BLAZE_SOURCES (blaze-engine/build.rs).
     "vendor/",
+    # ix's linter and rewriter, workspace members, and the rules the workspace check runs.
+    "tools/astlog/",
     # The workspace, the lock file (the build is --locked) and cargo's config ([env]).
     "Cargo.toml",
     "Cargo.lock",
@@ -56,7 +57,6 @@ CODE = (
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
     ".github/actions/blaze-remote/",
-    ".github/actions/rust-tests/",
 )
 # What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run
 # against the blaze that build built.

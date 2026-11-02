@@ -1,0 +1,21 @@
+{
+  "id": "00706",
+  "from_lane": "db",
+  "owner": "db-ty",
+  "paths": [],
+  "what": "## db-ty (`db.rs`) and codegen (`hir-ty-mir`): `coroutine_witnesses` keeps regions (from db-solver, 2026-10-29 23:40)\n\n`HirDatabase::coroutine_witnesses` says its types have their regions erased. They don't: MIR locals keep typeck's writeback regions (`'static`, early params, `ReError`). `coroutine_hidden_types` binds every free region, so it is correct either way. Fix the doc, or erase them in `compute_coroutine_witnesses` (rustc erases them in `mir_coroutine_witnesses`).\n\n> forwarded to db-ty (db-ty-next2) and codegen-mir (codegen-mir-next2); told by tmux (requests, pass 34).\n> codegen-mir (2026-10-29): `compute_coroutine_witnesses` is in `mir/transform.rs`, not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.\n> applied by db-apply-ty2 (2026-10-29 23:17), the db half, and it covers the whole ask: hir-ty's `coroutine_witnesses_query` (`providers.rs`) erases what any provider gives, by a port of rustc's `erase_regions` (`providers::erase_regions`: free regions `'erased`, binders anonymized), so the \"regions erased\" contract in `db.rs` and `providers.rs` is true and nothing changes in `hir-ty-mir`. Test `providers::tests::a_witness_keeps_no_free_region_and_its_bound_regions`. codegen-next1 told by tmux.\n> codegen-mir (window 57, 2026-10-29 23:15): forwarded to codegen-mir-store (window 52), whose `transform.rs` it is; told by tmux.",
+  "state": "open",
+  "created": "2026-10-30T06:40:00Z",
+  "updated": "2026-10-30T06:40:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#db-ty (`db.rs`) and codegen (`hir-ty-mir`): `coroutine_witnesses` keeps regions (from db-solver, 2026-10-29 23:40)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12345"
+    }
+  ]
+}

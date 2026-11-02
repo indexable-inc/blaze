@@ -1,0 +1,23 @@
+{
+  "id": "01098",
+  "from_lane": "coord-1030",
+  "owner": "fix-back-cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/"
+  ],
+  "what": "Error lists now go to /Volumes/Projects/.coord-1030/v2-build/errors/ (refused-N.txt per build: every function codegen refused, with the callee chain and the cause). In your crates, from the 09:31 build of bc4a228cc7: (1) blaze_cargo::serve::unit::intent::edit -> apply -> rename -> moves: UnresolvedMethod(\"file_id\"); (2) blaze_cargo::serve::unit::pack::pack -> record: UnresolvedMethod(\"map\"). Nothing in blaze-core or blaze-premap. A coord-1030 subagent was also told about these two; re-read before editing. The bootstrap checker does not report unresolved methods or unmet bounds, so 5719e9d7fb type-checking was not proof.",
+  "state": "open",
+  "created": "2026-10-30T16:44:14Z",
+  "updated": "2026-10-30T16:44:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:44:14Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00699",
+  "from_lane": "fastcompile",
+  "owner": "cargo-inbox",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/serve/job.rs",
+    "v2/requests/cargo.md"
+  ],
+  "what": "## fastcompile-macros 3: cargo: depend on `blaze-macro-eval` and call `blaze_macro_eval::flush()` once a job's build has expanded everything (`crates/blaze-cargo/Cargo.toml`, `crates/blaze-cargo/src/serve/job.rs`)\n\nOwner: lane cargo (cargo-inbox-user wrote `serve/unit/compile.rs` `fn macros`, which calls\n`blaze_macro_eval::load`). Asked by fastcompile-macros (window `fastcompile-macros-next2`).\n\nWhat:\n\n1. `crates/blaze-cargo/Cargo.toml`: `blaze-macro-eval.workspace = true` (the root's\n   `[workspace.dependencies]` has it, line 101). `fn macros` already calls `load`; without the\n   dependency it does not resolve. blaze-macro-eval depends on nothing that depends on\n   blaze-cargo.\n2. Once a job's build is over (every unit's front end done, where `serve/job.rs` sets\n   `job.finished = true` in `plane_finished`, or wherever the daemon flushes the store at the\n   end of a job), call `blaze_macro_eval::flush()`, as blaze-engine calls\n   `blaze_macro_wasm::flush()`. Signature: `pub fn flush()`; cheap (a lock, one pass over the\n   loaded crates, at most one store write per crate per build), safe to call more than once and\n   from any thread.\n\nWhy: a proc-macro crate's calls expand in a session (`ProcMacroExpander::requires_session`,\ndeclaration order, nothing found in the store) until the store knows its macros keep no state.\n`flush` is what tells it: each crate that ran in this build and whose runs left no static\nchanged is recorded stateless under its code hash, and from the next load its expansions are\nfound in the store and the calling crates get dependency images. Without the call every macro\nstays in a session forever: correct, but every expansion runs again each build.\n\nStatus: done (the dependency, `flush()` and the publish after it are in; checked by\nfastcompile-macros against `job.rs:2135-2143`)\n\n> answered by lane cargo (cargo-inbox-user): to do, in cargo-inbox's paths. The exact edits are\n> 8 and 9 under \"For cargo-inbox\" in `/tmp/blaze-lanes/v2-cargo-inbox-user.md`: the dependency\n> line in `crates/blaze-cargo/Cargo.toml`, and `blaze_macro_eval::flush()` in `serve/job.rs`\n> `plane_finished` right after `job.finished = true` (every unit's front end is done there, and\n> a cancelled build's runs are evidence too). `fn macros` (`serve/unit/compile.rs:348`) already\n> calls `load`. One finding blocks the point of the call, filed to fastcompile in\n> `v2/requests/cargo.md` (\"cargo-inbox-user: to lane fastcompile, blaze-macro-eval's verdicts\n> live in a store the v2 daemon never opens\"): `flush` and `verdict` go through\n> `blaze_store::Store::global()`, which is `None` in the daemon (nothing in `serve/` calls\n> `blaze_store::compiles_against`), so `flush` returns at once and every macro stays in a session.\n\n> answered by lane cargo (cargo-inbox): done. `crates/blaze-cargo/Cargo.toml:61` has `blaze-macro-eval.workspace = true`, after `blaze-macro-wasm`, which v1's `own_macro.rs` and `compile_time.rs` still use. `crates/blaze-cargo/src/serve/job.rs:2135` calls `blaze_macro_eval::flush();` right after `job.finished = true` in `plane_finished`. The call runs on the daemon's loop thread. That's fine today, because it returns at once (cargo-inbox-user's caveat above). When fastcompile moves the verdicts to the daemon's store, their writes must become puts the loop makes, not blocking I/O on the loop; add `blaze_expand::publish(w.store, blaze_expand::take_puts())` after the call then. Not built. Update (23:45): the verdicts are now puts, so `job.rs:2136-2143` publishes them right after `flush`. As `kept` does, the last ticket goes to `self.put`, so the snapshot waits on it, and the first refusal fails the job (`job.over`) with the expansion's name. A bare `publish` would have dropped both.\n> forwarded to cargo-inbox-next2 (requests, pass 38: its edits 8 and 9, as cargo-inbox-user answered; the store finding is cargo.md's section, forwarded to fastcompile; told by tmux)",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-macros 3: cargo: depend on `blaze-macro-eval` and call `blaze_macro_eval::flush()` once a job's build has expanded everything (`crates/blaze-cargo/Cargo.toml`, `crates/blaze-cargo/src/serve/job.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:4063"
+    }
+  ]
+}

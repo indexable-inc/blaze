@@ -1,0 +1,26 @@
+{
+  "id": "00876",
+  "from_lane": "speed-sol-vfs",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-core/src/uring.rs",
+    "crates/blaze-core/src/sim.rs",
+    "crates/blaze-vfs/src/journal.rs"
+  ],
+  "what": "Speed of light of the VFS journal (docs/v2/plan/lanes/vfs/speed-of-light.md, 'Commit and the journal'): the journal copies every file record's bytes into one Vec for Effect::Append and needs a second round trip, Effect::Sync, per batch. That is 70% over the bound on a checkout (2 GB copied at 10 GB/s beside 286 ms of NVMe) and 25% over on an edit (two effects and completions around one ~20 us flush). Add to blaze-core: (1) `Effect::AppendParts { file: FileName, parts: Vec<blaze_bytes::Bytes>, sync: bool, tag: Tag }`, completing once with `Done::Appended` (or `Done::Synced` when `sync`), written with one vectored write (pwritev; io_uring IORING_OP_WRITEV, or fixed buffers) of the parts in order; (2) `sync: true` makes it one durable write: RWF_DSYNC on the write, or the write linked (IOSQE_IO_LINK) to an fsync in one submission, with one completion. Same failure semantics as Append then Sync: Done::Failed when either fails, leaving the file possibly holding part of the batch. The Sim needs the same: a crash before completion may keep any prefix of the parts' bytes. Once it lands, blaze-vfs's journal (speed-sol-vfs or vfs) frames each file record as [header bytes, the file's Bytes, checksum bytes] parts with no copy and drops the Append->Sync step. The watcher's one-effect batch is the already-forwarded Effect::Look in v2/requests/core.md lines 282-301; this is separate.",
+  "state": "open",
+  "created": "2026-10-30T09:18:25Z",
+  "updated": "2026-10-30T09:18:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:25Z",
+      "by": "speed-sol-vfs",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00055",
+  "from_lane": "codegen-devspeed",
+  "owner": "coordinator",
+  "paths": [
+    "docs/support.md",
+    "docs/mir-passes.md"
+  ],
+  "what": "## codegen (parent) / plan\n\n8. **Std at its shipped level.** cargo's debug ripgrep links std's non-generic code as shipped\n   (`-O3`); blaze builds the std unit with the program's backend and level\n   (`blaze-engine/src/lib.rs` `std_unit`, `..args.clone()`), which at dev is Cranelift with\n   `opt_level=none` (`hir-ty-codegen/target.rs:324`). v2's plan says std non-generic compiles\n   as shipped: the std unit's `Spec` should be LLVM at -O3 (or the release backend), not the\n   dev profile's.\n9. **Docs** that this change makes untrue: `docs/support.md` \"MIR optimizations\" (\"0, the\n   default, runs none\") and `docs/mir-passes.md` (\"blaze picks the level from `BLAZE_MIR_OPT`\n   (0, the default, 1 or 2)\"). The default is now rustc's level per crate, and `BLAZE_MIR_OPT`\n   overrides it for every crate.\n10. **v1's store key** (`cached.rs` `Entry::key`) names an instance without its crate's\n    `debug-assertions`, which `ub_checks()` now follows. I bumped the entry version to 13 so no\n    entry made under the old always-false rule is read. Entries are still told apart only by\n    ` checked` (overflow checks), which matches `debug-assertions` in cargo's default\n    profiles but not in a profile that sets one without the other. v2 keys on\n    `Spec::debug_assertions`, so the gap is v1-only.\n\n8b. **plan: tests are built at the profile's opt-level** (lane file, #1404/#635). A `cargo\n    test` build is the `test` profile, which inherits `dev`: overflow checks and debug\n    assertions on, so `ub_checks()` is on as well (`Spec::debug_assertions`). A `--release`\n    test build is the `bench` profile, which inherits `release`. The policy should give test\n    units the profile's `Spec` (backend, `overflow_checks`, `debug_assertions`), not a fixed\n    one, so a test runs the code its profile would build.\n\n> forwarded to codegen: items 8, 8b and 10 (codegen's `blaze-engine`, policy and v1 store key).\n> forwarded to coordinator: item 9, `docs/support.md` and `docs/mir-passes.md`, are the coordinator's docs, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T00:26:26Z",
+  "updated": "2026-10-30T08:25:57Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/codegen-devspeed.md#codegen (parent) / plan",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-devspeed.md:48"
+    },
+    {
+      "at": "2026-10-30T08:25:56Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:57Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "Item 9 (the coordinator part): docs/support.md \"MIR optimizations\" and docs/mir-passes.md \"Optimizations\" now say the default is rustc level per crate (mir_opt_level_of: Debug at -Copt-level=0, Release above it and for library crates) and BLAZE_MIR_OPT overrides it for every crate. Items 8, 8b, 10 were forwarded to codegen and are not part of this."
+    }
+  ]
+}

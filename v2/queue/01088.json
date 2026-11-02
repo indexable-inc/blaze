@@ -1,0 +1,30 @@
+{
+  "id": "01088",
+  "from_lane": "integrate-tooling",
+  "owner": "coordinator",
+  "paths": [
+    "harness/testselect.py",
+    "harness/hermetic.py",
+    "harness/loadedits.py",
+    "harness/sandboxbench.py",
+    "harness/testselectbench.py",
+    "harness/spare.py",
+    "harness/memsplit.py",
+    "harness/ci.py"
+  ],
+  "what": "From integrate-tooling (01073 item 5, what the tooling pass could not port without v2 features): three CI-row harnesses test v1 settings no v2 crate reads, so they fail against v2 as written and will be red in the train. testselect.py sets BLAZE_TESTS=affected/all (v2's form is `blaze test --reached`, crates/blaze-cargo/src/cli/args.rs: port it to that, or say what --reached lacks); hermetic.py runs `blaze test --why --json` and reads target/blaze/tests.ndjson (v2 has neither: a v2 feature, cargo lane, before the harness can port); loadedits.py holds a load with BLAZE_LOAD_PAUSE_MS (needs a v2 hook in the VFS load, vfs lane). Not in CI, same cause: sandboxbench.py and testselectbench.py (BLAZE_TESTS), spare.py and memsplit.py (v1's spare worker, BLAZE_SPARE). Each needs an owner to decide: port onto what v2 has, add the v2 feature, or delete the harness with its row. fncache/bscache/frozenwarm/freshwarm were already deleted.",
+  "state": "open",
+  "created": "2026-10-30T16:18:00Z",
+  "updated": "2026-10-30T16:18:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:18:00Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

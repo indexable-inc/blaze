@@ -1,0 +1,20 @@
+[package]
+name = "blaze-reclaim"
+description = "blaze v2's memory reclamation at task boundaries: a value unlinked from a shared table is freed once every thread that could still read it has ended its task (docs/v2/plan/design/concurrency.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[lints]
+workspace = true

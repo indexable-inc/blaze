@@ -1,0 +1,36 @@
+{
+  "id": "01008",
+  "from_lane": "item-hash",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen",
+    "crates/blaze-codegen"
+  ],
+  "what": "Addendum to 00957: blaze_item_hash::presentation(db, def) covers only a body own names and positions. A function symbol and debuginfo also spell other items: callee paths, the paths of types in a generic instance (mangling), impl self types, debuginfo type names. Key each by the presentation of every item it names (the instance item and its generic arguments items), so renaming a type or a callee re-emits exactly the symbols and debug records that spell it, never stale names, and a fresh build stays byte-identical. From item-hash-store anon2 note.",
+  "state": "applied",
+  "created": "2026-10-30T13:37:35Z",
+  "updated": "2026-10-31T21:13:29Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:37:35Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:29Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:13:29Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "No codegen output spells another item name from a cache: debug names (v2/linked.rs debug_name, per describe), exported symbols (v2/frontend.rs symbol_of) and positions (link-time span tables) are made from the current database each build; instance args and share keys spell each type by item key, which changes with a rename or move. The rule for the debug records (key by the presentation of every item they spell) is in docs/v2/plan/lanes/codegen/names.md for 01004 and 01351."
+    }
+  ]
+}

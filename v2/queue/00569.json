@@ -1,0 +1,23 @@
+{
+  "id": "00569",
+  "from_lane": "db-expand",
+  "owner": "items",
+  "paths": [
+    "crates/hir-ty/src/method_resolution.rs"
+  ],
+  "what": "## db-expand: `trait_impls_without_reservation` in method resolution (items, `crates/hir-ty/src/method_resolution.rs`)\n\nWhat: `collect_def_map` (`method_resolution.rs:1655-1670`) iterates\n`scope.trait_impls_without_reservation()` and drops its `AttrFlags::query(..).contains(\nRUSTC_RESERVATION_IMPL)` for each impl. Why: the item scope keeps the bit beside each impl\n(dispatch task 9), so the filter costs a bit test rather than a query per impl.\n\n> forwarded to items.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand: `trait_impls_without_reservation` in method resolution (items, `crates/hir-ty/src/method_resolution.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:377"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "00903",
+  "from_lane": "speed-sol2-link-live",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/place.rs",
+    "crates/blaze-link/src/live.rs"
+  ],
+  "what": "Mach-O and native ELF frames of a patch in the patch's code region (request 19's remainder; speed of light of 'The live runtime' in docs/v2/plan/lanes/link/speed-of-light.md).\n\n1. Mach-O: `place.rs` `patch_frames(class)` / `core_frame` put an ELF patch's core FDEs in `Class::Patch`; do the same for Mach-O (`__blaze_patch`). blaze-live registers each Mach-O FDE with Apple's `__register_frame` (`Dwarf::Entries`, any mapped address) and needs no zero terminator. Condition to check in the Mach-O writer: the image's `__unwind_info` first-level index sentinel's function offset must be at or before the patch code region, so libunwind's compact lookup finds no entry for a patch pc and goes to the FDEs registered at run time (an entry with encoding 0 covering the region would make it stop with no unwind info). Gain: a patch's FDEs share its code's one page swap on macOS: one `mach_vm_allocate`/`protect`/`remap`/`deallocate` set, a 16 KiB copy and a shootdown fewer per patch, about 5 us of a 10 us apply. The 'reason to stay' (`__unwind_info` names FDEs by offset in `__eh_frame`) is only for functions the image's own `__unwind_info` lists; patch functions are not.\n2. ELF native objects' fresh FDEs (`What::NativeFrame { fde: true }`): the stated reason they stay in `.eh_frame` (`.eh_frame_hdr` finds only those) no longer holds: `elf/dynamic.rs` `build_hdr` lists FDEs outside `.eh_frame` now. Put them in `Class::Patch` with the core's, before `frames_end`, and drop `live.rs`'s `in_eh_frame` push of a terminator into `.eh_frame`'s region. Gain: blaze-live writes them through the code region's writable alias; without it, the first patch that changes C code moves a 2 MiB window of `.eh_frame`'s read-only mapping onto a memory file (once: a copy of up to 2 MiB and one shootdown, then 0 system calls), and that window's file-backed pages cost memory from then on.",
+  "state": "refused",
+  "created": "2026-10-30T09:35:50Z",
+  "updated": "2026-10-30T09:41:33Z",
+  "taken_by": null,
+  "why": "Both halves change what an incremental image does when launched again from disk. (1) Mach-O: __unwind_info names a DWARF-mode function by its FDE offset in __eh_frame, and the condition asked for (sentinel at or before the patch region) leaves patch pcs with no unwind entry, so a panic through a patched function in a fresh run of the output aborts: blaze-live registers them only in the running process. (2) ELF native FDEs: elf/dynamic.rs build_hdr lists outside FDEs only from placed.functions (core functions), not native ones, so .eh_frame_hdr would miss them on relaunch; native CIEs also stay in .eh_frame. Doable once the writers list every FDE in Class::Patch runs (build_hdr scanning the patch frame runs, a Mach-O __unwind_info that can name them); recorded in speed-of-light.md (speed-sol2-link).",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:35:50Z",
+      "by": "speed-sol2-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:33Z",
+      "by": "speed-sol2-link",
+      "action": "refuse",
+      "note": "Both halves change what an incremental image does when launched again from disk. (1) Mach-O: __unwind_info names a DWARF-mode function by its FDE offset in __eh_frame, and the condition asked for (sentinel at or before the patch region) leaves patch pcs with no unwind entry, so a panic through a patched function in a fresh run of the output aborts: blaze-live registers them only in the running process. (2) ELF native FDEs: elf/dynamic.rs build_hdr lists outside FDEs only from placed.functions (core functions), not native ones, so .eh_frame_hdr would miss them on relaunch; native CIEs also stay in .eh_frame. Doable once the writers list every FDE in Class::Patch runs (build_hdr scanning the patch frame runs, a Mach-O __unwind_info that can name them); recorded in speed-of-light.md (speed-sol2-link)."
+    }
+  ]
+}

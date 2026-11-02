@@ -1,0 +1,29 @@
+{
+  "id": "00946",
+  "from_lane": "speed",
+  "owner": "db",
+  "paths": [
+    "/tmp/blaze-lanes/speed-bigclone-db.txt"
+  ],
+  "what": "Coordinator's rule (principles.md, common.md 'controlled mechanically'): big types in hot crates must not derive Clone. hot_lint doesn't check it, so speed scanned the source: 108 types in lane db's paths derive Clone and own heap data (Vec, String, Box, maps, sets, SmallVec, arenas). The list, one `path:line kind Name` a line: /tmp/blaze-lanes/speed-bigclone-db.txt (scanner /tmp/speed-bigclone.py, source text only). For each type: no use of Clone, so drop it from the derive; used on a hot path (per item, query hit, function, relocation), so borrow, share an ID, or move instead, then drop it; used only cold (error, setup, the edge, tests), so keep it with `// clone: <why>` on the derive line. Speed applies the same rule to the done lanes' crates (core, graph, vfs, cas, ids, link, items, span, tt, mbe, parser, intern). Also give each hot path a blaze-alloc-count budget test (zero for memo hits, interner hits and lookups).",
+  "state": "taken",
+  "created": "2026-10-30T10:53:37Z",
+  "updated": "2026-10-30T14:13:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:53:37Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

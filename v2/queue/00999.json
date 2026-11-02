@@ -1,0 +1,36 @@
+{
+  "id": "00999",
+  "from_lane": "integrate-store",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "integrate-store (00031): v1's store refused a store directory, or a pack, that another user could write to, and closed one others could read (crates/blaze-store/src/lib.rs `the_store_and_its_files_are_the_users_alone`, `a_store_others_can_write_to_is_refused`, `a_pack_others_can_write_to_is_not_read`, `a_store_of_another_user_is_refused`, and the Windows ACL reading in src/acl.rs). blaze-cas has no such check, and it now keeps machine code (`Kind::Machine`, mapped and run by blaze-macro-wasm and blaze-wasi), so a store another user can write to lets them plant code under a key: a value is checked against its own content hash, never against what its key says made it.\n\nblaze-cas is sans-IO, so it can only check this through a `blaze_core::Effect`, and `blaze_core::Meta` (lib.rs:543) has no owner or mode. Asked of core: a way for the store to learn, of a file or directory, whether it belongs to this user and whether anyone else may write to it (or read it), on every platform the native driver runs on (on Windows, the owner SID and the DACL's write entries, as blaze-store/src/acl.rs reads them), and in the simulation. Then blaze-cas's `Store::open` asks it of its directory and refuses (`broken`) a directory of another user or one others may write to, and a pack or `file-*` others may write to is not read. The store lane has no live window, so I (integrate-store) or whoever holds blaze-cas then adds that check and ports the four tests onto it; until then the tests stay unported and the gap is named in docs/v2/plan/lanes/store.md.",
+  "state": "applied",
+  "created": "2026-10-30T13:04:06Z",
+  "updated": "2026-10-30T14:46:49Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:04:06Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:46:49Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:46:49Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "core has no window, so done by integrate-store. blaze-core: Effect::Private{dir}/Done::Private(Option<(FileName, Access)>), Access enum; fs/private.rs (Unix owner+mode, group write refused only while the dir lets its group in; Windows owner SID + DACL ported from blaze-store/src/acl.rs, needs windows-sys Win32_Security_Authorization, added in blaze-core/Cargo.toml); arms in threads, kqueue, iocp, uring (off_ring), sim (Sim::set_access + mode 0o002). blaze-cas: Store::open asks Private of its dir before any head read, Op::Private, broken on refusal; layers not checked (read-only, test-only). Driven::open no longer pre-creates the dir. Tests: fs/private/tests.rs, sim test, blaze-cas a_store_of_another_user_is_refused, a_store_others_can_write_to_is_refused, a_pack_others_can_write_to_is_not_read, the_store_and_its_files_are_the_users_alone; a_store_that_cannot_write_stops_and_says_where now names `store`. Unbuilt: needs coord build of blaze-core + blaze-cas on linux, macos, windows."
+    }
+  ]
+}

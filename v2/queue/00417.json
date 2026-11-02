@@ -1,0 +1,33 @@
+{
+  "id": "00417",
+  "from_lane": "codegen-mir",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 7. The adapter's `v2::build::Build`\n\nCarries, per unit, the `MirOptions` its bodies are asked with: the crate's MIR level\n(`mir_opt_level_of`), its `ub_checks` (`debug_assertions` of the crate), and\n`lifetime_markers: true`. Each is part of the MIR query's key, so nothing else is needed for\nthe memo to see it.\n\n> forwarded to codegen.",
+  "state": "applied",
+  "created": "2026-10-30T04:06:19Z",
+  "updated": "2026-10-31T20:38:18Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir.md#7. The adapter's `v2::build::Build`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir.md:125"
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:18Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "v2/build.rs MirOptions { level, ub_checks, lifetime_markers: true, inline } per unit (:79)."
+    }
+  ]
+}

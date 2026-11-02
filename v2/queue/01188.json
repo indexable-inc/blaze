@@ -1,0 +1,36 @@
+{
+  "id": "01188",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/invalid_const_arg.rs"
+  ],
+  "what": "01168 emitter: hir now has AnyDiagnostic::InvalidConstArg { site: SpanSyntax, reason: hir::CreateConstError } (hir-ty InferenceDiagnostic::InvalidConstArg replaces the fresh const var infer.rs gave for an invalid const arg). blaze-diagnostics lower() match is exhaustive, so it does not compile until this lands. Exact code (new module + 2 lines in lower/mod.rs) in /tmp/blaze-lanes/no-fallback-front-ty-01168-invalid_const_arg.rs.",
+  "state": "applied",
+  "created": "2026-10-30T23:58:06Z",
+  "updated": "2026-10-31T01:28:45Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:58:06Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "lower/invalid_const_arg.rs + arm, as written but E0425 for DoesNotResolve (the pinned nightly says E0425 for cannot find type, see tests/items/names.rs an_impl_of_an_unknown_type); test a_local_as_a_const_argument_is_e0435 (uncompiled)"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "01005",
+  "from_lane": "item-hash",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api",
+    "crates/blaze-protocol",
+    "crates/blaze-cargo/src/serve"
+  ],
+  "what": "Andrew (via coordinator): stable item IDs in blaze reports, design docs/v2/plan/design/item-hash.md section 14. Test results, --events records, diagnostics records and the agent API carry (item semantic identity, node) next to file:line:col; the test runner panic hook maps the &Location address to its location-table entry (section 12) and writes the ID to blaze side channel only; agent API locate(id) gives the current place after moves, renames and edits (daemon index identity->item plus a log of past identities per item key). Program stdout/stderr/panic text never change. item-hash will export the ID type and the identity->item index from blaze-item-hash.",
+  "state": "open",
+  "created": "2026-10-30T13:22:20Z",
+  "updated": "2026-10-30T13:22:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:22:20Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

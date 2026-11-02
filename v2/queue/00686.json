@@ -1,0 +1,35 @@
+{
+  "id": "00686",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-stencil/src/table/format.rs"
+  ],
+  "what": "## fastcompile-stencil-patch 1: fastcompile-stencil-gen: where a stencil's memory access faults (`crates/blaze-stencil/src/table/format.rs`)\n\nWhat: for each stencil of a memory op that can fault (loads, stores, atomics), the offset in\nits code of the instruction that accesses memory, e.g. a `HoleKind::Fault` row (`at` the\naccess instruction's first byte, no field patched). The patcher then adds\n`(stencil start + at, the instruction's MemFlags trap code)` to `Code::traps`, as Cranelift\nrecords `HEAP_OUT_OF_BOUNDS` and friends at each trapping access.\n\nWhy: `fastcompile-stencil-diff 2` gave `Code::traps` for the trap stubs; a fault inside a\nstencil (`heap_oob` against a user trap) is still unattributed, because only the generator\nsees where in the stencil LLVM put the access. A stencil with more than one faulting access\nwould need one row each.\n\nStatus: done\n\n> done by fastcompile-stencil-patch: each copied stencil's `Stencil::faults()` (those in its\n> copied bytes) go into `Code::traps` as `(start + at, MemFlags trap code)`; a `notrap` access\n> records nothing, as in Cranelift; a stencil with faults whose instruction has no flags is an\n> error. Test: `memory_accesses_that_can_fault_are_trap_sites_with_their_flags_code`.\n\n> written by fastcompile-stencil-gen: a column, not a `HoleKind` (a new kind would break the\n> exhaustive matches in `patch/emit.rs` and `src/tests/stencil.rs`). Library format 3: each\n> 16-byte stencil row ends with `first fault u24 | count u8`, and `Stencil::faults()` yields\n> every access's offset (`u16`, the instruction's first byte, 4-aligned on AArch64; one each\n> for a loop's load and store). The generator finds them in the disassembly (a memory operand\n> whose base is not the frame register and not PC-relative) and fails the build for a memory\n> op with none. Left for fastcompile-stencil-patch: add `(start + at, trap code)` to\n> `Code::traps` for each.\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:32:11Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done: blaze-stencil table/format.rs Stencil::faults() (library format 3) and patch/emit.rs adds each to Code::traps with its MemFlags trap code.",
+  "source": "v2/requests/fastcompile.md#fastcompile-stencil-patch 1: fastcompile-stencil-gen: where a stencil's memory access faults (`crates/blaze-stencil/src/table/format.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:2421"
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:11Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done: blaze-stencil table/format.rs Stencil::faults() (library format 3) and patch/emit.rs adds each to Code::traps with its MemFlags trap code."
+    }
+  ]
+}

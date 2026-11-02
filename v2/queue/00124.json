@@ -1,0 +1,37 @@
+{
+  "id": "00124",
+  "from_lane": "db-ty-infer",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/tests.rs",
+    "crates/hir-ty/src/infer/persist.rs",
+    "crates/hir"
+  ],
+  "what": "## 2. db-ty-hir: a fixture test of the inference record's round trip through the type table\n\nWhat: one test in `crates/hir/src/tests.rs` (its `TestDB` pattern), for each body of the fixture\nbelow: `let result = InferenceResult::of(db, def)`; `let record = result.to_record(interner)`;\n`let bytes = blaze_format::Aligned::copy_from(&blaze_format::to_bytes(&record))`;\n`let read = <InferenceRecord as blaze_format::Persist>::read(&bytes).unwrap()`;\n`assert_eq!(read.to_result(interner).unwrap(), *result)`, and the same for\n`record.as_ref().to_result(interner)`. `InferenceRecord` and `InferenceRecordRef` are in\n`hir_ty::infer::persist`. The fixture holds a method call with generic arguments, a field and a\ntuple field access, autoderef and autoref adjustments, an unsizing coercion, a closure capturing\nby reference and by move, a `ref mut` binding, a match on a reference (match ergonomics), an\ninline const, an `impl Trait` return, and two errors (an unresolved method, a type mismatch):\n\n```rust\n//- minicore: deref, coerce_unsized, fn, sized, index, slice\nstruct S { a: u32, b: (u8, bool) }\nimpl S { fn get<T: Default>(&self) -> T { T::default() } }\ntrait Tr { fn m(&self) -> u32; }\nimpl Tr for u32 { fn m(&self) -> u32 { *self } }\nfn opaque() -> impl Tr { 5u32 }\nfn f(s: &S, v: &mut Vec<u32>) -> u32 {\n    let x: u8 = s.get::<u8>();\n    let (ref mut y, _) = s.b;\n    let slice: &[u32] = &[1, 2, 3];\n    let mut count = 0;\n    let mut add = |n: u32| count += n + s.a;\n    add(1);\n    let moved = move || x;\n    match &s.b { (0, flag) => { let _: &bool = flag; } _ => {} }\n    let k = const { 3 + 4 };\n    s.missing();\n    let wrong: bool = 1u32;\n    opaque().m() + slice[0] + moved() as u32 + k\n}\n```\n\nWhere: `crates/hir/src/tests.rs`.\nWhy: db-ty-shared.md rule 4 asks a round-trip test for each `Persist` value; the one in\n`crates/hir-ty/src/infer/persist.rs` covers every column, diagnostic kind and capture with a\nlist of types in place of the table (it needs no database), so the table itself\n(`TyTableWriter`/`TyTableReader`) and `SolverDiagnostic::TraitUnimplemented` (whose trait\nreference needs an interner) are covered only by a fixture test.\n\n> forwarded to db: `crates/hir/` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:963` (`an_inference_record_round_trips_through_its_type_table`: the fixture, `to_record`, `Persist::read`, `to_result` and `as_ref().to_result`).",
+  "state": "applied",
+  "created": "2026-10-30T01:10:15Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-infer.md#2. db-ty-hir: a fixture test of the inference record's round trip through the type table",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-infer.md:27"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:963` (`an_inference_record_round_trips_through_its_type_table`: the fixture, `to_record`, `Persist::read`, `to_result` and `as_ref().to_result`)."
+    }
+  ]
+}

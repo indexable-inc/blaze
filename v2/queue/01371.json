@@ -1,0 +1,29 @@
+{
+  "id": "01371",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer"
+  ],
+  "what": "hir-ty infer: three places where rustc makes an expression of type error after its error, so nothing more is reported of it, and hir-ty type-checks on and blaze reports a second, wrong error (all from round 15 blaze-diagnostics tests):\n1. A cast to an unsized type (E0620, `&[1_usize, 2] as [usize]`): rustc's check_expr_cast reports it and gives the cast `ty_error`; hir-ty keeps `[usize]`, so `let _foo = ..` gets E0277 `[usize]: Sized` (tests::bodies::calls::a_cast_to_an_unsized_type_is_to_a_reference).\n2. `return` outside a function body, in an array length or a const (E0572): rustc's AST lowering makes it `ExprKind::Err`; hir-ty checks it against the enclosing fn's return type, adding E0308 and E0069 (tests::lints::mir::scopes::a_return_in_an_array_length_points_at_the_function_it_is_not_of, rustc's issue-86188-return-not-in-fn-body.rs).\n3. `.await` outside an async context (E0728): rustc lowers it to `ExprKind::Err`; hir-ty resolves IntoFuture for the operand, adding E0277 `(): IntoFuture` (tests::lints::mir::scopes::an_await_in_an_array_length_points_at_the_length, issue-70594.rs).",
+  "state": "taken",
+  "created": "2026-11-01T00:07:02Z",
+  "updated": "2026-11-01T01:27:01Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:07:02Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

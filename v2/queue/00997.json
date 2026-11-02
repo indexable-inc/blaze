@@ -1,0 +1,40 @@
+{
+  "id": "00997",
+  "from_lane": "integrate-engine",
+  "owner": "integrate",
+  "paths": [
+    "crates/blaze-engine/",
+    "harness/",
+    "tools/",
+    "docs/",
+    "crates/blaze-doc/",
+    ".github/"
+  ],
+  "what": "integrate-engine cut blaze-engine to the `blaze` program at 05:57 (report /tmp/blaze-lanes/v2-integrate-engine.md). For you to route or decide: (1) crates.md row for blaze-engine: 'kept: the `blaze` program (src/program.rs: sandbox launcher, release hand-over, build-script rustc/rustdoc stand-ins [as_rustc being ported onto v2 by integrate-engine-rustc], the pinned release, `pin`/`version-fetch`/`version-resolve`; then blaze_cargo::cli::main), pin.rs, versions.rs, build.rs (version line). Its crate-at-a-time tail is deleted.' (2) `crates/blaze-doc` now has no user (only v1 blaze-engine doc.rs used it; v2 cli has no `blaze doc`): delete it or give it a v2 caller (no lane of mine). (3) Commands the v1 entry dispatched that are gone and that tooling still runs: `blaze-engine cache ...` (.github/actions/blaze/action.yml `cache build`, actions/blaze-remote, harness/store*.py, remote.py, freshwarm.py: the store's, told integrate-store), `blaze-engine std` (release.yaml step, continue-on-error; harness/leanprof.py, stdstatics.py), `borrowck`/`consteval`/`mir` (harness/borrowck_apps.py, borrowck_speed.py, mirparity.py, bunprep.py), `weaken`, `deps`, `build-script`, `closure fetch|materialize` (docs/cargo.md 496), `cargo-answer` (harness/resolve.py, docs/resolve.md 197), `proc-macro-wasm`, `--check`, `daemon`, `compile-time-deps`, `--spare`, and the `blaze-rustc` binary (harness/bscache.py, tiers.py and others; tools/pgo; tools/bench). They all loaded through RA/load-cargo or the v1 store; v2's surface is blaze_cargo::cli (lane cargo). Those harness/tool scripts need owners to move onto `blaze` v2 commands or be retired. (4) Current docs still describing v1 throughout (docs/cargo.md, docs/cache.md, docs/platforms.md 158 `weaken`, docs/resolve.md, docs/harness.md rows): I fixed the lines my deletion made untrue (install.md, contributing.md, cargo.md install + BLAZE_OWN_BASE_MEMORY row, borrowck.md command passages) and marked architecture.md and live.md/tiers.md superseded (v2/plan.md, lanes/link.md, lanes/codegen.md), doc.md a record; a docs-wide v1->v2 pass is bigger than this lane.",
+  "state": "applied",
+  "created": "2026-10-30T13:02:41Z",
+  "updated": "2026-10-30T16:46:34Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:02:41Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:06:17Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:46:34Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "(1) crates.md blaze-engine row; (2) blaze doc on v2 queued to cargo (01000); (3) tooling pass done by integrate-vfs (report v2-integrate-tooling.md; 01073 BLAZE_BACKEND applied; 01078 release std step to coordinator); (4) docs pass done by integrate-ide (report v2-integrate-docs.md; tools/docs.py check passes)."
+    }
+  ]
+}

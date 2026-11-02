@@ -1,0 +1,36 @@
+{
+  "id": "00419",
+  "from_lane": "dedyn",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/eval",
+    "crates/hir-ty-mir"
+  ],
+  "what": "## dedyn: crates/hir-ty-mir/src/mir/eval: three `dyn` lines kept, justified (from dedyn-codegen, 2026-10-29)\n\n> applied by dedyn-codegen (2026-10-29): the three `// dyn:` lines are in; hot_lint finds no `dyn` in hir-ty-mir.\n\nFrom `dedyn-codegen` (report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). hot_lint flags these three;\neach stays, with a `// dyn:` line inserted above it (indented as the line). No code changes.\n\n1. `eval/shim/reflection.rs`, above `type FieldBytes<'a, 'db, M> = &'a mut dyn FnMut(`:\n\n   ```rust\n   // dyn: once per reflected field (`type_info`, once per constant), which allocates; ~20 closures would each copy the walkers\n   ```\n\n2. `eval/shim/reflection.rs` `reflected_slice`, above\n   `element: &mut dyn FnMut(&mut Self, Ty<'db>, usize) -> Result<'db, Made<M::Shadow>>,`:\n\n   ```rust\n   // dyn: once per element of a reflected slice, which allocates; as `FieldBytes`\n   ```\n\n3. `eval/unwind.rs` `payload_message`, above `Ok(\"Box<dyn Any>\".to_owned())`:\n\n   ```rust\n   // dyn: rustc's text for a payload that is no string, not a trait object\n   ```\n\n`mir/location.rs`'s `type SourcePaths = dyn Fn(..)` (codegen-mir-store's) already has its\n`// dyn:` line.\n\n> forwarded to codegen (codegen-mir-next2, `crates/hir-ty-mir/`) (requests, pass 20; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:06:19Z",
+  "updated": "2026-10-31T20:38:19Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir.md#dedyn: crates/hir-ty-mir/src/mir/eval: three `dyn` lines kept, justified (from dedyn-codegen, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir.md:221"
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:19Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "The three // dyn: lines are in (reflection.rs:25, :483; unwind.rs:441)."
+    }
+  ]
+}

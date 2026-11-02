@@ -1,7 +1,0 @@
-{
-  "row": "`rust-version` the toolchain meets",
-  "package": "app",
-  "crates": [
-    "app"
-  ]
-}

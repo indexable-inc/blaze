@@ -1,0 +1,26 @@
+{
+  "id": "00880",
+  "from_lane": "speed",
+  "owner": "vfs",
+  "paths": [
+    "crates/blaze-vfs/src/journal.rs",
+    "crates/blaze-vfs/src/lib.rs",
+    "crates/blaze-vfs/src/image.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "no-fallback: a journal of another version is cut, not refused. journal.rs's `record` answers None for any magic but `BZJ4` (bumped from BZJ3 by speed-sol-vfs, 10-30), so `Journal::load` reads a BZJ3 (or BZJ2) file as torn at byte 0, `cut` = Some(0), and the next append truncates it: every head and node the daemon had is silently gone. Wanted: `Journal::load` checks the first 4 bytes; `BZJ` plus a version other than `4` (or any non-empty file whose first record is not `MAGIC`) is `Err(JournalError::Version { found: [u8; 4] })` naming the file and the version, and nothing is cut. `Journal::recover`/`restore` and `Vfs::recover`/`Vfs::restore` (lib.rs:277, image.rs:196) return `Result<(Vfs, Recovered), JournalError>`; the 47 calls in blaze-vfs tests add `.unwrap()`; outside: blaze-cargo serve/daemon.rs:282 stops with the error (the daemon's restore), and the test callers in blaze-cargo heads.rs:564,669, mounts.rs:161,176,188,198, unit/intent.rs:120, blaze-api session/tests.rs:58, blaze-intent tests/mod.rs:47 add `.unwrap()`. Test: a file starting `BZJ3` is refused and left whole. Why: AGENTS.md no-fallback (never quietly take another path); today a version bump discards durable state. Pre-existing for BZJ2->BZJ3 too.",
+  "state": "open",
+  "created": "2026-10-30T09:20:03Z",
+  "updated": "2026-10-30T09:20:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:20:03Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

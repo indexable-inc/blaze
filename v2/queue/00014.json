@@ -1,0 +1,35 @@
+{
+  "id": "00014",
+  "from_lane": "proof-corpus",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2/report.py"
+  ],
+  "what": "## 2. A way for `rejections.py` to be gated by its floors alone (if wanted)\n\n- **Where:** `harness/v2/report.py`.\n- **What:** `Report.finish` exits 1 on any fail outcome. If the coordinator wants rejections\n  gated only by `min_same` and `max_accepted`, report.py needs a way to count per-unit findings\n  without failing the run (a flag on `add`, or a verdict that is counted but doesn't fail).\n- **Why:** against v1 many units will fail one by one. Without the change, the script behaves as\n  the brief says: each unit is an outcome and gates the run.\n\n> forwarded to coordinator: a choice of how rejections gate, asked of the coordinator (\"if wanted\"); `harness/v2/report.py` is unchanged.",
+  "state": "refused",
+  "created": "2026-10-29T23:53:23Z",
+  "updated": "2026-10-30T08:25:27Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "not wanted: a unit of tests/ui where blaze answers differently from rustc is a compiler finding (superset-of-rust), so it should fail the run as it does now; the floor and ceiling outcomes are gates on top, not instead. A verdict that is counted but does not fail would hide those differences. harness/v2/report.py unchanged.",
+  "source": "v2/requests/proof-corpus.md#2. A way for `rejections.py` to be gated by its floors alone (if wanted)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/proof-corpus.md:18"
+    },
+    {
+      "at": "2026-10-30T08:25:26Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:27Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "not wanted: a unit of tests/ui where blaze answers differently from rustc is a compiler finding (superset-of-rust), so it should fail the run as it does now; the floor and ceiling outcomes are gates on top, not instead. A verdict that is counted but does not fail would hide those differences. harness/v2/report.py unchanged."
+    }
+  ]
+}

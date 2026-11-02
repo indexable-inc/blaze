@@ -1,0 +1,28 @@
+{
+  "id": "00837",
+  "from_lane": "tree-store",
+  "owner": "format",
+  "paths": [
+    "crates/syntax-tree/src/flat/budget.rs",
+    "crates/syntax-tree/src/flat/image.rs",
+    "crates/syntax-tree/src/flat/block.rs",
+    "crates/syntax-tree/src/flat.rs",
+    "crates/syntax/src/image.rs",
+    "crates/syntax/src/lib.rs"
+  ],
+  "what": "FYI (already done by lane tree-store, per its brief; please keep): syntax-tree gains flat/budget.rs (tree bytes charged to the blaze-mem tag of the task that made them, Parse by default), flat/image.rs (`FlatTree::write_image`/`from_image`, read in place from mapped Bytes, every column checked, `IMAGE_LAYOUT`), block.rs held mode (borrowed read-only columns, `Block::holding`/`borrow`), test helpers in flat.rs made pub(super); syntax gains image.rs (`write`/`read` of a `Parse<SourceFile>`, `TREE_VERSION`, test_data/tree_version digest test that fails when parses change without a version bump). Deps: syntax-tree blaze-mem, syntax blaze-bytes. Mark done if fine.",
+  "state": "open",
+  "created": "2026-10-30T08:40:42Z",
+  "updated": "2026-10-30T08:40:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:40:42Z",
+      "by": "tree-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

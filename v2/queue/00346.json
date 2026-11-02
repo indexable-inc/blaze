@@ -1,0 +1,33 @@
+{
+  "id": "00346",
+  "from_lane": "mem-db-infer-method",
+  "owner": "db",
+  "paths": [],
+  "what": "## What these files allocate, in short\n\n| temporary | made | before | after |\n|---|---|---|---|\n| autoderef steps (`GeneralAutoderef::state.steps`) | per field access, call, index, method call, deref | `Vec<(Ty, AutoderefKind)>`, up to 3 global growths | `ArrayVec<_, 20>` inline (the walk stops at 20 steps), 0 allocations |\n| `autoderef()`'s yielded types (hir's `Type::autoderef`) | per IDE call | `Vec<Ty>` | `ArrayVec<Ty, 21>` inline |\n| probe's candidate lists (`inherent_candidates`, `extension_candidates`, `private_candidates`, `static_candidates`) | per method call and per path probed | 4 global `Vec<Candidate>`, growing | 4 frame `Vec`s |\n| probe's `impl_dups` | per probe | `FxHashSet<ImplId>` | frame `hashbrown::HashSet` |\n| probe's autoderef steps (`MethodAutoderefStepsResult::steps`) | per probe | `SmallVec<[CandidateStep; 3]>`, spills on a 4th step | frame `Vec` |\n| `TraitValueItems::runs` | per probe | `SmallVec<[_; 4]>`, spills past 4 crates of traits in scope | frame `Vec` |\n| `ProbeAllChoice::candidates` (completion) | per IDE probe | `FxIndexMap` (2 global tables) | frame `HashSet` + frame `Vec` |\n| `ConfirmResult::adjustments` | per method call | `Vec` then `into_boxed_slice` (1 to 2 global) | frame `Vec` handed to `write_expr_adj` as a slice (expr's X1/X2) |\n| `TraitImpls`/`InherentImpls` building (per crate, per block) | per crate, per block with impls | `FxHashMap<TraitId, OneTraitImplsBuilder>` of `SelfTyGroups` (an `FxHashMap` + a `Vec` per trait) of `(Vec, Vec)` per self type, then columns grown with `vec![0]`/`push`, radix sort scratch | frame builders (two maps, flat record `Vec`s), one counting pass, each column allocated once at its size |\n| frozen impls read | per frozen crate | `Vec` per entry from `dec.many`, then the same groups | pushes straight into the frame builders |\n| `trait_value_items` | per crate | global `Vec`, stable sort (global scratch), `into()` shrink | frame `Vec`, unstable sort with the position as tiebreak, exact `Box` |\n| `loaded_crates` | per crate | `Vec` of dependencies, a `Vec` per module of macro calls, `FxHashSet`, `vec![krate]` grown then shrunk | frame `Vec`s/set, no per-module list, exact `Box` |\n| `impls_in_bodies`, `macro_definitions` | per file | token `Vec`, brace `Vec`s, found `Vec` shrunk into the result; a `Box<[Symbol]>` per `macro_rules!` | frame `Vec`s; result exact; definitions as two flat columns |\n| `macros_writing_impls` | per crate | `FxHashMap<Symbol, bool>` (a `Symbol` clone per name added), `FxHashSet`, `Vec`, `into_iter().collect()` | frame map keyed by `&Symbol`, frame set and `Vec`, exact result |\n| other query results (`blanket_in_crate_and_deps`, `in_crate_for_trait`, `in_crate_and_deps_for_trait`, `in_crate_and_deps_for_trait_and_self_ty`, `in_crate_trait_value_items`, `crates_containing_incoherent_inherent_impls`, opaques' five) | per query run | `collect()`/`into()` of a growing `Vec` into `Box<[T]>` (grow, then a shrinking realloc) | frame `Vec`, then one exact `Box` |\n| `rpit_hidden_types` | per function | `ArenaMap::new()` grown, then `shrink_to_fit` | `ArenaMap::with_capacity(highest index + 1)`, no shrink |\n| `params_in_repr` | per ADT | `ThinVec` resized, then `shrink_to_fit` | frame `Vec` of words, one exact `ThinVec` |\n| `constrained_params` (E0207) | per impl | 2 `FxHashSet`, `SmallVec` | frame sets |\n| `has_drop_glue`'s visited set | per call (MIR, borrowck, codegen, lints) | `FxHashSet<Ty>` | frame set; `has_drop_glue_in(frame, ..)` for callers with a frame |\n| `UninhabitedFrom::recursive_ty` | per call (match checking, MIR lowering, lints) | `FxHashSet<Ty>` | frame set; `_in(frame, ..)` forms |\n| `where_predicate_must_hold` clauses | per IDE call | `Vec` | frame `Vec` in its own `frame::task` |\n\nNot present in this tree, though the brief names them: the probe has no `unsatisfied_predicates`\n(rustc's diagnostics list) and no per-step pick lists: `pick_core` walks `self.steps` and returns\nthe first pick, and each attempt's applicable candidates are one `ApplicableCandidates` SmallVec\n(kept, see \"Left as is\"). `assemble_*` push into the context's lists and have no buffers of their\nown.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:46): a summary of the sections below, each settled in its own subsection; in the tree.",
+  "state": "applied",
+  "created": "2026-10-30T03:35:03Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-method.md#What these files allocate, in short",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-method.md:21"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:46): a summary of the sections below, each settled in its own subsection; in the tree."
+    }
+  ]
+}

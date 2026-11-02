@@ -1,0 +1,41 @@
+{
+  "id": "00476",
+  "from_lane": "diagnostics-lints-mir-matches",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ide/src/diagnostics/expr.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower",
+    "crates/hir",
+    "crates/hir-ide/src/diagnostics",
+    "crates/hir/src/match_lints.rs",
+    "crates/hir-ty-matchck"
+  ],
+  "what": "## diagnostics-lints-mir-matches: what match checking gives, as rustc gives it (db, `crates/hir-ide/src/diagnostics/expr.rs`, `match_check.rs`, `match_check/pat_analysis.rs`, `crates/hir/src/diagnostics.rs`)\n\nEach of 1, 4 and 5 is a program rustc refuses and blaze accepts (superset-of-rust); 2 and 3 are\ntext rustc gives that blaze can't. The lowering is `crates/blaze-diagnostics/src/lower/\nmissing_match_arms.rs` (E0004) and `non_exhaustive_let.rs` (E0005).\n\n1. **Every pattern kind lowered.** `PatCtxt::lower_pattern` records an error, and\n   `validate_match` / `check_non_exhaustive_let` then give nothing at all, for integer, char,\n   str and float literals, ranges, slices, `&p`, `box p`, deref patterns and paths to consts\n   (`PatternError::Unimplemented`, `UnresolvedVariant`); `hoist_witness_pat` has\n   `unimplemented!()` for `IntRange`, `Slice` and `DerefPattern`. So `match 0 { 1 => () }`,\n   `let 5 = 6;`, `match s { \"a\" => () }`, `match x { &E::A => () }` and `match v[..] { [] => () }`\n   build. Port `rustc_mir_build/src/thir/pattern/mod.rs`'s lowering (consts evaluated to\n   valtrees, `expanded_const` kept for `is_const_pat_that_looks_like_binding`). Tests:\n   `tests/ui/pattern/usefulness/match-non-exhaustive.rs`, `non-exhaustive-match.rs`,\n   `non-exhaustive-pattern-witness.rs`, `tests/ui/pattern/issue-106552.rs`.\n2. **The witnesses, not their joined text.** Today `uncovered_patterns: String` is rustc's joined\n   form of rust-analyzer's printing; the lowering reads it back against the scrutinee's type\n   and reprints it rustc's way (`Uncovered::read`, `Witness::read`). That loses the 4th and 5th\n   witness (rustc labels the variants of the first five: `ExcessiveEnum` in\n   `non-exhaustive-pattern-witness.rs`) and can't tell `NonExhaustive` from `Wildcard` (both\n   `_`). Wanted, on both `MissingMatchArms` and `NonExhaustiveLet`:\n   `witnesses: Vec<String>` (every one, printed by a port of `rustc_pattern_analysis`'s\n   `print_witness_pat`: `Enum::Variant` except `Option`/`Result`, `_` for `Never` without\n   `never_patterns`, int ranges `i32::MIN..=0_i32` / `0_usize..`, slices, `box _`, unions'\n   `..`), `variants: Vec<hir::EnumVariant>` (`maybe_point_at_variant` of the first five for\n   the peeled scrutinee ADT), `special_tys: Vec<(hir::Type, SpecialTy)>` (`collect_special_tys`\n   of the first witness: beyond-boundary `usize`/`isize`, `str`, foreign `#[non_exhaustive]`,\n   uninhabited). The lowering then drops its reader.\n3. **`would_be_exhaustive_without_guards: bool`** on `MissingMatchArms` (`check_match`\n   re-analyzes with the guards off) for the note \"match arms with guards don't count towards\n   exhaustivity\".\n4. **Inhabitedness.** `hir::Type::is_inhabited_from(&self, db, hir::Module) -> bool` (hir-ty's\n   `inhabitedness`), for \"references are always considered inhabited\"\n   (`tests/ui/pattern/usefulness/issue-78123-non-exhaustive-reference.rs`), and on\n   `NonExhaustiveLet` `privately_uninhabited: bool` (rustc's `witness_1_is_privately_uninhabited`:\n   the first witness's variant inhabited from the module but not ignoring visibility) for\n   \"pattern `X` is currently uninhabited, but this variant contains private fields which may\n   become inhabited in the future\".\n5. **The other irrefutable bindings.** Only `let` statements with an initializer are checked.\n   rustc's `check_binding_is_irrefutable` also checks function parameters (\"refutable pattern\n   in function argument\"), closure parameters (\"closure argument\"), `for` patterns (\"`for` loop\n   binding\"), `let` without an initializer (`let Some(x);`, where `check_non_exhaustive_let`\n   returns at `initializer?`) and destructuring assignments (\"assignment\", with the note\n   \"destructuring assignments require an \\\"irrefutable pattern\\\" ..\"). Wanted:\n   `NonExhaustiveLet { pat, origin: BindingOrigin { Let, FnParam, ClosureParam, ForLoop,\n   Assignment }, has_initializer: bool, .. }`. Tests:\n   `tests/ui/pattern/usefulness/refutable-pattern-in-fn-arg.rs`,\n   `tests/ui/pattern/refutable-pattern-for-loop-15381.rs`,\n   `tests/ui/pattern/usefulness/refutable-pattern-errors.rs`.\n\n> forwarded to db: the fields on `hir::MissingMatchArms`/`NonExhaustiveLet` and `hir::Type::is_inhabited_from` (`crates/hir/`). > forwarded to coordinator: 1 to 5's checking is `crates/hir-ide/src/diagnostics/{expr,match_check}.rs`, which `crates.md` removes at integration; porting rustc's pattern lowering into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate match checking moves to first, then the port goes there.\n> checked by db-audit-other (22:37): in the tree. The fields are on `hir::MissingMatchArms` (`crates/hir/src/diagnostics.rs:844-866`: `witnesses`, `variants`, `special_tys`, `would_be_exhaustive_without_guards`, `no_arms`) and on `hir::NonExhaustiveLet` (`:868-882`: `origin: BindingOrigin`, `has_initializer`, `privately_uninhabited`, `interpreted_as_const`). `hir::Type::is_inhabited_from` is at `crates/hir/src/match_lints.rs:183`. Match checking (1 to 5) moved to `crates/hir-ty-matchck`.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-mir-matches: what match checking gives, as rustc gives it (db, `crates/hir-ide/src/diagnostics/expr.rs`, `match_check.rs`, `match_check/pat_analysis.rs`, `crates/hir/src/diagnostics.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:872"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:37): in the tree. The fields are on `hir::MissingMatchArms` (`crates/hir/src/diagnostics.rs:844-866`: `witnesses`, `variants`, `special_tys`, `would_be_exhaustive_without_guards`, `no_arms`) and on `hir::NonExhaustiveLet` (`:868-882`: `origin: BindingOrigin`, `has_initializer`, `privately_uninhabited`, `interpreted_as_const`). `hir::Type::is_inhabited_from` is at `cra"
+    }
+  ]
+}

@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""A proc macro that calls C a library's build script compiled, expanded as cargo's (zed's).
+"""A proc macro that calls C a library's build script compiled, expanded natively and as WebAssembly (zed's).
 
 zed's `include_flate_codegen` links zstd-sys, whose build script compiles zstd with the C
 compiler of `TARGET`. blaze ran that script for the host alone, so the macro's module, built
 for wasm32-wasip1, was linked with the host's `libzstd.a` ("neither Wasm object file nor LLVM
 bitcode") and failed (promote run 40895100165). For a module, the build script of each library
-it links runs for wasm32-wasip1, as cargo runs it for a library built for that target
-(compile_time.rs).
+it links runs for wasm32-wasip1, as cargo runs it for a library built for that target.
 
 The macro here hashes its input with a C function of `csum`, whose build script compiles it
 with the compiler of `TARGET` (`CC_<target>`, `CC` or `cc`, as cc-rs looks) and archives it
-(`AR_<target>`, `AR` or `ar`). The program prints the hash; blaze's has to print cargo's, with
-the macro expanded natively and as WebAssembly. wasm32-wasip1's compiler is clang and its
-archiver llvm-ar, as cc-rs takes them for a wasm target.
+(`AR_<target>`, `AR` or `ar`). The program prints the hash, which has to be the FNV-1a hash
+of each input, the same with the macro expanded natively and as WebAssembly, and the same
+again built from nothing (a home, a store and a target directory of its own). wasm32-wasip1's
+compiler is clang and its archiver llvm-ar, as cc-rs takes them for a wasm target.
 """
 import os, shutil, subprocess, tempfile
 
-from blaze_cli import base_env
-from checktargets import write
+from blaze_cli import Scratch, base_env, write
 
 C = r'''unsigned int csum(const unsigned char *bytes, __SIZE_TYPE__ len) {
     unsigned int hash = 2166136261u;
@@ -79,6 +78,14 @@ MAIN = r'''fn main() {
 '''
 
 
+def csum(text):
+    """What `csum` answers of `text`: its 32-bit FNV-1a hash."""
+    hash = 2166136261
+    for byte in text.encode():
+        hash = (hash ^ byte) * 16777619 % (1 << 32)
+    return hash
+
+
 def wasm_tools():
     """clang and llvm-ar, which cc-rs takes for a wasm target: an error naming what is missing."""
     clang = shutil.which("clang")
@@ -110,6 +117,7 @@ def main():
     write(at, "csum/src/lib.rs", LIB)
     passed = False
     base = None
+    expected = f"{csum('hello')} {csum('zed')}\n"
 
     def run(command):
         ran = subprocess.run(command, cwd=at, env=base, capture_output=True, text=True, timeout=900)
@@ -122,10 +130,12 @@ def main():
             base["BLAZE_PROC_MACRO_WASM"] = mode
             base["CC_wasm32_wasip1"] = clang
             base["AR_wasm32_wasip1"] = ar
-            expected = run(["cargo", "run", "-q"])
             ours = run(["blaze", "run", "-q"])
             assert ours == expected, f"wasm={mode}: {ours!r} != {expected!r}"
-            print(f"  wasm={mode}: {ours.strip()}, as cargo's", flush=True)
+            _, ran = Scratch(at, base).cargo("run", "-q", timeout=900)
+            assert ran.returncode == 0, f"wasm={mode} from nothing: exit {ran.returncode}\n{ran.stdout}\n{ran.stderr}"
+            assert ran.stdout == expected, f"wasm={mode} from nothing: {ran.stdout!r} != {expected!r}"
+            print(f"  wasm={mode}: {ours.strip()}, the hashes, and so from nothing", flush=True)
             run(["blaze", "stop"])
         passed = True
     finally:

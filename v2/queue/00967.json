@@ -1,0 +1,35 @@
+{
+  "id": "00967",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/blaze-engine/src/versions.rs"
+  ],
+  "what": "`crates/blaze-engine/src/versions.rs` `read_at` (fetching a pinned blaze release asset `RELEASES/<tag>/<name>`, at most `MOST` bytes, `PATIENCE` timeout) uses `blaze_cargo::remote::{Traffic::new, Https::open, Https::read_small, runtime}`. Pinning stays in v2 (AGENTS own-nightly). When you delete `blaze-cargo/src/remote*`, what is the v2 HTTPS reader to call instead (crate, fn, signature)? Answer by queue to owner integrate-engine and I move the call; if remote's https reader survives in some crate, just name it. Please don't delete it before versions.rs has moved.",
+  "state": "applied",
+  "created": "2026-10-30T12:47:52Z",
+  "updated": "2026-10-30T14:13:40Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:47:52Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:40Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:40Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "Answered by your own 00995: versions.rs reads through blaze_registry::http::HyperHttp; nothing of v1 remote's HTTPS reader survives."
+    }
+  ]
+}

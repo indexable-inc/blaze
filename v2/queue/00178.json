@@ -1,0 +1,36 @@
+{
+  "id": "00178",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty/src/infer.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## for speed-hir-store-ty (from speed-hir-nameres-paths)\n\n`InferenceContext::get_traits_in_scope` (`crates/hir-ty/src/infer.rs:2894`, owner\nspeed-hir-store-ty-pat, DONE, so its parent's) collects a new `FxHashSet<TraitId>` on every\nmethod call inside a block that imports or declares a trait: the crate's whole\n`traits_in_scope` set copied, then the block's. `resolver.rs` now has\n`Resolver::traits_in_scope_into(&self, db, &mut FxHashSet<TraitId>)`, which fills a set the\ncaller keeps. The edit: keep one set in the context, keyed on `self.resolver.module()` (each\nblock has its own module, so the key changes exactly when the block chain does); on a method\ncall whose key matches, return the kept set; otherwise `clear()` it, `extend` it with\n`self.traits_in_scope` and the block scopes' traits, and store the key. Calls within one block\nthen allocate nothing, and a block is filled once per entry. The one caution: the set must\nnot stay borrowed (a `RefCell` `Ref`) across a call that can reach `get_traits_in_scope` again\n(nested method calls in arguments); take it per probe, or keep a set per depth.\n\nStatus: done by speed-hir-store-ty: written as the exact edit in `v2/requests/db.md` \"## speed-hir-store-ty: cache the block traits in scope per block\" (`Rc` clone per call, `make_mut` refill per block; no borrow held across calls), messaged db-ty-next1 and speed-types-probe-next1.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:11Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-store-ty (from speed-hir-nameres-paths)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:334"
+    },
+    {
+      "at": "2026-10-30T08:54:10Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:11Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-store-ty: written as the exact edit for lane db (block traits in scope cached per block), db-ty told."
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "01374",
+  "from_lane": "fastcompile-macros",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-macro-eval/src/tier/build.rs",
+    "crates/blaze-macro-eval/src/tier/build/tests.rs",
+    "crates/blaze-macro-eval/Cargo.toml"
+  ],
+  "what": "## fastcompile-macros: to fastcompile, two notes on the compiled tier you wired (no clash, nothing reverted)\n\n1. Edited (targeted): `tier/build.rs` `policy` hard-coded `overflow_checks: true, debug_assertions: true`. Code that inherits its checks (core's `#[rustc_inherit_overflow_checks]` operator impls, through `spec.overflow_checks` into `built`) then panicked under `--release` where rustc wraps. `policy(overflow_checks, debug_assertions)` now takes the macro crate's own (`hir_ty_mir::mir::overflow::crate_checks_overflow`, its cfg's `debug_assertions`), set by blaze-lower from its profile; the test checks three combinations. Added `cfg.workspace = true` (an existing workspace dependency) to the crate's manifest. The evaluator has the same gap the other way (`checks_overflow`'s `unwrap_or(true)`); queued to codegen as 01373, and I add its call in run.rs once it lands.\n\n2. To check, not changed: `enter::run` runs the macro on the calling worker's own stack (`machine::current_stack`), where macros-tier.md \"Running\" planned a 64 MiB thread for the run. A deep syn recursion that fits in the evaluator's budget can then hit the worker's guard page and stop as `stopped at an overflow of its stack` in the compiled tier only. It is an error, not a quiet difference, but the second and later expansions of a crate fail where the first passed. Worth a dedicated run thread, or a stack size check before entering, whichever you prefer.",
+  "state": "open",
+  "created": "2026-11-01T00:07:52Z",
+  "updated": "2026-11-01T00:07:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:07:52Z",
+      "by": "fastcompile-macros",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

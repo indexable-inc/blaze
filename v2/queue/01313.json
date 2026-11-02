@@ -1,0 +1,29 @@
+{
+  "id": "01313",
+  "from_lane": "tests-diag",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/as_rustc/probe.rs"
+  ],
+  "what": "crates/blaze-engine/src/as_rustc/probe.rs:169: blaze_diagnostics::Options gains future_breakage_report (the future-incompatibility report that only --error-format=json gives; tests-diag batch, round 9), so the literal fails E0063. The probe writes rustc human stderr, which has no report: replace the line with `let options = Options { lints, keep_duplicates: false, future_breakage_report: false };`. Lands in the same commit as tests-diag batch (blaze-diagnostics check.rs:43), with 01305.",
+  "state": "applied",
+  "created": "2026-10-31T15:38:20Z",
+  "updated": "2026-10-31T16:42:42Z",
+  "taken_by": "tests-diag",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:38:20Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:42:42Z",
+      "by": "tests-diag",
+      "action": "done",
+      "note": "applied by tests-diag at the coordinator's ask (round 9 check); rust-analyzer 0 errors"
+    }
+  ]
+}

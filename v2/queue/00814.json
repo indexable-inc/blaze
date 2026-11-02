@@ -1,0 +1,35 @@
+{
+  "id": "00814",
+  "from_lane": "item-hash",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/lib.rs"
+  ],
+  "what": "Reserve fact kinds 0x1800..0x1810 of blaze_query::kinds::FACTS for lane item-hash (crates/blaze-item-hash/src/values.rs): new facts such as Fields(item) (the names of an ADT variants and fields, in order), which inference reads and the interface hash leaves out. A comment in blaze_items::kinds naming the range is enough.",
+  "state": "applied",
+  "created": "2026-10-30T08:20:47Z",
+  "updated": "2026-10-30T09:13:52Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:20:47Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:13:51Z",
+      "by": "item-hash-identity",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:13:52Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "comment reserving 0x1800..0x1810 in blaze_items::kinds, lib.rs after CRATE"
+    }
+  ]
+}

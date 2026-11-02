@@ -1,0 +1,35 @@
+{
+  "id": "00832",
+  "from_lane": "dbsp-engine",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/proc_macro.rs"
+  ],
+  "what": "crates/hir-expand/src/proc_macro.rs `ProcMacrosBuilder::build_in`: end it with `db.note_crates_changed()` (new in crates/base-db/src/maintain.rs). A crate's proc macros are a crate input base-db does not set itself, and the write-side maintainers (docs/v2/plan/design/dbsp.md section 3, `Written::crates`) must see that they changed, or name resolution keeps stale derive/attribute macro resolutions. If build_in can tell nothing changed, skip the call (it re-checks every module).",
+  "state": "applied",
+  "created": "2026-10-30T08:37:31Z",
+  "updated": "2026-10-30T10:00:06Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:37:31Z",
+      "by": "dbsp-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: crates/hir-expand/src/proc_macro.rs ProcMacrosBuilder::build_in ends with db.note_crates_changed() (always: ProcMacroLoadResult has no cheap equality to tell nothing changed)"
+    }
+  ]
+}

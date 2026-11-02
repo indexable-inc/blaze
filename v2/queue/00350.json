@@ -1,0 +1,33 @@
+{
+  "id": "00350",
+  "from_lane": "mem-db-infer-method",
+  "owner": "db",
+  "paths": [],
+  "what": "## Speed\n\nBytes per node and the dominant temporaries per run, on a 1,000-expression body with about 150\nmethod calls and 100 paths probed (R8's yardstick; frame allocation about 2 ns, `malloc`/`free`\n15 to 25 ns):\n\n| temporary | per probe | per body (250 probes) | before |\n|---|---|---|---|\n| probe candidate lists (4 lists, `Candidate` 40 bytes, 2 to 6 entries) | ~250 B, 2 to 3 frame bumps | ~60 KB | 2 to 4 `malloc` + regrowth |\n| `impl_dups` (16 `ImplId`s' table) | ~200 B, 1 bump | ~50 KB | 1 `malloc` |\n| probe steps (`CandidateStep` ~100 B, 1 to 4) | ~400 B, 1 bump | ~100 KB | 0 to 1 `malloc` (spill) |\n| `TraitValueItems::runs` (24 B each, 2 to 6 crates) | ~100 B, 1 bump | ~25 KB | 0 to 1 `malloc` |\n| autoderef steps (twice per method call, more for fields/index) | 0 (inline) | 0 | 1 to 3 `malloc` each |\n| receiver adjustments (24 B, 1 to 3) | ~70 B, 1 bump | ~10 KB (150 calls) | 1 to 2 `malloc` |\n\nSo about 1 KB of frame per probe written, about 250 KB per 1,000-expression body (linear in\nprobes: R8's bound is \"bytes per expression times expressions\", here about 250 B per expression\non average), where before the same body made roughly 2,000 to 3,000 global allocations from these\nfiles (about 40 to 75 µs of `malloc`/`free` at 15 to 25 ns). After: about 1,500 frame bumps\n(about 3 µs). The probe itself (solver goals per candidate, several µs each) stays the cost; the\nsolver's query responses (`make_query_response_ignoring_pending_obligations` per step, one\n`QueryResponse` with its own `Vec`s) are the largest allocation left per probe and are\nmem-db-solver's.\n\nImpl tables, per crate (std: ~8,000 trait impls in ~5,000 rows of ~900 traits; ~2,000 inherent\nimpls): frame bytes per record 16 (`(u32, ImplId)`) plus 32 per row (`(u32, (u64,\nSimplifiedType))` padded) plus about 1.15 × 16 per map entry, so about 400 KB of frame for std,\nwritten once and sorted (`n log n` on 4-byte indices); the result is 10 exact columns, 12 bytes per\nrow plus 8 per impl plus 4 per trait, about 140 KB, written once. Before: ~5,000 row `Vec`s plus\n~900 per-trait maps, each grown (about 15,000 `malloc`s, 0.3 ms) and every column regrown and\nshrunk. The bound is the write of the result columns plus one pass over the records: about\n0.5 MB touched, well under a millisecond, once per crate per change.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:46): notes, nothing to apply.",
+  "state": "applied",
+  "created": "2026-10-30T03:35:03Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-method.md#Speed",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-method.md:3115"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:46): notes, nothing to apply."
+    }
+  ]
+}

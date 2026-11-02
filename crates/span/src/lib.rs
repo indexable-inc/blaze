@@ -1,6 +1,8 @@
 //! File and span related types.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![deny(unsafe_code)]
+#![feature(allocator_api, allocator_ext)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -9,7 +11,13 @@ use std::fmt::{self, Write};
 
 mod ast_id;
 mod hygiene;
+// Its `simd` module is the one unsafe module: the newline bitmap's vector loads.
+mod lines;
 mod map;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub use self::{
     ast_id::{
@@ -17,12 +25,31 @@ pub use self::{
         NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID,
     },
     hygiene::{SyntaxContext, Transparency},
+    lines::{Kernel, LineIndex, Place, char_width, display_width},
     map::{RealSpanMap, SpanMap},
 };
 
 pub use syntax::Edition;
 pub use text_size::{TextRange, TextSize};
-pub use vfs::FileId;
+
+/// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct FileId(u32);
+
+impl FileId {
+    const MAX: u32 = 0x7fff_ffff;
+
+    #[inline]
+    pub const fn from_raw(raw: u32) -> FileId {
+        assert!(raw <= Self::MAX);
+        FileId(raw)
+    }
+
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 
 impl Span {
     pub fn cover(self, other: Span) -> Span {
@@ -51,7 +78,7 @@ impl Span {
         }
         // Differing context, we can't merge these so prefer the one that's root
         if self.ctx != other.ctx {
-            #[cfg(feature = "salsa")]
+            #[cfg(feature = "query")]
             if self.ctx.is_root() {
                 return Some(other);
             } else if other.ctx.is_root() {
@@ -203,14 +230,27 @@ impl EditionedFileId {
     }
 
     pub const fn edition(self) -> Edition {
-        let edition = (self.0 & Self::EDITION_MASK) >> Self::FILE_ID_BITS;
-        debug_assert!(edition <= Edition::LATEST as u32);
-        unsafe { std::mem::transmute(edition as u8) }
+        const E2015: u32 = Edition::Edition2015 as u32;
+        const E2018: u32 = Edition::Edition2018 as u32;
+        const E2021: u32 = Edition::Edition2021 as u32;
+        const E2024: u32 = Edition::Edition2024 as u32;
+        const _: () = assert!(Edition::LATEST as u32 == E2024, "a new edition: add it here");
+        // `new` and `from_raw` only make editions up to `Edition::LATEST`.
+        match (self.0 & Self::EDITION_MASK) >> Self::FILE_ID_BITS {
+            E2015 => Edition::Edition2015,
+            E2018 => Edition::Edition2018,
+            E2021 => Edition::Edition2021,
+            E2024 => Edition::Edition2024,
+            _ => panic!("an EditionedFileId with no edition"),
+        }
     }
 }
 
-#[cfg(not(feature = "salsa"))]
-mod salsa {
+#[cfg(feature = "query")]
+use blaze_query::db as query;
+
+#[cfg(not(feature = "query"))]
+mod query {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub struct Id(u32);
 }
@@ -229,13 +269,13 @@ mod salsa {
 /// (`MacroCallId` uses the location interning. You can check details here:
 /// <https://en.wikipedia.org/wiki/String_interning>).
 ///
-/// Internally this holds a `salsa::Id`, but we cannot use this definition here
+/// Internally this holds a `blaze_query::db::Id`, but we cannot use this definition here
 /// as it references things from base-db and hir-expand.
 // FIXME: Give this a better fitting name
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HirFileId(pub salsa::Id);
+pub struct HirFileId(pub query::Id);
 
 /// `MacroCallId` identifies a particular macro invocation, like
 /// `println!("Hello, {}", world)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MacroCallId(pub salsa::Id);
+pub struct MacroCallId(pub query::Id);

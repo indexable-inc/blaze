@@ -1,0 +1,35 @@
+{
+  "id": "00058",
+  "from_lane": "db-ty-hir",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs"
+  ],
+  "what": "## 2. Coordinator, blaze-engine: the check driver (db-ty's request 3, updated)\n\nWhat: `hir::check::check_crate(db, krate, style_lints, bodies)` now takes\n`bodies: Option<&(dyn Fn(DefWithBody) -> bool + Sync)>` (`hir::check::Bodies`), since its\nmodules run as plane tasks. A filter over a set (`|it| asked.contains(&it)`) is `Sync` already.\n`check_workspace`/`check_crates` check the modules of all their crates as one batch, and\n`hir::check::check_module(db, module, style_lints, bodies)` is the work of one task, for a\ndriver that schedules modules itself (e.g. on the plane, one node per file module from\n`hir::check::file_modules`). Results are in def-map order whatever the order tasks ran in.\nWhere: `crates/blaze-engine/src/lib.rs` `errors_of` (~6615), in place of\n`ide_diagnostics::semantic_diagnostics_of_bodies`.\n\n> forwarded to codegen: `crates/blaze-engine/src/lib.rs` is codegen's.",
+  "state": "refused",
+  "created": "2026-10-30T00:37:33Z",
+  "updated": "2026-10-31T20:30:04Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/db-ty-hir.md#2. Coordinator, blaze-engine: the check driver (db-ty's request 3, updated)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-hir.md:18"
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

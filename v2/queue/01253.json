@@ -1,0 +1,43 @@
+{
+  "id": "01253",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/base-db/src/db.rs",
+    "crates/base-db/src/named.rs",
+    "crates/base-db/src/lib.rs"
+  ],
+  "what": "qu-check7 (03d250e6f3) 5x E0308 in base-db: singleton new/builder(..).new take &mut by design (R18, query-unify.md:226: making a singleton is a write; & left readers of its absence valid forever), so the callers move, the macro stays. Every caller already holds a mutable db: db.rs:141 and :142 `.new(&db)` -> `.new(&mut db)` (db is `let mut`); named.rs:175 NamedPaths `.new(&*db)` -> `.new(db)` (PathBucket at :170 is not a singleton, keeps &*db); lib.rs:156 `ProcessEnv::new(&*db, vars, content)` -> `ProcessEnv::new(db, vars, content)`; lib.rs:517 AllCrates `.new(&*db)` -> `.new(db)`. Same rule for any other singleton made through & further up (FrozenDefMaps, FrozenLangItems, ProcMacros in hir-def).",
+  "state": "applied",
+  "created": "2026-10-31T12:10:30Z",
+  "updated": "2026-10-31T12:16:50Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:10:30Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:14:51Z",
+      "by": "query-unify",
+      "action": "reassign",
+      "note": "query-unify -> query-unify-port: Same work as 01249 (R18 singleton creations take &mut), which query-unify-port is doing now in blaze-v2-qu (db.rs:141/142 done); its edits are recorded in the crate JSONs, so they are the port's to make."
+    },
+    {
+      "at": "2026-10-31T12:16:50Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:16:50Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "applied in blaze-v2-qu (qu-check7): every singleton creation passes &mut; also ProcMacros::init_default takes &mut Db (callers blaze-lower lib.rs:308, hir-expand fixture.rs:397, blaze-wasm-pack tests.rs:74); bench Graph:266 is salsa. rust-analyzer 0 errors; logged in qu-build/ready.txt 05:14."
+    }
+  ]
+}

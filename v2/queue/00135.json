@@ -1,0 +1,35 @@
+{
+  "id": "00135",
+  "from_lane": "diagnostics-lints-bodies-liveness",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir"
+  ],
+  "what": "## 1. hir-ty-mir: mark the guard references in `MirBody`\n\nWhat: `MirBody::guard_locals: ArenaMap<LocalId, BindingId>` (or a `LocalInfo` per local), set\nwhere `lower.rs` takes `tmp = &place` for a by-value binding of a guarded arm (rustc's\n`BindingForm::RefForGuard(arm_local)`). Why: liveness merges the guard's reads into the\nbinding's. It now recognises the reference by its shape: an unprojected `Ref` assigned at the\nbinding's `PatId` to a local that is no binding's. That holds for what the lowering emits today,\nbut a later change to it would break it without anything failing loudly.\n\n> forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.\n\n> taken by codegen (lead, 2026-10-29): child codegen-rq-mir.",
+  "state": "applied",
+  "created": "2026-10-30T01:33:34Z",
+  "updated": "2026-10-31T20:36:07Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-bodies-liveness.md#1. hir-ty-mir: mark the guard references in `MirBody`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-bodies-liveness.md:7"
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:07Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "MirBody::guard_refs is in (hir-ty/src/mir.rs:1602) and filled by lower.rs."
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "id": "00511",
+  "from_lane": "diagnostics-lints-names-items",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def",
+    "crates/hir",
+    "crates/base-db",
+    "crates/hir-def/src/signatures.rs"
+  ],
+  "what": "## diagnostics-lints-names-items: default field values in the item tree (crates/hir-def `signatures.rs`)\n\nWhat: `#![feature(default_field_values)]` fields (`field: T = expr`) as\n`FieldData::default_value: Option<ExprId>` of a body of the field (rustc's `FieldDef::value`).\nWhy: the deny-by-default `default_overrides_default_fields`\n(`compiler/rustc_lint/src/default_could_be_derived.rs`) checks a manual `impl Default` whose\nbody's struct expression sets fields that have a default value; hir-def drops the `= expr`, so\nthe lint can't tell which fields have one.\n\n> forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).\n> checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/signatures.rs:1385`. `FieldData::default_value: Option<ConstRef>` is lowered from the field's `= expr` at `:1663`, and `ConstRef { expr: ExprId }` is in the variant's store (`hir/type_ref.rs:231`).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-items: default field values in the item tree (crates/hir-def `signatures.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2418"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:38): in the tree at `crates/hir-def/src/signatures.rs:1385`. `FieldData::default_value: Option<ConstRef>` is lowered from the field's `= expr` at `:1663`, and `ConstRef { expr: ExprId }` is in the variant's store (`hir/type_ref.rs:231`)."
+    }
+  ]
+}

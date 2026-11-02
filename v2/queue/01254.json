@@ -1,0 +1,44 @@
+{
+  "id": "01254",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-def",
+    "crates/hir-ty",
+    "crates/blaze-lower",
+    "crates/blaze-bench"
+  ],
+  "what": "Follow-up to 01253: other singletons made through & in blaze-v2-qu, each an E0308 once its crate is checked (same R18 rule, pass the &mut db the write already holds): hir-def deps/serve.rs:323 DepImages .new(&*db); hir-ty method_resolution/delta/publish.rs:201 ImplIdentities::new(&*db, ..) and :608 ImplSlices::new(&*db, ..); hir-ty consteval/deps.rs:148 KeptConsts .new(&*db); hir-ty check_cache.rs:107 ServedBodies .new(&*db); blaze-lower lib.rs:325-326 LibraryRoots/LocalRoots .new(&db); blaze-bench benches/query_hit.rs:266 Graph .new(&db). Calls passing a bare `db` (nameres.rs:144, frozen.rs:118/290, hir-ty frozen.rs:44, publish.rs:313, location.rs:134, inputs.rs:36, proc_macro.rs:156) are fine only if that db is &mut there.",
+  "state": "applied",
+  "created": "2026-10-31T12:10:47Z",
+  "updated": "2026-10-31T12:16:51Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:10:47Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:14:51Z",
+      "by": "query-unify",
+      "action": "reassign",
+      "note": "query-unify -> query-unify-port: Same work as 01249 (R18 singleton creations take &mut), which query-unify-port is doing now in blaze-v2-qu (db.rs:141/142 done); its edits are recorded in the crate JSONs, so they are the port's to make."
+    },
+    {
+      "at": "2026-10-31T12:16:50Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:16:51Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "applied in blaze-v2-qu (qu-check7): every singleton creation passes &mut; also ProcMacros::init_default takes &mut Db (callers blaze-lower lib.rs:308, hir-expand fixture.rs:397, blaze-wasm-pack tests.rs:74); bench Graph:266 is salsa. rust-analyzer 0 errors; logged in qu-build/ready.txt 05:14."
+    }
+  ]
+}

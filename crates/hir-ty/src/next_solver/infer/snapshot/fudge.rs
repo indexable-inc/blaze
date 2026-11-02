@@ -1,9 +1,6 @@
 use std::ops::Range;
 
-use ena::{
-    snapshot_vec as sv,
-    unify::{self as ut, UnifyKey},
-};
+use hir_def::{ConstParamId, TypeParamId};
 use rustc_type_ir::{
     ConstVid, FloatVid, IntVid, RegionVid, TyVid, TypeFoldable, TypeFolder, TypeSuperFoldable,
     TypeVisitableExt, inherent::IntoKind,
@@ -14,38 +11,44 @@ use crate::{
     next_solver::{
         Const, ConstKind, DbInterner, Region, RegionKind, Ty, TyKind,
         infer::{
-            InferCtxt, UnificationTable, iter_idx_range,
+            InferCtxt, iter_idx_range,
             snapshot::VariableLengths,
-            unify_key::{ConstVariableValue, ConstVidKey},
+            union_find::{UnifyKey, UnifyValue, UnionFind},
+            unify_key::ConstVariableValue,
         },
     },
 };
 
-fn vars_since_snapshot<'db, T>(
-    table: &UnificationTable<'_, 'db, T>,
+fn vars_since_snapshot<K: UnifyKey, V: UnifyValue>(
+    table: &UnionFind<K, V>,
     snapshot_var_len: usize,
-) -> Range<T>
-where
-    T: UnifyKey,
-    super::UndoLog<'db>: From<sv::UndoLog<ut::Delegate<T>>>,
-{
-    T::from_index(snapshot_var_len as u32)..T::from_index(table.len() as u32)
+) -> Range<K> {
+    K::from_index(snapshot_var_len as u32)..K::from_index(table.len() as u32)
 }
 
 fn const_vars_since_snapshot<'db>(
-    table: &mut UnificationTable<'_, 'db, ConstVidKey<'db>>,
+    table: &mut UnionFind<ConstVid, ConstVariableValue<'db>>,
+    params: &[(ConstVid, ConstParamId)],
     snapshot_var_len: usize,
-) -> (Range<ConstVid>, Vec<Span>) {
+) -> (Range<ConstVid>, Vec<(Span, Option<ConstParamId>)>) {
     let range = vars_since_snapshot(table, snapshot_var_len);
-    let range = range.start.vid..range.end.vid;
+    let params = &params[params.partition_point(|&(vid, _)| vid < range.start)..];
 
     (
-        range.clone(),
+        range.start..range.end,
         iter_idx_range(range)
-            .map(|index| match table.probe_value(index) {
-                ConstVariableValue::Known { value: _ } => Span::Dummy,
-                ConstVariableValue::Unknown { span, universe: _ } => span,
+            .map(|index| {
+                let span = match table.probe_value(index) {
+                    ConstVariableValue::Known { value: _ } => Span::Dummy,
+                    ConstVariableValue::Unknown { span, universe: _ } => span,
+                };
+                let param = params
+                    .binary_search_by_key(&index, |&(vid, _)| vid)
+                    .ok()
+                    .map(|at| params[at].1);
+                (span, param)
             })
+            // alloc: only when fudging, one span per variable made in the snapshot.
             .collect(),
     )
 }
@@ -104,7 +107,7 @@ impl<'db> InferCtxt<'db> {
             // going to be popped, so we will have to
             // eliminate any references to them.
             let snapshot_vars = SnapshotVarData::new(self, variable_lengths);
-            Ok((snapshot_vars, self.resolve_vars_if_possible(value)))
+            Ok((snapshot_vars, self.deeply_resolve_ignoring_regions(value)))
         })?;
 
         // At this point, we need to replace any of the now-popped
@@ -131,10 +134,10 @@ impl<'db> InferCtxt<'db> {
 
 struct SnapshotVarData {
     region_vars: (Range<RegionVid>, Vec<Span>),
-    type_vars: (Range<TyVid>, Vec<Span>),
+    type_vars: (Range<TyVid>, Vec<(Span, Option<TypeParamId>)>),
     int_vars: Range<IntVid>,
     float_vars: Range<FloatVid>,
-    const_vars: (Range<ConstVid>, Vec<Span>),
+    const_vars: (Range<ConstVid>, Vec<(Span, Option<ConstParamId>)>),
 }
 
 impl SnapshotVarData {
@@ -145,12 +148,14 @@ impl SnapshotVarData {
             .vars_since_snapshot(vars_pre_snapshot.region_constraints_len);
         let type_vars = inner.type_variables().vars_since_snapshot(vars_pre_snapshot.type_var_len);
         let int_vars =
-            vars_since_snapshot(&inner.int_unification_table(), vars_pre_snapshot.int_var_len);
+            vars_since_snapshot(inner.int_unification_table(), vars_pre_snapshot.int_var_len);
         let float_vars =
-            vars_since_snapshot(&inner.float_unification_table(), vars_pre_snapshot.float_var_len);
+            vars_since_snapshot(inner.float_unification_table(), vars_pre_snapshot.float_var_len);
 
+        let inner = &mut *inner;
         let const_vars = const_vars_since_snapshot(
-            &mut inner.const_unification_table(),
+            &mut inner.const_unification_storage,
+            &inner.const_var_params,
             vars_pre_snapshot.const_var_len,
         );
         SnapshotVarData { region_vars, type_vars, int_vars, float_vars, const_vars }
@@ -184,8 +189,8 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for InferenceFudger<'a, 'db> {
                         // This variable was created during the fudging.
                         // Recreate it with a fresh variable here.
                         let idx = vid.as_usize() - self.snapshot_vars.type_vars.0.start.as_usize();
-                        let span = self.snapshot_vars.type_vars.1[idx];
-                        self.infcx.next_ty_var(span)
+                        let (span, param) = self.snapshot_vars.type_vars.1[idx];
+                        self.infcx.next_ty_var_for_param(span, param)
                     } else {
                         // This variable was created before the
                         // "fudging". Since we refresh all type
@@ -245,8 +250,8 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for InferenceFudger<'a, 'db> {
                 rustc_type_ir::InferConst::Var(vid) => {
                     if self.snapshot_vars.const_vars.0.contains(&vid) {
                         let idx = vid.index() - self.snapshot_vars.const_vars.0.start.index();
-                        let span = self.snapshot_vars.const_vars.1[idx];
-                        self.infcx.next_const_var(span)
+                        let (span, param) = self.snapshot_vars.const_vars.1[idx];
+                        self.infcx.next_const_var_for_param(span, param)
                     } else {
                         ct
                     }

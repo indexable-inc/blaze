@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem;
@@ -74,7 +74,12 @@ impl Summary {
                 bail!("dev-dependencies are not allowed to be optional: `{}`", dep.name_in_toml())
             }
         }
-        let feature_map = build_feature_map(features, &dependencies)?;
+        let feature_map = build_feature_map(
+            features,
+            dependencies
+                .iter()
+                .map(|d| FeatureDep { name_in_toml: d.name_in_toml(), optional: d.is_optional() }),
+        )?;
         Ok(Summary {
             inner: Arc::new(Inner {
                 package_id: pkg_id,
@@ -179,35 +184,49 @@ impl Hash for Summary {
     }
 }
 
-fn build_feature_map(
+/// What the feature map reads of a dependency.
+#[derive(Clone, Copy, Debug)]
+pub struct FeatureDep {
+    /// The key of its `[dependencies]` entry.
+    pub name_in_toml: InternedString,
+    pub optional: bool,
+}
+
+/// cargo's `build_feature_map`: the declared features, plus the implicit feature of each
+/// optional dependency no `dep:` names, with cargo's checks and messages. `dependencies` is
+/// walked in its order, which decides which unused optional dependency an error names.
+pub fn build_feature_map<I>(
     features: &BTreeMap<InternedString, Vec<InternedString>>,
-    dependencies: &[Dependency],
-) -> Result<FeatureMap> {
+    dependencies: I,
+) -> Result<FeatureMap>
+where
+    I: Iterator<Item = FeatureDep> + Clone,
+{
     use FeatureValue::*;
     // Each name in `[dependencies]` and whether any entry of that name is optional.
-    let mut dep_map: FxHashMap<InternedString, bool> = FxHashMap::default();
-    for dep in dependencies.iter() {
-        *dep_map.entry(dep.name_in_toml()).or_insert(false) |= dep.is_optional();
+    let mut dep_map: HashMap<InternedString, bool> = HashMap::default();
+    for dep in dependencies.clone() { // clone: an iterator over borrowed dependencies
+        *dep_map.entry(dep.name_in_toml).or_insert(false) |= dep.optional;
     }
 
     let mut map: FeatureMap = features
         .iter()
-        .map(|(feature, list)| (*feature, list.iter().map(|fv| FeatureValue::new(*fv)).collect()))
-        .collect();
+        .map(|(feature, list)| (*feature, list.iter().map(|fv| FeatureValue::new(*fv)).collect())) // alloc: the feature map, once per package
+        .collect(); // alloc: as above
 
     // The implicit feature of an optional dependency that no `dep:` names and no feature of
     // the same name replaces.
-    let explicitly_listed: FxHashSet<_> =
-        map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).collect();
-    for dep in dependencies {
-        if !dep.is_optional() {
+    let explicitly_listed: HashSet<_> =
+        map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).collect(); // alloc: once per package
+    for dep in dependencies.clone() { // clone: an iterator over borrowed dependencies
+        if !dep.optional {
             continue;
         }
-        let dep_name = dep.name_in_toml();
+        let dep_name = dep.name_in_toml;
         if features.contains_key(&dep_name) || explicitly_listed.contains(&dep_name) {
             continue;
         }
-        map.insert(dep_name, vec![Dep { dep_name }]);
+        map.insert(dep_name, vec![Dep { dep_name }]); // alloc: the feature map, once per package
     }
 
     for (feature, fvs) in &map {
@@ -267,9 +286,9 @@ fn build_feature_map(
                         let has_other_dep = explicitly_listed.contains(stripped_dep);
                         let is_optional = dep_map.get(stripped_dep).is_some_and(|&o| o);
                         let extra_help = if *weak || has_other_dep || !is_optional {
-                            String::new()
+                            String::new() // alloc: error path
                         } else {
-                            format!(
+                            format!( // alloc: error path
                                 "\nIf the intent is to avoid creating an implicit feature \
                                  `{stripped_dep}` for an optional dependency, \
                                  then consider replacing this with two values:\n    \
@@ -284,7 +303,7 @@ fn build_feature_map(
                     if !is_any_dep {
                         bail!(MissingDependencyError {
                             feature: *feature,
-                            feature_value: fv.clone(),
+                            feature_value: fv.clone(), // clone: error path
                             dep_name: *dep_name,
                             weak_optional: *weak,
                         })
@@ -302,17 +321,16 @@ fn build_feature_map(
     }
 
     // Every optional dependency is enabled by some feature.
-    let used: FxHashSet<_> = map
+    let used: HashSet<_> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {
             Dep { dep_name } | DepFeature { dep_name, .. } => Some(dep_name),
             _ => None,
         })
-        .collect();
+        .collect(); // alloc: once per package
     if let Some(dep) = dependencies
-        .iter()
-        .map(|d| d.name_in_toml())
+        .map(|d| d.name_in_toml)
         .find(|dep| dep_map[dep] && !used.contains(dep))
     {
         bail!(
@@ -384,6 +402,8 @@ impl fmt::Display for FeatureValue {
     }
 }
 
+// BTreeMap: built once per package, read in order (`features_enabling_dependency_sorted`,
+// `blaze-tree`, the index) many times.
 pub type FeatureMap = BTreeMap<InternedString, Vec<FeatureValue>>;
 
 #[cfg(test)]

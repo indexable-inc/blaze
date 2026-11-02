@@ -2,7 +2,7 @@
 //!
 //! This attribute to tell the compiler about semi built-in std library
 //! features, such as Fn family of traits.
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
 use stdx::impl_from;
@@ -10,7 +10,7 @@ use stdx::impl_from;
 use crate::{
     AdtId, AssocItemId, AttrDefId, ConstId, Crate, EnumId, EnumVariantId, FunctionId, ImplId,
     ItemContainerId, MacroId, ModuleDefId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
-    attrs::AttrFlags,
+    attrs::{AttrFlags, CrateAttrFlags},
     nameres::{DefMap, assoc::TraitItems, crate_def_map, crate_local_def_map},
 };
 
@@ -33,9 +33,9 @@ impl_from!(
     EnumId, FunctionId, ImplId, StaticId, StructId, UnionId, TypeAliasId, TraitId, EnumVariantId, ConstId, MacroId for LangItemTarget
 );
 
-/// Salsa query. This will look for lang items in a specific crate.
-#[salsa::tracked(returns(as_deref))]
-pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<LangItems>> {
+/// A query. This will look for lang items in a specific crate.
+#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
     if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
         return frozen;
@@ -49,14 +49,22 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
         return None;
     }
 
+    // Each item's flags off its file's column, not its own query: the pass is often the first
+    // reader of a crate's flags, so the columns are built first, on every core.
+    blaze_mem::frame::current(|frame| {
+        let mut files = Vec::new_in(frame);
+        files.extend(crate_def_map.modules(db).filter_map(|(_, module)| module.origin.file_id()));
+        crate::attrs::build_columns(db, krate, &files);
+    });
+    let mut flags = CrateAttrFlags::new(db);
     for (_, module_data) in crate_def_map.modules(db) {
         for impl_def in module_data.scope(db).inherent_impls() {
-            lang_items.collect_lang_item(db, impl_def);
+            lang_items.collect_lang_item(&mut flags, impl_def);
             for &(_, assoc) in impl_def.impl_items(db).items.iter() {
                 match assoc {
-                    AssocItemId::FunctionId(f) => lang_items.collect_lang_item(db, f),
-                    AssocItemId::TypeAliasId(t) => lang_items.collect_lang_item(db, t),
-                    AssocItemId::ConstId(c) => lang_items.collect_lang_item(db, c),
+                    AssocItemId::FunctionId(f) => lang_items.collect_lang_item(&mut flags, f),
+                    AssocItemId::TypeAliasId(t) => lang_items.collect_lang_item(&mut flags, t),
+                    AssocItemId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
                 }
             }
         }
@@ -64,41 +72,41 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
         for def in module_data.scope(db).declarations() {
             match def {
                 ModuleDefId::TraitId(trait_) => {
-                    lang_items.collect_lang_item(db, trait_);
+                    lang_items.collect_lang_item(&mut flags, trait_);
                     TraitItems::query(db, trait_).items.iter().for_each(|&(_, assoc_id)| {
                         match assoc_id {
                             AssocItemId::FunctionId(f) => {
-                                lang_items.collect_lang_item(db, f);
+                                lang_items.collect_lang_item(&mut flags, f);
                             }
                             AssocItemId::TypeAliasId(alias) => {
-                                lang_items.collect_lang_item(db, alias)
+                                lang_items.collect_lang_item(&mut flags, alias)
                             }
-                            AssocItemId::ConstId(c) => lang_items.collect_lang_item(db, c),
+                            AssocItemId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
                         }
                     });
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
-                    lang_items.collect_lang_item(db, e);
+                    lang_items.collect_lang_item(&mut flags, e);
                     e.enum_variants(db).variants.values().for_each(|&(id, _)| {
-                        lang_items.collect_lang_item(db, id);
+                        lang_items.collect_lang_item(&mut flags, id);
                     });
                 }
                 ModuleDefId::AdtId(AdtId::StructId(s)) => {
-                    lang_items.collect_lang_item(db, s);
+                    lang_items.collect_lang_item(&mut flags, s);
                 }
                 ModuleDefId::AdtId(AdtId::UnionId(u)) => {
-                    lang_items.collect_lang_item(db, u);
+                    lang_items.collect_lang_item(&mut flags, u);
                 }
                 ModuleDefId::FunctionId(f) => {
-                    lang_items.collect_lang_item(db, f);
+                    lang_items.collect_lang_item(&mut flags, f);
                 }
                 ModuleDefId::StaticId(s) => {
-                    lang_items.collect_lang_item(db, s);
+                    lang_items.collect_lang_item(&mut flags, s);
                 }
                 ModuleDefId::TypeAliasId(t) => {
-                    lang_items.collect_lang_item(db, t);
+                    lang_items.collect_lang_item(&mut flags, t);
                 }
-                ModuleDefId::ConstId(c) => lang_items.collect_lang_item(db, c),
+                ModuleDefId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
                 _ => {}
             }
         }
@@ -110,13 +118,14 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
 
     lang_items.resolve_manually(db);
 
+    // alloc: the memo's value, once per crate
     if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }
 }
 
-/// Salsa query. Look for a lang items, starting from the specified crate and recursively
+/// A query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[salsa::tracked(returns(ref))]
-pub fn lang_items(db: &dyn SourceDatabase, start_crate: Crate) -> LangItems {
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
     let mut result = crate_lang_items(db, start_crate).cloned().unwrap_or_default();
@@ -141,19 +150,18 @@ pub fn lang_items(db: &dyn SourceDatabase, start_crate: Crate) -> LangItems {
 }
 
 impl LangItems {
-    fn collect_lang_item<T>(&mut self, db: &dyn SourceDatabase, item: T)
+    fn collect_lang_item<T>(&mut self, flags: &mut CrateAttrFlags<'_>, item: T)
     where
         T: Into<AttrDefId> + Into<LangItemTarget> + Copy,
     {
-        let _p = tracing::info_span!("collect_lang_item").entered();
-        if let Some(lang_item) = AttrFlags::lang_item(db, item.into()) {
+        if let Some(lang_item) = flags.lang_item(item.into()) {
             self.assign_lang_item(lang_item, item.into());
         }
     }
 }
 
 fn resolve_core_trait(
-    db: &dyn SourceDatabase,
+    db: &Db,
     core_def_map: &DefMap,
     modules: &[Symbol],
     name: Symbol,
@@ -161,7 +169,7 @@ fn resolve_core_trait(
     let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(*module))
         else {
             return None;
         };
@@ -179,7 +187,7 @@ fn resolve_core_trait(
 }
 
 fn resolve_core_macro(
-    db: &dyn SourceDatabase,
+    db: &Db,
     core_def_map: &DefMap,
     modules: &[Symbol],
     name: Symbol,
@@ -187,7 +195,7 @@ fn resolve_core_macro(
     let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(*module))
         else {
             return None;
         };
@@ -200,7 +208,7 @@ fn resolve_core_macro(
 }
 
 impl LangItems {
-    fn resolve_manually(&mut self, db: &dyn SourceDatabase) {
+    fn resolve_manually(&mut self, db: &Db) {
         let parent_trait =
             |lang_item: &mut Option<TraitId>, def: Option<FunctionId>| match def?.loc(db).container
             {
@@ -215,13 +223,13 @@ impl LangItems {
                 let trait_items = trait_.trait_items(db);
                 for (assoc_type, name) in assoc_types {
                     **assoc_type =
-                        trait_items.associated_type_by_name(&Name::new_symbol_root(name.clone()));
+                        trait_items.associated_type_by_name(&Name::new_symbol_root(*name));
                 }
             };
         let methods = |trait_: TraitId, assoc_types: &mut [(&mut Option<FunctionId>, Symbol)]| {
             let trait_items = trait_.trait_items(db);
             for (assoc_type, name) in assoc_types {
-                **assoc_type = trait_items.method_by_name(&Name::new_symbol_root(name.clone()));
+                **assoc_type = trait_items.method_by_name(&Name::new_symbol_root(*name));
             }
         };
         (|| {
@@ -321,23 +329,24 @@ impl LangItems {
     }
 }
 
-#[salsa::tracked(returns(as_deref))]
-pub fn crate_notable_traits(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<[TraitId]>> {
-    let mut traits = Vec::new();
-
-    let crate_def_map = crate_def_map(db, krate);
-
-    for (_, module_data) in crate_def_map.modules(db) {
-        for def in module_data.scope(db).declarations() {
-            if let ModuleDefId::TraitId(trait_) = def
-                && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
-            {
-                traits.push(trait_);
+#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
+    blaze_mem::frame::current(|frame| {
+        let mut traits = Vec::new_in(frame);
+        let crate_def_map = crate_def_map(db, krate);
+        for (_, module_data) in crate_def_map.modules(db) {
+            for def in module_data.scope(db).declarations() {
+                if let ModuleDefId::TraitId(trait_) = def
+                    && AttrFlags::query(db, trait_.into())
+                        .contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
+                {
+                    traits.push(trait_);
+                }
             }
         }
-    }
-
-    if traits.is_empty() { None } else { Some(traits.into_iter().collect()) }
+        // alloc: the memo's traits, exact
+        if traits.is_empty() { None } else { Some(Box::from(&traits[..])) }
+    })
 }
 
 macro_rules! language_item_table {
@@ -388,16 +397,10 @@ macro_rules! language_item_table {
                 $( self.$resolve_manually = self.$resolve_manually.or(other.$resolve_manually); )*
             }
 
+            /// Sets the lang item `name` names to `target`, unless `target` is not of its kind.
             fn assign_lang_item(&mut self, name: Symbol, target: LangItemTarget) {
-                match name {
-                    $(
-                        _ if name == $module::$name => {
-                            if let LangItemTarget::$target(target) = target {
-                                self.$lang_item = Some(target);
-                            }
-                        }
-                    )*
-                    _ => {}
+                if let Some(which) = LangItemEnum::from_symbol(&name) {
+                    self.set(which, target);
                 }
             }
 
@@ -414,7 +417,7 @@ macro_rules! language_item_table {
                 true
             }
 
-            fn fill_non_lang_core_items(&mut self, db: &dyn SourceDatabase, core_def_map: &DefMap) {
+            fn fill_non_lang_core_items(&mut self, db: &Db, core_def_map: &DefMap) {
                 $( self.$non_lang_trait = resolve_core_trait(db, core_def_map, &[ $(sym::$non_lang_trait_module),* ], sym::$non_lang_trait); )*
                 $( self.$non_lang_macro_field = resolve_core_macro(db, core_def_map, &[ $(sym::$non_lang_macro_module),* ], sym::$non_lang_macro); )*
             }
@@ -422,6 +425,7 @@ macro_rules! language_item_table {
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[allow(non_camel_case_types)]
+        #[repr(u16)]
         pub enum LangItemEnum {
             $(
                 $(#[$attr])*
@@ -451,8 +455,25 @@ macro_rules! language_item_table {
                 }
             }
 
+            /// The lang item `#[lang = "symbol"]` declares: the symbol's declared index and one
+            /// load, no hash. A symbol named twice keeps its first lang item.
             #[inline]
             pub fn from_symbol(symbol: &Symbol) -> Option<Self> {
+                // Member `i` is the `i`th `#[lang]` item, which leads `ALL` and whose
+                // discriminant is `i`.
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[ $( $module::Declared::$name, )* ]);
+                BY_SYMBOL.get(symbol).map(|at| Self::ALL[usize::from(at)])
+            }
+
+            /// Each lang item with the symbol of its `#[lang = ".."]`, in declaration order.
+            #[cfg(test)]
+            const SYMBOLS: &[(Symbol, LangItemEnum)] = &[ $( ($module::$name, Self::$lang_item), )* ];
+
+            /// [`Self::from_symbol`] as a chain of compares, the reference its table is checked
+            /// against.
+            #[cfg(test)]
+            fn from_symbol_by_compare(symbol: &Symbol) -> Option<Self> {
                 match symbol {
                     $( _ if *symbol == $module::$name => Some(Self::$lang_item), )*
                     _ => None,
@@ -476,6 +497,7 @@ language_item_table! { LangItems =>
     UseCloned,               sym::use_cloned,          TraitId;
     Clone,                   sym::clone,               TraitId;
     TrivialClone,            sym::trivial_clone,       TraitId;
+    TryAsDyn,                sym::try_as_dyn,          TraitId;
     Sync,                    sym::sync,                TraitId;
     DiscriminantKind,        sym::discriminant_kind,   TraitId;
     /// The associated item of the `DiscriminantKind` trait.
@@ -566,6 +588,9 @@ language_item_table! { LangItems =>
     CoroutineReturn,         sym::coroutine_return,    TypeAliasId;
     CoroutineYield,          sym::coroutine_yield,     TypeAliasId;
     Unpin,                   sym::unpin,               TraitId;
+    UnsafeUnpin,             sym::unsafe_unpin,        TraitId;
+    GlobalAlloc,             sym::global_alloc_ty,     StructId;
+    MaybeDangling,           sym::maybe_dangling,      StructId;
     Pin,                     sym::pin,                 StructId;
 
     PartialEq,               sym::eq,                  TraitId;
@@ -586,11 +611,35 @@ language_item_table! { LangItems =>
     ConstPanicFmt,           sym::const_panic_fmt,     FunctionId;
     PanicBoundsCheck,        sym::panic_bounds_check,  FunctionId;
     PanicMisalignedPointerDereference, sym::panic_misaligned_pointer_dereference, FunctionId;
+    PanicConstAddOverflow, sym::panic_const_add_overflow, FunctionId;
+    PanicConstSubOverflow, sym::panic_const_sub_overflow, FunctionId;
+    PanicConstMulOverflow, sym::panic_const_mul_overflow, FunctionId;
+    PanicConstDivOverflow, sym::panic_const_div_overflow, FunctionId;
+    PanicConstRemOverflow, sym::panic_const_rem_overflow, FunctionId;
+    PanicConstNegOverflow, sym::panic_const_neg_overflow, FunctionId;
+    PanicConstShrOverflow, sym::panic_const_shr_overflow, FunctionId;
+    PanicConstShlOverflow, sym::panic_const_shl_overflow, FunctionId;
+    PanicConstDivByZero, sym::panic_const_div_by_zero, FunctionId;
+    PanicConstRemByZero, sym::panic_const_rem_by_zero, FunctionId;
+    PanicConstCoroutineResumed, sym::panic_const_coroutine_resumed, FunctionId;
+    PanicConstAsyncFnResumed, sym::panic_const_async_fn_resumed, FunctionId;
+    PanicConstAsyncGenFnResumed, sym::panic_const_async_gen_fn_resumed, FunctionId;
+    PanicConstGenFnNone, sym::panic_const_gen_fn_none, FunctionId;
+    PanicConstCoroutineResumedPanic, sym::panic_const_coroutine_resumed_panic, FunctionId;
+    PanicConstAsyncFnResumedPanic, sym::panic_const_async_fn_resumed_panic, FunctionId;
+    PanicConstAsyncGenFnResumedPanic, sym::panic_const_async_gen_fn_resumed_panic, FunctionId;
+    PanicConstGenFnNonePanic, sym::panic_const_gen_fn_none_panic, FunctionId;
+    PanicConstCoroutineResumedDrop, sym::panic_const_coroutine_resumed_drop, FunctionId;
+    PanicConstAsyncFnResumedDrop, sym::panic_const_async_fn_resumed_drop, FunctionId;
+    PanicConstAsyncGenFnResumedDrop, sym::panic_const_async_gen_fn_resumed_drop, FunctionId;
+    PanicConstGenFnNoneDrop, sym::panic_const_gen_fn_none_drop, FunctionId;
     PanicInfo,               sym::panic_info,          StructId;
     PanicLocation,           sym::panic_location,      StructId;
     PanicImpl,               sym::panic_impl,          FunctionId;
     PanicCannotUnwind,       sym::panic_cannot_unwind, FunctionId;
     PanicNullPointerDereference, sym::panic_null_pointer_dereference, FunctionId;
+    PanicNullReferenceConstructed, sym::panic_null_reference_constructed, FunctionId;
+    PanicInvalidEnumConstruction, sym::panic_invalid_enum_construction, FunctionId;
     /// libstd panic entry point. Necessary for const eval to be able to catch it
     BeginPanic,              sym::begin_panic,         FunctionId;
 
@@ -704,6 +753,9 @@ language_item_table! { LangItems =>
     FieldType,               sym::field_type,          TypeAliasId;
 
     RangeMin,                sym::RangeMin,            ConstId;
+    /// `SizedTypeProperties::SIZE` and `::ALIGN`.
+    SizeOf,                  sym::mem_size_const,      ConstId;
+    AlignOf,                 sym::mem_align_const,     ConstId;
     RangeMax,                sym::RangeMax,            ConstId;
     RangeSub,                sym::RangeSub,            FunctionId;
 
@@ -779,4 +831,247 @@ language_item_table! { LangItems =>
     DerefMut_deref_mut,            FunctionId;
     Index_index,                   FunctionId;
     IndexMut_index_mut,            FunctionId;
+}
+
+#[cfg(test)]
+mod tests {
+    use intern::{Symbol, sym};
+    use blaze_query::db::FromId;
+    use hir_expand::fixture;
+
+    use super::{LangItemEnum, LangItemTarget, LangItems, crate_lang_items};
+    use crate::{
+        AttrDefId, ConstId, FunctionId, StructId, TraitId,
+        attrs::AttrFlags,
+        signatures::{ConstSignature, FunctionSignature, StructSignature, TraitSignature},
+        test_db::TestDBExt,
+    };
+
+    #[test]
+    fn symbol_table_matches_compares() {
+        let mut symbols: Vec<Symbol> = LangItemEnum::SYMBOLS.iter().map(|&(it, _)| it).collect();
+        // The same texts interned at run time, and near misses of each.
+        let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+        for text in &texts {
+            symbols.push(Symbol::intern(text));
+            symbols.push(Symbol::intern(&format!("{text}_")));
+            symbols.push(Symbol::intern(&text.to_uppercase()));
+            symbols.push(Symbol::intern(&text[..text.len() - 1]));
+        }
+        symbols.extend(
+            ["sized", "copy", "drop", "Default", "Debug", "", "not a lang item"].map(Symbol::intern),
+        );
+        symbols.extend([sym::Default, sym::Output, sym::Item, sym::call, sym::fmt, sym::self_]);
+        symbols.extend([sym::Integer::get(0), sym::Integer::get(300)]);
+        for symbol in &symbols {
+            assert_eq!(
+                LangItemEnum::from_symbol(symbol),
+                LangItemEnum::from_symbol_by_compare(symbol),
+                "{symbol:?}"
+            );
+        }
+        assert_eq!(LangItemEnum::from_symbol(&sym::sized), Some(LangItemEnum::Sized));
+        assert_eq!(LangItemEnum::from_symbol(&Symbol::intern("sized")), Some(LangItemEnum::Sized));
+        assert_eq!(LangItemEnum::from_symbol(&sym::fn_), Some(LangItemEnum::Fn));
+        assert_eq!(LangItemEnum::from_symbol(&Symbol::intern("not a lang item")), None);
+        // Items that are no `#[lang]` are never named by one.
+        assert_eq!(LangItemEnum::from_symbol(&sym::Default), None);
+    }
+
+    #[test]
+    fn discriminant_is_index_in_all() {
+        for (i, &which) in LangItemEnum::ALL.iter().enumerate() {
+            assert_eq!(which as u16 as usize, i, "{which:?}");
+        }
+        for (i, &(_, which)) in LangItemEnum::SYMBOLS.iter().enumerate() {
+            assert_eq!(LangItemEnum::ALL[i], which);
+        }
+    }
+
+    #[test]
+    fn assign_keeps_to_the_kind() {
+        let trait_ = TraitId::from_id(blaze_query::db::Id::from_u32(5));
+        let struct_ = StructId::from_id(blaze_query::db::Id::from_u32(6));
+        let mut items = LangItems::default();
+        items.assign_lang_item(sym::sized, struct_.into());
+        assert_eq!(items, LangItems::default());
+        items.assign_lang_item(sym::sized, trait_.into());
+        items.assign_lang_item(Symbol::intern("not a lang item"), trait_.into());
+        items.assign_lang_item(sym::phantom_data, struct_.into());
+        let mut expected = LangItems::default();
+        expected.Sized = Some(trait_);
+        expected.PhantomData = Some(struct_);
+        assert_eq!(items, expected);
+    }
+
+    /// The lang items of rustc's UB checks, `SizedTypeProperties`' consts and the UB checker's
+    /// three types, as the pinned nightly's `library/` declares them.
+    #[test]
+    fn check_and_layout_lang_items_are_found() {
+        let db = fixture::db(
+            r#"
+#![feature(lang_items)]
+#[lang = "panic_null_reference_constructed"]
+fn null_reference() -> ! { loop {} }
+#[lang = "panic_invalid_enum_construction"]
+fn invalid_enum(source: u128) -> ! { loop {} }
+pub trait SizedTypeProperties: Sized {
+    #[lang = "mem_size_const"]
+    const SIZE: usize = 0;
+    #[lang = "mem_align_const"]
+    const ALIGN: usize = 1;
+}
+#[lang = "unsafe_unpin"]
+pub unsafe auto trait UnsafeUnpin {}
+#[lang = "global_alloc_ty"]
+pub struct Global;
+#[lang = "maybe_dangling"]
+pub struct MaybeDangling<P: ?Sized>(P);
+"#,
+        )
+        .into_db();
+        let items = crate_lang_items(&db, db.fetch_test_crate()).unwrap();
+        let function =
+            |id: Option<FunctionId>| FunctionSignature::of(&db, id.unwrap()).name.clone();
+        let constant = |id: Option<ConstId>| ConstSignature::of(&db, id.unwrap()).name.clone();
+        let structure = |id: Option<StructId>| StructSignature::of(&db, id.unwrap()).name.clone();
+        let names = [
+            function(items.PanicNullReferenceConstructed),
+            function(items.PanicInvalidEnumConstruction),
+            constant(items.SizeOf).unwrap(),
+            constant(items.AlignOf).unwrap(),
+            TraitSignature::of(&db, items.UnsafeUnpin.unwrap()).name.clone(),
+            structure(items.GlobalAlloc),
+            structure(items.MaybeDangling),
+        ];
+        let names: Vec<&str> = names.iter().map(|it| it.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "null_reference",
+                "invalid_enum",
+                "SIZE",
+                "ALIGN",
+                "UnsafeUnpin",
+                "Global",
+                "MaybeDangling"
+            ]
+        );
+    }
+
+    /// The lang items read off the files' flag columns are found wherever an item is (a trait's
+    /// type, an inherent impl's fn, a variant, an inline and a file module, a `cfg_attr`), and
+    /// a macro's item, which no column holds, is read off its own query; each is what the
+    /// item's own `AttrFlags::lang_item` says.
+    #[test]
+    fn lang_items_off_the_columns_are_each_items_own() {
+        let db = fixture::db(
+            r#"
+//- /lib.rs crate:test
+#![feature(lang_items)]
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "owned_box"]
+pub struct Box<T>(T);
+pub enum Option<T> { None, #[lang = "Some"] Some(T) }
+pub trait Deref { #[lang = "deref_target"] type Target; }
+pub struct S;
+impl S { #[lang = "begin_panic"] pub fn begin() {} }
+pub mod inline { #[lang = "drop_in_place"] pub fn drop_in_place() {} }
+mod file;
+macro_rules! written { () => { #[lang = "panic"] pub fn panic() {} } }
+written!();
+#[cfg_attr(all(), lang = "String")]
+pub struct String;
+#[cfg_attr(any(), lang = "RangeFull")]
+pub struct RangeFull;
+//- /file.rs
+#[lang = "panic_fmt"]
+pub fn panic_fmt() {}
+"#,
+        )
+        .into_db();
+        let items = crate_lang_items(&db, db.fetch_test_crate()).unwrap();
+        let own = |target: LangItemTarget, name: &str| {
+            let owner = match target {
+                LangItemTarget::TraitId(it) => AttrDefId::from(it),
+                LangItemTarget::StructId(it) => it.into(),
+                LangItemTarget::EnumVariantId(it) => it.into(),
+                LangItemTarget::TypeAliasId(it) => it.into(),
+                LangItemTarget::FunctionId(it) => it.into(),
+                other => panic!("no {name} expected of {other:?}"),
+            };
+            assert_eq!(AttrFlags::lang_item(&db, owner), Some(Symbol::intern(name)), "{name}");
+        };
+        own(items.Sized.unwrap().into(), "sized");
+        own(items.OwnedBox.unwrap().into(), "owned_box");
+        own(items.OptionSome.unwrap().into(), "Some");
+        own(items.DerefTarget.unwrap().into(), "deref_target");
+        own(items.BeginPanic.unwrap().into(), "begin_panic");
+        own(items.DropInPlace.unwrap().into(), "drop_in_place");
+        own(items.PanicFmt.unwrap().into(), "panic_fmt");
+        own(items.Panic.unwrap().into(), "panic");
+        own(items.String.unwrap().into(), "String");
+        assert_eq!(items.RangeFull, None);
+    }
+
+    /// A lang-item lookup is a memo read and a field load.
+    #[test]
+    fn lang_item_lookup_allocates_nothing() {
+        let db = fixture::db(
+            r#"
+#![feature(lang_items)]
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "global_alloc_ty"]
+pub struct Global;
+"#,
+        )
+        .into_db();
+        let krate = db.fetch_test_crate();
+        let _ = super::lang_items(&db, krate);
+        let (sized, global) = blaze_alloc_count::assert_at_most(0, "a warm lang-item lookup", || {
+            let items = super::lang_items(&db, krate);
+            (items.Sized, LangItemEnum::GlobalAlloc.from_lang_items(items))
+        });
+        assert!(sized.is_some() && global.is_some());
+    }
+
+    /// A miss of `crate_notable_traits`, its inputs warm, allocates its box and nothing else.
+    /// The query's table, made once a database on its first call, is warmed by a call for
+    /// another crate.
+    #[test]
+    fn notable_traits_miss_is_its_result() {
+        let db = fixture::db(
+            r#"
+//- /other.rs crate:other
+pub trait Elsewhere {}
+//- /main.rs crate:main deps:other
+#[doc(notable_trait)]
+pub trait Read {}
+pub trait Other {}
+"#,
+        )
+        .into_db();
+        let named = |name: &str| {
+            *base_db::all_crates(&db)
+                .iter()
+                .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
+                .unwrap_or_else(|| panic!("no crate {name}"))
+        };
+        let (krate, other) = (named("main"), named("other"));
+        assert_eq!(super::crate_notable_traits(&db, other), None);
+        let def_map = crate::nameres::crate_def_map(&db, krate);
+        for (_, module) in def_map.modules(&db) {
+            for def in module.scope(&db).declarations() {
+                if let crate::ModuleDefId::TraitId(it) = def {
+                    let _ = crate::attrs::AttrFlags::query(&db, it.into());
+                }
+            }
+        }
+        let traits = blaze_alloc_count::assert_at_most(1, "a notable-traits miss", || {
+            super::crate_notable_traits(&db, krate).map(<[TraitId]>::len)
+        });
+        assert_eq!(traits, Some(1));
+    }
 }

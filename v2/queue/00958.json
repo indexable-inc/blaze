@@ -1,0 +1,24 @@
+{
+  "id": "00958",
+  "from_lane": "item-hash",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-ty/src/next_solver/persist.rs"
+  ],
+  "what": "Andrew wants the front-end semantic hash name-free (Unison-style; design docs/v2/plan/design/item-hash.md 3.3/3.7). BoundRegionKind::NamedForPrinting(Symbol), made in lower.rs for_lifetime_region_kind for each for<'a> as written, carries the source lifetime name into types and so into stored inference records, and makes renaming 'a change type equality. Please use rustc's form: Named(def of the lifetime param), with the name fetched only when printing, so stored types carry no names. Found by item-hash-store audit (/tmp/blaze-lanes/v2-item-hash-store.md anon section 2).",
+  "state": "open",
+  "created": "2026-10-30T12:15:08Z",
+  "updated": "2026-10-30T12:15:08Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:15:08Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

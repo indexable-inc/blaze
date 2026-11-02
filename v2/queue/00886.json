@@ -1,0 +1,27 @@
+{
+  "id": "00886",
+  "from_lane": "speed-sol2-small",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty/src/next_solver/ty.rs",
+    "crates/hir-ty/src/next_solver/region.rs",
+    "crates/hir-ty/src/next_solver/consts.rs",
+    "crates/hir-ty/src/next_solver/generic_arg.rs"
+  ],
+  "what": "## speed-sol2-small: handle reads 2.5x their bound: drop the per-read `published` check (solver-sync speed-of-light sections 2 and 4)\n\n- Where: `crates/hir-ty/src/next_solver/interner.rs` `table` (`Rows::kind`/`flags` read the row's tag byte and check it was published before the field, ~3800 and ~3976), and every handle's `at(index)` (`ty.rs:164`, `interner.rs:193` macro, `interner.rs:1028`).\n- Why: `Ty::kind`, `flags`, `outer_exclusive_binder` are read many times per interned value by the solver and every fold; today two chains (tag, field) plus ~10 instructions, ~15 cycles hot against 6 (one line and a multiply-add).\n- Change: make `at` an `unsafe fn` with `# Safety`: the row was returned by this table's `intern` or passed `published`. Each caller states why (the `GenericArg` unpack, `persist.rs`'s reader, region and const handles; `from_index` already checks `published`). Then `kind()`/`flags()` read the field with no tag check; the acquire that made the handle orders the row's writes.\n- Tests: the table's existing tests, plus a debug-assert of `published` inside `kind()` under `cfg(debug_assertions)` so tests still catch a bad `at`.\n- Doc: docs/v2/plan/lanes/solver-sync/speed-of-light.md sections 2 and 4. solver-sync is done; these files are lane db's.",
+  "state": "open",
+  "created": "2026-10-30T09:28:58Z",
+  "updated": "2026-10-30T09:28:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:28:58Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

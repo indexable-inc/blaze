@@ -1,0 +1,33 @@
+{
+  "id": "00767",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## R8. Paths as rustc prints them (whoever owns the display of paths)\n\nWhat: `path` in the call kinds is rustc's `def_path_str` as `const_check::def_path` writes it.\nTwo cases differ from rustc: a function nested in a function body (rustc: `copy::copy`,\nblaze: `copy`, `tests/ui/consts/const-unstable-intrinsic.stderr`), and generic arguments\n(rustc's `def_path_str_with_args`: `Vec::<u8>::new`). `NonConstFn` carries `callee` and `args`\nfor a printer that writes them.\n\n> forwarded to codegen-next2 (`const_check::def_path` in `hir-ty-mir` is codegen's, which ends BLOCKED; hir-ide's `display.rs` has no `def_path_str` to reuse, so the two cases are fixed in `def_path` itself); told by tmux (requests, pass 45).",
+  "state": "applied",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-31T20:43:32Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#R8. Paths as rustc prints them (whoever owns the display of paths)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:155"
+    },
+    {
+      "at": "2026-10-31T20:43:32Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:43:32Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "const_check.rs: def_path goes through a block's owner (type_name::block_owner; owner_segments: fn/const/static name, an impl's type or trait for an associated item), so ; described writes rustc's def_path_str_with_args: an impl's ADT self type with the impl's args (, impl_type_name) and the function's own args, lifetimes left out (turbofish). Tests in tests/mir/const_check.rs: a_function_in_a_body_is_named_through_its_owner, a_call_is_named_with_its_generic_arguments."
+    }
+  ]
+}

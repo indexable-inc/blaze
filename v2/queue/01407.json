@@ -1,0 +1,30 @@
+{
+  "id": "01407",
+  "from_lane": "observe",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-api/src/session.rs"
+  ],
+  "what": "observe: the agent API's way to read the flight recorder (Andrew, 2026-10-31: an always-on profiler usable in production, read with `blaze debug profile` or the agent API).\n\n1. Request::Profile { seconds: u32 }, answered with Response::Profile { trace: Vec<u8> } (a CBOR byte string; the bytes are a Chrome trace in JSON, see blaze_profile::flight::dump). Bump the schema version as your rule says.\n2. Session cx (session.rs `Daemon<'a>`, next to `memory: fn() -> Snapshot`): `pub profile: fn(std::time::Duration) -> Vec<u8>`. Handle it like Request::Status (session.rs:707): reply with (cx.profile)(Duration::from_secs(seconds.into())). It reads every thread's ring: a few ms, nothing per span.\n3. Stall errors come back as the existing ApiError { at: Some(\"stall\"), what: <the stall text> }; no new type is needed, just so you know the `at`.\n\nLane cargo fills the cx field and the CLI (my request to cargo).",
+  "state": "refused",
+  "created": "2026-11-01T01:19:26Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:19:26Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

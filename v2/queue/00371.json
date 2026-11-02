@@ -1,0 +1,38 @@
+{
+  "id": "00371",
+  "from_lane": "mem-db-infer-closure",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "crates/hir-ty/Cargo.toml",
+    "v2/requests/mem-db-infer.md",
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## Prerequisites (other parts)\n\n- **mem-db-infer** (`lib.rs`, `Cargo.toml`): `#![feature(allocator_api)]`, `blaze-mem` and\n  `hashbrown` (with `nightly`) in `crates/hir-ty/Cargo.toml`, as in `v2/requests/mem-db-infer.md`.\n  `arrayvec`, `either`, `smallvec` and `thin-vec` are already dependencies; nothing else is needed.\n- **mem-db-infer-ctx** (`infer.rs`): `pub(crate) frame: &'f blaze_mem::Frame` on\n  `InferenceContext<'db, 'f>` (R2). `InferenceContext` derives `Debug`, and the delegate methods\n  below are `#[instrument]`ed with it, so `frame`'s `Debug` must print (a `&Frame` does if\n  `Frame: Debug`; otherwise a hand-written `Debug` that skips it).\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:38): in the tree: hir-ty's `allocator_api`, `blaze-mem`, `hashbrown` (mem-db-infer 1-2), `frame` on `InferenceContext<'db, 'f>` (crates/hir-ty/src/infer.rs:2026, `#[derive(Debug)]`).",
+  "state": "applied",
+  "created": "2026-10-30T03:38:22Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-closure.md#Prerequisites (other parts)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-closure.md:76"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:38): in the tree: hir-ty's `allocator_api`, `blaze-mem`, `hashbrown` (mem-db-infer 1-2), `frame` on `InferenceContext<'db, 'f>` (crates/hir-ty/src/infer.rs:2026, `#[derive(Debug)]`)."
+    }
+  ]
+}

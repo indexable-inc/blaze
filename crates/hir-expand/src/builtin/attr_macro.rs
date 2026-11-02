@@ -1,5 +1,6 @@
 //! Builtin attributes.
-use base_db::SourceDatabase;
+use base_db::Db;
+use blaze_mem::Frame;
 use intern::sym;
 use span::Span;
 
@@ -18,13 +19,26 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$variant),*];
 
-            pub fn expander(&self) -> fn (&dyn SourceDatabase, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> for<'f> fn (&Db, &'f Frame, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree<&'f Frame>>  {
                 match *self {
                     $( BuiltinAttrExpander::$variant => $expand, )*
                 }
             }
 
+            /// The builtin attribute `name` names: its declared index and one load.
             fn find_by_name(name: &name::Name) -> Option<Self> {
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[$( sym::Declared::$name, )*]);
+                BY_SYMBOL.get(name.symbol()).map(|at| Self::ALL[usize::from(at)])
+            }
+
+            /// Each builtin attribute's name, in declaration order.
+            #[cfg(test)]
+            const NAMES: &[intern::Symbol] = &[$( sym::$name, )*];
+
+            /// [`Self::find_by_name`] as a chain of compares, the reference it is tested by.
+            #[cfg(test)]
+            fn find_by_name_by_compare(name: &name::Name) -> Option<Self> {
                 match name {
                     $( id if id == &sym::$name => Some(BuiltinAttrExpander::$variant), )*
                      _ => None,
@@ -36,14 +50,15 @@ macro_rules! register_builtin {
 }
 
 impl BuiltinAttrExpander {
-    pub fn expand(
+    pub fn expand<'f>(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
+        frame: &'f Frame,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
-        self.expander()(db, id, tt, span)
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+        self.expander()(db, frame, id, tt, span)
     }
 
     pub fn is_derive(self) -> bool {
@@ -77,36 +92,38 @@ pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
     BuiltinAttrExpander::find_by_name(ident)
 }
 
-fn dummy_attr_expand(
-    _db: &dyn SourceDatabase,
+fn dummy_attr_expand<'f>(
+    _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     _span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    ExpandResult::ok(tt.clone())
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame))
 }
 
 /// The static, and what calls it in the allocator's place: rustc's expansion defines `__rg_alloc`
 /// and the others, which its allocator shim calls. These have names of blaze's, which the
 /// stand-in rustc builds for a crate whose code is blaze's calls from a `#[global_allocator]`
 /// of its own (blaze's `stub.rs`).
-fn global_allocator_expand(
-    _db: &dyn SourceDatabase,
+fn global_allocator_expand<'f>(
+    _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ident = |it: tt::TtElement<'_>| match it {
-        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()),
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()), // clone: a copy (symbol and span); `#[global_allocator]`, once per crate
         _ => None,
     };
     let mut idents = tt.iter().filter_map(ident);
     idents.find(|it| it.sym.as_str() == "static");
     let Some(name) = idents.find(|it| it.sym.as_str() != "mut") else {
-        return ExpandResult::ok(tt.clone());
+        return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let name = &name;
-    let result = quote::quote! { span=>
+    let result = quote::quote_in! { frame, span=>
         #tt
         #[export_name = "__blaze_global_alloc"]
         unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 {
@@ -158,30 +175,32 @@ fn global_allocator_expand(
 
 /// The item keeps the list as a tool attribute, which type inference reads and name resolution
 /// does not expand again.
-fn define_opaque_expand(
-    db: &dyn SourceDatabase,
+fn define_opaque_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let MacroCallKind::Attr { attr_args: Some(args), .. } = &id.loc(db).kind else {
-        return ExpandResult::ok(tt.clone());
+        return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let args = &**args;
-    let result = quote::quote! { span=>
+    let result = quote::quote_in! { frame, span=>
         #[rust_analyzer::define_opaque(#args)]
         #tt
     };
     ExpandResult::ok(result)
 }
 
-fn dummy_gate_test_expand(
-    _db: &dyn SourceDatabase,
+fn dummy_gate_test_expand<'f>(
+    _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let result = quote::quote! { span=>
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let result = quote::quote_in! { frame, span=>
         #[cfg(test)]
         #tt
     };
@@ -199,7 +218,7 @@ fn dummy_gate_test_expand(
 ///  #![Foo]
 ///  #![bar::Bar]
 /// ```
-/// which allows fallback path resolution in hir::Semantics to properly identify our derives.
+/// which allows fallback path resolution in hir::view::Semantics to properly identify our derives.
 /// Since we do not expand the attribute in nameres though, we keep the original item.
 ///
 /// The ideal expansion here would be for the `#[derive]` to re-emit the annotated item and somehow
@@ -208,37 +227,43 @@ fn dummy_gate_test_expand(
 /// wasting a lot of memory, and it would also require some way to use a path in a way that makes it
 /// always resolve as a derive without nameres recollecting them.
 /// So this hacky approach is a lot more friendly for us, though it does require a bit of support in
-/// hir::Semantics to make this work.
-fn derive_expand(
-    db: &dyn SourceDatabase,
+/// hir::view::Semantics to make this work.
+fn derive_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let loc = id.loc(db);
     let derives = match &loc.kind {
         MacroCallKind::Attr { attr_args: Some(attr_args), .. } if loc.def.is_attribute_derive() => {
             attr_args
         }
         _ => {
-            return ExpandResult::ok(tt::TopSubtree::empty(tt::DelimSpan {
-                open: span,
-                close: span,
-            }));
+            return ExpandResult::ok(tt::TopSubtree::empty_in(
+                tt::DelimSpan { open: span, close: span },
+                frame,
+            ));
         }
     };
-    pseudo_derive_attr_expansion(tt, derives, span)
+    pseudo_derive_attr_expansion(frame, tt, derives, span)
 }
 
-pub fn pseudo_derive_attr_expansion(
+pub fn pseudo_derive_attr_expansion<'f>(
+    frame: &'f Frame,
     _: &tt::TopSubtree,
     args: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let mk_leaf =
         |char| tt::Leaf::Punct(tt::Punct { char, spacing: tt::Spacing::Alone, span: call_site });
 
-    let mut token_trees = tt::TopSubtreeBuilder::new(args.top_subtree().delimiter);
+    // Each of the `n` paths gains `#`, `!` and a bracket, and loses its comma: at most
+    // `len + 2n + 1` token trees, and `n <= len + 1`.
+    let len = args.token_trees().len();
+    let mut token_trees =
+        tt::TopSubtreeBuilder::with_capacity(args.top_subtree().delimiter, 3 * len + 3);
     let iter = args.token_trees().split(|tt| {
         matches!(tt, tt::TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ',', .. })))
     });
@@ -248,5 +273,38 @@ pub fn pseudo_derive_attr_expansion(
         token_trees.extend_with_tt(tts);
         token_trees.close(call_site);
     }
-    ExpandResult::ok(token_trees.build())
+    ExpandResult::ok(token_trees.build_in(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use intern::{Symbol, sym};
+
+    use super::BuiltinAttrExpander;
+    use crate::name::Name;
+
+    #[test]
+    fn builtin_attrs_found_as_by_compare() {
+        let mut symbols: Vec<Symbol> = BuiltinAttrExpander::NAMES.to_vec();
+        let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+        for text in &texts {
+            symbols.push(Symbol::intern(text));
+            symbols.push(Symbol::intern(&format!("{text}_")));
+            symbols.push(Symbol::intern(&text.to_uppercase()));
+            symbols.push(Symbol::intern(&text[..text.len() - 1]));
+        }
+        symbols.extend([sym::self_, sym::cfg, Symbol::intern("inline"), Symbol::intern("tokio_test")]);
+        for symbol in symbols {
+            let name = Name::new_symbol_root(symbol);
+            assert_eq!(
+                BuiltinAttrExpander::find_by_name(&name),
+                BuiltinAttrExpander::find_by_name_by_compare(&name),
+                "{name:?}"
+            );
+        }
+        for (at, symbol) in BuiltinAttrExpander::NAMES.iter().enumerate() {
+            let name = Name::new_symbol_root(symbol.clone());
+            assert_eq!(BuiltinAttrExpander::find_by_name(&name), Some(BuiltinAttrExpander::ALL[at]));
+        }
+    }
 }

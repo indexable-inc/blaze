@@ -1,0 +1,35 @@
+{
+  "id": "00629",
+  "from_lane": "speed-hir-store",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-wfcheck/src/lib.rs"
+  ],
+  "what": "## speed-hir-store: hir-ty-wfcheck onto the HIR column views (from speed-hir-store-ty)\n\n1 site in 1 file, a type ref (rule: addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`, landed: `Index<TypeRefId>` is gone).\n\n> forwarded to db.\n\n> applied by db-ty-cols-ty: as listed. 0 sites found beyond the list.\n\n### crates/hir-ty-wfcheck/src/lib.rs  (1 site, 2 edits, type ref; the where-clause `position` search)\n- ~L576  `let on_target = match (&store[*target], param) {`  ->  `let on_target = match (store.type_ref(*target), param) {`\n- ~L577  `(TypeRef::TypeParam(id), Some(param)) => *id == param,`  ->  `(TypeRef::TypeParam(id), Some(param)) => id == param,`\n  (`target` binds `&TypeRefId` from `predicate: &WherePredicate`, so `*target` stays. `store[*path]` at ~L583 indexes a `PathId` and stays.)\n\n`outlives.rs` and `persist.rs` read no store: no change.\n\nStatus: open",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db.md#speed-hir-store: hir-ty-wfcheck onto the HIR column views (from speed-hir-store-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:848"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: applied by db-ty-cols-ty: as listed. 0 sites found beyond the list."
+    }
+  ]
+}

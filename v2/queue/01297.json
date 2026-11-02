@@ -1,0 +1,41 @@
+{
+  "id": "01297",
+  "from_lane": "tests-misc-front1",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/dyn_compatibility.rs"
+  ],
+  "what": "For the hir-ty subagent. hir lower::a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do (round 8, lower.rs:561): for `fn opaque(&self) -> impl Sized;` in a trait, hir-ty gives ReferencesSelfOutput at `impl Sized` as well as ReferencesImplTraitInTrait. rustc gives only the latter: its IllegalSelfTypeVisitor (rustc_trait_selection traits/dyn_compatibility.rs) continues past `ty::Alias(Projection, data)` when `tcx.is_impl_trait_in_trait(data.def_id)` (\"We will deny these later in their own pass\"). Please port that skip into the self-reference check of a method output.",
+  "state": "applied",
+  "created": "2026-10-31T14:54:54Z",
+  "updated": "2026-10-31T16:49:03Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:54:54Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:47:08Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> no-fallback-front-ty: hir-ty dyn_compatibility (RPITIT skip) is the no-fallback-front-ty lane"
+    },
+    {
+      "at": "2026-10-31T16:49:03Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:49:03Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "IllegalSelfTypeVisitor skips a trait method return impl Trait (is_impl_trait_in_trait); test is hir lower::a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do"
+    }
+  ]
+}

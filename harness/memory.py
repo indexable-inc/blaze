@@ -1,6 +1,6 @@
 """memory.py: how much memory a process tree holds, the same way on Linux and macOS.
 
-The one helper the benchmarks measure memory with (bench.py, runbench.py, apps.py); a
+The one helper the benchmarks measure memory with (bench.py and the rest); a
 harness that measures memory imports this rather than reading /proc or `ps` itself. What it
 measures, and how far off it can be, is docs/benchmarks.md, "Memory and disk". In short:
 

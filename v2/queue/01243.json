@@ -1,0 +1,36 @@
+{
+  "id": "01243",
+  "from_lane": "query-unify",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs",
+    "crates/blaze-query/src/db/tests.rs"
+  ],
+  "what": "R16 (contract updated, docs/v2/plan/lanes/db/query-unify.md `View`): after 01217 renumbering, `Storage::view()` can repeat an earlier view's number, and the front end keys caches on `(Nonce, View)` equality as \"nothing changed\" (hir semantics/source_to_def.rs:306, hir-ty next_solver/interner/tls_cache.rs:160/175/468, method_resolution/pick_cache.rs:134/400, blaze-macro-eval code.rs:89): a repeat makes them serve stale entries. Make the public `View` `View(pub(crate) u64)`, a count of views ever opened kept in Storage (`opened: u64`, +1 in next_view, untouched by renumber), returned by `view()`; `as_u32` becomes `as_u64`; internal row stamps stay u32. Fix db/tests.rs:74 and :1051 (the renumber test should assert the stamp went down via a crate-internal accessor and `view()` went UP, strictly greater than before the renumber). No front-end call site changes (they use ==/Ord only).",
+  "state": "applied",
+  "created": "2026-10-31T03:09:35Z",
+  "updated": "2026-10-31T12:05:36Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:09:35Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T07:14:30Z",
+      "by": "query-unify",
+      "action": "reassign",
+      "note": "query-unify-engine -> query-unify: engine child idle at 70% context; query-unify writes R17 with R18 (singleton absence) so engine and macros land together"
+    },
+    {
+      "at": "2026-10-31T12:05:36Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "public View is a never-reused u64 count of views opened (storage.rs `opened`), as_u64; renumber test asserts stamp went down and view() went up (db/tests.rs)."
+    }
+  ]
+}

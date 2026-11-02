@@ -1,0 +1,38 @@
+{
+  "id": "00607",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa-macro-rules/src/setup_tracked_fn.rs",
+    "vendor/salsa/src/function",
+    "crates/hir-ty/src/evict.rs",
+    "crates/hir/src/evict.rs"
+  ],
+  "what": "## 1. db-salsa (through lane db): `evict_values` and `evict_value` on every tracked fn\n\nWhat: generate on each `#[salsa::tracked]` fn's struct\n`pub fn evict_values(db: &mut dyn Db)` (drops every memo's value) and\n`pub fn evict_value(db: &mut dyn Db, <the fn's inputs after db>)` (drops one key's value). Both\nmust keep each memo's fingerprint, revisions and edges, so a dependent verifies against it\nwithout the value and a recomputation backdates by fingerprint.\nWhere: `vendor/salsa-macro-rules/src/setup_tracked_fn.rs`, `vendor/salsa/src/function*`.\nWhy: `crates/hir-ty/src/evict.rs` and `crates/hir/src/evict.rs` call exactly these names (from\ndb-salsa's brief, item 4; db-salsa has not reported yet). They must be `pub`, because the MIR\nqueries are in `hir-ty-mir` and evicted from `hir`. If the names or signatures differ, those two\nfiles are the only callers to change.\n\n> forwarded to db: db-salsa made `evict_values(db) -> usize` and `evict_values_of(db, keys)`, both only on functions with `lru` (`HasCapacity`); no `evict_value` and nothing for functions without `lru`. Lane db decides between widening it and `evict.rs` calling those names.\n> checked by db-audit-dbsub (2026-10-29 22:40): settled the second way, in the tree: salsa generates `evict_values` and `evict_values_of` on every tracked fn whose output is `Hash` (`vendor/salsa-macro-rules/src/setup_tracked_fn.rs:547,558`), and `crates/hir/src/evict.rs:35-66` and `crates/hir-ty/src/evict.rs:24` call those names.",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#1. db-salsa (through lane db): `evict_values` and `evict_value` on every tracked fn",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:3"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): settled the second way, in the tree: salsa generates `evict_values` and `evict_values_of` on every tracked fn whose output is `Hash` (`vendor/salsa-macro-rules/src/setup_tracked_fn.rs:547,558`), and `crates/hir/src/evict.rs:35-66` and `crates/hir-ty/src/evict.rs:24` call those names."
+    }
+  ]
+}

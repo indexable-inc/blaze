@@ -2,8 +2,8 @@
 """nocompact.py: a program linked with `-no_compact_unwind` is spliced, and unwinds through the
 patch (macOS on AArch64, issue #33).
 
-usage: nocompact.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc
-                        are found next to it)
+usage: nocompact.py    (BLAZE_BIN names the blaze built; blaze is found next
+                        to it)
 
 Such a program has `__eh_frame` and no `__unwind_info`, and the unwinder looks for every
 frame in `__eh_frame`, to its end; bun links so. (What has only a compact entry, as most of

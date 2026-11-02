@@ -1,0 +1,21 @@
+{
+  "id": "00280",
+  "from_lane": "db-ty-d-infer1",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## To diagnostics (`lower/{binary,unary}_operator_cannot_be_applied.rs`, `cannot_be_dereferenced.rs`, `cannot_index_into.rs`)\n\n`hir::BinaryOperatorCannotBeApplied.at_error: Option<(String, String)>` and\n`hir::{UnaryOperatorCannotBeApplied, CannotBeDereferenced, CannotIndexInto}.at_error:\nOption<String>` are the operand types as rustc prints them when it reports the error, before\ninteger fallback (`{integer}`/`{float}` for an undecided literal; `true + 1` is \"cannot add\n`{integer}` to `bool`\", `*1` is \"type `{integer}` cannot be dereferenced\"). They are `None`\nwhen no operand held an undecided literal, which is when the `Type` fields already print the\nsame. Each message and label printing those types takes `at_error` when it is `Some`. Tests:\n`binop/binop-typeck.rs`, `error-codes/E0614.rs`, `error-codes/E0600.rs`.\n\n> forwarded to diagnostics (from requests, pass 17; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:55:50Z",
+  "updated": "2026-10-30T02:55:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-infer1.md#To diagnostics (`lower/{binary,unary}_operator_cannot_be_applied.rs`, `cannot_be_dereferenced.rs`, `cannot_index_into.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-infer1.md:58"
+    }
+  ]
+}

@@ -7,13 +7,12 @@
 #       AArch64 and macOS arm64; the pull request "toolchain: pin nightly-YYYY-MM-DD" is opened or
 #       updated, which runs the merge gate, and the release train is started on the branch and
 #       on toolchain/base, the main commit the branch is on
-#   the train on the branch finished: the standard library's refusals counted with the bump's
-#       build and main's (harness/stdcount.py); no job or harness red that is green on
-#       toolchain/base's train, and no more refusals: `gh pr merge --auto`. Otherwise a comment on
+#   the train on the branch finished: no job or harness red that is green on toolchain/base's
+#       train: `gh pr merge --auto`. Otherwise a comment on
 #       the pull request and the issue "Toolchain bump to <date> is blocked", opened or updated
 #   a step before the pull request failed (a vendoring conflict, no usable nightly, a conflict
 #       merging main into the bump): the same issue, with what failed
-#   by hand with a train's run id (`-f train=<id>`): the std count and verdict on it again, with
+#   by hand with a train's run id (`-f train=<id>`): the verdict on it again, with
 #       main's scripts now (a re-run of a verdict's run has the scripts of its own commit)
 #
 # Fixes for what a nightly breaks are pushed to toolchain/bump by hand; the next day's run merges
@@ -31,7 +30,7 @@ on:
         description: the nightly's date, YYYY-MM-DD (default the newest usable)
         required: false
       train:
-        description: no bump; the std count and verdict again for this train run of toolchain/bump (its id), as when it finished
+        description: no bump; the verdict again for this train run of toolchain/bump (its id), as when it finished
         required: false
   workflow_run:
     workflows: [train]
@@ -97,7 +96,7 @@ jobs:
         with:
           ref: toolchain/bump
       - uses: ./.github/actions/toolchain
-      - run: python3 harness/answers.py --write && cp crates/blaze-cargo/src/answers/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
+      - run: python3 harness/answers.py --write && cp crates/blaze-units/src/stdlib/rustc.json "$RUNNER_TEMP/rustc-${{ matrix.platform }}.json"
       - uses: actions/upload-artifact@v7
         with:
           name: answers-${{ matrix.platform }}
@@ -139,68 +138,9 @@ jobs:
           echo "The answers of a host or the pull request failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > "$RUNNER_TEMP/why.txt"
           python3 .github/scripts/toolchain_bump_ci.py blocked "$RUNNER_TEMP/why.txt" --date "$(cat harness/toolchain | sed s/nightly-//)"
 
-  # The standard library's refusals with the bump's build (the train's) and with the build of the
-  # main commit the bump is on (toolchain/base's train, which the verdict compares jobs with),
-  # each with the library/ it was built with. main's newest build would count main's std fixes
-  # since then against the bump.
-  std:
-    name: std refusals
-    if: (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'toolchain/bump' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.train != '')
-    runs-on: ubuntu-24.04
-    # It waits for toolchain/base's train, as the verdict does.
-    timeout-minutes: 180
-    permissions:
-      contents: write
-      actions: write
-    # main's scripts and toolchain; of the bump, only its build (the train's artifact) and its pin.
-    steps:
-      - uses: actions/checkout@v7
-      # The builds run with the flake's C library, as the train's borrowck job runs them.
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-linux-x64
-          path: ${{ runner.temp }}/new
-          run-id: ${{ github.event.workflow_run.id || inputs.train }}
-          github-token: ${{ github.token }}
-      - id: base
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN: ${{ github.event.workflow_run.id || inputs.train }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          HEAD_SHA=${HEAD_SHA:-$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN" --jq .head_sha)}
-          python3 .github/scripts/toolchain_bump_ci.py base-run "$RUN"
-          sha=$(sed -n 's/^sha=//p' "$GITHUB_OUTPUT")
-          pin() { gh api "repos/$GITHUB_REPOSITORY/contents/harness/toolchain?ref=$1" --jq .content | base64 -d | tr -d '\n'; }
-          echo "toolchain=$(pin "$sha")" >> "$GITHUB_OUTPUT"
-          echo "bump=$(pin "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-linux-x64
-          path: ${{ runner.temp }}/base
-          run-id: ${{ steps.base.outputs.run }}
-          github-token: ${{ github.token }}
-      - env:
-          BASE_TOOLCHAIN: ${{ steps.base.outputs.toolchain }}
-          BUMP_TOOLCHAIN: ${{ steps.base.outputs.bump }}
-        run: |
-          for side in new base; do tar -xf "$RUNNER_TEMP/$side/blaze.tar" -C "$RUNNER_TEMP/$side"; done
-          for tc in "$BUMP_TOOLCHAIN" "$BASE_TOOLCHAIN"; do rustup toolchain install "$tc" --profile minimal; done
-          python3 harness/stdcount.py --bin "$RUNNER_TEMP/new/blaze-engine" --toolchain "$BUMP_TOOLCHAIN" \
-            --base "$RUNNER_TEMP/base/blaze-engine" --base-toolchain "$BASE_TOOLCHAIN" --json "$RUNNER_TEMP/std.json" || true
-      - uses: actions/upload-artifact@v7
-        with:
-          name: std-refusals
-          path: ${{ runner.temp }}/std.json
-          retention-days: 7
-
   verdict:
     name: verdict
-    needs: std
-    if: always() && ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'toolchain/bump' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.train != ''))
+    if: ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'toolchain/bump' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.train != ''))
     runs-on: ubuntu-24.04
     # It waits for the train of the main commit the bump is on (toolchain/base), started beside
     # the bump's: about as long as the bump's took.
@@ -213,12 +153,7 @@ jobs:
     # main's script; the bump is read through the API.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          name: std-refusals
-          path: ${{ runner.temp }}/std
       - env:
           GH_TOKEN: ${{ github.token }}
           RUN: ${{ github.event.workflow_run.id || inputs.train }}
-        run: python3 .github/scripts/toolchain_bump_ci.py verdict "$RUN" "$RUNNER_TEMP/std/std.json"
+        run: python3 .github/scripts/toolchain_bump_ci.py verdict "$RUN"

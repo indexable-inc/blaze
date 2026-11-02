@@ -28,7 +28,7 @@ use std::{
 use anyhow::Context as _;
 use blaze_source::SourceId;
 
-pub use download::{Blobs, Package};
+pub use download::Package;
 pub use query::IndexRegistry;
 pub use registry::Registry;
 pub use sources::{Locked, SourceConfig, SourceDef, SourceMap, Sources};
@@ -69,9 +69,10 @@ pub struct Context {
     /// `$CARGO_HOME`, as cargo finds it: the `CARGO_HOME` variable, else `~/.cargo`.
     pub cargo_home: PathBuf,
     pub net: NetConfig,
+    // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     pub http: Arc<dyn http::Http>,
     /// blaze's store, which keeps `.crate` files by their sha256.
-    pub store: Option<Arc<dyn Blobs>>,
+    pub store: Option<&'static blaze_cas::Handle>,
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
     pub keep_crate_files: bool,
@@ -81,6 +82,7 @@ pub struct Context {
 }
 
 impl Context {
+    // dyn: the I/O driver, as on `Context::http`.
     pub fn new(cargo_home: PathBuf, http: Arc<dyn http::Http>) -> Context {
         Context {
             cargo_home,
@@ -131,25 +133,6 @@ impl PackageCacheLock {
             file.lock().with_context(|| format!("failed to lock `{}`", path.display()))?;
         }
         Ok(PackageCacheLock { _file: file })
-    }
-}
-
-/// Runs `future` to its end on this thread, parked while it waits.
-pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    struct Unpark(std::thread::Thread);
-    impl std::task::Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let mut future = std::pin::pin!(future);
-    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = std::task::Context::from_waker(&waker);
-    loop {
-        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-        std::thread::park();
     }
 }
 

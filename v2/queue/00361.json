@@ -1,0 +1,36 @@
+{
+  "id": "00361",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "docs/v2/plan/design/concurrency.md",
+    "crates/blaze-engine"
+  ],
+  "what": "## 6. `in_parallel_beside`: the worker handles in the caller's frame (required)\n\n`lib.rs:1442-1464`, before:\n\n```rust\n        let stopped = std::thread::scope(|scope| {\n            let workers: Vec<_> = (0..threads)\n                .map(|_| {\n                    let (db, next, parts) = (self.db.clone(), &next, self.parts());\n                    let counted = counted.clone();\n                    scope.spawn(move || {\n```\n\nand the end of that `.map(..)` at lines 1462-1464:\n\n```rust\n                    })\n                })\n                .collect();\n```\n\nafter (the whole statement down to the closing `});` of the scope at line 1483):\n\n```rust\n        let stopped = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {\n            std::thread::scope(|scope| {\n                let mut workers = Vec::with_capacity_in(threads, frame);\n                for _ in 0..threads {\n                    let (db, next, parts) = (self.db.clone(), &next, self.parts());\n                    let counted = counted.clone();\n                    // alloc: a thread a core per batch of units, not per unit.\n                    workers.push(scope.spawn(move || {\n                        let _worker = trace::cold_span(\"worker\", batch);\n                        let resolver = parts.over(&db);\n                        hir_ty_codegen::counted::within(counted, || {\n                            hir::attach_db(&db, || {\n                                loop {\n                                    let at =\n                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);\n                                    if at >= count {\n                                        break;\n                                    }\n                                    work(&db, &resolver, at);\n                                }\n                            })\n                        })\n                    }));\n                }\n                {\n                    let _caller = trace::cold_span(\"caller\", batch);\n                    beside();\n                }\n                // From when the caller is done to when the last thread is.\n                join = trace::cold_span(\"join\", batch);\n                // dyn: a panic's payload, only when a worker panics.\n                let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;\n                for worker in workers {\n                    let Err(panic) = worker.join() else { continue };\n                    let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();\n                    if stopped\n                        .as_ref()\n                        .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())\n                    {\n                        stopped = Some(panic);\n                    }\n                }\n                stopped\n            })\n        });\n```\n\n(lines 1465-1483 move inside unchanged; only the indentation and the `workers` vector change.)\n\n- Why: the handles live exactly as long as the scope: the caller's frame (memory.md, \"a\n  task\"). `beside()` runs inside this task; a unit it compiles opens its own `frame::task` and\n  gets another frame (`frame.rs:440`, \"A task inside a task gets another frame\"), so nothing of\n  it lands in this one. On the caller thread this frame sits under the backend's five at most\n  (mem-codegen-unit 4.1: job, `build`/`prepared`, `resolve`, `shape::value`), six in all. That\n  is within the eight a thread keeps warm (`frame.rs:35`), so no frame is unmapped and\n  reserved again. The thread spawns themselves allocate (std's `Packet` and the thread's\n  stack): once per core per batch, not per unit. Taking them out means a persistent worker pool\n  (blaze-core's plane at integration, docs/v2/plan/design/concurrency.md); that is a scheduling\n  change, not a memory one, and is codegen's.\n- Budget test: none of its own (a batch spawns threads). The per-unit budget is request 5's:\n  what a worker does per unit, outside the backend's own frame, is answer those questions.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-30T12:58:47Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": "v2/requests/mem-codegen-engine.md#6. `in_parallel_beside`: the worker handles in the caller's frame (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:902"
+    },
+    {
+      "at": "2026-10-30T12:58:47Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:58:47Z",
+      "by": "integrate-engine",
+      "action": "done",
+      "note": "Resolved by deletion: `in_parallel_beside` was in blaze-engine's v1 lib.rs (crate-at-a-time codegen), git rm'd with the v1 tail (integrate, 2026-10-30). v2 compiles per-function units on blaze-codegen's driver."
+    }
+  ]
+}

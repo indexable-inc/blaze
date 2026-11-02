@@ -1,0 +1,21 @@
+{
+  "id": "00263",
+  "from_lane": "codegen-mir-prov",
+  "owner": "codegen-mir",
+  "paths": [],
+  "what": "## 5. To codegen-mir: `typed(Default)` on every call's completed destination\n\nsafety-check's answer to shim request 3: nothing runs `typed` on a call's destination. Wanted:\nonce a call's destination is complete (a callee frame returned into it, or an intrinsic / extern\nshim wrote it and the call goes on at its target), if `M::CHECKS`,\n`self.typed_copy(destination.addr, destination_ty, destination.size, RetagMode::Default)?`\n(`typed_copy` is in `eval.rs`, beside `typed_assign`). This covers `read_via_copy`,\n`volatile_load` and ordinary returns; the shim no longer calls it for those itself, so it is\nnot run twice. `typed_swap_nonoverlapping` does its own (`RetagMode::None` on the left place,\nthen the right), per safety-check.\n\n> forwarded to codegen-mir (codegen-mir-next2 told).",
+  "state": "open",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-30T02:45:06Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov.md#5. To codegen-mir: `typed(Default)` on every call's completed destination",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:68"
+    }
+  ]
+}

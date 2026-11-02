@@ -1,0 +1,35 @@
+{
+  "id": "00091",
+  "from_lane": "usercode-macros",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine"
+  ],
+  "what": "## 2. `crates/blaze-engine` (or the daemon's pool owner): warm proc-macro servers\n\nWhere: wherever `ProcMacroClient::spawn` is called for a load.\n\nWhy: servers must run sandboxed and traced, warm, from the parent lane's `Pool`, over a Unix\nsocket (#805: a server is not keyed by `PATH`).\n\n- For each server: `proc_macro_api::warm::Server { program, code, dir, read, write, memory,\n  sandboxed: true }`; `server.command()` is the `Command` (sandbox `On { trace: true, network:\n  false }`, only `warm::SET` in its environment) and `server.key()` its `WarmKey`.\n- When the pool says the server is ready on connection `conn`: `let (bridge, link) =\n  warm::Bridge::new(conn, tags, wake)`, where `tags` is a base no other effect uses and `wake`\n  wakes the loop. The loop calls `bridge.effects(&mut effects)` each turn, hands it every\n  completion whose tag `bridge.owns(tag)`, and `bridge.end(why)` when the server exits.\n- `ProcMacroClient::warm(program, vec![warm::Warm { link, traced: Some((live_record,\n  socket)) }, …], environment)`.\n\n> forwarded to codegen: `ProcMacroClient::spawn`'s callers are in `crates/blaze-engine/` (codegen's); under v2 the daemon's pool owner is lane cargo's daemon, told with the same message.",
+  "state": "refused",
+  "created": "2026-10-30T00:52:12Z",
+  "updated": "2026-10-31T20:30:05Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/usercode-macros.md#2. `crates/blaze-engine` (or the daemon's pool owner): warm proc-macro servers",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros.md:36"
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

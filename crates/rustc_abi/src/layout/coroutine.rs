@@ -20,6 +20,7 @@
 //! of any variant.
 
 use std::iter;
+use std::ops::Deref;
 
 use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 use rustc_index::{Idx, IndexSlice, IndexVec};
@@ -39,11 +40,14 @@ enum SavedLocalEligibility<VariantIdx, FieldIdx> {
 }
 
 /// Compute the eligibility and assignment of each local.
-fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: Idx>(
+fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: Idx, K>(
     nb_locals: usize,
-    variant_fields: &IndexSlice<VariantIdx, IndexVec<FieldIdx, LocalIdx>>,
+    variant_fields: &IndexSlice<VariantIdx, K>,
     storage_conflicts: &BitMatrix<LocalIdx, LocalIdx>,
-) -> (DenseBitSet<LocalIdx>, IndexVec<LocalIdx, SavedLocalEligibility<VariantIdx, FieldIdx>>) {
+) -> (DenseBitSet<LocalIdx>, IndexVec<LocalIdx, SavedLocalEligibility<VariantIdx, FieldIdx>>)
+where
+    K: Deref<Target = IndexSlice<FieldIdx, LocalIdx>>,
+{
     use SavedLocalEligibility::*;
 
     let mut assignments: IndexVec<LocalIdx, _> = IndexVec::from_elem_n(Unassigned, nb_locals);
@@ -55,7 +59,7 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
     // Figure out which of our saved locals are fields in only
     // one variant. The rest are deemed ineligible for overlap.
     for (variant_index, fields) in variant_fields.iter_enumerated() {
-        for local in fields {
+        for local in fields.iter() {
             match assignments[*local] {
                 Unassigned => {
                     assignments[*local] = Assigned(variant_index);
@@ -136,11 +140,11 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
 }
 
 /// Compute the full coroutine layout.
-pub(super) fn layout<'a, F, VariantIdx, FieldIdx, LocalIdx>(
+pub(super) fn layout<'a, F, VariantIdx, FieldIdx, LocalIdx, K>(
     calc: &super::LayoutCalculator<impl HasDataLayout>,
     local_layouts: &IndexSlice<LocalIdx, F>,
     mut prefix_layouts: IndexVec<FieldIdx, F>,
-    variant_fields: &IndexSlice<VariantIdx, IndexVec<FieldIdx, LocalIdx>>,
+    variant_fields: &IndexSlice<VariantIdx, K>,
     storage_conflicts: &BitMatrix<LocalIdx, LocalIdx>,
     tag_to_layout: impl Fn(Scalar) -> F,
 ) -> super::LayoutCalculatorResult<FieldIdx, VariantIdx, F>
@@ -149,6 +153,7 @@ where
     VariantIdx: Idx,
     FieldIdx: Idx,
     LocalIdx: Idx,
+    K: Deref<Target = IndexSlice<FieldIdx, LocalIdx>>,
 {
     use SavedLocalEligibility::*;
 

@@ -1,0 +1,25 @@
+{
+  "id": "00915",
+  "from_lane": "speed-sol2-usercode-macros",
+  "owner": "usercode",
+  "paths": [
+    "crates/proc-macro-api/src/wire.rs",
+    "crates/proc-macro-srv/src/lib.rs",
+    "crates/proc-macro-srv-cli/src/main_loop.rs"
+  ],
+  "what": "A warm expansion sets and undoes its whole environment. WireAsk (proc-macro-api src/wire.rs) sends Environment::passed (about 100 vars, 6 KB) plus the crate vars (about 40, 3 KB) with every request; the server decodes them into String pairs and EnvChange (proc-macro-srv src/lib.rs) does set_var for each of the 140 under ENV_LOCK and sets back or removes each on drop: 280 setenv, about 36 us on glibc, plus 7 us of bytes and decode, per miss (docs/v2/plan/lanes/usercode/speed-of-light-macros.md). A diff against the last expansion is not exact today, because a macro may change a variable it was given, which the rollback undoes. Exact design: send the passed environment once per connection by its content id (Environment already interns by id), keep it applied in the server, set only the crate vars per call, compare each with the live value before writing, and define what a macro-made change to a passed var does (today: undone after the expansion). Needs WireAsk, EnvChange and the server loop crates/proc-macro-srv-cli/src/main_loop.rs (unowned in crates.md) together.",
+  "state": "open",
+  "created": "2026-10-30T09:45:03Z",
+  "updated": "2026-10-30T09:45:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:45:03Z",
+      "by": "speed-sol2-usercode-macros",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "00855",
+  "from_lane": "item-hash-facts",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/form.rs",
+    "crates/blaze-items/src/goals.rs",
+    "crates/blaze-items/src/lib.rs"
+  ],
+  "what": "Follow-up to 00828 from item-hash-facts. (1) form.rs `unobserved()` lists AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND, but hir-ty reads it while solving: next_solver/infer/errors.rs:578 (`#[diagnostic::do_not_recommend]` stops the error walk at that impl), so it is observed by every body whose trait error passes through the impl, and goals.rs fact_of_read's `AttrFlags::query` -> Signature(owner) misses adding or removing it. Please drop it from `unobserved()` (or tell me why the goal store never sees that path). blaze-item-hash now maps body-step reads of AttrFlags::query to its own Attrs fact (all bits), so item-hash does not depend on this. (2) Correction to 00828's kinds note: item-hash's kinds are FIELDS = 0x1800, ATTRS = 0x1801 (all attribute flags, #[unstable] feature, target features of an owner), CRATE_ROOT = 0x1802 (a crate's lang items by key, loaded crates and transitive deps by crate key, features, recursion limit); 0x1803..0x1810 unused (blaze_item_hash::values::kinds). Please list these in blaze_items::kinds' doc.",
+  "state": "open",
+  "created": "2026-10-30T08:56:50Z",
+  "updated": "2026-10-30T08:56:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:56:50Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

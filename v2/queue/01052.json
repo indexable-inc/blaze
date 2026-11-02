@@ -1,0 +1,35 @@
+{
+  "id": "01052",
+  "from_lane": "integrate-store-harness",
+  "owner": "coordinator",
+  "paths": [
+    "harness/bench.py"
+  ],
+  "what": "harness/bench.py imports `packs` (line ~64) and calls `packs.index` in `store_entries` (~696-715); packs.py read the v1 sealed pack format and is deleted (git rm). Drop `packs` from the import and either measure the v2 store as the bytes of `<BLAZE_HOME>/v2/store` (see harness/storelib.py stored_bytes) or remove the entries count. bench.py fails at import until then.",
+  "state": "applied",
+  "created": "2026-10-30T14:50:22Z",
+  "updated": "2026-10-30T15:39:14Z",
+  "taken_by": "integrate-tooling",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:50:22Z",
+      "by": "integrate-store-harness",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:39:14Z",
+      "by": "integrate-tooling",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:39:14Z",
+      "by": "integrate-tooling",
+      "action": "done",
+      "note": "bench.py imports storelib, not packs; store_entries, STORED and store_added_mb are gone; disk() and the result measure storelib.store_of(BLAZE_HOME) with memory.disk_mb"
+    }
+  ]
+}

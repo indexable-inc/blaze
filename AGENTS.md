@@ -12,9 +12,10 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    build`/`cargo test` or sccache. Where blaze can't build itself yet, fix that. See
    [docs/contributing.md](docs/contributing.md).
 3. **no-fallback**: No fallback, ever. When blaze can't do something it stops with an error naming what
-   and where, never quietly takes another path (rustc, a full rebuild instead of a patch, a slower
-   backend, an older cached result). A change that touches an existing fallback turns it into an
-   error.
+   and where, never quietly takes another path (rustc, a full link or rebuild instead of a patch, a
+   slower backend, an older cached result, a default guessed for a missing value). A fallback that
+   only logs its reason is still a fallback. A change that touches an existing fallback turns it
+   into an error, and a bench or test that hits one fails instead of timing the slow path.
 4. **superset-of-rust**: Own every layer from source to running code, never by narrowing what blaze
    accepts: every program the pinned nightly builds must build and behave the same under blaze, with
    the real std, C dependencies, build scripts and proc macros. The one allowed difference is
@@ -22,69 +23,170 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in
    and every program that doesn't use it behaves exactly as under rustc. See
    [docs/no-rustc.md](docs/no-rustc.md).
-5. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
+5. **useful-not-parity**: rustc and cargo are references, never specs. Judge everything blaze does by
+   how useful it is to the person or agent using it, not by how closely it matches them: errors,
+   warnings, lints, CLI commands and flags, printed and JSON output, progress, the target
+   directory's layout, file formats, caches, symbol names, debug info, what a build or test run does
+   and in what order. Match them only where real code or tools depend on it (a program's behavior, a
+   published crate's manifest, an editor reading the JSON); everywhere else pick the better design
+   and delete the copy. Tests check what makes the result useful and correct, never that it equals
+   rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds
+   still builds and runs as it does under rustc.
+6. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
    (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN`
    and `RUSTC`. Projects pin the blaze version, not Rust's. See
    [docs/toolchain.md](docs/toolchain.md).
-6. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
+7. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
    no sandbox can be made, blaze stops. Sandboxed tests are an opt-in experiment. The only ways out
    are the documented manifest opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
-7. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
-   rustc's rule properly, and spend the effort on proving it right (differential tests against
-   rustc, fuzzing, real crates). See
-   [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
-8. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
-   eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
-   `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
-   their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
-   outside the front end. See
-   [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
-9. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
-   deterministic CBOR; the CLI is a client of the same API. See
-   [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-10. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
+8. **proc-macros-on-wasm**: A proc macro runs as a WebAssembly module: blaze compiles the macro crate
+   to `wasm32-wasip1` with its own front end and code generator (never rustc), and Wasmtime runs it
+   in process, Cranelift as its compiler, behind the `proc_macro` bridge, whose shims are its only
+   imports. Cranelift's code generator runs only there, inside Wasmtime for wasm. Native code (every
+   target blaze builds for, debug or release) is never generated by Cranelift: it is copy-and-patch
+   stencils or LLVM, a function with no stencil is a typed error naming it, and there is no
+   Cranelift tier between them. Cranelift's IR types (`cranelift_codegen::ir`) may stay as the
+   stencils' input until blaze has its own IR. The MIR evaluator stays for const eval and as the
+   reference a macro's wasm output is tested against; nothing hand-rolls a wasm-style sandbox
+   (`blaze-macro-eval`'s `tier.rs` is replaced by this). See
+   [docs/v2/plan/lanes/usercode/macros.md](docs/v2/plan/lanes/usercode/macros.md).
+9. **bump-allocate**: Allocate by lifetime, never from the global heap by default: a collection that
+   lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator,
+   `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer
+   lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`,
+   `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its
+   line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied. See
+   [docs/v2/plan/design/memory.md](docs/v2/plan/design/memory.md).
+10. **standard-structures**: One choice per need, never a hand-rolled or std stand-in: locks are
+    `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a
+    shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}`
+    (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content
+    hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come
+    back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
+    `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
+    is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a
+    job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a
+    spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a
+    driver's timer. `BTreeMap` only where iteration order is part of the output.
+11. **fix-through-blaze-lints**: A change that moves a type, path, API or idiom across the code is a ban
+    with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which
+    blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a
+    MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied
+    with `blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only
+    shrink; a one-off move of a path is `blaze check --replace A=B`. Both find code by name
+    resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it
+    compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and
+    syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build
+    afterward.
+12. **sans-io-cores**: Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease,
+    a maintainer's plan) is a synchronous state machine that reads time only from an injected clock
+    (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions
+    and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test
+    replays a transcript with no real clock.
+13. **every-wait-says-what**: A thread or fiber that blocks says what it waits for: the wait opens a
+    span naming the awaited key, lock, channel, IO or child, and its owner when known. A wait with
+    no name, and time on a worker covered by no span, are bugs; the profile test fails on them.
+14. **slow-is-p0-traced**: Anything slow is a P0 until a span names it, and the trace comes before the
+    speed fix. Every stretch of worker time sits under a `tracing::info_span!(target: "blaze", ...)`
+    that names the work: the macro path for a proc-macro expansion, the package, version and target
+    kind for a unit, the query and key, the creator of a scope being waited on. Its own CPU time
+    (`self_cpu_ns`) is filled, so a DuckDB query over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says
+    which item took the time and whether it was busy or waiting. A sampler stack or a guess from a
+    log is a lead. The PR that makes something faster quotes the before and after from those spans.
+15. **bounded-progress**: Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a
+    retry) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed
+    outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never
+    an open loop whose only exit is success, and never a spin with no cap.
+16. **errors-name-the-thing**: An error names the item it is about (the function or instance with its
+    path, the crate, the key, the file and line) and the rule that refused it, in the message
+    itself. "a template made against 6 references is given 7" is unfinished until it says which
+    function and which template.
+17. **panics-fail-one-job**: A panic inside a job (a query, a codegen unit, a proc-macro evaluation)
+    fails that job's units with a typed error naming the panic and the job; the daemon keeps serving
+    and `--keep-going` keeps building the rest. Formatting an error must not panic: render what
+    needs the database while the database is attached.
+18. **keys-cover-every-input**: A query key, store key, fold key or template key covers every input its
+    value depends on, including the data a constant points to and the identity of a closure callee.
+    Two different values under one key is a refusal with a typed error, never an overwrite, and the
+    fix is the key, never the check.
+19. **measure-the-exact-tree**: A measurement, bisect or checkpoint names the exact tree it ran on (a
+    content digest of the sources and the blaze binary's hash) and keeps that tree; never re-sync or
+    rebuild between measuring and committing. A result you can't tie to a tree is not evidence.
+20. **test-the-cause**: A causal claim (this change caused the regression, this lock causes the convoy,
+    this index makes it fast) is tested by removing the cause and watching the effect go, not by
+    checking that its premises hold. Pin a load-bearing one with a test named for the property.
+21. **whole-ports**: A change to a shared signature or type (a struct's fields, a trait, a lock type)
+    updates every caller in the same batch, so the shared tree compiles at every save point. Do it
+    through `blaze check --fix`, `blaze check --replace` or a scoped rewrite, then build, then hand
+    the batch over. A half-ported tree blocks every lane's run.
+22. **deterministic-output**: No output (an object, a diagnostic's order, a store key, a profile row's
+    identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
+    Hashers have fixed seeds; anything iterated into output is sorted or ordered by construction; a
+    test builds twice and compares bytes.
+23. **persisted-state-round-trips**: Anything blaze persists (the daemon image, the store, the plane's
+    history) has a test that restores it and checks the result equals a fresh build byte for byte,
+    and a budget for restart to first answer. A restore that silently starts empty is a failure the
+    daemon reports, naming why.
+24. **no-wait-across-thread-locals**: A fiber can resume on another thread after any wait, so nothing
+    held across a wait may be tied to a thread: no thread-local borrow, lock guard or `Rc`. Mark
+    regions that must not wait with `NoWait`; read thread-locals in `#[inline(never)]` functions
+    that end before any wait.
+25. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
+    rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
+    passing under blaze, and fuzzing of blaze's own invariants. See
+    [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
+26. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
+    eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
+    `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
+    their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
+    outside the front end. See
+    [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
+27. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
+    deterministic CBOR; the CLI is a client of the same API. See
+    [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
+28. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-11. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
+29. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
     `git stash`.
-12. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+30. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-13. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+31. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-14. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
+32. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
     branch.
-15. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+33. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-16. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+34. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-17. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+35. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 
 ## Code Review Rules
 
-These guide Codex code review on pull requests. They add to the rustc comparison harnesses and a
-maintainer's approval; they replace neither.
+These guide Codex code review on pull requests. They add to the harnesses and a maintainer's
+approval; they replace neither.
 
 ### Compiler correctness
 
 - Flag any change that can make a program built by blaze behave differently from the same program
   built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
   panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
-  Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference
-  is sandboxing build scripts and proc macros. Code that opts into a blaze extension is exempt: it
-  need not build under rustc, but enabling the extension must not change any program that doesn't
-  use it.
+  Safe path: port rustc's rule and add a test (a crate whose own tests exercise it, or a unit test).
+  The one allowed difference is sandboxing build scripts and proc macros. Code that opts into a
+  blaze extension is exempt: it need not build under rustc, but enabling the extension must not
+  change any program that doesn't use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
   cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
   backend, an older cached result). Safe path: stop with an error that names what and where.

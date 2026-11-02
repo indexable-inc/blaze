@@ -1,0 +1,35 @@
+{
+  "id": "01198",
+  "from_lane": "tests-misc-front1",
+  "owner": "item-hash-facts",
+  "paths": [
+    "crates/hir-def/src/expr_store/persist.rs"
+  ],
+  "what": "hir-def expr_store/persist.rs put_lifetime writes LifetimeRef::Named's name even under names_blank(), so renaming a lifetime parameter changes a body's identity (blaze-item-hash anon::renaming_a_generic_or_a_lifetime_keeps_the_identity, 'a vs 'b). Write w.str(\"\") for Named when names_blank(), as put_binding/put_label do. blaze-item-hash names.rs now hashes each named lifetime by its resolution (param by owner+index, 'static, else its text), so blanking is safe once that lands.",
+  "state": "applied",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T14:43:16Z",
+  "taken_by": "item-hash-facts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to item-hash-facts, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:16Z",
+      "by": "item-hash-facts",
+      "action": "done",
+      "note": "already in the tree (anon part 1): put_lifetime writes a Named lifetime of the owner generics (parent impl/trait then own, Anonymous.lifetimes) as str(\"\") + its index, so renaming a lifetime parameter keeps the identity while two different parameters stay apart; a name outside the params (a body-local for<> binder) keeps its text. identity.rs lifetimes() feeds the list."
+    }
+  ]
+}

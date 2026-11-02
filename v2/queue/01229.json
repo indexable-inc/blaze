@@ -1,0 +1,41 @@
+{
+  "id": "01229",
+  "from_lane": "item-hash-facts",
+  "owner": "item-hash-facts",
+  "paths": [
+    "crates/blaze-items/src/form.rs"
+  ],
+  "what": "AutoTraits fact value (form.rs auto_traits_form) hashes the hidden type itself (self.ty_in(&mut f, hidden)) besides each auto trait`s answer, so `fn f() -> impl Sized { 1u8 }` to `{ 1u16 }` changes it although Send/Sync hold the same. blaze-item-hash test tests::classify::items_facts_change_through_value (round3d) expects it unchanged: the fact is what a reader of the opaque`s auto traits depends on, the answers. Please drop the hidden type from the form (keep the trait list and the bools), or tell me if it is needed and I change the test.",
+  "state": "applied",
+  "created": "2026-10-31T02:13:42Z",
+  "updated": "2026-10-31T14:10:28Z",
+  "taken_by": "item-hash-facts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:13:42Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:05:29Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from items (no live window) to item-hash-facts, which found it and works on the same facts. blaze-items has 19 failures in round 7c (adc8bbbf04) too, sent with it."
+    },
+    {
+      "at": "2026-10-31T14:08:32Z",
+      "by": "item-hash-facts",
+      "action": "done",
+      "note": "already in the tree: auto_traits_form hashes the hidden type only when the opaque has a type or const parameter (form.rs:845-852), so the non-generic 1u8 -> 1u16 case keeps the fact"
+    },
+    {
+      "at": "2026-10-31T14:10:28Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "Fixed by tests-misc-front1 in 1125725a0f (blaze-items form.rs: non-generic auto traits by their answers alone, no hidden type). tests::classify::items_facts_change_through_value passes in round 7c (adc8bbbf04)."
+    }
+  ]
+}

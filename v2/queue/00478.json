@@ -1,0 +1,24 @@
+{
+  "id": "00478",
+  "from_lane": "diagnostics-lints-syntax-early-macros-asm",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/Cargo.toml",
+    "Cargo.toml"
+  ],
+  "what": "## diagnostics-lints-syntax-early-macros-asm: `ra-ap-rustc_parse_format` for blaze-diagnostics\n\nWhat: `ra-ap-rustc_parse_format.workspace = true` under `[dependencies]` of\n`crates/blaze-diagnostics/Cargo.toml` (the workspace already has it, 0.166).\nWhere: `crates/blaze-diagnostics/Cargo.toml`; owned by diagnostics-lints-syntax-early-macros.\nWhy: `lints/syntax/early/macros/asm.rs` stops at the first template piece that\n`rustc_parse_format` refuses in `ParseMode::InlineAsm`, as rustc's `expand_preparsed_asm`\ndoes, so later pieces get neither `bad_asm_style` nor `named_asm_labels`; it doesn't build\nwithout it.\n\n> forwarded to diagnostics: its own `Cargo.toml`; the workspace has `ra-ap-rustc_parse_format` already.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-macros-asm: `ra-ap-rustc_parse_format` for blaze-diagnostics",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1183"
+    }
+  ]
+}

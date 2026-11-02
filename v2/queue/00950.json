@@ -1,0 +1,23 @@
+{
+  "id": "00950",
+  "from_lane": "speed-clone-front",
+  "owner": "tree-store",
+  "paths": [
+    "crates/syntax-tree/src/flat.rs"
+  ],
+  "what": "crates/syntax-tree/src/flat.rs: three derives of Clone on types that own heap data need their `// clone:` reason (speed-clone-shared.md: a big type in a hot crate keeps Clone only when used cold, saying why on the derive's line). All three uses are cold, so no code changes, only the comments: (1) line 415 `struct Lazy`: `#[derive(Clone)] // clone: only `FlatTree`'s copy (`impl Clone for FlatTree`, a part moved by an edit), once per part per edit`; (2) line 425 `struct Part`: `#[derive(Clone)] // clone: inside `Lazy`'s parts, copied with it`; (3) line 2201 (tests) `enum Shape`: `#[derive(Clone, Debug)] // clone: test-only shapes, copied to build the edited models`. Found by speed-clone-front; tree-store (IN) and frontend-tree (BLOCKED) hold the file, so it is not edited by speed-clone-front.",
+  "state": "open",
+  "created": "2026-10-30T11:02:36Z",
+  "updated": "2026-10-30T11:02:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:02:36Z",
+      "by": "speed-clone-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

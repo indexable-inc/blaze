@@ -56,10 +56,9 @@ def main():
     name = sys.argv[1]
     base, spec = project_spec(name)
     ws = checkout(base, spec)
-    home, store, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "store", "cargo-home"))
-    for d in (home, store):
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d, mode=0o700)
+    home, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "cargo-home"))
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(home, mode=0o700)
     os.makedirs(cargo_home, exist_ok=True)
     log = f"{L}/logs/{name}.log"
     open(log, "w").close()
@@ -67,17 +66,9 @@ def main():
     prefix = os.environ.get("NR_PATH_PREFIX", "")
     env.update(PATH=f"{L}/target/release:{prefix + ':' if prefix else ''}/run/current-system/sw/bin:{env['PATH']}",
                RUSTUP_TOOLCHAIN="nr-pin",
-               BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
+               BLAZE_HOME=home, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
-    # A release ships the standard library its builds start from (crates/blaze-engine/src/shipped.rs):
-    # made here by the blaze under test as the release workflow makes it, from the toolchain
-    # the builds use, and fetched by the first build. NR_STD=build has the builds make it.
-    if os.environ.get("NR_STD") != "build":
-        toolchain = f"{L}/tc-pin"
-        shipped = f"{L}/std-remote"
-        # What the toolchain runs for it is the release's, not the build's: counted apart.
-        subprocess.run(["blaze-engine", "std", shipped, toolchain], env=dict(env, NR_LOG=f"{L}/logs/std.log"), check=True)
-        env["BLAZE_STD_FROM"] = shipped
+    # The standard library's crates are units of the first build like any other.
     extra = json.loads(os.environ.get("NR_ENV", "{}"))
     env.update(extra)
     steps_out = f"{L}/logs/{name}.steps.jsonl"

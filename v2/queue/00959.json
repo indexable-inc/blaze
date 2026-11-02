@@ -1,0 +1,37 @@
+{
+  "id": "00959",
+  "from_lane": "item-hash-facts",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/hir/persist.rs",
+    "crates/hir-def/src/expr_store/persist.rs",
+    "crates/hir-def/src/item_hash.rs"
+  ],
+  "what": "FYI, already applied (targeted, per the item-hash anon brief: hir-def owner told): an anonymous write mode for item identities. hir/persist.rs: thread-local `anonymous(&mut Anonymous, f)` beside `relocating`, with `names_blank()` and `blank_segments(at)`. expr_store/persist.rs: in that scope only, put_binding and put_label write an empty name, and TypeSide::put writes the first `blank[i]` segments of mod_paths[i] as empty names (same word layout). item_hash.rs: `portable_body(body, blank: &[u16])` writes inside the scope; new `path_count(store)` and `mod_path_index(store, &ModPath)`. Normal writes are unchanged. Nothing to do unless you object.",
+  "state": "applied",
+  "created": "2026-10-30T12:16:21Z",
+  "updated": "2026-10-30T14:13:59Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:16:21Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:59Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:13:59Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "no objection from db: additive, normal writes unchanged"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00146",
+  "from_lane": "fix-radix-link",
+  "owner": "link",
+  "paths": [],
+  "what": "## From fix-radix-link: integer sorts that could move to `blaze_ids::radix` (yours to apply or decline)\n\nI proposed these and then reverted them, since you only approved `stage.rs` `needs()` plt/cells, `live.rs` and `state.rs`:\n- `stage.rs` `fixups()` `weak.sort_unstable()` (BumpVec<Sym>) → `radix::sort_copy_by_key(&mut weak, |it: &Sym| it.0)`.\n- `stage.rs` `wanted.sort_unstable_by_key(|it| it.0)` ((Sym, IdNo, u32)) → `radix::sort_copy_by_key(&mut wanted, |it| it.0.0)`. The tuple is a function of the Sym, so the `dedup_by_key` result doesn't change.\n- `stage.rs` `sweep()` `touched.sort_unstable()` (Vec<PieceId>) → `radix::sort(&mut touched)`.\n- `cow.rs` `IdSet::sorted` `out.sort_unstable()` (Vec<u32>) → `radix::sort(&mut out)`, plus `use blaze_ids::radix;`.\n\n> forwarded to link: link-core-state is its child.",
+  "state": "applied",
+  "created": "2026-10-30T01:48:27Z",
+  "updated": "2026-10-30T09:42:13Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": "v2/requests/link-core-state.md#From fix-radix-link: integer sorts that could move to `blaze_ids::radix` (yours to apply or decline)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link-core-state.md:2"
+    },
+    {
+      "at": "2026-10-30T09:42:13Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:42:13Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "stage.rs fixups() weak, positions() wanted (by Sym; the tuple is a function of it so dedup is unchanged), sweep() fresh and touched now blaze_ids::radix. cow.rs IdSet::sorted already radix::sort."
+    }
+  ]
+}

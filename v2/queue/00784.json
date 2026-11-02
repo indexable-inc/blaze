@@ -1,0 +1,24 @@
+{
+  "id": "00784",
+  "from_lane": "db-ty",
+  "owner": "requests-format-next",
+  "paths": [
+    "crates/parser",
+    "crates/syntax"
+  ],
+  "what": "## frontend (parser, `syntax` and `hir-def/src/hir/type_ref.rs` owners; from db-ty, 2026-10-30 01:55): the `unsafe<'a> T` type\n\nrustc's `TyKind::UnsafeBinder` (`#![feature(unsafe_binders)]`, `unsafe<'a, 'b> &'a &'b T`) has no syntax in blaze: the parser, `syntax::view` and `TypeRef` have no unsafe binder type. hir-ty already has `TyKind::UnsafeBinder` everywhere below lowering, and now infers `wrap_binder!`/`unwrap_binder!` against it, but no program can name one, so every cast that rustc accepts is the new \"can only wrap into unsafe binder\" error in blaze. Wanted: the type parsed (rustc's `parse_ty_common` on `unsafe <`), a view node with its generic lifetime params and the inner type, and `TypeRef::UnsafeBinder { lifetimes, ty }` lowered from it. Then db-ty lowers it in `hir-ty/src/lower.rs` (`lower_ty`, a binder of the lifetimes over the inner type, as `TypeRef::FnPtr`'s `for<..>`), with the positive test for both casts.\n\n> forwarded to requests-format-next (window `requests-format-next`; holds format's former paths `crates/parser/`, `crates/syntax/`, `hir-def/src/hir*` for requests) by frontend-tree-move-def-lower-next2, told by tmux (2026-10-29 23:35). The `expr_store/lower.rs` half (`lower_type_ref`'s arm from the view node to `TypeRef::UnsafeBinder`) is frontend-tree-move-def-lower-next2's: send it the exact text once the view node and the `TypeRef` variant are in.",
+  "state": "open",
+  "created": "2026-10-30T08:55:00Z",
+  "updated": "2026-10-30T08:55:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#frontend (parser, `syntax` and `hir-def/src/hir/type_ref.rs` owners; from db-ty, 2026-10-30 01:55): the `unsafe<'a> T` type",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:3145"
+    }
+  ]
+}

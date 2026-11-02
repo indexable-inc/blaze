@@ -1,0 +1,35 @@
+{
+  "id": "00631",
+  "from_lane": "frontend-journal-tree",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/tree.rs"
+  ],
+  "what": "## frontend-journal-tree: `Reader::file` is a `Result` of `Bytes` (blaze-query's `Tree`; 2026-10-29)\n\nWhy: restore.md, \"The VFS tree itself is in the mapped image\". A file of a restored tree is a\nrange of the daemon's mapped image, checked by its page group's CRC32C when it is first read.\n`blaze_vfs::Reader::file` is now\n`Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, blaze_vfs::Corrupt>`. `Bytes` is\n`blaze_bytes::Bytes`, re-exported: a heap `Arc<[u8]>` or the image's range, `Deref<Target =\n[u8]>`, and a clone takes one count. `Corrupt { section, group, cause }` names the bad group.\n`crates/blaze-query/src/tree.rs:29-31` no longer compiles as written. Its `bytes.clone()` was\none `Arc` count; on a `Result` it is a type error.\n\nWhat I'd do, but the shape is yours:\n1. `Tree::file` -> `Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, blaze_vfs::Corrupt>`.\n   For `blaze_vfs::Reader`: `blaze_vfs::Reader::file(self, root, path)`, with no clone, because\n   it already gives owned `Bytes`. `MemTree`'s `Files` holds `Bytes`, built with\n   `Bytes::from(Arc::<[u8]>::from(bytes))`, and its `file` is `Ok(..cloned())`.\n2. `InputData::File` holds `Option<(ContentId, Mode, Bytes)>`. `Ctx::file` lends `&**bytes`, as\n   it does now.\n3. `read_input` on `Err(corrupt)`: insert nothing into `state.inputs`, and stop the run with\n   the error, as a cancellation does, so the request fails naming the section and group.\n   It must not be cached: the daemon mends the file by rescanning the path (the watcher\n   writes the disk's bytes again, and `Tree::file` gives the node those bytes). The same root\n   then reads fine, and a memoized error would outlive the repair. Treating it as `None`\n   would be a fallback: the file would look absent, and the build would differ.\n\nNo error can happen before the daemon restores from an image (cargo's request), because until\nthen every file is a heap file.\nStatus: open\n\n> forwarded to db (`blaze-query/src/tree.rs` is its; db-query-next2 told).\n> frontend-hooks (2026-10-29): nothing to apply; already in (db-query). `Tree::file` returns\n> `Result<Option<(ContentId, Mode, Bytes)>, Corrupt>` and `Reader`'s impl passes\n> `blaze_vfs::Reader::file` through with no clone (`crates/blaze-query/src/tree.rs:18,29`).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db.md#frontend-journal-tree: `Reader::file` is a `Result` of `Bytes` (blaze-query's `Tree`; 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:3890"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: `blaze_vfs::Reader::file` through with no clone (`crates/blaze-query/src/tree.rs:18,29`)."
+    }
+  ]
+}

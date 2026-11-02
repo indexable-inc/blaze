@@ -1,0 +1,33 @@
+{
+  "id": "00412",
+  "from_lane": "mem-core",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## C4 (blaze-query `src/lib.rs` `kinds`, lane db): the front and back sub-ranges\n\n`blaze_graph::admission::tag_of` places a query kind in a subsystem by these ranges; the ones in\nuse already fit them (`hir-def` names `0x2200..0x2240`, `hir-ty` `0x2400..0x2600`,\n`blaze-codegen` `0x4000..`). Write them beside `FRONT` and `BACK` so a new kind is placed by its\nsubsystem:\n\n```rust\n    /// The front end's syntax (parse): `0x2000..0x2200`.\n    pub const SYNTAX: std::ops::Range<u16> = 0x2000..0x2200;\n    /// Names (resolve): `0x2200..0x2400`.\n    pub const NAMES: std::ops::Range<u16> = 0x2200..0x2400;\n    /// Signatures, bodies and inference: `0x2400..0x2c00`.\n    pub const INFER: std::ops::Range<u16> = 0x2400..0x2c00;\n    /// Macros (expand): `0x2c00..0x3000`.\n    pub const EXPAND: std::ops::Range<u16> = 0x2c00..0x3000;\n    /// MIR, its passes, borrow checking and const eval: `0x3000..0x4000`.\n    pub const MIR: std::ops::Range<u16> = 0x3000..0x4000;\n    /// Codegen: `0x4000..0x4800`.\n    pub const CODEGEN: std::ops::Range<u16> = 0x4000..0x4800;\n    /// Link: `0x4800..0x5000`.\n    pub const LINK: std::ops::Range<u16> = 0x4800..0x5000;\n```\n\n> forwarded to mem-core (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:02:04Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/mem-core.md#C4 (blaze-query `src/lib.rs` `kinds`, lane db): the front and back sub-ranges",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-core.md:82"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "crates/blaze-query/src/lib.rs kinds: SYNTAX, NAMES, INFER, EXPAND, MIR (within FRONT), CODEGEN, LINK (within BACK), the same ranges blaze_graph::admission::tag_of matches"
+    }
+  ]
+}

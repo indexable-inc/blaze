@@ -1,0 +1,23 @@
+{
+  "id": "00252",
+  "from_lane": "diagnostics-lints-names-items-speed",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "## 2. For `diagnostics` / `diagnostics-lints-levels`: which lints can fire (same as imports' request 8)\n\nWhere: `crates/blaze-diagnostics/src/cx.rs` (`Cx`).\n\nWhat: `cx.lint_may_fire(name) -> bool`, from a per-crate bitset over lint ids, false when the\ncommand line and every attribute in the crate leave the lint allowed.\n\nWhy: most of this lane's lints are allow-by-default (`missing_docs`, `unreachable_pub`,\n`missing_copy_implementations`, `missing_debug_implementations`, `single_use_lifetimes`,\n`unused_lifetimes`, ..), and their passes run anyway. rustc skips them\n(`lints_that_dont_need_to_run`). With the flag, `after_abort` would skip `derives`, `docs` and\n`publicity`, and `Effective::of` too when none of them can fire.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:36:30Z",
+  "updated": "2026-10-30T02:36:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-names-items-speed.md#2. For `diagnostics` / `diagnostics-lints-levels`: which lints can fire (same as imports' request 8)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-names-items-speed.md:35"
+    }
+  ]
+}

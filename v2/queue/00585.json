@@ -1,0 +1,23 @@
+{
+  "id": "00585",
+  "from_lane": "frontend-tree-move-hir",
+  "owner": "frontend-fast-method",
+  "paths": [
+    "crates/hir-ty/src/method_resolution.rs"
+  ],
+  "what": "## Edited directly (items is DONE)\n\n- `crates/hir-ty/src/method_resolution.rs`: `loaded_crates`' `named_in` walks a view root\n  (`Parse::root`, `Node::flat`), the same `(tree, at)` the handle's `flat()` gave.\n\n> forwarded to frontend-fast-method: since pass 23 it holds `crates/hir-ty/src/method_resolution.rs` (the free rule), so it keeps this edit when it next writes the file; told by tmux (requests, pass 27).",
+  "state": "open",
+  "created": "2026-10-30T05:06:14Z",
+  "updated": "2026-10-30T05:06:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-tree-move-hir.md#Edited directly (items is DONE)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-tree-move-hir.md:16"
+    }
+  ]
+}

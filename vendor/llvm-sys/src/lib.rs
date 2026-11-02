@@ -2,7 +2,98 @@
 //!
 //! Refer to the [LLVM documentation](http://llvm.org/docs/) for more
 //! information.
+//!
+//! # The contract (blaze)
+//!
+//! This crate is declarations only: no function body, no logic, no `unsafe` block
+//! (`forbid(unsafe_code)` below holds it to that). Every call into it is `unsafe`, and in blaze
+//! every one is made behind a safe wrapper in `crates/hir-ty-codegen/llvm.rs` and `llvm/` (or
+//! in inkwell, which hir-ty-codegen calls through), whose `// SAFETY:` comments say which of
+//! the rules below each call keeps.
+//!
+//! ## Who owns each `LLVM*Ref`
+//!
+//! - `LLVMContextRef`: whoever called `LLVMContextCreate`, until `LLVMContextDispose`. The
+//!   context owns every type, constant, metadata node and attribute made in it
+//!   (`LLVMTypeRef`, constant `LLVMValueRef`s, `LLVMMetadataRef`, `LLVMAttributeRef`): none of
+//!   those is freed on its own, and all of them dangle once the context is disposed of.
+//!   `LLVMGetGlobalContext` is one context for the whole process; blaze never uses it.
+//! - `LLVMModuleRef`: whoever created or parsed it, until `LLVMDisposeModule`, which must come
+//!   before the disposal of its context. The module owns its functions and globals.
+//!   `LLVMLinkModules2(Dest, Src)` destroys `Src` whether or not it fails.
+//! - Functions, globals, basic blocks and instructions (`LLVMValueRef`, `LLVMBasicBlockRef`)
+//!   are owned by their parent (module, function, block). `LLVMDeleteFunction`,
+//!   `LLVMDeleteGlobal`, `LLVMDeleteBasicBlock` and `LLVMInstructionEraseFromParent` free them;
+//!   the handle, and any handle to a use of it, dangles after. Free one only when nothing uses
+//!   it (`LLVMReplaceAllUsesWith` first), and take the next instruction of a walk before
+//!   erasing the current one. `LLVMInstructionRemoveFromParent` unlinks without freeing.
+//! - `LLVMUseRef` is a view of one entry of a value's use list: valid until that list changes
+//!   (a use added, replaced or erased).
+//! - `LLVMBuilderRef` (`LLVMCreateBuilderInContext`) and `LLVMDIBuilderRef`
+//!   (`LLVMCreateDIBuilder`, finalized with `LLVMDIBuilderFinalize`): the caller's, until
+//!   `LLVMDisposeBuilder` / `LLVMDisposeDIBuilder`, before their context or module is disposed
+//!   of. A builder only inserts into blocks of its own context.
+//! - `LLVMMemoryBufferRef`: the caller's, until `LLVMDisposeMemoryBuffer`.
+//!   `LLVMCreateMemoryBufferWithMemoryRange` does not copy: the bytes must outlive the buffer
+//!   (`..RangeCopy` copies). `LLVMParseIRInContext2` and `LLVMParseBitcodeInContext2` leave the
+//!   buffer the caller's; the deprecated `LLVMParseIRInContext` takes it.
+//! - `LLVMTargetRef` is a registry entry that lives for the process and is never freed.
+//!   `LLVMTargetMachineRef` (`LLVMCreateTargetMachine`) is the caller's until
+//!   `LLVMDisposeTargetMachine`; `LLVMTargetDataRef` from `LLVMCreateTargetDataLayout` until
+//!   `LLVMDisposeTargetData`.
+//! - `LLVMPassBuilderOptionsRef`: the caller's, until `LLVMDisposePassBuilderOptions`.
+//! - blaze's `LLVMBlazePassesRef` (`transforms::pass_builder`, `wrappers/passes.cpp`): the
+//!   caller's, until `LLVMBlazeDisposePasses`, which must come before the disposal of the
+//!   target machine it was made for, and of the profile bytes it was given. It is bound to the
+//!   first context it runs a module of and refuses a module of another.
+//! - `LLVMErrorRef`: null is success. A non-null error is owned by whoever got it and must be
+//!   consumed exactly once, by `LLVMConsumeError` or by `LLVMGetErrorMessage`, whose message is
+//!   then freed with `LLVMDisposeErrorMessage` (not `LLVMDisposeMessage`).
+//! - `LLVMDiagnosticInfoRef`, given to a diagnostic handler, lives for that call only.
+//!
+//! ## Strings
+//!
+//! - A `*const c_char` argument with no length beside it is read up to its NUL: it must be
+//!   NUL-terminated (`c"..."` or a `CString`) and live for the call. One with a length
+//!   (`LLVMSetValueName2`, `LLVMBlazeRunPasses`' `Pipeline`, `LLVMBlazeHasFeature`'s `Name`) is
+//!   read for that many bytes and needs no NUL.
+//! - A `*mut c_char` returned, or written through a `*mut *mut c_char` out-parameter (the
+//!   `ErrorMessage`/`OutMessage` of `LLVMVerifyModule`, `LLVMTargetMachineEmitToMemoryBuffer`,
+//!   `LLVMGetTargetFromTriple`, `LLVMParseIRInContext2`, ...), is a new allocation the caller
+//!   owns and frees once with `LLVMDisposeMessage`: `LLVMPrintModuleToString`,
+//!   `LLVMPrintValueToString`, `LLVMPrintTypeToString`, `LLVMGetDefaultTargetTriple`,
+//!   `LLVMNormalizeTargetTriple`, `LLVMGetHostCPUName`, `LLVMGetHostCPUFeatures`,
+//!   `LLVMGetTargetMachineTriple`, `LLVMGetTargetMachineCPU`,
+//!   `LLVMGetTargetMachineFeatureString`, `LLVMCopyStringRepOfTargetData`,
+//!   `LLVMGetDiagInfoDescription`, `LLVMCreateMessage`. Start an out-parameter null and free
+//!   it whenever it is non-null after the call, failed or not: `LLVMVerifyModule` writes one
+//!   (empty) on success too.
+//! - A `*const c_char` returned (`LLVMGetValueName2`, `LLVMGetMDString`, `LLVMGetTargetName`,
+//!   `LLVMGetSectionName`, `LLVMGetBufferStart`) is borrowed from its owner: never freed, and
+//!   valid only while the owner lives and is unchanged.
+//!
+//! ## Threads
+//!
+//! - A context and everything in it (its modules, builders, values, types and metadata) is used
+//!   by one thread at a time. Separate contexts can be used on separate threads at once: blaze
+//!   keeps one per thread (`hir-ty-codegen` `llvm::Machine`, thread-local), with that thread's
+//!   target machines and passes, so no handle crosses threads.
+//! - Process-wide state is set up once, before threads use it: `LLVMParseCommandLineOptions`
+//!   (blaze calls it under a `Once`, before any target machine is made) and the target
+//!   initializers (`LLVMInitializeX86Target` and the rest), which write LLVM's target
+//!   registry: blaze calls them through inkwell's `Target::initialize_*`, which holds a
+//!   process-wide lock around each.
+//! - A diagnostic handler (`LLVMContextSetDiagnosticHandler`) runs on the thread doing the work
+//!   in that context. A callback must not unwind into LLVM: an `extern "C"` fn that panics
+//!   aborts.
+//!
+//! ## `LLVMBool`
+//!
+//! `0` is false and anything else true. For the functions that report failure through it
+//! (`LLVMVerifyModule`, `LLVMTargetMachineEmitToMemoryBuffer`, the parsers, `LLVMLinkModules2`)
+//! true means failed.
 
+#![forbid(unsafe_code)]
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 

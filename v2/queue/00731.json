@@ -1,0 +1,40 @@
+{
+  "id": "00731",
+  "from_lane": "dedyn",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve.rs",
+    "v2/requests/mem-core.md",
+    "crates/blaze-core",
+    "crates/blaze-units/src/query.rs",
+    "crates/blaze-units/src/lib.rs",
+    "crates/blaze-cargo/build.rs"
+  ],
+  "what": "## dedyn: crates/blaze-cargo/src/serve.rs: the daemon runs on `blaze_core::Native`, no per-target branches (user's call, 2026-10-29)\n\n> APPLIED by dedyn 2026-10-29 21:20, with `run` taking `blaze_core::Native` (its one instance; the tests start `Daemon` on `Sim` directly).\n\nNeeds `blaze_core::{Native, native}` from `v2/requests/mem-core.md` \"## dedyn: crates/blaze-core:\n`Driver` is never a trait object\" (apply together). The daemon is already monomorphized\n(`run<D: Driver>`, `Daemon<D: Driver>`); this removes the three `cfg` blocks that each pick a\ndriver. The current last block gives Windows `Threads` instead of its native IOCP driver, and the\nBSD block names `blaze_core::kqueue`, which exists on macOS only. Replace, from\n`    #[cfg(target_os = \"linux\")]` through the closing `}` of the `#[cfg(not(any(..)))]` block\n(the three driver blocks at the end of the function that builds `runner`), with:\n\n```rust\n    let driver = blaze_core::native(std::path::Path::new(\"/\"), threads)\n        .context(\"starting this machine's native driver (io_uring, kqueue or IOCP)\")?;\n    run(driver.confined(confine).scratch(scratch), options, steps, runner)\n```\n\nand after `fn run<D: Driver>(..) { .. }`:\n\n```rust\n#[cfg(not(any(target_os = \"linux\", target_os = \"macos\", windows)))]\ncompile_error!(\"blaze serve runs on a native driver: io_uring (Linux), kqueue (macOS) or IOCP (Windows)\");\n```\n\nFix the doc comment of `fn run`:\nbefore `/// The loop over the platform's driver (io_uring on Linux, kqueue on macOS and the BSDs,`\n       `/// threads elsewhere), its root `/`, until it stops.`\nafter  `/// The loop over this target's native driver ([`blaze_core::Native`]), its root `/`, until`\n       `/// it stops.`\n\nIf `threads` is now used only by `native` on Linux (where it is ignored), it stays: it is also\n`Options`' `threads` field. `run` itself can stay generic over `D` (one instance, `Native`) or\ntake `blaze_core::Native`; keeping `D` lets a test daemon run on `Sim`.\n\n> answered by lane cargo (request 9, again under the new speed bar; this supersedes the earlier\n> \"not written\"): written as `CborBytes<T>` in `crates/blaze-units/src/query.rs`, owned, since\n> `Persist` is `'static` and a borrowed `CborBytes<'a, T>` can't be a query value. Same schema\n> and layout as `Cbor<T>`, so every reader gets the same `CborRef<T>`; `CborBytes::of(ref)`\n> copies the bytes once, `CborBytes::encode` encodes. `StdUnits` (cargo-units, `stdlib.rs`)\n> moves to it: the checks still decode, the re-encode goes. Test\n> `passed_on_bytes_are_the_value_as_written`.\n\n> answered by lane cargo (requests' forward of 10 forbid, 12 data_layout, 7, 10 sha2, dedup\n> blaze-sha256): cargo-std's 10 is in (`crates/blaze-units/src/lib.rs` has\n> `#![forbid(unsafe_code)]`); 12 is in (`stdlib::target::data_layout`); 7 is in (`blaze-source`\n> in blaze-cargo's dependencies); cargo-load-source's 10 is in (`sha2` optional in blaze-units'\n> `query` feature). The blaze-sha256 dedup is applied: `crates/blaze-cargo/build.rs` uses\n> `blaze_sha256::Sha256` and its copy is deleted; `[build-dependencies] blaze-sha256` added.\n> \"From safety-audit\": given to cargo-unsafe (blaze-cargo outside `serve/`) and cargo-inbox\n> (`serve.rs`, `load-cargo`).\n> forwarded to cargo (requests, pass 21; told by tmux).\n\n> checked by lane cargo (speed-runtime-plane's `step_into`, forwarded again 2026-10-29): in\n> place at `serve/plane.rs` `step` (565-570) and `cancel` (485-490), one reused `said` buffer;\n> `outputs` drains it.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedyn: crates/blaze-cargo/src/serve.rs: the daemon runs on `blaze_core::Native`, no per-target branches (user's call, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4085"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "applied by dedyn (serve.rs:230 blaze_core::native, :241 compile_error)"
+    }
+  ]
+}

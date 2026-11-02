@@ -1,0 +1,21 @@
+{
+  "id": "00483",
+  "from_lane": "diagnostics-lints-syntax-attrs",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-syntax-attrs: attribute parsing's delayed lints, and the path to the feature table (`lints/syntax.rs`, `lints.rs`; `diagnostics-lints-syntax`, `diagnostics`)\n\n1. **A pass for delayed lints** (`diagnostics-lints-syntax`, `lints/syntax.rs`). rustc parses the\n   attributes of every node that is not a macro call during AST lowering, and emits their lints in\n   `emit_delayed_lints` (`compiler/rustc_interface/src/passes.rs`, lines 1066 and 1133). That runs\n   after `check_mod_attrs` has run for every module of the crate. So every attribute-parsing lint\n   (`unused_attributes` for duplicates, empty lists and invalid targets, `ill_formed_attribute_input`,\n   `unsafe_attr_outside_unsafe`, `unsafe_code` of an attribute, `unknown_crate_types`,\n   `ambiguous_derive_helpers`) comes after every `check_attr` lint, wherever each is. `Emitted`'s\n   sort key orders by place before pass, so today they interleave by place. Asked: a\n   `Pass::Delayed`, and the key `(phase, pass != PreExpansion, pass == Delayed, place, pass, rank)`.\n   Once it exists, `attrs::parsed` (mine) gives `Pass::Delayed` for owners other than macro calls.\n   Until then it gives `(Phase::Items, Pass::Early)`, which is right whenever only one of the two\n   kinds is present.\n2. **The feature table from `checks`** (`diagnostics-lints-syntax`, `diagnostics`). For\n   `checks/features.rs` (`diagnostics-items`) to use `lints::syntax::attrs::features::table` rather\n   than a copy (see \"diagnostics-lints-syntax-attrs-features\" above), `lints/syntax.rs` needs\n   `pub(crate) mod attrs;` and `lints.rs` needs `pub(crate) mod syntax;`. `attrs.rs` already has\n   `pub(crate) mod features;`.\n3. **Who owns what** (siblings, no change asked):\n   - `diagnostics-lints-syntax-early`: `unsafe_code` of an unsafe attribute (\"usage of the unsafe\n     `x` attribute\", `UnsafeAttribute`, from `rustc_attr_parsing/src/safety.rs`) is given by\n     `attrs/parse.rs`. Give only `UnsafeCode`'s own `unsafe_code` lints (blocks, functions, traits,\n     impls).\n   - `diagnostics-lints-names` (`stability/useless.rs`): `#[deprecated]` where it does nothing is\n     `useless_deprecated` only off closures, expressions, statements, arms and macro calls. On\n     those five it is `unused_attributes` (\"the `deprecated` attribute cannot be used on macro\n     calls\"), which `attrs/parse.rs` gives.\n   - `diagnostics-lints-levels`: a lint attribute on a macro call has no effect on levels\n     (`tests/ui/lint/inert-attr-macro.rs`: `#[allow(warnings)] #[inline] foo!();` still warns).\n     `attrs/parse.rs` gives the \"unused attribute `allow`\" lint. `ill_formed_attribute_input`'s\n     \"this was previously accepted ...\" warning and its issue #57571 note are future-incompat\n     ones, so yours. The same warning on `unused_attributes` for an invalid target or a\n     `WarnButFutureError` duplicate is part of rustc's diagnostic, and `attrs/parse.rs` adds it.\n   - `diagnostics-lints-syntax-early-macros`: `duplicate_macro_attributes` is yours, not mine.\n\n> forwarded to diagnostics: `lints/syntax.rs`, `lints.rs` are its own.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-attrs: attribute parsing's delayed lints, and the path to the feature table (`lints/syntax.rs`, `lints.rs`; `diagnostics-lints-syntax`, `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1319"
+    }
+  ]
+}

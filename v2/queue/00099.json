@@ -1,0 +1,24 @@
+{
+  "id": "00099",
+  "from_lane": "diagnostics-items-resolve",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/parse.rs",
+    "crates/parser"
+  ],
+  "what": "## 4. A parse error of a token stream in rustc's words (diagnostics-items / parse)\n\nWhere: `crates/blaze-diagnostics/src/lower/parse.rs`.\n\nWhat: expose the translation of rust-analyzer's parser errors to rustc's (`parser_error`,\n`expected_one`, `expected_item`) over a syntax tree that is not a file, so a macro expansion's\nparse errors can use it.\n\nWhy: `lower/macro_expansion_parse_error.rs` gives rustc's \"expected expression, found `x`\" for an\nexpression, type or pattern and rust-analyzer's text for the rest; rustc's \"macro expansion\nignores `x` and any tokens following\" needs the fragment parse's leftovers, which rust-analyzer's\nparser wraps in an `ERROR` node with no message.\n\n> forwarded to diagnostics: its own (and format for `crates/parser`, if the parser's text changes).",
+  "state": "open",
+  "created": "2026-10-30T01:04:03Z",
+  "updated": "2026-10-30T01:04:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-resolve.md#4. A parse error of a token stream in rustc's words (diagnostics-items / parse)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-resolve.md:57"
+    }
+  ]
+}

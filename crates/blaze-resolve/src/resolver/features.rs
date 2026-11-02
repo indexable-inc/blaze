@@ -76,6 +76,7 @@ pub enum CompileKind {
 /// The actual discrimination happens with the [`FeaturesFor`] type.
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
+// BTreeSet: grown while resolving and read in order by every `activated_features` call.
 pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>>;
 
 /// Set of all activated features for all packages in the resolve graph.
@@ -279,6 +280,23 @@ impl ResolvedFeatures {
         }
     }
 
+    /// `activated_features` without a `Vec`: the features in place, for a caller that extends
+    /// a buffer of its own. Panics as `activated_features` does when the pair was not resolved.
+    pub fn activated_features_iter(
+        &self,
+        pkg_id: PackageId,
+        features_for: FeaturesFor,
+    ) -> impl Iterator<Item = InternedString> + '_ {
+        let fk = features_for.apply_opts(&self.opts);
+        match self.activated_features.get(&(pkg_id, fk)) {
+            Some(fs) => fs.iter().cloned(),
+            None => panic!(
+                "did not find features for ({pkg_id:?}, {features_for:?}) within activated_features:\n{:#?}",
+                self.activated_features.keys()
+            ),
+        }
+    }
+
     /// Variant of `activated_features` that returns `None` if this is
     /// not a valid `pkg_id/is_build` combination. Used in places which do
     /// not know which packages are activated (like `cargo clean`).
@@ -347,8 +365,8 @@ pub type DiffMap = BTreeMap<PackageFeaturesKey, BTreeSet<InternedString>>;
 ///
 /// [`resolve`]: Self::resolve
 /// [module-level documentation]: crate::resolver::features
-pub struct FeatureResolver<'a> {
-    targets: &'a dyn PackageTargets,
+pub struct FeatureResolver<'a, T> {
+    targets: &'a T,
     /// The platforms to build for, requested by the user.
     requested_targets: &'a [CompileKind],
     resolve: &'a Resolve,
@@ -381,14 +399,14 @@ pub struct FeatureResolver<'a> {
         HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString>>,
 }
 
-impl<'a> FeatureResolver<'a> {
+impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
     /// Runs the resolution algorithm and returns a new [`ResolvedFeatures`]
     /// with the result.
     ///
     /// `member_features` are the workspace members asked for and their features, from
     /// [`super::members_with_features`].
     pub fn resolve(
-        targets: &'a dyn PackageTargets,
+        targets: &'a T,
         resolve: &'a Resolve,
         member_features: &[(&Summary, CliFeatures)],
         requested_targets: &'a [CompileKind],
@@ -685,7 +703,7 @@ impl<'a> FeatureResolver<'a> {
         fn platform_activated(
             dep: &Dependency,
             fk: FeaturesFor,
-            targets: &dyn PackageTargets,
+            targets: &impl PackageTargets,
             requested_targets: &[CompileKind],
         ) -> bool {
             let Some(platform) = dep.platform() else {

@@ -1,0 +1,35 @@
+{
+  "id": "01107",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "crates/proc-macro-srv",
+    "crates/proc-macro-srv-cli",
+    "crates/blaze-macro-wasm",
+    "crates/blaze-wasi",
+    "crates/proc-macro-api",
+    "fuzz/targets",
+    "docs/v2/plan/lanes/dedup.md"
+  ],
+  "what": "dedup asks agreement (Andrew 14:24, one engine per job): proc macros run one way, blaze-macro-eval (compile-time.md change 20; the only engine the build calls, blaze-cargo/src/serve/unit/compile.rs:409). Delete proc-macro-srv, proc-macro-srv-cli, blaze-macro-wasm (wasm host and the native in-process host), blaze-wasi (wasm build scripts, called by nothing), the client half of proc-macro-api (process.rs, legacy_protocol, ProcMacroClient, the server pool in warm.rs), their fuzz targets, and blaze-cargo toolchain/own.rs pin of wasm32-wasip1 std. Keep proc-macro-api kept/bridge/msg. Drops Wasmtime and most duplicate lock versions. Evidence and the full list: docs/v2/plan/lanes/dedup.md, section Proc macros: one engine. Reply done (agreed) or refuse (why). dedup does the edits; root Cargo.toml lines come to you as a separate request.",
+  "state": "applied",
+  "created": "2026-10-30T21:33:51Z",
+  "updated": "2026-10-30T22:21:31Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:33:51Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:31Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "Agreed: blaze-macro-eval is the one proc-macro engine (compile-time.md change 20, the only host the build calls; proc-macro-srv runs rustc-built dylibs, against no-rustc; a second host would be a fallback). Delete as listed in dedup.md. Conditions: (1) a macro blaze-macro-eval cannot run stops with an error naming the macro and crate, never another host; (2) blaze-macro-eval corpus and kept tests keep their own oracle (fixture tests) and still check under rustc after the deletion, send me the crates touched and I run cargo test -p blaze-macro-eval -p proc-macro-api -p blaze-cargo; (3) the sandbox of in-process evaluation (tier/confine) stays the proc-macro sandbox, so docs/cargo.md and docs/no-rustc.md that name the wasm or out-of-process hosts are fixed in the same change (tools/docs.py check); (4) fuzz/ manifests and the root members list updated in the same change so the workspace still loads. Do it between my checks (pgrep check.sh)."
+    }
+  ]
+}

@@ -106,7 +106,7 @@ enum NicheBias {
     End,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutCalculatorError<F> {
     /// An unsized type was found in a location where a sized type was expected.
     ///
@@ -241,11 +241,11 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
     ///
     /// This uses dedicated code instead of [`Self::layout_of_struct_or_enum`], as coroutine
     /// fields may be shared between multiple variants (see the [`coroutine`] module for details).
-    pub fn layout_of_coroutine<'a, F, VariantIdx, FieldIdx, LocalIdx>(
+    pub fn layout_of_coroutine<'a, F, VariantIdx, FieldIdx, LocalIdx, K>(
         &self,
         local_layouts: &IndexSlice<LocalIdx, F>,
         prefix_layouts: IndexVec<FieldIdx, F>,
-        variant_fields: &IndexSlice<VariantIdx, IndexVec<FieldIdx, LocalIdx>>,
+        variant_fields: &IndexSlice<VariantIdx, K>,
         storage_conflicts: &BitMatrix<LocalIdx, LocalIdx>,
         tag_to_layout: impl Fn(Scalar) -> F,
     ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
@@ -254,6 +254,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         VariantIdx: Idx,
         FieldIdx: Idx,
         LocalIdx: Idx,
+        K: Deref<Target = IndexSlice<FieldIdx, LocalIdx>>,
     {
         coroutine::layout(
             self,
@@ -340,10 +341,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         layout
     }
 
-    pub fn layout_of_struct_or_enum<'a, FieldIdx, VariantIdx, F>(
+    pub fn layout_of_struct_or_enum<'a, FieldIdx, VariantIdx, F, V>(
         &self,
         repr: &ReprOptions,
-        variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
+        variants: &IndexSlice<VariantIdx, V>,
         is_enum: bool,
         niche_optimizations: NicheOptimizations,
         discr_range_of_repr: impl Fn(RangeFrom<i128>, RangeToInclusive<u128>) -> (Integer, bool),
@@ -354,6 +355,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         FieldIdx: Idx,
         VariantIdx: Idx,
         F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+        V: Deref<Target = IndexSlice<FieldIdx, F>>,
     {
         let (present_first, present_second) = {
             let mut present_variants = variants.iter_enumerated().filter_map(|(i, v)| {
@@ -394,15 +396,16 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         }
     }
 
-    pub fn layout_of_union<'a, FieldIdx, VariantIdx, F>(
+    pub fn layout_of_union<'a, FieldIdx, VariantIdx, F, V>(
         &self,
         repr: &ReprOptions,
-        variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
+        variants: &IndexSlice<VariantIdx, V>,
     ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
     where
         FieldIdx: Idx,
         VariantIdx: Idx,
         F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+        V: Deref<Target = IndexSlice<FieldIdx, F>>,
     {
         let dl = self.cx.data_layout();
         let mut align = if repr.pack.is_some() { dl.i8_align } else { dl.aggregate_align };
@@ -421,7 +424,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         let mut size = Size::ZERO;
         let only_variant_idx = VariantIdx::new(0);
         let only_variant = &variants[only_variant_idx];
-        for field in only_variant {
+        for field in only_variant.iter() {
             if field.is_unsized() {
                 return Err(LayoutCalculatorError::UnexpectedUnsized(*field));
             }
@@ -530,10 +533,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
     ///
     /// They are the same thing, if you think about it
     /// (Typechecking will reject discriminant-sizing attrs.)
-    fn layout_of_struct<'a, FieldIdx, VariantIdx, F>(
+    fn layout_of_struct<'a, FieldIdx, VariantIdx, F, V>(
         &self,
         repr: &ReprOptions,
-        variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
+        variants: &IndexSlice<VariantIdx, V>,
         variant_idx: VariantIdx,
         is_enum: bool,
         niche_optimizations: NicheOptimizations,
@@ -543,6 +546,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         FieldIdx: Idx,
         VariantIdx: Idx,
         F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+        V: Deref<Target = IndexSlice<FieldIdx, F>>,
     {
         let dl = self.cx.data_layout();
         let v = variant_idx;
@@ -580,10 +584,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         Ok(st)
     }
 
-    fn layout_of_enum<'a, FieldIdx, VariantIdx, F>(
+    fn layout_of_enum<'a, FieldIdx, VariantIdx, F, V>(
         &self,
         repr: &ReprOptions,
-        variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
+        variants: &IndexSlice<VariantIdx, V>,
         discr_range_of_repr: impl Fn(RangeFrom<i128>, RangeToInclusive<u128>) -> (Integer, bool),
         discriminants: impl Iterator<Item = (VariantIdx, u128)>,
     ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
@@ -591,6 +595,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         FieldIdx: Idx,
         VariantIdx: Idx,
         F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+        V: Deref<Target = IndexSlice<FieldIdx, F>>,
     {
         let dl = self.cx.data_layout();
         // bail if the enum has an incoherent repr that cannot be computed
@@ -813,7 +818,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         let mut prefix_align = min_ity.align(dl).abi;
         if repr.c() {
             for fields in variants {
-                for field in fields {
+                for field in fields.iter() {
                     prefix_align = prefix_align.max(field.align.abi);
                 }
             }
@@ -936,7 +941,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             for (field_layouts, layout_variant) in iter::zip(variants, &layout_variants) {
                 // We skip *all* ZST here and later check if we are good in terms of alignment.
                 // This lets us handle some cases involving aligned ZST.
-                let mut fields = iter::zip(field_layouts, &layout_variant.field_offsets)
+                let mut fields = iter::zip(field_layouts.iter(), &layout_variant.field_offsets)
                     .filter(|p| !p.0.is_zst());
                 let (field, offset) = match (fields.next(), fields.next()) {
                     (None, None) => {

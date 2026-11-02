@@ -3,8 +3,8 @@
 program, and the running program must run the new code, applied by blaze-live from the
 daemon's patch.
 
-usage: live_e2e.py          (BLAZE_BIN names the blaze built; blaze and blaze-rustc
-                             are found next to it)
+usage: live_e2e.py          (BLAZE_BIN names the blaze built; blaze is found next
+                             to it)
        LIVE_PROGRAM=live-alloc live_e2e.py
                             the same steps on harness/live-alloc, the program on the nightly's
                             `allocator_api` (a bump arena through `Vec<T, A>` and `Box<T, A>`)

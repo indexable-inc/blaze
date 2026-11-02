@@ -6,6 +6,7 @@
 //! `HostEffect` clauses. Only [`const_call_error`] (and so [`non_const_calls`]) does, in an
 //! environment of its own, so non-const code pays nothing for this.
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId,
@@ -15,7 +16,7 @@ use hir_def::{
     signatures::{FnFlags, FunctionSignature, ImplSignature, TraitFlags, TraitSignature},
 };
 use rustc_type_ir::{BoundConstness, ClauseKind, TypeVisitableExt, TypingMode, inherent::IntoKind};
-use syntax::ast;
+use syntax::view as ast;
 
 use crate::{
     InferenceResult, ParamEnvAndCrate,
@@ -30,13 +31,13 @@ use crate::{
     },
 };
 
-pub fn trait_is_const(db: &dyn HirDatabase, trait_: TraitId) -> bool {
+pub fn trait_is_const(db: &Db, trait_: TraitId) -> bool {
     TraitSignature::of(db, trait_).flags.contains(TraitFlags::CONST)
 }
 
 /// Whether a trait impl is a `const impl` of a `const trait`, or an inherent impl is a
 /// `const impl`.
-pub fn impl_is_const(db: &dyn HirDatabase, impl_: AnyImplId) -> bool {
+pub fn impl_is_const(db: &Db, impl_: AnyImplId) -> bool {
     match impl_ {
         AnyImplId::ImplId(impl_) => {
             ImplSignature::of(db, impl_).is_const()
@@ -55,7 +56,7 @@ pub fn impl_is_const(db: &dyn HirDatabase, impl_: AnyImplId) -> bool {
 
 /// Whether `func` is (conditionally) const: a `const fn`, or a method of a `const trait` or of a
 /// `const impl`.
-pub fn fn_is_const(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn fn_is_const(db: &Db, func: FunctionId) -> bool {
     match func.lookup(db).container {
         ItemContainerId::TraitId(trait_) => trait_is_const(db, trait_),
         ItemContainerId::ImplId(impl_) if db.impl_trait(impl_).is_some() => {
@@ -67,28 +68,32 @@ pub fn fn_is_const(db: &dyn HirDatabase, func: FunctionId) -> bool {
 }
 
 /// Whether the closure is a `const` closure.
-pub fn closure_is_const(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> bool {
+pub fn closure_is_const(db: &Db, closure: InternedClosureId<'_>) -> bool {
     let InternedClosure { owner, expr, .. } = closure.loc(db);
     closure_expr_is_const(db, owner.expression_store_owner(db), expr)
 }
 
 fn closure_expr_is_const(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: ExpressionStoreOwnerId,
     expr: ExprId,
 ) -> bool {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner);
     let Ok(source) = source_map.expr_syntax(expr) else { return false };
-    let root = source.file_id.parse_or_expand(db);
-    match source.value.to_node(&root) {
-        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),
-        _ => false,
+    // The span of an expression in parentheses is the parentheses' (as rustc's).
+    let Either::Left(mut syntax) = source.value.to_view(source.file_id.root(db)) else {
+        return false;
+    };
+    while let ast::Expr::ParenExpr(paren) = &syntax {
+        let Some(inner) = paren.expr() else { return false };
+        syntax = inner;
     }
+    matches!(syntax, ast::Expr::ClosureExpr(closure) if closure.const_token().is_some())
 }
 
 /// rustc's `is_conditionally_const`: whether `def` can be used in a const context, given that its
 /// [`crate::lower::const_conditions`] hold const.
-pub(crate) fn is_conditionally_const(db: &dyn HirDatabase, def: GenericDefId) -> bool {
+pub(crate) fn is_conditionally_const(db: &Db, def: GenericDefId) -> bool {
     match def {
         GenericDefId::FunctionId(func) => fn_is_const(db, func),
         GenericDefId::ImplId(impl_) => impl_is_const(db, impl_.into()),
@@ -118,14 +123,15 @@ pub(crate) fn effect_trait_refs<'db>(
 /// The `[const]` conditions of a `#[derive_const]` impl: `T: [const] Trait` for each of the
 /// type's parameters, as rustc's derive writes them.
 pub(crate) fn builtin_derive_const_conditions<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_: hir_def::BuiltinDeriveImplId,
 ) -> Vec<Binder<'db, TraitRef<'db>>> {
     if !impl_is_const(db, impl_.into()) {
-        return Vec::new();
+        return Vec::new(); // alloc: empty
     }
     let loc = impl_.loc(db);
     let interner = DbInterner::new_with(db, loc.module(db).krate(db));
+    // alloc: empty
     let Some(trait_) = loc.trait_.get_id(interner.lang_items()) else { return Vec::new() };
     crate::builtin_derive::predicates(db, impl_)
         .all_predicates()
@@ -140,12 +146,13 @@ pub(crate) fn builtin_derive_const_conditions<'db>(
                 _ => None,
             }
         })
+        // alloc: only `#[derive_const]` impls, a nightly feature; the solver takes a `Vec`
         .collect()
 }
 
 /// How const a body is: `Const` for constants and statics, `Maybe` for const fns (const exactly
 /// when their `[const]` bounds are), `None` when it is not const.
-pub fn body_constness(db: &dyn HirDatabase, def: DefWithBodyId) -> Option<BoundConstness> {
+pub fn body_constness(db: &Db, def: DefWithBodyId) -> Option<BoundConstness> {
     match def {
         DefWithBodyId::FunctionId(func) => fn_is_const(db, func).then_some(BoundConstness::Maybe),
         DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => {
@@ -156,14 +163,14 @@ pub fn body_constness(db: &dyn HirDatabase, def: DefWithBodyId) -> Option<BoundC
 
 /// The environment const calls in `def` are proven in: its where-clauses, and its `[const]`
 /// bounds as `HostEffect(Maybe)` clauses.
-pub fn const_param_env<'db>(db: &'db dyn HirDatabase, def: GenericDefId) -> ParamEnvAndCrate<'db> {
+pub fn const_param_env<'db>(db: &'db Db, def: GenericDefId) -> ParamEnvAndCrate<'db> {
     let krate = def.module(db).krate(db);
     let clauses = const_param_env_query(db, def).as_ref();
     ParamEnvAndCrate { param_env: ParamEnv { clauses }, krate }
 }
 
-#[salsa::tracked(returns(ref))]
-fn const_param_env_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredClauses {
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+fn const_param_env_query(db: &Db, def: GenericDefId) -> StoredClauses {
     let interner = DbInterner::new_with(db, def.module(db).krate(db));
     let env = crate::lower::trait_environment(db, def);
     let conditions = crate::lower::const_conditions(db, def).skip_binder();
@@ -190,7 +197,7 @@ pub enum NonConst<'db> {
 /// Why calling `callee` with `args` in a body of `constness` with environment `env` (see
 /// [`const_param_env`]) is not const, or `None` when it is.
 pub fn const_call_error<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     constness: BoundConstness,
     callee: FunctionId,
@@ -213,7 +220,7 @@ pub fn const_call_error<'db>(
         Some(fn_trait) => {
             fn_trait_condition = [Binder::dummy(TraitRef::identity(interner, fn_trait.into()))
                 .to_host_effect_clause(interner, BoundConstness::Maybe)];
-            EarlyBinder::bind(&fn_trait_condition[..])
+            EarlyBinder::bind_iter(&fn_trait_condition[..])
         }
         None if !fn_is_const(db, callee) => return Some(NonConst::Fn(callee)),
         None => crate::lower::const_conditions(db, callee.into()),
@@ -238,17 +245,17 @@ pub fn const_call_error<'db>(
         );
         !infcx.predicate_must_hold_modulo_regions(&obligation)
     })
-    .collect();
+    .collect(); // alloc: error path, empty (no allocation) unless a bound does not hold
     (!unsatisfied.is_empty()).then_some(NonConst::Unsatisfied(callee, unsatisfied))
 }
 
 /// The calls in `def`'s body that are not const, when the body is const. Bodies of closures that
 /// are not `const` are skipped (making such a closure is fine, calling it is not).
 pub fn non_const_calls<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: DefWithBodyId,
 ) -> Vec<(ExprId, NonConst<'db>)> {
-    let Some(constness) = body_constness(db, def) else { return Vec::new() };
+    let Some(constness) = body_constness(db, def) else { return Vec::new() }; // alloc: empty
     let mut walk = Walk {
         db,
         owner: def.into(),
@@ -256,14 +263,14 @@ pub fn non_const_calls<'db>(
         infer: InferenceResult::of(db, def),
         env: const_param_env(db, def.generic_def(db)),
         constness,
-        found: Vec::new(),
+        found: Vec::new(), // alloc: error path, pushed only for a call that is not const
     };
     walk.expr(walk.body.root_expr());
     walk.found
 }
 
 struct Walk<'a, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: ExpressionStoreOwnerId,
     body: &'db Body,
     infer: &'a InferenceResult<'db>,
@@ -274,14 +281,14 @@ struct Walk<'a, 'db> {
 
 impl Walk<'_, '_> {
     fn expr(&mut self, expr: ExprId) {
-        match &self.body[expr] {
+        match self.body.expr(expr) {
             Expr::Closure { body, .. } => {
                 if closure_expr_is_const(self.db, self.owner, expr) {
-                    self.expr(*body);
+                    self.expr(body);
                 }
                 return;
             }
-            Expr::Call { callee, .. } => self.call(expr, Some(*callee)),
+            Expr::Call { callee, .. } => self.call(expr, Some(callee)),
             Expr::MethodCall { .. }
             | Expr::BinaryOp { .. }
             | Expr::UnaryOp { .. }
@@ -305,6 +312,7 @@ impl Walk<'_, '_> {
                 }
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
+                        let args = args.no_bound_vars().unwrap();
                         const_call_error(self.db, self.env, self.constness, func, args)
                     }
                     crate::CallableDefId::StructId(_) | crate::CallableDefId::EnumVariantId(_) => {
@@ -319,6 +327,6 @@ impl Walk<'_, '_> {
 }
 
 /// Whether an ADT's `Drop` impl is a `const impl`.
-pub(crate) fn destructor_is_const(db: &dyn HirDatabase, adt: AdtId) -> Option<bool> {
+pub(crate) fn destructor_is_const(db: &Db, adt: AdtId) -> Option<bool> {
     crate::drop::destructor(db, adt).map(|impl_: ImplId| impl_is_const(db, impl_.into()))
 }

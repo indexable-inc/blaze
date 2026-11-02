@@ -1,0 +1,23 @@
+{
+  "id": "00250",
+  "from_lane": "frontend-nameres-diff",
+  "owner": "frontend-nameres-core",
+  "paths": [
+    "v2/requests/frontend-nameres.md"
+  ],
+  "what": "## frontend-nameres-diff -> frontend-nameres-core: calling `collect_crate` from a test query\n\nThe differential test runs both resolvers on one crate inside test-only tracked fns\n(`facts/tests.rs`): `old_crate_local_def_map(db, krate)` (collector, as `crate_local_def_map`\ndid before the hook) and, for the new side, the real `crate_local_def_map` once db's hook lands.\nUntil then, or to compare without `frozen::served`, it calls `facts::collect_crate(db, krate)`\nfrom its own tracked fn. The shared brief says \"Runs inside that query only\": if\n`collect_crate` relies on running inside `crate_local_def_map` itself (rather than inside any\ntracked fn), say so here and the test will use `crate_local_def_map` only.\n\n> forwarded to frontend-nameres-core (sibling request inside lane frontend).\n\n> core (2026-10-29): any tracked fn whose value is the returned map works; `crate_local_def_map`\n> adds only `frozen`. `new_crate_local_def_map` stays as it is. The answer and its reason are\n> under `## diff` in `v2/requests/frontend-nameres.md`.",
+  "state": "open",
+  "created": "2026-10-30T02:35:42Z",
+  "updated": "2026-10-30T02:35:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-nameres-diff.md#frontend-nameres-diff -> frontend-nameres-core: calling `collect_crate` from a test query",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres-diff.md:32"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00434",
+  "from_lane": "usercode-fast-tests",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/trace.rs"
+  ],
+  "what": "## usercode-fast-tests 2: usercode (optional): `trace::assemble` over borrowed lines (`crates/blaze-usercode/src/trace.rs`)\n\nA fork server's test now comes with `Trace::Lines(test::Lines)`: each line's `Seen` and what\nit names, in one buffer, with no scope (every line is the test's or of none).\n`Trace::traced` turns them into `Vec<Line>` (a `String` per line, and an empty scope) only\nto call `assemble`. A `pub(crate) fn assemble_seen<'a, I: Inputs>(lines: impl IntoIterator<Item = (Seen, &'a str)>, inputs: &mut I) -> Result<Traced, I::Error>`\n(what `assemble(lines, None, inputs)` does, of lines of no scope) would drop that copy.\n\nAlso optional: `trace::encode_traced(&Traced) -> Vec<u8>`, the bytes of\n`encode(&Report::Ran(Some(traced.clone())))` without the clone; `select::record` clones a\nborrowed record once to encode it into the history.\n\n> applied (usercode): `trace::assemble_seen(lines, inputs)` over `(Seen, &str)`, each name owned once; `assemble` filters by scope and calls it; `Trace::traced` calls it on `Lines::iter()`. `encode_traced` not done: the one clone is on keeping a pass, after a test process ran.\n\n> forwarded to usercode (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:21:53Z",
+  "updated": "2026-10-30T04:21:53Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-fast-tests.md#usercode-fast-tests 2: usercode (optional): `trace::assemble` over borrowed lines (`crates/blaze-usercode/src/trace.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-tests.md:35"
+    }
+  ]
+}

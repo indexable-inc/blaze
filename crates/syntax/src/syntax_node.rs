@@ -6,16 +6,11 @@
 //! The *real* implementation is in the (language-agnostic) `syntax-tree` crate, this
 //! module just wraps its API.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
-use syntax_tree::{GreenNodeBuilder, Language};
+use syntax_tree::{FlatTree, FlatTreeBuilder, Language, Text};
 
-use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
-
-pub(crate) use syntax_tree::{GreenNode, GreenToken, NodeOrToken};
+use crate::{Parse, SyntaxError, SyntaxKind, TextRange, TextSize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RustLanguage {}
@@ -38,97 +33,99 @@ pub type SyntaxNodeChildren = syntax_tree::SyntaxNodeChildren<RustLanguage>;
 pub type SyntaxElementChildren = syntax_tree::SyntaxElementChildren<RustLanguage>;
 pub type PreorderWithTokens = syntax_tree::api::PreorderWithTokens<RustLanguage>;
 
-/// The tree of a parse: green, or flat when nobody edits it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Tree {
-    Green(GreenNode),
-    Flat(Arc<syntax_tree::FlatTree>),
-}
+/// The tree of a parse, flat: every tree is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Tree(Arc<FlatTree>);
 
 impl Tree {
+    pub fn new(tree: Arc<FlatTree>) -> Tree {
+        Tree(tree)
+    }
+
     pub fn root(&self) -> SyntaxNode {
-        match self {
-            Tree::Green(green) => SyntaxNode::new_root(green.clone()),
-            Tree::Flat(tree) => SyntaxNode::new_flat_root(tree.clone()),
-        }
+        SyntaxNode::new_flat_root(Arc::clone(&self.0)) // clone: a handle root's count; goes with the handles
     }
 
-    pub fn into_green(self) -> GreenNode {
-        match self {
-            Tree::Green(green) => green,
-            Tree::Flat(_) => self.root().green().to_owned(),
-        }
+    pub fn flat(&self) -> &Arc<FlatTree> {
+        &self.0
     }
-}
 
-static GREEN_TREES: AtomicBool = AtomicBool::new(false);
-
-/// Whether parses make green trees, which edit cheaply, instead of flat ones, which are
-/// made and walked cheaply. Flat unless asked for green.
-pub fn set_green_trees(green: bool) {
-    GREEN_TREES.store(green, Ordering::Relaxed);
-}
-
-enum Builder {
-    Green(GreenNodeBuilder<'static>),
-    Flat(syntax_tree::FlatTreeBuilder),
+    /// The tree, when this is the last count of it.
+    pub(crate) fn into_unique(self) -> Option<FlatTree> {
+        Arc::into_inner(self.0)
+    }
 }
 
 pub struct SyntaxTreeBuilder {
     errors: Vec<SyntaxError>,
-    inner: Builder,
+    inner: FlatTreeBuilder,
+    lazy: bool,
 }
 
 impl Default for SyntaxTreeBuilder {
+    /// A builder that keeps the text its tokens are given, for trees not parsed from one text
+    /// (macro expansions).
     fn default() -> SyntaxTreeBuilder {
-        let inner = match GREEN_TREES.load(Ordering::Relaxed) {
-            true => Builder::Green(GreenNodeBuilder::new()),
-            false => Builder::Flat(syntax_tree::FlatTreeBuilder::new()),
-        };
-        SyntaxTreeBuilder { errors: Vec::new(), inner }
+        // alloc: `Vec::new` allocates nothing until an error is pushed
+        SyntaxTreeBuilder { errors: Vec::new(), inner: FlatTreeBuilder::new(), lazy: false }
     }
 }
 
 impl SyntaxTreeBuilder {
-    pub(crate) fn finish_raw(self) -> (Tree, Vec<SyntaxError>) {
-        let tree = match self.inner {
-            Builder::Green(it) => Tree::Green(it.finish()),
-            Builder::Flat(it) => Tree::Flat(Arc::new(it.finish())),
-        };
-        (tree, self.errors)
+    /// A builder whose tokens are consecutive slices of `range` of `source`, which the tree shares.
+    pub(crate) fn sourced_range(source: Text, range: TextRange) -> SyntaxTreeBuilder {
+        SyntaxTreeBuilder {
+            errors: Vec::new(), // alloc: `Vec::new` allocates nothing until an error is pushed
+            inner: FlatTreeBuilder::sourced_range(source, range),
+            lazy: false,
+        }
+    }
+
+    /// The tree and the errors given; a tree with lazy nodes expands them with
+    /// [`crate::parsing::expand_lazy`] in `edition`.
+    pub(crate) fn finish_raw(mut self, edition: parser::Edition) -> (FlatTree, Vec<SyntaxError>) {
+        if self.lazy {
+            self.inner.expand_with(crate::parsing::expand_lazy, edition as u32);
+        }
+        (self.inner.finish(), self.errors)
     }
 
     pub fn finish(self) -> Parse<SyntaxNode> {
-        let (tree, errors) = self.finish_raw();
+        self.finish_as()
+    }
+
+    /// [`SyntaxTreeBuilder::finish`] tagged [`crate::view::Untyped`], read through views.
+    pub fn finish_view(self) -> Parse<crate::view::Untyped> {
+        self.finish_as()
+    }
+
+    fn finish_as<T>(self) -> Parse<T> {
+        let (tree, errors) = self.finish_raw(parser::Edition::CURRENT);
+        let tree = Tree(Arc::new(tree)); // alloc: the tree's one shared box, once per parse
         // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357
         #[allow(clippy::overly_complex_bool_expr)]
         if cfg!(debug_assertions) && false {
-            crate::validation::validate_block_structure(&tree.root());
+            crate::validation::validate_block_structure(crate::view::Node::root(tree.flat()));
         }
         Parse::new(tree, errors)
     }
 
     pub fn token(&mut self, kind: SyntaxKind, text: &str) {
-        let kind = RustLanguage::kind_to_raw(kind);
-        match &mut self.inner {
-            Builder::Green(it) => it.token(kind, text),
-            Builder::Flat(it) => it.token(kind, text),
-        }
+        self.inner.token(RustLanguage::kind_to_raw(kind), text);
     }
 
     pub fn start_node(&mut self, kind: SyntaxKind) {
-        let kind = RustLanguage::kind_to_raw(kind);
-        match &mut self.inner {
-            Builder::Green(it) => it.start_node(kind),
-            Builder::Flat(it) => it.start_node(kind),
-        }
+        self.inner.start_node(RustLanguage::kind_to_raw(kind));
+    }
+
+    /// The source's next `len` bytes as one lazy node of `kind`, for a sourced builder.
+    pub(crate) fn lazy(&mut self, kind: SyntaxKind, len: TextSize) {
+        self.lazy = true;
+        self.inner.lazy(RustLanguage::kind_to_raw(kind), len.into());
     }
 
     pub fn finish_node(&mut self) {
-        match &mut self.inner {
-            Builder::Green(it) => it.finish_node(),
-            Builder::Flat(it) => it.finish_node(),
-        }
+        self.inner.finish_node();
     }
 
     pub fn error(&mut self, error: String, text_pos: TextSize) {

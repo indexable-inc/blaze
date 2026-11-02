@@ -1,0 +1,39 @@
+{
+  "id": "00463",
+  "from_lane": "db-ty",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/mir.rs",
+    "crates/hir-ty/src/mir",
+    "docs/v2/plan/reference/crates.md",
+    "docs/v2/plan/design/data.md",
+    "crates/hir-ty-mir"
+  ],
+  "what": "## 10. Coordinator: MIR's layout belongs to codegen\n\nWhat: move `crates/hir-ty/src/mir.rs` and `crates/hir-ty/src/mir/` (the MIR types) from db to\ncodegen in `docs/v2/plan/reference/crates.md`.\nWhy: `docs/v2/plan/design/data.md` gives MIR's columnar layout (locals as columns, blocks as ranges,\nstatements as tag and data, places as base plus CSR projections) to codegen, which builds and\nreads every `MirBody` in `crates/hir-ty-mir`. The types sit in hir-ty only because borrowck and\nconst eval read them; whoever changes the layout changes all their constructors. Until it moves,\ndb-ty does not change MIR's layout.\n\n> forwarded to coordinator: an ownership change in `docs/v2/plan/reference/crates.md`, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T08:30:54Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/db-ty.md#10. Coordinator: MIR's layout belongs to codegen",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:130"
+    },
+    {
+      "at": "2026-10-30T08:30:54Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:54Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/reference/crates.md: crates/hir-ty/src/mir.rs and mir/ moved from db to codegen (codegen row lists them; db row says hir-ty but items and codegen files; the hir-ty row of what v2 does names codegen for the MIR layout), per data.md MIR row."
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "01325",
+  "from_lane": "coordinator",
+  "owner": "compile-time-sched",
+  "paths": [
+    "crates/blaze-cargo/src/serve/job.rs",
+    "crates/blaze-cargo/src/serve/plane.rs",
+    "crates/blaze-cargo/src/serve/unit.rs"
+  ],
+  "what": "Split serve job.rs unit compile into its own plane nodes (names, bodies, codegen, store, link), each timed by the work it really does (no synthetic split), for units as well as lone requests, so Worked.steps_us / timeline-us shows where newfn 16 s goes. Coordinate with no-fallback-link-cargo (01287, 01169 daemon.rs half) on serve/job.rs and plane.rs.",
+  "state": "applied",
+  "created": "2026-10-31T17:07:09Z",
+  "updated": "2026-10-31T17:27:30Z",
+  "taken_by": "compile-time-sched",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T17:07:09Z",
+      "by": "coord",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:12:04Z",
+      "by": "compile-time-sched",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T17:27:30Z",
+      "by": "compile-time-sched",
+      "action": "done",
+      "note": "edits ready, unbuilt (ra clean): a unit is a node per Phase (names, bodies, codegen, link, store; checks_only: names, bodies, store) in serve/job.rs build(), kinds UNIT_NAMES/UNIT_BODIES/COMPILE/UNIT_LINK/UNIT_STORE (program: PROGRAM/PROGRAM_LINK via push_program) in blaze-graph admission.rs; phase state in unit/compile.rs Phases; check runs as the bodies node beside codegen (checks.rs beside/alongside gone); codegen::Parts for the link. Lone requests were already one phase each (lower = names, answer = bodies). Loop-side Store::put still timed by no node. Notes: docs/v2/plan/lanes/compile-time-sched/notes.md. History keys change (program_key domain 2)."
+    }
+  ]
+}

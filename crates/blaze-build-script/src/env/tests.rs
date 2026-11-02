@@ -2,6 +2,11 @@
 //! and `build_script_env.rs` in rust-lang/cargo at 5f94df478, MIT or Apache-2.0), ported to
 //! the description they are run from. Each names the test it comes from.
 
+use std::collections::BTreeMap;
+
+use blaze_hash::HashSet;
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::unit::{ConfigEnv, Dependency, DylibSearch, Package, Profile, Target, Tools};
 
@@ -168,7 +173,7 @@ fn metadata_of_dependencies() {
     assert_eq!(var(&env, "CARGO_MANIFEST_LINKS"), Some("a.b-c"));
     assert_eq!(var(&env, "DEP_FOO_FOO"), Some("bar"));
     assert_eq!(var(&env, "DEP_FOO_BAR_BAZ"), Some("baz"));
-    assert!(!env.vars.keys().any(|it| it.to_str().unwrap().contains("_X")));
+    assert!(!env.vars.iter().any(|(it, _)| it.to_str().unwrap().contains("_X")));
     assert_eq!(envify("a.b-c"), "A.B_C");
 }
 
@@ -243,6 +248,101 @@ fn config_env() {
     assert_eq!(var(&env, "CARGO_PKG_NAME"), Some("bar"));
     assert_eq!(var(&env, "TARGET"), Some("x86_64-unknown-linux-gnu"));
     assert_eq!(var(&env, "RUSTFLAGS"), None);
+}
+
+/// What cargo sets from the unit and what it passes through of its own environment (#805),
+/// which together are what the script sees.
+#[test]
+fn set_from_the_unit_or_passed_through() {
+    let mut unit = bar();
+    unit.package.links = Some("bar".into());
+    unit.dependencies = vec![Dependency {
+        name: "a".into(),
+        links: Some("foo".into()),
+        metadata: vec![("root".into(), "/x".into())],
+    }];
+    unit.config_env = vec![
+        ConfigEnv { name: "FROM_CONFIG".into(), value: "1".into(), force: false },
+        ConfigEnv { name: "HOME".into(), value: "/config-home".into(), force: false },
+        ConfigEnv { name: "USER".into(), value: "forced".into(), force: true },
+    ];
+    unit.tools.rustc_wrapper = Some("/wrap".into());
+    let inherited = os(&[
+        ("PATH", "/bin"),
+        ("HOME", "/home/me"),
+        ("USER", "me"),
+        ("CC", "clang"),
+        ("TARGET", "from-the-shell"),
+        ("RUSTFLAGS", "-Cfoo"),
+        ("LD_LIBRARY_PATH", "/opt/lib"),
+    ]);
+    let env = env(&unit, &inherited).unwrap();
+    let origin = |name: &str| env.origin(OsStr::new(name));
+    for name in [
+        "TARGET",
+        "HOST",
+        "OUT_DIR",
+        "NUM_JOBS",
+        "PROFILE",
+        "OPT_LEVEL",
+        "DEBUG",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "CARGO",
+        "CARGO_MANIFEST_DIR",
+        "CARGO_MANIFEST_LINKS",
+        "CARGO_PKG_NAME",
+        "CARGO_FEATURE_FOO",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "DEP_FOO_ROOT",
+        "FROM_CONFIG",
+        "USER",
+        "LD_LIBRARY_PATH",
+    ] {
+        assert_eq!(origin(name), Some(Origin::Unit), "{name}");
+    }
+    for name in ["PATH", "HOME", "CC"] {
+        assert_eq!(origin(name), Some(Origin::PassedThrough), "{name}");
+    }
+    assert_eq!(origin("RUSTFLAGS"), None, "taken away");
+    assert_eq!(origin("NOT_SET"), None);
+    assert_eq!(var(&env, "TARGET"), Some("x86_64-unknown-linux-gnu"), "the unit's wins");
+
+    let passed: Vec<_> = env.passed_through().map(|(name, _)| name.to_str().unwrap()).collect();
+    assert_eq!(passed, ["CC", "HOME", "PATH"]);
+    let set: BTreeMap<_, _> = env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
+    let mut whole = set.clone();
+    whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
+    assert_eq!(
+        whole.into_iter().collect::<Vec<_>>(),
+        env.vars,
+        "the two make the whole environment"
+    );
+    assert_eq!(
+        set.len(),
+        env.from_unit.iter().filter(|it| **it).count(),
+        "every name set from the unit is in the environment"
+    );
+    let in_order: Vec<&OsStr> = env.set_from_unit().map(|(name, _)| name).collect();
+    assert!(in_order.windows(2).all(|it| it[0] < it[1]), "set from the unit in name order");
+    assert!(in_order.iter().all(|name| env.origin(name) == Some(Origin::Unit)));
+
+    // The same unit from another shell: what is set from the unit is the same.
+    let other = super::env(&unit, &os(&[("PATH", "/nix/bin:/bin"), ("HOME", "/home/me")])).unwrap();
+    let other_set: BTreeMap<_, _> =
+        other.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
+    // The dynamic library path keeps what cargo's environment had of it after the unit's.
+    fn without_dylib<'a>(it: &BTreeMap<&'a OsStr, &'a OsStr>) -> BTreeMap<&'a OsStr, &'a OsStr> {
+        let mut it = it.clone();
+        it.remove(OsStr::new("LD_LIBRARY_PATH"));
+        it
+    }
+    let set: BTreeMap<&OsStr, &OsStr> = set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
+    let other_set: BTreeMap<&OsStr, &OsStr> =
+        other_set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
+    assert_eq!(without_dylib(&set), without_dylib(&other_set));
 }
 
 /// `build_script_with_dynamic_native_dependency` and
@@ -339,6 +439,54 @@ fn jobserver_and_versions() {
     assert_eq!(var(&env, "CARGO_PKG_AUTHORS"), Some("a:b <b@x>"));
 }
 
+/// What cargo always gives a script is never guessed: an empty field, a version that is not
+/// semver's, a cfg not as rustc prints it each stop the run, naming what and whose.
+#[test]
+fn a_value_missing_is_an_error() {
+    let refused = |unit: &Unit| -> Error { env(unit, &[]).unwrap_err() };
+    let cases: [(&'static str, fn(&mut Unit)); 9] = [
+        ("TARGET", |it| it.target.clear()),
+        ("HOST", |it| it.host.clear()),
+        ("OUT_DIR", |it| it.out_dir = PathBuf::new()),
+        ("RUSTC", |it| it.tools.rustc = PathBuf::new()),
+        ("RUSTDOC", |it| it.tools.rustdoc = PathBuf::new()),
+        ("CARGO", |it| it.tools.cargo = PathBuf::new()),
+        ("the script's executable", |it| it.script = PathBuf::new()),
+        ("OPT_LEVEL", |it| it.profile.opt_level.clear()),
+        ("CARGO_MANIFEST_DIR", |it| it.package.manifest_dir = PathBuf::new()),
+    ];
+    for (field, empty) in cases {
+        let mut unit = bar();
+        empty(&mut unit);
+        let want = crate::unit::Unfilled::Empty { package: "bar v0.5.0".into(), field };
+        assert_eq!(unit.check(), Err(want.clone()), "{field}");
+        assert_eq!(refused(&unit), Error::from(want), "{field}");
+    }
+    for version in ["7", "1.2", "1.2.3.4", "1..3", "a.b.c", "1.2.x-pre"] {
+        let mut unit = bar();
+        unit.package.version = version.into();
+        let want = crate::unit::Unfilled::Version {
+            package: format!("bar v{version}"),
+            version: version.into(),
+        };
+        assert_eq!(refused(&unit), Error::from(want), "{version}");
+    }
+    let mut unit = bar();
+    unit.target_cfgs.push("target_os=linux".into());
+    let want = crate::unit::Unfilled::Cfg { package: "bar v0.5.0".into(), line: "target_os=linux".into() };
+    assert_eq!(refused(&unit), Error::from(want));
+}
+
+/// A toolchain with no library directory of its own adds none, and no empty entry, which the
+/// loader would read as the working directory.
+#[test]
+fn no_sysroot_library_directory_adds_none() {
+    let mut unit = bar();
+    unit.dylib_search.sysroot_libdir = PathBuf::new();
+    let env = env(&unit, &[]).unwrap();
+    assert_eq!(var(&env, "LD_LIBRARY_PATH"), Some("/p/foo/target/debug:/p/foo/target/debug/deps"));
+}
+
 /// cargo on Linux gives its scripts the certificates libgit2 found for it (found by
 /// harness/scripts.py on dev-aws-8, where cargo's scripts had `SSL_CERT_FILE` and
 /// `SSL_CERT_DIR` and blaze's did not).
@@ -379,3 +527,156 @@ fn certificates_libgit2_finds() {
         );
     }
 }
+
+/// The environment sorted once against the one built before it ([`reference::env`]: a hash
+/// map applied to a `BTreeMap`), over seeded units: features and cfgs named again, emptied
+/// and not ASCII, `[env]` over what cargo sets and inherits, wrappers set and taken away,
+/// dependencies' metadata, each host's dynamic library path, and an inherited environment
+/// with a name twice. The same variables in the same order, the same set from the unit.
+#[test]
+fn the_sorted_environment_is_the_one_built_before() {
+    let names = [
+        "PATH",
+        "HOME",
+        "TARGET",
+        "RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "LD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "CC",
+        "CARGO_PKG_NAME",
+        "CARGO_FEATURE_FOO",
+        "CARGO_CFG_UNIX",
+        "A",
+        "AB",
+        "ABCDEFGH",
+        "ABCDEFGHI",
+        "ABCDEFGH_",
+        "FOO",
+    ];
+    let values = ["", "/bin", "/opt/lib:/x", "x", "\u{e9}t\u{e9}"];
+    let features = ["foo", "other-feature", "\u{fc}n\u{ef}", "a-b-c", "FOO", "\u{df}"];
+    let cfgs = [
+        "unix",
+        "debug_assertions",
+        "target_os=\"linux\"",
+        "target_feature=\"sse\"",
+        "target_feature=\"sse2\"",
+        "panic = \"unwind\"",
+        "my_cfg",
+        "my_cfg=\"a\"",
+        "feature=\"x\"",
+        "feature",
+        "debug_assertions=\"x\"",
+        "my-cfg=\"\u{e9}\"",
+    ];
+    let hosts = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
+    let mut rng = SplitMix64::new(0x6a09_e667_f3bc_c908);
+    for _ in 0..4_000 {
+        let mut unit = bar();
+        unit.host = hosts[rng.index(hosts.len())].into();
+        unit.features = (0..rng.index(4)).map(|_| features[rng.index(features.len())].to_owned()).collect();
+        unit.target_cfgs = (0..rng.index(14)).map(|_| cfgs[rng.index(cfgs.len())].to_owned()).collect();
+        unit.profile.debug_assertions = rng.index(2) == 0;
+        unit.profile.debuginfo = rng.index(2) == 0;
+        unit.profile.release = rng.index(2) == 0;
+        unit.jobs = [0, 1, 8, 10, u32::MAX][rng.index(5)];
+        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/tmp/j".to_owned());
+        unit.workspace_member = rng.index(2) == 0;
+        unit.tools.rustc_wrapper = (rng.index(2) == 0).then(|| "/wrap".into());
+        unit.tools.rustc_workspace_wrapper = (rng.index(2) == 0).then(|| "/ww".into());
+        unit.tools.linker = (rng.index(3) == 0).then(|| "/ld".into());
+        unit.package.links = (rng.index(2) == 0).then(|| "a.b-c".to_owned());
+        unit.package.description = (rng.index(2) == 0).then(|| "d".to_owned());
+        unit.package.authors = (0..rng.index(3)).map(|it| format!("a{it}")).collect();
+        unit.package.version = ["0.5.0", "1.2.3-pre+b", "7"][rng.index(3)].to_owned();
+        unit.rustflags = (0..rng.index(3)).map(|it| format!("-C{it}")).collect();
+        unit.dependencies = (0..rng.index(3))
+            .map(|it| Dependency {
+                name: format!("d{it}"),
+                links: [None, Some("foo"), Some("a.b-c")][rng.index(3)].map(str::to_owned),
+                metadata: (0..rng.index(3))
+                    .map(|_| {
+                        let key = ["root", "bar-baz", "\u{e9}"][rng.index(3)].to_owned();
+                        (key, values[rng.index(values.len())].to_owned())
+                    })
+                    .collect(),
+            })
+            .collect();
+        unit.config_env = (0..rng.index(4))
+            .map(|_| ConfigEnv {
+                name: names[rng.index(names.len())].into(),
+                value: values[rng.index(values.len())].into(),
+                force: rng.index(2) == 0,
+            })
+            .collect();
+        if rng.index(3) == 0 {
+            unit.dylib_search.host_root = None;
+        }
+        unit.dylib_search.plugin_search = (0..rng.index(3))
+            .map(|it| match it {
+                0 => "native=/p/foo/target/debug/build/dep-1/out".into(),
+                1 => "/usr/lib".into(),
+                _ => "/p/foo/target/debug/x".into(),
+            })
+            .collect();
+        let mut inherited: Vec<(OsString, OsString)> = (0..rng.index(9))
+            .map(|_| (names[rng.index(names.len())].into(), values[rng.index(values.len())].into()))
+            .collect();
+        // Half the time as a caller that sorts it once passes it: by name, each name once.
+        if rng.index(2) == 0 {
+            inherited.sort_by(|a, b| a.0.cmp(&b.0));
+            inherited.dedup_by(|later, first| later.0 == first.0);
+        }
+        match (env(&unit, &inherited), reference::env(&unit, &inherited)) {
+            (Ok(new), Ok((vars, from_unit))) => {
+                assert_eq!(
+                    new.vars,
+                    vars.into_iter().collect::<Vec<_>>(),
+                    "{unit:?} {inherited:?}"
+                );
+                let set: HashSet<OsString> =
+                    new.set_from_unit().map(|(name, _)| name.to_owned()).collect();
+                assert_eq!(set, from_unit, "{unit:?} {inherited:?}");
+                assert_eq!(new.from_unit.len(), new.vars.len());
+            }
+            (Err(new), Err(old)) => assert_eq!(new, old),
+            (new, old) => panic!("{new:?} against {old:?}"),
+        }
+    }
+}
+
+/// The variables cargo makes from names against `format!` and the old `envify`, and the
+/// decimal of a count against `to_string`.
+#[test]
+fn names_and_numbers_are_made_as_format_made_them() {
+    for name in ["foo", "other-feature", "\u{fc}n\u{ef}-x", "\u{df}", "a.b-c", "", "-"] {
+        let old: String = name
+            .chars()
+            .flat_map(char::to_uppercase)
+            .map(|c| if c == '-' { '_' } else { c })
+            .collect();
+        assert_eq!(envify(name), old);
+        assert_eq!(prefixed("CARGO_FEATURE_", name), format!("CARGO_FEATURE_{old}"));
+    }
+    for n in [0, 1, 9, 10, 99, 100, 4_294_967_295, 1_000_000_007 % u32::MAX] {
+        assert_eq!(decimal(n), n.to_string());
+    }
+}
+
+
+/// Reading a script's environment allocates nothing, for a name it has or not.
+#[test]
+fn lookups_allocate_nothing() {
+    let env = env(&bar(), &os(&[("PATH", "/bin"), ("HOME", "/home/me")])).unwrap();
+    let found = blaze_alloc_count::assert_at_most(0, "environment lookups", || {
+        ["TARGET", "PATH", "CARGO_CFG_UNIX", "NOT_SET", "OUT_DIR"]
+            .into_iter()
+            .filter(|name| env.get(name).is_some() && env.origin(OsStr::new(name)).is_some())
+            .count()
+    });
+    assert_eq!(found, 4);
+}
+
+mod reference;

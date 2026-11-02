@@ -1,0 +1,35 @@
+{
+  "id": "00555",
+  "from_lane": "mem-db-checks-regions",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/regions.rs"
+  ],
+  "what": "## R0. Setup\n\nLines 11-48, the imports. Line 20, before:\n\n```rust\nuse rustc_hash::{FxHashMap, FxHashSet};\n```\n\nafter (`FxHashMap`/`FxHashSet` stay only where a test or an owned value still needs one; once\nevery site below is applied neither is used, and the line goes):\n\n```rust\nuse crate::mem::{self, FMap, FSet, FVec, Frame, filled};\n```\n\nLines 43-48, before:\n\n```rust\nuse super::{\n    Ctx,\n    bitset::BitMatrix,\n    cfg::{Cfg, Location},\n    constraints::Constraints,\n};\n```\n\nafter:\n\n```rust\nuse super::{\n    Ctx,\n    bitset::{BitMatrix, BitSet},\n    cfg::{Cfg, Location},\n    constraints::Constraints,\n};\n```\n\n> forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).\n> applied by db-mem-borrowck-regions (2026-10-29 21:40): both import edits as written; R3's `infer::region_constraints::Constraint` added to the `next_solver` group here too.\n\n### R0.1 What other files call, after this part\n\nThe check.rs sibling (`mem-db-checks-check`, B7) and the parent's B5 call these; told by tmux.\n\n| function | before | after |\n|---|---|---|\n| `build` (712) | `(ctx, body, &Cfg, &FxHashMap<ExprId, (usize, Vec<Requirement>)>) -> Regions<'db>` | `(ctx, body, &Cfg<'_>, &FMap<'_, ExprId, (usize, FVec<'_, Requirement<'db>>)>) -> Regions<'a, 'db>` |\n| `Regions::type_bounds_of` (229) | `-> Vec<Rv>` | `-> impl Iterator<Item = Rv> + '_` (check.rs 2087 drops its `.into_iter()`, B7.7) |\n| `opaque_captures` (293) | `(db, opaque, len) -> Option<Vec<bool>>` | `(frame, db, opaque, len) -> Option<FVec<'f, bool>>`; liveness.rs 812 passes `self.ctx.frame`, polonius.rs 280 `ctx.frame`, check.rs 2166 `self.ctx.frame` |\n| `regions_of` (699) | `(ty, &mut Vec<Rv>)` | `(ty, &mut FVec<'_, Rv>)` (liveness.rs 604/621 pass B5.1's `found: &mut FVec<'_, Rv>`; explain.rs 312 a frame vector) |\n| `outlives_components` (6873) | `(ty, &mut Vec<Rv>, &mut Vec<Ty>)` | `(ty, &mut FVec<'_, Rv>, &mut FVec<'_, Ty<'db>>)` |\n| `alias_components` (6941) | `(ty, &mut Vec<Ty>)` | `(ty, &mut FVec<'_, Ty<'db>>)` |\n| `constraint_path` (7005) | `(&Regions, count, from, to) -> Vec<Outlives>` | `(&Regions<'f, '_>, count, from, to) -> FVec<'f, Outlives>` |\n| `blame`, `blame_with` (7042, 7048) | `(&[Outlives])` | unchanged (a frame vector derefs to the slice) |\n| `normalize` (7075) | `(ctx, ty)` | unchanged signature |\n| `adt_variants` (6858) | `(db, adt) -> Vec<VariantId>` | `(db, adt) -> impl Iterator<Item = VariantId> + '_` (R8.5; names.rs 105 `.get(i).copied()` -> `.nth(i)`, check/parts.rs 267 drops `.into_iter()`) |\n| `path_binding`, `spells_generics`, `alias_def_id`, `rv_of` | | unchanged |\n\n---\n\n> forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:33): in the tree: crates/hir-ty-borrowck/src/regions.rs:706 `build`, 220 `type_bounds_of -> impl Iterator`, 281 `opaque_captures(frame, ..)` (callers liveness.rs:780, polonius.rs:284, check.rs:2403 pass the frame), 693 `regions_of`, 7078 `outlives_components`, 7146 `alias_components`, 7214 `constraint_path`, 7056 `adt_variants`.",
+  "state": "applied",
+  "created": "2026-10-30T04:40:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-checks-regions.md#R0. Setup",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks-regions.md:30"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:33): in the tree: crates/hir-ty-borrowck/src/regions.rs:706 `build`, 220 `type_bounds_of -> impl Iterator`, 281 `opaque_captures(frame, ..)` (callers liveness.rs:780, polonius.rs:284, check.rs:2403 pass the frame), 693 `regions_of`, 7078 `outlives_components`, 7146 `alias_components`, 7214 `constraint_path`, 7056 `adt_variants`."
+    }
+  ]
+}

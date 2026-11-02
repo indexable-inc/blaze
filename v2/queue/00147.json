@@ -1,0 +1,21 @@
+{
+  "id": "00147",
+  "from_lane": "diagnostics-items-attrs-stability",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## 4. Missing stability annotations need effective visibilities (diagnostics)\n\nrustc's `MissingStabilityAnnotations` also gives \"{descr} has missing stability attribute\"\n(`MissingStabilityAttr`) and \"{descr} has missing const stability attribute\"\n(`MissingConstStabAttr`). Both apply only to definitions that are reachable from outside the\ncrate (`effective_visibilities`), which this lane has no query for. Until one exists they\naren't given. `tests/ui/stability-attribute/missing-stability-attr-at-top-level.rs` and\n`missing-const-stability.rs` need them.\n\n> forwarded to diagnostics: between its own children.\n\n> open: with diagnostics, for an effective-visibility query; `MissingStabilityAttr` and `MissingConstStabAttr` are not given until then.",
+  "state": "open",
+  "created": "2026-10-30T01:50:32Z",
+  "updated": "2026-10-30T01:50:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-attrs-stability.md#4. Missing stability annotations need effective visibilities (diagnostics)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-attrs-stability.md:78"
+    }
+  ]
+}

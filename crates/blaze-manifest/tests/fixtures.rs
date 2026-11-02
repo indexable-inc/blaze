@@ -1,6 +1,6 @@
 //! Each workspace of `tests/fixtures` read as `cargo metadata --no-deps --format-version 1`
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
-//! (`expected.json`, written by `harness/resolve.py --fixtures`).
+//! (`expected.json`, recorded once and kept as blaze's own expected output).
 
 // `expected.json` is what cargo printed on Linux: `/` in its paths and `file:///` ids of
 // them. On Windows cargo prints `\` and `file:///C:/` there, which these were not recorded with.
@@ -29,7 +29,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The error as cargo prints it, blank lines dropped as `harness/resolve.py` drops them.
+/// The error as cargo prints it, blank lines dropped as they were when `expected.json` was recorded.
 fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
     if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
         return diagnostic

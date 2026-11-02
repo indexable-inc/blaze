@@ -1,0 +1,35 @@
+{
+  "id": "01137",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db"
+  ],
+  "what": "Contract additions to plumbing (docs/v2/plan/lanes/db/query-unify.md, The contract, edited by query-unify-macros): (1) intern_by takes the key by value: `intern_by<I: Interned, Q: Hash>(storage, key: Q, eq: impl Fn(&Q, &I::Fields) -> bool, make: impl FnOnce(Q) -> I::Fields) -> Id` (eq borrows the key, make moves it; with the old shape the two closures can't both capture it). Interned constructors call it so `T::new(db, \"name\")` for a `String` field works as under salsa. (2) `pub trait Lookup<O> { fn into_owned(self) -> O; }` and `pub trait HashEqLike<O> { fn eq(&self, data: &O) -> bool; }` with salsa's impls (vendor/salsa/src/interned.rs:1874-2120: T for T, &T for T: Clone, &T for Box/Arc/triomphe::Arc, &str for String, &[A] and [A; N] for Vec<T>, &Path for PathBuf, Cow; drop compact_str unless a front-end crate uses it). (3) ids_of dispatch as salsa's (interned.rs:104-139): `pub struct IdsOf<'a, T: ?Sized>(pub &'a T);` and traits IdOfAsId (impl for &&IdsOf<T: AsId>, pushes as_id), IdOfNamed (impl for &IdsOf<T: NamesIds>, calls names_ids), IdOfOther (impl for IdsOf<T>, nothing), each `fn push_ids(&self, out: &mut Vec<Id>)`; generated ids_of is `use plumbing::{IdOfAsId as _, IdOfNamed as _, IdOfOther as _}; (&&&plumbing::IdsOf(&fields.0)).push_ids(out); ..`. The macros (crates/blaze-query-macros) already generate against these, FILE consts, Vtable::{function,input,interned,tracked}, owner checks.",
+  "state": "applied",
+  "created": "2026-10-30T22:17:58Z",
+  "updated": "2026-10-30T23:44:40Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:17:58Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:44:40Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "intern_by by value, Lookup/HashEqLike with salsa impls, IdsOf + IdOfAsId/IdOfNamed/IdOfOther in db/interned.rs and db/value.rs"
+    }
+  ]
+}

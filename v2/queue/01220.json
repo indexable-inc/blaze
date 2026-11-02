@@ -1,0 +1,37 @@
+{
+  "id": "01220",
+  "from_lane": "query-unify",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/storage.rs",
+    "crates/blaze-query/src/db/function.rs",
+    "crates/blaze-query/src/db/tests.rs"
+  ],
+  "what": "R14 + R15 from query-unify-port (01211, 01212), settled in docs/v2/plan/lanes/db/query-unify.md (contract: Storage, LRU and eviction, Function, plumbing). R14: `pub fn resume_readers(&mut self)` on Storage, clearing clock bit 32 (`*self.clock.get_mut() &= !(1 << 32)`), no view, no sweep; test: stop_readers then resume_readers gives readers_stopped() false and a query runs without PendingWrite, view unchanged. R15: the lru cap becomes runtime: FnTable<F> holds `cap: AtomicUsize` starting at F::LRU; register for sweep (`add_lru` in FnTable::new and `Vtable::sweep`) when F::EVICTABLE, not F::LRU > 0; `sweep::<F>` returns when cap == 0 or held <= cap and uses cap for `over`; new `pub fn plumbing::set_lru_capacity<F: Function>(db: &mut F::Db, capacity: usize)` that creates the table if absent and stores the cap (applied at the next view); asserts F::EVICTABLE. Test: lru = 2 function, set_lru_capacity(4), 6 keys run, new view, 4 values held; set 0, new view, nothing evicted. The cap is read only in sweep, never on a hit.",
+  "state": "applied",
+  "created": "2026-10-31T01:51:44Z",
+  "updated": "2026-10-31T02:55:50Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:51:44Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:45:27Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:55:50Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "R14 Storage::resume_readers; R15 FnTable.cap (starts at F::LRU), on the sweep list when EVICTABLE, sweep uses the cap (0: none), plumbing::set_lru_capacity asserts EVICTABLE and makes the table. Tests resume_readers_clears_the_stop_without_a_view, a_cap_set_at_runtime_applies_at_the_next_view_and_zero_is_none, a_cap_on_a_function_without_lru_panics. rust-analyzer clean, no cargo run."
+    }
+  ]
+}

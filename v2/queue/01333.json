@@ -1,0 +1,23 @@
+{
+  "id": "01333",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/infer/closure"
+  ],
+  "what": "Closure kind: `let held = Held(x); let add = move |y: u32| y + held.0;` (Held: Drop, not Copy; the body only reads held.0: u32) is given kind FnOnce; rustc gives it Fn (a move closure's kind is from how its body uses the captures, not that it captures by value), and `call_dyn(&add, 1)` with `f: &dyn Fn(u32) -> u32` accepts it. Seen as hir-ty-codegen v2::refs::tests::a_dyn_fn_call_lists_the_closure_vtable (round 10): 'vtable shim for a closure taken by value, in the call or call_mut slot of a closure of kind FnOnce'. Fixture DYN_FN in crates/hir-ty-codegen/v2/refs/tests.rs.",
+  "state": "open",
+  "created": "2026-10-31T18:20:20Z",
+  "updated": "2026-10-31T18:20:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:20:20Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

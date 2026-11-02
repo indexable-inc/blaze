@@ -1,0 +1,36 @@
+{
+  "id": "00753",
+  "from_lane": "solver-sync-interner",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "crates/parser/src/grammar/items.rs"
+  ],
+  "what": "## 3. hir-def: record `type const` items (`min_generic_const_args`)\n\n- Where: `crates/hir-def/src/signatures.rs` `ConstSignature` (and the trait/impl associated\n  const lowering that builds it). The parser already parses `type const`\n  (`crates/parser/src/grammar/items.rs:283`, test `type_const`); hir-def drops the keyword.\n- What: a flag `ConstFlags::TYPE_CONST` (or `is_type_const: bool`) set when the item is written\n  `type const`.\n- Why: the nightly's `Interner::is_direct_const(AliasConstKind)` is rustc's `is_type_const`, and\n  `const_of_item` returns the item's right-hand side as a const argument for such an item. Until\n  hir-def records the keyword, `interner.rs` answers `false`/`None` for every const, so a\n  `type const` is evaluated like a plain const (`evaluate_const`), which is rustc's rule for every\n  item that is not `type const`. Once the flag exists, `is_direct_const` returns it, and\n  `const_of_item` returns the lowered right-hand side for those items (that lowering, a const\n  argument to a `Const`, is the lower lane's). Owner: hir-def (format for `hir/`, db for\n  `signatures.rs`).\n\n> forwarded to db: `hir-def/src/signatures.rs` is its.\n\n> not applied by db-solver (2026-10-29 23:45): waits on hir-def's `ConstFlags::TYPE_CONST` (not in `signatures.rs` yet). `is_direct_const` / `const_of_item` (`interner.rs` ~1448) stay rustc's rule for every const not written `type const`, which until the flag is every const hir-def records.",
+  "state": "applied",
+  "created": "2026-10-30T06:45:00Z",
+  "updated": "2026-10-30T10:07:24Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-interner.md#3. hir-def: record `type const` items (`min_generic_const_args`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-interner.md:38"
+    },
+    {
+      "at": "2026-10-30T10:07:24Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:07:24Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied in hir-def: ConstFlags::TYPE_CONST (1 << 3), set from the const's own `type` token in ConstSignature::lower, read by ConstSignature::is_type_const(); child_tokens_as_the_accessors checks it against ast::Const::type_token on `type const E: u8 = 0;`. Left in hir-ty: interner.rs is_direct_const can return it only once const_of_item returns the lowered right-hand side as a const argument (the lower lane's lowering); until then both stay false/None, so a `type const` is still evaluated like a plain const"
+    }
+  ]
+}

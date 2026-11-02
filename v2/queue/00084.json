@@ -1,0 +1,36 @@
+{
+  "id": "00084",
+  "from_lane": "db-ty-unify",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-borrowck/src/regions.rs",
+    "crates/hir-ty-borrowck"
+  ],
+  "what": "## 3. db-ty-borrowck (sibling), `crates/hir-ty-borrowck/src/regions.rs`\n\n- `constraint_pairs` (line ~6437): take an iterator.\n\n  ```rust\n  fn constraint_pairs<'db>(\n      interner: hir_ty::next_solver::DbInterner<'db>,\n      constraints: impl IntoIterator<Item = hir_ty::next_solver::infer::region_constraints::Constraint<'db>>,\n  ) -> Vec<(Region<'db>, Region<'db>)> {\n      constraints.into_iter().map(|constraint| constraint.regions(interner)).collect()\n  }\n  ```\n\n- In the trait proving path (line ~6236):\n  `constraint_pairs(interner, inner.unwrap_region_constraints().region_constraint_data().constraints.iter_from(constraints_before))`.\n- `prove_query` (line ~6497) and `normalize_query` (line ~7359):\n  `constraint_pairs(interner, constraints.region_constraint_data().constraints.iter())`.\n- `normalize_full` (line ~7168): replace `.constraints[constraints_before..].to_vec()` with\n  `.constraints.iter_from(constraints_before).collect::<Vec<_>>()`.\n\nThe `.constraints.len()` calls compile unchanged.\n\n> forwarded to db: `crates/hir-ty-borrowck/` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-borrowck/src/regions.rs:6590` (`constraint_pairs` takes an iterator, extending a frame `FVec` in place of returning a `Vec`), callers at :6348, :6647, :7368 (`iter_from`) and :7551; `rg 'constraints\\['` finds no slicing left.",
+  "state": "applied",
+  "created": "2026-10-30T00:48:18Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-unify.md#3. db-ty-borrowck (sibling), `crates/hir-ty-borrowck/src/regions.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-unify.md:51"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-borrowck/src/regions.rs:6590` (`constraint_pairs` takes an iterator, extending a frame `FVec` in place of returning a `Vec`), callers at :6348, :6647, :7368 (`iter_from`) and :7551; `rg 'constraints\\['` finds no slicing left."
+    }
+  ]
+}

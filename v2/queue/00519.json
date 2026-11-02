@@ -1,0 +1,23 @@
+{
+  "id": "00519",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## diagnostics-lints-names-dead: the crate's definitions shared by `dead` and `items` (crates/blaze-diagnostics `lints/names.rs`)\n\nWhat: whether `items::private_in_public`, `items::after_abort` and `dead::lints` should share\none numbering of the crate's definitions (`dead/defs.rs::Defs`: every item, associated item,\nvariant and field with its kind, name, parent and children, in `checks::modules` order) and\nthe effective visibilities (`dead/reach.rs::Reach`, rustc's `effective_visibilities` at\n`Reachable`). If so, `names::after_abort` would build them once and pass them to both, which is\nan interface change to their `fn(cx) -> Vec<Found>` signatures. Why: rustc computes\n`effective_visibilities` once per crate, and dead code, `unreachable_pub` and `private_interfaces`\nall read it. Today `dead::lints` walks the crate once and computes its own visibilities, and\nnothing inside it repeats a walk. Whether `items` walks the crate again for the same facts is\nthe parent's call.\n\n> forwarded to diagnostics (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: the crate's definitions shared by `dead` and `items` (crates/blaze-diagnostics `lints/names.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2915"
+    }
+  ]
+}

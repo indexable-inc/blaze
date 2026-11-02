@@ -1,0 +1,23 @@
+{
+  "id": "00038",
+  "from_lane": "core-macos",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/process.rs"
+  ],
+  "what": "## 3. Spawn with `posix_spawn` on macOS: drop the `pre_exec` (`process.rs`)\n\n- What: on macOS, don't install `pre_exec(move || crate::footprint::limit_self(bytes))` in\n  `process::start` (the `#[cfg(target_os = \"macos\")] if let Some(bytes) = command.memory`\n  block). Keep `Limit::Footprint(Watch::start(pid, bytes))` as it is: the footprint watch alone\n  holds the limit.\n- Where: `crates/blaze-core/src/process.rs`. Once that block is gone, `footprint::limit_self` and\n  its test `limits_set_before_exec_let_a_small_program_run` have no caller: tell me and I delete\n  them, or delete them with it (`footprint.rs` is mine, but the two go together).\n- Why (performance, per the new principle): std's `Command::spawn` on macOS uses `posix_spawn`\n  unless a `pre_exec` closure is set; with one it forks the daemon. Forking a daemon with a\n  multi-gigabyte mapped image and many threads copies its whole address-space map on every\n  spawn, so every limited build script and proc macro pays that. `posix_spawn` starts the program\n  with no copy (std handles the working directory with `posix_spawn_file_actions_addchdir_np`).\n  The rlimits buy nothing on macOS: `RLIMIT_AS` is refused (request 2), and `RLIMIT_DATA`\n  doesn't hold `malloc`'s `mach_vm_allocate` regions. The footprint watch, which reads the\n  number the kernel itself goes by, is the backstop either way.\n\n---\nApplied by core: request 1 (`Finish::exited(self, pid, stdout, stderr)` stops the limit, then\nreaps; `threads.rs` and `kqueue.rs` changed with it, io_uring told). Request 2 kept as written:\nthe footprint watch is always on and holds the limit, the rlimit is extra.\n\n> forwarded to core: request 3 is not applied yet; `process.rs` line 135 still sets `pre_exec(limit_self)` on macOS.",
+  "state": "open",
+  "created": "2026-10-30T00:02:44Z",
+  "updated": "2026-10-30T00:02:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-macos.md#3. Spawn with `posix_spawn` on macOS: drop the `pre_exec` (`process.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-macos.md:45"
+    }
+  ]
+}

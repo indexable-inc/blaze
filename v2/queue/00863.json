@@ -1,0 +1,36 @@
+{
+  "id": "00863",
+  "from_lane": "speed-sol-core",
+  "owner": "mem",
+  "paths": [
+    "crates/blaze-mem/src/tag.rs",
+    "crates/blaze-graph/src/arena.rs"
+  ],
+  "what": "speed-sol-core (lane core's speed of light): one load for what blaze-mem has committed.\n\nWhere: crates/blaze-mem/src/tag.rs, and the one caller crates/blaze-graph/src/arena.rs `own()` (lane core's; speed-sol-core asks you to make that one-line edit too, so both land together).\n\nWhy: `blaze_graph::arena::own()` is `held() + blaze_mem::tag::snapshot().committed`. `snapshot()` folds the thread's pending counts and reads 5 counters of each of the 20 tags (100 relaxed loads over 20 cache lines that every worker keeps writing with `fetch_add`), to use one field, `COMMITTED.now`. On the owner thread of `exec::Scheduler` that is about 20 contended misses, roughly 2 us, each time the plane hears what blaze holds (now once per batch of up to 64 messages, with a budget only; it was after every Done). One load is about 5 ns.\n\nExact edit:\n1. crates/blaze-mem/src/tag.rs, after `pub fn headroom`:\n    /// Bytes committed in every region now: [`Snapshot::committed`] without the rest of a\n    /// snapshot, one load.\n    pub fn committed_now() -> u64 {\n        COMMITTED.now.load(Ordering::Relaxed)\n    }\n2. crates/blaze-graph/src/arena.rs `own()`:\n    held().saturating_add(blaze_mem::tag::committed_now())\n   and its doc's `[blaze_mem::tag::Snapshot::committed]` link becomes `[blaze_mem::tag::committed_now]`.\nSame value as before (the field snapshot reads), so no test changes; `snapshot()` stays for its other callers.",
+  "state": "applied",
+  "created": "2026-10-30T09:07:43Z",
+  "updated": "2026-10-30T09:29:06Z",
+  "taken_by": "speed-sol2-small-mem",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:07:43Z",
+      "by": "speed-sol-core",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:28:52Z",
+      "by": "speed-sol2-small-mem",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:29:06Z",
+      "by": "speed-sol2-small-mem",
+      "action": "done",
+      "note": "crates/blaze-mem/src/tag.rs: `pub fn committed_now() -> u64` added after `headroom` as asked (one relaxed load of COMMITTED.now). The blaze-graph/src/arena.rs own() edit is lane core's path, filed to core as 00890 with the exact edit."
+    }
+  ]
+}

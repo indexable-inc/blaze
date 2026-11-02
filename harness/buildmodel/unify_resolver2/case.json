@@ -1,9 +1,0 @@
-{
-  "row": "feature unification, resolver 2 (host apart from target)",
-  "package": "app",
-  "crates": [
-    "app",
-    "shared"
-  ],
-  "cargo": []
-}

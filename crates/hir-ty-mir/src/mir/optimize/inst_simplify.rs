@@ -8,6 +8,7 @@
 //! which rustc rewrites with intrinsics this MIR does not have, and the pointer aggregates it
 //! has no rvalue for.
 
+use blaze_mem::Frame;
 use hir_def::{ItemContainerId, Lookup};
 use rustc_type_ir::inherent::IntoKind;
 
@@ -15,23 +16,20 @@ use crate::{
     mir::{
         BasicBlock, BinOp, BorrowKind, CastKind, MirBody, MutBorrowKind, Operand, OperandKind,
         Place, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets, TerminatorKind,
-        UnOp, transform::Ctx,
+        UnOp,
+        framed::{Bits, bits_in, local_index},
+        transform::Ctx,
     },
     next_solver::{Ty, TyKind},
 };
 
-use super::{Location, Mention, local_index, visit_body};
+use super::{Location, Mention, visit_body};
 
-fn operand_ty<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, operand: &Operand) -> Option<Ty<'db>> {
-    let ty = match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
-        }
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        OperandKind::Static(_) => return None,
-    };
-    Some(ctx.normalize(ty))
+fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Option<Ty<'db>> {
+    if let OperandKind::Static(_) = operand.kind {
+        return None;
+    }
+    Some(ctx.normalize(ctx.operand_ty(body, operand)))
 }
 
 fn constant_bool(operand: &Operand) -> Option<bool> {
@@ -52,7 +50,7 @@ fn constant_bool(operand: &Operand) -> Option<bool> {
 }
 
 /// The function a call calls, when it names one.
-fn callee(func: &Operand) -> Option<hir_def::FunctionId> {
+pub(super) fn callee(func: &Operand) -> Option<hir_def::FunctionId> {
     let ty = match &func.kind {
         OperandKind::Allocation { allocation } => allocation.as_ref().ty,
         OperandKind::Constant { ty, .. } => ty.as_ref(),
@@ -67,7 +65,7 @@ fn callee(func: &Operand) -> Option<hir_def::FunctionId> {
     }
 }
 
-pub(super) fn inst_simplify<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
+pub(super) fn inst_simplify<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, _frame: &Frame) {
     let clone_trait = ctx.infcx.interner.lang_items().Clone;
     let mut blocks = std::mem::take(&mut body.basic_blocks);
     for (_, block) in blocks.iter_mut() {
@@ -90,14 +88,17 @@ pub(super) fn inst_simplify<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
 
 fn simplify_bool_cmp(rvalue: &mut Rvalue) {
     let Rvalue::BinaryOp(op @ (BinOp::Eq | BinOp::Ne), a, b) = &*rvalue else { return };
+    // Each arm keeps one operand of the rvalue it replaces: a place's refcount or a handle.
     let new = match (op, constant_bool(a), constant_bool(b)) {
+        // clone: the kept operand
         (BinOp::Eq, _, Some(true)) | (BinOp::Ne, _, Some(false)) => Rvalue::Use(a.clone()),
+        // clone: the kept operand
         (BinOp::Eq, Some(true), _) | (BinOp::Ne, Some(false), _) => Rvalue::Use(b.clone()),
         (BinOp::Eq, Some(false), _) | (BinOp::Ne, Some(true), _) => {
-            Rvalue::UnaryOp(UnOp::Not, b.clone())
+            Rvalue::UnaryOp(UnOp::Not, b.clone()) // clone: the kept operand
         }
         (BinOp::Eq, _, Some(false)) | (BinOp::Ne, _, Some(true)) => {
-            Rvalue::UnaryOp(UnOp::Not, a.clone())
+            Rvalue::UnaryOp(UnOp::Not, a.clone()) // clone: the kept operand
         }
         _ => return,
     };
@@ -107,7 +108,7 @@ fn simplify_bool_cmp(rvalue: &mut Rvalue) {
 /// `&*r` is `r` when `r` is a reference of that type. A two-phase borrow is left alone, as
 /// rustc leaves it: it is not a full `&mut` reborrow.
 fn simplify_ref_deref<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     _to: Place<'db>,
     rvalue: &mut Rvalue,
@@ -136,18 +137,18 @@ fn simplify_ref_deref<'db>(
     *rvalue = Rvalue::Use(Operand { kind: OperandKind::Copy(base.store()), span: None });
 }
 
-fn simplify_cast<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, rvalue: &mut Rvalue) {
+fn simplify_cast<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, rvalue: &mut Rvalue) {
     let Rvalue::Cast(kind, operand, ty) = rvalue else { return };
     if !matches!(kind, CastKind::IntToInt | CastKind::FloatToFloat | CastKind::PtrToPtr) {
         return;
     }
     let Some(from) = operand_ty(ctx, body, operand) else { return };
     if from == ctx.normalize(ty.as_ref()) {
-        *rvalue = Rvalue::Use(operand.clone());
+        *rvalue = Rvalue::Use(operand.clone()); // clone: the kept operand
     }
 }
 
-fn simplify_repeat_once<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, rvalue: &mut Rvalue) {
+fn simplify_repeat_once<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, rvalue: &mut Rvalue) {
     let Rvalue::Repeat(operand, count) = rvalue else { return };
     if crate::consteval::try_const_usize(ctx.db, count.as_ref()) != Some(1) {
         return;
@@ -155,13 +156,14 @@ fn simplify_repeat_once<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, rvalue: &mut R
     let Some(element) = operand_ty(ctx, body, operand) else { return };
     *rvalue = Rvalue::Aggregate(
         crate::mir::AggregateKind::Array(element.store()),
+        // alloc: clone: the kept aggregate's one operand, in the body
         Box::new([operand.clone()]),
     );
 }
 
 /// `Clone::clone(&x)` of a primitive `x` is `x`.
 fn simplify_primitive_clone<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     clone_trait: hir_def::TraitId,
     block: &mut BasicBlock,
@@ -186,7 +188,7 @@ fn simplify_primitive_clone<'db>(
     let value = place.as_ref().project(ProjectionElem::Deref).store();
     block.statements.push(Statement {
         kind: StatementKind::Assign(
-            destination.clone(),
+            destination.clone(), // clone: a place's refcount, kept in the body
             Rvalue::Use(Operand { kind: OperandKind::Copy(value), span: None }),
         ),
         span: terminator.span,
@@ -205,7 +207,11 @@ pub(super) fn simplify_duplicate_switch_targets(kind: &mut TerminatorKind) {
 
 /// rustc's `LowerSliceLenCalls`: `<[T]>::len(r)` is the length of `*r`. rustc reads it with
 /// `PtrMetadata(r)`; this MIR has `Len`, which reads the same.
-pub(super) fn lower_slice_len_calls<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
+pub(super) fn lower_slice_len_calls<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    _frame: &Frame,
+) {
     let Some(slice_len) = ctx.infcx.interner.lang_items().SliceLen else { return };
     for (_, block) in body.basic_blocks.iter_mut() {
         let Some(terminator) = &mut block.terminator else { continue };
@@ -221,6 +227,7 @@ pub(super) fn lower_slice_len_calls<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>
         let (OperandKind::Copy(place) | OperandKind::Move(place)) = &arg.kind else { continue };
         let slice = place.as_ref().project(ProjectionElem::Deref).store();
         block.statements.push(Statement {
+            // clone: a place's refcount, kept in the body
             kind: StatementKind::Assign(destination.clone(), Rvalue::Len(slice)),
             span: terminator.span,
         });
@@ -235,23 +242,23 @@ fn is_constant(operand: &Operand) -> bool {
 /// rustc's `SingleUseConsts`: a local assigned a constant once and read once is that
 /// constant where it is read, and one never read is not assigned. A local a debugger is told
 /// of keeps its constant, where rustc moves the constant into the debug info.
-pub(super) fn single_use_consts(body: &mut MirBody<'_>) {
+pub(super) fn single_use_consts(body: &mut MirBody<'_>, frame: &Frame) {
     let count = body.locals.len();
-    let mut ineligible = vec![false; count];
+    let mut ineligible: Bits<'_> = bits_in(count, frame);
     for &local in body.param_locals.iter().chain(body.binding_locals.values()) {
-        ineligible[local_index(local)] = true;
+        ineligible.insert(local_index(local));
     }
     for local in
         body.promoted_locals.iter().map(|it| it.0).chain(body.upvars_in_place.iter().map(|it| it.0))
     {
-        ineligible[local_index(local)] = true;
+        ineligible.insert(local_index(local));
     }
-    ineligible[local_index(crate::mir::return_slot())] = true;
-    let mut init: Vec<Option<Location>> = vec![None; count];
-    let mut uses: Vec<Option<Location>> = vec![None; count];
+    ineligible.insert(local_index(crate::mir::return_slot()));
+    let init = frame.alloc_slice_fill_with(count, |_| None::<Location>);
+    let uses = frame.alloc_slice_fill_with(count, |_| None::<Location>);
     // What `visit_body` says of a local that is not its constant assignment or a read of the
     // whole of it as an operand makes it ineligible.
-    let mut whole_reads: Vec<u32> = vec![0; count];
+    let whole_reads = frame.alloc_slice_fill_with(count, |_| 0u32);
     for (block, data) in body.basic_blocks.iter() {
         for (index, statement) in data.statements.iter().enumerate() {
             let at = Location { block, index };
@@ -260,21 +267,21 @@ pub(super) fn single_use_consts(body: &mut MirBody<'_>) {
                 && is_constant(operand)
             {
                 if init[local_index(local)].replace(at).is_some() {
-                    ineligible[local_index(local)] = true;
+                    ineligible.insert(local_index(local));
                 }
             }
             statement.kind.for_each_operand(&mut |operand| {
-                note_use(operand, at, &mut uses, &mut ineligible, &mut whole_reads)
+                note_use(operand, at, uses, &mut ineligible, whole_reads)
             });
         }
         if let Some(terminator) = &data.terminator {
             let at = Location { block, index: data.statements.len() };
             terminator.kind.for_each_operand(&mut |operand| {
-                note_use(operand, at, &mut uses, &mut ineligible, &mut whole_reads)
+                note_use(operand, at, uses, &mut ineligible, whole_reads)
             });
         }
     }
-    let mut mentions: Vec<u32> = vec![0; count];
+    let mentions = frame.alloc_slice_fill_with(count, |_| 0u32);
     visit_body(body, |local, mention, _| {
         if mention != Mention::Storage {
             mentions[local_index(local)] += 1;
@@ -283,7 +290,7 @@ pub(super) fn single_use_consts(body: &mut MirBody<'_>) {
     for local in 0..count {
         let Some(at) = init[local] else { continue };
         // The constant assignment and the one read are all there is of it.
-        if ineligible[local] || mentions[local] != 1 + whole_reads[local] {
+        if ineligible.contains(local) || mentions[local] != 1 + whole_reads[local] {
             continue;
         }
         let statement = &mut body.basic_blocks[at.block].statements[at.index];
@@ -322,13 +329,13 @@ fn note_use(
     operand: &Operand,
     at: Location,
     uses: &mut [Option<Location>],
-    ineligible: &mut [bool],
+    ineligible: &mut Bits<'_>,
     whole_reads: &mut [u32],
 ) {
     let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else { return };
     let Some(local) = place.as_ref().as_local() else { return };
     whole_reads[local_index(local)] += 1;
     if uses[local_index(local)].replace(at).is_some() {
-        ineligible[local_index(local)] = true;
+        ineligible.insert(local_index(local));
     }
 }

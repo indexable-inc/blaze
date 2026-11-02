@@ -1,0 +1,39 @@
+{
+  "id": "00216",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "crates/stdx/src/thread/pool.rs",
+    "crates/stdx/src/thread.rs",
+    "crates/stdx/Cargo.toml",
+    "crates/stdx/src",
+    "docs/v2/plan/lanes/dedup.md"
+  ],
+  "what": "## dedup: delete `stdx::thread::Pool`, a thread pool nothing uses (from dedup-mem)\n\n- What: delete `crates/stdx/src/thread/pool.rs`. In `crates/stdx/src/thread.rs` remove\n  `mod pool;` (line 21) and `pub use pool::Pool;` (line 24). In `crates/stdx/Cargo.toml` remove\n  `crossbeam-channel.workspace = true` and `crossbeam-utils = \"0.8.21\"` (pool.rs is their only\n  user in stdx: `rg crossbeam crates/stdx/src` finds nothing else).\n- Why: it is rust-analyzer's LSP thread pool and has no caller in the tree\n  (`rg 'thread::Pool|stdx::thread' crates` finds only `Builder`, `ThreadIntent`, `JoinHandle`\n  in `ide-db` and `vfs-notify`). The plane's pool, `blaze_graph::pool::Pool` (work stealing,\n  topology-aware, LIFO slot), is blaze's one thread pool; a second is a copy\n  (docs/v2/plan/lanes/dedup.md, \"Thread pools\").\n- Check: `rg -n 'stdx::thread::Pool|thread::\\{[^}]*Pool' crates` stays empty.\n\nStatus: open\n\n> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:32:27Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: delete `stdx::thread::Pool`, a thread pool nothing uses (from dedup-mem)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:694"
+    },
+    {
+      "at": "2026-10-30T08:32:27Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:27Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/stdx/src/thread/pool.rs and its mod/use lines were already gone; removed crossbeam-channel and crossbeam-utils from crates/stdx/Cargo.toml (no other user in stdx/src). No Pool user remains in crates/."
+    }
+  ]
+}

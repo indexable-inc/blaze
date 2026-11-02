@@ -1,0 +1,29 @@
+{
+  "id": "00709",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-engine/src/main.rs"
+  ],
+  "what": "## 4. Coordinator: the `blaze` program's entry (at integration)\n\n`crates/blaze-engine/src/main.rs` (codegen's) runs `blaze_engine::main`, which runs v1's\n`blaze_cargo::cargo::command`. At integration the `blaze` program (and `cargo-blaze`, which cargo\nruns for `cargo blaze`) runs `blaze_cargo::cli::main(std::env::args_os())` (lane cargo's v2\nclient), and `blaze serve` runs `blaze_cargo::serve::main` (lane cargo's v2 daemon).\n\n> forwarded to coordinator: an integration step in codegen's `crates/blaze-engine/src/main.rs`; listed in the requests report for integration.",
+  "state": "taken",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:32:34Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/cargo.md#4. Coordinator: the `blaze` program's entry (at integration)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:240"
+    },
+    {
+      "at": "2026-10-30T08:32:34Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

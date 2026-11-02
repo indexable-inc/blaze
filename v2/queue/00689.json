@@ -1,0 +1,29 @@
+{
+  "id": "00689",
+  "from_lane": "dedyn",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-intent"
+  ],
+  "what": "## dedyn: crates/blaze-intent: `Files` by type, not `&dyn Files` (user's call, 2026-10-29)\n\n> APPLIED by dedyn-files 2026-10-29 21:55: `Edits<'a, F: Files>`, `apply<F: Files>`, rename.rs takes `Edits<'_, impl Files>` (no `?Sized`: no trait-object caller).\n> Being applied in the tree by dedyn-files (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.\n\n\n`Edits::files` is asked once per file a request's edits read or move (`lib.rs:147`,\n`rename.rs:105`, `:471`, `:496`), through `&dyn Files`. Its implementations: the test's `View`\nand the daemon's view, still to be written; neither is blaze-intent's to name, so a generic. Code\nsize: `apply` and `rename.rs` are compiled once per implementation, once in a release build\n(the daemon's), twice in blaze-intent's test build.\n\n- `lib.rs:66`: `pub(crate) struct Edits<'a> {` → `pub(crate) struct Edits<'a, F: Files + ?Sized> {`\n- `lib.rs:69`: `pub files: &'a dyn Files,` → `pub files: &'a F,`\n- `lib.rs:81`: `pub fn apply(db: &Db, files: &dyn Files, edits: &[Edit]) -> Result<Applied, ApiError> {`\n  → `pub fn apply<F: Files + ?Sized>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, ApiError> {`\n- `lib.rs:120`: `impl Edits<'_> {` → `impl<F: Files + ?Sized> Edits<'_, F> {`\n- `rename.rs:61`: `cx: &mut Edits<'_>` → `cx: &mut Edits<'_, impl Files + ?Sized>`; the same for\n  `rename.rs:245` (`classify`), `:270` (`classify_one`), `:385` (`record_expr_field`) with\n  `cx: &Edits<'_, impl Files + ?Sized>`, and `:459` (`moves`) with `&mut`. Add `Files` to\n  `rename.rs`'s `use crate::{.., Edits}`.\n\nCallers (`tests/rename.rs`, and the daemon's when written) pass `&view` as today.\n\n> forwarded to fastcompile (`crates/blaze-intent/`; told by tmux; requests, pass 22).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T14:11:42Z",
+  "taken_by": "fastcompile",
+  "why": null,
+  "source": "v2/requests/fastcompile.md#dedyn: crates/blaze-intent: `Files` by type, not `&dyn Files` (user's call, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:2957"
+    },
+    {
+      "at": "2026-10-30T14:11:42Z",
+      "by": "fastcompile",
+      "action": "done",
+      "note": "applied by dedyn-files 2026-10-29 (Edits<F: Files>)"
+    }
+  ]
+}

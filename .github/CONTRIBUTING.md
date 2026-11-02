@@ -22,8 +22,8 @@ cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax
 `python3 harness/unittests.py` is the one `cargo test` CI runs, over blaze's crates and the
 front end's (`hir-ty`, `hir-def`, `parser`, `syntax` and the rest), all in `crates/`.
 
-The real gate compares blaze's output with rustc's on real programs: see
-[docs/harness.md](../docs/harness.md). Run what fits your change and say in the pull request
+The real gate is real crates' own test suites passing under blaze, and tests that state their
+expected result: see [docs/harness.md](../docs/harness.md). Run what fits your change and say in the pull request
 what you ran and on which platform.
 
 ## Changes

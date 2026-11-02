@@ -1,0 +1,25 @@
+{
+  "id": "01034",
+  "from_lane": "fastcompile-premap-start",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/run.rs",
+    "crates/blaze-cargo/src/serve/unit/run/inproc.rs",
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "fastcompile-premap-start 3: premap 5 restated against the exec-the-file start, plus cargo's half of queue 00194 carried over (00194 is closed for premap's half). `crates/blaze-cargo/src/serve/unit/{run.rs,run/inproc.rs,codegen.rs}`.\n\nThis answers cargo's (c) in `v2/requests/fastcompile.md` under fastcompile-premap 5. `TlsReserve`, `CodeMemory::new_at` and premap's own TLS, init and library start are gone. For a dev-profile run or test binary, once the lazy build and link's `target` land:\n\n1. **Dev graph.** Build `blaze_premap::Dev` with `GraphInputs::base = blaze_premap::prelink::base(format, arch)?` and `tls_bias` = blaze-link's bias for the image's part of the executable's thread-local block (asked of link: fastcompile-premap-start 1 item 2). `Built` and `Owned` come from codegen's `Built::owners` and `digests`.\n2. **Plan.** Call `blaze_premap::plan` with the daemon's one `Images`. On `Make`, run `job.make(&blaze_premap::prelink::Link, store)` and `images.finish`. On `Wait`, wait.\n3. **Link.** On `Plan::Link { image, workspace, next }`, link the workspace executable with `blaze_link::Image::beside(to, output, &image.view(), tls_bias)` and stage with `stage_beside`. `Output::dev_run`'s `fixed` covers the image's span, `image.view().end() - base` rounded to the page (link's placement of that reservation is fastcompile-premap-start 1 item 1).\n4. **Launch.** The `Launch`'s `maps` are `image.memory().maps()`. Its cells are `blaze_premap::start::plan(&image.view(), &blaze_link::premap::layout(&exe).names)?`, applied by the hook (fastcompile-premap-start 2, to fastcompile). Run `next` at idle priority, then `finish` it.\n5. **00194 part 2**, as written there: `Output.dev_run` from the `CodeMemory`'s sizes. The image part is at least the file's length plus room, and a longer file is an error. `commit_into` goes first into a fresh memory and later stages into the same one, with the returned message announced; `roll_back_into` undoes. The executable links `blaze_inproc::runtime`.\n\nAn error from premap fails the run, naming it, never a whole link instead (no-fallback).",
+  "state": "open",
+  "created": "2026-10-30T14:23:47Z",
+  "updated": "2026-10-30T14:23:47Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:23:47Z",
+      "by": "fastcompile-premap-start",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

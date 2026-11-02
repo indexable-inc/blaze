@@ -1,0 +1,35 @@
+{
+  "id": "00885",
+  "from_lane": "speed-sol2-small",
+  "owner": "speed-sol2-format",
+  "paths": [
+    "crates/blaze-ids/src/lib.rs"
+  ],
+  "what": "## speed-sol2-small: `Hasher::new(&str)` costs an FNV-1a of the domain name per key (blaze-ids lib.rs `context_key`/`name_hash`)\n\n- Where: `crates/blaze-ids/src/lib.rs` `Hasher::new` -> `context_key` -> `context_key_in`: every call hashes the name byte by byte (one dependent multiply a byte, 20 to 30 bytes: ~100 cycles, ~30 ns) and compares the slot (pointer, then text). 251 callers in the workspace use `Hasher::new`; 12 use `Hasher::of(&Domain)`. A one-block key costs one BLAKE3 compression (~20 ns), so the lookup more than doubles a short key (item store hit: 5 keys, ~150 ns of FNV against ~140 ns of compressions; docs/v2/plan/lanes/item-hash-store/speed-of-light.md).\n- Change: in front of the FNV path, a direct-mapped cache keyed by the name pointer: `static BY_PTR: [AtomicPtr<(&str, ContextKey)>; 256]`, index `(domain.as_ptr() as usize >> 4) & 255`, an acquire load and a pointer and length compare; on a miss run today`s `context_key_in` and publish the entry pointer (entries are the `&static` slots of `DOMAIN_KEYS`, so nothing is freed). Keys and bytes hashed are unchanged (same context key), so no hash changes.\n- Test: a model test that `context_key` through the cache equals `b3::context_key(name)` for many names, including two equal names at different addresses and names colliding in the cache index; an allocation budget of zero for a warm `Hasher::new`.\n- Also from dedup-scan-ident (docs/v2/plan/lanes/dedup/scan-ident.md, Speed of light): an inline buffer of a few hundred bytes in `Hasher` for many tiny `update`s (identity spellings ~1.5x their bound). Same file.",
+  "state": "applied",
+  "created": "2026-10-30T09:27:57Z",
+  "updated": "2026-10-30T09:58:48Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:27:57Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:58:48Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:58:48Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "Done in crates/blaze-ids/src/lib.rs (speed-sol2-format, 2026-10-30): context_key finds a domain by its address and length (home(): one multiply, an acquire load, a pointer compare), reading none of the text; no FNV is left. A second address of one name takes its own slot with the same key (many_domains_keep_their_own_keys, model_colliding_domains_keep_their_own_keys). New test a_warm_hasher_allocates_nothing: a warm Hasher::new, 80 short updates and finish allocate nothing. The inline buffer for tiny updates: blake3-servil's Hasher already stages short updates in an inline 16 KiB MaybeUninit buffer (incremental.rs stage), so nothing to add on its targets; the official backend (Windows, x86-64 macOS) keeps its 64-byte chunk buffer. Recorded in format/speed-of-light.md (content IDs)."
+    }
+  ]
+}

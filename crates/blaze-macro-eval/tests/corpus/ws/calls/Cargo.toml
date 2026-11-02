@@ -1,0 +1,12 @@
+[package]
+name = "corpus-calls"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+corpus-macros = { path = "../macros" }
+corpus-state = { path = "../state" }
+serde = { version = "=1.0.228", features = ["derive"] }
+thiserror = "=2.0.18"
+tokio-macros = "=2.6.1"

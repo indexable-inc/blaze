@@ -1,0 +1,35 @@
+{
+  "id": "01301",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-borrowck/src/lib.rs"
+  ],
+  "what": "For 01271 (compile_error_is_an_error_at_the_call): hir-ty-borrowck must not borrow-check a body tainted by a failed macro expansion, as rustc (ExprKind::Err taints, mir_borrowck skips). Patch: add to `enum NotChecked` `/// A macro call in it failed to expand, an error reported at the call: rustc lowers it to `ExprKind::Err`, which taints the body.\\n    ExpansionErrors,`; in check_def after the `has_lowering_errors` check: `if hir_ty_mir::mir::has_failed_expansion(db, owner) { result.not_checked = Some(NotChecked::ExpansionErrors); return result; }`; the same in borrowck_anon_const before check_owner (owner = InferBodyId::AnonConstId(konst)). Fix any exhaustive match on NotChecked (gate.rs, blaze-diagnostics). hir_ty_mir::mir::has_failed_expansion is in the tree (uncompiled); lowering now gives MirLowerError::HasErrors for such a body.",
+  "state": "applied",
+  "created": "2026-10-31T14:57:21Z",
+  "updated": "2026-10-31T15:26:47Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:57:21Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:26:46Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:26:47Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "applied by the borrowck owner: NotChecked::ExpansionErrors, set in check_def after has_lowering_errors and in borrowck_anon_const before check_owner, from hir_ty_mir::mir::has_failed_expansion. Ready for the next round"
+    }
+  ]
+}

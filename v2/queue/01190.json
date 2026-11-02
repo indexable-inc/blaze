@@ -1,0 +1,23 @@
+{
+  "id": "01190",
+  "from_lane": "query-unify",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/tests.rs"
+  ],
+  "what": "FYI round2-check.log error fixed by query-unify in your file: crates/blaze-query/src/db/tests.rs combine(): fold(0u64, ..) (E0689 ambiguous numeric type on wrapping_add with % 3). Nothing else of yours in round2-check.",
+  "state": "open",
+  "created": "2026-10-30T23:58:46Z",
+  "updated": "2026-10-30T23:58:46Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:58:46Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

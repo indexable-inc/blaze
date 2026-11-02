@@ -1,0 +1,21 @@
+{
+  "id": "00414",
+  "from_lane": "mem-db-def-resolve",
+  "owner": "frontend-nameres",
+  "paths": [],
+  "what": "## T5. A cold `crate_local_def_map` allocates the same for any width (`nameres/tests/budget.rs`, collect's Part F file; db-expand-names)\n\n> deferred by db-expand-names (2026-10-29 21:05) with R10; see R10's note.\n\nWith R10, a cold collection's global allocations are the settled tables (one per non-empty list,\nmap, index and table) plus salsa's own costs for the query and the ids it makes. Neither depends\non how many names a list holds. The fixture adds names without adding ids: one `use` with n\nrenames of one struct gives one `UseId` and no new interned id per name. The item tree, which\ninterns the names and makes the `AstIdMap`, is computed outside the measure. The widest crate is\ncollected first, so this thread's blaze-mem scratch shelves and frames have grown to it before\nanything is measured. Without R10, the count grows with n (about log2 n reallocations per\ngrowing column), so this test fails today and passes once R10 lands.\n\n```rust\n/// A crate whose module `wide` binds `n` names (types and values) through one `use`.\nfn wide_crate(n: usize) -> String {\n    let renames: Vec<String> = (0..n).map(|i| format!(\"S as A{i}\")).collect();\n    format!(\n        \"//- /lib.rs crate:main\\npub mod m {{ pub struct S; }}\\npub mod wide {{ pub use super::m::{{{}}}; }}\\n\",\n        renames.join(\", \")\n    )\n}\n\n/// The global allocations of a cold `crate_local_def_map` of [`wide_crate`]`(n)`, with its item\n/// tree made first.\nfn cold_collection(n: usize) -> u64 {\n    let (db, files) = TestDB::with_many_files(&wide_crate(n));\n    let krate = db.fetch_test_crate();\n    black_box(file_item_tree(&db, files[0].into(), krate));\n    let (pair, used) = measure(|| crate_local_def_map(&db, krate));\n    let map = pair.def_map(&db);\n    let wide = map\n        .modules(&db)\n        .find(|(id, _)| id.name(&db).is_some_and(|it| it.as_str() == \"wide\"))\n        .map(|(id, _)| id)\n        .expect(\"the fixture has `wide`\");\n    assert_eq!(map.module(&db, wide).scope(&db).entries().count(), n);\n    used.allocations\n}\n\n/// Budget: a cold collection allocates the same whether a module holds 9 names or 513: every\n/// table being collected grows in the frame, and the memo's tables are made once each at their\n/// length. Each width crosses one more doubling of every growing column, and all stay above\n/// `LINEAR`, so the settled tables are the same in number.\n#[test]\nfn a_cold_collection_allocates_the_same_for_any_width() {\n    const WIDTHS: [usize; 7] = [9, 17, 33, 65, 129, 257, 513];\n    black_box(cold_collection(WIDTHS[WIDTHS.len() - 1]));\n    let counts = WIDTHS.map(cold_collection);\n    assert!(\n        counts.iter().all(|&it| it == counts[0]),\n        \"a cold collection's allocations grew with the number of names: {:?}\",\n        WIDTHS.iter().zip(&counts).collect::<Vec<_>>()\n    );\n}\n```\n\nThe file's imports gain `crate::nameres::crate_local_def_map`. `file_item_tree`, `measure` and\n`black_box` are already there (Part F). The test runs on the calling thread, as Part F's do\n(`TestDB`'s `RUN_ORDER`).\n\n> forwarded to frontend-nameres (frontend-nameres-next1, `nameres/tests/`, collect's) (requests, pass 19; told by tmux).\n\n> frontend-nameres (2026-10-29 21:24): accepted, deferred with R10 as db-expand-names noted above. The test fails until R10 and H6 land (each growing column costs about log2 n reallocations), and a red test in `nameres/tests/budget.rs` would hold up hir-def's first build. It goes in the change that lands R10.3's facts part and H6, as written here, and the cold path it measures is `facts::collect_crate`.",
+  "state": "open",
+  "created": "2026-10-30T04:05:00Z",
+  "updated": "2026-10-30T04:05:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-def-resolve.md#T5. A cold `crate_local_def_map` allocates the same for any width (`nameres/tests/budget.rs`, collect's Part F file; db-expand-names)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def-resolve.md:2313"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00131",
+  "from_lane": "speed-types-probe",
+  "owner": "format",
+  "paths": [],
+  "what": "## format (hir-def): a name index on `TraitItems` and `ImplItems` (open, from items-hirty)\n\nWith items sorted by name in `TraitItems`/`ImplItems` (plus the declaration order kept for\nthe first-of-a-name rule), `trait_value_items` would not need to sort per crate and\n`impl_value_item` could binary-search instead of scanning. Not required by anything here.\n\n> forwarded to format: `TraitItems`/`ImplItems` are in format's hir-def files.",
+  "state": "refused",
+  "created": "2026-10-30T01:24:42Z",
+  "updated": "2026-10-30T10:04:27Z",
+  "taken_by": "speed-sol2-format",
+  "why": "Not format's: TraitItems and ImplItems are in crates/hir-def/src/nameres/assoc.rs (:34, :106), which is lane db's (crates.md: hir-def but format's files; format's are expr_store*, hir*, item_tree*). Their readers are hir-ty method_resolution.rs:599 and :617 (items'). Please send it to db, or to frontend-nameres while it holds nameres/.",
+  "source": "v2/requests/speed-types-probe.md#format (hir-def): a name index on `TraitItems` and `ImplItems` (open, from items-hirty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-types-probe.md:12"
+    },
+    {
+      "at": "2026-10-30T10:04:24Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:04:27Z",
+      "by": "speed-sol2-format",
+      "action": "refuse",
+      "note": "Not format's: TraitItems and ImplItems are in crates/hir-def/src/nameres/assoc.rs (:34, :106), which is lane db's (crates.md: hir-def but format's files; format's are expr_store*, hir*, item_tree*). Their readers are hir-ty method_resolution.rs:599 and :617 (items'). Please send it to db, or to frontend-nameres while it holds nameres/."
+    }
+  ]
+}

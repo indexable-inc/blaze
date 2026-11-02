@@ -3,6 +3,7 @@
 //! rustdoc's layout: a path shows its last segment, bounds on a parameter stay by it, other
 //! predicates go to a `where` clause, a long parameter list breaks one parameter to a line.
 
+use base_db::Db;
 use hir::{HasVisibility, ModuleDef};
 use hir_def::{
     AdtId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, ItemContainerId, TraitId,
@@ -32,11 +33,7 @@ use hir_def::{
     },
     visibility::Visibility,
 };
-use ide_db::RootDatabase;
-use syntax::{
-    AstNode,
-    ast::{self, HasName},
-};
+use syntax::view::{self as ast, AstNode, HasName};
 
 use crate::{
     model::{Code, Kind, Piece},
@@ -47,7 +44,7 @@ use crate::{
 const WIDTH: usize = 100;
 
 pub(crate) struct Sig<'a> {
-    pub(crate) db: &'a RootDatabase,
+    pub(crate) db: &'a Db,
     pub(crate) places: Linking<'a>,
     store: &'a ExpressionStore,
     resolver: Resolver<'a>,
@@ -56,7 +53,7 @@ pub(crate) struct Sig<'a> {
 
 impl<'a> Sig<'a> {
     pub(crate) fn new(
-        db: &'a RootDatabase,
+        db: &'a Db,
         places: Linking<'a>,
         store: &'a ExpressionStore,
         resolver: Resolver<'a>,
@@ -67,7 +64,7 @@ impl<'a> Sig<'a> {
 
     pub(crate) fn ty(&self, out: &mut Code, ty: TypeRefId) {
         let db = self.db;
-        match &self.store[ty] {
+        match self.store.type_ref(ty) {
             TypeRef::Never => {
                 out.text("!");
             }
@@ -93,7 +90,7 @@ impl<'a> Sig<'a> {
                     Mutability::Shared => "*const ",
                     Mutability::Mut => "*mut ",
                 });
-                self.ty(out, *inner);
+                self.ty(out, inner);
             }
             TypeRef::Reference(reference) => {
                 out.text("&");
@@ -115,7 +112,7 @@ impl<'a> Sig<'a> {
             }
             TypeRef::Slice(inner) => {
                 out.text("[");
-                self.ty(out, *inner);
+                self.ty(out, inner);
                 out.text("]");
             }
             TypeRef::Fn(fn_) => {
@@ -150,13 +147,28 @@ impl<'a> Sig<'a> {
                         out.text(if params.is_empty() { "..." } else { ", ..." });
                     }
                     out.text(")");
-                    if !matches!(&self.store[*ret], TypeRef::Tuple(it) if it.is_empty()) {
+                    if !matches!(self.store.type_ref(*ret), TypeRef::Tuple(it) if it.is_empty()) {
                         out.text(" -> ");
                         self.ty(out, *ret);
                     }
                 } else {
                     out.text(")");
                 }
+            }
+            TypeRef::UnsafeBinder { lifetimes, ty } => {
+                // rustdoc's `print_higher_ranked_params_with_space`: nothing when no lifetime is bound.
+                let names = self.store.names(lifetimes);
+                if !names.is_empty() {
+                    out.kw("unsafe").text("<");
+                    for (at, name) in names.iter().enumerate() {
+                        if at > 0 {
+                            out.text(", ");
+                        }
+                        out.push(Piece::Lifetime(lifetime_text(name.as_str())));
+                    }
+                    out.text("> ");
+                }
+                self.ty(out, ty);
             }
             TypeRef::ImplTrait(bounds) => {
                 out.kw("impl").text(" ");
@@ -167,7 +179,7 @@ impl<'a> Sig<'a> {
                 self.bounds(out, bounds);
             }
             TypeRef::TypeParam(param) => {
-                if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| it == param) {
+                if let Some((_, code)) = self.places.subst.iter().find(|(it, _)| *it == param) {
                     out.extend(code.clone());
                     return;
                 }
@@ -190,7 +202,7 @@ impl<'a> Sig<'a> {
                             .iter()
                             .filter_map(|pred| match pred {
                                 WherePredicate::TypeBound { target, bound, .. }
-                                    if matches!(store[*target], TypeRef::TypeParam(id) if id == *param) =>
+                                    if matches!(store.type_ref(*target), TypeRef::TypeParam(id) if id == param) =>
                                 {
                                     Some(bound)
                                 }
@@ -206,7 +218,7 @@ impl<'a> Sig<'a> {
                     }
                 }
             }
-            TypeRef::PatternType(inner, _) => self.ty(out, *inner),
+            TypeRef::PatternType(inner, _) => self.ty(out, inner),
         }
     }
 
@@ -249,23 +261,23 @@ impl<'a> Sig<'a> {
                         out.text("[").kw("const").text("] ");
                     }
                 }
-                self.path(out, &self.store[*path]);
+                self.path(out, self.store.path(*path));
             }
             TypeBound::ForLifetime(names, path) => {
                 out.kw("for").text("<");
-                for (at, name) in names.iter().enumerate() {
+                for (at, name) in self.store.names(*names).iter().enumerate() {
                     if at > 0 {
                         out.text(", ");
                     }
                     out.push(Piece::Lifetime(lifetime_text(name.as_str())));
                 }
                 out.text("> ");
-                self.path(out, &self.store[*path]);
+                self.path(out, self.store.path(*path));
             }
             TypeBound::Lifetime(lifetime) => self.lifetime(out, *lifetime),
             TypeBound::Use(args) => {
                 out.kw("use").text("<");
-                for (at, arg) in args.iter().enumerate() {
+                for (at, arg) in self.store.use_args(*args).iter().enumerate() {
                     if at > 0 {
                         out.text(", ");
                     }
@@ -306,10 +318,10 @@ impl<'a> Sig<'a> {
         out.text(text);
     }
 
-    pub(crate) fn path(&self, out: &mut Code, path: &Path) {
+    pub(crate) fn path(&self, out: &mut Code, path: Path<'_>) {
         let db = self.db;
         if let Path::LangItem(target, name) = path {
-            let def: Option<ModuleDef> = match *target {
+            let def: Option<ModuleDef> = match target {
                 LangItemTarget::TraitId(it) => Some(ModuleDef::Trait(it.into())),
                 LangItemTarget::StructId(it) => Some(ModuleDef::Adt(hir::Adt::Struct(it.into()))),
                 LangItemTarget::EnumId(it) => Some(ModuleDef::Adt(hir::Adt::Enum(it.into()))),
@@ -400,7 +412,7 @@ impl<'a> Sig<'a> {
         }
     }
 
-    fn segment(&self, out: &mut Code, ns: TypeNs, name: &str, args: Option<&GenericArgs>) {
+    fn segment(&self, out: &mut Code, ns: TypeNs, name: &str, args: Option<GenericArgs<'_>>) {
         let db = self.db;
         let def: Option<ModuleDef> = match ns {
             TypeNs::AdtId(it) => Some(ModuleDef::Adt(it.into())),
@@ -457,12 +469,12 @@ impl<'a> Sig<'a> {
         }
     }
 
-    pub(crate) fn generic_args(&self, out: &mut Code, args: &GenericArgs) {
+    pub(crate) fn generic_args(&self, out: &mut Code, args: GenericArgs<'_>) {
         match args.parenthesized {
             GenericArgsParentheses::ParenSugar => {
                 out.text("(");
                 if let Some(GenericArg::Type(tuple)) = args.args.first() {
-                    match &self.store[*tuple] {
+                    match self.store.type_ref(*tuple) {
                         TypeRef::Tuple(items) => {
                             for (at, item) in items.iter().enumerate() {
                                 if at > 0 {
@@ -476,7 +488,7 @@ impl<'a> Sig<'a> {
                 }
                 out.text(")");
                 if let Some(ret) = args.bindings.first().and_then(|it| it.type_ref)
-                    && !matches!(&self.store[ret], TypeRef::Tuple(it) if it.is_empty())
+                    && !matches!(self.store.type_ref(ret), TypeRef::Tuple(it) if it.is_empty())
                 {
                     out.text(" -> ");
                     self.ty(out, ret);
@@ -513,7 +525,7 @@ impl<'a> Sig<'a> {
             }
             first = false;
             out.push(Piece::Plain(binding.name.as_str().to_owned()));
-            if let Some(args) = &binding.args {
+            if let Some(args) = binding.args {
                 self.generic_args(out, args);
             }
             if let Some(ty) = binding.type_ref {
@@ -622,7 +634,7 @@ impl<'a> Sig<'a> {
     }
 
     fn is_param(&self, target: TypeRefId, id: LocalTypeOrConstParamId) -> bool {
-        matches!(self.store[target], TypeRef::TypeParam(p) if p.local_id() == id)
+        matches!(self.store.type_ref(target), TypeRef::TypeParam(p) if p.local_id() == id)
     }
 
     /// The predicates that do not sit on a parameter, as `where` and one predicate to a line.
@@ -634,7 +646,7 @@ impl<'a> Sig<'a> {
             match pred {
                 WherePredicate::TypeBound { lifetimes, target, bound } => {
                     let inline = lifetimes.is_none()
-                        && match self.store[*target] {
+                        && match self.store.type_ref(*target) {
                             TypeRef::TypeParam(p) => {
                                 let data = &GenericParams::of(db, p.parent())[p.local_id()];
                                 // `impl Trait` arguments, trait `Self` and listed parameters
@@ -661,7 +673,7 @@ impl<'a> Sig<'a> {
                     let mut line = Code::default();
                     if let Some(lifetimes) = lifetimes {
                         line.kw("for").text("<");
-                        for (at, name) in lifetimes.iter().enumerate() {
+                        for (at, name) in self.store.names(*lifetimes).iter().enumerate() {
                             if at > 0 {
                                 line.text(", ");
                             }
@@ -702,7 +714,7 @@ pub(crate) fn lifetime_text(name: &str) -> String {
 
 /// `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` or nothing, said from `module`, the module
 /// the item is in.
-pub(crate) fn visibility(db: &RootDatabase, out: &mut Code, vis: Visibility, module: hir::Module) {
+pub(crate) fn visibility(db: &Db, out: &mut Code, vis: Visibility, module: hir::Module) {
     match vis {
         Visibility::Public => {
             out.kw("pub").text(" ");
@@ -736,7 +748,7 @@ pub(crate) fn visibility(db: &RootDatabase, out: &mut Code, vis: Visibility, mod
 
 /// A signature renderer for the generic parameters of `def`.
 fn sig_of<'a>(
-    db: &'a RootDatabase,
+    db: &'a Db,
     places: Linking<'a>,
     store: &'a ExpressionStore,
     def: GenericDefId,
@@ -754,7 +766,7 @@ pub(crate) enum FnContext {
 }
 
 pub(crate) fn function(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     func: hir::Function,
     context: FnContext,
@@ -812,7 +824,7 @@ pub(crate) fn function(
     }
     let mut ret = Code::default();
     if let Some(ret_ty) = return_type(data)
-        && !matches!(&data.store[ret_ty], TypeRef::Tuple(it) if it.is_empty())
+        && !matches!(data.store.type_ref(ret_ty), TypeRef::Tuple(it) if it.is_empty())
     {
         ret.text(" -> ");
         sig.ty(&mut ret, ret_ty);
@@ -849,9 +861,11 @@ fn return_type(data: &FunctionSignature) -> Option<TypeRefId> {
     if !data.is_async() && !data.is_gen() {
         return Some(ret);
     }
-    match &data.store[ret] {
+    match data.store.type_ref(ret) {
         TypeRef::ImplTrait(bounds) => match bounds.first() {
-            Some(TypeBound::Path(path, _)) => data.store[*path]
+            Some(TypeBound::Path(path, _)) => data
+                .store
+                .path(*path)
                 .segments()
                 .last()
                 .and_then(|it| it.args_and_bindings)
@@ -864,11 +878,11 @@ fn return_type(data: &FunctionSignature) -> Option<TypeRefId> {
 }
 
 fn self_param(sig: &Sig<'_>, out: &mut Code, ty: TypeRefId, store: &ExpressionStore) {
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Path(path) if path.is_self_type() => {
             out.kw("self");
         }
-        TypeRef::Reference(reference) if matches!(&store[reference.ty], TypeRef::Path(p) if p.is_self_type()) =>
+        TypeRef::Reference(reference) if matches!(store.type_ref(reference.ty), TypeRef::Path(p) if p.is_self_type()) =>
         {
             out.text("&");
             if let Some(lifetime) = reference.lifetime {
@@ -889,20 +903,20 @@ fn self_param(sig: &Sig<'_>, out: &mut Code, ty: TypeRefId, store: &ExpressionSt
 
 /// The parameter names as rustdoc shows them: a binding's name without `mut` or `ref`, another
 /// pattern as written.
-fn param_names(db: &RootDatabase, func: hir::Function) -> Vec<Option<String>> {
-    use hir::HasSource;
-    let Some(source) = func.source(db) else { return vec![] };
+fn param_names(db: &Db, func: hir::Function) -> Vec<Option<String>> {
+    use hir::view::HasSourceView;
+    let Some(source) = func.source_view(db) else { return vec![] };
     let Some(list) = source.value.param_list() else { return vec![] };
     let mut out = vec![];
     if list.self_param().is_some() {
         out.push(None);
     }
     for param in list.params() {
-        let name = param.pat().map(|pat| match &pat {
+        let name = param.pat().map(|pat| match pat {
             ast::Pat::IdentPat(ident) if ident.pat().is_none() => {
                 ident.name().map_or_else(|| "_".to_owned(), |it| it.text().to_owned())
             }
-            other => squash(&other.syntax().text().to_string()),
+            other => squash(other.syntax().text()),
         });
         out.push(Some(name.unwrap_or_else(|| "_".to_owned())));
     }
@@ -921,7 +935,7 @@ pub(crate) struct Fields {
 /// A struct, union or enum variant's fields as the declaration lists them: public ones (all
 /// when documenting private items), the rest as `/* private fields */`.
 fn fields_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     variant: VariantId,
     module: hir::Module,
@@ -1004,7 +1018,7 @@ fn fields_decl(
 }
 
 /// The type of one field, for its entry under "Fields".
-pub(crate) fn field_type(db: &RootDatabase, places: Linking<'_>, field: hir::Field) -> Code {
+pub(crate) fn field_type(db: &Db, places: Linking<'_>, field: hir::Field) -> Code {
     let variant: VariantId = field.parent_def(db).into();
     let fields = VariantFields::of(db, variant);
     let sig = Sig::new(
@@ -1021,7 +1035,7 @@ pub(crate) fn field_type(db: &RootDatabase, places: Linking<'_>, field: hir::Fie
 }
 
 /// A variant as its entry shows it: `Name(u8)`, `Name { .. }` with its fields, `Name = 3`.
-pub(crate) fn variant(db: &RootDatabase, places: Linking<'_>, variant: hir::EnumVariant) -> Code {
+pub(crate) fn variant(db: &Db, places: Linking<'_>, variant: hir::EnumVariant) -> Code {
     let mut out = Code::default();
     out.push(Piece::Name(variant.name(db).as_str().to_owned(), Kind::Variant));
     let id: hir_def::EnumVariantId = variant.into();
@@ -1035,7 +1049,7 @@ pub(crate) fn variant(db: &RootDatabase, places: Linking<'_>, variant: hir::Enum
 
 /// A struct's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn struct_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Struct,
     show_private: bool,
@@ -1088,7 +1102,7 @@ fn trim_leading_space(mut code: Code) -> Code {
 
 /// A union's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn union_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Union,
     show_private: bool,
@@ -1119,7 +1133,7 @@ pub(crate) fn union_decl(
 
 /// An enum's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn enum_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Enum,
     alias: Option<&Aliased>,
@@ -1165,19 +1179,14 @@ pub(crate) fn enum_decl(
 }
 
 /// `#[repr(..)]` and `#[non_exhaustive]`, which rustdoc shows above a type.
-fn attributes(db: &RootDatabase, out: &mut Code, adt: AdtId) {
+fn attributes(db: &Db, out: &mut Code, adt: AdtId) {
     let flags = hir_def::attrs::AttrFlags::query(db, adt.into());
     if flags.contains(hir_def::attrs::AttrFlags::NON_EXHAUSTIVE) {
         out.push(Piece::Attribute("#[non_exhaustive]".to_owned())).text("\n");
     }
 }
 
-pub(crate) fn trait_header(
-    db: &RootDatabase,
-    places: Linking<'_>,
-    it: hir::Trait,
-    out: &mut Code,
-) -> Code {
+pub(crate) fn trait_header(db: &Db, places: Linking<'_>, it: hir::Trait, out: &mut Code) -> Code {
     let id: TraitId = it.into();
     let data = TraitSignature::of(db, id);
     visibility(db, out, it.visibility(db), it.module(db));
@@ -1197,7 +1206,7 @@ pub(crate) fn trait_header(
         .iter()
         .filter_map(|pred| match pred {
             WherePredicate::TypeBound { lifetimes: None, target, bound }
-                if matches!(data.store[*target], TypeRef::TypeParam(p)
+                if matches!(data.store.type_ref(*target), TypeRef::TypeParam(p)
                     if data.generic_params[p.local_id()].is_trait_self()) =>
             {
                 Some(bound)
@@ -1220,7 +1229,7 @@ pub(crate) fn trait_header(
 }
 
 pub(crate) fn type_alias(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::TypeAlias,
     context: FnContext,
@@ -1262,14 +1271,10 @@ pub(crate) struct Aliased {
     where_clause: Code,
 }
 
-pub(crate) fn aliased(
-    db: &RootDatabase,
-    places: Linking<'_>,
-    it: hir::TypeAlias,
-) -> Option<Aliased> {
+pub(crate) fn aliased(db: &Db, places: Linking<'_>, it: hir::TypeAlias) -> Option<Aliased> {
     let id: TypeAliasId = it.into();
     let data = TypeAliasSignature::of(db, id);
-    let TypeRef::Path(path) = &data.store[data.ty?] else { return None };
+    let TypeRef::Path(path) = data.store.type_ref(data.ty?) else { return None };
     let sig = sig_of(db, places, &data.store, id.into());
     let TypeNs::AdtId(adt_id) = sig.resolver.resolve_path_in_type_ns_fully(db, path)? else {
         return None;
@@ -1347,11 +1352,7 @@ fn head(
 }
 
 /// The type an alias stands for: `[u8]` of `type Target = [u8];`.
-pub(crate) fn alias_type(
-    db: &RootDatabase,
-    places: Linking<'_>,
-    it: hir::TypeAlias,
-) -> Option<Code> {
+pub(crate) fn alias_type(db: &Db, places: Linking<'_>, it: hir::TypeAlias) -> Option<Code> {
     let id: TypeAliasId = it.into();
     let data = TypeAliasSignature::of(db, id);
     let mut out = Code::default();
@@ -1360,7 +1361,7 @@ pub(crate) fn alias_type(
 }
 
 pub(crate) fn constant(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Const,
     context: FnContext,
@@ -1386,17 +1387,17 @@ pub(crate) fn constant(
 }
 
 /// A constant's value as written when it is short and simple, as rustdoc shows it.
-fn short_initializer(db: &RootDatabase, it: hir::Const) -> Option<String> {
-    use hir::HasSource;
-    let source = it.source(db)?;
+fn short_initializer(db: &Db, it: hir::Const) -> Option<String> {
+    use hir::view::HasSourceView;
+    let source = it.source_view(db)?;
     let body = source.value.body()?;
     let simple = matches!(body, ast::Expr::Literal(_) | ast::Expr::PathExpr(_))
-        || matches!(&body, ast::Expr::PrefixExpr(prefix) if matches!(prefix.expr(), Some(ast::Expr::Literal(_))));
-    let text = squash(&body.syntax().text().to_string());
+        || matches!(body, ast::Expr::PrefixExpr(prefix) if matches!(prefix.expr(), Some(ast::Expr::Literal(_))));
+    let text = squash(body.syntax().text());
     (simple && text.len() <= 60).then_some(text)
 }
 
-pub(crate) fn static_decl(db: &RootDatabase, places: Linking<'_>, it: hir::Static) -> Code {
+pub(crate) fn static_decl(db: &Db, places: Linking<'_>, it: hir::Static) -> Code {
     let id: hir_def::StaticId = it.into();
     let data = StaticSignature::of(db, id);
     let mut out = Code::default();
@@ -1415,7 +1416,7 @@ pub(crate) fn static_decl(db: &RootDatabase, places: Linking<'_>, it: hir::Stati
 }
 
 /// `impl<T: Clone> Trait<A> for Foo<T>` and its `where` clause.
-pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl) -> Code {
+pub(crate) fn impl_header(db: &Db, places: Linking<'_>, it: hir::Impl) -> Code {
     if let (Some(trait_), Some(adt)) = (it.trait_(db), it.self_ty(db).as_adt())
         && is_builtin_derive(db, it)
     {
@@ -1435,7 +1436,7 @@ pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl)
         if data.is_negative() {
             out.text("!");
         }
-        sig.path(&mut out, &data.store[trait_ref.path]);
+        sig.path(&mut out, data.store.path(trait_ref.path));
         out.text(" ").kw("for").text(" ");
     }
     sig.ty(&mut out, data.self_ty);
@@ -1445,12 +1446,12 @@ pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl)
 
 /// Whether `it` is the impl of a built-in derive (`#[derive(Clone)]`), which rustdoc shows as
 /// rustc's derive writes it, whatever rust-analyzer's expansion of it says.
-pub(crate) fn is_builtin_derive(db: &RootDatabase, it: hir::Impl) -> bool {
-    use hir::HasSource;
+pub(crate) fn is_builtin_derive(db: &Db, it: hir::Impl) -> bool {
+    use hir::view::HasSourceView;
     if ImplId::try_from(it).is_err() {
         return true;
     }
-    let Some(source) = it.source(db) else { return false };
+    let Some(source) = it.source_view(db) else { return false };
     source
         .file_id
         .macro_file()
@@ -1461,7 +1462,7 @@ pub(crate) fn is_builtin_derive(db: &RootDatabase, it: hir::Impl) -> bool {
 /// derived trait, as rustc's derive writes the impl; `bound` is that trait when it is not the
 /// one implemented, as `impl<T: PartialEq> StructuralPartialEq for Foo<T>`.
 pub(crate) fn derive_header(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     trait_: hir::Trait,
     bound: hir::Trait,
@@ -1524,7 +1525,7 @@ pub(crate) struct AdtParams {
     pub(crate) args: Vec<String>,
 }
 
-pub(crate) fn adt_params(db: &RootDatabase, places: Linking<'_>, adt: hir::Adt) -> AdtParams {
+pub(crate) fn adt_params(db: &Db, places: Linking<'_>, adt: hir::Adt) -> AdtParams {
     let def = GenericDefId::AdtId(adt.into());
     let (params, store) = GenericParams::with_store(db, def);
     let sig = sig_of(db, places, store, def);

@@ -1,0 +1,29 @@
+{
+  "id": "01242",
+  "from_lane": "query-unify-macros",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query-macros/src/input.rs"
+  ],
+  "what": "qu-build/qu-check1.log base-db lib.rs:165 E0106 (input FileText with an Option<&static str> field) was the input macro: fixed in main crates/blaze-query-macros/src/input.rs (the field accessor names its lifetime), regression field in tests/structs.rs. blaze-v2-qu needs main macros merged, which also brings parse_::set_lru_capacity (01221). resume_readers is the engine (R14), not macros.",
+  "state": "applied",
+  "created": "2026-10-31T03:08:02Z",
+  "updated": "2026-10-31T12:05:36Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:08:02Z",
+      "by": "query-unify-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:05:36Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "read; nothing to do"
+    }
+  ]
+}

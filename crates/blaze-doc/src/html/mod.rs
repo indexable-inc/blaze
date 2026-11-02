@@ -9,10 +9,10 @@
 use std::{
     fmt::Write as _,
     io,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{HashMap, HashSet};
 
 use crate::{
     markdown::{self, Context, Ids},
@@ -47,6 +47,21 @@ pub struct Written {
     pub source_pages: usize,
 }
 
+/// One file of the documentation: its path under `doc/`, `/`-separated, and its bytes.
+#[derive(Debug)]
+pub struct Page {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Every file of the documentation but `crates.js` ([`crates_list`]), which also names the
+/// crates earlier runs documented in the same directory.
+#[derive(Debug, Default)]
+pub struct Pages {
+    pub files: Vec<Page>,
+    pub written: Written,
+}
+
 struct Statics {
     css: String,
     js: String,
@@ -54,42 +69,22 @@ struct Statics {
 
 fn hash(text: &str) -> String {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = blaze_hash::FixedHasher::default();
     text.hash(&mut hasher);
     format!("{:08x}", hasher.finish() as u32)
 }
 
-/// Writes every page of `model` under `out` (`target/doc`), in parallel.
-pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
-    use rayon::prelude::*;
+/// Every page of `model`, made in parallel: item pages, each module's `sidebar-items.js`,
+/// source pages, each crate's `all.html` and search index, and the stylesheet and script.
+pub fn pages(model: &Model) -> Pages {
+    use blaze_graph::par;
     let statics = Statics {
         css: format!("static.files/blaze-{}.css", hash(CSS)),
         js: format!("static.files/blaze-{}.js", hash(JS)),
     };
-    std::fs::create_dir_all(out.join("static.files"))?;
-    std::fs::write(out.join(&statics.css), CSS)?;
-    std::fs::write(out.join(&statics.js), JS)?;
-    let names: FxHashSet<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
-
-    // Every directory first, then the pages in parallel.
-    let mut dirs: FxHashSet<PathBuf> = FxHashSet::default();
-    dirs.insert(out.join("search-index"));
-    for krate in &model.crates {
-        for item in &krate.items {
-            if item.kind == Kind::Module {
-                dirs.insert(out.join(module_dir(krate, item)));
-            }
-        }
-        for file in &krate.sources {
-            let path = out.join("src").join(&krate.name).join(&file.path);
-            if let Some(parent) = path.parent() {
-                dirs.insert(parent.to_owned());
-            }
-        }
-    }
-    for dir in &dirs {
-        std::fs::create_dir_all(dir)?;
-    }
+    let names: HashSet<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
+    let page = |path: String, text: String| Page { path, bytes: text.into_bytes() };
+    let mut files = vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
 
     let jobs: Vec<(usize, usize)> = model
         .crates
@@ -97,66 +92,68 @@ pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.items.len()).map(move |i| (k, i)))
         .collect();
-    let pages = jobs
-        .par_iter()
-        .map(|&(k, i)| {
-            let krate = &model.crates[k];
-            let item = &krate.items[i];
-            let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
-            let html = writer.item_page(i);
-            std::fs::write(out.join(page_path(krate, item)), html)?;
-            if item.kind == Kind::Module {
-                std::fs::write(
-                    out.join(module_dir(krate, item)).join("sidebar-items.js"),
-                    sidebar_items(krate, item),
-                )?;
-            }
-            Ok(1)
-        })
-        .collect::<io::Result<Vec<usize>>>()?
-        .len();
+    let items: Vec<Vec<Page>> = par::map(&jobs, |&(k, i)| {
+        let krate = &model.crates[k];
+        let item = &krate.items[i];
+        let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
+        let mut out = vec![page(page_path(krate, item), writer.item_page(i))];
+        if item.kind == Kind::Module {
+            let path = format!("{}/sidebar-items.js", module_dir(krate, item));
+            out.push(page(path, sidebar_items(krate, item)));
+        }
+        out
+    });
+    let pages = items.len();
+    files.extend(items.into_iter().flatten());
     let sources: Vec<(usize, usize)> = model
         .crates
         .iter()
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.sources.len()).map(move |f| (k, f)))
         .collect();
-    let source_pages = sources
-        .par_iter()
-        .map(|&(k, f)| {
-            let krate = &model.crates[k];
-            let file = &krate.sources[f];
-            let mut dir = vec!["src".to_owned(), krate.name.clone()];
-            dir.extend(file.path.split('/').map(str::to_owned));
-            dir.pop();
-            let writer = Writer::new(model, &names, &statics, k, dir);
-            let html = writer.source_page(f);
-            std::fs::write(
-                out.join("src").join(&krate.name).join(format!("{}.html", file.path)),
-                html,
-            )?;
-            Ok(1)
-        })
-        .collect::<io::Result<Vec<usize>>>()?
-        .len();
-    model.crates.par_iter().enumerate().try_for_each(|(k, krate)| -> io::Result<()> {
+    let source_files: Vec<Page> = par::map(&sources, |&(k, f)| {
+        let krate = &model.crates[k];
+        let file = &krate.sources[f];
+        let mut dir = vec!["src".to_owned(), krate.name.clone()];
+        dir.extend(file.path.split('/').map(str::to_owned));
+        dir.pop();
+        let writer = Writer::new(model, &names, &statics, k, dir);
+        page(format!("src/{}/{}.html", krate.name, file.path), writer.source_page(f))
+    });
+    let source_pages = source_files.len();
+    files.extend(source_files);
+    let per_crate: Vec<[Page; 2]> = par::map(par::enumerate(&model.crates), |(k, krate)| {
         let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
-        std::fs::write(out.join(&krate.name).join("all.html"), writer.all_items())?;
-        std::fs::write(
-            out.join("search-index").join(format!("{}.js", krate.name)),
-            search_index(krate),
-        )?;
-        Ok(())
-    })?;
-    write_crates_list(model, out)?;
-    Ok(Written { pages: pages + model.crates.len(), source_pages })
+        [
+            page(format!("{}/all.html", krate.name), writer.all_items()),
+            page(format!("search-index/{}.js", krate.name), search_index(krate)),
+        ]
+    });
+    files.extend(per_crate.into_iter().flatten());
+    Pages { files, written: Written { pages: pages + model.crates.len(), source_pages } }
 }
 
-/// `crates.js`: every crate documented under `out`, those of earlier runs kept.
-fn write_crates_list(model: &Model, out: &Path) -> io::Result<()> {
-    let path = out.join("crates.js");
-    let mut names: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
+/// Writes every page of `model` under `out` (`target/doc`), and `crates.js`.
+pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
+    let Pages { files, written } = pages(model);
+    for file in &files {
+        let path = out.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, &file.bytes)?;
+    }
+    let earlier = std::fs::read_to_string(out.join("crates.js")).ok();
+    let names: Vec<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
+    let list = crates_list(earlier.as_deref(), |name| out.join(name).join("index.html").exists(), &names);
+    std::fs::write(out.join("crates.js"), list)?;
+    Ok(written)
+}
+
+/// `crates.js`: every crate of `names`, and those `earlier` (the file as it was) named that
+/// still have their pages (`kept`), sorted.
+pub fn crates_list(earlier: Option<&str>, kept: impl Fn(&str) -> bool, names: &[&str]) -> String {
+    let mut listed: Vec<String> = earlier
         .and_then(|text| {
             let start = text.find('[')?;
             let end = text.rfind(']')?;
@@ -164,18 +161,15 @@ fn write_crates_list(model: &Model, out: &Path) -> io::Result<()> {
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|name| out.join(name).join("index.html").exists())
+        .filter(|name| kept(name))
         .collect();
-    for krate in &model.crates {
-        if !names.contains(&krate.name) {
-            names.push(krate.name.clone());
+    for name in names {
+        if !listed.iter().any(|it| it == name) {
+            listed.push((*name).to_owned());
         }
     }
-    names.sort();
-    std::fs::write(
-        path,
-        format!("window.BLAZE_CRATES = {};\n", serde_json::to_string(&names).unwrap()),
-    )
+    listed.sort();
+    format!("window.BLAZE_CRATES = {};\n", serde_json::to_string(&listed).unwrap())
 }
 
 fn module_dir(krate: &CrateDoc, module: &Item) -> String {
@@ -278,9 +272,9 @@ fn search_index(krate: &CrateDoc) -> String {
     )
 }
 
-struct Writer<'a> {
+pub(crate) struct Writer<'a> {
     model: &'a Model,
-    names: &'a FxHashSet<&'a str>,
+    names: &'a HashSet<&'a str>,
     statics: &'a Statics,
     k: usize,
     /// From the page's directory up to the documentation root: `../../`.
@@ -291,7 +285,7 @@ struct Writer<'a> {
 impl<'a> Writer<'a> {
     fn new(
         model: &'a Model,
-        names: &'a FxHashSet<&'a str>,
+        names: &'a HashSet<&'a str>,
         statics: &'a Statics,
         k: usize,
         dir: Vec<String>,
@@ -338,7 +332,7 @@ impl<'a> Writer<'a> {
         &self.model.crates[self.k]
     }
 
-    fn url(&self, target: &Target) -> Option<String> {
+    pub(crate) fn url(&self, target: &Target) -> Option<String> {
         match target {
             Target::Url(url) => Some(url.clone()),
             Target::Item(item) => {
@@ -357,7 +351,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn title(target: &Target) -> String {
+    pub(crate) fn title(target: &Target) -> String {
         match target {
             Target::Url(url) => url.clone(),
             Target::Item(item) => {
@@ -388,14 +382,12 @@ impl<'a> Writer<'a> {
     }
 
     fn docs_html(&self, doc: &Doc, heading_offset: u32) -> String {
-        let url = |t: &Target| self.url(t);
-        let cx = Context { url: &url, title: &Self::title, heading_offset };
+        let cx = Context { writer: self, heading_offset };
         markdown::render(doc, &cx, &mut self.ids.borrow_mut())
     }
 
     fn summary_html(&self, doc: &Doc) -> String {
-        let url = |t: &Target| self.url(t);
-        let cx = Context { url: &url, title: &Self::title, heading_offset: 1 };
+        let cx = Context { writer: self, heading_offset: 1 };
         markdown::summary(doc, &cx)
     }
 
@@ -1095,28 +1087,20 @@ impl<'a> Writer<'a> {
 
     fn trait_body(&self, item: &Item) -> String {
         let mut out = String::new();
-        let groups: [(&str, &str, Box<dyn Fn(&Member) -> bool>); 5] = [
+        let groups: [(&str, &str, fn(&Member) -> bool); 5] = [
             (
                 "required-associated-types",
                 "Required Associated Types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && !m.provided),
+                |m: &Member| m.kind == Kind::AssocType && !m.provided,
             ),
             (
                 "provided-associated-types",
                 "Provided Associated Types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && m.provided),
+                |m: &Member| m.kind == Kind::AssocType && m.provided,
             ),
-            (
-                "associated-constants",
-                "Associated Constants",
-                Box::new(|m: &Member| m.kind == Kind::AssocConst),
-            ),
-            (
-                "required-methods",
-                "Required Methods",
-                Box::new(|m: &Member| m.kind == Kind::TyMethod),
-            ),
-            ("provided-methods", "Provided Methods", Box::new(|m: &Member| m.kind == Kind::Method)),
+            ("associated-constants", "Associated Constants", |m: &Member| m.kind == Kind::AssocConst),
+            ("required-methods", "Required Methods", |m: &Member| m.kind == Kind::TyMethod),
+            ("provided-methods", "Provided Methods", |m: &Member| m.kind == Kind::Method),
         ];
         for (id, title, wanted) in groups {
             let members: Vec<&Member> = item.trait_items.iter().filter(|m| wanted(m)).collect();
@@ -1162,7 +1146,7 @@ impl<'a> Writer<'a> {
         out.push_str("<main><div class=\"width-limiter\">");
         out.push_str(&self.topbar());
         out.push_str("<section id=\"main-content\" class=\"content\"><div class=\"main-heading\"><h1>List of all items</h1></div>");
-        let mut by_kind: FxHashMap<Kind, Vec<(String, String)>> = FxHashMap::default();
+        let mut by_kind: HashMap<Kind, Vec<(String, String)>> = HashMap::default();
         for item in &krate.items {
             if item.kind == Kind::Module && item.name.is_empty() {
                 continue;

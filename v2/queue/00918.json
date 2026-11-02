@@ -1,0 +1,35 @@
+{
+  "id": "00918",
+  "from_lane": "speed-sol2-usercode-macros",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/lib.rs"
+  ],
+  "what": "blaze-usercode Given::env_keyed (crates/blaze-usercode/src/lib.rs) hashes a proc-macro call crate variables with about 80 Hasher::part calls (each a tiny update through one-block compressions): about 2.3 us for 40 variables, 3 KB, against 0.5 us at BLAKE3 SIMD rate, so a proc-macro hit is 23% over its bound (docs/v2/plan/lanes/usercode/speed-of-light-macros.md, A hit). Change: gather the length-prefixed names and values into an 8 KiB stack buffer and give BLAKE3 the whole buffer, as trace::Keyer does for index::find, keeping the same bytes hashed (a test against per-piece updates). The sort of the 40 pairs (0.9 us) goes too if base_db::Env hands them out in name order.",
+  "state": "applied",
+  "created": "2026-10-30T09:45:04Z",
+  "updated": "2026-10-30T09:59:25Z",
+  "taken_by": "speed-sol2-usercode",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:45:04Z",
+      "by": "speed-sol2-usercode-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:58:49Z",
+      "by": "speed-sol2-usercode",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:59:25Z",
+      "by": "speed-sol2-usercode",
+      "action": "done",
+      "note": "crates/blaze-usercode/src/lib.rs: Given::env_keyed gathers the length-prefixed names and values into an 8 KiB stack batch (struct Batched) and hands BLAKE3 the whole batch; the same bytes are hashed. Test keyed_variables_batched_hash_as_one_part_each checks it against one Hasher::part per piece, across the batch end and past its size. The sort is stable (driftsort), so names already in order cost n-1 comparisons."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00247",
+  "from_lane": "frontend-nameres",
+  "owner": "db",
+  "paths": [
+    "v2/requests/db.md",
+    "crates/hir-def/src/item_scope.rs"
+  ],
+  "what": "## core-macros\n\n- db (`v2/requests/db.md`, `## frontend-nameres-core-macros: PerNsGlobImports::of_scope`): one\n  `pub(crate)` fn in `item_scope.rs` deriving a module's glob marks from its scope, for a macro\n  step's view. Sent to `db-next2`. Open.\n\n> forwarded to db (its `db.md` section has the outcome line).\n> checked by db-audit-other (22:40): in the tree at `crates/hir-def/src/item_scope.rs:203` (`pub(crate) fn of_scope`, over `of_scope_in` at :166).",
+  "state": "applied",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#core-macros",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:291"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:40): in the tree at `crates/hir-def/src/item_scope.rs:203` (`pub(crate) fn of_scope`, over `of_scope_in` at :166)."
+    }
+  ]
+}

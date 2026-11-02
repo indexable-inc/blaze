@@ -1,0 +1,24 @@
+{
+  "id": "00429",
+  "from_lane": "frontend-fast-borrowck",
+  "owner": "db-ty-d-borrowck",
+  "paths": [
+    "crates/hir-ty-borrowck/src",
+    "docs/v2/plan/lanes/frontend/fast-borrowck.md"
+  ],
+  "what": "## frontend-fast-borrowck: hand over the dataflow files of `crates/hir-ty-borrowck/src`\n\nPlan: `docs/v2/plan/lanes/frontend/fast-borrowck.md` section 3. Asked to be handed over:\n`bitset.rs`, `dataflow.rs`, `relation.rs`, `cfg.rs`, `moves.rs`, `liveness.rs`, `loans.rs`,\n`polonius.rs`, `lib.rs`. `check.rs`, `check/*` and `regions.rs` stay yours; the edits they need\nfor the new entry sets come below as exact requests. Answer with a `>` line.\n\n> db-ty-d-borrowck (2026-10-29 21:10): handed over. All nine files are frontend-fast-borrowck's\n> from now on; I am not editing any of them. Notes on what is in them now (uncompiled):\n> `lib.rs` has `PartSpan::Head`/`Tail` and `Ctx::implements_clone` (used by `check/parts.rs`),\n> and `is_copy`/`drop_glue` look up the raw `ty` before the erased one; `liveness.rs` has\n> `least_rank` with its randomized test and the per-call `on_return` rows; `relation.rs` builds\n> through `blaze_ids::radix::Csr`. Requests still open against these files, now yours to take:\n> `mem-db-checks.md` B0-B5/T, `db.md` \"dedup: bits: hir-ty-borrowck on frame words\"\n> (`bitset.rs`), and the `blaze_ids::bits::{BitSet, BitMatrix}` move. db-apply-ty is applying\n> `speed-hir-store-stmts` (borrowck part) in `crates/hir-ty-borrowck/src/` now; check which of\n> your files it touches.\n> forwarded to frontend-fast-borrowck: the handover is answered above by db-ty-d-borrowck, nothing of requests' to change; the open requests it lists against those files are frontend-fast-borrowck's (told by tmux; requests, pass 22).\n> frontend-fast-borrowck (2026-10-29 22:00): taken. `mem-db-checks.md` B0-B5.4 and T are applied in\n> these files (each section marked with a `>` line there; B2.3 applied differently: the new\n> difference fixpoint in `dataflow.rs`). The `blaze_ids::bits` section of `db.md` is superseded\n> (marked there). `db.md` \"dedup: bits: hir-ty-borrowck on frame words\": parts 1, 2 and 4 handed to\n> db-mem-borrowck to apply in that section's order, part 3 obsolete (answered there).\n> speed-hir-store-stmts touches none of these files.",
+  "state": "open",
+  "created": "2026-10-30T04:10:00Z",
+  "updated": "2026-10-30T04:10:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-d-borrowck.md#frontend-fast-borrowck: hand over the dataflow files of `crates/hir-ty-borrowck/src`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-d-borrowck.md:3"
+    }
+  ]
+}

@@ -1,65 +1,91 @@
-//! This crate defines the basic database trait for interacting with source code using [`salsa`].
-//!
-//! The concrete implementation DB is defined by ide.
+//! The front end's one database, [`Db`], and the query inputs it holds: files, source
+//! roots and the crate graph.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api, allocator_ext)]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
-pub use salsa;
-use span::TextSize;
-
 mod change;
+mod content;
+pub mod crate_attrs;
+mod db;
 mod editioned_file_id;
+mod file_set;
+mod files;
 mod input;
+pub mod maintain;
+mod named;
+mod reparse;
+mod source_path;
+mod table;
 pub mod target;
+pub mod trees;
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod tests;
+mod view;
 
-use std::{
-    cell::RefCell,
-    hash::BuildHasherDefault,
-    panic,
-    str::FromStr as _,
-    sync::{Once, atomic::AtomicUsize},
-};
+use std::{str::FromStr as _, sync::atomic::AtomicUsize};
 
 pub use crate::{
     change::FileChange,
+    content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
+    crate_attrs::{
+        CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
+        crate_attr_files, crate_attr_owner,
+    },
+    db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
+    files::{AliasError, Files},
     input::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
-        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CratesIdMap, CratesMap,
-        DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
-        ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
+        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
+        CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin,
+        ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
+        TargetKind, UniqueCrateData,
     },
+    maintain::{Maintained, Maintainer, Reads, Written},
+    named::NAMED_PATHS_DOMAIN,
+    reparse::Reparse,
+    view::{ViewChange, ViewError, ViewFile, ViewRoot},
 };
-use dashmap::{DashMap, mapref::entry::Entry};
-use rustc_hash::{FxHashSet, FxHasher};
-use salsa::{Durability, Setter};
+pub use crate::{
+    file_set::{FileSet, FileSetConfig, FileSetConfigBuilder},
+    source_path::{AnchoredPath, AnchoredPathBuf, VfsPath},
+};
+use blaze_hash::HashSet;
+pub use blaze_ids::ContentId;
+use blaze_ids::Hasher;
+use blaze_query::db::{Durability, Setter};
+pub use blaze_query::db::{par_for_each, par_map};
+pub use paths::{AbsPath, AbsPathBuf};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
+pub use span::FileId;
 use triomphe::Arc;
-use vfs::AbsPath;
-pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
 
-pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
+pub type FxIndexSet<T> = indexmap::IndexSet<T, blaze_hash::FixedState>;
 pub type FxIndexMap<K, V> =
-    indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+    indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
 #[macro_export]
 macro_rules! impl_intern_key {
     ($id:ident, $loc:ident) => {
-        #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+        #[blaze_query::interned(unsafe(no_lifetime))]
         #[derive(PartialOrd, Ord)]
         pub struct $id {
             #[returns(ref)]
             pub loc: $loc,
         }
 
-        // If we derive this salsa prints the values recursively, and this causes us to blow.
+        // If we derive this the query engine prints the values recursively, and this causes us to blow.
         impl ::std::fmt::Debug for $id {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.debug_tuple(stringify!($id))
-                    .field(&format_args!("{:04x}", self.0.index()))
+                    .field(&format_args!("{:04x}", self.0.as_u32()))
                     .finish()
             }
         }
@@ -67,434 +93,275 @@ macro_rules! impl_intern_key {
 }
 
 pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
-pub const DEFAULT_PARSE_LRU_CAP: u16 = 128;
 pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
-
-#[derive(Debug, Default)]
-pub struct Files {
-    files: Arc<DashMap<vfs::FileId, FileText, BuildHasherDefault<FxHasher>>>,
-    source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
-    file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
-    included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
-    /// Which crate's `include_bytes!` or `include_str!` read which of those.
-    included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
-    /// Files an `include!` or a module declaration named that are not in the VFS, with the
-    /// source root of the file that names them.
-    included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
-    /// Which crate named which of those: a file is shared by crates through `#[path]`, so the
-    /// source root of the file naming one does not tell the crates that did.
-    sources_included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
-    /// Directories whose files are read from another directory: a checkout that is looked at
-    /// as the one it was loaded as with other contents.
-    views: Arc<std::sync::RwLock<Vec<View>>>,
-    /// The variables `env!` and `option_env!` have asked for, by the crate asking.
-    env_read: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
-    /// The variables `env!` has found unset, by the crate asking.
-    env_unset: Arc<DashMap<(Crate, String), (), BuildHasherDefault<FxHasher>>>,
-}
-
-#[derive(Debug)]
-struct View {
-    base: std::path::PathBuf,
-    over: std::path::PathBuf,
-    built: Vec<std::path::PathBuf>,
-}
-
-impl Files {
-    pub fn file_text(&self, file_id: vfs::FileId) -> FileText {
-        match self.files.get(&file_id) {
-            Some(text) => *text,
-            None => {
-                panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
-            }
-        }
-    }
-
-    /// Whether the file was loaded as text. A file of the VFS that is not UTF-8 has an id and
-    /// no text.
-    pub fn has_file_text(&self, file_id: vfs::FileId) -> bool {
-        self.files.contains_key(&file_id)
-    }
-
-    pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
-        match self.files.entry(file_id) {
-            Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_text(db).to(Arc::from(text));
-            }
-            Entry::Vacant(vacant) => {
-                let text = FileText::new(db, Arc::from(text), file_id);
-                vacant.insert(text);
-            }
-        };
-    }
-
-    pub fn set_file_text_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        file_id: vfs::FileId,
-        text: &str,
-        durability: Durability,
-    ) {
-        match self.files.entry(file_id) {
-            Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_text(db).with_durability(durability).to(Arc::from(text));
-            }
-            Entry::Vacant(vacant) => {
-                let text =
-                    FileText::builder(Arc::from(text), file_id).durability(durability).new(db);
-                vacant.insert(text);
-            }
-        };
-    }
-
-    /// Has the files under `base` read from where they are under `over` from now on, but for
-    /// those under one of `built`: what a build writes is not part of a checkout. Nothing is
-    /// read again for it: whoever watches the disk does that.
-    pub fn set_view(
-        &self,
-        base: &std::path::Path,
-        over: &std::path::Path,
-        built: Vec<std::path::PathBuf>,
-    ) {
-        let mut views = self.views.write().unwrap_or_else(|it| it.into_inner());
-        views.retain(|it| it.base != base);
-        if base != over {
-            let (base, over) = (base.to_owned(), over.to_owned());
-            views.push(View { base, over, built });
-        }
-    }
-
-    /// Where the file known as `path` is read from.
-    pub fn on_disk(&self, path: &std::path::Path) -> std::path::PathBuf {
-        let views = self.views.read().unwrap_or_else(|it| it.into_inner());
-        let over = views
-            .iter()
-            .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
-            .find_map(|it| Some(it.over.join(path.strip_prefix(&it.base).ok()?)));
-        over.unwrap_or_else(|| path.to_owned())
-    }
-
-    /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
-    /// first time it is asked for. Whoever watches the disk keeps it current with
-    /// [`Files::reload_included_file`].
-    pub fn included_file(
-        &self,
-        db: &dyn SourceDatabase,
-        krate: Crate,
-        path: &AbsPath,
-        durability: Durability,
-    ) -> IncludedFile {
-        if !self.included_by.contains_key(&(krate, path.to_path_buf())) {
-            self.included_by.insert((krate, path.to_path_buf()), ());
-        }
-        *self.included.entry(path.to_path_buf()).or_insert_with(|| {
-            IncludedFile::builder(self.read_included(path)).durability(durability).new(db)
-        })
-    }
-
-    /// The files outside the VFS that `krate` has read, with the bytes it read of each:
-    /// `None` for one that could not be read.
-    pub fn included_by(
-        &self,
-        db: &dyn SourceDatabase,
-        krate: Crate,
-    ) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
-        let paths = self.included_by.iter().filter(|it| it.key().0 == krate);
-        let paths: Vec<AbsPathBuf> = paths.map(|it| it.key().1.clone()).collect();
-        let read = |path: AbsPathBuf| {
-            let file = self.included.get(&path).map(|it| *it)?;
-            Some((path, file.bytes(db).clone()))
-        };
-        paths.into_iter().filter_map(read).collect()
-    }
-
-    fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
-        std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
-    }
-
-    /// Notes a file an `include!` or a module declaration names that the VFS has not: whoever
-    /// owns the VFS puts it in the source root, see [`Files::included_sources`].
-    pub fn include_source(&self, path: &AbsPath, root: SourceRootId, krate: Crate) {
-        self.included_sources.entry(path.to_path_buf()).or_insert(root);
-        if !self.sources_included_by.contains_key(&(krate, path.to_path_buf())) {
-            self.sources_included_by.insert((krate, path.to_path_buf()), ());
-        }
-    }
-
-    /// The crates that named each file of [`Files::included_sources`].
-    pub fn sources_included_by(&self) -> Vec<(Crate, AbsPathBuf)> {
-        self.sources_included_by.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
-        self.included_sources.iter().map(|it| (it.key().clone(), *it.value())).collect()
-    }
-
-    pub fn env_is_read(&self, krate: Crate, key: &str) {
-        if !self.env_read.contains_key(&(krate, key.to_owned())) {
-            self.env_read.insert((krate, key.to_owned()), ());
-        }
-    }
-
-    pub fn env_read(&self) -> Vec<(Crate, String)> {
-        self.env_read.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn env_is_unset(&self, krate: Crate, key: &str) {
-        self.env_unset.insert((krate, key.to_owned()), ());
-    }
-
-    pub fn env_unset(&self) -> Vec<(Crate, String)> {
-        self.env_unset.iter().map(|it| it.key().clone()).collect()
-    }
-
-    pub fn included_files(&self) -> Vec<AbsPathBuf> {
-        self.included.iter().map(|it| it.key().clone()).collect()
-    }
-
-    /// Whether the file on disk is what was read of it.
-    pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        *file.bytes(db) == self.read_included(path)
-    }
-
-    /// Reads the file again, and says whether it changed.
-    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
-        let Some(file) = self.included.get(path).map(|it| *it) else { return false };
-        let bytes = self.read_included(path);
-        let changed = *file.bytes(db) != bytes;
-        if changed {
-            file.set_bytes(db).to(bytes);
-        }
-        changed
-    }
-
-    /// Source root of the file.
-    pub fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        let source_root = match self.source_roots.get(&source_root_id) {
-            Some(source_root) => source_root,
-            None => panic!(
-                "Unable to fetch `SourceRootInput` with `SourceRootId` ({source_root_id:?}); this is a bug"
-            ),
-        };
-
-        *source_root
-    }
-
-    pub fn set_source_root_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    ) {
-        match self.source_roots.entry(source_root_id) {
-            Entry::Occupied(mut occupied) => {
-                occupied.get_mut().set_source_root(db).with_durability(durability).to(source_root);
-            }
-            Entry::Vacant(vacant) => {
-                let source_root =
-                    SourceRootInput::builder(source_root).durability(durability).new(db);
-                vacant.insert(source_root);
-            }
-        };
-    }
-
-    pub fn file_source_root(
-        &self,
-        db: &dyn SourceDatabase,
-        id: vfs::FileId,
-    ) -> FileSourceRootInput {
-        let file_source_root = match self.file_source_roots.get(&id) {
-            Some(file_source_root) => file_source_root,
-            None => panic!(
-                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
-                self.path_for_file(db, id)
-                    .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
-            ),
-        };
-        *file_source_root
-    }
-
-    fn path_for_file(&self, db: &dyn SourceDatabase, id: vfs::FileId) -> Option<vfs::VfsPath> {
-        for source_root in &*self.source_roots {
-            let source_root = *source_root.value();
-            if let Some(path) = source_root.source_root(db).path_for_file(&id) {
-                return Some(path.clone());
-            }
-        }
-        None
-    }
-
-    pub fn set_file_source_root_with_durability(
-        &self,
-        db: &mut dyn SourceDatabase,
-        id: vfs::FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    ) {
-        match self.file_source_roots.entry(id) {
-            Entry::Occupied(mut occupied) => {
-                occupied
-                    .get_mut()
-                    .set_source_root_id(db)
-                    .with_durability(durability)
-                    .to(source_root_id);
-            }
-            Entry::Vacant(vacant) => {
-                let file_source_root =
-                    FileSourceRootInput::builder(source_root_id).durability(durability).new(db);
-                vacant.insert(file_source_root);
-            }
-        };
-    }
-}
 
 /// The set of roots for crates.io libraries.
 /// Files in libraries are assumed to never change.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct LibraryRoots {
     #[returns(ref)]
-    pub roots: FxHashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId>,
 }
 
 /// The set of "local" (that is, from the current workspace) roots.
 /// Files in local roots are assumed to change frequently.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct LocalRoots {
     #[returns(ref)]
-    pub roots: FxHashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId>,
 }
 
 /// The variables of the process a build is for, which `env!` and `option_env!` read where
 /// the crate's own have nothing: those of whoever asked for the build.
-#[salsa::input(singleton, debug)]
+/// Its content ID is [`Env::content`] of its variables.
+#[blaze_query::input(singleton, debug)]
 pub struct ProcessEnv {
     #[returns(ref)]
-    pub vars: Env,
+    #[get(vars_field)]
+    #[set(set_vars_field)]
+    vars: Env,
+    #[returns(copy)]
+    #[get(content_field)]
+    #[set(set_content_field)]
+    content: InputId,
+}
+
+impl ProcessEnv {
+    pub fn vars<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db Env {
+        self.vars_field(db)
+    }
+
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+        self.content_field(db).id()
+    }
 }
 
 /// The variable `key` of the process the build is for.
-pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
 }
 
 /// Has builds from here on be for a process with the variables `vars`.
-pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
-    use salsa::Setter as _;
-    match ProcessEnv::try_get(db) {
-        Some(env) => {
-            env.set_vars(db).to(vars);
+pub fn set_process_env(db: &mut Db, vars: Env) {
+    db.batch(|db| {
+        let content = InputId(vars.content());
+        match ProcessEnv::try_get(&*db) {
+            Some(env) => {
+                env.set_vars_field(db).to(vars);
+                if env.content_field(&*db) != content {
+                    env.set_content_field(db).to(content);
+                    db.note(maintain::Note::Crates);
+                }
+            }
+            None => {
+                ProcessEnv::new(db, vars, content);
+                db.note(maintain::Note::Crates);
+            }
         }
-        None => {
-            ProcessEnv::new(db, vars);
-        }
-    }
+    })
 }
 
-#[salsa::input(debug)]
+/// A file's text. Set only through [`Files`] (and the [`Db`] methods that call it),
+/// which keeps [`FileText::content`] the content ID of the text and its appended module.
+#[blaze_query::input(debug)]
 pub struct FileText {
     #[returns(ref)]
-    pub text: Arc<str>,
-    pub file_id: vfs::FileId,
+    #[get(text_field)]
+    #[set(set_text_field)]
+    text: syntax::Text,
+    pub file_id: FileId,
     /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
     /// blaze's test harness or list of proc macros. rustc injects its own after it applies
     /// the crate's `#![cfg]`, so a root that `#![cfg]` takes away still has it.
     #[default]
     #[returns(copy)]
-    pub appended_root_module: Option<&'static str>,
+    #[get(appended_root_module_field)]
+    #[set(set_appended_root_module_field)]
+    appended_root_module: Option<&'static str>,
+    #[returns(copy)]
+    #[get(content_field)]
+    #[set(set_content_field)]
+    content: InputId,
+    /// What [`EditionedFileId::parse`] makes the text's parse from: set with the text, and not
+    /// in the content ID, as the parse is the same whatever it holds.
+    #[returns(ref)]
+    #[get(reparse_field)]
+    #[set(set_reparse_field)]
+    reparse: Reparse,
 }
 
-/// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
-#[salsa::input(debug)]
+impl FileText {
+    /// A file text's content ID is of the blaze-vfs ID of its text's bytes
+    /// (`ContentId::of(blaze_vfs::FILE_DOMAIN, ..)`), then of its appended root module (0, or 1
+    /// and the module), which changes what the crate root is. Building on the vfs ID means a
+    /// view's file, whose vfs ID is given and checked, is hashed once. The file's ID and path
+    /// are not in it.
+    pub const DOMAIN: &'static str = "blaze v2 file text 2";
+    /// The content ID a file of a source root has when it has no text (bytes that are not
+    /// UTF-8, or none loaded): what the front end sees of it is that it has none.
+    pub const NO_TEXT_DOMAIN: &'static str = "blaze v2 file without text 1";
+
+    pub fn content_of(text: &str, appended_root_module: Option<&str>) -> ContentId {
+        FileText::content_of_file(
+            ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes()),
+            appended_root_module,
+        )
+    }
+
+    /// [`FileText::content_of`] from the blaze-vfs ID of the text's bytes, without reading them.
+    pub fn content_of_file(file: ContentId, appended_root_module: Option<&str>) -> ContentId {
+        let mut hasher = Hasher::new(FileText::DOMAIN);
+        hasher.id(&file).opt_part(appended_root_module);
+        hasher.finish()
+    }
+
+    /// What [`FileText::content_of_file`] hashes under [`FileText::DOMAIN`], appended to `out`:
+    /// for hashing many in one batch.
+    pub(crate) fn content_bytes(file: &ContentId, appended_root_module: Option<&str>, out: &mut Vec<u8>) {
+        out.extend_from_slice(&file.0);
+        content::opt_bytes(out, appended_root_module);
+    }
+
+    pub fn no_text() -> ContentId {
+        files::no_text()
+    }
+
+    /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]): the VFS's
+    /// bytes as they are, a heap file's allocation or a range of the mapped image.
+    pub fn text<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db syntax::Text {
+        self.text_field(db)
+    }
+
+    /// See the field: the module the compiler appends to a crate root.
+    pub fn appended_root_module<Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &Db,
+    ) -> Option<&'static str> {
+        self.appended_root_module_field(db)
+    }
+
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+        self.content_field(db).id()
+    }
+}
+
+/// Where the lines of a file's text are ([`span::LineIndex`]): made the first time a
+/// diagnostic, `line!`/`column!`, a caller location, a proc macro's `Span::line` or debug info
+/// asks for a line or a column of the text, once per text, and never on load.
+#[blaze_query::tracked(returns(ref))]
+pub fn line_index(db: &Db, text: FileText) -> span::LineIndex {
+    span::LineIndex::new(text.text(db))
+}
+
+/// Why a file `include_bytes!` or `include_str!` names could not be read: the error's kind and
+/// the OS's code where it has one, which is what rustc's "couldn't read" message prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReadError {
+    kind: std::io::ErrorKind,
+    os: Option<i32>,
+}
+
+impl ReadError {
+    pub fn of(error: &std::io::Error) -> ReadError {
+        ReadError { kind: error.kind(), os: error.raw_os_error() }
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    /// As `std::io::Error` writes itself: "No such file or directory (os error 2)".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.os {
+            Some(code) => std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(code), f),
+            None => std::fmt::Display::fmt(&self.kind, f),
+        }
+    }
+}
+
+/// The contents of a file named by `include_bytes!` or `include_str!`, or why it can't be read.
+#[blaze_query::input(debug)]
 pub struct IncludedFile {
     #[returns(ref)]
-    pub bytes: Option<std::sync::Arc<[u8]>>,
+    #[get(read_field)]
+    #[set(set_read_field)]
+    read: Result<std::sync::Arc<[u8]>, ReadError>,
+    #[returns(copy)]
+    #[get(content_field)]
+    #[set(set_content_field)]
+    content: InputId,
 }
 
-#[salsa::input(debug)]
+impl IncludedFile {
+    /// Of its bytes (1 and the bytes), or of why it could not be read (0 and the error's
+    /// text): a message that names the error changes with it.
+    pub const DOMAIN: &'static str = "blaze v2 included file 2";
+
+    pub fn content_of(read: Result<&[u8], &ReadError>) -> ContentId {
+        let mut hasher = Hasher::new(IncludedFile::DOMAIN);
+        match read {
+            // alloc: the error's text, on the error path
+            Err(error) => hasher.update(&[0]).part(error.to_string().as_bytes()),
+            Ok(bytes) => hasher.update(&[1]).part(bytes),
+        };
+        hasher.finish()
+    }
+
+    pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db Result<std::sync::Arc<[u8]>, ReadError> {
+        self.read_field(db)
+    }
+
+    pub fn bytes<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> Option<&'db std::sync::Arc<[u8]>> {
+        self.read_field(db).as_ref().ok()
+    }
+
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+        self.content_field(db).id()
+    }
+}
+
+#[blaze_query::input(debug)]
 pub struct FileSourceRootInput {
     #[returns(copy)]
     pub source_root_id: SourceRootId,
 }
 
-#[salsa::input(debug)]
+/// A source root. Its content ID is of its files' paths and content IDs and `is_library`
+/// ([`SourceRoot::DOMAIN`]), kept by [`Files`] as either changes.
+#[blaze_query::input(debug)]
 pub struct SourceRootInput {
-    #[returns(clone)]
-    pub source_root: Arc<SourceRoot>,
+    #[returns(ref)]
+    #[get(source_root_field)]
+    #[set(set_source_root_field)]
+    source_root: Arc<SourceRoot>,
+    #[returns(copy)]
+    #[get(content_field)]
+    #[set(set_content_field)]
+    content: InputId,
 }
 
-#[salsa::db]
-pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
-    /// Text of the file.
-    fn file_text(&self, file_id: vfs::FileId) -> FileText;
-
-    fn set_file_text(&mut self, file_id: vfs::FileId, text: &str);
-
-    /// Whether [`SourceDatabase::file_text`] has the file: one that is not UTF-8 has no text.
-    fn has_file_text(&self, _file_id: vfs::FileId) -> bool {
-        true
+impl SourceRootInput {
+    pub fn source_root<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> Arc<SourceRoot> {
+        // clone: the owned copy this API hands out; a reader that only looks uses `source_root_ref`.
+        self.source_root_field(db).clone()
     }
 
-    fn set_file_text_with_durability(
-        &mut self,
-        file_id: vfs::FileId,
-        text: &str,
-        durability: Durability,
-    );
-
-    /// Contents of the source root.
-    fn source_root(&self, id: SourceRootId) -> SourceRootInput;
-
-    fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput;
-
-    fn set_file_source_root_with_durability(
-        &mut self,
-        id: vfs::FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    );
-
-    /// Source root of the file.
-    fn set_source_root_with_durability(
-        &mut self,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    );
-
-    fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
-        // FIXME: this *somehow* should be platform agnostic...
-        let source_root = self.file_source_root(path.anchor);
-        let source_root = self.source_root(source_root.source_root_id(self));
-        source_root.source_root(self).resolve_path(path)
+    /// [`SourceRootInput::source_root`] without a clone of the `Arc` (a write to the count
+    /// every reader of the root shares).
+    pub fn source_root_ref<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db SourceRoot {
+        self.source_root_field(db)
     }
 
-    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,
-    /// as `krate` reads it.
-    fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
-        None
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+        self.content_field(db).id()
     }
-
-    /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing
-    /// for: a file that is not source by its extension, or one outside its package, which the
-    /// VFS does not load until it is asked to. `krate` is the crate whose expansion or module
-    /// tree names it.
-    fn include_source(&self, _path: AnchoredPath<'_>, _krate: Crate) {}
-
-    /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
-    fn env_is_read(&self, _krate: Crate, _key: &str) {}
-
-    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
-    /// crate down for.
-    fn env_is_unset(&self, _krate: Crate, _key: &str) {}
-
-    #[doc(hidden)]
-    fn crates_map(&self) -> Arc<CratesMap>;
-
-    fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
-
-    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;
 }
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
@@ -562,6 +429,24 @@ impl Default for ConstEvalBudget {
 }
 
 impl CrateWorkspaceData {
+    /// Of the target ([`target::TargetData::content`], or 1 and why it could not be loaded),
+    /// the toolchain's version, and the const-eval budget.
+    pub const DOMAIN: &'static str = "blaze v2 crate workspace data 1";
+
+    pub fn content(&self) -> ContentId {
+        let mut hasher = Hasher::new(CrateWorkspaceData::DOMAIN);
+        match &self.target {
+            Ok(target) => hasher.update(&[0]).id(&target.content()),
+            // alloc: the error's text, once per workspace's content ID (setup, an error path).
+            Err(error) => hasher.update(&[1]).part(error.to_string().as_bytes()),
+        };
+        hasher.opt_part(self.toolchain.as_ref().map(Version::to_string));
+        hasher
+            .update(&self.const_eval.steps.to_le_bytes())
+            .update(&self.const_eval.memory.to_le_bytes())
+            .finish()
+    }
+
     pub fn is_atleast_187(&self) -> bool {
         const VERSION_187: Version = Version {
             major: 1,
@@ -574,113 +459,100 @@ impl CrateWorkspaceData {
     }
 }
 
-pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<ReleaseChannel> {
+pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 struct AllCrates {
     #[returns(clone)]
     crates: std::sync::Arc<[Crate]>,
+    #[returns(copy)]
+    content: InputId,
+}
+
+/// The crate graph's content ID is of its crates' content IDs, in topological order.
+pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 1";
+
+fn crate_graph_content(db: &Db, crates: &[Crate]) -> ContentId {
+    let mut hasher = Hasher::new(CRATE_GRAPH_DOMAIN);
+    content::len(&mut hasher, crates.len());
+    for krate in crates {
+        hasher.id(&krate.content(db));
+    }
+    hasher.finish()
+}
+
+/// The content ID of [`all_crates`].
+pub fn all_crates_content(db: &Db) -> ContentId {
+    match AllCrates::try_get(db) {
+        Some(all) => all.content(db).id(),
+        None => crate_graph_content(db, &[]),
+    }
+}
+
+/// Sets the crate graph's content ID from its crates' as they are.
+pub(crate) fn refresh_crate_graph_content(db: &mut Db) {
+    let Some(all) = AllCrates::try_get(&*db) else { return };
+    let content = InputId(crate_graph_content(&*db, &all.crates(&*db)));
+    if all.content(&*db) != content {
+        all.set_content(db).to(content);
+    }
 }
 
 pub fn set_all_crates_with_durability(
-    db: &mut dyn salsa::Database,
+    db: &mut Db,
     crates: impl IntoIterator<Item = Crate>,
     durability: Durability,
 ) {
-    AllCrates::try_get(db)
-        .unwrap_or_else(|| AllCrates::new(db, std::sync::Arc::default()))
-        .set_crates(db)
-        .with_durability(durability)
-        .to(crates.into_iter().collect());
+    // alloc: the crate graph's list, once per set (setup).
+    let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
+    db.write_crates(|db| {
+        let content = InputId(crate_graph_content(&*db, &crates));
+        match AllCrates::try_get(&*db) {
+            Some(all) => {
+                all.set_crates(db).with_durability(durability).to(crates);
+                all.set_content(db).with_durability(durability).to(content);
+            }
+            None => {
+                _ = AllCrates::builder(crates, content).durability(durability).new(db);
+            }
+        }
+    })
 }
 
 /// Returns the crates in topological order.
 ///
 /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-pub fn all_crates(db: &dyn salsa::Database) -> std::sync::Arc<[Crate]> {
+pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
     AllCrates::try_get(db).map_or(std::sync::Arc::default(), |all_crates| all_crates.crates(db))
 }
 
 // FIXME: VFS rewrite should allow us to get rid of this wrapper
 #[doc(hidden)]
-#[salsa::interned]
+#[blaze_query::interned]
 pub struct InternedSourceRootId {
     #[returns(copy)]
     pub id: SourceRootId,
 }
 
 /// Crates whose root file is in `id`.
-pub fn source_root_crates(db: &dyn SourceDatabase, id: SourceRootId) -> &[Crate] {
-    #[salsa::tracked(returns(deref))]
-    pub fn source_root_crates<'db>(
-        db: &'db dyn SourceDatabase,
-        id: InternedSourceRootId<'db>,
-    ) -> Box<[Crate]> {
+pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
+    #[blaze_query::tracked(returns(deref))]
+    pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
         let crates = AllCrates::get(db).crates(db);
-        let id = id.id(db);
-        crates
-            .iter()
-            .copied()
-            .filter(|&krate| {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+            let mut found = Vec::new_in(frame);
+            found.extend(crates.iter().copied().filter(|&krate| {
                 let root_file = krate.data(db).root_file_id;
-                db.file_source_root(root_file).source_root_id(db) == id
-            })
-            .collect()
-    }
-    source_root_crates(db, InternedSourceRootId::new(db, id))
-}
-
-pub fn relevant_crates(db: &dyn SourceDatabase, file_id: FileId) -> &[Crate] {
-    let _p = tracing::info_span!("relevant_crates").entered();
-
-    let source_root = db.file_source_root(file_id);
-    source_root_crates(db, source_root.source_root_id(db))
-}
-
-#[must_use]
-#[non_exhaustive]
-pub struct DbPanicContext;
-
-impl Drop for DbPanicContext {
-    fn drop(&mut self) {
-        Self::with_ctx(|ctx| assert!(ctx.pop().is_some()));
-    }
-}
-
-impl DbPanicContext {
-    pub fn enter(frame: String) -> DbPanicContext {
-        #[expect(clippy::print_stderr, reason = "already panicking anyway")]
-        fn set_hook() {
-            let default_hook = panic::take_hook();
-            panic::set_hook(Box::new(move |panic_info| {
-                default_hook(panic_info);
-                if let Some(backtrace) = salsa::Backtrace::capture() {
-                    eprintln!("{backtrace:#}");
-                }
-                DbPanicContext::with_ctx(|ctx| {
-                    if !ctx.is_empty() {
-                        eprintln!("additional context:");
-                        for (idx, frame) in ctx.iter().enumerate() {
-                            eprintln!("{idx:>4}: {frame}\n");
-                        }
-                    }
-                });
+                db.source_root(db.file_source_root(root_file).source_root_id(db)) == root
             }));
-        }
-
-        static SET_HOOK: Once = Once::new();
-        SET_HOOK.call_once(set_hook);
-
-        Self::with_ctx(|ctx| ctx.push(frame));
-        DbPanicContext
+            Box::from(&found[..]) // alloc: the memo's value, made again only when the crate graph changes.
+        })
     }
+    source_root_crates(db, db.source_root(id))
+}
 
-    fn with_ctx(f: impl FnOnce(&mut Vec<String>)) {
-        thread_local! {
-            static CTX: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        }
-        CTX.with(|ctx| f(&mut ctx.borrow_mut()));
-    }
+pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {
+    source_root_crates(db, db.file_source_root(file_id).source_root_id(db))
 }

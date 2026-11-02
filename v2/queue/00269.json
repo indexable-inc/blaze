@@ -1,0 +1,37 @@
+{
+  "id": "00269",
+  "from_lane": "usercode-bridge",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-expand/src/native/proc_macro",
+    "crates/blaze-macro-wasm/guest/proc_macro.rs",
+    "crates/blaze-expand/src/native/host.rs"
+  ],
+  "what": "## What exists\n\n- **The `proc_macro` a macro is compiled against:** `crates/blaze-expand/src/native/proc_macro/`\n  (crate `blaze-native-proc-macro`, root dep `native-proc-macro`). It is blaze's wasm guest's\n  `proc_macro` (`crates/blaze-macro-wasm/guest/proc_macro.rs`) with its imports answered in\n  process. Every question a macro asks goes through one trait, `__native::Host`\n  (`proc_macro/lib.rs`), which is set for the length of a call by `__native::with_host`. The\n  entry points are `__native::expand1(f, input, output)` and `expand2(f, attr, input, output)`.\n- **The host:** `crates/blaze-expand/src/native/host.rs`. It answers a span's text, file and\n  line as the wasm host does (`blaze-macro-wasm` `add_host`): the same number for the same span,\n  and the same question of the database for the same call.\n- **The entry:** `blaze_expand::native::expand(Expander, db: Option<&dyn SourceDatabase>, subtree,\n  attrs, def_site, call_site, mixed_site) -> Result<TopSubtree, ProcMacroExpansionError>`, with\n  `pub enum Expander { One(fn(TokenStream) -> TokenStream), Two(fn(TokenStream, TokenStream) ->\n  TokenStream) }`.\n  - Spans are numbered as the wasm host numbers them: the sites 1, 2 and 3, then the input's as\n    they first appear. So an output is the module's, token for token and span for span.\n  - `native::difference(a, b)` names the first token where two outputs part, for a verify mode\n    against the wasm or warm-server path.\n  - An expansion allocates only what its output keeps: the spans table and the encodings are\n    reused per thread.\n- **In flight (usercode-wire, frontend-tokens item 4):** `expand` passes the `TopSubtree`\n  itself, with no encoded bytes in between.\n\n> forwarded to fastcompile (with the file; see \"Asked of fastcompile\").",
+  "state": "applied",
+  "created": "2026-10-30T02:52:03Z",
+  "updated": "2026-10-30T14:24:28Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/usercode-bridge.md#What exists",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-bridge.md:9"
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Change 20's, taken up by crates/blaze-macro-eval/ (child fastcompile-macros): the proc-macro bridge, its evaluator and expander (src/expander.rs) live there; see docs/v2/plan/lanes/fastcompile/ and /tmp/blaze-lanes/v2-fastcompile-macros.md."
+    }
+  ]
+}

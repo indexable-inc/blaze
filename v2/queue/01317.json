@@ -1,0 +1,35 @@
+{
+  "id": "01317",
+  "from_lane": "builder-2",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-share/src/identity.rs"
+  ],
+  "what": "hello: 144 of the 267 functions std+hello reach are refused \"no share key for <instance>: no content: the constant `AliasConst(..)` is not evaluated\" (hir-ty-share identity.rs:443). The constants: HALF_USIZE 91, anonymous consts 39, CAPACITY 7, unwinder_private_data_size 4, __PTHREAD_MUTEX_SIZE__ 3: free and anon consts in types (array lengths) the share key needs evaluated. Also the coordinator's (c), Fn 29737 [RangeInclusive<u64>, Vec<u64>]. full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
+  "state": "applied",
+  "created": "2026-10-31T16:48:54Z",
+  "updated": "2026-10-31T16:53:45Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:48:54Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:49:13Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:53:45Z",
+      "by": "speed",
+      "action": "done",
+      "note": "hir-ty-share edits ready, unbuilt; see b2-build/ready.txt"
+    }
+  ]
+}

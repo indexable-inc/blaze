@@ -1,0 +1,24 @@
+{
+  "id": "00248",
+  "from_lane": "speed-hir",
+  "owner": "mem-format",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "docs/v2/plan/lanes/db/speed-of-light.md"
+  ],
+  "what": "## for speed-hir-defs-sigs (from speed-hir-store): one BLAKE3 pass for a signature's tree hash\n\n`crates/hir-def/src/signatures.rs` `fn tree_hash` (~L251) hashes the whole tree twice with\nSipHash, once per seed, for 128 bits. That's two passes over the item's text and words on every\n`SignatureSyntax` build. `expr_store::body::subtree_hash(tree, at) -> u128` (`pub(crate)`) is\none BLAKE3 pass over the same `hash_subtree` writes: the text and words go in as whole slices,\nwhich BLAKE3 hashes many chunks at a time with SIMD. Body trees use it already. The edit:\n\n```rust\n// before\n/// What `tree` is made of, as two 64-bit hashes of it.\nfn tree_hash(tree: &FlatTree) -> u128 {\n    use std::hash::{Hash, Hasher};\n    let half = |seed: u8| {\n        let mut hasher = std::hash::DefaultHasher::new();\n        seed.hash(&mut hasher);\n        tree.hash_subtree(0, &mut hasher);\n        u128::from(hasher.finish())\n    };\n    (half(0) << 64) | half(1)\n}\n// after\n/// What `tree` is made of: 128 bits of one BLAKE3 pass over it.\nfn tree_hash(tree: &FlatTree) -> u128 {\n    crate::expr_store::body::subtree_hash(tree, 0)\n}\n```\n\nSpeed: SipHash-1-3 costs about 1.5 cycles a byte, so two passes are about 3. BLAKE3 costs about\n0.3 cycles a byte with AVX-512 over a large tree, or about 1.3 with one chunk. Nothing persists\nthe hash.\nStatus: done another way by speed-hir-defs-sigs (2026-10-29 19:35). `SignatureSyntax` keeps no\nhash, and `tree_hash` is gone. Its `PartialEq` compares the tree by content\n(`*self.tree == *other.tree`, `FlatTree: PartialEq`). Salsa only compares when the query runs\nagain and an old value exists. The comparison is then about 2 memcmp passes over the outline,\nabout 0.1 cycles a byte against about 1.3 for one-chunk BLAKE3, and nothing is computed when the\nvalue is new. Being exact, it also can't collide and reuse a stale signature. Nothing calls\n`subtree_hash` from `signatures.rs`. The arithmetic is in\n`docs/v2/plan/lanes/db/speed-of-light.md`, section \"hir-def signatures\".\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n> mem-format-fwd: overtaken by `SignatureSyntax`/`FileOutline` comparing the tree by content (`FlatTree: PartialEq`); `signatures.rs` has no `tree_hash`. `body::subtree_hash` is now `tree.subtree_hash(at)` (`expr_store/body.rs` ~L491). Nothing to apply.",
+  "state": "open",
+  "created": "2026-10-30T02:35:00Z",
+  "updated": "2026-10-30T02:35:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-defs-sigs (from speed-hir-store): one BLAKE3 pass for a signature's tree hash",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:624"
+    }
+  ]
+}

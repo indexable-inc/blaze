@@ -1,0 +1,36 @@
+{
+  "id": "00952",
+  "from_lane": "speed-clone-front",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "crates/hir-def/src/expr_store.rs"
+  ],
+  "what": "signatures.rs:1640 (VariantFields of a variant with no fields): replace `// clone: of the empty store, which allocates nothing` + `store: ExpressionStore::empty().clone(),` with `store: ExpressionStore::empty_owned(),` (written in expr_store.rs: the same empty store as a value). That is the one clone of an ExpressionStore in the workspace; then drop `Clone` from the derives of `ExpressionOnlyStore` (expr_store.rs:137) and `ExpressionStore` (expr_store.rs:204), whose `// clone:` comments name this id, and delete those comments. Nothing else needs either derive (no holder derives Clone, no returns(clone), no T: Clone use).",
+  "state": "applied",
+  "created": "2026-10-30T11:16:52Z",
+  "updated": "2026-10-30T14:11:44Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:16:52Z",
+      "by": "speed-clone-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:44Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:11:44Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: signatures.rs uses ExpressionStore::empty_owned() (it was already in expr_store.rs); Clone dropped from the derives of ExpressionOnlyStore and ExpressionStore with their 00952 comments. Checked: no derive(Clone) type holds either by value, no other .clone() of one"
+    }
+  ]
+}

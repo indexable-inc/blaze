@@ -1,0 +1,41 @@
+{
+  "id": "01141",
+  "from_lane": "tests-diag",
+  "owner": "no-fallback-front-def",
+  "paths": [
+    "crates/hir-def/src/attrs/stability.rs"
+  ],
+  "what": "crates/hir-def/src/attrs/stability.rs forces_unstable: every CrateOrigin::Lang crate without staged_api gets FORCE_UNSTABLE (rustc_private), which includes the fixtures minicore `core` (Lang(Core), no staged_api), so every use of Sized/Iterator/... from minicore is E0658 `use of unstable library feature rustc_private` in 28 blaze-diagnostics UI tests. rustc: -Zforce-unstable-if-unmarked only matters for sysroot crates without staged_api; core/alloc/std/proc_macro/test always have staged_api in the real sysroot. Fix: `matches!(origin, CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other))`. Also, separately: block_owner (stability.rs:698) panics `no definition of its module holds the block` for a block expanded from a macro_rules called inside core::panic! (test tests::items::impls::drop_of_an_instantiation_of_its_type); parent_ancestors_with_macros_view seems not to climb out of the nested macro file.",
+  "state": "applied",
+  "created": "2026-10-30T22:23:59Z",
+  "updated": "2026-10-31T15:00:42Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:23:59Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:42Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> coord-1030: hir-def is listed for coord-1030's test-fix subagent in crate-holds.md, so db does not edit it. db checked the fix and it is rustc's rule: -Zforce-unstable-if-unmarked only changes crates without staged_api, and the real core/alloc/std/proc_macro/test always have staged_api, so this changes nothing for a real sysroot and frees minicore's core. Exact edit, crates/hir-def/src/attrs/stability.rs:320: `matches!(krate.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other))` (import LangCrateOrigin from base_db). The block_owner panic (stability.rs:698, a block from a macro_rules inside core::panic!) is a separate bug: give it back to db as its own item once hir-def is free. If hir-def's line in the ledger is stale, say so and db applies both"
+    },
+    {
+      "at": "2026-10-31T14:53:44Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Assigned to no-fallback-front-def (hir-def attrs/stability.rs). Round 7c: 98 blaze-diagnostics UI tests hit rustc_private and 6 hit the block_owner panic (tests-diag count)."
+    },
+    {
+      "at": "2026-10-31T15:00:42Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "uncompiled, rust-analyzer clean. (1) attrs/stability.rs forces_unstable: Lang(Dependency|Other) only (the real core/alloc/std/proc_macro/test always have staged_api, so a real sysroot is unchanged); test attrs::tests::stability::a_core_without_staged_api_is_not_forced_unstable. (2) two bugs behind the block_owner panic: hir-expand files.rs parent_with_macros stopped at a macro call that is its own expansion root (panic! expands to the bare call panic_2021!(..)), now climbs on; and block_owner looked for the definition only in the block's module, so a block with items inside another block with items (static_mut_refs) found none: it now walks out through the enclosing blocks' modules as nameres/demand.rs block_owner does. Test a_block_in_a_block_or_in_a_macro_call_of_a_macro_call_is_in_its_function."
+    }
+  ]
+}

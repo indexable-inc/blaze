@@ -1,0 +1,79 @@
+; Follows cranelift/filetests/filetests/runtests/stack.clif's vector widening loads, apart
+; from `stack.clif` because `cranelift-interpreter` leaves them unimplemented: through
+; `stack_addr` with an access offset and with a slot offset, little-endian, each lane
+; zero- or sign-extended.
+test run
+target x86_64
+target aarch64
+
+function %uload8x8(i64) -> i16x8 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store v0, v1+8
+    v2 = uload8x8 v1+8
+    return v2
+}
+; run: %uload8x8(0x0123456789abcdef) == [239 205 171 137 103 69 35 1]
+; run: %uload8x8(0xfedcba9876543210) == [16 50 84 118 152 186 220 254]
+
+function %sload8x8(i64) -> i16x8 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store v0, v1+8
+    v2 = sload8x8 v1+8
+    return v2
+}
+; run: %sload8x8(0x0123456789abcdef) == [-17 -51 -85 -119 103 69 35 1]
+; run: %sload8x8(0xfedcba9876543210) == [16 50 84 118 -104 -70 -36 -2]
+
+function %uload16x4(i64) -> i32x4 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0+4
+    store v0, v1
+    v2 = uload16x4 v1
+    return v2
+}
+; run: %uload16x4(0x0123456789abcdef) == [52719 35243 17767 291]
+; run: %uload16x4(0xfedcba9876543210) == [12816 30292 47768 65244]
+
+function %sload16x4(i64) -> i32x4 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0+4
+    store v0, v1
+    v2 = sload16x4 v1
+    return v2
+}
+; run: %sload16x4(0x0123456789abcdef) == [-12817 -30293 17767 291]
+; run: %sload16x4(0xfedcba9876543210) == [12816 30292 -17768 -292]
+
+function %uload32x2(i64) -> i64x2 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store v0, v1
+    v2 = uload32x2 v1
+    return v2
+}
+; run: %uload32x2(0x0123456789abcdef) == [2309737967 19088743]
+; run: %uload32x2(0xfedcba9876543210) == [1985229328 4275878552]
+
+function %sload32x2(i64) -> i64x2 {
+    ss0 = explicit_slot 16
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store v0, v1
+    v2 = sload32x2 v1
+    return v2
+}
+; run: %sload32x2(0x0123456789abcdef) == [-1985229329 19088743]
+; run: %sload32x2(0xfedcba9876543210) == [1985229328 -19088744]

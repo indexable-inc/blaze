@@ -1,0 +1,37 @@
+{
+  "id": "00418",
+  "from_lane": "codegen-mir",
+  "owner": "db",
+  "paths": [
+    "crates/intern",
+    "v2/requests/db.md",
+    "crates/hir-def/src/lang_item.rs"
+  ],
+  "what": "## 11. hir-def `src/lang_item.rs` (db-def): the `panic_const_*` lang items\n\nA failed `Assert` (overflow, bounds, division by zero, ..) unwinds with the message but\ndoesn't call core's `panic_const_add_overflow` and the rest, so std's panic hook and a\n`#[panic_handler]` don't see it. Wanted: the lang items `panic_const_add_overflow`, ..\n(rustc's `AssertKind::panic_function` list) and `panic_bounds_check`,\n`panic_misaligned_pointer_dereference`, `panic_null_pointer_dereference`, so the evaluator\ncalls them as rustc's codegen does.\n\n> forwarded to db (hir-def is db's; db-next2 told).\n> forwarded by db-audit-other (22:50) to format (through requests-next3). The `lang_item.rs` lines need 22 `sym::panic_const_*` names in `crates/intern` (format's), so the two halves must land as one change. `v2/requests/db.md` `## format (through requests-next3; from db-audit-other): the panic_const_* symbols and lang items` has the exact text for both and db's go for the `lang_item.rs` half. `panic_bounds_check`, `panic_misaligned_pointer_dereference` and `panic_null_pointer_dereference` are in already (`crates/hir-def/src/lang_item.rs:603-609`). Codegen finds these functions by path (`hir-ty-codegen/v2/refs.rs:1185`), so only the evaluator is left to call them.",
+  "state": "refused",
+  "created": "2026-10-30T04:06:19Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": "format/requests: the 22 sym::panic_const_* names are in crates/intern; db-audit-other forwarded both halves to format through requests-next3 to land as one change",
+  "source": "v2/requests/codegen-mir.md#11. hir-def `src/lang_item.rs` (db-def): the `panic_const_*` lang items",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir.md:191"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "format/requests: the 22 sym::panic_const_* names are in crates/intern; db-audit-other forwarded both halves to format through requests-next3 to land as one change"
+    }
+  ]
+}

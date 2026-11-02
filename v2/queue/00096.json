@@ -1,0 +1,35 @@
+{
+  "id": "00096",
+  "from_lane": "db-ty-lower",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/tests.rs"
+  ],
+  "what": "## 5. db-ty-hir: fixture tests in `crates/hir/src/tests.rs`\n\nWhat: three tests against the `TestDB` pattern there (fixture `//- /dep.rs crate:dep library`\nmakes a crate whose origin is not local, so its module-level items are batched):\n\n1. `a_dependency_batch_is_what_the_per_item_lowering_gives`: the same declarations in `dep`\n   (batched) and in `main` (a query per item): a struct of a few fields, a tuple struct, an\n   enum with two variants, an inherent impl and a trait impl with a where clause, all generic\n   over `T` and naming only std-free types. For each pair of same-named items, the field types\n   (`db.field_types(v).values()`, `ty().skip_binder()`), the impl self types, the impl traits and\n   `GenericPredicates::query_all(db, i.into())` print the same (their `Debug`, with the crate's\n   own ADTs replaced by their names), and `db.executed` shows `crate_field_types`,\n   `crate_impl_self_tys`, `crate_impl_traits` and `crate_impl_predicates` each ran once, for\n   `dep`, and `field_types_of_variant`, `impl_self_ty_of_impl`, `impl_trait_of_impl` only for\n   `main`'s items.\n2. `a_cold_batch_round_trips_with_its_types`: for `dep`'s `CrateFieldTypes::of(db, dep)`,\n   `CrateImplSelfTys`, `CrateImplTraits`, `CrateImplPredicates`: `ColdBatch::of_*(interner,\n   batch)`, `blaze_format::to_bytes`, `blaze_format::Aligned::copy_from`, `ColdBatch::read`,\n   then `.field_types(interner)` (and the like) equals the batch (`assert_eq!`, they derive\n   `PartialEq`); and the bytes of two writes are equal.\n3. `a_workspace_crate_has_no_batch`: `main`'s items never run a `crate_*` query.\n\nWhy: my files have unit tests for everything that needs no database (side tables, the cold\nform's columns and checks, the diagnostics' words, supertraits' order, the `params_in_repr`\nbitset); the type columns need interned types, which need a database, and hir-ty has none.\n\n> forwarded to db: `crates/hir/src/tests.rs` is inside lane db (db-ty-hir).\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:776` (`a_dependency_batch_is_what_the_per_item_lowering_gives`), `:817` (`a_cold_batch_round_trips_with_its_types`) and `:855` (`a_workspace_crate_has_no_batch`).",
+  "state": "applied",
+  "created": "2026-10-30T00:56:27Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-lower.md#5. db-ty-hir: fixture tests in `crates/hir/src/tests.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-lower.md:99"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:776` (`a_dependency_batch_is_what_the_per_item_lowering_gives`), `:817` (`a_cold_batch_round_trips_with_its_types`) and `:855` (`a_workspace_crate_has_no_batch`)."
+    }
+  ]
+}

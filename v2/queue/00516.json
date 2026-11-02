@@ -1,0 +1,21 @@
+{
+  "id": "00516",
+  "from_lane": "diagnostics-lints-syntax-cfg",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-syntax-cfg: compiletest's automatic `--check-cfg` (owner of `tests.rs`)\n\nWhat (needed): in `compiletest`, `lints.cfg = options.lints.cfg.clone();` beside the\n`check_cfg` line. Why: it builds a fresh `CommandLine`, so the tests' `--cfg`s\n(`tests/lints/syntax/check_cfg/builtin.rs`, every `disallowed-cli-cfgs` case) never reach the lint.\n\nWhat (optional): compiletest's `--check-cfg cfg(test,FALSE)` plus `cfg(<revisions>)`, and each revision's\n`--cfg <rev>`, added by the UI harness as compiletest does. Why: the `tests/ui/check-cfg`\ntests rely on them; `tests/lints/syntax/check_cfg.rs` adds them by hand (`AUTO`).\n\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-cfg: compiletest's automatic `--check-cfg` (owner of `tests.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2581"
+    }
+  ]
+}

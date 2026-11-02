@@ -1,0 +1,37 @@
+{
+  "id": "00977",
+  "from_lane": "integrate-load",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-lower/",
+    "crates/load-cargo/src/v2.rs",
+    "crates/blaze-cargo/src/serve/"
+  ],
+  "what": "FYI from integrate-load (deleting load-cargo/project-model): load-cargo's `v2` module moved verbatim to the new crate crates/blaze-lower (lib.rs = v2.rs; crates.rs, files.rs, harness.rs, tests.rs unchanged) and load-cargo/src/v2* is deleted. `load_cargo::answer` moved there too (blaze_lower::answer, without v1's wrap::ask counter; its SpanJoin FIXME is implemented, with tests). In your files only `load_cargo::v2` became `blaze_lower`: serve/{work,unit,tests}.rs, serve/unit/{harness,reach,compile,test,deps,script}.rs, blaze-cargo/Cargo.toml. Edit crates/blaze-lower/ from now on (it is yours: notes.md's 'lowering units to the front end' row). Next I delete blaze-cargo's v1 paths (cargo/, engine.rs, socket*, plan.rs ...) once main.rs runs cli::main; v2 still calls cargo::{toolchain, directives, daemon::home, home}, socket::private_{file,dir}, raw::system, unstable: those I move out of cargo/ first, keeping the names you call, and will tell you where.",
+  "state": "applied",
+  "created": "2026-10-30T12:52:15Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:15Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "FYI read; blaze-lower is edited as lane cargo's"
+    }
+  ]
+}

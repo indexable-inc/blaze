@@ -1,0 +1,37 @@
+{
+  "id": "00579",
+  "from_lane": "db-expand-macros",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs",
+    "crates/hir-expand/src/builtin/derive_macro.rs",
+    "crates/test-utils"
+  ],
+  "what": "## db-expand-macros: minicore's `marker::StructuralPartialEq` (coordinator, `crates/test-utils/src/minicore.rs`)\n\nWhat: in `pub mod marker`, before its closing brace (after `// endregion:const_param_ty`, ~L236):\n\n```rust\n    // region:eq\n    #[lang = \"structural_peq\"]\n    pub trait StructuralPartialEq {}\n    // endregion:eq\n```\n\nWhy: an expanded `#[derive(PartialEq)]` now writes `impl $crate::marker::StructuralPartialEq for T {}`\nbefore the `PartialEq` impl, as rustc's `expand_deriving_partial_eq` does (db-matchck's request\n11, `crates/hir-expand/src/builtin/derive_macro.rs`). In a fixture with `minicore: eq` and builtin\nderives expanded (`set_expand_builtin_derives(db, true)`), the path doesn't resolve without the\ntrait, and `hir-ty-matchck`'s `is_structural` can't find the impl. core has it at\n`core::marker::StructuralPartialEq` with lang item `structural_peq` (`LangItem::StructuralPeq`,\n`hir-def/src/lang_item.rs:485`).\n\n> forwarded to the coordinator (`crates/test-utils/`): on requests' coordinator list (requests, pass 24).",
+  "state": "applied",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-macros: minicore's `marker::StructuralPartialEq` (coordinator, `crates/test-utils/src/minicore.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:2568"
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `#[lang = \"structural_peq\"] pub trait StructuralPartialEq {}` in `mod marker`, region eq, after const_param_ty."
+    }
+  ]
+}

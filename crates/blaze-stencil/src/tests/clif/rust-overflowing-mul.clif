@@ -1,0 +1,109 @@
+; Shaped like what hir-ty-codegen makes for `i64::overflowing_mul`, `u64::overflowing_mul`,
+; `i32::overflowing_mul`, `u8::overflowing_mul`, a multiply by a constant and a debug
+; build's overflow-checked `*`: `smul_overflow`/`umul_overflow`, the result a scalar pair
+; (wrapped value, `bool` as `i8`).
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %i64_overflowing_mul(i64, i64) -> i64, i8 {
+block0(v0: i64, v1: i64):
+    v2, v3 = smul_overflow v0, v1
+    return v2, v3
+}
+; run: %i64_overflowing_mul(6, 7) == [42, 0]
+; run: %i64_overflowing_mul(-6, 7) == [-42, 0]
+; run: %i64_overflowing_mul(-1, -1) == [1, 0]
+; run: %i64_overflowing_mul(0, 0x8000000000000000) == [0, 0]
+; run: %i64_overflowing_mul(0x8000000000000000, 1) == [0x8000000000000000, 0]
+; run: %i64_overflowing_mul(0x8000000000000000, -1) == [0x8000000000000000, 1]
+; run: %i64_overflowing_mul(-1, 0x8000000000000000) == [0x8000000000000000, 1]
+; run: %i64_overflowing_mul(0x7fffffffffffffff, 2) == [-2, 1]
+; run: %i64_overflowing_mul(0x7fffffffffffffff, -1) == [0x8000000000000001, 0]
+; run: %i64_overflowing_mul(0x4000000000000000, -2) == [0x8000000000000000, 0]
+; run: %i64_overflowing_mul(0x4000000000000000, 2) == [0x8000000000000000, 1]
+; run: %i64_overflowing_mul(0x100000000, 0x100000000) == [0, 1]
+; run: %i64_overflowing_mul(3037000499, 3037000499) == [9223372030926249001, 0]
+; run: %i64_overflowing_mul(3037000500, 3037000500) == [-9223372036709301616, 1]
+; run: %i64_overflowing_mul(-3037000500, 3037000500) == [9223372036709301616, 1]
+
+function %u64_overflowing_mul(i64, i64) -> i64, i8 {
+block0(v0: i64, v1: i64):
+    v2, v3 = umul_overflow v0, v1
+    return v2, v3
+}
+; run: %u64_overflowing_mul(6, 7) == [42, 0]
+; run: %u64_overflowing_mul(0, 0xffffffffffffffff) == [0, 0]
+; run: %u64_overflowing_mul(0xffffffffffffffff, 1) == [-1, 0]
+; run: %u64_overflowing_mul(0xffffffffffffffff, 2) == [0xfffffffffffffffe, 1]
+; run: %u64_overflowing_mul(0xffffffffffffffff, 0xffffffffffffffff) == [1, 1]
+; run: %u64_overflowing_mul(0x100000000, 0xffffffff) == [0xffffffff00000000, 0]
+; run: %u64_overflowing_mul(0x100000000, 0x100000000) == [0, 1]
+; run: %u64_overflowing_mul(0x8000000000000000, 2) == [0, 1]
+; run: %u64_overflowing_mul(0x8000000000000000, 1) == [0x8000000000000000, 0]
+; run: %u64_overflowing_mul(3037000500, 3037000500) == [9223372037000250000, 0]
+
+function %i32_overflowing_mul(i32, i32) -> i32, i8 {
+block0(v0: i32, v1: i32):
+    v2, v3 = smul_overflow v0, v1
+    return v2, v3
+}
+; run: %i32_overflowing_mul(46340, 46340) == [2147395600, 0]
+; run: %i32_overflowing_mul(46341, 46341) == [-2147479015, 1]
+; run: %i32_overflowing_mul(0x7fffffff, 0x7fffffff) == [1, 1]
+; run: %i32_overflowing_mul(0x10000, 0x10000) == [0, 1]
+; run: %i32_overflowing_mul(0xffff, 0x10001) == [-1, 1]
+; run: %i32_overflowing_mul(-32768, 65536) == [0x80000000, 0]
+; run: %i32_overflowing_mul(32768, 65536) == [0x80000000, 1]
+; run: %i32_overflowing_mul(0x80000000, -1) == [0x80000000, 1]
+; run: %i32_overflowing_mul(-1, -1) == [1, 0]
+
+function %u8_overflowing_mul(i8, i8) -> i8, i8 {
+block0(v0: i8, v1: i8):
+    v2, v3 = umul_overflow v0, v1
+    return v2, v3
+}
+; run: %u8_overflowing_mul(15, 17) == [0xff, 0]
+; run: %u8_overflowing_mul(16, 16) == [0, 1]
+; run: %u8_overflowing_mul(0xff, 0xff) == [1, 1]
+; run: %u8_overflowing_mul(0x80, 2) == [0, 1]
+; run: %u8_overflowing_mul(0x80, 1) == [0x80, 0]
+; run: %u8_overflowing_mul(0, 0xff) == [0, 0]
+
+function %i64_times3(i64) -> i64, i8 {
+block0(v0: i64):
+    v1 = iconst.i64 3
+    v2, v3 = smul_overflow v0, v1
+    return v2, v3
+}
+; run: %i64_times3(0x2aaaaaaaaaaaaaaa) == [0x7ffffffffffffffe, 0]
+; run: %i64_times3(0x2aaaaaaaaaaaaaab) == [0x8000000000000001, 1]
+; run: %i64_times3(-3074457345618258602) == [-9223372036854775806, 0]
+; run: %i64_times3(0xd555555555555555) == [0x7fffffffffffffff, 1]
+
+function %panic_const_mul_overflow(i64) {
+block0(v0: i64):
+    trap user1
+}
+
+function %mul(i64, i64) -> i64 {
+    fn0 = %panic_const_mul_overflow(i64)
+
+block0(v0: i64, v1: i64):
+    v2, v3 = smul_overflow v0, v1
+    brif v3, block2, block1
+
+block1:
+    return v2
+
+block2 cold:
+    v4 = iconst.i64 0
+    call fn0(v4)
+    trap user1
+}
+; run: %mul(-3, 5) == -15
+; run: %mul(0x4000000000000000, -2) == 0x8000000000000000
+; trap: %mul(0x4000000000000000, 2)
+; trap: %mul(0x8000000000000000, -1)
+; trap: %mul(3037000500, 3037000500)

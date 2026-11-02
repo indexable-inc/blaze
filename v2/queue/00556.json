@@ -1,0 +1,36 @@
+{
+  "id": "00556",
+  "from_lane": "usercode-win-launcher",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve.rs",
+    "crates/blaze-core/src"
+  ],
+  "what": "## 3. cargo: the daemon on Windows runs the IOCP driver (`crates/blaze-cargo/src/serve.rs`, `serve`)\n\nWhat: the last arm (`not(any(linux, macos, bsd))`) starts `blaze_core::threads::Threads`, which\nfails every `Effect::Spawn` on Windows (\"processes and sockets are built on Unix only\"). On\nWindows it becomes:\n\n```rust\n    #[cfg(windows)]\n    {\n        let driver = blaze_core::iocp::Iocp::new(std::path::Path::new(\"/\"), threads).context(\"starting IOCP\")?;\n        run(driver.confined(confine).scratch(scratch), options, steps, runner)\n    }\n```\n\nwith the `Threads` arm's `cfg` narrowed to `not(any(linux, macos, freebsd, openbsd, netbsd,\nwindows))`. (`Iocp::scratch` is cargo's request to core for every driver, cargo.md \"To core,\n`crates/blaze-core/src/{uring,kqueue,threads,iocp}.rs`\".)\n\nWhy: without it no sandboxed run happens on Windows at all, warm launcher or not.\n\n> forwarded to cargo (requests, pass 20; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:41:54Z",
+  "updated": "2026-10-31T20:29:30Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/usercode-win-launcher.md#3. cargo: the daemon on Windows runs the IOCP driver (`crates/blaze-cargo/src/serve.rs`, `serve`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-win-launcher.md:224"
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:30Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "superseded by 00731 (applied): serve.rs:230 runs blaze_core::native, IOCP on Windows; other targets are a compile_error"
+    }
+  ]
+}

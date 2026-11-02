@@ -1,0 +1,39 @@
+{
+  "id": "00596",
+  "from_lane": "db-unsafeck",
+  "owner": "db",
+  "paths": [
+    "crates/hir",
+    "crates/hir/src/lib.rs",
+    "crates/hir/src/diagnostics.rs",
+    "crates/hir/src/semantics.rs",
+    "crates/hir/src/source_analyzer.rs"
+  ],
+  "what": "## 2. db-ty-next1: `hir` takes the unsafety check from `hir_ty_unsafeck`\n\nWhat, in files of `crates/hir/` that are not db-unsafeck's:\n- `crates/hir/src/lib.rs` (about line 211): drop `diagnostics::UnsafetyReason` from the\n  `hir_ide::{..}` re-export. It is an explicit re-export, so it shadows the glob\n  `diagnostics::*` that brings `hir_ty_unsafeck::UnsafetyReason` (re-exported from\n  `crates/hir/src/diagnostics.rs`). Left in place, `hir::UnsafetyReason` is the old enum, which\n  does not type-check against `MissingUnsafe::reason`.\n- `crates/hir/src/semantics.rs:36` and `crates/hir/src/source_analyzer.rs:39-41`: import\n  `unsafe_operations` and `InsideUnsafeBlock` from `hir_ty_unsafeck` instead of\n  `hir_ide::diagnostics`. The signatures are the same (`db`, `infer`, `ExpressionStoreOwnerId`,\n  `&ExpressionStore`, `ExprId`, `&mut dyn FnMut(ExprOrPatId, InsideUnsafeBlock)`).\nWhy: hir-ide's checker is deleted at integration, and the editor's highlighting should come\nfrom the same walk as the diagnostics. Told in tmux window `db-ty-next1`.\n\n> forwarded to db (window `db-next2`, told by tmux).\n> checked by db-audit-dbsub (2026-10-29 22:33): in the tree at `crates/hir/src/semantics.rs:42` and `crates/hir/src/source_analyzer.rs:51` (`use hir_ty_unsafeck::..`); `crates/hir/src/lib.rs` no longer re-exports `diagnostics::UnsafetyReason`, and `crates/hir/src/diagnostics.rs:743` re-exports `hir_ty_unsafeck::{UnsafeLint, UnsafetyReason}`.",
+  "state": "applied",
+  "created": "2026-10-30T05:33:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-unsafeck.md#2. db-ty-next1: `hir` takes the unsafety check from `hir_ty_unsafeck`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-unsafeck.md:15"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:33): in the tree at `crates/hir/src/semantics.rs:42` and `crates/hir/src/source_analyzer.rs:51` (`use hir_ty_unsafeck::..`); `crates/hir/src/lib.rs` no longer re-exports `diagnostics::UnsafetyReason`, and `crates/hir/src/diagnostics.rs:743` re-exports `hir_ty_unsafeck::{UnsafeLint, UnsafetyReason}`."
+    }
+  ]
+}

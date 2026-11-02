@@ -1,0 +1,24 @@
+{
+  "id": "00108",
+  "from_lane": "speed-runtime-vfs",
+  "owner": "safety",
+  "paths": [
+    "crates/blaze-vfs",
+    "v2/requests/speed.md"
+  ],
+  "what": "## From speed-runtime-vfs (2026-10-29): `crates/blaze-vfs` under unsafe.md, for safety-audit-edge and safety-model\n\n- Unsafe is only in `src/store.rs` (32 blocks, each with `// SAFETY:` and one unsafe op; every\n  `unsafe fn` is private with `# Safety`). Its API is safe: every read is checked against a\n  column length published with release, every push goes through the one `Writer` (`&mut\n  self`, never cloned) or a `Building` nobody else holds, and a reader reaches a table only\n  through a `Snapshot` holding its `blaze_reclaim` task. `lib.rs` says `#![deny(unsafe_code)]`\n  with `#[allow(unsafe_code)] mod store;` (`forbid` can't be lifted for one module).\n- Differential tests against safe references are in `src/store/tests.rs` (`Vec`, `FxHashMap`,\n  `Vec<String>`), plus the crate's model tests in `src/tests.rs`.\n- Model checking: `src/sync.rs` is the switch from model.md; `model_a_node_reads_whole_or_not_at_all`\n  (`#[cfg(blaze_check)]`) runs a writer adding a file and its directory against a reader. Its\n  manifest line is requested in v2/requests/speed.md until `blaze-check` is in the workspace.\n  Row for model.md's table: `blaze-vfs` | `store.rs` columns, index levels, table swap | vfs.\n- Untrusted bytes: the journal (`src/journal.rs`) is parsed with checked slicing after its\n  checksum; nothing is viewed zero-copy from it (a file's bytes are copied into an `Arc`).\n  safety-fuzz-vfs's entry point is `Vfs::recover(file, tags, bytes)`.\n\n> forwarded to safety: notes for safety-audit-edge, safety-model and safety-fuzz-vfs.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-runtime-vfs (2026-10-29): `crates/blaze-vfs` under unsafe.md, for safety-audit-edge and safety-model",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:458"
+    }
+  ]
+}

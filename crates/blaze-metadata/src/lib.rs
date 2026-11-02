@@ -14,17 +14,16 @@
 //! dependency of a registry package whose `.crate` cannot be fetched.
 
 mod graph;
-mod summary;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use blaze_hash::HashMap;
 use blaze_manifest::config::RegistryConfig;
-use blaze_manifest::config::schema::{
-    CargoResolverConfig, FeatureUnification, IncompatibleRustVersions,
-};
+use blaze_manifest::config::schema::FeatureUnification;
+use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::{SerializedPackage, export, export_package, root_manifest};
 use blaze_manifest::{Config, Context, Workspace};
@@ -36,12 +35,12 @@ use blaze_resolve::resolver::{
 };
 use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
 use blaze_resolve::{
-    Cfg, Dependency, IndexSummary, InternedString, MemRegistry, PackageId, PackageIdSpec,
-    PartialVersion, Platform, QueryKind, Registry, ResolveVersion, RustVersion, SourceId, Summary,
+    Cfg, Dependency, IndexSummary, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform,
+    QueryKind, Registry, ResolveVersion, RustVersion, SourceId, Summary, query_pinned,
 };
-use rustc_hash::FxHashMap;
+use blaze_units::read::{self as summary, Package};
 
-pub use crate::summary::Read;
+pub use blaze_units::Read;
 
 /// What is asked of the workspace, as `cargo metadata` or `cargo build` is asked.
 pub struct Asked<'a> {
@@ -59,8 +58,6 @@ pub struct Asked<'a> {
     /// `--filter-platform`: the target's triple and its `cfg`.
     pub platform: Option<TargetPlatform<'a>>,
     pub offline: bool,
-    /// blaze's store, which keeps `.crate` files by their sha256.
-    pub store: Option<Arc<dyn blaze_registry::Blobs>>,
     /// The release of the rustc that builds, as `rustc -vV` says it (`1.101.0-nightly`): the
     /// Rust version a resolve that honours `rust-version` prefers when no member names one.
     pub rustc_version: Option<&'a str>,
@@ -86,14 +83,6 @@ impl TargetPlatform<'_> {
     fn activates(&self, platform: &Platform) -> bool {
         platform.matches(self.triple, self.cfg)
     }
-}
-
-/// A package read for the metadata: where its manifest is, the manifest, and the source the
-/// lock file pins it to when it is not a path package.
-struct Package {
-    manifest_path: PathBuf,
-    manifest: Box<Manifest>,
-    locked_source: Option<String>,
 }
 
 /// The root manifest of the workspace the manifest at `manifest_path` is in, as
@@ -228,7 +217,7 @@ pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
 pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
     let relock =
         Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
-    let made = resolving_with(asked, None, Some(relock), |resolved, serialized, ids, _| {
+    let made = resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
         described(asked, &resolved, serialized, ids)
     })?;
     Ok(made.json)
@@ -244,7 +233,7 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     let Made { json, roots, unharnessed } = made(asked)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
-    let features: FxHashMap<&str, Vec<&str>> = nodes
+    let features: HashMap<&str, Vec<&str>> = nodes
         .filter_map(|node| {
             let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
             Some((node["id"].as_str()?, on.collect()))
@@ -356,7 +345,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
         units.release,
         units.profile,
     )?;
-    resolved(asked, None, |resolved| {
+    resolved(asked, as_asked(asked), |resolved| {
         let FeatureRoots { specs, members: member_features } = resolved.one_feature_resolve()?;
         let Resolved { ws, resolve, behavior, packages: reads, .. } = resolved;
         let profiles = blaze_manifest::profiles::Profiles::new(
@@ -379,7 +368,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
         let features =
             FeatureResolver::resolve(&packages, resolve, &member_features, &kinds, opts)?;
         let roots = resolved.selected_ids(&specs);
-        let mut by_id = FxHashMap::default();
+        let mut by_id = HashMap::default();
         for id in resolve.iter() {
             let manifest = resolved
                 .manifests
@@ -406,7 +395,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
 /// The workspace of an [`Asked`] resolved as cargo's `resolve_ws_with_opts` resolves it, before
 /// the feature resolver: what `cargo metadata` and `cargo tree` print from.
 pub struct Resolved<'a> {
-    pub ws: &'a Workspace<'a>,
+    pub ws: &'a Workspace<'a, Disk>,
     /// The resolve of the packages `specs` select, guided by the lock file.
     pub resolve: &'a blaze_resolve::Resolve,
     pub members: Members<'a>,
@@ -420,11 +409,11 @@ pub struct Resolved<'a> {
     /// `resolver.feature-unification`: which members the features are resolved for.
     pub unification: FeatureUnification,
     /// What was read of every package the lock file names.
-    pub packages: &'a FxHashMap<PackageId, Read>,
+    pub packages: &'a HashMap<PackageId, Read>,
     /// The manifest of every package the lock file names.
-    pub manifests: &'a FxHashMap<PackageId, &'a Manifest>,
+    pub manifests: &'a HashMap<PackageId, &'a Manifest>,
     /// The configuration the workspace was read with.
-    pub config: &'a Config,
+    pub config: &'a Config<Disk>,
 }
 
 /// One feature resolve of a build: the packages it selects, and the members it resolves the
@@ -490,14 +479,11 @@ impl<'a> Resolved<'a> {
     }
 }
 
-/// The packages a command selects of the workspace, from its members' ids.
-pub type Pick<'a> = &'a dyn Fn(&Workspace<'_>, &[PackageId]) -> Result<Vec<PackageIdSpec>>;
-
-/// Resolves the workspace of `asked` for the packages `pick` selects (none: as `asked.build`
-/// selects them, or every member), and hands it to `then`.
+/// Resolves the workspace of `asked` for the packages `pick` selects of it, from its members'
+/// ids, and hands it to `then`.
 pub fn resolved<R>(
     asked: &Asked<'_>,
-    pick: Option<Pick<'_>>,
+    pick: impl FnOnce(&Workspace<'_, Disk>, &[PackageId]) -> Result<Vec<PackageIdSpec>>,
     then: impl FnOnce(Resolved<'_>) -> Result<R>,
 ) -> Result<R> {
     resolving(asked, pick, |it, _, _| then(it))
@@ -529,7 +515,7 @@ pub fn locked(asked: &Asked<'_>) -> Result<Option<Locked>> {
 pub fn fetch_locked(asked: &Asked<'_>) -> Result<Option<usize>> {
     with_lock(asked, "fetch", |ctx, _, lock| {
         let offline = asked.offline || ctx.config.net_config()?.offline.unwrap_or(false);
-        let sources = sources(ctx, offline, asked.store.clone(), true, None)?;
+        let sources = sources(ctx, offline, true, None)?;
         Ok(fetch(&locked_ids(lock), lock.checksums(), ctx, &sources)?.len())
     })
 }
@@ -539,7 +525,7 @@ pub fn fetch_locked(asked: &Asked<'_>) -> Result<Option<usize>> {
 fn with_lock<R>(
     asked: &Asked<'_>,
     command: &str,
-    then: impl FnOnce(&Context, &Workspace<'_>, &blaze_resolve::Resolve) -> Result<R>,
+    then: impl FnOnce(&Context<Disk>, &Workspace<'_, Disk>, &blaze_resolve::Resolve) -> Result<R>,
 ) -> Result<Option<R>> {
     let mut config = Config::load(asked.cwd, asked.env.clone(), &[])?;
     config.start(command, asked.config)?;
@@ -549,7 +535,10 @@ fn with_lock<R>(
     let Ok(lock_text) = std::fs::read_to_string(root.join("Cargo.lock")) else {
         return Ok(None);
     };
-    let path_packages = path_packages(&ws, &root, &ctx)?;
+    let root_text = root_text(&root)?;
+    let root_table = summary::Root::new(&root, &root_text)?;
+    let replace = summary::replace_table(&root_table)?;
+    let path_packages = summary::path_packages(&ws, &root_table, &replace, &ctx)?;
     let mut path_deps = PathDeps::default();
     let members = ws.members().map(|(_, m)| m);
     for m in members.chain(path_packages.iter().map(|it| &*it.manifest)) {
@@ -563,7 +552,7 @@ fn with_lock<R>(
 
 /// The metadata of `asked`, and what of it a build of its members reads ([`Made`]).
 fn made(asked: &Asked<'_>) -> Result<Made> {
-    resolving(asked, None, |resolved, serialized, ids| described(asked, &resolved, serialized, ids))
+    resolving(asked, as_asked(asked), |resolved, serialized, ids| described(asked, &resolved, serialized, ids))
 }
 
 /// Resolves the workspace of `asked` again after its manifests changed, as `cargo remove`
@@ -572,7 +561,7 @@ fn made(asked: &Asked<'_>) -> Result<Made> {
 /// the packages `[patch]` names that the resolve did not use.
 pub fn relock(asked: &Asked<'_>, command: &str, locked: Option<&str>) -> Result<Vec<PackageId>> {
     let relock = Relock { command, locked, respect_source_config: true };
-    resolving_with(asked, None, Some(relock), |_, _, _, unused| Ok(unused.to_vec()))
+    resolving_with(asked, as_asked(asked), Some(relock), |_, _, _, unused| Ok(unused.to_vec()))
 }
 
 /// What a resolve that may change the lock file was asked by.
@@ -584,9 +573,19 @@ struct Relock<'a> {
     respect_source_config: bool,
 }
 
+/// The packages `asked.build` selects, or every member.
+fn as_asked(
+    asked: &Asked<'_>,
+) -> impl FnOnce(&Workspace<'_, Disk>, &[PackageId]) -> Result<Vec<PackageIdSpec>> {
+    move |ws, member_ids| match &asked.build {
+        None => Ok(member_ids.iter().map(|id| id.to_spec()).collect()),
+        Some(build) => selected(ws, member_ids, build),
+    }
+}
+
 fn resolving<R>(
     asked: &Asked<'_>,
-    pick: Option<Pick<'_>>,
+    pick: impl FnOnce(&Workspace<'_, Disk>, &[PackageId]) -> Result<Vec<PackageIdSpec>>,
     then: impl FnOnce(Resolved<'_>, Vec<SerializedPackage<'_>>, &[PackageId]) -> Result<R>,
 ) -> Result<R> {
     resolving_with(asked, pick, None, |it, serialized, ids, _| then(it, serialized, ids))
@@ -594,7 +593,7 @@ fn resolving<R>(
 
 fn resolving_with<R>(
     asked: &Asked<'_>,
-    pick: Option<Pick<'_>>,
+    pick: impl FnOnce(&Workspace<'_, Disk>, &[PackageId]) -> Result<Vec<PackageIdSpec>>,
     relock: Option<Relock<'_>>,
     then: impl FnOnce(Resolved<'_>, Vec<SerializedPackage<'_>>, &[PackageId], &[PackageId]) -> Result<R>,
 ) -> Result<R> {
@@ -604,7 +603,9 @@ fn resolving_with<R>(
     let ctx = Context::new(config);
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
     let root = ws.root().to_owned();
-    let replace = summary::replace_table(&root)?;
+    let root_text = root_text(&root)?;
+    let root_table = summary::Root::new(&root, &root_text)?;
+    let replace = summary::replace_table(&root_table)?;
     let lock_path = root.join("Cargo.lock");
     let lock_text = match std::fs::read_to_string(&lock_path) {
         Ok(text) => Some(text),
@@ -612,7 +613,7 @@ fn resolving_with<R>(
         Err(err) => return Err(err).with_context(|| format!("reading {}", lock_path.display())),
     };
 
-    let path_packages = path_packages(&ws, &root, &ctx)?;
+    let path_packages = summary::path_packages(&ws, &root_table, &replace, &ctx)?;
     let mut path_deps = PathDeps::default();
     let members = ws.members().map(|(_, m)| m);
     for m in members.chain(path_packages.iter().map(|it| &*it.manifest)) {
@@ -625,7 +626,7 @@ fn resolving_with<R>(
         None => None,
     };
     let respect = relock.is_none_or(|it| it.respect_source_config);
-    let sources = sources(&ctx, offline, asked.store.clone(), respect, None)?;
+    let sources = sources(&ctx, offline, respect, None)?;
     let fetched = match &lock {
         Some(lock) => fetch(&locked_ids(lock), lock.checksums(), &ctx, &sources)?,
         None => Vec::new(),
@@ -643,10 +644,10 @@ fn resolving_with<R>(
         }
         serialized.push(it);
     }
-    let mut reads = FxHashMap::default();
+    let mut reads = HashMap::default();
     let mut ids = Vec::with_capacity(serialized.len());
     for package in &serialized {
-        let mut read = summary::read(&serde_json::to_value(package)?)?;
+        let mut read = summary::read(package)?;
         let id = read.summary.package_id();
         if let Some(Some(checksum)) = lock.as_ref().and_then(|it| it.checksums().get(&id)) {
             read.summary.set_checksum(checksum.clone());
@@ -659,8 +660,8 @@ fn resolving_with<R>(
     for read in reads.values() {
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
-    let patch = summary::patch_tables(&root)?;
-    let by_path: FxHashMap<SourceId, Summary> = reads
+    let patch = summary::patch_tables(&root_table)?;
+    let by_path: HashMap<SourceId, Summary> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
@@ -671,11 +672,7 @@ fn resolving_with<R>(
     let members: Vec<&Summary> = member_summaries.iter().collect();
     let current =
         ws.members().position(|(path, _)| path == ws.current_manifest()).map(|at| member_ids[at]);
-    let behavior = match ws.resolve_behavior() {
-        blaze_manifest::features::ResolveBehavior::V1 => ResolveBehavior::V1,
-        blaze_manifest::features::ResolveBehavior::V2 => ResolveBehavior::V2,
-        blaze_manifest::features::ResolveBehavior::V3 => ResolveBehavior::V3,
-    };
+    let behavior = ws.resolve_behavior();
     let new_cli_feature_behavior = behavior != ResolveBehavior::V1 || ws.is_virtual();
     let members_of = || Members { members: &members, current, new_cli_feature_behavior };
     let member_rust_versions: Vec<RustVersion> = ws
@@ -691,14 +688,16 @@ fn resolving_with<R>(
         replace: &replace,
         require_optional_deps: true,
         version_ordering: VersionOrdering::MaximumVersionsFirst,
-        rust_versions: rust_versions(asked, &ctx, behavior, &member_rust_versions)?,
+        rust_versions: summary::rust_versions(
+            &ctx,
+            behavior,
+            &member_rust_versions,
+            asked.rustc_version,
+        )?,
         resolve_version: ResolveVersion::with_rust_version(lowest_rust_version.as_ref()),
+        offline_flag: offline.then_some("--offline"),
     };
-    let specs: Vec<PackageIdSpec> = match (pick, &asked.build) {
-        (Some(pick), _) => pick(&ws, &member_ids)?,
-        (None, None) => member_ids.iter().map(|id| id.to_spec()).collect(),
-        (None, Some(build)) => selected(&ws, &member_ids, build)?,
-    };
+    let specs = pick(&ws, &member_ids)?;
     let cli_features = CliFeatures::from_command_line(
         asked.features,
         asked.all_features,
@@ -708,7 +707,7 @@ fn resolving_with<R>(
         Some(build) if !build.dev_units => HasDevUnits::No,
         _ => HasDevUnits::Yes,
     };
-    let unification = feature_unification(&ctx.config)?;
+    let unification = summary::feature_unification(&ctx.config)?;
     let every_member: Vec<PackageIdSpec>;
     let resolved_for = match unification {
         FeatureUnification::Workspace => {
@@ -736,7 +735,7 @@ fn resolving_with<R>(
         if let Some(source) = &package.locked_source {
             it.set_source(source.clone());
         }
-        let mut read = summary::read(&serde_json::to_value(&it)?)?;
+        let mut read = summary::read(&it)?;
         let id = read.summary.package_id();
         if let Some(Some(checksum)) = whole.checksums().get(&id) {
             read.summary.set_checksum(checksum.clone());
@@ -760,7 +759,7 @@ fn resolving_with<R>(
             .with_context(|| format!("failed to write {}", lock_path.display()))?;
     }
     let unused_patches = whole.unused_patches().to_vec();
-    let manifests: FxHashMap<PackageId, &Manifest> = ws
+    let manifests: HashMap<PackageId, &Manifest> = ws
         .members()
         .map(|(_, m)| m)
         .chain(path_packages.iter().chain(&fetched).chain(&picked).map(|it| &*it.manifest))
@@ -782,17 +781,6 @@ fn resolving_with<R>(
         config: &ctx.config,
     };
     then(resolved, serialized, &ids, &unused_patches)
-}
-
-/// `resolver.feature-unification`, which nightly cargo reads only with `-Zfeature-unification`
-/// (`unstable.feature-unification`); `selected` otherwise.
-fn feature_unification(config: &Config) -> Result<FeatureUnification> {
-    let resolver = config.get::<CargoResolverConfig>("resolver")?;
-    let unstable = config.get::<Option<bool>>("unstable.feature-unification")?;
-    Ok(match (unstable, resolver.feature_unification) {
-        (Some(true), Some(it)) => it,
-        _ => FeatureUnification::Selected,
-    })
 }
 
 /// What `cargo metadata` prints of `resolved`, and what of it a build of its members reads.
@@ -828,21 +816,20 @@ fn described(
             let features =
                 FeatureResolver::resolve(&packages, targeted, &member_features, &kinds, opts)?;
             roots = resolved.selected_ids(&specs);
-            let activated = |platform: &Platform| packages.activates(platform);
             graph::of_build(
                 targeted,
                 &features,
                 &roots,
                 build.dev_units,
                 reads,
-                &activated,
+                &packages,
                 current,
             )?
         }
     };
 
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
-    let reached: FxHashMap<PackageId, usize> =
+    let reached: HashMap<PackageId, usize> =
         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
@@ -871,15 +858,15 @@ struct Made {
 }
 
 /// What the resolve graph and the feature resolver read of the packages.
-struct Packages<'a> {
-    reads: &'a FxHashMap<PackageId, Read>,
+pub(crate) struct Packages<'a> {
+    reads: &'a HashMap<PackageId, Read>,
     platform: Option<&'a TargetPlatform<'a>>,
     /// The host's platform, for what is built for it, when it is not `platform`.
     host: Option<&'a TargetPlatform<'a>>,
 }
 
 impl Packages<'_> {
-    fn activates(&self, platform: &Platform) -> bool {
+    pub(crate) fn activates(&self, platform: &Platform) -> bool {
         self.platform.is_none_or(|it| it.activates(platform))
     }
 
@@ -922,7 +909,7 @@ impl PackageTargets for Packages<'_> {
 /// The members `build` selects, as cargo's `Packages::from_flags` and `to_package_id_specs`
 /// select them.
 fn selected(
-    ws: &Workspace<'_>,
+    ws: &Workspace<'_, Disk>,
     member_ids: &[PackageId],
     build: &Build<'_>,
 ) -> Result<Vec<PackageIdSpec>> {
@@ -942,41 +929,10 @@ fn selected(
     Ok(ids.iter().map(|id| id.to_spec()).collect())
 }
 
-/// The path packages that are not members: those the members and the root's `[patch]` and
-/// `[replace]` name by path, and theirs in turn.
-fn path_packages(ws: &Workspace<'_>, root: &Path, ctx: &Context) -> Result<Vec<Package>> {
-    let members: Vec<PathBuf> =
-        ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
-    let mut queue = summary::patch_paths(root)?;
-    queue.extend(summary::replace_paths(&summary::replace_table(root)?));
-    for (path, m) in ws.members() {
-        queue.extend(path_dependencies(&serde_json::to_value(export_package(path, m))?));
-    }
-    let mut seen: Vec<PathBuf> = members.clone();
-    let mut read = Vec::new();
-    while let Some(dir) = queue.pop() {
-        if seen.contains(&dir) {
-            continue;
-        }
-        seen.push(dir.clone());
-        let manifest_path = dir.join("Cargo.toml");
-        let source = blaze_manifest::source::SourceId::for_path(&dir)?;
-        let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
-            bail!("{} is a path dependency with no package", manifest_path.display());
-        };
-        let json = serde_json::to_value(export_package(&manifest_path, &manifest))?;
-        queue.extend(path_dependencies(&json));
-        read.push(Package { manifest_path, manifest, locked_source: None });
-    }
-    Ok(read)
-}
-
-fn path_dependencies(package: &serde_json::Value) -> Vec<PathBuf> {
-    let deps = package["dependencies"].as_array().into_iter().flatten();
-    deps.filter(|it| it["source"].is_null())
-        .filter_map(|it| it["path"].as_str())
-        .map(|it| summary::normalize(Path::new(it)))
-        .collect()
+/// The text of the root manifest of the workspace at `root`.
+fn root_text(root: &Path) -> Result<String> {
+    let path = root.join("Cargo.toml");
+    std::fs::read_to_string(&path).with_context(|| path.display().to_string())
 }
 
 /// Every package of `lock` that is not a path package, the `[[patch.unused]]` entries too,
@@ -990,8 +946,8 @@ fn locked_ids(lock: &blaze_resolve::Resolve) -> Vec<PackageId> {
 /// with `checksums` those of a lock file or resolve.
 fn fetch(
     ids: &[PackageId],
-    checksums: &FxHashMap<PackageId, Option<String>>,
-    ctx: &Context,
+    checksums: &HashMap<PackageId, Option<String>>,
+    ctx: &Context<Disk>,
     sources: &blaze_registry::Sources,
 ) -> Result<Vec<Package>> {
     let mut locked = Vec::new();
@@ -1017,7 +973,7 @@ fn fetch(
     let mut read = Vec::with_capacity(texts.len());
     for (source_text, (dir, _)) in texts.into_iter().zip(roots) {
         let manifest_path = dir.join("Cargo.toml");
-        let source = manifest_source(&source_text, &ctx.config)?;
+        let source = summary::manifest_source(&source_text, &ctx.config)?;
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
             bail!("{} has no package", manifest_path.display());
         };
@@ -1036,30 +992,12 @@ impl Registry for Pinned<'_> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
-        let source = dep.source_id();
-        let registry = self.0.registry_of(source)?;
-        if kind == QueryKind::Exact && (registry.is_none() || dep.version_req().is_locked()) {
-            let mut found = false;
-            self.0
-                .others()
-                .query(dep, kind, &mut |it| {
-                    found = true;
-                    f(it)
-                })
-                .await?;
-            if found || source.is_path() {
-                return Ok(());
-            }
-            if registry.is_none() {
-                bail!(
-                    "`{}` of {} is not pinned by Cargo.lock, and blaze reads that source only \
-                     at the versions Cargo.lock pins",
-                    dep.package_name(),
-                    self.describe_source(source)
-                );
-            }
+        let registry = self.0.registry_of(dep.source_id())?;
+        let describe = |it: SourceId| self.describe_source(it);
+        if query_pinned(self.0.others(), registry.is_some(), dep, kind, f, describe).await? {
+            return Ok(());
         }
         self.0.query(dep, kind, f).await
     }
@@ -1073,40 +1011,11 @@ impl Registry for Pinned<'_> {
     }
 }
 
-/// The Rust versions the resolve prefers packages to support, as cargo's `resolve_with_previous`
-/// gives them: when `resolver.incompatible-rust-versions` is `fallback`, or unset with resolver
-/// 3, the members' `rust-version`s, or rustc's release if none names one.
-fn rust_versions(
-    asked: &Asked<'_>,
-    ctx: &Context,
-    behavior: ResolveBehavior,
-    members: &[RustVersion],
-) -> Result<Option<Vec<PartialVersion>>> {
-    let config: CargoResolverConfig = ctx.config.get("resolver")?;
-    let honours = match config.incompatible_rust_versions {
-        Some(IncompatibleRustVersions::Allow) => false,
-        Some(IncompatibleRustVersions::Fallback) => true,
-        None => behavior == ResolveBehavior::V3,
-    };
-    if !honours {
-        return Ok(None);
-    }
-    if members.is_empty() {
-        let rustc = asked.rustc_version.context(
-            "the resolve prefers packages that support the workspace's Rust version, no member \
-             names a `rust-version`, and the release of the rustc that builds is not known",
-        )?;
-        return Ok(Some(vec![rustc.parse()?]));
-    }
-    Ok(Some(members.iter().map(RustVersion::to_partial).collect()))
-}
-
 /// The sources packages are fetched from, `[source]` replacing those it names unless not
 /// `respect_source_config`.
 fn sources(
-    ctx: &Context,
+    ctx: &Context<Disk>,
     offline: bool,
-    store: Option<Arc<dyn blaze_registry::Blobs>>,
     respect_source_config: bool,
     auth: Option<Arc<blaze_registry::auth::Auth>>,
 ) -> Result<blaze_registry::Sources> {
@@ -1115,7 +1024,6 @@ fn sources(
         blaze_registry::http::HyperHttp::shared()?,
     );
     context.net.offline = offline;
-    context.store = store;
     context.auth = match auth {
         Some(auth) => Some(auth),
         None => Some(Arc::new(blaze_registry::auth::Auth::new(
@@ -1135,12 +1043,12 @@ fn sources(
 /// `ops::registry` reads it both ways), offline as `net.offline` says, with the command's
 /// credentials when it has them.
 pub fn registry_sources(
-    ctx: &Context,
+    ctx: &Context<Disk>,
     respect_source_config: bool,
     auth: Option<Arc<blaze_registry::auth::Auth>>,
 ) -> Result<blaze_registry::Sources> {
     let offline = ctx.config.net_config()?.offline.unwrap_or(false);
-    sources(ctx, offline, None, respect_source_config, auth)
+    sources(ctx, offline, respect_source_config, auth)
 }
 
 /// A package of the lock file as `cargo vendor` reads it.
@@ -1165,10 +1073,10 @@ pub fn vendored(
     locked: Option<&str>,
 ) -> Result<Vec<Vendored>> {
     let relock = Relock { command: "vendor", locked, respect_source_config };
-    resolving_with(asked, None, Some(relock), |_, _, _, _| Ok(()))?;
+    resolving_with(asked, as_asked(asked), Some(relock), |_, _, _, _| Ok(()))?;
     let read = with_lock(asked, "vendor", |ctx, _, lock| {
         let offline = asked.offline || ctx.config.net_config()?.offline.unwrap_or(false);
-        let sources = sources(ctx, offline, asked.store.clone(), respect_source_config, None)?;
+        let sources = sources(ctx, offline, respect_source_config, None)?;
         let mut out = Vec::new();
         let mut locked = Vec::new();
         let mut fetched = Vec::new();
@@ -1214,39 +1122,12 @@ pub fn vendored(
     read.context("a lock file the resolve just wrote")
 }
 
-/// The source of a package the lock file pins to `source`, as blaze-manifest names it.
-fn manifest_source(source: &str, config: &Config) -> Result<blaze_manifest::source::SourceId> {
-    use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};
-    use cargo_util_schemas::core::GitReference;
-    let (kind, rest) = source.split_once('+').context("a source with no kind")?;
-    match kind {
-        "registry" if rest == CRATES_IO_INDEX => SourceId::crates_io(config),
-        "registry" => Ok(SourceId::for_registry(&rest.parse()?)),
-        "sparse" => Ok(SourceId::for_registry(&source.parse()?)),
-        "git" => {
-            let mut url: url::Url = rest.parse()?;
-            let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
-            let reference = match (query.get("branch"), query.get("tag"), query.get("rev")) {
-                (Some(branch), _, _) => GitReference::Branch(branch.clone()),
-                (_, Some(tag), _) => GitReference::Tag(tag.clone()),
-                (_, _, Some(rev)) => GitReference::Rev(rev.clone()),
-                _ => GitReference::DefaultBranch,
-            };
-            url.set_fragment(None);
-            url.set_query(None);
-            Ok(SourceId::for_git(&url, reference))
-        }
-        _ => bail!("the source {source} is not one blaze reads yet"),
-    }
-}
-
 /// `[source]` and `[registries]` as blaze-registry takes them.
-fn source_config(config: &Config) -> Result<blaze_registry::SourceConfig> {
-    use blaze_manifest::source::SourceId;
-    use cargo_util_schemas::core::{GitReference, SourceKind};
+fn source_config(config: &Config<Disk>) -> Result<blaze_registry::SourceConfig> {
+    use blaze_resolve::{GitReference, SourceKind};
     let mut out = blaze_registry::SourceConfig::default();
     for (name, def) in config.source_configs()? {
-        let (replace_with, definition) = def.replace_with.clone().unzip();
+        let (replace_with, definition) = def.replace_with.unzip();
         let mut it = blaze_registry::SourceDef {
             replace_with,
             definition: definition.unwrap_or_default(),
@@ -1258,8 +1139,8 @@ fn source_config(config: &Config) -> Result<blaze_registry::SourceConfig> {
             }
             continue;
         }
-        let SourceId { kind, url, .. } = &def.id;
-        match kind {
+        let url = def.id.url();
+        match def.id.kind() {
             SourceKind::Registry | SourceKind::SparseRegistry => {
                 it.registry = Some(url.to_string());
             }
@@ -1274,7 +1155,7 @@ fn source_config(config: &Config) -> Result<blaze_registry::SourceConfig> {
                     GitReference::DefaultBranch => {}
                 }
             }
-            _ => bail!("`source.{name}` is not a source blaze reads yet"),
+            SourceKind::Path => bail!("`source.{name}` is not a source blaze reads yet"),
         }
         out.sources.push((name, it));
     }

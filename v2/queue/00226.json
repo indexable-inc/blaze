@@ -1,0 +1,24 @@
+{
+  "id": "00226",
+  "from_lane": "solver-sync-callers",
+  "owner": "fastcompile-ident-share",
+  "paths": [
+    "crates/hir-ty-share/src/walk.rs",
+    "crates/hir-ty-share"
+  ],
+  "what": "## Added 2026-10-29 19:25 (new sites only; earlier lines unchanged)\n\n> forwarded: each site to its section's owner, as above.\n\n### fastcompile-ident-share\n\n- `crates/hir-ty-share/src/walk.rs` L36: `next_solver::{AllocationData, Const, ConstKind, GenericArgs, Ty, TyKind, UnevaluatedConst},` → `next_solver::{AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId, GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind},`. R7.\n  > already ported (fastcompile-ident-share, 19:50): L36-39 import exactly this list, with no `UnevaluatedConst`, so nothing was applied.\n- `crates/hir-ty-share/src/walk.rs` L217: `let ConstKind::Unevaluated(UnevaluatedConst { def, args }) = konst.kind() else {` → `let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {`. R7. Then the match below becomes `match kind { AliasConstKind::Projection { def_id: TraitAssocConstId(id) } | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => { let (id, args) = lookup_impl_const(&cx.infcx, cx.env.param_env, id, args); db.const_eval(id, args, Some(cx.env)) } AliasConstKind::Anon { def_id } => db.anon_const_eval(def_id.0, args, Some(cx.env)), AliasConstKind::InherentSelf { .. } => return Err(Unshared::ConstEval(format!(\"`{konst:?}`: an inherent const in Self form after type check\"))) }`. The `StaticId` arm goes, as in hir-ty-codegen's `eval_const`, which this mirrors.\n  > already ported (fastcompile-ident-share, 19:50), so nothing was applied. L220 is `let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {`. L224-237 is this match: three kinds go through `lookup_impl_const` and `const_eval`, `Anon` goes to `anon_const_eval(def_id.0, ..)`, and `InherentSelf` is the error. There is no `StaticId` arm.\n- `crates/hir-ty-share/src/walk.rs` L867: `TyKind::FnDef(def, fn_args) => match def.0 {` → `TyKind::FnDef(def, fn_args) => match def.0 {`. R4: pattern unchanged; read `fn_args` as `fn_args.no_bound_vars().unwrap()` (once, `let fn_args = fn_args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.\n  > already ported (fastcompile-ident-share, 19:50), so nothing was applied. The site is now L880-881, `TyKind::FnDef(def, fn_args) => { let fn_args = fn_args.no_bound_vars().unwrap(); match def.0 {`. The other `FnDef` site in `callee()`, L740-741, reads `let args = args.no_bound_vars().unwrap();` once.\n\n> forwarded to fastcompile-ident-share (window `fastcompile-ident-share-next2`, told by tmux): `crates/hir-ty-share/` is its.",
+  "state": "open",
+  "created": "2026-10-30T02:25:00Z",
+  "updated": "2026-10-30T02:25:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-callers.md#Added 2026-10-29 19:25 (new sites only; earlier lines unchanged)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-callers.md:1356"
+    }
+  ]
+}

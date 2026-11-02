@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """unwinds.py: a daemon follows edits to functions that a panic unwinds through.
 
-Unless BLAZE_SPLICE=0 the edited functions are code added to the linked binary, which the unwinder
-has to find the frames of. Each step is compared with what `cargo build` of the same source prints.
+The unwinder has to find the frames of each edited function in the program the daemon builds.
+Each step is held to what a fresh build of the same source does (includes.py's `follow`).
 """
 from includes import follow
 
@@ -38,7 +38,7 @@ fn main() {
     }
 }
 """
-# (what the step is, [(file, old, new)], whether cargo rejects it)
+# (what the step is, [(file, old, new)], whether it does not build)
 STEPS = [
     ("nothing edited", [], False),
     ("the function that panics", [(MAIN, "n > 2", "n > 1")], False),

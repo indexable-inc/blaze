@@ -1,0 +1,36 @@
+{
+  "id": "00003",
+  "from_lane": "speed-link-edge-live",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/live.rs",
+    "docs/v2/plan/lanes/link/speed-link-edge-live.md"
+  ],
+  "what": "## 10. From speed-link-edge-live: encode the live message once, and a shorter AArch64 stub\n\nStatus: open. For lead `link` (`crates/blaze-link/src/live.rs`, `commit.rs`, `table.rs`). The\n`blaze-live` side is in place, and the bytes on the wire are unchanged. See\n`docs/v2/plan/lanes/link/speed-link-edge-live.md`.\n\n1. `live.rs` `message()`: each piece is copied (`self.new.bytes(piece).to_vec()`) into an owned\n   `Patch`. `blaze_live::patch::PatchRef<'a>` has the same fields, borrowing: `code` and `data`\n   are `&'a [(u64, &'a [u8])]`, and `rebase`, `cells`, `frames` and `windows` are slices. Build\n   the `(address, &[u8])` list over `self.new.bytes(piece)` and call\n   `PatchRef::encode_into(&mut out)`, which reserves `encoded_len()` and writes once.\n   `Patch::with(|it| ..)` gives the same view of an owned `Patch`, for tests.\n2. `commit.rs`: `Writes::message` is `Option<(u64, Message)>`, encoded in the step\n   (`message.encode()`). Carrying the bytes encoded by item 1 (`Option<(u64, Vec<u8>)>`) makes\n   one buffer, moved into the one `Effect::Write`, which already writes a temp file and renames\n   it. `RollBack` and `Restart` take `Message::encode_into` the same way.\n3. `table.rs` AArch64 stub (6 instructions now: `adrp`, `ldr` of the cell, `movz`, `movk`, `ldr\n   x16, [x16, x17]`, `br`): while `slot * 8 < 32768`, `adrp x16, cell; ldr x16, [x16,\n   :lo12:cell]; ldr x16, [x16, #slot*8]; br x16` (4). Up to 2^21 slots, add `add x16, x16,\n   #(slot*8 >> 12), lsl #12` before the load (5). Pad it to 24 bytes. That is one register and\n   two instructions fewer on every call; the loads stay address dependent, so the cell's release\n   store still orders the slots.\n\n> forwarded to link: lane link's paths.",
+  "state": "applied",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-30T09:41:50Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": "v2/requests/link.md#10. From speed-link-edge-live: encode the live message once, and a shorter AArch64 stub",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:370"
+    },
+    {
+      "at": "2026-10-30T09:41:50Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:50Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "1: live.rs message() builds a borrowing PatchRef over piece bytes and encode_into once (was already so). 2: commit.rs Writes::message is Option<(u64, Vec<u8>)>, the encoded bytes moved into the effect (was already so). 3: table.rs AArch64 stub 4/5/6 instructions by slot range, 24 bytes, see 00905."
+    }
+  ]
+}

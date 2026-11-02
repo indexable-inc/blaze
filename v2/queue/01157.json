@@ -1,0 +1,35 @@
+{
+  "id": "01157",
+  "from_lane": "speed",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "Andrew 15:56 bench ('full link: no executable to add to'): in v2 the same symptom happens whenever a link fails. `codegen::link` takes the kept image out (`images.swap_remove(at)`, codegen.rs:725) and returns on any `?` after that (native read, `stage`, `bytes`, test table) without putting it back, so the build after one failed link lays the whole image out again. A failed `Image::stage` leaves the image as it was (lib.rs 'a failed stage leaves nothing behind'), so it can be kept. Ask: on every error after line 725, push the image back as `KeptImage { path, kept: linked }` with the bookkeeping lists as they were before this call. Today `renamed(std::mem::take(&mut linked.names), ..)` and the statics take make that hard, so compute the new lists into locals and assign `linked.functions/statics/natives/names` only after `stage` and `bytes` succeed. Test: a link that fails (an undefined symbol), then a good one: the second stage is not `full()`.",
+  "state": "applied",
+  "created": "2026-10-30T23:03:23Z",
+  "updated": "2026-10-30T23:07:13Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:03:23Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:07:13Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:07:13Z",
+      "by": "speed",
+      "action": "done",
+      "note": "crates/blaze-cargo/src/serve/unit/codegen.rs link/relink: the kept image is always put back; its function/static/native lists are written only after Image::bytes succeeds, names restored on a refused stage"
+    }
+  ]
+}

@@ -1,9 +1,10 @@
 use super::RequestedFeatures;
-use super::dep_cache::RegistryQueryer;
+use super::dep_cache::{Query, RegistryQueryer};
 use super::errors::ActivateResult;
 use super::types::{ActivationsKey, ConflictMap, ConflictReason, FeaturesSet, ResolveOpts};
 use crate::graph::Graph;
 use crate::interning::InternedString;
+use crate::persistent;
 use crate::resolver::HashMap;
 use crate::resolver::HashSet;
 use crate::{Dependency, PackageId, Registry, Summary};
@@ -20,13 +21,13 @@ pub(super) struct ResolverContext {
     pub age: ContextAge,
     pub activations: Activations,
     /// list the features that are activated for each package
-    pub resolve_features: im_rc::HashMap<PackageId, FeaturesSet, rustc_hash::FxBuildHasher>,
+    pub resolve_features: persistent::HashMap<PackageId, FeaturesSet, blaze_hash::FixedState>,
     /// get the package that will be linking to a native library by its links attribute
-    pub links: im_rc::HashMap<InternedString, PackageId, rustc_hash::FxBuildHasher>,
+    pub links: persistent::HashMap<InternedString, PackageId, blaze_hash::FixedState>,
 
     /// a way to look up for a package in activations what packages required it
     /// and all of the exact deps that it fulfilled.
-    pub parents: Graph<PackageId, im_rc::HashSet<Dependency, rustc_hash::FxBuildHasher>>,
+    pub parents: Graph<PackageId, persistent::HashSet<Dependency, blaze_hash::FixedState>>,
 }
 
 /// When backtracking it can be useful to know how far back to go.
@@ -41,16 +42,16 @@ pub(super) type ContextAge = usize;
 /// semver compatible version of each crate.
 /// This all so stores the `ContextAge`.
 pub(super) type Activations =
-    im_rc::HashMap<ActivationsKey, (Summary, ContextAge), rustc_hash::FxBuildHasher>;
+    persistent::HashMap<ActivationsKey, (Summary, ContextAge), blaze_hash::FixedState>;
 
 impl ResolverContext {
     pub(super) fn new() -> ResolverContext {
         ResolverContext {
             age: 0,
-            resolve_features: im_rc::HashMap::default(),
-            links: im_rc::HashMap::default(),
+            resolve_features: persistent::HashMap::default(),
+            links: persistent::HashMap::default(),
             parents: Graph::new(),
-            activations: im_rc::HashMap::default(),
+            activations: persistent::HashMap::default(),
         }
     }
 
@@ -70,14 +71,14 @@ impl ResolverContext {
         let id = summary.package_id();
         let age: ContextAge = self.age;
         match self.activations.entry(id.as_activations_key()) {
-            im_rc::hashmap::Entry::Occupied(o) => {
+            persistent::Entry::Occupied(o) => {
                 debug_assert_eq!(
                     &o.get().0,
                     summary,
                     "cargo does not allow two semver compatible versions"
                 );
             }
-            im_rc::hashmap::Entry::Vacant(v) => {
+            persistent::Entry::Vacant(v) => {
                 if let Some(link) = summary.links()
                     && self.links.insert(link, id).is_some()
                 {
@@ -168,7 +169,7 @@ impl ResolverContext {
 
     pub(super) fn resolve_replacements(
         &self,
-        registry: &RegistryQueryer<'_, impl Registry>,
+        registry: &RegistryQueryer<'_, impl Registry, impl Query>,
     ) -> HashMap<PackageId, PackageId> {
         self.activations
             .values()

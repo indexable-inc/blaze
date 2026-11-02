@@ -1,0 +1,23 @@
+{
+  "id": "01298",
+  "from_lane": "tests-diag",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "test-utils minicore.rs lacks two things real core has, which blaze-diagnostics UI tests need. (1) Integer MIN/MAX: there is no `impl usize { pub const MAX }`, so tests::bodies::const_patterns::exclusive_ranges_one_apart_and_overlapping_endpoints_are_linted gets E0599 on `0..usize::MAX`. Proposal: in region int_impl (or a new region int_consts), add `pub const MIN: Self` and `pub const MAX: Self` to each impl_int type, with the type's values. (2) `impl Default for bool` (false) under default + builtin_impls; tests::lints::syntax::delims::values::a_labelled_break_of_a_name_before_a_block_keeps_its_parentheses gets E0277 `bool: Default`. I set that test's flags to `default, ord, builtin_impls`; for (1) tell me the flag name and I will add it to the const_patterns test.",
+  "state": "open",
+  "created": "2026-10-31T14:56:11Z",
+  "updated": "2026-10-31T14:56:11Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:56:11Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

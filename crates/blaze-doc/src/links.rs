@@ -8,6 +8,7 @@
 
 use std::ops::Range;
 
+use base_db::Db;
 use hir::{DocLinkDef, ModuleDef, Namespace};
 use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag};
 
@@ -38,7 +39,7 @@ pub(crate) fn markdown_links(markdown: &str) -> Vec<MarkdownLink> {
     let parser = Parser::new_with_broken_link_callback(markdown, options(), Some(&mut callback));
     let mut out = vec![];
     for (event, range) in parser.into_offset_iter() {
-        if let Event::Start(Tag::Link(kind, dest, _)) = event {
+        if let Event::Start(Tag::Link { link_type: kind, dest_url: dest, .. }) = event {
             out.push(MarkdownLink { kind, link: dest.to_string(), range });
         }
     }
@@ -364,7 +365,7 @@ pub(crate) enum Resolved {
 /// Resolves `link` as the docs on `def` have it, where an inner doc comment (`//!`) resolves in
 /// the module itself rather than its parent.
 pub(crate) fn resolve(
-    db: &ide_db::RootDatabase,
+    db: &Db,
     def: impl hir::HasAttrs + Copy,
     link: &Preprocessed,
     is_inner: hir::IsInnerDoc,

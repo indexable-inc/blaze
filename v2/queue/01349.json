@@ -1,0 +1,23 @@
+{
+  "id": "01349",
+  "from_lane": "cargo",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/key.rs"
+  ],
+  "what": "From blaze-builds-blaze run self2 (/Volumes/Projects/.coord-1030/b2-build/self2-self.log:385): crates_by_prefix (key.rs ~1101) panicked on two Crates of object@0.39.1's build-script-build with one key. Lane cargo fixed the cause in blaze-lower (lib.rs lower_into: units whose crate inputs are all equal, as cargo keeps two units apart for a profile's opt-level/debuginfo only, now share one Crate; test units_apart_only_in_what_the_front_end_does_not_read_are_one_crate). Two asks for key.rs: (1) no-fallback: the duplicate is a stop of the daemon by panic; make it a typed error naming both crates and their packages, returned to the build (crates_by_prefix -> Result, or the caller checks). (2) crate_key (key.rs:92) does not hash the crate's env, so two crates that differ only in env (OUT_DIR from two runs of one build script, env! values, CARGO_PKG_*) get one key and their items are taken for each other's; blaze-lower keeps them two crates. Hash krate.env(db) (sorted) into crate_key, or say why env cannot change what an item names.",
+  "state": "open",
+  "created": "2026-10-31T21:00:21Z",
+  "updated": "2026-10-31T21:00:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T21:00:21Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

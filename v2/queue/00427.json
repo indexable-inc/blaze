@@ -1,0 +1,36 @@
+{
+  "id": "00427",
+  "from_lane": "speed-link-edge-wire",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-api/src/server.rs",
+    "docs/v2/plan/lanes/ci/speed-link-edge-wire.md"
+  ],
+  "what": "## From speed-link-edge-wire: a sent buffer handed back (2026-10-29)\n\nFor `crates/blaze-api/src/server.rs`, the daemon's API listener. The numbers are in\n`docs/v2/plan/lanes/ci/speed-link-edge-wire.md`.\n\nK3. **`Done::Sent` carrying the `Vec<u8>` that `Effect::Send` took, emptied (length 0, capacity\n    kept): `Done::Sent(Vec<u8>)`, or a new `Done::SentBack(Vec<u8>)` beside it.**\n    - The server now encodes every reply straight into its connection's queue, and an idle\n      connection hands that queue to `Effect::Send` whole. The allocation left on the steady\n      path is the next queue, because the driver drops the one it sent. With the buffer back,\n      the queue is reused and a connection allocates nothing per reply once it is warm.\n    - io_uring and kqueue: return the buffer when the send completes. Threads driver and sim:\n      the same.\n    - K2 (`RecvInto`) serves the server too: `Frames` already adopts a received `Vec` when it\n      holds nothing, and with `RecvInto` it would pass its own buffer in, giving one copy\n      (kernel to frame buffer) and no allocation per receive. On Linux, registered buffers\n      (`IORING_REGISTER_BUFFERS`, provided-buffer rings) would also remove the per-receive\n      page pinning.\n\n> forwarded to coordinator: lane core is DONE and K3 (`Done::Sent` handing the buffer back) changes a completion in every driver (io_uring, kqueue, IOCP, threads, the simulation): new work for a lane the coordinator names, as `Effect::Look` above.",
+  "state": "refused",
+  "created": "2026-10-30T04:09:13Z",
+  "updated": "2026-10-30T08:30:05Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done: blaze-core Done::Sent(Vec<u8>) hands the send buffer back cleared with its capacity in every driver (uring/flight.rs, kqueue.rs, iocp.rs, threads.rs, sim.rs), and blaze-api server.rs reuses it (let Done::Sent(spare) = done). K2 RecvInto is not asked here.",
+  "source": "v2/requests/core.md#From speed-link-edge-wire: a sent buffer handed back (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core.md:301"
+    },
+    {
+      "at": "2026-10-30T08:30:05Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:05Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done: blaze-core Done::Sent(Vec<u8>) hands the send buffer back cleared with its capacity in every driver (uring/flight.rs, kqueue.rs, iocp.rs, threads.rs, sim.rs), and blaze-api server.rs reuses it (let Done::Sent(spare) = done). K2 RecvInto is not asked here."
+    }
+  ]
+}

@@ -19,7 +19,7 @@ macro_rules! m { ($x:literal) => (literal!();); ($x:tt) => (not_a_literal!();); 
 literal!();
 literal!();
 literal!();
-/* error: leftover tokens */not_a_literal!();
+/* error: no rules expected `-` */not_a_literal!();
 "#]],
     )
 }
@@ -49,7 +49,7 @@ m!(&k");
 "#,
         expect![[r#"
 macro_rules! m { ($i:literal) => {}; }
-/* error: expected literal */"#]],
+/* error: this macro call's `(` is never closed, so it is not expanded */"#]],
     );
 }
 
@@ -62,7 +62,7 @@ m!(/**/);
 "#,
         expect![[r#"
 macro_rules! m{ ($fmt:expr) => (); }
-/* error: expected Expr */
+/* error: unexpected end of macro invocation */
 "#]],
     );
 }
@@ -110,11 +110,11 @@ macro_rules! m {
     ($($s:stmt)*) => (stringify!($($s |)*);)
 }
 stringify!(;
-| ;
-|92| ;
-|let x = 92| ;
+|;
+|92|;
+|let x = 92|;
 |loop {}
-| ;
+|;
 |);
 "#]],
     );
@@ -171,7 +171,7 @@ macro_rules! foo {
 }
 
 fn test() {
-    /* error: no rule matches input tokens */missing;
+    /* error: no rules expected keyword `let` */missing;
 }
 "#]],
     );
@@ -196,7 +196,7 @@ macro_rules! foo {
 }
 
 fn test() {
-    /* error: no rule matches input tokens */missing;
+    /* error: no rules expected keyword `const` */missing;
 }
 "#]],
     );

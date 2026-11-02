@@ -1,17 +1,16 @@
 //! The releases of blaze a workspace pins (`pin.rs`), fetched once into
 //! `~/.blaze/versions/<version>`: the release's archive for this host from its GitHub release,
-//! checked against the release's `SHA256SUMS`, unpacked there. The launcher asks this only when
+//! checked against the release's `B3SUMS` (BLAKE3, as `b3sum` writes it), unpacked there. The launcher asks this only when
 //! the pinned release is not there, so a pinned build reaches the network once per release.
 //! A release that can't be fetched is an error: no other blaze builds in its place.
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context as _, bail};
-use sha2::{Digest as _, Sha256};
+use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp, Retry};
 
 use crate::pin;
 
@@ -48,19 +47,19 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
     let host = hir_ty_codegen::Target::host();
     let archive = format!("blaze-v{version}-{host}.tar.gz");
     eprintln!("blaze: fetching blaze {version} for {host}, which this workspace pins");
-    let sums = read(version, "SHA256SUMS")?;
+    let sums = read(version, "B3SUMS")?;
     let sums = String::from_utf8_lossy(&sums);
     let wanted = sums.lines().find_map(|line| {
         let (hash, name) = line.split_once(char::is_whitespace)?;
         (name.trim_start().trim_start_matches('*') == archive).then(|| hash.to_owned())
     });
     let wanted = wanted.with_context(|| {
-        format!("blaze {version} has no build for {host}: its SHA256SUMS names no {archive}")
+        format!("blaze {version} has no build for {host}: its B3SUMS names no {archive}")
     })?;
     let bytes = read(version, &archive)?;
-    let got: String = Sha256::digest(&bytes).iter().map(|it| format!("{it:02x}")).collect();
+    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes));
     if got != wanted {
-        bail!("{archive} of blaze {version} has sha256 {got}, and its SHA256SUMS says {wanted}");
+        bail!("{archive} of blaze {version} has BLAKE3 hash {got}, and its B3SUMS says {wanted}");
     }
     let dir = exe.parent().context("a release in no directory")?;
     unpacked(&bytes, dir, &format!("blaze-v{version}-{host}"))
@@ -83,7 +82,7 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
         );
     }
     let cwd = std::env::current_dir()?;
-    let manifest = pin::root_manifest(&pin::start(args, &cwd)).context(
+    let manifest = pin::root_manifest(&pin::start(args, &cwd))?.context(
         "`blaze pin` pins blaze in the workspace it is run in, and there is no Cargo.toml here \
          or above",
     )?;
@@ -126,8 +125,13 @@ pub(crate) fn why_this_one() -> String {
         return format!("{this}, as {} pins it", Path::new(&by).display());
     }
     let ours = pin::OURS;
-    let Some(manifest) = std::env::current_dir().ok().and_then(|it| pin::root_manifest(&it)) else {
-        return format!("{this}, as no workspace is here to pin one");
+    let found = std::env::current_dir()
+        .map_err(pin::PinError::NoWorkingDirectory)
+        .and_then(|it| pin::root_manifest(&it));
+    let manifest = match found {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return format!("{this}, as no workspace is here to pin one"),
+        Err(why) => return format!("{this}: {why}"),
     };
     let shown = manifest.display();
     match pin::pinned(&manifest) {
@@ -151,7 +155,11 @@ fn read(version: &str, name: &str) -> anyhow::Result<Vec<u8>> {
 
 /// The asset `name` of the release tagged `tag`, `None` when it has none.
 fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    let given = std::env::var(RELEASES_FROM).ok().filter(|it| !it.is_empty());
+    let given = match std::env::var(RELEASES_FROM) {
+        Ok(given) => Some(given).filter(|it| !it.is_empty()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => return Err(FetchError::ReleasesNotText(value).into()),
+    };
     if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
         let file = Path::new(dir).join(tag).join(name);
         return match std::fs::read(&file) {
@@ -161,12 +169,17 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         };
     }
     let base = given.unwrap_or_else(|| RELEASES.to_owned());
-    let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?;
-    let traffic = Arc::new(crate::remote::Traffic::new(1));
-    let web = crate::remote::Https::open(&address, PATIENCE, traffic)?;
-    let runtime = crate::remote::runtime()?;
-    let read = runtime.block_on(web.read_small(name, MOST))?;
-    Ok(read.map(|(bytes, _)| bytes))
+    let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;
+    let http = HyperHttp::new(PATIENCE)?;
+    let answer = Retry::default().run(|| http.get(address.as_str(), &[]))?;
+    match answer.status {
+        404 => Ok(None),
+        200..300 if answer.body.len() as u64 > MOST => {
+            bail!("{address} is {} bytes, more than the {MOST} a release's asset may be", answer.body.len())
+        }
+        200..300 => Ok(Some(answer.body)),
+        _ => Err(HttpNotSuccessful::new(address.as_str(), &answer).into()),
+    }
 }
 
 /// The tag of the release whose assets are the channels' pointers (docs/release.md).
@@ -194,21 +207,52 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
             "the {channel} channel of blaze's releases names {version:?}, which is not a version"
         );
     }
-    if let Some(file) = pin::channel_file(channel) {
-        let kept = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
-            let staged = file.with_extension(format!("{}", std::process::id()));
-            std::fs::write(&staged, format!("{version}\n"))?;
-            std::fs::rename(&staged, &file)
-        });
-        if let Err(e) = kept {
-            eprintln!(
-                "blaze: could not keep the {channel} channel's version in {}: {e}",
-                file.display()
-            );
-        }
-    }
+    let file = pin::channel_file(channel).ok_or(FetchError::NoHome)?;
+    let kept = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+        let staged = file.with_extension(format!("{}", std::process::id()));
+        std::fs::write(&staged, format!("{version}\n"))?;
+        std::fs::rename(&staged, &file)
+    });
+    kept.map_err(|error| FetchError::ChannelUnkept { channel: channel.to_owned(), file, error })?;
     Ok(version)
 }
+
+/// What a fetch of a release or a channel can't do, which no other path does in its place.
+#[derive(Debug)]
+enum FetchError {
+    /// [`RELEASES_FROM`] is set to what is not text.
+    ReleasesNotText(std::ffi::OsString),
+    /// No home directory, where blaze keeps releases and what a channel named.
+    NoHome,
+    /// What a channel names can't be kept where the launcher reads it.
+    ChannelUnkept { channel: String, file: PathBuf, error: std::io::Error },
+    /// An earlier fetch's staging directory is there and can't be removed.
+    Staging { dir: PathBuf, error: std::io::Error },
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::ReleasesNotText(value) => {
+                write!(f, "`{RELEASES_FROM}` is {value:?}, which is not text: it names an address or a directory")
+            }
+            FetchError::NoHome => f.write_str(
+                "blaze keeps releases and what a channel names in .blaze in your home directory, \
+                 and there is none (`BLAZE_HOME` names where)",
+            ),
+            FetchError::ChannelUnkept { channel, file, error } => write!(
+                f,
+                "keeping the {channel} channel's version in {}, where `blaze` reads it: {error}",
+                file.display()
+            ),
+            FetchError::Staging { dir, error } => {
+                write!(f, "removing {}, left by an earlier fetch: {error}", dir.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 /// Unpacks the `.tar.gz` `bytes`, whose files are under `top`, into `dir`. Unpacked beside it
 /// first and moved into place whole, so a `dir` that is there is a whole release.
@@ -216,7 +260,12 @@ fn unpacked(bytes: &[u8], dir: &Path, top: &str) -> anyhow::Result<()> {
     let parent = dir.parent().context("a release in no directory")?;
     std::fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".{}.{}", top, std::process::id()));
-    _ = std::fs::remove_dir_all(&staging);
+    match std::fs::remove_dir_all(&staging) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(FetchError::Staging { dir: staging, error }.into());
+        }
+        _ => {}
+    }
     tar::Archive::new(flate2::read::GzDecoder::new(bytes)).unpack(&staging)?;
     let moved = std::fs::rename(staging.join(top), dir);
     _ = std::fs::remove_dir_all(&staging);
@@ -272,6 +321,13 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("blaze")).unwrap(), b"run");
         // a second fetch at once finds it there
         unpacked(&bytes, &dest, &top).unwrap();
+        // what an earlier fetch left that can't be removed stops this one
+        let elsewhere = root.join("home/versions/0.2.0");
+        let staging = root.join(format!("home/versions/.{top}.{}", std::process::id()));
+        std::fs::write(&staging, b"not a directory").unwrap();
+        let error = unpacked(&bytes, &elsewhere, &top).unwrap_err();
+        assert!(matches!(error.downcast_ref::<FetchError>(), Some(FetchError::Staging { .. })), "{error:#}");
+        assert!(!elsewhere.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -13,28 +13,37 @@
 //! unwinds (`MirBody::panic_unwinds`); after this pass no statement panics and every binary
 //! operation is a `BinaryOp`.
 
-use rustc_hash::FxHashMap;
+use arrayvec::ArrayVec;
+use blaze_mem::Frame;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::mir::{
     AssertKind, BasicBlock, BasicBlockId, BinOp, CastKind, FieldIndex, Local, LocalId, MirBody,
     MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement,
     StatementKind, StoredPlace, Terminator, TerminatorKind, UnOp,
+    framed::{self, block_id, local_index},
 };
-use crate::next_solver::{Ty, TyKind};
+use crate::next_solver::{ConstExt, Ty, TyKind};
 
 use super::Ctx;
 
 /// A check: what computes the condition, the condition, what it must be, and the panic.
 struct Check {
-    setup: Vec<Statement>,
+    /// At most the length, the comparison and the bound.
+    setup: ArrayVec<Statement, 3>,
     cond: Operand,
     expected: bool,
     msg: AssertKind,
     span: MirSpan,
 }
 
-pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
+/// The checks one statement or terminator makes, reused across them.
+type Checks<'f> = Vec<Check, &'f Frame>;
+
+/// Where each local starts to live, by its index: see [`index_spans`].
+type IndexSpans<'f> = Vec<Option<MirSpan>, &'f Frame>;
+
+pub(super) fn add_asserts<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, frame: &Frame) {
     // rustc builds overflow checks into the MIR of a crate that checks overflow, of a function
     // that inherits the check from the crate it is compiled in, and of every constant and
     // static; the standard library is built without.
@@ -46,28 +55,34 @@ pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
         let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
         !ctx.krate.data(ctx.db).origin.is_lang() && ctx.krate.cfg_options(ctx.db).check_atom(&flag)
     };
-    let unwinds: FxHashMap<(BasicBlockId, usize), BasicBlockId> =
-        body.panic_unwinds.drain(..).map(|(block, at, unwind)| ((block, at), unwind)).collect();
-    let index_spans = index_spans(body);
-    let ids: Vec<BasicBlockId> = body.basic_blocks.iter().map(|(id, _)| id).collect();
-    for id in ids {
-        let statements = std::mem::take(&mut body.basic_blocks[id].statements);
+    let mut unwinds = framed::map_in(frame);
+    unwinds.reserve(body.panic_unwinds.len());
+    unwinds
+        .extend(body.panic_unwinds.drain(..).map(|(block, at, unwind)| ((block, at), unwind)));
+    let index_spans = index_spans(body, frame);
+    let mut pending: Vec<Statement, &Frame> = Vec::new_in(frame);
+    let mut checks: Checks<'_> = Vec::new_in(frame);
+    // The blocks `assert` adds go after these, and are already checked.
+    let blocks = body.basic_blocks.len();
+    for index in 0..blocks {
+        let id = block_id(index);
+        pending.clear();
+        pending.extend(body.basic_blocks[id].statements.drain(..));
         let terminator = body.basic_blocks[id].terminator.take();
         let is_cleanup = body.basic_blocks[id].is_cleanup;
+        let count = pending.len();
         let mut current = id;
-        for (at, statement) in statements.into_iter().enumerate() {
+        for (at, statement) in pending.drain(..).enumerate() {
             let unwind = unwinds.get(&(id, at)).copied();
-            let mut checks = Vec::new();
             let rewritten =
                 rewrite(ctx, body, statement, &index_spans, checks_overflow, &mut checks);
-            for check in checks {
-                current = assert(body, current, check, unwind, is_cleanup);
+            for check in checks.drain(..) {
+                current = assert(body, current, check, unwind, is_cleanup, count - at);
             }
-            body.basic_blocks[current].statements.extend(rewritten);
+            body.basic_blocks[current].statements.push(rewritten);
         }
         if let Some(terminator) = terminator {
             let unwind = terminator.kind.unwind();
-            let mut checks = Vec::new();
             terminator.kind.for_each_operand(&mut |operand| {
                 if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
                     bounds_checks(ctx, body, place, terminator.span, &index_spans, &mut checks);
@@ -78,25 +93,27 @@ pub(super) fn add_asserts<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
             {
                 bounds_checks(ctx, body, place, terminator.span, &index_spans, &mut checks);
             }
-            for check in checks {
-                current = assert(body, current, check, unwind, is_cleanup);
+            for check in checks.drain(..) {
+                current = assert(body, current, check, unwind, is_cleanup, 0);
             }
             body.basic_blocks[current].terminator = Some(terminator);
         }
     }
 }
 
-/// Ends `block` in an `Assert` for `check`, and returns the block it goes on to.
+/// Ends `block` in an `Assert` for `check`, and returns the block it goes on to, made with room
+/// for the `after` statements that follow the check.
 fn assert(
     body: &mut MirBody<'_>,
     block: BasicBlockId,
     check: Check,
     unwind: Option<BasicBlockId>,
     is_cleanup: bool,
+    after: usize,
 ) -> BasicBlockId {
     body.basic_blocks[block].statements.extend(check.setup);
     let next = body.basic_blocks.alloc(BasicBlock {
-        statements: Vec::new(),
+        statements: Vec::with_capacity(after),
         terminator: None,
         is_cleanup,
     });
@@ -116,13 +133,13 @@ fn assert(
 /// The statement as it is after its checks, which go to `checks` in the order rustc makes
 /// them: the places its operands read, the operation, then the place it writes.
 fn rewrite<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     statement: Statement,
-    index_spans: &FxHashMap<LocalId, MirSpan>,
+    index_spans: &IndexSpans<'_>,
     checks_overflow: bool,
-    checks: &mut Vec<Check>,
-) -> Vec<Statement> {
+    checks: &mut Checks<'_>,
+) -> Statement {
     let span = statement.span;
     match statement.kind {
         StatementKind::Assign(place, rvalue) => {
@@ -157,7 +174,7 @@ fn rewrite<'db>(
                         let is_min = eq(ctx, body, copy(&a), min, span);
                         checks.push(Check {
                             cond: move_of(is_min.0),
-                            setup: vec![is_min.1],
+                            setup: setup_of([is_min.1]),
                             expected: false,
                             msg: AssertKind::OverflowNeg(copy(&a)),
                             span,
@@ -168,26 +185,26 @@ fn rewrite<'db>(
                 rvalue => rvalue,
             };
             bounds_checks(ctx, body, &place, span, index_spans, checks);
-            vec![Statement { kind: StatementKind::Assign(place, rvalue), span }]
+            Statement { kind: StatementKind::Assign(place, rvalue), span }
         }
         // `let _ = items[at]` checks the index all the same.
         StatementKind::FakeRead(read) => {
             bounds_checks(ctx, body, &read, span, index_spans, checks);
-            vec![Statement { kind: StatementKind::FakeRead(read), span }]
+            Statement { kind: StatementKind::FakeRead(read), span }
         }
-        kind => vec![Statement { kind, span }],
+        kind => Statement { kind, span },
     }
 }
 
 /// The checks of `a op b`, and the operation after them.
 fn binary_op<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     op: BinOp,
     a: Operand,
     b: Operand,
     span: MirSpan,
-    checks: &mut Vec<Check>,
+    checks: &mut Checks<'_>,
 ) -> Rvalue {
     let ty = operand_ty(ctx, body, &a);
     let signed = matches!(ty.kind(), TyKind::Int(_));
@@ -217,7 +234,7 @@ fn binary_op<'db>(
             // rustc's checks of the other operations read them: what a future keeps of them
             // is gone once the check is done.
             checks.push(Check {
-                setup: vec![setup],
+                setup: setup_of([setup]),
                 cond: Operand { kind: OperandKind::Move(field(1)), span: None },
                 expected: false,
                 msg: AssertKind::Overflow(op, a, b),
@@ -229,7 +246,7 @@ fn binary_op<'db>(
             let zero = int_const(ctx, ty, Bound::Zero);
             let is_zero = eq(ctx, body, copy(&b), zero, span);
             checks.push(Check {
-                setup: vec![is_zero.1],
+                setup: setup_of([is_zero.1]),
                 cond: move_of(is_zero.0),
                 expected: false,
                 msg: match op {
@@ -252,10 +269,12 @@ fn binary_op<'db>(
                     span,
                 };
                 checks.push(Check {
-                    setup: vec![is_minus_one.1, is_min.1, both],
+                    setup: setup_of([is_minus_one.1, is_min.1, both]),
                     cond: move_of(overflow),
                     expected: false,
-                    msg: AssertKind::Overflow(op.clone(), copy(&a), copy(&b)),
+                    // clone: a `BinOp` tag, kept in the panic as in the operation
+                    // clone: a `BinOp` tag, kept in the panic as in the operation
+                msg: AssertKind::Overflow(op.clone(), copy(&a), copy(&b)),
                     span,
                 });
             }
@@ -263,7 +282,7 @@ fn binary_op<'db>(
         }
         BinOp::Shl | BinOp::Shr => {
             let rhs_ty = operand_ty(ctx, body, &b);
-            let mut setup = Vec::new();
+            let mut setup = ArrayVec::new();
             let (unsigned, unsigned_ty) = match rhs_ty.kind() {
                 TyKind::Int(int) => {
                     let uint_ty = Ty::new_uint(ctx.infcx.interner, unsigned_of(int));
@@ -279,7 +298,7 @@ fn binary_op<'db>(
                 }
                 _ => (copy(&b), rhs_ty),
             };
-            let bits = ctx.size_of(ty).unwrap_or(8) * 8;
+            let bits = ty.primitive_size(ctx.infcx.interner).bits();
             let bits = int_value(ctx, unsigned_ty, u128::from(bits));
             let inbounds = temp(body, ctx.bool_ty());
             setup.push(Statement {
@@ -293,6 +312,7 @@ fn binary_op<'db>(
                 setup,
                 cond: move_of(inbounds),
                 expected: true,
+                // clone: a `BinOp` tag, kept in the panic as in the operation
                 msg: AssertKind::Overflow(op.clone(), copy(&a), copy(&b)),
                 span,
             });
@@ -304,12 +324,12 @@ fn binary_op<'db>(
 
 /// The bounds check of each runtime index in `place`, outermost first.
 fn bounds_checks<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     place: &StoredPlace,
     span: MirSpan,
-    index_spans: &FxHashMap<LocalId, MirSpan>,
-    checks: &mut Vec<Check>,
+    index_spans: &IndexSpans<'_>,
+    checks: &mut Checks<'_>,
 ) {
     let projection = place.projection.as_slice();
     for (at, elem) in projection.iter().enumerate() {
@@ -324,7 +344,7 @@ fn bounds_checks<'db>(
         // An array's length is its constant, as rustc has it (monomorphization fills in a
         // generic one); a slice's is read from the place.
         let base_ty = ctx.normalize(base.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
-        let mut setup = Vec::new();
+        let mut setup = ArrayVec::new();
         let len = match base_ty.kind() {
             TyKind::Array(_, len) => Operand {
                 kind: OperandKind::Constant { konst: len.store(), ty: usize_ty.store() },
@@ -342,6 +362,7 @@ fn bounds_checks<'db>(
         setup.push(Statement {
             kind: StatementKind::Assign(
                 Place::from(lt).store(),
+                // clone: the index and length the kept body reads twice (interned handles)
                 Rvalue::BinaryOp(BinOp::Lt, index.clone(), len.clone()),
             ),
             span,
@@ -353,7 +374,9 @@ fn bounds_checks<'db>(
             msg: AssertKind::BoundsCheck { len, index },
             // rustc reports it at the indexing expression, where the index's temporary starts.
             span: match elem {
-                ProjectionElem::Index(index) => index_spans.get(index).copied().unwrap_or(span),
+                ProjectionElem::Index(index) => {
+                    index_spans.get(local_index(*index)).copied().flatten().unwrap_or(span)
+                }
                 _ => span,
             },
         });
@@ -362,14 +385,18 @@ fn bounds_checks<'db>(
 
 /// Where each local starts to live: a local that holds the index of `base[index]` starts at
 /// that expression.
-fn index_spans(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
-    let statements = body.basic_blocks.iter().flat_map(|(_, block)| &block.statements);
-    statements
-        .filter_map(|statement| match statement.kind {
-            StatementKind::StorageLive(local) => Some((local, statement.span)),
-            _ => None,
-        })
-        .collect()
+/// The last marker of a local wins, as the map this was had it.
+fn index_spans<'f>(body: &MirBody<'_>, frame: &'f Frame) -> IndexSpans<'f> {
+    let mut spans = Vec::with_capacity_in(body.locals.len(), frame);
+    spans.resize(body.locals.len(), None);
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::StorageLive(local) = statement.kind {
+                spans[local_index(local)] = Some(statement.span);
+            }
+        }
+    }
+    spans
 }
 
 enum Bound {
@@ -378,8 +405,8 @@ enum Bound {
     Min,
 }
 
-fn int_const<'db>(ctx: &Ctx<'db>, ty: Ty<'db>, bound: Bound) -> Operand {
-    let bytes = ctx.size_of(ty).unwrap_or(8) as u32;
+fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
+    let bytes = ty.primitive_size(ctx.infcx.interner).bytes() as u32;
     let value = match bound {
         Bound::Zero => 0,
         Bound::MinusOne => u128::MAX,
@@ -388,9 +415,9 @@ fn int_const<'db>(ctx: &Ctx<'db>, ty: Ty<'db>, bound: Bound) -> Operand {
     int_value(ctx, ty, value)
 }
 
-/// The integer `value` of `ty`, truncated to its width.
-fn int_value<'db>(ctx: &Ctx<'db>, ty: Ty<'db>, value: u128) -> Operand {
-    let bytes = ctx.size_of(ty).unwrap_or(8) as usize;
+/// The integer `value` of the integer type `ty`, truncated to its width.
+fn int_value<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, value: u128) -> Operand {
+    let bytes = ty.primitive_size(ctx.infcx.interner).bytes() as usize;
     Operand::from_bytes(value.to_le_bytes()[..bytes].into(), ty)
 }
 
@@ -408,7 +435,7 @@ fn unsigned_of(int: rustc_type_ir::IntTy) -> rustc_type_ir::UintTy {
 
 /// `t = a == b` into a new temporary.
 fn eq<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     a: Operand,
     b: Operand,
@@ -420,6 +447,15 @@ fn eq<'db>(
         span,
     };
     (t, statement)
+}
+
+/// A check's setup, of at most three statements.
+fn setup_of<const N: usize>(statements: [Statement; N]) -> ArrayVec<Statement, 3> {
+    let mut setup = ArrayVec::new();
+    for statement in statements {
+        setup.push(statement);
+    }
+    setup
 }
 
 fn temp<'db>(body: &mut MirBody<'db>, ty: Ty<'db>) -> LocalId {
@@ -437,19 +473,13 @@ fn copy_of(local: LocalId) -> Operand {
 /// The operand read again: an integer is `Copy`.
 fn copy(operand: &Operand) -> Operand {
     match &operand.kind {
+        // clone: the place the kept body reads again (interned handles)
         OperandKind::Move(place) => Operand { kind: OperandKind::Copy(place.clone()), span: None },
+        // clone: the operand the kept body reads again (interned handles)
         _ => operand.clone(),
     }
 }
 
-fn operand_ty<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
-    let ty = match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
-        }
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        OperandKind::Static(_) => return ctx.bool_ty(),
-    };
-    ctx.normalize(ty)
+fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
+    ctx.normalize(ctx.operand_ty(body, operand))
 }

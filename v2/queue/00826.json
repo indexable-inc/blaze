@@ -1,0 +1,24 @@
+{
+  "id": "00826",
+  "from_lane": "coord-apply-manifests",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/solver.rs",
+    "crates/hir-ty/Cargo.toml"
+  ],
+  "what": "hir-ty: answer TransmuteFrom with rustc_transmute (from solver-sync request 00150, now vendored). crates/hir-ty/src/next_solver/solver.rs SolverDelegate::is_transmutable (line 667) panics today. vendor/rustc_transmute (workspace dep `rustc_transmute.workspace = true`, rustc feature off) exposes rustc_transmute::{QueryContext, is_transmutable(src, dst, assume, context) -> rustc_type_ir::transmute::Answer<C::Region, C::Type>, Assume} and layout::{Tree, Endian, Byte, Reference, Def, Region, Type} with every Tree builder public (vendor/rustc_transmute/PATCHES.md 0002). Port rustc Tree::from_ty (upstream compiler/rustc_transmute/src/layout/tree.rs, `mod rustc`, cfg(feature = \"rustc\")) onto hir-ty layouts, implement QueryContext (Def: has_safety_invariants, Region = Region<db>, Type = Ty<db>), port Assume::from_const (lib.rs `mod rustc`), and replace the panic. Add a differential test against rustc on core::mem::TransmuteFrom cases. Cargo.lock gains rustc_transmute at the next lock refresh.",
+  "state": "open",
+  "created": "2026-10-30T08:33:53Z",
+  "updated": "2026-10-30T08:33:53Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:33:53Z",
+      "by": "coord-apply-manifests",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

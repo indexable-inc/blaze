@@ -1,0 +1,37 @@
+{
+  "id": "00410",
+  "from_lane": "usercode-replicas",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/test_harness.rs",
+    "crates/blaze-usercode/src/test",
+    "crates/blaze-engine"
+  ],
+  "what": "## usercode-replicas 2: codegen: the fork server's wire is version 3 (`crates/blaze-engine/src/test_harness.rs`)\n\nFrom `usercode-replicas`, 2026-10-29. Informational, no change expected. The harness text still\ncomes from `crates/blaze-usercode/src/test/{wire,fork_server}.rs` and still ends in\n`fork_server::serve(tests, socket)`. The wire is now version 3: `Hello` carries `fork: u64` (the\nserver's measured fork, in nanoseconds) and there is a new frame, `Replicate { count: u32 }`.\nThat supersedes \"The wire version is 2\" in `usercode-fast-tests` 3. If the harness pins or\nchecks the version anywhere outside that text, make it 3.\n\nNo sandbox change: answered by usercode under `usercode-fast-tests` 7.\n\n> forwarded to codegen (codegen-next1, `crates/blaze-engine/`) (requests, pass 20; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:58:14Z",
+  "updated": "2026-10-31T20:28:50Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/usercode-replicas.md#usercode-replicas 2: codegen: the fork server's wire is version 3 (`crates/blaze-engine/src/test_harness.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-replicas.md:33"
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:28:50Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "No pin outside the text: the harness takes the wire from blaze_usercode (wire.rs VERSION = 3); nothing in hir-ty-codegen checks the version."
+    }
+  ]
+}

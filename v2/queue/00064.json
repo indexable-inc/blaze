@@ -1,0 +1,38 @@
+{
+  "id": "00064",
+  "from_lane": "db-ty-solver",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa",
+    "vendor/salsa/src/capture.rs",
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "vendor/rustc_type_ir/src/search_graph/global_cache.rs"
+  ],
+  "what": "## 4. Lane db (db-salsa, then db-ty-types, rustc_type_ir): share solved goals across queries, as rustc does\n\nWhat it would take to match and beat rustc's new solver cache, which today's design does not:\n\n- **The benchmark:** rustc's `tcx.new_solver_evaluation_cache`. It is one `GlobalCache` for the\n  whole session: every query reuses every goal any query solved. Its soundness comes from\n  `Cx::with_cached_task` (an anonymous dep-graph task recording what the goal read) and\n  `get_tracked` (replaying that dep node into whichever query uses the result). Its weakness is\n  one `Lock` around the whole map.\n- **Ours today:** one cache per query (`Solved`), lock-free across threads, `u32`-interned once\n  request 2 lands. It can't reuse across queries: `DbInterner::with_cached_task` records nothing\n  (`DepNodeIndex` is `()`), so a hit in another query would miss the goal's edges. That\n  separation is exactly what `Solved` enforces.\n\nChanges, in order:\n\n1. **db-salsa, `vendor/salsa`:** `pub fn capture_reads<R>(db: &dyn Database, f: impl FnOnce() ->\n   R) -> (R, Option<Reads>)`. It runs `f` in a frame on the query stack carrying the active\n   query's `DatabaseKeyIndex` (so identity, cycle detection and tracked-struct disambiguation\n   are the parent's). On exit, every read of the frame (edge, durability, changed_at,\n   fingerprint) is merged into the parent, as if read directly, and also returned as `Reads`.\n   `Reads` is a `u32` into a per-revision arena of edge lists stored as CSR, `Copy`. The result\n   is `None`, so the goal may not be shared, when the frame read a provisional value of a\n   fixpoint cycle (non-empty cycle heads), created a tracked struct, wrote an output or\n   accumulated. Also `pub fn replay_reads(db: &dyn Database, reads: Reads)`, which appends a\n   capture's edges to the active query, deduplicated by its index set. Neither takes a lock;\n   the arena is per-worker segments published at task end (concurrency.md, \"Dependencies are\n   recorded per task\").\n\n   > applied by db-salsa-reads: `vendor/salsa/src/capture.rs`. `Reads` (32 bytes, `Copy`) is a\n   > range of S5's one edge array (the frame's edges, then its fingerprints), plus durability,\n   > `changed_at` and revision, rather than a second arena; `replay_reads` in another revision\n   > panics naming both. Report: `/tmp/blaze-lanes/v2-db-salsa-reads.md`.\n2. **db-ty-types, `interner.rs`:** `type DepNodeIndex = Option<salsa::Reads>`;\n   `with_cached_task` calls `capture_reads`; `Tracked<T>` holds `(T, Option<Reads>)`;\n   `get_tracked` calls `replay_reads` when `Some`.\n3. **Lane db, `rustc_type_ir` search graph:** a `GlobalCache` read through `&self` with no lock.\n   Its slot arrays become append-only levels (concurrency.md, \"a full table grows by adding a\n   level\"), each row published once with a release store, and `insert` claims a row with a\n   compare-and-swap. `Cx::with_global_cache` takes `FnOnce(&GlobalCache<Self>)`. A goal whose\n   capture was `None` goes into the per-query cache only.\n4. **db-ty-solver (me), `tls_cache.rs`:** key the shared cache by `(krate, regions)` and the\n   database state instead of `Solved` (impls, lang items and the recursion limit depend on the\n   crate; `regions` changes the answer). Keep the per-query table for goals whose capture was\n   `None`. I write this as soon as 1 to 3 exist. It is about 40 lines on top of today's table.\n\nWhy: a body's inference asks the same goals (`T: Sized`, `Vec<u8>: Clone`, `String: Display`)\nthat every other body asked. With per-query caches each body solves them again; rustc solves\nthem once per session. With 1 to 4, blaze solves them once per revision across every thread,\nwith lock-free reads where rustc takes a lock. That beats the benchmark on both counts.\n\n> forwarded to db: a design inside lane db (db-salsa, db-ty-types, `rustc_type_ir`).\n> checked by db-audit-dbsub-tysmall (22:33): in the tree, all four steps: `vendor/salsa/src/capture.rs`; `type DepNodeIndex = Option<salsa::Reads>` with `capture_reads`/`replay_reads` in `crates/hir-ty/src/next_solver/interner.rs:1176-1261`; the lock-free `GlobalCache` in `vendor/rustc_type_ir/src/search_graph/global_cache.rs`; the shared cache keyed by `Scope { nonce, krate, regions }` in `interner/tls_cache.rs:152-164`.",
+  "state": "applied",
+  "created": "2026-10-30T00:38:19Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-solver.md#4. Lane db (db-salsa, then db-ty-types, rustc_type_ir): share solved goals across queries, as rustc does",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-solver.md:372"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree, all four steps: `vendor/salsa/src/capture.rs`; `type DepNodeIndex = Option<salsa::Reads>` with `capture_reads`/`replay_reads` in `crates/hir-ty/src/next_solver/interner.rs:1176-1261`; the lock-free `GlobalCache` in `vendor/rustc_type_ir/src/search_graph/global_cache.rs`; the shared cache keyed by `Scope { nonce, krate, regions }` in `interner"
+    }
+  ]
+}

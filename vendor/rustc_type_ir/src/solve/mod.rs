@@ -10,16 +10,19 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableH
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
 };
+use smallvec::SmallVec;
 use tracing::debug;
 
+use crate::inherent::*;
 use crate::lang_items::SolverTraitLangItem;
-use crate::search_graph::PathKind;
+use crate::region_constraint::RegionConstraint;
 use crate::{
-    self as ty, Canonical, CanonicalVarValues, CantBeErased, Interner, TypingMode, Upcast,
+    self as ty, Canonical, CantBeErased, Const, ConstVid, FloatVid, GenericArgKind, InferConst,
+    IntVid, Interner, TermKind, TyVid, TypingMode, Upcast,
 };
 
-pub type CanonicalInput<I, T = <I as Interner>::Predicate> =
-    ty::CanonicalQueryInput<I, QueryInput<I, T>>;
+pub type CanonicalInputData<I> =
+    ty::CanonicalQueryInput<I, QueryInput<I, <I as Interner>::Predicate>>;
 pub type CanonicalResponse<I> = Canonical<I, Response<I>>;
 /// The result of evaluating a canonical query.
 ///
@@ -77,26 +80,21 @@ impl From<RerunNonErased> for NoSolutionOrRerunNonErased {
     }
 }
 
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Hash,
-    PartialEq,
-    Eq,
-    TypeVisitable_Generic,
-    TypeFoldable_Generic,
-    GenericTypeVisitable,
-)]
+/// A small set of up to 3 `Copy` elements, used as an optimization in [`RerunCondition`].
+/// The entire set can be `Copy`ed because of this requirement.
+///
+/// Set properties maintained using [`union`](SmallCopySet::union), which deduplicates values.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
-pub enum SmallCopyList<T: Copy + Debug + Hash + Eq> {
+pub enum SmallCopySet<T: Copy + Debug + Hash + Eq> {
     Empty,
     One([T; 1]),
     Two([T; 2]),
     Three([T; 3]),
 }
 
-impl<T: Copy + Debug + Hash + Eq> SmallCopyList<T> {
+impl<T: Copy + Debug + Hash + Eq> SmallCopySet<T> {
     fn empty() -> Self {
         Self::Empty
     }
@@ -106,6 +104,21 @@ impl<T: Copy + Debug + Hash + Eq> SmallCopyList<T> {
     }
 
     /// Computes the union of two lists. Duplicates are removed.
+    ///
+    /// Since the set can hold at most 3 elements, returns `None` if the resulting set cannot be
+    /// represented.
+    ///
+    /// In the context of [`RerunCondition`], this means we fall back to rerunning unconditionally.
+    /// This can be beneficial, since at some point, tracking all the conditions under which a query
+    /// has to be rerun becomes slower than just rerunning unconditionally. This is especially so,
+    /// since as long as rerun conditions are tracked, we keep executing the current query. As soon as
+    /// we cannot track anymore, and unconditionally rerun, we also abort the current query.
+    /// By at some point opting to abort early, we may save a lot of time skipping further work
+    /// that will have to likely be redone anyway.
+    ///
+    /// note that *not* all cases are handled. you can union two lists of two elements with equal
+    /// elements, and still get `none` back. checking for all cases is more work than just rerunning
+    /// in some cases.
     fn union(self, other: Self) -> Option<Self> {
         match (self, other) {
             (Self::Empty, other) | (other, Self::Empty) => Some(other),
@@ -129,12 +142,15 @@ impl<T: Copy + Debug + Hash + Eq> SmallCopyList<T> {
             (Self::One([a]), Self::Two([b, c])) | (Self::Two([a, b]), Self::One([c])) => {
                 Some(Self::Three([a, b, c]))
             }
+            // There are some more cases we could handle, like 2 + 2 => 3 if there's one duplicate,
+            // But the check seems to be more expensive than the gain. Even then, the difference is
+            // tiny, and could just be noise. Not worth it regardless.
             _ => None,
         }
     }
 }
 
-impl<T: Copy + Debug + Hash + Eq> AsRef<[T]> for SmallCopyList<T> {
+impl<T: Copy + Debug + Hash + Eq> AsRef<[T]> for SmallCopySet<T> {
     fn as_ref(&self) -> &[T] {
         match self {
             Self::Empty => &[],
@@ -153,7 +169,7 @@ impl<T: Copy + Debug + Hash + Eq> AsRef<[T]> for SmallCopyList<T> {
 /// | never                   | no    | no                                                                                                                   |
 /// | always                  | yes   | yes                                                                                                                  |
 /// | [defid in storage]      | no    | only if any of the defids in the list is in the opaque type storage OR if TypingMode::PostAnalysis                   |
-/// | opaque with hidden type | no    | only if any of the the opaques in the opaque type storage has a hidden type in this list AND if TypingMode::Analysis |
+/// | opaque with hidden type | no    | only if any of the opaques in the opaque type storage has a hidden type in this list AND if TypingMode::Typeck       |
 ///
 /// - "bail" is implemented with [`should_bail`](Self::should_bail).
 ///   If true, we're abandoning our attempt to canonicalize in [`TypingMode::ErasedNotCoherence`],
@@ -169,15 +185,15 @@ impl<T: Copy + Debug + Hash + Eq> AsRef<[T]> for SmallCopyList<T> {
 pub enum RerunCondition<I: Interner> {
     Never,
 
-    /// Note that this only reruns according to the condition *if* we are in [`TypingMode::Analysis`].
+    /// Note that this only reruns according to the condition *if* we are in [`TypingMode::Typeck`].
     AnyOpaqueHasInferAsHidden,
     /// Note: unconditionally reruns in postanalysis
-    OpaqueInStorage(SmallCopyList<I::LocalDefId>),
+    OpaqueInStorage(SmallCopySet<I::LocalDefId>),
 
     /// Merges [`Self::AnyOpaqueHasInferAsHidden`] and [`Self::OpaqueInStorage`].
     /// Note that just like the unmerged [`Self::OpaqueInStorage`], that part of the
-    /// condition only matters in [`TypingMode::Analysis`]
-    OpaqueInStorageOrAnyOpaqueHasInferAsHidden(SmallCopyList<I::LocalDefId>),
+    /// condition only matters in [`TypingMode::Typeck`]
+    OpaqueInStorageOrAnyOpaqueHasInferAsHidden(SmallCopySet<I::LocalDefId>),
 
     Always,
 }
@@ -217,7 +233,7 @@ impl<I: Interner> RerunCondition<I> {
             | (
                 Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
                 Self::AnyOpaqueHasInferAsHidden,
-            ) => Self::OpaqueInStorage(a),
+            ) => Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
 
             (
                 Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
@@ -269,7 +285,8 @@ impl<I: Interner> RerunCondition<I> {
 
 /// Mainly for debugging, to keep track of the source of the rerunning
 /// in [`TypingMode::ErasedNotCoherence`].
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, TypeVisitable_Generic, GenericTypeVisitable)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub enum RerunReason {
     NormalizeOpaqueTypeRemoteCrate,
@@ -333,19 +350,19 @@ impl<I: Interner> AccessedOpaques<I> {
         debug!("set rerun if post analysis");
         self.update(AccessedOpaques {
             reason: Some(reason),
-            rerun: RerunCondition::OpaqueInStorage(SmallCopyList::empty()),
+            rerun: RerunCondition::OpaqueInStorage(SmallCopySet::empty()),
         })
     }
 
     pub fn rerun_if_opaque_in_opaque_type_storage(
         &mut self,
         reason: RerunReason,
-        defid: I::LocalDefId,
+        defid: I::LocalOpaqueTyId,
     ) -> Result<(), RerunNonErased> {
         debug!("set rerun if opaque type {defid:?} in storage");
         self.update(AccessedOpaques {
             reason: Some(reason),
-            rerun: RerunCondition::OpaqueInStorage(SmallCopyList::new(defid)),
+            rerun: RerunCondition::OpaqueInStorage(SmallCopySet::new(defid.into())),
         })
     }
 
@@ -393,22 +410,15 @@ impl<I: Interner, P> Goal<I, P> {
 
 /// Why a specific goal has to be proven.
 ///
-/// This is necessary as we treat nested goals different depending on
-/// their source. This is used to decide whether a cycle is coinductive.
-/// See the documentation of `EvalCtxt::step_kind_for_source` for more details
-/// about this.
+/// This is used by proof tree visitors, especially for diagnostics purposes.
 ///
-/// It is also used by proof tree visitors, e.g. for diagnostics purposes.
+/// FIXME(-Znext-solver=coinductive): This will also matter in the future when
+/// deciding whether a step in a cycle is coinductive. We're currently still
+/// matching the old solver behavior here for now, so the `GoalSource` is ignored.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum GoalSource {
     Misc,
-    /// A nested goal required to prove that types are equal/subtypes.
-    /// This is always an unproductive step.
-    ///
-    /// This is also used for all `NormalizesTo` goals as we they are used
-    /// to relate types in `AliasRelate`.
-    TypeRelating,
     /// We're proving a where-bound of an impl.
     ImplWhereBound,
     /// Const conditions that need to hold for `[const]` alias bounds to hold.
@@ -420,12 +430,8 @@ pub enum GoalSource {
     /// 2. for rigid projections's trait goal,
     /// 3. for GAT where clauses.
     AliasWellFormed,
-    /// In case normalizing aliases in nested goals cycles, eagerly normalizing these
-    /// aliases in the context of the parent may incorrectly change the cycle kind.
-    /// Normalizing aliases in goals therefore tracks the original path kind for this
-    /// nested goal. See the comment of the `ReplaceAliasWithInfer` visitor for more
-    /// details.
-    NormalizeGoal(PathKind),
+    /// Normalizing happens in the current context and is unproductive by itself.
+    Normalization,
 }
 
 #[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, Goal<I, P>)]
@@ -540,17 +546,8 @@ pub enum ParamEnvSource {
     Global,
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Hash,
-    PartialEq,
-    Eq,
-    Debug,
-    TypeVisitable_Generic,
-    GenericTypeVisitable,
-    TypeFoldable_Generic,
-)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub enum AliasBoundKind {
     /// Alias bound from the self type of a projection
     SelfBounds,
@@ -568,10 +565,12 @@ pub enum BuiltinImplSource {
     /// unless more specific information is necessary.
     Misc,
     /// A built-in impl for trait objects. The index is only used in winnowing.
+    // FIXME(-Znext-solver=no): The new solver does not need this index, remove!
     Object(usize),
     /// A built-in implementation of `Upcast` for trait objects to other trait objects.
     ///
     /// The index is only used for winnowing.
+    // FIXME(-Znext-solver=no): The new solver does not need this index, remove!
     TraitUpcasting(usize),
 }
 
@@ -588,19 +587,89 @@ pub enum FetchEligibleAssocItemResponse<I: Interner> {
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub struct Response<I: Interner> {
     pub certainty: Certainty,
-    pub var_values: CanonicalVarValues<I>,
+    pub var_values: I::GenericArgs,
     /// Additional constraints returned by this query.
     pub external_constraints: I::ExternalConstraints,
 }
 
+impl<I: Interner> Response<I> {
+    pub fn is_identity(&self) -> bool {
+        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.kind() {
+            ty::GenericArgKind::Lifetime(r) => {
+                matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if br.var().as_usize() == bv)
+            }
+            ty::GenericArgKind::Type(ty) => {
+                matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if bt.var().as_usize() == bv)
+            }
+            ty::GenericArgKind::Const(ct) => {
+                matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if bc.var().as_usize() == bv)
+            }
+        })
+    }
+
+    pub fn is_identity_modulo_regions(&self) -> bool {
+        let mut var = ty::BoundVar::ZERO;
+        for arg in self.var_values.iter() {
+            match arg.kind() {
+                ty::GenericArgKind::Lifetime(r) => {
+                    if matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if var == br.var())
+                    {
+                        var = var + 1;
+                    } else {
+                        // It's ok if this region var isn't an identity variable
+                    }
+                }
+                ty::GenericArgKind::Type(ty) => {
+                    if matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if var == bt.var())
+                    {
+                        var = var + 1;
+                    } else {
+                        return false;
+                    }
+                }
+                ty::GenericArgKind::Const(ct) => {
+                    if matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if var == bc.var())
+                    {
+                        var = var + 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+}
+
 impl<I: Interner> Eq for Response<I> {}
 
+#[derive_where(Clone, Hash, PartialEq, Debug; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
+pub enum ExternalRegionConstraints<I: Interner> {
+    /// normal region constraints used on stable/when -Znext-solver is used by itself
+    Old(Vec<(ty::RegionConstraint<I>, VisibleForLeakCheck)>),
+    /// new form of region constraints used when `-Zassumptions-on-binders` is enabled.
+    /// supports ORs.
+    NextGen(RegionConstraint<I>),
+}
+
+impl<I: Interner> ExternalRegionConstraints<I> {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Old(r) => r.is_empty(),
+            Self::NextGen(r) => r.is_true(),
+        }
+    }
+}
+
 /// Additional constraints returned on success.
-#[derive_where(Clone, Hash, PartialEq, Debug, Default; I: Interner)]
+#[derive_where(Clone, Hash, PartialEq, Debug; I: Interner)]
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub struct ExternalConstraintsData<I: Interner> {
-    pub region_constraints: Vec<(ty::RegionConstraint<I>, VisibleForLeakCheck)>,
+    pub region_constraints: ExternalRegionConstraints<I>,
     pub opaque_types: Vec<(ty::OpaqueTypeKey<I>, I::Ty)>,
     pub normalization_nested_goals: NestedNormalizationGoals<I>,
 }
@@ -608,10 +677,28 @@ pub struct ExternalConstraintsData<I: Interner> {
 impl<I: Interner> Eq for ExternalConstraintsData<I> {}
 
 impl<I: Interner> ExternalConstraintsData<I> {
+    pub fn new(cx: I) -> Self {
+        let region_constraints = match cx.assumptions_on_binders() {
+            true => ExternalRegionConstraints::NextGen(RegionConstraint::new_true()),
+            false => ExternalRegionConstraints::Old(vec![]),
+        };
+
+        Self {
+            region_constraints,
+            opaque_types: vec![],
+            normalization_nested_goals: NestedNormalizationGoals::default(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.region_constraints.is_empty()
-            && self.opaque_types.is_empty()
-            && self.normalization_nested_goals.is_empty()
+        let ExternalConstraintsData {
+            region_constraints,
+            opaque_types,
+            normalization_nested_goals,
+        } = self;
+        region_constraints.is_empty()
+            && opaque_types.is_empty()
+            && normalization_nested_goals.is_empty()
     }
 }
 
@@ -819,19 +906,26 @@ impl Certainty {
         }
     }
 
-    pub fn is_overflow(&self) -> bool {
-        match self {
-            Certainty::Maybe(MaybeInfo { cause: MaybeCause::Overflow { .. }, .. }) => true,
-            _ => false,
-        }
-    }
-
     pub const fn overflow(suggest_increasing_limit: bool) -> Certainty {
         Certainty::Maybe(MaybeInfo {
             cause: MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: false },
             opaque_types_jank: OpaqueTypesJank::AllGood,
             stalled_on_coroutines: StalledOnCoroutines::No,
         })
+    }
+
+    pub fn is_yes(&self) -> bool {
+        match self {
+            Certainty::Yes => true,
+            Certainty::Maybe(_) => false,
+        }
+    }
+
+    pub fn is_overflow(&self) -> bool {
+        match self {
+            Certainty::Maybe(MaybeInfo { cause: MaybeCause::Overflow { .. }, .. }) => true,
+            _ => false,
+        }
     }
 }
 
@@ -925,5 +1019,163 @@ impl SizedTraitKind {
             SizedTraitKind::Sized => SolverTraitLangItem::Sized,
             SizedTraitKind::MetaSized => SolverTraitLangItem::MetaSized,
         })
+    }
+}
+
+#[derive_where(Clone, Debug; I: Interner)]
+pub enum SucceededInErased<I: Interner> {
+    /// This goal previously succeeded in erased mode, which based on `accessed_opaques`
+    /// might make us take a fast path slightly more often.
+    Yes {
+        accessed_opaques: AccessedOpaques<I>,
+    },
+    No,
+}
+
+#[derive_where(Clone, Debug; I: Interner)]
+pub enum GoalStalledOnOpaques<I: Interner> {
+    /// This goal got stalled in `compute_goal_fast_path`. Usually this means
+    /// the goal is stalled on not that much, only one or two variables, and
+    /// definitely nothing to do with opaque types. So we don't store that information.
+    No,
+    Yes {
+        num_opaques_in_storage: usize,
+        previously_succeeded_in_erased: SucceededInErased<I>,
+    },
+}
+
+/// The variables a stalled goal waits on: inline for the one or two a goal almost always has,
+/// so stalling allocates nothing (rustc has a `ThinVec`, #160005, which allocates for one).
+pub type StalledVars = SmallVec<[TyOrConstInferVar; 2]>;
+
+/// The sub-unification roots of a stalled goal's type variables, inline as [`StalledVars`].
+pub type SubRoots = SmallVec<[TyVid; 2]>;
+
+/// The conditions that must change for a goal to warrant
+#[derive_where(Clone, Debug; I: Interner)]
+pub struct GoalStalledOn<I: Interner> {
+    pub stalled_vars: StalledVars,
+    pub sub_roots: SubRoots,
+    /// The `MaybeInfo` that will be returned on subsequent evaluations if this
+    /// goal remains stalled.
+    pub stalled_maybe_info: MaybeInfo,
+    pub opaques: GoalStalledOnOpaques<I>,
+}
+
+/// What `SolverDelegate::compute_goal_fast_path` may answer where it is asked.
+///
+/// The search graph charges a goal it evaluates one level of the recursion limit, and charges
+/// its parent the levels below it. A fast-path answer that stands for such an evaluation must
+/// cost the same, so it needs the depth the goal is evaluated with, which only the place that
+/// evaluates the goal knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastPathDepth {
+    /// The goal is being added to its parent's nested goals and is evaluated later, at a
+    /// depth not known yet: only answers that cost no depth.
+    Added,
+    /// The goal is being evaluated after `Added` gave no answer: only `HoldsWithin`, within
+    /// the depth available to the goal, or none when `None` (evaluating it overflows, or a
+    /// proof tree is being built).
+    Evaluating(Option<usize>),
+    /// A root goal or a stalled goal rerun: every answer, `HoldsWithin` within this depth.
+    Any(Option<usize>),
+}
+
+impl FastPathDepth {
+    /// Whether answers that cost no depth may be given.
+    pub fn depth_free(self) -> bool {
+        !matches!(self, FastPathDepth::Evaluating(_))
+    }
+
+    /// The depth a `HoldsWithin` answer must fit in, when one may be given.
+    pub fn available(self) -> Option<usize> {
+        match self {
+            FastPathDepth::Added => None,
+            FastPathDepth::Evaluating(available) | FastPathDepth::Any(available) => available,
+        }
+    }
+}
+
+/// For some goals we can trivially answer some questions without going through
+/// canonicalization. There are three options:
+#[derive(Clone, Debug)]
+pub enum ComputeGoalFastPathOutcome<I: Interner> {
+    /// Do not attempt the fast path. Compute as normal.
+    NoFastPath,
+    /// The goal trivially holds, immediately produce a result with [`Certainty::Yes`]
+    TriviallyHolds,
+    /// The goal holds with [`Certainty::Yes`] and no constraints, as its search-graph
+    /// evaluation finds with `required_depth` levels below it. Given only when the
+    /// [`FastPathDepth`] has an available depth of at least `required_depth`; the caller
+    /// charges the parent goal as a global cache hit of that required depth is charged.
+    HoldsWithin { required_depth: usize },
+    /// The goal is trivially stalled: we know for sure that it makes no sense to compute it right
+    /// now, but can return information about what its stalled on and when it can be computed for real.
+    TriviallyStalled { stalled_on: GoalStalledOn<I> },
+}
+
+/// Helper for `InferCtxt::ty_or_const_infer_var_changed` (see comment on that), used
+/// for `traits::fulfill`'s list of `stalled_on` inference variables and for merging
+/// ambiguity errors caused by the same inference variable during error reporting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TyOrConstInferVar {
+    /// Equivalent to `ty::Infer(ty::TyVar(_))`.
+    Ty(TyVid),
+    /// Equivalent to `ty::Infer(ty::IntVar(_))`.
+    TyInt(IntVid),
+    /// Equivalent to `ty::Infer(ty::FloatVar(_))`.
+    TyFloat(FloatVid),
+
+    /// Equivalent to `ty::ConstKind::Infer(ty::InferConst::Var(_))`.
+    Const(ConstVid),
+}
+
+impl TyOrConstInferVar {
+    pub fn as_type<I: Interner>(&self, interner: I) -> Option<I::Ty> {
+        match self {
+            Self::Ty(vid) => Some(I::Ty::new_var(interner, *vid)),
+            Self::TyInt(_) | Self::TyFloat(_) | Self::Const(_) => None,
+        }
+    }
+
+    /// Tries to extract an inference variable from a type or a constant, returns `None`
+    /// for types other than `ty::Infer(_)` (or `InferTy::Fresh*`) and
+    /// for constants other than `ty::ConstKind::Infer(_)` (or `InferConst::Fresh`).
+    pub fn maybe_from_generic_arg<I: Interner>(arg: I::GenericArg) -> Option<Self> {
+        match arg.kind() {
+            GenericArgKind::Type(ty) => Self::maybe_from_ty::<I>(ty),
+            GenericArgKind::Const(ct) => Self::maybe_from_const::<I>(ct),
+            GenericArgKind::Lifetime(_) => None,
+        }
+    }
+
+    /// Tries to extract an inference variable from a type or a constant, returns `None`
+    /// for types other than `ty::Infer(_)` (or `InferTy::Fresh*`) and
+    /// for constants other than `ty::ConstKind::Infer(_)` (or `InferConst::Fresh`).
+    pub fn maybe_from_term<I: Interner>(term: I::Term) -> Option<Self> {
+        match term.kind() {
+            TermKind::Ty(ty) => Self::maybe_from_ty::<I>(ty),
+            TermKind::Const(ct) => Self::maybe_from_const::<I>(ct),
+        }
+    }
+
+    /// Tries to extract an inference variable from a type, returns `None`
+    /// for types other than `ty::Infer(_)` (or `InferTy::Fresh*`).
+    fn maybe_from_ty<I: Interner>(ty: I::Ty) -> Option<Self> {
+        match ty.kind() {
+            ty::Infer(ty::TyVar(v)) => Some(TyOrConstInferVar::Ty(v)),
+            ty::Infer(ty::IntVar(v)) => Some(TyOrConstInferVar::TyInt(v)),
+            ty::Infer(ty::FloatVar(v)) => Some(TyOrConstInferVar::TyFloat(v)),
+            _ => None,
+        }
+    }
+
+    /// Tries to extract an inference variable from a constant, returns `None`
+    /// for constants other than `ty::ConstKind::Infer(_)` (or `InferConst::Fresh`).
+    fn maybe_from_const<I: Interner>(ct: Const<I>) -> Option<Self> {
+        match ct.kind() {
+            ty::ConstKind::Infer(InferConst::Var(v)) => Some(TyOrConstInferVar::Const(v)),
+            _ => None,
+        }
     }
 }

@@ -1,0 +1,35 @@
+{
+  "id": "00358",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine"
+  ],
+  "what": "## 3. `Resolver` holds the memos instead of `named` (required)\n\n`lib.rs`, a new struct after `struct Prebuilt { .. }` (after line 539):\n\n```rust\n/// What the code generator asks of the resolver again for every unit, each worked out once a\n/// build ([`memo::Memo`]).\nstruct Memos {\n    /// By whether the build had turned out to be one in full ([`Resolver::in_full`]) when the\n    /// symbol was named: in full, what only the executable has is named no more.\n    functions: memo::Memo<(FunctionId, bool), Option<intern::Symbol>>,\n    privates: memo::Memo<FunctionId, bool>,\n    statics: memo::Memo<StaticId, Option<intern::Symbol>>,\n    sources: memo::Memo<vfs::FileId, Option<intern::Symbol>>,\n    crates: memo::Memo<ide_db::base_db::Crate, CrateFacts>,\n}\n\nimpl Memos {\n    /// Address space for as many as a build of every crate of crates.io names: nothing is\n    /// committed until it is filled.\n    fn new() -> Memos {\n        Memos {\n            functions: memo::Memo::new(1 << 23),\n            privates: memo::Memo::new(1 << 22),\n            statics: memo::Memo::new(1 << 20),\n            sources: memo::Memo::new(1 << 18),\n            crates: memo::Memo::new(1 << 16),\n        }\n    }\n}\n\n/// What a build asks of a crate for every unit that names an item of it.\nstruct CrateFacts {\n    /// rustc's `StableCrateId`, when rustc built something of it.\n    rustc_id: Option<u64>,\n    /// Blaze's id of a crate rustc built nothing of ([`Resolver::own_crate_id`]).\n    own_id: Option<u64>,\n    /// [`SymbolResolver::rustc_built`].\n    rustc_built: bool,\n    /// How the paths of symbols spell it ([`Resolver::crate_path`]).\n    path: Option<Box<str>>,\n}\n```\n\n`lib.rs:418-420` (in `struct Resolver`), before:\n\n```rust\n    /// The symbols of the functions asked about, for every thread of the build: the threads\n    /// that compile find them ahead of the one that puts the functions in the object.\n    named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,\n```\n\nafter:\n\n```rust\n    /// What the threads of the build ask again for every unit: the threads that compile find\n    /// the symbols ahead of the one that puts the functions in the object.\n    memos: Arc<Memos>,\n```\n\n`lib.rs:453` (in `struct ResolverParts`), before:\n\n```rust\n    named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,\n```\n\nafter:\n\n```rust\n    memos: Arc<Memos>,\n```\n\n`lib.rs:474` (in `Resolver::parts`), before: `            named: self.named.clone(),`\nafter: `            memos: self.memos.clone(),`\n\n`lib.rs:500` and `lib.rs:519` (the destructuring and the constructor in `ResolverParts::over`),\nbefore: `            named,` after: `            memos,` (both lines).\n\n`lib.rs:858` (in `Resolver::with`), before:\n\n```rust\n            named: Default::default(),\n```\n\nafter:\n\n```rust\n            // alloc: once a build, shared by its threads.\n            memos: Arc::new(Memos::new()),\n```\n\n- Why: one `Arc` a build in place of one; the memos are shared the same way `named` was\n  (`parts` clones the `Arc` once per worker per `in_parallel` call, not per unit).\n- Budget test: request 5's.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-31T20:30:05Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#3. `Resolver` holds the memos instead of `named` (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:298"
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

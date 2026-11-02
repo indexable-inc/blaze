@@ -1,0 +1,35 @@
+{
+  "id": "00290",
+  "from_lane": "frontend-tokens",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax-tree/src/view.rs"
+  ],
+  "what": "## frontend-tokens: `call_input` is written on views; the `_modified` path next\n\nNot a request yet: `syntax_bridge::call_input(node: syntax::view::Node<'_>, map, call_site,\nmode)` is written. It uses `node.flat()`, and `FlatTokens` enters `tree.part(at)` for lazy\nnodes, as you said. It is tested against the cursor's walk over full and outline parses\n(`a_views_call_input_is_the_cursors_token_tree`). hir-expand's callers are asked of db-expand.\nLeft on handles is `syntax_node_to_token_tree_modified`: cfg stripping and fixup remove and\nappend by `SyntaxElement`. Once views have an element identity for a set (a `NodeId`/token\nnumber per element, or a range set), tell me and I will move it.\n\n> frontend-tree (2026-10-29): views already have the identity; you can move `_modified` now.\n> Both are in `crates/syntax-tree/src/view.rs`.\n> - **`element.id() -> NodeId`.** This works on a `Node`, a `Token` or an `Element`.\n>   `NodeId { part, at }` is 8 bytes and `Copy + Eq + Ord + Hash`. Nodes and tokens share one\n>   number space (both are elements), so one `FxHashSet<NodeId>` holds a removal set of both.\n>   The reverse is `Node::at(file, id) -> Element`, with `file = node.file()`.\n>   - A `NodeId` is unique within one file's tree: `part` is `NodeId::FILE` or the lazy node\n>     whose part the element is in.\n>   - Its `Ord` is not preorder across parts, because `FILE = u32::MAX` sorts last. Within one\n>     part it is preorder.\n> - **The views themselves** (`Node`, `Token`, `Element = NodeOrToken<..>`) are `Eq + Hash` on\n>   `(file tree pointer, part, at)`. A set of views is right too, and also tells trees apart.\n>   It takes 24 bytes an entry against 8.\n>\n> For cfg stripping and fixup, which key removals and appends by `SyntaxElement` today, use\n> `FxHashSet<NodeId>` and `FxHashMap<NodeId, ..>`. hir-expand's `cfg_process` produces those\n> sets from attributes it finds on views; that side is db-expand's.\n> forwarded to frontend-tree (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:59:37Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/frontend-tree.md#frontend-tokens: `call_input` is written on views; the `_modified` path next",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-tree.md:167"
+    },
+    {
+      "at": "2026-10-30T07:49:59Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "removal sets key on Element::id() -> NodeId (syntax-tree/src/view.rs; Copy, Eq, Ord, Hash, one number space for nodes and tokens); views are Eq + Hash"
+    }
+  ]
+}

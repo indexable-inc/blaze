@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// This takes all the opaque type uses during HIR typeck. It first computes
     /// the concrete hidden type by iterating over all defining uses.
     ///
@@ -63,7 +63,7 @@ impl<'db> UsageKind<'db> {
     }
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     fn compute_definition_site_hidden_types(
         &mut self,
         mut opaque_types: Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>,
@@ -74,7 +74,7 @@ impl<'db> InferenceContext<'db> {
         debug!(?opaque_types);
 
         let interner = self.interner();
-        let TypingMode::Analysis { defining_opaque_types_and_generators } =
+        let TypingMode::Typeck { defining_opaque_types_and_generators } =
             self.table.infer_ctxt.typing_mode_raw()
         else {
             unreachable!();
@@ -103,18 +103,19 @@ impl<'db> InferenceContext<'db> {
             }
 
             if let UsageKind::HasDefiningUse(ty) = usage_kind {
+                // Every use instantiates it in another environment, so its aliases go back to
+                // non-rigid once, here, as rustc's `EarlyBinder::bind` does.
+                let ty = EarlyBinder::bind(interner, ty.ty);
                 for &(opaque_type_key, hidden_type) in &opaque_types {
                     if opaque_type_key.def_id != def_id.into() {
                         continue;
                     }
 
-                    let expected = EarlyBinder::bind(ty.ty)
-                        .instantiate(interner, opaque_type_key.args)
-                        .skip_norm_wip();
+                    let expected = ty.instantiate(interner, opaque_type_key.args).skip_norm_wip();
                     _ = self.demand_eqtype_fixme_no_diag(expected, hidden_type.ty);
                 }
 
-                self.result.type_of_opaque.insert(def_id, ty.ty.store());
+                self.result.type_of_opaque.insert(def_id, ty.skip_binder().store());
 
                 continue;
             }

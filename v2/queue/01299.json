@@ -1,0 +1,25 @@
+{
+  "id": "01299",
+  "from_lane": "compile-time-sched",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/arena.rs",
+    "crates/blaze-graph/src/admission.rs",
+    "crates/blaze-graph/src/plane.rs"
+  ],
+  "what": "FYI + follow-up from 01101 (program builds admitted by the budget). Edited your files: arena.rs (HIGH process high-water in add(); high_water_from_now/high_water; test a_watch_sees_what_every_thread_held_at_most), admission.rs (kinds::PROGRAM 0x1_0009, Tag::Codegen; Predict::measured default true), plane.rs pick (a task predicted exactly the whole budget starts once granted == 0, whatever held is; test in plane_tests). Open, yours: a task peak beside others is still its own thread only (arena::measure); rayon work in blaze-codegen until_stopped and blaze-link par sites is not attributed. A scope rayon jobs enter, carrying the task id, would let every kind learn its real peak; see docs/v2/plan/lanes/compile-time-sched/notes.md.",
+  "state": "open",
+  "created": "2026-10-31T14:56:45Z",
+  "updated": "2026-10-31T14:56:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:56:45Z",
+      "by": "compile-time-sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

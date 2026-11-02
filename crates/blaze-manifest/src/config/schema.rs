@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use serde::Deserialize;
 use serde_untagged::UntaggedEnumVisitor;
 
@@ -58,6 +58,18 @@ pub struct CargoNetConfig {
     pub offline: Option<bool>,
     pub git_fetch_with_cli: Option<bool>,
     pub ssh: Option<CargoSshConfig>,
+}
+
+/// `[unstable]`: the `-Z` flags blaze reads, in the form cargo's `CliUnstable` takes them from
+/// configuration. Other keys are left unread, as cargo leaves keys it has no field for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CargoUnstableConfig {
+    pub unstable_options: Option<bool>,
+    pub bindeps: Option<bool>,
+    pub build_std: Option<Vec<String>>,
+    pub build_std_features: Option<Vec<String>>,
+    pub codegen_backend: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,7 +271,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = FxHashMap<String, EnvConfigValue>;
+pub type EnvConfig = HashMap<String, EnvConfigValue>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]

@@ -11,7 +11,6 @@ use std::{
 use anyhow::{Context as _, bail};
 use semver::{Version, VersionReq};
 use serde_derive::Deserialize;
-use sha2::{Digest, Sha256};
 
 use blaze_source::SourceId;
 
@@ -26,6 +25,7 @@ pub struct Vendored {
     /// The sha256 of the `.crate` file it was unpacked from, which a registry's lock entry
     /// names; none for a package vendored from git.
     pub checksum: Option<String>,
+    // BTreeMap: `verify` reports the first changed file in path order, the same on every run.
     files: BTreeMap<String, String>,
 }
 
@@ -167,12 +167,9 @@ fn read(root: &Path) -> anyhow::Result<Vec<Vendored>> {
 fn verify(package: &Vendored) -> anyhow::Result<()> {
     for (file, expected) in &package.files {
         let path = package.root.join(file);
-        let mut hasher = Sha256::new();
-        let mut reader = std::fs::File::open(&path)
+        let bytes = std::fs::read(&path)
             .with_context(|| format!("failed to calculate checksum of: {}", path.display()))?;
-        std::io::copy(&mut reader, &mut hasher)
-            .with_context(|| format!("failed to calculate checksum of: {}", path.display()))?;
-        let actual: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual: String = blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
         if &actual != expected {
             bail!(
                 "the listed checksum of `{}` has changed:\nexpected: {expected}\nactual:   {actual}\n\n\

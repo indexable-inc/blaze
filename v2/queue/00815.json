@@ -1,0 +1,35 @@
+{
+  "id": "00815",
+  "from_lane": "graph",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-image/src/lib.rs"
+  ],
+  "what": "Add SectionId::SALSA_GRAPH = SectionId(0x0501) with name \"salsa query graph\" to crates/blaze-image/src/lib.rs (beside SALSA_INTERNED). vendor/salsa/src/graph/frozen.rs writes the frozen query graph there and uses SectionId(0x0501) directly until the constant exists.",
+  "state": "applied",
+  "created": "2026-10-30T08:20:50Z",
+  "updated": "2026-10-30T08:32:54Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:20:50Z",
+      "by": "graph",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:54Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:54Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "crates/blaze-image/src/lib.rs: SectionId::SALSA_GRAPH = SectionId(0x0501) beside SALSA_INTERNED, Display name \"salsa query graph\"; vendor/salsa/src/graph/frozen.rs SECTION = SectionId::SALSA_GRAPH (graph told by tmux)."
+    }
+  ]
+}

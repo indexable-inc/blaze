@@ -1,0 +1,25 @@
+{
+  "id": "01031",
+  "from_lane": "fastcompile-premap-start",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/premap.rs",
+    "crates/blaze-link/src/lib.rs",
+    "crates/blaze-link/src/place.rs"
+  ],
+  "what": "fastcompile-premap-start 1: the workspace executable beside a dependency image, under the exec-the-file start (`docs/v2/plan/lanes/fastcompile/inproc.md`; premap 4 superseded). premap's side is in `crates/blaze-premap/src/{prelink,start}.rs`; `docs/v2/plan/lanes/fastcompile/premap.md` \"The start\".\n\n1. **Place.** The dependency image is a `FixedMap` at its linked address inside the executable's reservation for fixed maps, and slides with the executable. `blaze_premap::prelink::base(format, arch)` is one address per format (ELF 0x40_0000, Mach-O 0x1_0000_0000, PE 0x1_4001_0000 = EXE_BASE + one 64 KiB granule, since PE headers sit at ImageBase). `Image::beside` already starts the executable's own segments at the image's end; it must also make `.blaze.reserve.fixed` (PE `.bfixed`, Mach-O's reservation segment) cover exactly `[outside base, outside end)`, so blaze-inproc's checks find every fixed map inside a reservation. Today the fixed reservation goes after the arena and cells, past the executable's segments, which can't contain an image linked below them. `Outside` needs a `base()` for this, or `end()` plus the image's first segment.\n2. **The system loader's parts, carried by the executable.** premap no longer runs a start of its own for these; the executable must carry the image's:\n   - thread-local template as the image's part of its own `PT_TLS` / TLS directory / `__thread_vars`, at the offsets the image was linked for (`Request::tls_bias`). With the system loader's layout the image's part can only have fixed offsets if the bias is the ABI's: AArch64 ELF variant I puts the block at TP + align_up(16, p_align); x86-64 variant II ends it at TP, so the image's part must be last in the block (or the bias negative, from the image's size). Please give `pub fn tls_bias(format, arch, align) -> Result<i64, LinkError>` (or a rule premap can call), and the error for an executable whose block would move the image's part;\n   - init and fini pieces, merged with the executable's own in the whole link's order (rank, line order, tie) in `.init_array`/`.fini_array`, `__mod_init_func`, the CRT sections;\n   - shared libraries in `DT_NEEDED`/`LC_LOAD_DYLIB`/imports, in line order, each once; an `as_needed` library the image's binds use counts as used;\n   - call frame information in `.eh_frame_hdr` / `__unwind_info` / `.pdata`, so the unwinder finds the image's frames through the executable.\n   For these, `Outside` could gain `tls_template`, `init`, `fini`, `libraries`, `unwind`, `thread_vars`; `blaze_premap::View` already has each accessor, and premap will implement them the day they land.\n3. **The slide.** The image's own bytes (pointers in statics, vtables, the binds' neighbours) hold addresses linked at its base, so the image runs right only where the executable does not slide, which `Image::beside`'s limit already says. For it to really slide with the executable, the prelink must list every absolute 8-byte word that names an address of the image (`Prelinked::rebases`, sorted), and class every segment holding one as `Prot::Data`, so it is a private copy a run can rebase. premap then adds them to the start. Until then, a slid run is an error (asked of inproc, fastcompile-premap-start 2).\n\nWhy: superset-of-rust and no-fallback. Under the exec contract the kernel and the system loader start the program from its own file, so the image's TLS, init order, libraries and unwind are right only if the file carries them.",
+  "state": "open",
+  "created": "2026-10-30T14:23:25Z",
+  "updated": "2026-10-30T14:23:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:23:25Z",
+      "by": "fastcompile-premap-start",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00733",
+  "from_lane": "dedyn",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo"
+  ],
+  "what": "## dedyn: crates/blaze-cargo: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines\n\n> Being applied in the tree by dedyn-cargo (dedyn, 2026-10-29 21:22): don't apply it again.\n\n> APPLIED by dedyn-cargo-rest 2026-10-29 21:33 (the sites outside serve/, re-decided as code, not comments: see /tmp/blaze-lanes/v2-dedyn-cargo-rest.md)\n\n> APPLIED by dedyn-cargo 2026-10-29 22:10 (the serve/ sites): `plane.rs` `Work<T>` is gone, every batch is one `job::Step<S>` enum run by a `match` (`plane::Work`); `image.rs` `on_pool` keeps its `// dyn:` line, its shape being `blaze_image::Jobs`'s, once per image section. See /tmp/blaze-lanes/v2-dedyn-cargo.md.\n\nEach was read for where it is called. None is called per item of a hot loop: each runs once per\nrun, request, package, path or job, next to a process spawn, a file read, a hash of a file or a\ndownload. No code change; add the line above each (today's numbers):\n\n- `src/serve/plane.rs:47` `Work<T>`: `// dyn: a batch's task, one call per plane task (a whole node's work); batches of different closures share the pool's queue.`\n- `src/serve/image.rs:176` `on_pool`: `// dyn: one call per image job, each a whole object's work, on the worker pool.`\n- `src/cargo/keyed.rs:138`, `:164`, `:182` (`now`): `// dyn: one call per path a run read, each a stat or hash of the file.`\n- `src/cargo/hermetic/mod.rs:413` (`unplace`): `// dyn: one call per dependency directory of a key, once per run.`\n- `src/cargo/fetches.rs:153` (`dependency`) and `:1072` (`fetch`): `// dyn: one call per package, each a download or a lookup of one.`\n- `src/cargo/own_script.rs:266`, `:303` (`rustc_had`): `// dyn: one call per build script's dep-info line, once per script run.`\n- `src/cargo/run.rs:545`, `:611` (`bare`): `// dyn: makes one command per run.`\n- `src/answers.rs:157`, `src/answers/own.rs:495`, `:505` (`var`): `// dyn: the environment, read a few times per rustc question answered.`\n- `src/answers/cargo.rs:149` (`rustc`): `// dyn: asks rustc's host once per answer.`\n- `src/cargo/daemon.rs:2427` (`ask`): `// dyn: one boxed answer per daemon request.`\n- `src/deps.rs:514` (`archives`): `// dyn: three archive writers, each run once.`\n\n> forwarded to cargo (told by tmux; requests, pass 23).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedyn: crates/blaze-cargo: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4242"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "applied by dedyn-cargo and dedyn-cargo-rest"
+    }
+  ]
+}

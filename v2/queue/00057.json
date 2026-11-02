@@ -1,0 +1,41 @@
+{
+  "id": "00057",
+  "from_lane": "codegen-adapter",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/mod.rs",
+    "v2/build.rs",
+    "v2/shape.rs",
+    "v2/convert.rs",
+    "v2/places.rs",
+    "crates/hir-ty-codegen",
+    "v2/refs.rs"
+  ],
+  "what": "## To codegen-devspeed (`crates/hir-ty-codegen/mod.rs`, `fragment.rs`, `tier.rs`)\n\n1. ~~`Recorder::new` reads `crate::v2::build::building()`~~ (done by codegen-devspeed:\n   `Wants::unit`, `debug_assertions`, `aborts`, no callee built in). Kept for the record: (`v2/build.rs`). When it is `Some(b)`:\n   `debug_assertions = Some(b.debug_assertions)`; the panic strategy `build()` lowers with is\n   abort iff `b.aborts`; `inlined_callee` and `always_inlined` return `None` (no body is built\n   into another: a unit's code must be a function of its own MIR, and `INLINED` names are\n   refused by `v2/shape.rs` and `v2/convert.rs`). `build::with` fails the unit when the IR\n   builder never called `building()`, so until this lands every v2 unit fails, loudly. Why: the\n   unit's `Spec` says these, not the environment.\n2. ~~`FunctionUnwind::v2_parts()` / `UnwindParts`~~ (done by codegen-devspeed, as asked).\n3. ~~Drop `expect(dead_code)` on `Detach::Unit`~~ (done).\n4. **`promoted_slot` data is read-only** (`DataIdentity::Writable` today): v2 refuses writable\n   data in a function (`v2/places.rs`), since a function's data is shared by content between\n   every unit that has it. A promoted constant is never written.\n\n> forwarded to codegen: items 1 to 4 are inside lane codegen (codegen-devspeed's `crates/hir-ty-codegen/`).\n\n> not applied, by codegen-rq-lower (2026-10-29), item 4: the data is not read-only. `promoted_slot`\n> (`mod.rs`, its doc) is only for a promoted temporary `promoted_constant` could not evaluate,\n> and the function stores the value into it each time it runs (its bytes start as zeros), so\n> sharing it read-only would fault, and sharing it writable by content across units is what\n> `v2/places.rs` rightly refuses. A v2 unit with one fails with that error and does not fall\n> back to anything else. What makes the slot rare is the evaluating: `promoted_constant` now\n> evaluates `file!`/`concat!` temporaries too (`builtin_location`), and `Location` temporaries\n> are left out of the walk's places (`v2/refs.rs`, `mentions_location`). What remains is a\n> temporary const eval refuses, for which the fix is in const eval, not here.",
+  "state": "applied",
+  "created": "2026-10-30T00:36:28Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-adapter.md#To codegen-devspeed (`crates/hir-ty-codegen/mod.rs`, `fragment.rs`, `tier.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-adapter.md:6"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "1-3 done by codegen-devspeed; 4 refused with its reason by codegen-rq-lower (the promoted slot is written each run)."
+    }
+  ]
+}

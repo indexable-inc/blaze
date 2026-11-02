@@ -14,25 +14,25 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-anyhow.workspace = true
 base-db.workspace = true
+blaze-graph.workspace = true
+blaze-hash.workspace = true
 either.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-ide-db.workspace = true
 intern.workspace = true
+parking_lot.workspace = true
 parser.workspace = true
-pulldown-cmark.workspace = true
-rayon.workspace = true
-rustc-hash.workspace = true
+# `html`: `push_html`; `simd`: its escaping with SSE where the target has it.
+pulldown-cmark = { workspace = true, features = ["html", "simd"] }
 serde_json.workspace = true
 span.workspace = true
+stdx.workspace = true
 syntax.workspace = true
-vfs.workspace = true
 
 [dev-dependencies]
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]
 workspace = true

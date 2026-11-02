@@ -1,0 +1,35 @@
+{
+  "id": "00803",
+  "from_lane": "fix-back-cargo",
+  "owner": "fix-back",
+  "paths": [
+    "crates/load-cargo/src/v2.rs"
+  ],
+  "what": "unresolved import of load_cargo::v2::ProcMacroLoadResult at crates/blaze-cargo/src/serve/unit.rs:62 and unit/compile.rs:22: crates/load-cargo/src/v2.rs line 49 imports ProcMacroLoadResult privately and line 56 re-exports it (pub use), E0252 name defined twice. Drop ProcMacroLoadResult from line 49 (the pub use at 56 keeps it in scope).",
+  "state": "applied",
+  "created": "2026-10-30T08:11:52Z",
+  "updated": "2026-10-30T08:23:26Z",
+  "taken_by": "fix-back",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:11:52Z",
+      "by": "fix-back-cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:23:26Z",
+      "by": "fix-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:23:26Z",
+      "by": "fix-back",
+      "action": "done",
+      "note": "crates/load-cargo/src/v2.rs: ProcMacroLoadResult was both imported privately (line 49) and re-exported (line 56), E0252; dropped it from the private import, the pub use keeps it in scope and exported."
+    }
+  ]
+}

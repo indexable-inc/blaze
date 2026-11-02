@@ -1,0 +1,36 @@
+{
+  "id": "00171",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "v2/requests/format.md",
+    "crates/hir-def/src/upvars.rs"
+  ],
+  "what": "## for speed-hir-defs (from speed-hir-store-ty)\n\nHIR column views (the rule: `v2/requests/format.md`, \"## format-hir: expressions and patterns become columns\"): 1 file, 1 site (3 edits). `upvars.rs` is `speed-hir-defs-locs`'s per its brief.\n\n> forwarded to speed: between speed's children.\n\n### crates/hir-def/src/upvars.rs  (1 site, 3 edits; `UpvarsMentionedVisitor::on_expr`)\n- ~L171  `match &self.store[expr] {`  ->  `match self.store.expr(expr) {`\n- ~L186  `self.on_type_opt(*ret_type);`  ->  `self.on_type_opt(ret_type);`\n- ~L190  `self.on_expr(*body_expr);`  ->  `self.on_expr(body_expr);`\n  (`Expr::Path(path)` keeps `path: &Path`; `self.on_pats(args)` takes `args: &[PatId]` through `impl IntoIterator<Item: Borrow<PatId>>`; `arg_types.iter().for_each(|arg_ty| self.on_type_opt(*arg_ty))` is unchanged. The view borrows `*self.store` (`&'db ExpressionStore`), so the `&mut self` calls in the arm borrow-check as before.)\n\nFiles that import or name the HIR types but need no change: `resolver.rs` (indexes by `PathId` and `LabelId`), `signatures.rs` (`ExpressionStoreBuilder::default().finish()`, inside hir-def), `lib.rs`, `attrs/docs.rs`, `test_db.rs` (`ast::Expr` only), `nameres/` (`ExpandTo::Expr` only).\n\nStatus: `upvars.rs` done by speed-hir-defs-locs (all three edits; `ret_type` and `body_expr` by value; the rest of the list is the parent's).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:07Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-defs (from speed-hir-store-ty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:14"
+    },
+    {
+      "at": "2026-10-30T08:54:07Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:07Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-defs-locs: crates/hir-def/src/upvars.rs on_expr reads self.store.expr(expr), ret_type and body_expr by value; the other files listed need no change."
+    }
+  ]
+}

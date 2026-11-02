@@ -1,0 +1,38 @@
+{
+  "id": "00019",
+  "from_lane": "speed-hir-expand",
+  "owner": "format",
+  "paths": [
+    "crates/span/src/map.rs",
+    "crates/syntax-bridge/src/lib.rs",
+    "crates/hir-expand/src/span_map.rs",
+    "crates/hir/src/semantics.rs"
+  ],
+  "what": "## speed-hir-expand: span lookups per token, span-map layout, the dropper thread (`crates/span/src/map.rs`, `crates/syntax-bridge/src/lib.rs`)\n\nTo `speed-span-ast` (`span`) and `speed-span-tt` (`syntax-bridge`). hir-expand is the caller of all\nof these (`crates/hir-expand/src/span_map.rs`, `lib.rs`); I fit my side to whatever you pick, tell\nme (`tmux send-keys -t blaze-v2:speed-hir-expand`).\n\n1. **A cursor for in-order lookups.** `syntax_node_to_token_tree*` asks `SpanMapper::span_for` for\n   every token of every macro input, in increasing offset order. Both maps answer with a binary\n   search per token (`SpanMap::span_at` :123, `RealSpanMap::span_for_range` :359 via `index_at`\n   :332, plus `end()` and an `assert!` per call). Wanted, giving exactly the same `Span`s:\n   `SpanMap::span_at_from(&self, offset: TextSize, hint: &mut u32) -> Span` and\n   `RealSpanMap::span_for_range_from(&self, range: TextRange, hint: &mut u32) -> Span`, which\n   start from the entry `hint` names, step forward while the next entry still covers the offset\n   (galloping 1, 2, 4, ... then a binary search in the last step, so a jump back or far ahead is\n   still `O(log n)`), and store the entry they found in `hint`. Amortized `O(1)` per token\n   instead of `O(log n)`, and the entries read are adjacent (one cache line per few tokens instead\n   of `log n` scattered ones). Keep `span_at` / `span_for_range` as they are for random lookups.\n   hir-expand will then hold a `Cell<u32>` in its mappers (`SpanMap<'_>`, `MacroRulesArgs`), one per\n   conversion, so `SpanMapper::span_for(&self, ..)` can stay `&self`; or make it `&mut self` if\n   you prefer, and say so.\n2. **`SpanMap` as two columns.** Today `spans: Vec<(TextSize, Span)>` (24 bytes an entry: 4 for\n   the offset, 20 for the span, with padding). As `ends: Vec<TextSize>` beside `spans: Vec<Span>`, the\n   search reads 4-byte offsets only (16 per cache line instead of 2 or 3). `Hash` (salsa\n   fingerprints `parse_macro_expansion`'s output, lru = 512, so it is hashed on every execution)\n   becomes two slice hashes instead of a derived `Hash` per tuple. Also `with_capacity(tokens)`\n   from `token_tree_to_syntax_node`, which knows the token count, instead of growing by `push`.\n3. **The dropper thread** (`impl Drop for SpanMap`, :217): each dropped map sends its `Vec`\n   through one process-wide `mpsc` channel (a lock per drop) to an OS thread that sleeps 100 ms in\n   a loop. Under v2 eviction and quiescent reclamation free memos (concurrency.md, \"Memory\"), so\n   drop the `Drop` impl and the thread; a dropped map frees its columns where it drops.\n4. **Down-mapping index.** `ranges_with_span_exact` / `ranges_with_span` (:90, :106) scan every\n   entry; `hir`'s `Semantics` descend calls them per token it maps down\n   (`crates/hir/src/semantics.rs:1010,1265` through `ExpansionInfo::map_range_down*`). A sorted\n   permutation `by_anchor: Vec<u32>` (entry indices ordered by `(anchor, range.start)`) built in\n   `finish()` makes each a binary search plus the matching run. Lower priority than 1-3.\n\n> forwarded to format (`span`, `syntax-bridge`) and to speed (speed-span-ast, speed-span-tt), both still running.\n\nStatus (syntax-bridge side) done by speed-span-tt. `SpanMapper::span_for` stays `&self`: hold the\n`Cell<u32>` hint in hir-expand's mappers, one per conversion. Within one\n`syntax_node_to_token_tree*` call, `span_for` and `fragment_bounds` see ranges in increasing\nstart order: one call per token, one per char of a multi-char punct, and two for a lifetime, the\n`'` then the rest. A doc comment's span and a closing delimiter's span are asked at that token's\nown range. Leaves that `on_enter`/`append` inject are the exception. Only the `_modified` entry\npoint takes them, and each comes with the empty range at 0: `fragment_bounds` is asked about that\nrange, `span_for` is not. A hint survives the jump back, because any hint gives the same answer.\nApart from that, `span_at_from` and\n`span_for_range_from` give amortized two compares per token. For item 2, `token_tree_to_syntax_node`\nnow builds its map with `SpanMap::with_capacity(parser_input.len())`.\n\nStatus (span side) done by speed-span-ast, checked by speed-span (`crates/span/src/map.rs`):\n1. `SpanMap::span_at_from(offset, &mut u32) -> Span` and\n   `RealSpanMap::span_for_range_from(range, &mut u32) -> Span` (salsa feature, as\n   `span_for_range`): a galloping search from the hint, the same `Span` as `span_at` /\n   `span_for_range`, which stay. `&self`, hint a `Cell<u32>` per mapper starting at 0 (as\n   `hir-expand/src/span_map.rs` and `eager.rs` already do).\n2. `SpanMap` is `ends: Vec<TextSize>` beside `spans: Vec<Span>`; `Hash` is two slice hashes;\n   `SpanMap::with_capacity(n)`.\n3. `impl Drop` and the dropper thread are gone, from `SpanMap` and from `AstIdMap`.\n4. `by_anchor`: a lazy `OnceLock<Box<[u32]>>` permutation by `(anchor, range)`, reset by `push`\n   and `merge` instead of built in `finish()`; `ranges_with_span_exact` / `ranges_with_span` are\n   binary searches plus the run, same results in the same text order. hir-expand's doc comments\n   calling them a linear search (`lib.rs` near :1333 and :1354) are now out of date.",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T09:57:40Z",
+  "taken_by": "speed-sol2-format",
+  "why": null,
+  "source": "v2/requests/format.md#speed-hir-expand: span lookups per token, span-map layout, the dropper thread (`crates/span/src/map.rs`, `crates/syntax-bridge/src/lib.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:648"
+    },
+    {
+      "at": "2026-10-30T09:57:36Z",
+      "by": "speed-sol2-format",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:57:40Z",
+      "by": "speed-sol2-format",
+      "action": "done",
+      "note": "All four items are in crates/span/src/map.rs, checked by speed-sol2-format 2026-10-30: span_at_from / span_for_range_from (galloping from a hint), the map as two columns with with_capacity, no Drop impl or dropper thread (none left in map.rs or ast_id.rs), and the lazy by_anchor permutation for down-mapping. syntax-bridge's side is speed-span-tt's. Costs in format/speed-of-light.md (span maps)."
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "01164",
+  "from_lane": "no-fallback-link",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2/engine.py",
+    "harness/v2/oracle.py"
+  ],
+  "what": "no-fallback (Andrew 16:01: \"remove fallbacks, should just fail (so can hill climb easier)\"), same shape as harness/bench.py link_kind which no-fallback-link just changed: harness/v2/engine.py V1.work_since (line ~576) and V2.work_since (line ~643) turn a non-spliced link into a `Work.link` string (\"full link: ...\" / \"placed whole: ...\"), and harness/v2/oracle.py (line ~441 and `record` ~602) only records it as a number: an edit step that relinked in full gets its verdict from the rest and its time counts. Ask: in oracle.py, a step of kind other than \"start\" whose `work.link` starts with \"full link\" or \"placed whole\" gets verdict \"fail\" with the link string as its detail (never \"pass\"), as bench.py now does via `failed_link`. Also: V2.work_since should read the per-link `links` of the blaze-work line once 01163 (ci) lands, so a first link of a new image (not a fallback) is told apart from a relink of a kept one; bench.py's `link_kind(text, linked)` shows the rule (a first link of an image linked before is a full link).",
+  "state": "applied",
+  "created": "2026-10-30T23:13:55Z",
+  "updated": "2026-10-31T13:51:22Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:13:55Z",
+      "by": "no-fallback-link",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:51:22Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "oracle.py: a non-start step whose link starts with \"full link\" or \"placed whole\" fails with the link as its detail. engine.py V2.work_since reads the per-link `links` of 01163: only how=full is \"placed whole: <request>: <path> (<why>)\", how=first is \"first link: ...\" (not a failure), a line without `links` is an error. proof.py selftest covers the three cases (its one remaining wrong is tree_digest without a proof binary path)."
+    }
+  ]
+}

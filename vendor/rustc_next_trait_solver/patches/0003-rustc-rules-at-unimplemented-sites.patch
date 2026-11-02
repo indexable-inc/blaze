@@ -1,0 +1,114 @@
+diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+--- a/src/canonical/canonicalizer.rs
++++ b/src/canonical/canonicalizer.rs
+@@ -551,7 +551,9 @@
+                         }
+                     }
+                 }
+-                ty::InferConst::Fresh(_) => unimplemented!(),
++                ty::InferConst::Fresh(_) => {
++                    panic!("fresh vars not expected in canonicalization")
++                }
+             },
+             ty::ConstKind::Placeholder(placeholder) => match self.canonicalize_mode {
+                 CanonicalizeMode::Input { .. } => {
+diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+--- a/src/solve/effect_goals.rs
++++ b/src/solve/effect_goals.rs
+@@ -290,7 +290,8 @@
+         _ecx: &mut EvalCtxt<'_, D>,
+         _goal: Goal<I, Self>,
+     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+-        unimplemented!("Fn* are not yet const")
++        // `FnPtr` has no const impl: no `[const] FnPtr` bound holds.
++        Err(NoSolutionOrRerunNonErased::NoSolution(NoSolution))
+     }
+ 
+     #[instrument(level = "trace", skip_all, ret)]
+@@ -347,7 +348,8 @@
+         _goal: Goal<I, Self>,
+         _kind: rustc_type_ir::ClosureKind,
+     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+-        unimplemented!("AsyncFn* are not yet const")
++        // No async closure or async fn is const, so no builtin `AsyncFn*` impl is.
++        Err(NoSolutionOrRerunNonErased::NoSolution(NoSolution))
+     }
+ 
+     fn consider_builtin_async_fn_kind_helper_candidate(
+diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+--- a/src/solve/mod.rs
++++ b/src/solve/mod.rs
+@@ -299,11 +299,16 @@
+             ty::ConstKind::Alias(ty::IsRigid::Yes, alias_const) => {
+                 alias_const.type_of(self.cx()).skip_norm_wip()
+             }
+-            ty::ConstKind::Alias(ty::IsRigid::No, _) => unimplemented!(
+-                "non-rigid unevaluated constant for compute_const_arg_has_type_goal: {ct:?}"
++            // `structurally_normalize_const` leaves an inference variable or what it was bound
++            // to, and the solver never binds one to a non-rigid alias (generalization replaces
++            // an alias with a fresh variable and a nested goal).
++            ty::ConstKind::Alias(ty::IsRigid::No, _) => unreachable!(
++                "non-rigid unevaluated constant after structural normalization in \
++                 compute_const_arg_has_type_goal: {ct:?}"
+             ),
+-            ty::ConstKind::Expr(_) => unimplemented!(
+-                "`feature(generic_const_exprs)` is not supported in the new trait solver"
++            ty::ConstKind::Expr(_) => unreachable!(
++                "a `ConstKind::Expr` without `feature(generic_const_exprs)`, which the interner \
++                 says is off: nothing lowers a constant to one"
+             ),
+             ty::ConstKind::Param(_) => {
+                 unreachable!("`ConstKind::Param` should have been canonicalized to `Placeholder`")
+diff -ruN a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+--- a/src/solve/normalizes_to.rs
++++ b/src/solve/normalizes_to.rs
+@@ -798,9 +798,32 @@
+                 }
+             },
+ 
+-            ty::UnsafeBinder(_) => {
+-                // FIXME(unsafe_binder): Figure out how to handle pointee for unsafe binders.
+-                unimplemented!()
++            // An unsafe binder is as sized as the type it binds (`structural_traits`), so its
++            // metadata is that type's. Where the type names a lifetime of the binder, the only
++            // metadata a type outside it can be is `()`, which holds when it is `Sized`.
++            ty::UnsafeBinder(inner) => {
++                let inner: ty::Binder<I, I::Ty> = inner.into();
++                match inner.no_bound_vars() {
++                    Some(inner) => {
++                        Ty::new_projection(cx, ty::IsRigid::No, metadata_def_id, [inner])
++                    }
++                    None => {
++                        return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(
++                            |ecx| {
++                                let sized = inner.map_bound(|inner| {
++                                    ty::TraitRef::new(
++                                        cx,
++                                        cx.require_trait_lang_item(SolverTraitLangItem::Sized),
++                                        [I::GenericArg::from(inner)],
++                                    )
++                                });
++                                ecx.add_goal(GoalSource::Misc, goal.with(cx, sized))?;
++                                ecx.instantiate_normalizes_to_term(goal, Ty::new_unit(cx).into())?;
++                                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
++                            },
++                        );
++                    }
++                }
+             }
+ 
+             ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
+@@ -1006,12 +1029,8 @@
+             | ty::Slice(_)
+             | ty::Dynamic(_, _)
+             | ty::Tuple(_)
++            | ty::UnsafeBinder(_)
+             | ty::Error(_) => self_ty.discriminant_ty(ecx.cx()),
+-
+-            ty::UnsafeBinder(_) => {
+-                // FIXME(unsafe_binders): instantiate this with placeholders?? i guess??
+-                unimplemented!("discr subgoal...")
+-            }
+ 
+             // Given an alias, parameter, or placeholder we add an impl candidate normalizing to a rigid
+             // alias. In case there's a where-bound further constraining this alias it is preferred over

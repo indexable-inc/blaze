@@ -1,0 +1,37 @@
+{
+  "id": "00724",
+  "from_lane": "dedup",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/remote.rs",
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo"
+  ],
+  "what": "## dedup: blaze-cargo off memmap2\n\nFrom `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). `crates/blaze-cargo/src/remote.rs`\n(store's path, free) now maps packs with `blaze_core::fs::Mapped`; it was the crate's only user\nof memmap2. In `crates/blaze-cargo/Cargo.toml`, delete line 44:\n\n    memmap2 = \"0.9\"\n\n(`blaze-core.workspace = true` is already there.) `rg memmap2 crates/blaze-cargo` then finds only\nthat line.\n\nStatus: open\n\n> forwarded to cargo (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:56:24Z",
+  "taken_by": "unify-cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedup: blaze-cargo off memmap2",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2935"
+    },
+    {
+      "at": "2026-10-30T08:55:49Z",
+      "by": "unify-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:24Z",
+      "by": "unify-cargo",
+      "action": "done",
+      "note": "already in the tree: rg memmap2 crates/blaze-cargo finds nothing; remote.rs maps with blaze_core::fs::Mapped."
+    }
+  ]
+}

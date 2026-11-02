@@ -1,0 +1,24 @@
+{
+  "id": "00168",
+  "from_lane": "solver-sync-kinds",
+  "owner": "solver-sync",
+  "paths": [
+    "crates/hir-ty/src/next_solver/infer/mod.rs",
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "## 6. `BoundVarReplacerDelegate` is generic over the interner\n\n- `crates/hir-ty/src/next_solver/infer/mod.rs:1129`:\n  - old: `impl<'db> BoundVarReplacerDelegate<'db> for ToFreshVars<'db> {`\n  - new: `impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToFreshVars<'db> {`\n- `crates/hir-ty/src/next_solver/interner.rs:2284` (solver-sync-interner, told by tmux).\n\n`FnMutDelegate { regions, types, consts }` and `BoundVarReplacer::new(interner, delegate)` keep\ntheir shape (`infer/relate/higher_ranked.rs:39`, `infer/canonical/instantiate.rs:93`,\n`util.rs:468`). The replacer now caches folded types (rustc's `DelayedMap`), so a delegate must\ngive the same answer for the same bound variable, as the trait already asked.\n\n> forwarded to solver-sync: both sites are in `next_solver/`.\n> forwarded to solver-sync: both sites are in `next_solver/`.",
+  "state": "open",
+  "created": "2026-10-30T02:09:05Z",
+  "updated": "2026-10-30T02:09:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#6. `BoundVarReplacerDelegate` is generic over the interner",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:114"
+    }
+  ]
+}

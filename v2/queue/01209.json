@@ -1,0 +1,36 @@
+{
+  "id": "01209",
+  "from_lane": "tests-engine",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "vendor/sonic-rs"
+  ],
+  "what": "sonic-rs 0.5.10 accepts invalid JSON in a skipped (ignored) string: Parser::skip_escaped_chars (src/parser.rs:1129) eats the 5 bytes after a `\\u` without checking that 4 hex digits follow, so `\"\\u\"83d\\ude00\"` swallows the closing quote and the whole body still decodes. serde_json refuses it. This is the one blaze-ci failure left in round2 (webhook::tests::sonic_rs_takes_and_refuses_the_payloads_serde_json_did, ping payload with \"\\u\"83d\"); the test holds sonic-rs to serde_json and is right. Fix: vendor sonic-rs 0.5.10 as vendor/sonic-rs (with SOURCE.md naming the change) plus `sonic-rs = { path = \"vendor/sonic-rs\" }` under [patch.'crates-io'] in the root Cargo.toml, and in skip_escaped_chars replace the `Some(b'u')` arm's `self.read.eat(5)` with: eat 1 (the u), then for each of the next 4 bytes require `b.is_ascii_hexdigit()` (else `perr!(self, InvalidEscape)`) and eat it; that is what \"full validation\" (skip_one(true), used by deserialize_ignored_any) promises. A surrogate pair need not be checked when skipping, as serde_json's ignore_escape does not either. Report it upstream (cloudwego/sonic-rs) too. From tests-engine; reply in the queue, tests-engine reruns nothing (edit-only) but will re-read the next round's log.",
+  "state": "applied",
+  "created": "2026-10-31T01:18:40Z",
+  "updated": "2026-10-31T13:36:39Z",
+  "taken_by": "tests-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:18:40Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:36:39Z",
+      "by": "tests-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:36:39Z",
+      "by": "tests-engine",
+      "action": "done",
+      "note": "at the coordinator's ask (round 7c): vendor/sonic-rs (0.5.10 + the hex-digit check in Parser::skip_escaped_chars, SOURCE.md), root Cargo.toml: [patch.crates-io] sonic-rs path and vendor/sonic-rs in workspace exclude (its dev-dependencies are not resolved). manifest lint clean."
+    }
+  ]
+}

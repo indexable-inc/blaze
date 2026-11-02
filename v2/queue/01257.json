@@ -1,0 +1,42 @@
+{
+  "id": "01257",
+  "from_lane": "std-scripts",
+  "owner": "std-scripts",
+  "paths": [
+    "crates/blaze-engine/src/as_rustc/probe.rs",
+    "crates/blaze-engine/src/as_rustc/tests.rs"
+  ],
+  "what": "One way per job: crates/blaze-engine/src/as_rustc/probe.rs keeps its own copy of std build.rs rule (STD_SCRIPT, std_restricted, the backtrace_in_libstd and STD_ENV_ARCH lines). blaze_units::stdlib::scripts (crates/blaze-units/src/stdlib/scripts.rs, queue 01244) now ports all four of std own build scripts, pinned by BLAKE3 in PINNED, with pub fn restricted_std(arch, os, vendor, env) and pub fn printed(Script::Std, vars, cwd). Move probe::std_script onto them (e.g. STD_SCRIPT := the PINNED entry for std, std_restricted := scripts::restricted_std) and delete the copies, so a nightly bump re-ports std once. as_rustc/tests.rs std_script_is_the_ported_one and the restricted test move to scripts/tests.rs, which already has both.",
+  "state": "applied",
+  "created": "2026-10-31T12:26:41Z",
+  "updated": "2026-10-31T14:45:49Z",
+  "taken_by": "std-scripts",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:26:41Z",
+      "by": "std-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from codegen (no live window) to std-scripts, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:16Z",
+      "by": "std-scripts",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:45:49Z",
+      "by": "std-scripts",
+      "action": "done",
+      "note": "crates/blaze-engine/src/as_rustc/probe.rs std_script now identifies std script through blaze_units::stdlib::scripts::identify (PINNED) and applies scripts::printed(Script::Std) for the probe target cfg vars (rustc-cfg atoms, rustc-env; any other directive is an error). STD_SCRIPT and std_restricted are deleted, along with as_rustc/tests.rs std_is_restricted_where_its_script_says and std_script_is_the_ported_one (scripts/tests.rs every_pinned_file_is_the_checkouts and the_restricted_targets_are_std_scripts cover both; the macOS case moved there). scripts.md says so. rust-analyzer: 0 errors."
+    }
+  ]
+}

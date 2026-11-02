@@ -1,0 +1,33 @@
+{
+  "id": "00348",
+  "from_lane": "mem-db-infer-method",
+  "owner": "db",
+  "paths": [],
+  "what": "## Left as is, with why\n\nEvery hit of `.clone()`, `Vec::new()`, `vec![`, `.collect()`, `.to_vec()`, `Box::new(`,\n`FxHashMap::default()`, `FxHashSet::default()`, `SmallVec`, `ThinVec`, `IndexMap` in my files\nthat is not changed above (`rg` over the eleven files):\n\n- `probe.rs:90` `ApplicableCandidates = SmallVec<[&Candidate; 4]>`, collected at 1608: the\n  candidates of one pick attempt that match; 0 or 1 almost always, 5 or more only on an\n  ambiguity error. Never spills in practice (R3 keeps it).\n- `probe.rs:697` and `probe.rs:1358` `.collect()` into `MethodError::Ambiguity(Vec)`: the error\n  value escapes to the caller (and into diagnostics); error path only.\n- `probe.rs:2007, 2230` `shadowed_candidates: vec![]`: empty, no allocation; `probe.rs:2088`\n  `.collect()` into `Pick::shadowed_candidates`: part of the `Pick` returned, owned by the caller,\n  built only when a subtrait pick collapses.\n- `probe.rs:2026-2051` `collapse_candidates_to_subtrait_pick`'s two `FxHashSet` collects,\n  `to_vec`, `vec![]`: run only with `#![feature(supertrait_item_shadowing)]` and two or more\n  applicable candidates (an ambiguity otherwise). Cold; `supertrait_def_ids` is\n  `rustc_type_ir`'s and allocates on its own.\n- `probe.rs:834` `candidate.clone()`: the `Candidate` stored for the IDE (P5), owned.\n- `probe.rs` per-step `make_query_response_ignoring_pending_obligations` and\n  `OriginalQueryValues::default()` (317), `PredefinedOpaques::new_from_iter` (318): the solver's\n  query-response types (region constraints, opaque type lists, var values). mem-db-solver's;\n  they are the probe's dominant remaining allocations (see \"Speed\").\n- `confirm.rs:132, 135, 401, 408` `.into()`: generic-arg conversions, no allocation.\n  `predicates_require_illegal_sized_bound`'s `elaborate` and `upcast_choices`: solver code.\n- `method_resolution.rs:256, 259` `.into()`: generic-arg conversions. `lookup_method_for_operator`'s\n  `PredicateObligations::new()` + `extend` (in `impl InferenceTable`): the solver's type and the\n  value returned in `InferOk`, owned by the caller.\n- `method_resolution.rs:513` `name.clone()`: `Name` is an 8-byte `Copy`-like handle; no\n  allocation.\n- `method_resolution.rs:1277` `range.clone()`: `Range<usize>`.\n- `method_resolution.rs:1352, 1375, 1600, 1612` `.into()` from `&[ImplId]`: exact `Box`, the\n  memo result.\n- `method_resolution.rs:1364, 1552` `Box::new(result)`, `1535, 1540` `Arc::new`: the memo's\n  handle, one allocation each.\n- `method_resolution.rs:1557` `Self::for_crate(db, dep).clone()`: an `Arc` refcount per loaded\n  crate into the exact result; sharing the tables is the point of the query.\n- `method_resolution.rs:1877-1883` (`inert_attribute_tests`): test code.\n- `frozen.rs:36` `StdArc::new(maps)`: the input's value, once per `set`. `frozen.rs:61, 87, 189,\n  214, 224, 296, 324` `to_owned()`/`format!`: error strings on corrupt bytes.\n- `traits.rs:179` `.collect()` into `Vec<bool>`: exact (`Map<slice::Iter>`), the caller's result.\n- `traits.rs:149, 203, 218` `&mut dyn FnMut`: parameters, no allocation; whether they are hot\n  `dyn` is lane dedyn's to judge and change.\n- `specialization.rs:215` `SmallVec<[ImplId; 4]>` of ancestors: impls a specializing impl\n  specializes; 0 to 2 (only under `feature(specialization)`), never spills in practice.\n- `representability.rs:190` `collect()` in a test.\n- `opaques.rs` `tait_hidden_types`' `ArenaMap::with_capacity`: already exact.\n- `autoderef.rs` `structurally_normalize_ty`'s `ObligationCtxt` and `into_pending_obligations`,\n  `AutoderefSnapshot::obligations: PredicateObligations`: solver types, mem-db-solver's.\n- `crates_containing_incoherent_inherent_impls`: `Crate::transitive_deps` returns base-db's owned\n  `Vec` (base-db, lane db; a `_in(frame)` form would be base-db's entry).\n- `impls_in_bodies`/`macro_definitions`: `syntax::LexedStr::new` allocates its token arrays\n  (lane syntax's).\n- `loaded_crates`: `file.parse(db)`, `parse_macro_expansion`, `to_flat()`: syntax and expansion\n  memos.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:46): notes, nothing to apply; db-mem-infer-b's hot_lint (22:10) found only these listed lines left.",
+  "state": "applied",
+  "created": "2026-10-30T03:35:03Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-method.md#Left as is, with why",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-method.md:2926"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:46): notes, nothing to apply; db-mem-infer-b's hot_lint (22:10) found only these listed lines left."
+    }
+  ]
+}

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """realdebug.py: what a debugger, a panic, perf and addr2line are told by a program
-`blaze` built of a real project, against the cargo build of the same source.
+`blaze` built of a real project.
 
     realdebug.py [PROJECT...] [--keep]
 
 Each project is cloned as blaze_cli.py has it, and copied. A panic that an environment
-variable asks for is written into the copy, cargo builds it into `target-ref`, and
-`blaze` builds it cold, waits for the daemon, and builds it again after a comment is
-added, so that the program looked at is the one the daemon linked. Then, in the dev profile:
-  gdb       stops at each place, in a function of blaze's; the arguments and locals cargo's
-            build names there are named, with the same values where they are plain ones
-  panic     the frames of the workspace's files are those of the cargo build, by file:line
+variable asks for is written into the copy, and `blaze` builds it cold, waits for the
+daemon, and builds it again after a comment is added, so that the program looked at is the
+one the daemon linked. Then, in the dev profile:
+  gdb       stops at each place, in a function of blaze's, and has its arguments and locals
+            with values, none of them optimized out (v2 compiles the dev profile with Cranelift)
+  panic     each panic has a frame at the line the panic was written into, by file:line
   perf      `perf record --call-graph dwarf`, then `perf report` names the symbols and
             `perf script` the lines of the frames in blaze's functions
   addr2line every function of blaze's has a name and a line at its first address
@@ -20,7 +20,7 @@ import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, 
 
 import blaze_cli
 from blaze_cli import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
-from debuginfo import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, compare, own_ranges, panics, units, unit_of
+from dwarf import DWARFDUMP, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
 
 PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for"); }'
 
@@ -132,51 +132,35 @@ def stopped(binary, ws, place, run, serves):
                 at=int(pc.group(1), 16) - int(base.group(1), 16) if pc and base else None)
 
 
-def plain(value):
-    """Whether what gdb printed is a number, a character or a truth value: something that is
-    the same in two builds of one source at one place, once it has been given a value."""
-    return bool(re.fullmatch(r"-?\d+(\.\d+)?|true|false|\d+ '.*'", value))
-
-
-def debugger(tally, what, reference, binary, ws, spec):
+def debugger(tally, what, binary, ws, spec):
     run, serves = spec.get("run", []), spec.get("serves")
     for file, text in spec["places"]:
         place = f"{file}:{line_of(ws, file, text)}"
         said = f"{what}: gdb at {os.path.basename(file)}:{place.rsplit(':', 1)[1]}"
-        theirs, ours = stopped(reference, ws, place, run, serves), stopped(binary, ws, place, run, serves)
-        if not theirs:
-            tally.say(said, "not looked at", "gdb does not stop there in the cargo build")
-            continue
+        ours = stopped(binary, ws, place, run, serves)
         if not ours:
-            # Optimized code may have no instruction for a line, and then there is nowhere to stop.
-            empty = LLVM and "contains no code" in told(binary, ws, f"info line {place}")
-            tally.say(said, "no code" if empty else "NOT STOPPED", "the optimizer left the line none" if empty else "")
+            tally.say(said, "NOT STOPPED")
             continue
         producer = unit_of(binary, ours["at"]) if ours["at"] is not None else "nothing"
         if not producer.startswith("blaze"):
             tally.say(said, "NOT BLAZE'S", f"the code is of {producer}")
             continue
-        # What rustc has an `async` body resumed with is of no name the source has.
-        names = [name for name in theirs["values"] if name != "_task_context"]
-        unnamed = [name for name in names if name not in ours["values"]]
-        gone = [name for name in names if name in ours["values"] and OPTIMIZED_OUT in ours["values"][name]]
-        both = [name for name in names if name not in unnamed and name not in gone]
-        same = [name for name in both if ours["values"][name] == theirs["values"][name]]
-        differ = [name for name in both if name not in same and plain(theirs["values"][name])]
-        verdict = ("NOT NAMED" if unnamed or (gone and not LLVM) else "OTHER VALUE" if differ
-                   else "OTHER FUNCTION" if ours["name"] != theirs["name"] else "as cargo's")
-        more = (f"in {ours['name'][:50]}: {len(names) - len(unnamed)} of {len(names)} names, {len(same)} values the same, "
-                f"{len(both) - len(same) - len(differ)} not plain ones and shown otherwise, {len(gone)} optimized out")
-        first = (unnamed + gone + differ)[:1]
-        if first and verdict.isupper():
-            more += f"; {first[0]} = {ours['values'].get(first[0], 'nothing')[:60]} for {theirs['values'][first[0]][:60]}"
+        # What an `async` body is resumed with is of no name the source has.
+        names = [name for name in ours["values"] if name != "_task_context"]
+        gone = [name for name in names if OPTIMIZED_OUT in ours["values"][name]]
+        verdict = "OPTIMIZED OUT" if gone else "stopped"
+        more = f"in {ours['name'][:50]}: {len(names)} names, {len(gone)} optimized out"
+        if gone and verdict.isupper():
+            more += f"; {gone[0]}"
         tally.say(said, verdict, more)
 
 
-def backtrace(tally, what, reference, binary, ws, spec):
+def backtrace(tally, what, binary, ws, spec):
     env = dict(os.environ, RUST_BACKTRACE="1", REALDEBUG_PANIC="1")
-    theirs, ours = (panics(driven([it, *spec.get("run", [])], ws, env, spec.get("serves"))) for it in (reference, binary))
-    compare(tally, f"{what}: frames of each panic", theirs, ours, binary)
+    ours = panics(driven([binary, *spec.get("run", [])], ws, env, spec.get("serves")))
+    file = spec["panic"][0]
+    site = f"{file}:{line_of(ws, file, PANIC)}"
+    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]] * max(len(ours), 1))
 
 
 def profiler(tally, what, binary, ws, spec):
@@ -221,7 +205,7 @@ def addr2line(tally, what, binary):
 
 def verify(tally, what, binary):
     """`llvm-dwarfdump --verify`, for the units of blaze's: rustc's own have functions the linker
-    left out, which it finds to overlap, in the cargo build as well."""
+    left out, which it finds to overlap."""
     said = subprocess.run([DWARFDUMP, "--verify", binary], capture_output=True, text=True, errors="replace").stdout
     heads = units(binary)
     count = sum(bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in heads)
@@ -243,27 +227,25 @@ def verify(tally, what, binary):
 def project(tally, name, work):
     spec, check = PROJECTS[name], CHECKS[name]
     ws = os.path.realpath(os.path.join(work, name))
-    shutil.copytree(fetch(name, spec), ws, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
+    shutil.copytree(fetch(name, spec), ws, symlinks=True, ignore=shutil.ignore_patterns("target"))
     rewrite(os.path.join(ws, check["panic"][0]), *check["panic"][1:])
     env = base_env(os.path.join(work, "home"))
-    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    ours = Side(ws, env, True)
     build = check.get("build", [])
     ours.cargo("stop")
-    for side in (theirs, ours):
-        took, ran = side.cargo("build", *build)
-        if ran.returncode != 0:
-            return tally.say(f"{name}: built", "NOT BUILT", ran.stderr[-200:])
+    took, ran = ours.cargo("build", *build)
+    if ran.returncode != 0:
+        return tally.say(f"{name}: built", "NOT BUILT", ran.stderr[-200:])
     _, states = wait_warm(ours, ws)
     with open(os.path.join(ws, check["panic"][0]), "a") as source:
         source.write("// built again\n")
-    for side in (theirs, ours):
-        took, ran = side.cargo("build", *build)
+    took, ran = ours.cargo("build", *build)
     built = how_built(ran.stderr)
     tally.say(f"{name}: built", "by the daemon" if built == "daemon" else "NOT BY THE DAEMON", f"{built}; {'; '.join(states)[:80]}; {took:.2f}s")
-    reference, binary = (os.path.join(ws, target, "debug", check["binary"]) for target in ("target-ref", "target"))
+    binary = os.path.join(ws, "target", "debug", check["binary"])
     verify(tally, name, binary)
-    debugger(tally, name, reference, binary, ws, check)
-    backtrace(tally, name, reference, binary, ws, check)
+    debugger(tally, name, binary, ws, check)
+    backtrace(tally, name, binary, ws, check)
     profiler(tally, name, binary, ws, check)
     addr2line(tally, name, binary)
     ours.cargo("stop")
@@ -281,7 +263,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'} ({'llvm' if LLVM else 'cranelift'})")
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}")
     sys.exit(1 if tally.wrong else 0)
 
 

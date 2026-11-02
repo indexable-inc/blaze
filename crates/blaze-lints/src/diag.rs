@@ -1,342 +1,134 @@
-//! A lint's diagnostic as data: what rustc's `DiagInner` holds of one, which is what
-//! [`crate::emit`] writes as rustc does. It crosses the daemon's socket as it is, so the source
-//! it points into is read where it is written, by its path.
+//! A lint's diagnostic as data: [`blaze_diagnostics::model`]'s, as every diagnostic blaze gives
+//! is, and the naming of the spans a lint query makes. It crosses the daemon's socket as it is,
+//! so the source it points into is read where it is written, by its path.
 
-use serde::{Deserialize, Serialize};
 use syntax::TextRange;
 
-use crate::Level;
+pub use blaze_diagnostics::model::{
+    Applicability, Child, Code, Diag, Expansion, MacroKind, MultiSpan, Span, SpanLabel, Sublevel,
+    Suggestion, SuggestionStyle,
+};
 
-/// A range of a file: bytes from 0. `file` is the path as rustc shows it, from the root of the
-/// workspace when the file is below it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Span {
-    pub file: String,
-    pub lo: u32,
-    pub hi: u32,
-    /// The macro whose expansion it is in, when it is in one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expansion: Option<Box<Expansion>>,
+/// What a span made in a lint query has for its file, before the driver names it: the empty
+/// name for the tree the query walks (its range moved into the file by the driver), or this
+/// byte and the file's number for a span of another file.
+const FILE_ID: char = '\0';
+
+/// A span of the tree a lint query walks, which the driver moves into the file and names.
+pub(crate) fn in_query(range: TextRange) -> Span {
+    Span { file: String::new(), lo: range.start().into(), hi: range.end().into(), expansion: None }
 }
 
-/// A macro's expansion a span is in: rustc's `ExpnData`, as much of it as diagnostics show.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Expansion {
-    /// Where the macro was called: its call, or for a derive the path in `#[derive]`.
-    pub call_site: Span,
-    pub kind: MacroKind,
-    pub name: String,
-    /// Where the macro is defined, when rustc says.
-    pub def_site: Option<Span>,
+/// A span of `file` as a lint query makes it, which the driver names.
+pub(crate) fn of_file(file: span::FileId, range: TextRange) -> Span {
+    let mut name = String::with_capacity(11);
+    name.push(FILE_ID);
+    name.push_str(&file.index().to_string());
+    Span { file: name, lo: range.start().into(), hi: range.end().into(), expansion: None }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum MacroKind {
-    Bang,
-    Attr,
-    Derive,
+/// A file of the crate the caller's `check::NameOf` gives no name: what a lint finds in it
+/// can't be said where rustc says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unnamed {
+    pub file: span::FileId,
 }
 
-impl MacroKind {
-    /// As rustc's notes name it.
-    pub fn descr(self) -> &'static str {
-        match self {
-            MacroKind::Bang => "macro",
-            MacroKind::Attr => "attribute macro",
-            MacroKind::Derive => "derive macro",
+impl std::fmt::Display for Unnamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the lints' file {} has no name to report a diagnostic in", self.file.index())
+    }
+}
+
+impl std::error::Error for Unnamed {}
+
+/// Names the files of every span of `diag` a lint query made ([`place`]).
+pub(crate) fn place_diag(
+    diag: &mut Diag,
+    offset: u32,
+    name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
+    name_of: &dyn Fn(span::FileId) -> Option<String>,
+) -> Result<(), Unnamed> {
+    place_multi(&mut diag.span, offset, name, name_of)?;
+    for child in &mut diag.children {
+        place_multi(&mut child.span, offset, name, name_of)?;
+    }
+    for suggestion in &mut diag.suggestions {
+        for (span, _) in suggestion.substitutions.iter_mut().flatten() {
+            place(span, offset, name, name_of)?;
         }
     }
+    Ok(())
 }
 
-impl Expansion {
-    /// As rustc's JSON names it: `name!`, `#[name]`, `#[derive(Name)]`.
-    pub fn decl_name(&self) -> String {
-        match self.kind {
-            MacroKind::Bang => format!("{}!", self.name),
-            MacroKind::Attr => format!("#[{}]", self.name),
-            MacroKind::Derive => format!("#[derive({})]", self.name),
-        }
+fn place_multi(
+    span: &mut MultiSpan,
+    offset: u32,
+    name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
+    name_of: &dyn Fn(span::FileId) -> Option<String>,
+) -> Result<(), Unnamed> {
+    for span in span.primary.iter_mut().chain(span.labels.iter_mut().map(|it| &mut it.0)) {
+        place(span, offset, name, name_of)?;
     }
+    Ok(())
 }
 
-impl Span {
-    pub fn new(file: &str, range: TextRange) -> Span {
-        Span {
-            file: file.to_owned(),
-            lo: range.start().into(),
-            hi: range.end().into(),
-            expansion: None,
-        }
+/// Gives a span a lint query made its file's name, moving it by `offset` when it is of the
+/// tree the query walked, named `name`.
+pub(crate) fn place(
+    span: &mut Span,
+    offset: u32,
+    name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
+    name_of: &dyn Fn(span::FileId) -> Option<String>,
+) -> Result<(), Unnamed> {
+    if span.file.is_empty() {
+        span.lo += offset;
+        span.hi += offset;
+        name.clone_into(&mut span.file);
+    } else if let Some(id) = span.file.strip_prefix(FILE_ID) {
+        let id = span::FileId::from_raw(id.parse().expect("a span's file number, as `of_file` wrote it"));
+        span.file = name_of(id).ok_or(Unnamed { file: id })?;
     }
-
-    pub fn to(&self, other: &Span) -> Span {
-        Span { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi), ..self.clone() }
-    }
-
-    pub fn with_lo(&self, lo: u32) -> Span {
-        Span { lo, ..self.clone() }
-    }
-
-    pub fn with_hi(&self, hi: u32) -> Span {
-        Span { hi, ..self.clone() }
-    }
-
-    pub fn shrink_to_lo(&self) -> Span {
-        Span { hi: self.lo, ..self.clone() }
-    }
-
-    pub fn shrink_to_hi(&self) -> Span {
-        Span { lo: self.hi, ..self.clone() }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lo == self.hi
+    match &mut span.expansion {
+        Some(expansion) => place_expansion(expansion, offset, name, name_of),
+        None => Ok(()),
     }
 }
 
-/// rustc's `MultiSpan`: the places a diagnostic is of, and the labels on places.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct MultiSpan {
-    pub primary: Vec<Span>,
-    pub labels: Vec<(Span, String)>,
+fn place_expansion(
+    expansion: &mut Expansion,
+    offset: u32,
+    name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
+    name_of: &dyn Fn(span::FileId) -> Option<String>,
+) -> Result<(), Unnamed> {
+    if let Some(def_site) = expansion.def_site.as_mut() {
+        place(def_site, offset, name, name_of)?;
+    }
+    place(&mut expansion.call_site, offset, name, name_of)
 }
 
-/// A span with whether it is one of the primary ones and its label: rustc's `SpanLabel`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SpanLabel<'a> {
-    pub span: &'a Span,
-    pub is_primary: bool,
-    pub label: Option<&'a str>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl From<Span> for MultiSpan {
-    fn from(span: Span) -> MultiSpan {
-        MultiSpan::of(span)
-    }
-}
-
-impl MultiSpan {
-    pub fn of(span: Span) -> MultiSpan {
-        MultiSpan { primary: vec![span], labels: Vec::new() }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.primary.is_empty() && self.labels.is_empty()
-    }
-
-    pub fn primary_span(&self) -> Option<&Span> {
-        self.primary.first()
-    }
-
-    /// rustc's `MultiSpan::span_labels`: the labelled spans in the order they were labelled,
-    /// then the primary spans that have no label.
-    pub fn span_labels(&self) -> Vec<SpanLabel<'_>> {
-        let mut labels: Vec<SpanLabel<'_>> = self
-            .labels
-            .iter()
-            .map(|(span, label)| SpanLabel {
-                span,
-                is_primary: self.primary.contains(span),
-                label: Some(label),
-            })
-            .collect();
-        for span in &self.primary {
-            if !labels.iter().any(|it| it.span == span) {
-                labels.push(SpanLabel { span, is_primary: true, label: None });
-            }
-        }
-        labels
-    }
-}
-
-/// The level of a part of a diagnostic: rustc's `Sublevel`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Sublevel {
-    Note,
-    Help,
-    Warning,
-}
-
-impl Sublevel {
-    pub fn name(self) -> &'static str {
-        match self {
-            Sublevel::Note => "note",
-            Sublevel::Help => "help",
-            Sublevel::Warning => "warning",
-        }
-    }
-}
-
-/// A note, a help or a warning under a diagnostic: rustc's `Subdiag`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Child {
-    pub level: Sublevel,
-    pub message: String,
-    pub span: MultiSpan,
-    /// rustc's `note_once` and `help_once`: written with the first diagnostic of a crate it is
-    /// part of, and not again in that crate.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub once: bool,
-}
-
-/// How sure a suggestion is: rustc's `Applicability`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Applicability {
-    MachineApplicable,
-    MaybeIncorrect,
-    HasPlaceholders,
-    Unspecified,
-}
-
-impl Applicability {
-    pub fn name(self) -> &'static str {
-        match self {
-            Applicability::MachineApplicable => "MachineApplicable",
-            Applicability::MaybeIncorrect => "MaybeIncorrect",
-            Applicability::HasPlaceholders => "HasPlaceholders",
-            Applicability::Unspecified => "Unspecified",
-        }
-    }
-}
-
-/// How a suggestion is shown: rustc's `SuggestionStyle`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SuggestionStyle {
-    /// Its message only, never its code.
-    HideCodeInline,
-    HideCodeAlways,
-    /// Only for tools: not written.
-    CompletelyHidden,
-    /// Inline when it is short, else as a patch.
-    ShowCode,
-    /// Always as a patch.
-    ShowAlways,
-}
-
-impl SuggestionStyle {
-    pub fn hide_inline(self) -> bool {
-        !matches!(self, SuggestionStyle::ShowCode)
-    }
-}
-
-/// A suggested change: one or more ways to substitute parts of the source: rustc's
-/// `CodeSuggestion`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Suggestion {
-    pub message: String,
-    /// Each way to substitute, each a set of disjoint parts.
-    pub substitutions: Vec<Vec<(Span, String)>>,
-    pub applicability: Applicability,
-    pub style: SuggestionStyle,
-}
-
-/// A lint's diagnostic, at the level it was found at.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Diagnostic {
-    /// As rustc's JSON names it: `clippy::needless_bool`, `unfulfilled_lint_expectations`.
-    pub lint: String,
-    /// `Warn`, `ForceWarn`, `Deny` or `Forbid`: the levels a diagnostic is written at.
-    pub level: Level,
-    pub message: String,
-    pub span: MultiSpan,
-    pub children: Vec<Child>,
-    pub suggestions: Vec<Suggestion>,
-    /// rustc turns off the suggestions of a lint in code of another crate's macro.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub suggestions_disabled: bool,
-}
-
-impl Diagnostic {
-    /// Whether it is written as an error.
-    pub fn is_error(&self) -> bool {
-        self.level >= Level::Deny
-    }
-
-    /// Whether cargo counts it as one `cargo clippy --fix` applies: it has a suggestion rustfix
-    /// takes as it is.
-    pub fn is_fixable(&self) -> bool {
-        !self.suggestions_disabled
-            && self
-                .suggestions
-                .iter()
-                .any(|it| it.applicability == Applicability::MachineApplicable)
-    }
-
-    pub fn note(&mut self, message: impl Into<String>) -> &mut Diagnostic {
-        self.sub(Sublevel::Note, message, MultiSpan::default(), false)
-    }
-
-    pub fn help(&mut self, message: impl Into<String>) -> &mut Diagnostic {
-        self.sub(Sublevel::Help, message, MultiSpan::default(), false)
-    }
-
-    pub fn span_note(&mut self, span: Span, message: impl Into<String>) -> &mut Diagnostic {
-        self.sub(Sublevel::Note, message, MultiSpan::of(span), false)
-    }
-
-    pub fn span_help(&mut self, span: Span, message: impl Into<String>) -> &mut Diagnostic {
-        self.sub(Sublevel::Help, message, MultiSpan::of(span), false)
-    }
-
-    pub fn sub(
-        &mut self,
-        level: Sublevel,
-        message: impl Into<String>,
-        span: MultiSpan,
-        once: bool,
-    ) -> &mut Diagnostic {
-        self.children.push(Child { level, message: message.into(), span, once });
-        self
-    }
-
-    /// A label on `span`, which is primary when it is one of the primary spans.
-    pub fn span_label(&mut self, span: Span, label: impl Into<String>) -> &mut Diagnostic {
-        self.span.labels.push((span, label.into()));
-        self
-    }
-
-    /// rustc's `span_suggestion`: shown inline when it is short.
-    pub fn suggestion(
-        &mut self,
-        span: Span,
-        message: impl Into<String>,
-        code: impl Into<String>,
-        applicability: Applicability,
-    ) -> &mut Diagnostic {
-        self.suggestion_with_style(
-            vec![(span, code.into())],
-            message,
-            applicability,
-            SuggestionStyle::ShowCode,
-        )
-    }
-
-    /// rustc's `multipart_suggestion`: the parts are one change, shown as a patch even when
-    /// there is one.
-    pub fn multipart_suggestion(
-        &mut self,
-        message: impl Into<String>,
-        parts: Vec<(Span, String)>,
-        applicability: Applicability,
-    ) -> &mut Diagnostic {
-        self.suggestion_with_style(parts, message, applicability, SuggestionStyle::ShowAlways)
-    }
-
-    pub fn suggestion_with_style(
-        &mut self,
-        mut parts: Vec<(Span, String)>,
-        message: impl Into<String>,
-        applicability: Applicability,
-        style: SuggestionStyle,
-    ) -> &mut Diagnostic {
-        let mut seen = rustc_hash::FxHashSet::default();
-        parts.retain(|(span, code)| seen.insert((span.lo, span.hi, code.clone())));
-        self.suggestions.push(Suggestion {
-            message: message.into(),
-            substitutions: vec![parts],
-            applicability,
-            style,
-        });
-        self
+    #[test]
+    fn a_span_of_the_query_is_moved_and_named_and_one_of_another_file_is_named() {
+        let range = TextRange::new(2.into(), 5.into());
+        let mut diag = Diag::lint("clippy::needless_bool", "x", in_query(range));
+        diag.span_label(of_file(span::FileId::from_raw(7), range), "there");
+        let name_of = |file: span::FileId| (file.index() == 7).then(|| "src/other.rs".to_owned());
+        assert_eq!(place_diag(&mut diag, 100, "src/lib.rs", &name_of), Ok(()));
+        assert_eq!((diag.span.primary[0].file.as_str(), diag.span.primary[0].lo, diag.span.primary[0].hi), ("src/lib.rs", 102, 105));
+        assert_eq!((diag.span.labels[0].0.file.as_str(), diag.span.labels[0].0.lo), ("src/other.rs", 2));
+        let mut unnamed = Diag::lint("clippy::needless_bool", "x", of_file(span::FileId::from_raw(8), range));
+        assert_eq!(
+            place_diag(&mut unnamed, 0, "src/lib.rs", &name_of),
+            Err(Unnamed { file: span::FileId::from_raw(8) }),
+            "an unnamed file is the error, never a diagnostic left out"
+        );
     }
 }

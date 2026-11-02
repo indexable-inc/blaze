@@ -3,7 +3,7 @@
 //! To save time and memory, builtin derives are not really expanded. Instead, we record them
 //! and create their impls based on lowered data, see crates/hir-ty/src/builtin_derive.rs.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::{AstId, InFile, builtin::BuiltinDeriveExpander, name::Name};
 use intern::{Symbol, sym};
 use syntax::ast;
@@ -125,12 +125,12 @@ pub(crate) fn has_builtin_derive_impl(derive: BuiltinDeriveExpander) -> bool {
 impl BuiltinDeriveImplMethod {
     pub fn trait_method(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         impl_: BuiltinDeriveImplId,
     ) -> Option<FunctionId> {
         let loc = impl_.loc(db);
         let lang_items = crate::lang_item::lang_items(db, loc.krate(db));
-        let trait_ = impl_.loc(db).trait_.get_id(lang_items)?;
+        let trait_ = loc.trait_.get_id(lang_items)?;
         trait_.trait_items(db).method_by_name(&Name::new_symbol_root(self.name()))
     }
 }
@@ -164,15 +164,15 @@ pub(crate) fn with_derive_traits(
 impl BuiltinDeriveImplLoc {
     /// Whether the derive is listed in a `#[derive_const(..)]`, which makes the impl a
     /// `const impl`.
-    pub fn is_const(&self, db: &dyn SourceDatabase) -> bool {
+    pub fn is_const(&self, db: &Db) -> bool {
         let (adt_ast_id, module) = self.adt_source(db);
-        let (_, meta) = self.derive_attr_id.find_attr_range(db, module.krate(db), adt_ast_id);
+        let (_, meta) = self.derive_attr_id.find_attr_range_view(db, module.krate(db), adt_ast_id);
         meta.path()
             .and_then(|path| path.as_single_name_ref())
             .is_some_and(|name| name.text() == "derive_const")
     }
 
-    pub fn source(&self, db: &dyn SourceDatabase) -> InFile<TextRange> {
+    pub fn source(&self, db: &Db) -> InFile<TextRange> {
         let (adt_ast_id, module) = self.adt_source(db);
         let derive_range = self.derive_attr_id.find_derive_range(
             db,
@@ -183,7 +183,7 @@ impl BuiltinDeriveImplLoc {
         adt_ast_id.with_value(derive_range)
     }
 
-    fn adt_source(&self, db: &dyn SourceDatabase) -> (AstId<ast::Adt>, crate::ModuleId) {
+    fn adt_source(&self, db: &Db) -> (AstId<ast::Adt>, crate::ModuleId) {
         match self.adt {
             AdtId::StructId(adt) => {
                 let adt_loc = adt.loc(db);

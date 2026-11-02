@@ -1,0 +1,31 @@
+{
+  "id": "01000",
+  "from_lane": "integrate",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/cli",
+    "crates/blaze-units/src/query",
+    "crates/blaze-cargo/src/serve"
+  ],
+  "what": "`blaze doc` on v2: the v1 entry dispatched `blaze doc` to crates/blaze-doc (rustdoc replacement, no-rustc); integrate-engine deleted that entry (blaze-engine/src/doc.rs) and v2 `blaze_cargo::cli` has only build/check/run/test/bench (blaze_units::query::Command). Add `Command::Doc` (cargo doc's flags, clap text as for the others) whose daemon side lowers the units through blaze-lower and calls blaze-doc on the `base_db::Db`, writing cargo's target/doc layout. Without it `cargo doc` stops working under blaze, a regression (superset-of-rust). blaze-doc's manifest already takes base-db/hir directly (ide-db gone). Tell integrate when done.",
+  "state": "applied",
+  "created": "2026-10-30T13:07:42Z",
+  "updated": "2026-10-31T20:41:46Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:07:42Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:41:46Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Already in v2: blaze_units::query::Command::Doc with cargo doc's flags (cli/args.rs), Request::Doc { view, targets, no_deps, private } (cli.rs request), Work::Doc in serve/job.rs, and serve/unit.rs:871 `doc` lowering the units and calling blaze-doc on the Db, writing target/doc; serve/tests.rs covers Request::Doc. integrate: nothing to do."
+    }
+  ]
+}

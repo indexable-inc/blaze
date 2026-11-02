@@ -1,0 +1,40 @@
+{
+  "id": "00112",
+  "from_lane": "safety-fuzz",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-fuzz",
+    "python/typed-input/src",
+    "fuzz/src",
+    "fuzz/targets",
+    "fuzz/src/tests.rs"
+  ],
+  "what": "## From safety-fuzz (2026-10-29): `hot_lint.py` and the fuzzer\n\n> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.\n\n### F4. Coordinator (`tools/v2/hot_lint.py`): it crashes when given `\"crates\"`\n\n`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{\"root\": \".\", \"crates\": [\"blaze-link\"]}'`\nraises `TypeError: typed_input: crates has a type it does not read: list[str]`. `typed_input`\nhas no reader for `list[str]` (a `tuple[str, ...]` field, or a `list` reader in typed_input,\nwould fix it). Without `\"crates\"` it runs over the whole `HOT` list. The lint also looks only\nin `crates/<name>/src`, so `fuzz/` (package `blaze-fuzzer`) is never scanned. I ran its\n`lint_file` on `fuzz/src/` directly: 72 findings. One was a real per-run allocation (the\nmutator's `to_string`), now fixed. A list built only to be iterated is gone, and a `Display`\ntype replaces a `String` built per status line. The rest are on lines that are errors, command\nline, setup or a kept input's file write, and those carry `// alloc:` or `// clone:` reasons.\n`fuzz/src/` now has none left.\n\nAsked: treat `fuzz/targets/` as test code, as `tests/` is (826 findings, almost all `vec![..]`\nin the `seeds()` builders and in the targets' checks: re-encodings to compare and models,\nwhich are the test's own work). The engine's hot path is `fuzz/src/` and is held to the\nbudget by a test (below).\n\n> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.\n\n### F5. Whoever owns `crates/blaze-fuzz`: one counting allocator\n\n`blaze-fuzz` installs its own `#[global_allocator]` (largest request per thread), so a test\nbinary that links it (every `blaze-fuzzer` test, and the store's fuzz tests) can't also install\n`blaze-alloc-count`'s: two global allocators don't link. `fuzz/src/tests.rs`\n(`a_run_that_keeps_nothing_allocates_nothing`) uses `blaze_fuzz::largest_allocation`, which is 0\nexactly when nothing was allocated. Asked: make `blaze-fuzz` count through `blaze-alloc-count`\n(that crate keeping the largest request per thread too, beside `allocations` and `bytes`), so\none allocator serves both kinds of test.\n\n> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.",
+  "state": "applied",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T08:31:29Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/safety.md#From safety-fuzz (2026-10-29): `hot_lint.py` and the fuzzer",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:976"
+    },
+    {
+      "at": "2026-10-30T08:31:29Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:29Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "F4: hot_lint takes crates as a tuple and lints fuzz/src (fuzz/targets unread, as tests are). F5: blaze-alloc-count's Used has largest (the biggest single request while measuring, nesting kept) and installed() (whether Counting is the global allocator); blaze-fuzz has no allocator now: largest_allocation measures through blaze_alloc_count and panics unless Counting is installed, so a missing install can't pass. Installed under cfg(test) in crates/blaze-store/src/lib.rs (dev-dep added) and fuzz/src/lib.rs (new [dev-dependencies]); blaze-protocol and hir-ty-codegen already had it (they could not link before: two global allocators). Cargo.lock entries for the three new edges handed to coord-apply-manifests."
+    }
+  ]
+}

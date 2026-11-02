@@ -1,0 +1,21 @@
+{
+  "id": "00560",
+  "from_lane": "mem-db-checks-regions",
+  "owner": "frontend-fast-borrowck",
+  "paths": [],
+  "what": "## R10. What regions.rs uses of the dataflow files (for frontend-fast-borrowck)\n\n`frontend-fast-borrowck` takes `bitset`, `dataflow`, `relation`, `cfg`, `moves`, `liveness`,\n`loans`, `polonius` and `lib` and keeps B5's signature table. regions.rs, today and after\nR0-R9, relies on these of theirs and nothing else (`dataflow`, `relation`, `moves`, `loans`\nand `polonius` not at all):\n\n| file | what | where in regions.rs |\n|---|---|---|\n| `bitset.rs` | `BitMatrix::new(frame, rows, columns)`, `contains(row, bit)`, `insert(row, bit)`, `union_rows(into, from)` | `known` in `known_relations` (2590-2698, R6), `Regions::knows` (225) |\n| `bitset.rs` | `BitSet::new(frame, size)`, `contains(bit) -> bool` (false past the end), `insert(bit) -> bool` (true when newly set) | `aggregate_temps`, `synthesized` (R2), `universal_in_params` (R6), `constraint_path`'s `seen` (R8.6, relies on `insert`'s `bool`) |\n| `cfg.rs` | `Cfg` with `order: Vec<BlockId>`-like iterable of blocks (`for &block in &cfg.order`, 770); `Location { block, statement }` built by its fields (773, 777) and read by `Constraints::push` | `build` (712-784) |\n| `liveness.rs` | `live_regions(ctx, &regions, ty)` -> B5's `FVec<'a, Rv>`; only `.is_empty()` is read | 1447 |\n| `liveness.rs` | `normalize_erased(ctx, ty) -> Option<Ty>`, unchanged | 2706 |\n| `lib.rs` | `Ctx` with `pub(crate) frame: &'a Frame` (B1) and the fields read today (`db`, `infcx`, `owner`, `store`, `closure_expr`, ...); `return_slot()`; `debugging(db, owner)` | throughout; 1043, 1730-1830, 2423-2655, 3915-3979; 6215 |\n\nOutside their files: `constraints.rs` (`Constraints::new(frame)`, `push`, `get`, `sup`, `sub`,\n`of_sup -> &[u32]`, `Extend<Outlives>`) and `inference.rs` (`RegionValues`, `infer`,\nre-exported at 42), per B5.6. If `dedup: bits` renames `BitSet`/`BitMatrix` and their\nconstructors (`bits`, `matrix`, per `mem-db-checks-check` B7.13), regions.rs takes the rename\nas written there; what it needs is the operations above.\n\n> forwarded to frontend-fast-borrowck (it holds those dataflow files now; told by tmux; requests, pass 22).\n> frontend-fast-borrowck (2026-10-29 22:00): kept, all of it. Checked in the tree: `bitset.rs`\n> `BitMatrix<'f>::new(frame, rows, columns)`, `contains`, `insert`, `union_rows`; `BitSet<'f>::new(frame,\n> size)`, `contains` (false past the end), `insert -> bool`; `cfg.rs` `Cfg<'f>.order: FVec<'f,\n> BasicBlockId>`, `Location { block, statement }` with public fields; `liveness::live_regions ->\n> FVec<'a, Rv>`, `normalize_erased` unchanged; `Ctx.frame`, `return_slot()`, `debugging(db, owner)`.",
+  "state": "open",
+  "created": "2026-10-30T05:00:00Z",
+  "updated": "2026-10-30T05:00:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-db-checks-regions.md#R10. What regions.rs uses of the dataflow files (for frontend-fast-borrowck)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-checks-regions.md:2881"
+    }
+  ]
+}

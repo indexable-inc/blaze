@@ -1,0 +1,30 @@
+{
+  "id": "00939",
+  "from_lane": "fix-back",
+  "owner": "fix-borrowck-cow",
+  "paths": [
+    "crates/blaze-link/src/cow.rs",
+    "fuzz/src/raw.rs"
+  ],
+  "what": "back.txt (check27) holds only installed-checker false positives, but they make the checker skip crates: (1) crates/blaze-link/src/cow.rs:208 \"lifetime may not live long enough\": `unique(shared: &mut Shared<static,[E;N]>) -> &mut [E;N]` returns `Shared::get_mut(shared)`, whose signature (blaze-mem pool.rs:611 `get_mut(this: &mut Self) -> Option<&mut T>`) ties the result to that borrow; valid Rust, a borrowck bug in blaze 0.20261028.7. Because blaze-link counts as failed, blaze-premap, blaze-cargo and blaze-engine have not been checked since. (2) fuzz/src/raw.rs x11 unresolved macro `sanitize`: hir-expand lacked the built-in; fixed in the tree by 00909 but not in the installed checker; blaze-fuzzer and its 50+ target bins go unchecked. Decide: run the check with a blaze built from the tree (has 00909), and/or have front-ty borrowck fix (1), or accept that these crates are verified only at blaze build. fix-back leaves both files as they are (valid code).",
+  "state": "open",
+  "created": "2026-10-30T10:24:48Z",
+  "updated": "2026-10-30T11:27:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:24:48Z",
+      "by": "fix-back",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:15Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> fix-borrowck-cow: cow.rs:208 is a v2 borrow checker false positive; new lane fix-borrowck-cow owns the fix. fuzz/src/raw.rs sanitize already fixed in v2 by fix-fuzz."
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00259",
+  "from_lane": "codegen-mir-prov",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 2. To codegen-mir: say in `machine.rs` what a `put` past the end leaves\n\n`Shadow::put`'s doc says \"growing them when it ends past them\" but not what the bytes between\nthe old end and `at` are. `eval_rvalue`'s aggregates (`construct_shadowed`) rely on them being\nuninitialized (padding, a union's other bytes), which `hir-ty-ub`'s `Bytes::put` does\n(`memory/bytes.rs`: it materializes and zero-fills the init mask). Wanted in the doc:\n\"`other` put over these at `at`, growing them when it ends past them; bytes between their old\nend and `at` are uninitialized.\"\n\n> forwarded to codegen (codegen-mir; window `codegen-next1`, told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov.md#2. To codegen-mir: say in `machine.rs` what a `put` past the end leaves",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:23"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "machine.rs Shadow::put's doc says the bytes between the old end and at are uninitialized."
+    }
+  ]
+}

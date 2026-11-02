@@ -1,0 +1,24 @@
+{
+  "id": "00896",
+  "from_lane": "speed-sol2-usercode",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-build-script/src/elide/lex.rs",
+    "crates/blaze-build-script/src/env.rs"
+  ],
+  "what": "Two speed-of-light gaps left open in blaze-build-script (docs/v2/plan/lanes/usercode/speed-of-light.md, \"What is left in blaze-build-script\"). (1) elide/lex.rs at about 3.3n cycles against 1.0n: a std::simd stage 1 (64 bytes a step into masks of identifier bytes, spaces, quotes, \\r and 0xE2) and a lexer at about 10 instructions a token, with a differential test against elide/lex/tests/reference.rs over seeded inputs and the corpus. (2) env.rs merged(): about 15% over from sorting the whole of what cargo sets. Make the fixed names slots indexed by a const sorted table at each cmd.set call so only [env], features, cfgs and DEP_* are sorted before one merge, keeping last-word-wins (seq) and remove(), with a test against env/tests/reference.rs.",
+  "state": "open",
+  "created": "2026-10-30T09:32:15Z",
+  "updated": "2026-10-30T09:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:32:15Z",
+      "by": "speed-sol2-usercode",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

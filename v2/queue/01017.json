@@ -1,0 +1,28 @@
+{
+  "id": "01017",
+  "from_lane": "integrate-store",
+  "owner": "coordinator",
+  "paths": [
+    ".github/actions/blaze-remote/",
+    ".github/actions/blaze/action.yml",
+    ".github/workflows/blaze-platform.yaml",
+    ".github/scripts/gate_changes.py",
+    ".github/SECURITY.md",
+    ".github/blaze-version"
+  ],
+  "what": "When .github/blaze-version moves to a v2 release: delete .github/actions/blaze-remote/ and its uses (.github/actions/blaze/action.yml:104, .github/workflows/blaze-platform.yaml:120,193, .github/scripts/gate_changes.py:57), and in .github/actions/blaze/action.yml the `blaze-engine cache build` project step and BLAZE_CACHE/BLAZE_CACHE_MAX lines (and the job `project` output). Why: those run the *pinned release*, which is v1 today, so they keep CI warm until the bump; v2 has no `cache build|push|pull` (v1 Identity is gone, #1439; v2 remote is the read-through blaze_cas::remote tier, nothing pushes, docs/v2/plan/lanes/store.md), so a v2 pin makes them fail loudly. Removing them now would make every CI run cold (about an hour, 28 GB, rcache #664). Also .github/SECURITY.md names the v1 remote signing key; edit with it.",
+  "state": "open",
+  "created": "2026-10-30T14:15:17Z",
+  "updated": "2026-10-30T14:15:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:15:17Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

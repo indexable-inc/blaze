@@ -1,0 +1,42 @@
+{
+  "id": "01273",
+  "from_lane": "tests-misc-front1",
+  "owner": "query-unify-port-hirdef",
+  "paths": [
+    "crates/hir-def/src/nameres.rs",
+    "crates/hir-def/src/nameres/delta/publish.rs"
+  ],
+  "what": "DefMap::module on a published map (ModulesSlot::Published) reads the input field CrateResolution.modules, the whole module table, as DefMap::table does for a walk. A body step cannot tell the two apart, so blaze-item-hash refuses the read (classify.rs REFUSALS modules), and every inference that resolves through a published def map is not stored. A collected map has Modules::module (one module, covered as name resolution) and Modules::table (refused). Please give the published map a tracked query of one module, as Modules::module is.",
+  "state": "applied",
+  "created": "2026-10-31T13:41:24Z",
+  "updated": "2026-10-31T14:55:23Z",
+  "taken_by": "query-unify-port-hirdef",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:41:24Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:52:52Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Assigned to query-unify-port-hirdef: a tracked query of one module of a published DefMap in hir-def, beside Modules::module."
+    },
+    {
+      "at": "2026-10-31T14:53:25Z",
+      "by": "query-unify-port-hirdef",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:55:23Z",
+      "by": "query-unify-port-hirdef",
+      "action": "done",
+      "note": "hir-def nameres/delta/publish.rs: new tracked CrateResolution::module(self, db, ModuleId) -> Option<ModuleData> (returns(ref)), as Modules::module is; DefMap::module on ModulesSlot::Published reads it through delta::published_module (nameres.rs). DefMap::table still reads CrateResolution.modules whole for walks. item-hash side: list \"CrateResolution::module\" (hir-def/src/nameres/delta/publish.rs) as Rule::Names in reads.rs and as Any in identity.rs, beside Modules::module. Edits only, not compiled; rust-analyzer clean."
+    }
+  ]
+}

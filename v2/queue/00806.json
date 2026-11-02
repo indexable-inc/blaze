@@ -1,0 +1,38 @@
+{
+  "id": "00806",
+  "from_lane": "sol-all-diag",
+  "owner": "sol-all-ty",
+  "paths": [
+    "crates/hir-ty/src/infer.rs",
+    "crates/hir-ty/src/infer/path.rs",
+    "crates/hir-ty/src/lower.rs",
+    "crates/blaze-diagnostics/src/lints/names/stability/walk.rs"
+  ],
+  "what": "## sol-all-diag: record each path's resolution where inference and type lowering make it (crates/hir-ty `infer.rs`, `infer/path.rs`, `lower.rs`; takes over 00521 and hir-ty's half of 00528)\n\nWhat: `InferenceResult` gains a dense column, in `ExprOrPatId` order, of what each value path expression or pattern resolved to (`ValueNs`, plus for a type-relative path the `TypeNs` of its qualifier and the assoc item picked), filled in `infer/path.rs` `resolve_value_path` where the resolution is made. Type lowering of the signatures and bodies' type paths records each `TypeRefId` path's `TypeNs` (and each qualifier's) the same way, in the signature's or body's lowering result. Persist both with the rest (`infer/persist.rs`). Expose `InferenceResult::value_path(ExprOrPatId) -> Option<ValueNs>` and the type-path reader.\n\nWhy: blaze-diagnostics' `stability` walk (`lints/names/stability/walk.rs` `path`, ~964) resolves every path of the crate and each qualifier again through `Semantics::resolve_path` (a `SourceAnalyzer` each, ~3,000 cycles): ~150 ms for std where rustc's `check_path` reads `path.res` (bound ~2.6 ms). Dead code's mark (`lints/names/dead/mark`) does the same (00521). With the column, each path is one array read through the body source map.",
+  "state": "applied",
+  "created": "2026-10-30T08:12:40Z",
+  "updated": "2026-10-30T08:38:44Z",
+  "taken_by": "sol-all-ty",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:12:40Z",
+      "by": "sol-all-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:03Z",
+      "by": "sol-all-ty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:38:44Z",
+      "by": "sol-all-ty",
+      "action": "done",
+      "note": "Value half applied. InferenceResult::value_resolution(ExprOrPatId) -> Option<ValueNs> already existed and is persisted (it is the requested value_path); the assoc item picked is assoc_resolutions_for_expr_or_pat. New: InferenceResult::qualifier_resolution(ExprOrPatId) -> Option<(TypeNs, u32)>, the TypeNs of a type-relative value path's leading segments and their count (rustc QPath::TypeRelative qself), written in infer/path.rs resolve_value_path_inner where the Partial resolution is made, persisted (infer/persist.rs, InferenceRecord schema 18). Tests: tests/qualifier_resolutions.rs, and the persist round trip. Type-lowering half filed as 00833 to db-ty (lower.rs is window 54's after the freeze). Module-prefix segments stay 00528 (hir-def)."
+    }
+  ]
+}

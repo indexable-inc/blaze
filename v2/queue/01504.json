@@ -1,0 +1,23 @@
+{
+  "id": "01504",
+  "from_lane": "observe",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "observe (explore-web question 7: peak memory per build). blaze-profile has a new counter `Plot::Footprint` (\"footprint bytes\") and a view `footprint_per_build` (peak and last footprint in each build's window). Please plot it in Daemon::plot beside LiveBytes: `if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) { blaze_profile::plot(Plot::Footprint, bytes) }` on macOS; on Linux the same from /proc/self/status VmRSS (or a footprint fn in raw/memory.rs for both), so the counter exists on every platform the daemon runs. Unbuilt on my side.",
+  "state": "open",
+  "created": "2026-11-01T13:43:37Z",
+  "updated": "2026-11-01T13:43:37Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:43:37Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

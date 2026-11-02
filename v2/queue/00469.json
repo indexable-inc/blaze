@@ -1,0 +1,39 @@
+{
+  "id": "00469",
+  "from_lane": "diagnostics-lints-bodies",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty",
+    "crates/hir",
+    "crates/blaze-diagnostics/src/lints/bodies/patterns.rs",
+    "crates/hir/src/match_lints.rs",
+    "crates/hir-ty-matchck"
+  ],
+  "what": "## diagnostics-lints-bodies: what match checking lints (db, `crates/hir-ty` or a crate of its own, `crates/hir`)\n\nrustc's `check_match` (`compiler/rustc_mir_build/src/thir/pattern/check_match.rs` over\n`rustc_pattern_analysis`) ported into the front end, with what it lints given through `hir`.\nhir-ide's `ExprValidator::validate_match` is not it: its pattern lowering\n(`hir-ide/src/diagnostics/match_check.rs`) makes every literal but `bool`, every range and every\nconstant `_`, so its usefulness would call `1 => .., 2 => ..` redundant, and it has \"FIXME\nReport unreachable arms\". The port needs rustc's `PatCtxt::lower_pat` (literals, ranges,\nconstants through const eval, slices, strings, deref and box patterns, never patterns), its\n`MatchVisitor` order and `LetSource`s, and gives E0004/E0005 (hir's `MissingMatchArms` and\n`NonExhaustiveLet`, which `diagnostics-lints-mir-matches` lowers) from the same run. What, in\n`crates/hir`:\n\n```rust\nimpl DefWithBody {\n    /// What `check_match` lints in this body, in the order rustc emits them (its THIR visit:\n    /// per `match`, each arm's `bindings_with_variant_name` as its pattern is lowered, then the\n    /// redundant or-pattern alternatives sorted by span, then the redundant arms).\n    pub fn match_lints<'db>(self, db: &'db dyn HirDatabase) -> Vec<MatchLint<'db>>;\n\n    /// Whether `check_match` returned `Err` (E0004, E0005, or any other error it gives), from\n    /// the same salsa query as `match_lints`: rustc's `mir_built` is then `construct_error`'s\n    /// body, so the body gets no MIR lint (liveness, `unconditional_recursion`, known panics,\n    /// `LintAndRemoveUninhabited`), though `check_unsafety` still visits its THIR.\n    pub fn match_check_failed(self, db: &dyn HirDatabase) -> bool;\n}\n\npub enum MatchLint<'db> {\n    UnreachablePattern(UnreachablePattern<'db>),\n    IrrefutableLet(IrrefutableLet),\n    BindingWithVariantName(BindingWithVariantName),\n}\n\n/// `unreachable_patterns` (`report_unreachable_pattern`).\npub struct UnreachablePattern<'db> {\n    pub pat: InFile<AstPtr<ast::Pat>>,\n    /// `RedundancyExplanation::covered_by`, in its order; empty when it matches no values.\n    pub covered_by: Vec<InFile<AstPtr<ast::Pat>>>,\n    /// `covered_by` is one pattern and `pat_is_catchall` of it.\n    pub catchall: bool,\n    /// `matches_no_values_ty`: `pat`'s type, or the uninhabited type `pat.walk` finds.\n    pub ty: Type<'db>,\n    /// The arm, when a whole arm of a `match` (`Normal` or `Postfix`) is redundant\n    /// (`whole_arm_span`).\n    pub arm: Option<InFile<AstPtr<ast::MatchArm>>>,\n    /// `find_fallback_pattern_typo`, when `catchall`.\n    pub typo: Option<PatternTypo>,\n}\n\n/// `find_fallback_pattern_typo`'s finding, as it puts it on the lint.\npub enum PatternTypo {\n    /// `WantedConstant`: `const_name`, `const_path` (`def_path_str` with no trimmed paths).\n    WantedConstant { is_typo: bool, const_name: String, const_path: String },\n    /// `accessible_constant`: the name of the `use` that re-exports it.\n    AccessibleConstant(InFile<TextRange>),\n    /// `inaccessible_constant`: the constant (its `def_span`).\n    InaccessibleConstant(Const),\n    /// `pattern_let_binding`: the name a `let` binds.\n    PatternLetBinding(InFile<TextRange>),\n}\n\n/// `irrefutable_let_patterns` (`report_irrefutable_let_patterns`, always `count` 1).\npub struct IrrefutableLet {\n    pub source: LetSource, // IfLet (and ElseIfLet), IfLetGuard, LetElse, WhileLet\n    /// The `let` expression (or the `&&` chain of `lint_single_let`), or the `let` statement\n    /// for `LetElse`.\n    pub at: InFile<SyntaxNodePtr>,\n    /// `check_irrefutable_option_some`: the pattern and the inner `Option` of the initializer.\n    pub replacement: Option<(InFile<AstPtr<ast::Pat>>, InFile<AstPtr<ast::Expr>>)>,\n}\n\n/// `bindings_with_variant_name` (E0170, `check_for_bindings_named_same_as_variants`).\npub struct BindingWithVariantName {\n    pub pat: InFile<AstPtr<ast::IdentPat>>,\n    pub enum_: Enum,\n    /// `rf == Refutable || variant_count == 1`.\n    pub suggest: bool,\n}\n```\n\nWhy: these are `check_match`'s lints, the front end's semantics;\n`crates/blaze-diagnostics/src/lints/bodies/patterns.rs` lowers them as written above.\n\n> forwarded to db: `crates/hir/` and the `check_match` port into the front end are db's.\n> checked by db-audit-other (22:37): in the tree at `crates/hir/src/match_lints.rs:38-172`. That has `MatchLint`, `UnreachablePattern`, `PatternTypo`, `IrrefutableLet`, `BindingWithVariantName`, `DefWithBody::match_lints` (:157) and `match_check_failed` (:172). The port of `check_match` is the crate `crates/hir-ty-matchck` (`lib.rs:51-141`).",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies: what match checking lints (db, `crates/hir-ty` or a crate of its own, `crates/hir`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:244"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:37): in the tree at `crates/hir/src/match_lints.rs:38-172`. That has `MatchLint`, `UnreachablePattern`, `PatternTypo`, `IrrefutableLet`, `BindingWithVariantName`, `DefWithBody::match_lints` (:157) and `match_check_failed` (:172). The port of `check_match` is the crate `crates/hir-ty-matchck` (`lib.rs:51-141`)."
+    }
+  ]
+}

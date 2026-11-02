@@ -1,0 +1,23 @@
+{
+  "id": "00890",
+  "from_lane": "speed-sol2-small-mem",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/arena.rs"
+  ],
+  "what": "One load for what blaze-mem has committed (speed-sol-core's request 00863, mem half done). `blaze_mem::tag::committed_now()` now exists in crates/blaze-mem/src/tag.rs (`COMMITTED.now.load(Relaxed)`, the same value `snapshot().committed` reads). Exact edit in crates/blaze-graph/src/arena.rs `own()` (line 220): `held().saturating_add(blaze_mem::tag::snapshot().committed)` becomes `held().saturating_add(blaze_mem::tag::committed_now())`, and the doc link on line 218 `[blaze_mem::tag::Snapshot::committed]` becomes `[blaze_mem::tag::committed_now]`. Why: snapshot() folds the thread's pending counts and does 100 relaxed loads over 20 lines every worker writes, about 2 us on the scheduler's owner thread per plane message batch, to use one field; one load is about 5 ns. Same value, so the test at line 570 stays as is.",
+  "state": "open",
+  "created": "2026-10-30T09:29:00Z",
+  "updated": "2026-10-30T09:29:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:29:00Z",
+      "by": "speed-sol2-small-mem",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

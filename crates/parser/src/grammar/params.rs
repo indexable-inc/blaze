@@ -47,9 +47,13 @@ fn list_(p: &mut Parser<'_>, flavor: Flavor) {
     p.bump(bra);
 
     let mut param_marker = None;
-    if let FnDef | TraitFn2015 = flavor {
+    if let FnDef | TraitFn2015 | FnPointer = flavor {
         // test self_param_outer_attr
         // fn f(#[must_use] self) {}
+
+        // test fn_pointer_self_param
+        // type A = fn(&self);
+        // type B = fn(mut self: u8, u8);
         let m = p.start();
         attributes::outer_attrs(p);
         match opt_self_param(p, m) {
@@ -106,7 +110,9 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
 
         // test trait_fn_unnamed_params 2015
         // trait T { fn f(&self, *const u8, Option<&u8>, x: u8, _: &u8, &u8) -> u8; }
-        Flavor::TraitFn2015 if !is_named_param(p) => types::type_(p),
+        Flavor::TraitFn2015 if !is_named_param(p) && !is_ref_mut_named_param(p) => {
+            types::type_(p)
+        }
 
         // test fn_def_param
         // fn foo(..., (x, y): (i32, i32)) {}
@@ -128,9 +134,21 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
 
         // test fn_pointer_unnamed_arg
         // type Foo = fn(_: bar);
+
+        // test fn_pointer_param_pat
+        // type A = fn(mut a: u8, &b: u8, &&c: u8, r#ref: u8);
+
+        // test_err fn_pointer_param_ref_mut_pat
+        // type A = fn(&mut a: u8);
         Flavor::FnPointer => {
-            if (p.at(IDENT) || p.at(UNDERSCORE)) && p.nth(1) == T![:] && !p.nth_at(1, T![::]) {
+            let ref_mut = !is_named_param(p) && is_ref_mut_named_param(p);
+            if ref_mut || is_named_param(p) {
                 patterns::pattern_single(p);
+                if ref_mut {
+                    // rustc's `recover_arg_parse` (E0642), which reads the pattern only after
+                    // `&mut a` failed as a type.
+                    p.error("patterns aren't allowed in function pointer types");
+                }
                 if !variadic_param(p) {
                     if p.at(T![:]) {
                         types::ascription(p);
@@ -156,17 +174,31 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
     m.complete(p, PARAM);
 }
 
-/// Whether a parameter starts with a name and a colon, as rustc's `Parser::is_named_param`
-/// asks of a parameter that may be a type alone.
+/// rustc's `Parser::is_named_param`, asked of a parameter that may be a type alone: whether it
+/// starts `x:`, `&x:`, `&&x:` or `mut x:`, where `x` is any identifier, keywords and `_`
+/// included.
 fn is_named_param(p: &Parser<'_>) -> bool {
-    let offset = match p.current() {
-        T![&] if p.nth_at(1, T![mut]) => 2,
-        T![&] | T![mut] => 1,
-        _ => 0,
+    let offset = if p.at(T![&&]) {
+        2
+    } else if p.at(T![&]) || p.at(T![mut]) {
+        1
+    } else {
+        0
     };
-    matches!(p.nth(offset), IDENT | T![_])
-        && p.nth_at(offset + 1, T![:])
-        && !p.nth_at(offset + 1, T![::])
+    is_name_before_colon(p, offset)
+}
+
+/// Whether a parameter starts `&mut x:`, which rustc's `is_named_param` misses: it parses `&mut x`
+/// as a type, fails at the `:` and reads it again as a pattern.
+fn is_ref_mut_named_param(p: &Parser<'_>) -> bool {
+    p.at(T![&]) && p.nth_at(1, T![mut]) && is_name_before_colon(p, 2)
+}
+
+fn is_name_before_colon(p: &Parser<'_>, n: usize) -> bool {
+    let name = p.nth(n);
+    (name.is_any_identifier() || name == T![_])
+        && p.nth_at(n + 1, T![:])
+        && !p.nth_at(n + 1, T![::])
 }
 
 fn variadic_param(p: &mut Parser<'_>) -> bool {

@@ -5,16 +5,18 @@
 
 Each row copies the `soak/` workspace (a build script, three kinds of proc macro, a program
 and its tests), has a daemon of its own load it, does the thing the row is named for, and
-then compares `blaze run` (or `test`) with a cold `cargo run` of the same tree. A row
-is right when the two agree at every comparison and neither the daemon nor a worker logged
-a panic; who built each one, the daemon or cargo with the reason blaze gave, is in the
-table. A build cargo did in place of the daemon is right: that is the contract.
+then compares `blaze run` (or `test`) with blaze's build of the same tree from nothing
+(`blaze_cli.Scratch`), and the program with what the edit says it prints. A row is right
+when the two agree at every comparison, the program says what it should, and neither the
+daemon nor a worker logged a panic; who built each one, the daemon or cargo with the reason
+blaze gave, is in the table. A build cargo did in place of the daemon is right: that is the
+contract.
 
 Writes SOAKROWS.md next to this file.
 """
 import argparse, glob, os, re, shutil, signal, subprocess, sys, tempfile, time
 
-from blaze_cli import HERE, BLAZE, TOOLCHAIN, Side, base_env, difference, how_built, program_output, test_results, wait_warm
+from blaze_cli import HERE, BLAZE, TOOLCHAIN, Scratch, Side, base_env, difference, how_built, program_output, test_results, wait_warm
 
 GIT = ["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", "-c", "advice.detachedHead=false"]
 OTHER_TOOLCHAIN = "1.94.0"
@@ -38,8 +40,9 @@ class Row:
         self.dir = os.path.join(work, name)
         self.ws = os.path.realpath(at or os.path.join(self.dir, "ws"))
         self.home = os.path.join(self.dir, "home")
+        self.store = os.path.join(self.home, "v2", "store")
         os.makedirs(self.dir, exist_ok=True)
-        self.env = dict(base_env(self.home), BLAZE_CACHE=os.path.join(self.dir, "store"), **(env or {}))
+        self.env = dict(base_env(self.home), **(env or {}))
         self.built, self.notes, self.mark = [], [], 1000
         self.copy(self.ws)
 
@@ -50,7 +53,7 @@ class Row:
         main = os.path.join(ws, "app/src/main.rs")
         text = open(main).read().replace("fn main() {", 'fn main() {\n    println!("mark {}", soak_core::mark());', 1)
         open(main, "w").write(text)
-        open(os.path.join(ws, ".gitignore"), "w").write("target\ntarget-ref\ntarget-warm\n")
+        open(os.path.join(ws, ".gitignore"), "w").write("target\ntarget-scratch\n")
         self.git("init", "-q", cwd=ws), self.git("add", ".", cwd=ws), self.git("commit", "-qm", "first", cwd=ws)
 
     def git(self, *args, cwd=None):
@@ -79,21 +82,21 @@ class Row:
         _, states = wait_warm(side, os.path.realpath(ws or self.ws))
         return states
 
-    def both(self, label, command="run", ws=None, env=None, args=(), want=None, reference_env=None):
-        """Compares `blaze COMMAND` with a cold `cargo COMMAND` of the tree, the latter
-        with `reference_env` over `env`."""
+    def both(self, label, command="run", ws=None, env=None, args=(), want=None, fails=False):
+        """Compares `blaze COMMAND` with blaze's `COMMAND` of the tree from nothing, and has
+        the program say `want`. It has to exit 0, or other than 0 when it `fails`."""
         ws, env = ws or self.ws, dict(self.env, **(env or {}))
         _, ours = Side(ws, env, True).cargo(command, *args, timeout=1800)
-        reference = self.path("target-ref", ws=os.path.realpath(ws))
-        shutil.rmtree(reference, ignore_errors=True)
-        theirs_env = dict(env, CARGO_TARGET_DIR=reference, **(reference_env or {}))
-        _, theirs = Side(ws, theirs_env, False).cargo(command, *args, timeout=1800)
+        _, fresh = Scratch(ws, env).cargo(command, *args, timeout=1800)
+        shutil.rmtree(self.path("target-scratch", ws=ws), ignore_errors=True)
         read = test_results if command == "test" else program_output
-        differs = difference(read(ours), read(theirs))
+        differs = difference(read(ours), read(fresh))
         how = how_built(ours.stderr)
         self.built.append(f"{label}: {how}")
         if differs:
             raise Wrong(f"{label} ({how}): {differs}")
+        if (ours.returncode != 0) != fails:
+            raise Wrong(f"{label} ({how}): exits {ours.returncode} from nothing too: {ours.stderr[-300:]}")
         if want and want not in ours.stdout:
             raise Wrong(f"{label}: both say the same, and neither says `{want}`: {ours.stdout[-200:]}")
         return how, ours
@@ -210,20 +213,10 @@ def twice_in_a_tick(row):
         Side(row.ws, row.env, True).cargo("build")
         row.edit()
         row.both(f"written again at once, {round}", want=f"mark {row.mark}")
-    # The same size and the same time: nothing but the bytes says it changed. What cargo
-    # does with a target directory it built in before is said too.
-    warm = dict(row.env, CARGO_TARGET_DIR=row.path("target-warm"))
-    Side(row.ws, warm, False).cargo("run")
+    # The same size and the same time: nothing but the bytes says it changed, and a build
+    # that misses it is stale.
     row.edit(write=same_stamp)
-    _, cargos = Side(row.ws, warm, False).cargo("run")
-    stale = f"mark {row.mark}" not in cargos.stdout
-    row.notes.append(f"same size and time: warm cargo is {'stale' if stale else 'right'}")
-    try:
-        row.both("same size and time", want=f"mark {row.mark}")
-    except Wrong as wrong:
-        if not stale:
-            raise
-        row.built.append(f"same size and time: stale, as warm cargo is ({wrong})")
+    row.both("same size and time", want=f"mark {row.mark}")
 
 
 def checkout_of_thousands(row, count=3000):
@@ -389,18 +382,21 @@ def non_utf8_root(row):
     run = lambda argv, env: subprocess.run(argv, cwd=ws, env=env, capture_output=True, text=True, errors="replace", timeout=1800)
     for label in ("cold", "edited"):
         ours = run(["blaze", "run"], row.env)
-        theirs = run(["cargo", "run"], dict(row.env, CARGO_TARGET_DIR=os.path.join(ws, b"target-ref")))
+        _, fresh = Scratch(os.fsdecode(ws), row.env).cargo("run", timeout=1800)
+        shutil.rmtree(os.path.join(ws, b"target-scratch"), ignore_errors=True)
         how = how_built(ours.stderr)
-        row.built.append(f"{label}: {how}" + ("" if theirs.returncode == 0 else f" (cargo itself exits {theirs.returncode})"))
-        if (ours.returncode, ours.stdout) != (theirs.returncode, theirs.stdout):
-            raise Wrong(f"{label} ({how}): {ours.returncode} {ours.stdout[-200:]!r} {ours.stderr[-300:]!r} for {theirs.returncode} {theirs.stdout[-200:]!r}")
+        row.built.append(f"{label}: {how}")
+        if (ours.returncode, ours.stdout) != (fresh.returncode, fresh.stdout):
+            raise Wrong(f"{label} ({how}): {ours.returncode} {ours.stdout[-200:]!r} {ours.stderr[-300:]!r}, and from nothing {fresh.returncode} {fresh.stdout[-200:]!r}")
+        if ours.returncode != 0 or f"mark {row.mark}" not in ours.stdout:
+            raise Wrong(f"{label} ({how}): exits {ours.returncode} without `mark {row.mark}`: {ours.stdout[-200:]!r} {ours.stderr[-300:]!r}")
         lib = os.path.join(ws, b"core/src/lib.rs")
         in_place(lib, MARK.sub(row.next_mark(), open(lib).read()))
         time.sleep(5)
 
 
 def other_filesystem(row):
-    here, there = os.stat(row.ws).st_dev, os.stat(row.env["BLAZE_CACHE"] if os.path.isdir(row.env["BLAZE_CACHE"]) else row.dir).st_dev
+    here, there = os.stat(row.ws).st_dev, os.stat(row.store if os.path.isdir(row.store) else row.dir).st_dev
     if here == there:
         raise Wrong("the workspace and the store are on one filesystem here; name another with --other-fs")
     row.warm()
@@ -408,10 +404,9 @@ def other_filesystem(row):
         row.edit()
         row.both(f"edited, {round}", want=f"mark {row.mark}")
     row.both("tests", command="test")
-    # A pack is open for as long as the worker that writes it lives.
-    packs = [it for kind in ("*.pack", "*.open") for it in glob.glob(os.path.join(row.env["BLAZE_CACHE"], kind))]
-    stored = sum(os.path.getsize(it) for it in packs)
-    row.notes.append(f"{stored} bytes in {len(packs)} packs in the store on the other filesystem")
+    packs, files = (glob.glob(os.path.join(row.store, kind)) for kind in ("pack-*", "file-*"))
+    stored = sum(os.path.getsize(it) for it in packs + files)
+    row.notes.append(f"{stored} bytes in {len(packs)} packs and {len(files)} files in the store on the other filesystem")
     if not stored:
         raise Wrong("nothing was stored")
 
@@ -431,7 +426,7 @@ def says_its_rustc(row):
 def toolchain_switched(row):
     """The toolchain file of the directory changes under a live daemon, as `rustup
     override` or a checkout does. `blaze` builds with the release it compiles whatever
-    the file says (#269), so what it builds is cargo's under that release, and the daemon's."""
+    the file says (#269), from nothing and on the daemon alike."""
     says_its_rustc(row)
     file = row.path("rust-toolchain.toml")
     ours = lambda version: in_place(file, f'[toolchain]\nchannel = "{version}"\n')
@@ -440,10 +435,9 @@ def toolchain_switched(row):
     row.warm()
     row.both("the toolchain blaze is built for", want=f"rustc {TOOLCHAIN}")
     ours(OTHER_TOOLCHAIN)
-    as_ours = {"RUSTUP_TOOLCHAIN": TOOLCHAIN}
-    row.both(f"the file now says {OTHER_TOOLCHAIN}", reference_env=as_ours, want=f"rustc {TOOLCHAIN}")
+    row.both(f"the file now says {OTHER_TOOLCHAIN}", want=f"rustc {TOOLCHAIN}")
     row.edit()
-    how, _ = row.both(f"edited under {OTHER_TOOLCHAIN}", reference_env=as_ours, want=f"mark {row.mark}")
+    how, _ = row.both(f"edited under {OTHER_TOOLCHAIN}", want=f"mark {row.mark}")
     if how != "daemon":
         raise Wrong(f"an edit under a file naming {OTHER_TOOLCHAIN} was not the daemon's: {how}")
     ours(TOOLCHAIN)
@@ -461,8 +455,7 @@ def toolchains_in_turn(row):
     for round in range(3):
         for version in (OTHER_TOOLCHAIN, TOOLCHAIN):
             row.edit()
-            how, ran = row.both(f"{version}, {round}", env={"RUSTUP_TOOLCHAIN": version},
-                                reference_env={"RUSTUP_TOOLCHAIN": TOOLCHAIN}, want=f"rustc {TOOLCHAIN}")
+            how, ran = row.both(f"{version}, {round}", env={"RUSTUP_TOOLCHAIN": version}, want=f"rustc {TOOLCHAIN}")
             if f"mark {row.mark}" not in ran.stdout:
                 raise Wrong(f"{version}, {round}: not the edit")
             if how != "daemon":
@@ -489,7 +482,7 @@ def pinned_to_a_nightly(row):
 
 # The programs of one build, which run each other from next to themselves: with one missing,
 # `blaze` is cargo's.
-PROGRAMS = ("blaze-engine", "blaze", "blaze-rustc")
+PROGRAMS = ("blaze-engine", "blaze")
 
 
 def another_build(source, bin):
@@ -807,11 +800,11 @@ mod clock_tests {
     row.both("edited, tests", command="test", args=args)
     row.warm()
     in_place(lib, open(lib).read().replace("assert_eq!(1 + 1, 2);", "assert_eq!(1 + 1, 3);"))
-    _, ours = row.both("a test that now fails", command="test", args=args)
+    _, ours = row.both("a test that now fails", command="test", args=args, fails=True)
     if "sums ... FAILED" not in ours.stdout:
         raise Wrong(f"the test that fails was not seen to: {ours.stdout[-300:]}")
     row.edit()
-    row.both("edited again, tests", command="test", args=args)
+    row.both("edited again, tests", command="test", args=args, fails=True)
 
 
 def show_in_main(row, shown):
@@ -916,7 +909,7 @@ def reached_from_one_left(row):
     can't take its place: a function private to rustc's object (`offset`, which only `seven`
     calls) and a generic one (`scaled::<u8>`). An edit of either, or of `seven` before the
     daemon had a build of its own, was not in the program the daemon built. Each is built by
-    the daemon or by cargo, and runs as cargo's build does. An item added to `main` first
+    the daemon or by cargo, and runs as its source says. An item added to `main` first
     has the daemon build in full, with `seven` left to rustc as rustc compiled it."""
     with open(row.path("core/src/lib.rs"), "a") as lib:
         lib.write("""
@@ -991,7 +984,7 @@ def statics_one_unit_uses(row):
     may reach any static of its crate, also `FLAG` through rustc's copy of `flag`. The base the
     daemon builds of its own after the first patch can't link to a local symbol: it took the
     `FLAG` in a body as its own, apart from the one rustc's `left` counts with, and a patch of
-    that base printed what cargo's does not. The edits are of `main`'s crate: one of `left`'s
+    that base printed what the source does not say. The edits are of `main`'s crate: one of `left`'s
     could change what rustc's copy of it would be, and goes to cargo."""
     in_place(row.path("core/src/gate.rs"), """use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1146,9 +1139,8 @@ def main():
         print(f"{'ok ' if result == 'right' else '-- ' if result.startswith('not run') else 'NOT'} {name}  {time.time() - began:.0f}s  {result if result != 'right' else ''}", flush=True)
         for line in row.built:
             print(f"      {line}", flush=True)
-    backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     with open(os.path.join(HERE, "SOAKROWS.md"), "w") as out:
-        out.write(f"# soakrows.py\n\n{len(table) - failed} of {len(table)} rows right, {backend}.\n\n| row | result | who built each comparison |\n|---|---|---|\n")
+        out.write(f"# soakrows.py\n\n{len(table) - failed} of {len(table)} rows right.\n\n| row | result | who built each comparison |\n|---|---|---|\n")
         for name, result, built, _ in table:
             out.write(f"| {name} | {result.replace('|', '/')[:400]} | {'; '.join(built).replace('|', '/')} |\n")
         for name, _, _, notes in table:

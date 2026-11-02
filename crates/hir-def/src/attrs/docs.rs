@@ -12,20 +12,17 @@ use std::{
     ops::{ControlFlow, Range},
 };
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
     AstId, ExpandTo, HirFileId, InFile, MacroCallId,
-    attrs::{AstPathExt, expand_cfg_attr_with_doc_comments},
+    attrs::expand_cfg_attr_with_doc_comments_view,
     mod_path::ModPath,
     span_map::SpanMap,
 };
 use span::AstIdMap;
-use syntax::{
-    AstNode, SyntaxNode,
-    ast::{self, IsString},
-};
+use syntax::view::{self as ast, AstNode, HasAttrs, IsString};
 use thin_vec::ThinVec;
 use tt::{TextRange, TextSize};
 
@@ -60,7 +57,7 @@ pub struct Docs {
     /// (as outline modules don't have inner attributes).
     outline_inner_docs_start: Option<TextSize>,
     /// All macro calls in `#[doc = ...]` attributes, recursively.
-    macro_calls: ThinVec<(AstId<ast::MacroCall>, MacroCallId)>,
+    macro_calls: ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +72,48 @@ enum DocCommentKind {
 struct Indent {
     lines: Vec<Option<(usize, DocCommentKind)>>,
     seen_sugared: bool,
+}
+
+/// The buffers a run of [`extract_docs`] builds in, kept by the worker: the text, its source
+/// map and the indent of each line grow to the largest docs seen and are reused.
+#[derive(Default)]
+struct DocBuffers {
+    docs: String,
+    source_map: Vec<DocsSourceMapLine>,
+    indent: Vec<Option<(usize, DocCommentKind)>>,
+}
+
+thread_local! {
+    static SPARE_DOC_BUFFERS: std::cell::RefCell<Option<DocBuffers>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl blaze_mem::scratch::Shelved for DocBuffers {
+    fn empty(&mut self) {
+        self.docs.clear();
+        self.source_map.clear();
+        self.indent.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.docs.capacity()
+            + self.source_map.capacity() * size_of::<DocsSourceMapLine>()
+            + self.indent.capacity() * size_of::<Option<(usize, DocCommentKind)>>()
+    }
+
+    fn unshelve() -> Option<Self> {
+        SPARE_DOC_BUFFERS.try_with(|spare| spare.borrow_mut().take()).ok().flatten()
+    }
+
+    fn shelve(self) {
+        // A thread that is ending, or a nested run's smaller set: freed.
+        let _ = SPARE_DOC_BUFFERS.try_with(|spare| {
+            let mut spare = spare.borrow_mut();
+            if spare.as_ref().is_none_or(|it| it.held() < self.held()) {
+                *spare = Some(self);
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +141,9 @@ impl Docs {
     }
 
     #[inline]
-    pub fn macro_calls(&self) -> impl Iterator<Item = (AstId<ast::MacroCall>, MacroCallId)> {
+    pub fn macro_calls(
+        &self,
+    ) -> impl Iterator<Item = (AstId<syntax::ast::MacroCall>, MacroCallId)> {
         self.macro_calls.iter().copied()
     }
 
@@ -218,13 +259,13 @@ impl Docs {
         ));
     }
 
-    fn extend_with_doc_comment(&mut self, comment: ast::DocComment, indent: &mut Indent) {
+    fn extend_with_doc_comment(&mut self, comment: ast::DocComment<'_>, indent: &mut Indent) {
         let doc = comment.text();
         let offset = comment.syntax().text_range().start() + ast::DocComment::PREFIX_LEN;
         self.extend_with_doc_str(doc, offset, DocCommentKind::Sugared(comment.shape()), indent);
     }
 
-    fn extend_with_doc_attr(&mut self, value: ast::String, indent: &mut Indent) {
+    fn extend_with_doc_attr(&mut self, value: ast::String<'_>, indent: &mut Indent) {
         let Some(value_offset) = value.text_range_between_quotes() else { return };
         let value_offset = value_offset.start();
         let Ok(unescaped) = value.value() else { return };
@@ -286,39 +327,25 @@ impl Docs {
             return;
         }
 
-        let mut lines: Vec<(&str, TextSize)> = doc
-            .lines()
-            .map(|line| {
-                let offset = TextSize::new(doc.substr_range(line).unwrap().start as u32);
-                (line, offset)
-            })
-            .collect();
-
-        let raw_lines: Vec<&str> = lines.iter().map(|(l, _)| *l).collect();
-        let lines = match get_vertical_trim(&raw_lines) {
-            Some((i, j)) => &mut lines[i..j],
-            None => &mut lines[..],
-        };
-
-        let raw_lines: Vec<&str> = lines.iter().map(|(l, _)| *l).collect();
-        if let Some(horizontal) = get_horizontal_trim(&raw_lines, shape) {
-            let horizontal_len = TextSize::of(horizontal.as_str());
+        let (i, j) = get_vertical_trim(doc).unwrap_or((0, doc.lines().count()));
+        let lines = || doc.lines().skip(i).take(j - i);
+        let horizontal = get_horizontal_trim(lines(), shape);
+        for line in lines() {
+            let mut line_offset = TextSize::new(doc.substr_range(line).unwrap().start as u32);
+            let mut line = line;
             // Strip `"[ \t]*\*"` from each line where present, exactly like rustc.
-            for (line, line_offset) in lines.iter_mut() {
-                if let Some(rest) = line.strip_prefix(horizontal.as_str()) {
-                    *line = rest;
-                    *line_offset += horizontal_len;
-                    if shape == ast::CommentShape::Block
-                        && (*line == "*" || line.starts_with("* ") || line.starts_with("**"))
-                    {
-                        *line = &line[1..];
-                        *line_offset += TextSize::of("*");
-                    }
+            if let Some(horizontal) = horizontal
+                && let Some(rest) = line.strip_prefix(horizontal)
+            {
+                line = rest;
+                line_offset += TextSize::of(horizontal);
+                if shape == ast::CommentShape::Block
+                    && (line == "*" || line.starts_with("* ") || line.starts_with("**"))
+                {
+                    line = &line[1..];
+                    line_offset += TextSize::of("*");
                 }
             }
-        }
-
-        for (line, line_offset) in lines.iter().copied() {
             self.push_doc_line(line, ast_offset.map(|it| it + line_offset), comment_kind, indent);
         }
     }
@@ -348,7 +375,8 @@ impl Docs {
     }
 
     fn remove_indent(&mut self, indent: &Indent) {
-        /// In case of panics, we want to avoid corrupted UTF-8 in `self.docs`, so we clear it.
+        /// In case of panics the text is half shifted and already moved out of `self.docs`, so
+        /// we drop everything that points into it.
         struct Guard<'a>(&'a mut Docs);
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
@@ -362,9 +390,7 @@ impl Docs {
                     outline_inner_docs_start: _,
                     macro_calls: _,
                 } = self.0;
-                // Don't use `String::clear()` here because it's not guaranteed to not do UTF-8-dependent things,
-                // and we may have temporarily broken the string's encoding.
-                unsafe { docs.as_mut_vec() }.clear();
+                docs.clear();
                 // This is just to avoid panics down the road.
                 docs_source_map.clear();
                 *outline_mod = None;
@@ -405,24 +431,25 @@ impl Docs {
             return;
         };
 
-        let guard = Guard(self);
+        let docs_len = TextSize::of(&self.docs);
+        let mut bytes = std::mem::take(&mut self.docs).into_bytes();
+        let guard = Guard(&mut *self);
         let source_map = guard.0.docs_source_map.as_mut_slice();
         let Some(&DocsSourceMapLine { string_offset: mut copy_into, .. }) = source_map.first()
         else {
             return;
         };
-        // We basically want to remove multiple ranges from a string. Doing this efficiently (without O(N^2)
-        // or allocations) requires unsafe. Basically, for each line, we copy the line minus the indent into
-        // consecutive to the previous line (which may have moved). Then at the end we truncate.
+        // We remove multiple ranges from the text in place, without O(N^2) or allocations: for
+        // each line, we copy the line minus the indent right after the previous line (which may
+        // have moved). Then at the end we truncate and check the UTF-8 once.
         let mut accumulated_offset = TextSize::new(0);
         for idx in 0..source_map.len() {
-            let string_end_offset = source_map
-                .get(idx + 1)
-                .map_or_else(|| TextSize::of(&guard.0.docs), |next_attr| next_attr.string_offset);
+            let string_end_offset =
+                source_map.get(idx + 1).map_or(docs_len, |next_attr| next_attr.string_offset);
             let line_source = &mut source_map[idx];
-            let line_docs =
-                &guard.0.docs[TextRange::new(line_source.string_offset, string_end_offset)];
-            let line_docs_len = TextSize::of(line_docs);
+            let line_range = TextRange::new(line_source.string_offset, string_end_offset);
+            let line_docs = &bytes[Range::<usize>::from(line_range)];
+            let line_docs_len = line_range.len();
             let indent_size = if let Some((_, DocCommentKind::Desugared)) = indent.lines[idx]
                 && min_indent > 0
             {
@@ -430,11 +457,13 @@ impl Docs {
             } else {
                 min_indent
             };
-            let indent_size = line_docs.char_indices().nth(indent_size).map_or_else(
-                || TextSize::of(line_docs) - TextSize::of("\n"),
-                |(offset, _)| TextSize::new(offset as u32),
+            // Every copy lands at or before its own line's start, so this line's bytes are
+            // still the UTF-8 that was pushed and its char starts are its non-continuation bytes.
+            let indent_size = char_starts(line_docs).nth(indent_size).map_or_else(
+                || line_docs_len - TextSize::of("\n"),
+                |offset| TextSize::new(offset as u32),
             );
-            unsafe { guard.0.docs.as_bytes_mut() }.copy_within(
+            bytes.copy_within(
                 Range::<usize>::from(TextRange::new(
                     line_source.string_offset + indent_size,
                     string_end_offset,
@@ -460,86 +489,88 @@ impl Docs {
 
             accumulated_offset += indent_size;
         }
-        // Don't use `String::truncate()` here because it's not guaranteed to not do UTF-8-dependent things,
-        // and we may have temporarily broken the string's encoding.
-        unsafe { guard.0.docs.as_mut_vec() }.truncate(copy_into.into());
+        bytes.truncate(copy_into.into());
 
         std::mem::forget(guard);
+        // alloc: none: `from_utf8` keeps `bytes`' buffer
+        self.docs = String::from_utf8(bytes)
+            .expect("doc lines end in `\\n` and their indent ends on a char start");
     }
 
     fn remove_last_newline(&mut self) {
         self.docs.truncate(self.docs.len().saturating_sub(1));
     }
-
-    fn shrink_to_fit(&mut self) {
-        let Docs {
-            docs,
-            docs_source_map,
-            outline_mod: _,
-            inline_file: _,
-            prefix_len: _,
-            inline_inner_docs_start: _,
-            outline_inner_docs_start: _,
-            macro_calls,
-        } = self;
-        docs.shrink_to_fit();
-        docs_source_map.shrink_to_fit();
-        macro_calls.shrink_to_fit();
-    }
 }
 
-/// Copied verbatim from rustc's [`beautify_doc_string`], modulo `CommentKind`/`CommentShape`
-/// renaming.
+/// rustc's [`beautify_doc_string`]'s vertical trim, modulo `CommentKind`/`CommentShape`
+/// renaming, over the lines of `doc`.
 ///
 /// [`beautify_doc_string`]: https://github.com/rust-lang/rust/blob/16a623ad672a92409b5c04beb303583c6cf72a7e/compiler/rustc_ast/src/util/comments.rs#L38
-fn get_vertical_trim(lines: &[&str]) -> Option<(usize, usize)> {
+fn get_vertical_trim(doc: &str) -> Option<(usize, usize)> {
+    let len = doc.lines().count();
     let mut i = 0;
-    let mut j = lines.len();
+    let mut j = len;
     // first line of all-stars should be omitted
-    if lines.first().is_some_and(|line| line.chars().all(|c| c == '*')) {
+    if doc.lines().next().is_some_and(|line| line.chars().all(|c| c == '*')) {
         i += 1;
     }
 
     // like the first, a last line of all stars should be omitted
-    if j > i && !lines[j - 1].is_empty() && lines[j - 1].chars().all(|c| c == '*') {
+    if j > i
+        && let Some(last) = doc.lines().next_back()
+        && !last.is_empty()
+        && last.chars().all(|c| c == '*')
+    {
         j -= 1;
     }
 
-    if i != 0 || j != lines.len() { Some((i, j)) } else { None }
+    if i != 0 || j != len { Some((i, j)) } else { None }
 }
 
-/// Copied verbatim from rustc's [`beautify_doc_string`], modulo `CommentKind`/`CommentShape`
-/// renaming and returning `String` rather than interning to `Symbol`.
+/// rustc's [`beautify_doc_string`]'s horizontal trim, modulo `CommentKind`/`CommentShape`
+/// renaming, over `lines`, returning the prefix borrowed from the first line rather than
+/// interning it.
 ///
 /// [`beautify_doc_string`]: https://github.com/rust-lang/rust/blob/16a623ad672a92409b5c04beb303583c6cf72a7e/compiler/rustc_ast/src/util/comments.rs#L54
-fn get_horizontal_trim(lines: &[&str], kind: ast::CommentShape) -> Option<String> {
+fn get_horizontal_trim<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    kind: ast::CommentShape,
+) -> Option<&'a str> {
     let mut i = usize::MAX;
     let mut first = true;
 
     // In case we have doc comments like `/**` or `/*!`, we want to remove stars if they are
     // present. However, we first need to strip the empty lines so they don't get in the middle
     // when we try to compute the "horizontal trim".
-    let lines = match kind {
+    // clone: of `lines`, here and below, a copy of a `str::Lines` cursor, no allocation
+    let len = lines.clone().count();
+    let (start, end) = match kind {
         ast::CommentShape::Block => {
             // Whatever happens, we skip the first line.
-            let mut i = lines
-                .first()
-                .map(|l| if l.trim_start().starts_with('*') { 0 } else { 1 })
-                .unwrap_or(0);
-            let mut j = lines.len();
-
-            while i < j && lines[i].trim().is_empty() {
-                i += 1;
+            // clone: a cursor
+            let skip = lines.clone().next().map_or(0, |l| {
+                if l.trim_start().starts_with('*') { 0 } else { 1 }
+            });
+            // The first and one past the last line from `skip` on that is not blank; both the
+            // end when every one is blank, as rustc's two trims meet there.
+            let (mut start, mut end) = (len, len);
+            // clone: a cursor
+            for (at, line) in lines.clone().enumerate().skip(skip) {
+                if !line.trim().is_empty() {
+                    if start == len {
+                        start = at;
+                    }
+                    end = at + 1;
+                }
             }
-            while j > i && lines[j - 1].trim().is_empty() {
-                j -= 1;
-            }
-            &lines[i..j]
+            (start, end)
         }
-        ast::CommentShape::Line => lines,
+        ast::CommentShape::Line => (0, len),
     };
+    let mut lines = lines.skip(start).take(end - start);
 
-    for line in lines {
+    // clone: a cursor
+    for line in lines.clone() {
         for (j, c) in line.chars().enumerate() {
             if j > i || !"* \t".contains(c) {
                 return None;
@@ -558,11 +589,12 @@ fn get_horizontal_trim(lines: &[&str], kind: ast::CommentShape) -> Option<String
             return None;
         }
     }
-    Some(lines.first()?[..i].to_string())
+    let first = lines.next()?;
+    Some(&first[..i])
 }
 
 struct DocMacroExpander<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     macro_depth: u32,
     recursion_limit: u32,
@@ -574,8 +606,8 @@ struct DocMacroExpander<'db> {
 
 fn expand_doc_expr_via_macro_pipeline<'db>(
     expander: &mut DocMacroExpander<'db>,
-    macro_calls: &mut ThinVec<(AstId<ast::MacroCall>, MacroCallId)>,
-    expr: ast::Expr,
+    macro_calls: &mut ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
+    expr: ast::Expr<'_>,
 ) -> Option<String> {
     match expr {
         ast::Expr::ParenExpr(paren_expr) => {
@@ -595,19 +627,22 @@ fn expand_doc_expr_via_macro_pipeline<'db>(
 
 fn expand_doc_macro_call<'db>(
     expander: &mut DocMacroExpander<'db>,
-    macro_calls: &mut ThinVec<(AstId<ast::MacroCall>, MacroCallId)>,
-    macro_call: ast::MacroCall,
+    macro_calls: &mut ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
+    macro_call: ast::MacroCall<'_>,
 ) -> Option<String> {
     if expander.macro_depth >= expander.recursion_limit {
         return None;
     }
 
     let path = macro_call.path()?;
-    let mod_path = ModPath::from_src(expander.db, path, &mut |range| {
+    let mod_path = ModPath::from_src_view(expander.db, path, &mut |range| {
         expander.span_map.span_for_range(range).ctx
     })?;
     let call_site = expander.span_map.span_for_range(macro_call.syntax().text_range());
-    let ast_id = AstId::new(expander.file_id, expander.ast_id_map.ast_id(&macro_call));
+    let ast_id = AstId::new(
+        expander.file_id,
+        expander.ast_id_map.ast_id_of_view::<syntax::ast::MacroCall>(macro_call),
+    );
     let call_id = macro_call_as_call_id(
         expander.db,
         ast_id,
@@ -620,14 +655,15 @@ fn expand_doc_macro_call<'db>(
         |path| {
             expander.resolver.resolve_path_as_macro_def(expander.db, path, Some(MacroSubNs::Bang))
         },
-        &mut |_, _| (),
+        // alloc: none unless an eager input holds macro calls; a doc macro's are not kept
+        &mut Vec::new(),
     )
     .ok()?
     .value?;
     macro_calls.push((ast_id, call_id));
 
     let (parse, span_map) = &call_id.parse_macro_expansion(expander.db).value;
-    let expr = parse.clone().cast::<ast::Expr>().map(|parse| parse.tree())?;
+    let expr = ast::Expr::cast(parse.root())?;
 
     // Build a new source context for the expansion file so that any further
     // recursive expansion (e.g. a user macro expanding to `concat!(...)`)
@@ -653,10 +689,10 @@ fn expand_doc_macro_call<'db>(
 /// The string a `#[key = value]` attribute's value is once the macros in it are expanded, as
 /// `#[link_name = concat!(prefix!(), "name")]`.
 pub(crate) fn expand_attr_value<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     resolver: Resolver<'db>,
-    value: InFile<ast::Expr>,
+    value: InFile<ast::Expr<'_>>,
 ) -> Option<String> {
     let file_id = value.file_id;
     let recursion_limit = resolver.top_level_def_map().recursion_limit();
@@ -675,20 +711,20 @@ pub(crate) fn expand_attr_value<'db>(
 
 fn extend_with_attrs<'a, 'db>(
     result: &mut Docs,
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
-    node: &SyntaxNode,
+    node: ast::Node<'_>,
     file_id: HirFileId,
     expect_inner_attrs: bool,
     indent: &mut Indent,
-    get_cfg_options: &dyn Fn() -> &'a CfgOptions,
+    get_cfg_options: &impl Fn() -> &'a CfgOptions,
     cfg_options: &mut Option<&'a CfgOptions>,
-    make_resolver: &dyn Fn() -> Resolver<'db>,
+    make_resolver: &impl Fn() -> Resolver<'db>,
 ) {
     // Lazily initialised when we first encounter a `#[doc = macro!()]`.
     let mut expander = None;
 
-    expand_cfg_attr_with_doc_comments::<_, Infallible>(
+    expand_cfg_attr_with_doc_comments_view::<_, Infallible>(
         node.children()
             .filter_map(ast::AnyAttr::cast)
             .filter(|attr| attr.kind().is_inner() == expect_inner_attrs)
@@ -701,9 +737,9 @@ fn extend_with_attrs<'a, 'db>(
             match attr {
                 Either::Right(doc_comment) => result.extend_with_doc_comment(doc_comment, indent),
                 Either::Left((attr, _)) => match attr {
-                    ast::Meta::KeyValueMeta(attr) if attr.path().is1("doc") => {
+                    ast::Meta::KeyValueMeta(attr) if super::path_is(attr.path(), "doc") => {
                         if let Some(value) = attr.expr() {
-                            if let ast::Expr::Literal(value) = &value
+                            if let ast::Expr::Literal(value) = value
                                 && let ast::LiteralKind::String(value) = value.kind()
                             {
                                 result.extend_with_doc_attr(value, indent);
@@ -741,18 +777,68 @@ fn extend_with_attrs<'a, 'db>(
     );
 }
 
+/// The node holding `owner`'s inner attributes and inner doc comments.
+/// `HasAttrs::inner_attributes_node` leaves an outline's unparsed fn body (#1294) out when its
+/// text can't start with `#`, and an inner doc comment (`//!`, `/*!`) is a comment to that check:
+/// such a body is entered here when it may start with one.
+pub(super) fn inner_docs_node(owner: ast::AnyHasAttrs<'_>) -> Option<ast::Node<'_>> {
+    if let Some(node) = owner.inner_attributes_node() {
+        return Some(node);
+    }
+    let body = ast::Fn::cast(owner.syntax())?.body()?;
+    if !body.syntax().is_lazy() {
+        return None;
+    }
+    if !ast::block_may_start_with_inner_attr(body.syntax().text(), true) {
+        return None;
+    }
+    Some(body.stmt_list()?.syntax())
+}
+
+/// The offsets at which a char of `utf8` starts, as `str::char_indices` gives them.
+fn char_starts(utf8: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    utf8.iter().enumerate().filter(|&(_, &byte)| byte & 0xC0 != 0x80).map(|(at, _)| at)
+}
+
 pub(crate) fn extract_docs<'a, 'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
-    resolver: &dyn Fn() -> Resolver<'db>,
-    get_cfg_options: &dyn Fn() -> &'a CfgOptions,
-    source: InFile<ast::AnyHasAttrs>,
-    outer_mod_decl: Option<InFile<ast::Module>>,
-    inner_attrs_node: Option<SyntaxNode>,
+    resolver: &impl Fn() -> Resolver<'db>,
+    get_cfg_options: &impl Fn() -> &'a CfgOptions,
+    source: InFile<ast::AnyHasAttrs<'_>>,
+    outer_mod_decl: Option<InFile<ast::Module<'_>>>,
+    inner_attrs_node: Option<ast::Node<'_>>,
+) -> Option<Box<Docs>> {
+    blaze_mem::scratch::with::<DocBuffers, _>(|buffers| {
+        extract_docs_into(
+            buffers,
+            db,
+            krate,
+            resolver,
+            get_cfg_options,
+            source,
+            outer_mod_decl,
+            inner_attrs_node,
+        )
+    })
+}
+
+/// [`extract_docs`] in the worker's `buffers`: the memo gets an exact copy of the text and the
+/// source map, and the buffers go back to the worker, grown to the largest docs seen.
+#[allow(clippy::too_many_arguments)]
+fn extract_docs_into<'a, 'db>(
+    buffers: &mut DocBuffers,
+    db: &'db Db,
+    krate: Crate,
+    resolver: &impl Fn() -> Resolver<'db>,
+    get_cfg_options: &impl Fn() -> &'a CfgOptions,
+    source: InFile<ast::AnyHasAttrs<'_>>,
+    outer_mod_decl: Option<InFile<ast::Module<'_>>>,
+    inner_attrs_node: Option<ast::Node<'_>>,
 ) -> Option<Box<Docs>> {
     let mut result = Docs {
-        docs: String::new(),
-        docs_source_map: Vec::new(),
+        docs: std::mem::take(&mut buffers.docs),
+        docs_source_map: std::mem::take(&mut buffers.source_map),
         outline_mod: None,
         inline_file: source.file_id,
         prefix_len: TextSize::new(0),
@@ -763,7 +849,7 @@ pub(crate) fn extract_docs<'a, 'db>(
 
     let mut cfg_options = None;
 
-    let mut indent = Indent::default();
+    let mut indent = Indent { lines: std::mem::take(&mut buffers.indent), seen_sugared: false };
     if let Some(outer_mod_decl) = outer_mod_decl {
         // For outer docs (the `mod foo;` declaration), use the module's own resolver.
         extend_with_attrs(
@@ -794,7 +880,7 @@ pub(crate) fn extract_docs<'a, 'db>(
         &mut cfg_options,
         resolver,
     );
-    if let Some(inner_attrs_node) = &inner_attrs_node {
+    if let Some(inner_attrs_node) = inner_attrs_node {
         result.inline_inner_docs_start = Some(TextSize::of(&result.docs));
         extend_with_attrs(
             &mut result,
@@ -813,27 +899,67 @@ pub(crate) fn extract_docs<'a, 'db>(
 
     result.remove_last_newline();
 
-    result.shrink_to_fit();
+    // alloc: the memo's text and source map, exact; nothing for empty docs
+    let docs = String::from(result.docs.as_str());
+    // alloc: (the same)
+    let source_map = Vec::from(result.docs_source_map.as_slice());
+    buffers.docs = std::mem::replace(&mut result.docs, docs);
+    buffers.source_map = std::mem::replace(&mut result.docs_source_map, source_map);
+    buffers.indent = indent.lines;
+    // A `#[doc = macro!()]` is rare: its calls keep the `ThinVec` they were pushed to.
+    result.macro_calls.shrink_to_fit();
 
+    // alloc: the memo's box, only for an item with docs
     if result.is_empty() { None } else { Some(Box::new(result)) }
 }
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use expect_test::expect;
     use hir_expand::InFile;
-    use syntax::{AstNode, AstToken, ast};
-    use test_fixture::WithFixture;
+    use syntax::view::{self as ast, AstNode, AstToken, block_may_start_with_inner_attr};
+    use hir_expand::fixture;
     use thin_vec::ThinVec;
     use tt::{TextRange, TextSize};
 
-    use crate::test_db::TestDB;
 
     use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
 
     #[test]
+    fn a_block_may_start_with_inner_docs() {
+        for maybe in [
+            "{ //! inner docs\n x }",
+            "{ /*! inner docs */ x }",
+            "{//!}",
+            "{ // a comment\n //! inner }",
+            "{ /* a /* nested */ comment */ /*! inner */ }",
+            "{ #![allow(unused)] }",
+            "{ \u{2028} x }",
+            "{ /* unterminated ",
+            "{ // no newline",
+            "not a block",
+            "{",
+        ] {
+            assert!(block_may_start_with_inner_attr(maybe, true), "{maybe:?}");
+        }
+        for not in [
+            "{}",
+            "{ let x = 1; //! late }",
+            "{ // not //! docs\n x }",
+            "{ /// outer docs\n x }",
+            "{ /** outer docs */ x }",
+            "{ /* //! */ x }",
+        ] {
+            assert!(!block_may_start_with_inner_attr(not, true), "{not:?}");
+        }
+    }
+
+    #[test]
     fn docs() {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let mut docs = Docs {
             docs: String::new(),
             docs_source_map: Vec::new(),
@@ -1010,7 +1136,9 @@ mod tests {
 
     #[test]
     fn sugared_desugared_mix() {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let mut docs = Docs {
             docs: String::new(),
             docs_source_map: Vec::new(),
@@ -1036,12 +1164,83 @@ mod tests {
         assert_eq!(docs.docs(), "hello!\nanother");
     }
 
+    /// `remove_indent` as a model: each line cut at its indent with `str::char_indices` and
+    /// pushed onto a new string.
+    fn remove_indent_by_lines(docs: &Docs, indent: &Indent) -> String {
+        let add_indent = if indent.seen_sugared { 1 } else { 0 };
+        let Some(min_indent) = indent
+            .lines
+            .iter()
+            .filter_map(|it| *it)
+            .map(|(line_indent, line_kind)| match line_kind {
+                DocCommentKind::Sugared(_) => line_indent,
+                DocCommentKind::Desugared => line_indent + add_indent,
+            })
+            .min()
+        else {
+            return docs.docs.clone();
+        };
+        let map = &docs.docs_source_map;
+        let mut out = String::new();
+        for (idx, line) in map.iter().enumerate() {
+            let end = map.get(idx + 1).map_or(TextSize::of(&docs.docs), |it| it.string_offset);
+            let line = &docs.docs[TextRange::new(line.string_offset, end)];
+            let skip = match indent.lines[idx] {
+                Some((_, DocCommentKind::Desugared)) if min_indent > 0 => min_indent - add_indent,
+                _ => min_indent,
+            };
+            let start = line.char_indices().nth(skip).map_or(line.len() - 1, |(at, _)| at);
+            out.push_str(&line[start..]);
+        }
+        out
+    }
+
+    #[test]
+    fn remove_indent_as_by_lines() {
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
+        let lines = [
+            "", " ", "  a", "\tb", " \t ü", "ü", "   日本", "x", "  ", " 🦀 c", "\t\td", "    e",
+        ];
+        let kinds = [
+            DocCommentKind::Sugared(ast::CommentShape::Line),
+            DocCommentKind::Sugared(ast::CommentShape::Block),
+            DocCommentKind::Desugared,
+        ];
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
+        for case in 0..2000 {
+            let mut docs = Docs {
+                docs: String::new(),
+                docs_source_map: Vec::new(),
+                outline_mod: None,
+                inline_file: file_id.into(),
+                prefix_len: TextSize::new(0),
+                inline_inner_docs_start: None,
+                outline_inner_docs_start: None,
+                macro_calls: ThinVec::new(),
+            };
+            let mut indent = Indent::default();
+            for _ in 0..1 + case % 6 {
+                let line = lines[rng.index(lines.len())];
+                let kind = kinds[rng.index(kinds.len())];
+                docs.push_doc_lines(line, None, kind, &mut indent);
+            }
+            let want = remove_indent_by_lines(&docs, &indent);
+            docs.remove_indent(&indent);
+            assert_eq!(docs.docs, want, "case {case}");
+        }
+    }
+
     /// Extracts the docs of the first comment in `source`, running the same normalization as
     /// [`super::extract_docs`] does for inline docs.
     fn comment_docs(source: &str) -> Docs {
-        let (_db, file_id) = TestDB::with_single_file("");
-        let comment = syntax::SourceFile::parse(source, span::Edition::CURRENT)
-            .syntax_node()
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
+        let parse = syntax::SourceFile::parse(source, span::Edition::CURRENT);
+        let comment = parse
+            .root()
             .descendants_with_tokens()
             .filter_map(|it| it.into_node())
             .find_map(ast::DocComment::cast)
@@ -1123,9 +1322,12 @@ mod tests {
 
     /// Extracts the docs of the first string in `source`, as if it were a `#[doc = "..."]` value.
     fn doc_attr_docs(source: &str) -> Docs {
-        let (_db, file_id) = TestDB::with_single_file("");
-        let value = syntax::SourceFile::parse(source, span::Edition::CURRENT)
-            .syntax_node()
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
+        let parse = syntax::SourceFile::parse(source, span::Edition::CURRENT);
+        let value = parse
+            .root()
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .find_map(ast::String::cast)
@@ -1169,5 +1371,147 @@ mod tests {
         let docs = doc_attr_docs(r#"#[doc = "a\"b"] fn f() {}"#);
         assert_eq!(docs.docs, "a\"b");
         assert_eq!(mapped(&docs, 2, 3), None);
+    }
+
+    /// rustc's vertical trim over collected lines, as `get_vertical_trim` was before it read
+    /// `doc.lines()`.
+    fn reference_vertical_trim(lines: &[&str]) -> Option<(usize, usize)> {
+        let mut i = 0;
+        let mut j = lines.len();
+        if lines.first().is_some_and(|line| line.chars().all(|c| c == '*')) {
+            i += 1;
+        }
+        if j > i && !lines[j - 1].is_empty() && lines[j - 1].chars().all(|c| c == '*') {
+            j -= 1;
+        }
+        if i != 0 || j != lines.len() { Some((i, j)) } else { None }
+    }
+
+    /// rustc's horizontal trim over collected lines, as `get_horizontal_trim` was before it
+    /// read an iterator.
+    fn reference_horizontal_trim(lines: &[&str], kind: ast::CommentShape) -> Option<String> {
+        let mut i = usize::MAX;
+        let mut first = true;
+        let lines = match kind {
+            ast::CommentShape::Block => {
+                let mut i = lines
+                    .first()
+                    .map(|l| if l.trim_start().starts_with('*') { 0 } else { 1 })
+                    .unwrap_or(0);
+                let mut j = lines.len();
+                while i < j && lines[i].trim().is_empty() {
+                    i += 1;
+                }
+                while j > i && lines[j - 1].trim().is_empty() {
+                    j -= 1;
+                }
+                &lines[i..j]
+            }
+            ast::CommentShape::Line => lines,
+        };
+        for line in lines {
+            for (j, c) in line.chars().enumerate() {
+                if j > i || !"* \t".contains(c) {
+                    return None;
+                }
+                if c == '*' {
+                    if first {
+                        i = j;
+                        first = false;
+                    } else if i != j {
+                        return None;
+                    }
+                    break;
+                }
+            }
+            if i >= line.len() {
+                return None;
+            }
+        }
+        Some(lines.first()?[..i].to_string())
+    }
+
+    /// The lines of a multi-line `doc` and their offsets in it, as `push_doc_lines` pushed them
+    /// when it collected them.
+    fn reference_push_lines(doc: &str, shape: ast::CommentShape) -> Vec<(&str, TextSize)> {
+        let mut lines: Vec<(&str, TextSize)> = doc
+            .lines()
+            .map(|line| (line, TextSize::new(doc.substr_range(line).unwrap().start as u32)))
+            .collect();
+        let raw_lines: Vec<&str> = lines.iter().map(|(l, _)| *l).collect();
+        let (i, j) = reference_vertical_trim(&raw_lines).unwrap_or((0, lines.len()));
+        let lines = &mut lines[i..j];
+        let raw_lines: Vec<&str> = lines.iter().map(|(l, _)| *l).collect();
+        if let Some(horizontal) = reference_horizontal_trim(&raw_lines, shape) {
+            for (line, line_offset) in lines.iter_mut() {
+                if let Some(rest) = line.strip_prefix(horizontal.as_str()) {
+                    *line = rest;
+                    *line_offset += TextSize::of(horizontal.as_str());
+                    if shape == ast::CommentShape::Block
+                        && (*line == "*" || line.starts_with("* ") || line.starts_with("**"))
+                    {
+                        *line = &line[1..];
+                        *line_offset += TextSize::of("*");
+                    }
+                }
+            }
+        }
+        lines.to_vec()
+    }
+
+    /// The trims over `doc.lines()` give the lines and offsets the collected ones gave, over
+    /// seeded doc strings of stars, blanks, tabs and text, in both shapes.
+    #[test]
+    fn trims_match_reference() {
+        use super::{get_horizontal_trim, get_vertical_trim};
+
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
+        let pieces = ["", "*", "**", " * a", "\t* b", "  c", "* ", "   ", "*/", "d *", " ** e"];
+        let mut rng = SplitMix64::new(0x646f_6373);
+        for case in 0..20_000 {
+            let lines = rng.index(7);
+            let doc: String = (0..lines)
+                .map(|_| pieces[rng.index(pieces.len())])
+                .collect::<Vec<_>>()
+                .join(if case % 2 == 0 { "\n" } else { "\r\n" });
+            if !doc.contains('\n') {
+                continue;
+            }
+            let all: Vec<&str> = doc.lines().collect();
+            assert_eq!(get_vertical_trim(&doc), reference_vertical_trim(&all), "{doc:?}");
+            let (i, j) = get_vertical_trim(&doc).unwrap_or((0, all.len()));
+            let kept = &all[i..j];
+            for shape in [ast::CommentShape::Line, ast::CommentShape::Block] {
+                assert_eq!(
+                    get_horizontal_trim(kept.iter().copied(), shape).map(str::to_owned),
+                    reference_horizontal_trim(kept, shape),
+                    "{doc:?} {}",
+                    matches!(shape, ast::CommentShape::Block),
+                );
+
+                let mut docs = Docs {
+                    docs: String::new(),
+                    docs_source_map: Vec::new(),
+                    outline_mod: None,
+                    inline_file: file_id.into(),
+                    prefix_len: TextSize::new(0),
+                    inline_inner_docs_start: None,
+                    outline_inner_docs_start: None,
+                    macro_calls: ThinVec::new(),
+                };
+                let base = TextSize::new(3);
+                let kind = DocCommentKind::Sugared(shape);
+                docs.push_doc_lines(&doc, Some(base), kind, &mut Indent::default());
+                let mut want = Docs { docs: String::new(), docs_source_map: Vec::new(), ..docs.clone() };
+                let mut indent = Indent::default();
+                for (line, offset) in reference_push_lines(&doc, shape) {
+                    want.push_doc_line(line, Some(base + offset), kind, &mut indent);
+                }
+                assert_eq!(docs.docs, want.docs, "{doc:?}");
+                assert_eq!(docs.docs_source_map, want.docs_source_map, "{doc:?}");
+            }
+        }
     }
 }

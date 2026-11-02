@@ -1,0 +1,57 @@
+{
+  "id": "01143",
+  "from_lane": "tests-fuzz",
+  "owner": "tests-fuzz",
+  "paths": [
+    "crates/syntax/src/validation.rs",
+    "crates/syntax/src/fuzz.rs",
+    "crates/parser/src/grammar/expressions.rs",
+    "fuzz/targets/syntax_reparse.rs",
+    "fuzz/targets/syntax_parse.rs"
+  ],
+  "what": "fuzz target syntax_reparse (and syntax_parse once its stack overflow is fixed) fails in syntax::validation::validate_block_structure (validation.rs:253, called by syntax::fuzz::check_file_invariants from CheckReparse::run and check_parser): the assertion that each } pairs with the { before it as a sibling is false for the parser on real input, both for full parses and reparses. Two causes seen in cargo-test3.log: (1) text whose braces are unbalanced in the source, e.g. `fn main(){ use foo::{a a Other); }` (the use-tree-list { never closes, so the block } pairs with it); no parser can satisfy a stack pairing there. (2) a `}` wrapped in ERROR by stmt()s err_and_bump after attributes (parser grammar/expressions.rs:91, upstream test attr_end_of_stmt_list.rast already shows ERROR(R_CURLY)); v2 made doc comments parsed DOC_COMMENT elements, so `fn main(){ /// doc\n}` now eats the block } too, putting every later item inside the fn (a recovery regression vs rust-analyzer, where /// is trivia). Asks: fix (2) in the parser (e.g. after outer attrs, at } report the error without bumping, leaving it to stmt_list; MACRO_STMTS still needs a bump on a bare }), update attr_end_of_stmt_list.rast; and decide the invariant for (1): check block structure only on texts whose braces balance as tokens, or compare against the full parse only (CheckReparse already compares every node kind and range with the full parse, which implies the same structure). tests-fuzz has not edited crates/syntax or crates/parser.",
+  "state": "applied",
+  "created": "2026-10-30T22:28:52Z",
+  "updated": "2026-10-31T18:24:12Z",
+  "taken_by": "tests-fuzz",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:28:52Z",
+      "by": "tests-fuzz",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to tests-fuzz, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:45:00Z",
+      "by": "tests-fuzz",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:45:00Z",
+      "by": "tests-fuzz",
+      "action": "done",
+      "note": "In the tree for round 8 (not run yet). (2): stmt(), record_expr_field_list and record_pat_field report at `}` without bumping; macro_stmts bumps a bare `}` itself; attr_end_of_stmt_list.rast updated (the first fn's `}` closes its block, the second fn is an item again). (1): kept the invariant, fixed the parser instead: delimited() with `{` that stops early and whose `{` some `}` closes takes the tokens up to that `}` as ERROR (Parser::curly_closes), as rustc's token trees pair it; an unclosed `{` keeps the old recovery. reparsing.rs refuses a reparsed item with unpaired curlies near its window's edge. syntax_parse's stack overflow: grammar grows its stack (stdx::ensure_sufficient_stack, in 7abbb7252c; parser Cargo.toml stdx -> [dependencies] in the tree). 5 corpus seeds in fuzz/corpus/syntax_reparse. tools/v2/queue.py fails (no module typed_input), so this entry was edited by hand."
+    },
+    {
+      "at": "2026-10-31T16:35:00Z",
+      "by": "tests-fuzz",
+      "action": "take",
+      "note": "Reopened: applied was early. The 07:58 run still failed syntax_reparse on `extern crate \\n}` (a name helper's err_and_bump took the block's `}`); fixed after it by grammar.rs err_name, not yet run. Done once round 9 shows syntax_reparse and syntax_parse green."
+    },
+    {
+      "at": "2026-10-31T18:24:12Z",
+      "by": "tests-fuzz",
+      "action": "done",
+      "note": "syntax_reparse green in round 10 (844fdd3314). syntax_parse round 10 failure (floating curlies: err_and_bump took nested pairs flat) fixed in round 11 (7c81a55a8d): each nested pair is its own ERROR node; seed nested-curlies-in-an-error.hex. Earlier: asm and offset_of recovery stop at a closing curly."
+    }
+  ]
+}

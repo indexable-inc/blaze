@@ -1,0 +1,21 @@
+{
+  "id": "00037",
+  "from_lane": "core-macos",
+  "owner": "core",
+  "paths": [],
+  "what": "## 2. For your review: `limit_self` and `EINVAL` (no change asked)\n\n`footprint::limit_self` sets `RLIMIT_DATA` and `RLIMIT_AS` (both soft and hard, clamped to the\ncurrent hard limit). macOS refuses an address-space limit below what the process already reserves\n(`ulimit -v` gives \"Invalid argument\"; every process reserves hundreds of GB of unbacked ranges),\nso an `EINVAL` from `setrlimit` is taken as \"macOS does not hold this limit\" and the footprint\nwatch holds it alone. Any other error fails the spawn. If you'd rather an `EINVAL` fail the\nspawn, it's one line in `limit_self`, but then every spawn with a memory limit would fail on\nmacOS. `footprint::tests::limits_set_before_exec_let_a_small_program_run` and\n`kqueue::tests::processes_end_with_their_output_code_and_signal` (tag 5) check that a limited\nspawn runs.\n\n> forwarded to core: a review question from core-macos to its parent, no change asked.",
+  "state": "open",
+  "created": "2026-10-30T00:02:44Z",
+  "updated": "2026-10-30T00:02:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-macos.md#2. For your review: `limit_self` and `EINVAL` (no change asked)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-macos.md:31"
+    }
+  ]
+}

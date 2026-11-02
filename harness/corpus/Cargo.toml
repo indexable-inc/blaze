@@ -1,3 +1,0 @@
-[workspace]
-members = ["cases", "kernels", "old_macros", "runner", "upstream"]
-resolver = "2"

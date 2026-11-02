@@ -1,0 +1,41 @@
+{
+  "id": "00191",
+  "from_lane": "requests-live",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/mem-backend-live.md",
+    "crates/blaze-live",
+    "docs/v2/plan/lanes/mem/backend-live.md",
+    "crates/blaze-live/Cargo.toml",
+    "tools/nix/life_launch.py",
+    "harness/tiers.py",
+    "Cargo.toml"
+  ],
+  "what": "## From requests-live (2026-10-29): blaze-live takes no blaze-mem, and what still ties it to the workspace\n\n`v2/requests/mem-backend-live.md` \"mem-backend-live 1\" is refused and undone in\n`crates/blaze-live/` (the reason is under it): blaze-live links into user programs that build\noutside this workspace, and blaze-mem is `publish = false`, path-only in the root, and nightly-only.\n\n1. `docs/v2/plan/lanes/mem/backend-live.md`, the table row for \"`blaze-live` `Log` (ten columns\n   per generation) and `Lasting` ranges\" (~L23), says \"`RegionVec`s, `Tag::Link` ...\n   (requested)\". Make it \"`Vec`s, kept: refused, blaze-live takes no dependency (see the request)\".\n   Lane mem is the doc's owner; it is DONE, so the doc is the coordinator's.\n2. `crates/blaze-live/Cargo.toml` still needs a workspace root to load: `[lints] workspace = true`\n   (from the v2 plan commit) and `blaze-ids.workspace = true` under `[dev-dependencies]` (already\n   used by its tests). In-tree that resolves. But `flake.nix` `lifeSource`,\n   `tools/nix/life_launch.py` `prepare` and `harness/tiers.py` copy `crates/blaze-live` and the\n   demo alone, without the root `Cargo.toml`, so cargo can't load blaze-live there (\"failed to\n   find a workspace root\"). Pick one: those three copy the root `Cargo.toml` too (and whatever it\n   names as members), or blaze-live writes its lints out and takes `blaze-ids` by\n   `{ path = \"../blaze-ids\" }`. I left the manifest alone because `[lints]` was the coordinator's\n   choice.\n\n> forwarded to the coordinator: the mem lane doc (mem DONE) and the choice between copying the root `Cargo.toml` in `flake.nix`/`tools/nix/life_launch.py`/`harness/tiers.py` or writing blaze-live's lints out are coordinator paths and a coordinator decision; on the requests report's coordinator list.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-30T08:27:25Z",
+  "taken_by": "coord-apply-back",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-live (2026-10-29): blaze-live takes no blaze-mem, and what still ties it to the workspace",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:200"
+    },
+    {
+      "at": "2026-10-30T08:27:24Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:27:25Z",
+      "by": "coord-apply-back",
+      "action": "done",
+      "note": "2: chose the self-contained manifest (blaze-live builds outside the workspace): crates/blaze-live/Cargo.toml dev-deps blaze-alloc-count, blaze-ids, blaze-check by ../ path and [lints] written out equal to the root [workspace.lints], with a comment to keep them equal; flake.nix, life_launch.py, tiers.py need no change; manifest lint clean. 1: the docs/v2/plan/lanes/mem/backend-live.md row is handed to coord-apply-docs through coord-apply."
+    }
+  ]
+}

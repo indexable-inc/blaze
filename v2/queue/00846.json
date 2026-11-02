@@ -1,0 +1,35 @@
+{
+  "id": "00846",
+  "from_lane": "firewall",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/lib.rs"
+  ],
+  "what": "Add `impl salsa::plumbing::interned::NamesIds for ExpressionStoreOwnerId` in crates/hir-def/src/lib.rs, pushing the salsa id of the variant's inner id (Signature(GenericDefId) / Body(DefWithBodyId) / VariantFields(VariantId): `out.push(salsa::plumbing::AsId::as_id(&inner))`). Why: ExpressionStoreOwnerId is not a salsa Supertype (overlapping variants), so a query taking it among several arguments (e.g. hir-ty db.rs `closure_exprs(db, owner, ())`) has interned arguments whose `ids` list nothing, and crates/hir-firewall cannot tell that the key is the edited body's: it would report a false leak. Same pattern as the NamesIds impls for Ty/GenericArgs in crates/hir-ty/src/next_solver/ty.rs (vendor/salsa interned.rs NamesIds/IdsOf).",
+  "state": "applied",
+  "created": "2026-10-30T08:49:13Z",
+  "updated": "2026-10-30T10:00:07Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:49:13Z",
+      "by": "firewall",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:06Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:07Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "already in the tree: crates/hir-def/src/lib.rs:1197 impl NamesIds for ExpressionStoreOwnerId"
+    }
+  ]
+}

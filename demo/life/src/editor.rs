@@ -1,8 +1,9 @@
 //! The source editor on the right of the window: line-number gutter, caret-row and
 //! matching-bracket highlight, Rust highlighting, Tab as four spaces. Every edit goes to the
-//! blaze-engine daemon as text, the way an editor tells a language server (`blaze_live::edit`):
-//! the daemon builds it from memory and the window applies the patch as it arrives. The file
-//! is written after that, for the edit to stay; nothing waits for it.
+//! blaze daemon over its API (blaze-api), the way an editor tells a language server: the text
+//! is committed to the daemon's head of the checkout as a write, and the checkout built from
+//! it, so a running window can take the patch. The file is written after that, for the edit to
+//! stay; nothing waits for it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -73,14 +74,85 @@ fn send_as_typed(file: PathBuf, shared: Shared) {
     }
 }
 
-#[cfg(any(unix, all(windows, target_arch = "x86_64")))]
+/// Commits `text` as `file` to the daemon's head of the checkout `file` is in, named as the
+/// CLI names it, then builds the checkout: what the build said, or why it failed or the daemon
+/// could not be asked.
+#[cfg(unix)]
 fn send(file: &Path, text: &str) -> Result<String, String> {
-    blaze_live::edit(file, text)
+    use blaze_api::client::{self, Client};
+    use blaze_api::{Level, Mode, Op, Request, Response, Targets, ViewRef};
+
+    let file = std::path::absolute(file).map_err(|it| format!("{}: {it}", file.display()))?;
+    let dir = file.parent().ok_or_else(|| format!("{} is in no directory", file.display()))?;
+    let root = client::checkout(dir);
+    let head = root.to_str().ok_or_else(|| format!("{} is not UTF-8", root.display()))?;
+    let path = file
+        .strip_prefix(&root)
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or_else(|| format!("{} is not a UTF-8 path under {head}", file.display()))?;
+    let socket = client::socket()?;
+    let mut daemon = Client::unix(&socket).map_err(|it| format!("no daemon: {it}"))?;
+    let view = || ViewRef::Head(head.to_owned());
+    let mut said = Vec::new();
+    let mut ask =
+        |request: Request, what: &str, on: &mut dyn FnMut(&Response)| -> Result<(), String> {
+            said.clear();
+            let ok = daemon
+                .call(request, |response| match response {
+                    Response::Error(error) => said.push(match &error.at {
+                        Some(at) => format!("{} (at {at})", error.what),
+                        None => error.what.clone(),
+                    }),
+                    Response::Diagnostic(it) if it.level == Level::Error => {
+                        said.push(it.message.clone())
+                    }
+                    other => on(other),
+                })
+                .map_err(|it| format!("{what}: {it}"))?;
+            match (ok, said.is_empty()) {
+                (true, _) => Ok(()),
+                (false, true) => Err(format!("{what} failed, and the daemon said nothing more")),
+                (false, false) => Err(format!("{what}: {}", said.join("; "))),
+            }
+        };
+
+    let mut base = None;
+    ask(Request::Open { view: view() }, &format!("opening {head}"), &mut |response| {
+        if let Response::Opened { root } = response {
+            base = Some(*root);
+        }
+    })?;
+    let base = base.ok_or_else(|| format!("the daemon opened {head} without saying its root"))?;
+    let ops = vec![Op::Write { mode: Mode::Regular, path: path.to_owned(), bytes: text.into() }];
+    ask(
+        Request::Commit { ops, base, head: head.to_owned() },
+        &format!("committing {path}"),
+        &mut |_| {},
+    )?;
+    let targets = Targets {
+        cargo: None,
+        target: None,
+        profile: "dev".to_owned(),
+        features: Vec::new(),
+        packages: Vec::new(),
+        all_features: false,
+        no_default_features: false,
+    };
+    let started = Instant::now();
+    let mut members = 0;
+    ask(Request::Build { view: view(), targets }, &format!("building {head}"), &mut |response| {
+        if let Response::Built { members: built, .. } = response {
+            members = *built;
+        }
+    })?;
+    Ok(format!("ok built members={members} ms={}", started.elapsed().as_millis()))
 }
 
-#[cfg(not(any(unix, all(windows, target_arch = "x86_64"))))]
+#[cfg(not(unix))]
 fn send(_: &Path, _: &str) -> Result<String, String> {
-    Err("live edits run on macOS, Linux and Windows only".to_owned())
+    Err("edits go to the daemon over its Unix socket, which this platform's client lacks"
+        .to_owned())
 }
 
 /// Writes by rename, so that nothing reads a half-written file.

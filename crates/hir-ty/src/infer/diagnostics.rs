@@ -5,6 +5,8 @@
 use std::cell::{OnceCell, RefCell};
 use std::ops::{Deref, DerefMut};
 
+use base_db::Db;
+use blaze_mem::Frame;
 use either::Either;
 use hir_def::expr_store::path::Path;
 use hir_def::{ExpressionStoreOwnerId, GenericDefId};
@@ -14,20 +16,19 @@ use hir_def::{
     resolver::Resolver,
 };
 use la_arena::RawIdx;
-use rustc_hash::FxHashMap;
 use thin_vec::ThinVec;
 
 use crate::lower::LifetimeLoweringMode;
 use crate::{
-    InferenceDiagnostic, Span, TyLoweringDiagnostic,
+    InferenceDiagnostic, TyLoweringDiagnostic,
     db::{AnonConstId, HirDatabase},
     generics::Generics,
-    infer::unify::InferenceTable,
+    infer::{columns::DenseMap, unify::InferenceTable},
     lower::{
-        ForbidParamsAfterReason, LifetimeElisionKind, TyLoweringContext, TyLoweringInferVarsCtx,
+        ForbidParamsAfterReason, LifetimeElisionKind, TyLoweringContext,
         path::{PathDiagnosticCallback, PathLoweringContext},
     },
-    next_solver::{Const, Region, StoredTy, Ty},
+    next_solver::StoredTy,
 };
 
 // Unfortunately, this struct needs to use interior mutability (but we encapsulate it)
@@ -46,10 +47,11 @@ impl Diagnostics {
         self.0.borrow_mut().extend(diagnostic.iter().cloned());
     }
 
-    fn push_ty_diagnostics(&self, diagnostics: ThinVec<TyLoweringDiagnostic>) {
-        self.0
-            .borrow_mut()
-            .extend(diagnostics.into_iter().map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
+    fn push_ty_diagnostics(&self, diagnostics: impl ExactSizeIterator<Item = TyLoweringDiagnostic>) {
+        if diagnostics.len() == 0 {
+            return;
+        }
+        self.0.borrow_mut().extend(diagnostics.map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
     }
 
     pub(super) fn any(&self, f: impl FnMut(&InferenceDiagnostic) -> bool) -> bool {
@@ -66,43 +68,24 @@ pub(crate) struct PathDiagnosticCallbackData<'a> {
     diagnostics: &'a Diagnostics,
 }
 
-pub(super) struct InferenceTyLoweringVarsCtx<'a, 'db> {
-    pub(super) table: &'a mut InferenceTable<'db>,
-    pub(super) type_of_type_placeholder: &'a mut FxHashMap<TypeRefId, StoredTy>,
+pub(crate) struct InferenceTyLoweringVarsCtx<'a, 'db, 'f> {
+    pub(crate) table: &'a mut InferenceTable<'db>,
+    pub(crate) type_of_type_placeholder: &'a mut DenseMap<'f, TypeRefId, StoredTy>,
 }
 
-impl<'db> TyLoweringInferVarsCtx<'db> for InferenceTyLoweringVarsCtx<'_, 'db> {
-    fn next_ty_var(&mut self, span: Span) -> Ty<'db> {
-        let ty = self.table.infer_ctxt.next_ty_var(span);
-
-        if let Span::TypeRefId(type_ref) = span {
-            self.type_of_type_placeholder.insert(type_ref, ty.store());
-        }
-
-        ty
-    }
-    fn next_const_var(&mut self, span: Span) -> Const<'db> {
-        self.table.infer_ctxt.next_const_var(span)
-    }
-    fn next_region_var(&mut self, span: Span) -> Region<'db> {
-        self.table.infer_ctxt.next_region_var(span)
-    }
-
-    fn as_table(&mut self) -> Option<&mut InferenceTable<'db>> {
-        Some(self.table)
-    }
-}
-
-pub(super) struct InferenceTyLoweringContext<'db, 'a> {
+pub(super) struct InferenceTyLoweringContext<'db, 'a, 'f> {
     ctx: TyLoweringContext<'db, 'a>,
     diagnostics: &'a Diagnostics,
-    defined_anon_consts: &'a RefCell<ThinVec<AnonConstId<'db>>>,
+    defined_anon_consts: &'a RefCell<Vec<AnonConstId<'db>, &'f Frame>>,
+    /// Where the `_` placeholders `ctx` makes variables of land, from its `type_placeholders`
+    /// when this is dropped: `TyLoweringContext` has no `'f` to hold this map itself.
+    type_of_type_placeholder: &'a mut DenseMap<'f, TypeRefId, StoredTy>,
 }
 
-impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
+impl<'db, 'a, 'f> InferenceTyLoweringContext<'db, 'a, 'f> {
     #[inline]
     pub(super) fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         resolver: &'a Resolver<'db>,
         store: &'db ExpressionStore,
         diagnostics: &'a Diagnostics,
@@ -111,10 +94,12 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
         generics: &'a OnceCell<Generics<'db>>,
         lifetime_elision: LifetimeElisionKind<'db>,
         allow_using_generic_params: bool,
-        infer_vars: &'a mut InferenceTyLoweringVarsCtx<'a, 'db>,
-        defined_anon_consts: &'a RefCell<ThinVec<AnonConstId<'db>>>,
+        infer_vars: &'a mut InferenceTyLoweringVarsCtx<'a, 'db, 'f>,
+        defined_anon_consts: &'a RefCell<Vec<AnonConstId<'db>, &'f Frame>>,
         lifetime_lowering_mode: LifetimeLoweringMode,
+        frame: &'a Frame,
     ) -> Self {
+        let InferenceTyLoweringVarsCtx { table, type_of_type_placeholder } = infer_vars;
         let mut ctx = TyLoweringContext::new(
             db,
             resolver,
@@ -124,18 +109,24 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
             generics,
             lifetime_elision,
             lifetime_lowering_mode,
+            frame,
         )
-        .with_infer_vars_behavior(Some(infer_vars));
+        .with_inference_vars(&mut **table);
         if !allow_using_generic_params {
             ctx.forbid_params_after(0, ForbidParamsAfterReason::AnonConst);
         }
-        Self { ctx, diagnostics, defined_anon_consts }
+        Self {
+            ctx,
+            diagnostics,
+            defined_anon_consts,
+            type_of_type_placeholder: &mut **type_of_type_placeholder,
+        }
     }
 
     #[inline]
     pub(super) fn at_path<'b>(
         &'b mut self,
-        path: &'b Path,
+        path: Path<'b>,
         node: ExprOrPatIdPacked,
     ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
@@ -152,7 +143,7 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     #[inline]
     pub(super) fn at_path_forget_diagnostics<'b>(
         &'b mut self,
-        path: &'b Path,
+        path: Path<'b>,
     ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
             data: Either::Right(PathDiagnosticCallbackData {
@@ -170,7 +161,7 @@ impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     }
 }
 
-impl<'db, 'a> Deref for InferenceTyLoweringContext<'db, 'a> {
+impl<'db, 'a> Deref for InferenceTyLoweringContext<'db, 'a, '_> {
     type Target = TyLoweringContext<'db, 'a>;
 
     #[inline]
@@ -179,17 +170,23 @@ impl<'db, 'a> Deref for InferenceTyLoweringContext<'db, 'a> {
     }
 }
 
-impl DerefMut for InferenceTyLoweringContext<'_, '_> {
+impl DerefMut for InferenceTyLoweringContext<'_, '_, '_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.ctx
     }
 }
 
-impl Drop for InferenceTyLoweringContext<'_, '_> {
+impl Drop for InferenceTyLoweringContext<'_, '_, '_> {
     #[inline]
     fn drop(&mut self) {
-        self.diagnostics.push_ty_diagnostics(std::mem::take(&mut self.ctx.diagnostics));
-        self.defined_anon_consts.borrow_mut().extend(self.ctx.defined_anon_consts.iter().copied());
+        self.diagnostics.push_ty_diagnostics(self.ctx.diagnostics.drain(..));
+        let anon_consts = &mut self.ctx.defined_anon_consts;
+        if !anon_consts.is_empty() {
+            self.defined_anon_consts.borrow_mut().extend(anon_consts.drain(..));
+        }
+        for (type_ref, ty) in self.ctx.type_placeholders.drain(..) {
+            self.type_of_type_placeholder.insert(type_ref, ty.store());
+        }
     }
 }

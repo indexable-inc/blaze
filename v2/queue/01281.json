@@ -1,0 +1,29 @@
+{
+  "id": "01281",
+  "from_lane": "tests-misc",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/socket/windows.rs"
+  ],
+  "what": "syntax self_hosting_parsing (round 7c): crates/blaze-cargo/src/socket/windows.rs:91 `unsafe { *unit } != 0` is a syntax error rustc rejects too: a block-like expression statement ends at its `}` inside the closure body, so `!= 0` starts no expression (rustc: expected expression, found `!=`, parenthesize). cargo check never sees it because `mod windows` is #[cfg(windows)] (socket.rs:26) and an unconfigured out-of-line module is not read. Fix: `(unsafe { *unit }) != 0` (or bind it first). blaze-cargo is not my crate; the test is right.",
+  "state": "applied",
+  "created": "2026-10-31T14:24:04Z",
+  "updated": "2026-10-31T16:26:25Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:24:04Z",
+      "by": "tests-misc",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:26:25Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "Fixed in 15548acdae: socket/windows.rs `(unsafe { *unit }) != 0`."
+    }
+  ]
+}

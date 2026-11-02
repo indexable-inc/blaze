@@ -5,12 +5,14 @@
 //! ported: `Clone::clone(&x)` called as a function.
 
 use hir::{Adjust, AsAssocItem as _, HirDisplay as _};
-use syntax::{AstNode, ast};
+use syntax::view as ast;
+
+use ast::AstNode as _;
 
 use super::utils;
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "clone_on_copy";
+const LINT: super::Implemented = super::Implemented::CloneOnCopy;
 
 /// clippy's `ParentIsSuffixExpr`: what the clone is used in.
 #[derive(PartialEq, Eq)]
@@ -22,26 +24,26 @@ enum Parent {
     Keep,
 }
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) {
-        return;
-    }
-    let Some(call) = utils::method_call(cx, expr) else { return };
-    if call.name != "clone" || !call.args.is_empty() {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT) || utils::method_name(expr) != Some("clone") {
         return;
     }
     let ast::Expr::MethodCallExpr(method) = expr else { return };
+    let Some(call) = utils::method_call(cx, expr) else { return };
+    if !call.args().is_empty() {
+        return;
+    }
     let db = cx.db();
     let clone = cx.lang_trait(hir::LangItem::Clone);
-    let Some(function) = cx.sema().resolve_method_call(method) else { return };
+    let Some(function) = cx.method(method) else { return };
     if clone.is_none()
         || function.as_assoc_item(db).and_then(|it| it.container_or_implemented_trait(db)) != clone
     {
         return;
     }
-    let adjustments = cx.sema().expr_adjustments(&call.receiver).unwrap_or_default();
+    let adjustments = cx.adjustments(call.receiver).unwrap_or_default();
     let Some(arg_ty) =
-        adjustments.last().map(|it| it.target.clone()).or_else(|| cx.ty(&call.receiver))
+        adjustments.last().map(|it| it.target.clone()).or_else(|| cx.ty(call.receiver))
     else {
         return;
     };
@@ -64,7 +66,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     let derefs = adjustments.iter().take_while(|it| matches!(it.kind, Adjust::Deref(_))).count();
     let stars = "*".repeat(derefs);
     let (help, sugg) = match (derefs, parent) {
-        (0, _) => ("try removing the `clone` call", snippet),
+        (0, _) => ("try removing the `clone` call", snippet.to_owned()),
         (_, Parent::Suffix) => ("try dereferencing it", format!("({stars}{snippet})")),
         _ => ("try dereferencing it", format!("{stars}{snippet}")),
     };
@@ -80,15 +82,15 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
 }
 
 /// clippy's `check_parent_is_suffix_expr`.
-fn parent_of(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> Parent {
-    let mut used = expr.syntax().clone();
+fn parent_of<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> Parent {
+    let mut used = expr.syntax();
     while let Some(parent) = used.parent()
         && ast::ParenExpr::can_cast(parent.kind())
     {
         used = parent;
     }
     let Some(parent) = used.parent() else { return Parent::Other };
-    if let Some(stmt) = ast::LetStmt::cast(parent.clone()) {
+    if let Some(stmt) = ast::LetStmt::cast(parent) {
         let by_ref =
             matches!(stmt.pat(), Some(ast::Pat::IdentPat(pat)) if pat.ref_token().is_some());
         return if by_ref { Parent::Keep } else { Parent::Other };
@@ -96,7 +98,7 @@ fn parent_of(cx: &Cx<'_, '_, '_>, expr: &ast::Expr) -> Parent {
     match ast::Expr::cast(parent) {
         Some(ast::Expr::RefExpr(_)) => Parent::Keep,
         Some(ast::Expr::MethodCallExpr(call))
-            if call.receiver().is_some_and(|it| it.syntax() == &used) =>
+            if call.receiver().is_some_and(|it| it.syntax() == used) =>
         {
             let changed = cx.ty(expr).zip(cx.adjusted_ty(expr)).is_some_and(|(a, b)| a != b);
             if changed { Parent::Keep } else { Parent::Suffix }

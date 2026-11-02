@@ -1,0 +1,23 @@
+{
+  "id": "01261",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres"
+  ],
+  "what": "hir-def round 5 (fd6947867d, 69 failed), addendum to 01224 (every other round-5 failure is still 01224's or format's 01223). Output per test: /tmp/blaze-lanes/hirdef-round5-failures.log ('---- <test> stdout'). New causes in nameres source: (1) nameres::tests::incremental::typing_inside_an_attribute_should_not_invalidate_def_map: editing the body of `#[proc_macros::identity] fn f() {}` to `fn f() { foo }` runs no MacroCallId::macro_arg_ / proc_macro_expansion_ / parse_macro_expansion_ in the write (set_file_text, then crate_def_map, maintainer included) and keeps the def map. An attribute macro sees the whole item, body included, so its output can change items; keeping the map without re-expanding is a stale result (I left the snapshot as is). (2) incremental::crate_metadata_changes_should_not_invalidate_unrelated_def_maps: crate_local_def_map runs 3 times, expected 2, after adding deps c->b, b->a (a's map should be kept). (3) delta::tests::trace::an_item_added_reruns_only_its_module (trace.rs:142): crate::b::foo is collected twice ([a::foo, b::foo, b::foo, c::foo]). (4) facts::tests::trace::adding_an_import_reruns_the_partition_and_the_components_whose_facts_changed (trace.rs:165): 7 modules rerun {crate, a, b, c, d, e, y}, expected {a, c}. (5) differential / delta::random / generated, three kinds of old-vs-new difference: (a) glob provenance: use_imports_{types,values,macros} old records Glob(CUseTree of the re-exporting `use`), new records Def(the item), e.g. globs.rs glob_may_override_visibility, regression_18308, regression_18580, uses.rs a_glob_read_through_another_glob_uses_both, paths.rs SHAPES, prelude rust_20xx modules; (b) minicore's core::fmt, core::fmt::rt and core::option: the old collector reports UnresolvedMacroCall for `#[derive]` on a struct, the new resolves it and adds derive_macros, builtin_derive_impls (Clone, Copy) and impls; one of the two is wrong about derive resolution in a no_core core crate (macros.rs eager_include_names_a_macro_an_earlier_include_defined, uses.rs an_import_is_visible_as_the_prelude_gives_it_too); (c) delta::random sanitize_is_a_builtin_attribute_and_no_sanitize_is_not after Remove{at:0}: the maintained map keeps unstable_features {\"sanitize\"} after the #![feature] is removed, collect_crate has none.",
+  "state": "open",
+  "created": "2026-10-31T12:41:02Z",
+  "updated": "2026-10-31T12:41:02Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:41:02Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

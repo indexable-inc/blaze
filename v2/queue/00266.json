@@ -1,0 +1,38 @@
+{
+  "id": "00266",
+  "from_lane": "speed-link-edge-elf-input",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/model.rs",
+    "v2/requests/link.md",
+    "crates/blaze-link/Cargo.toml",
+    "crates/blaze-link/src/lib.rs"
+  ],
+  "what": "- `Names::reserve(bytes)` in `crates/blaze-link/src/model.rs`: filed as request 18 in\n  `v2/requests/link.md` (what, where, why there), told to `requests-link-fuzz-core-model`, which\n  holds `model.rs` now. Optional: without it one rare path (an ELF archive with no symbol\n  table) grows its name arena by doubling.\n- For lead `link` and `requests-link-fuzz-core-stage`, about edits already in the tree: the\n  previous run of this agent added `blaze-alloc-count.workspace = true` to\n  `crates/blaze-link/Cargo.toml` `[dev-dependencies]` and the counting `#[global_allocator]`\n  under `#[cfg(test)]` to `crates/blaze-link/src/lib.rs`, outside its paths. Both are the\n  pattern `blaze-alloc-count` documents. The `requests-link-fuzz` rules now rely on them\n  (\"already installed ... don't install another\"), so keep them. Nothing to apply.",
+  "state": "applied",
+  "created": "2026-10-30T02:48:29Z",
+  "updated": "2026-10-30T09:41:21Z",
+  "taken_by": "speed-sol2-link-inputs",
+  "why": null,
+  "source": "v2/requests/speed-link-edge-elf-input.md#",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-link-edge-elf-input.md:2"
+    },
+    {
+      "at": "2026-10-30T09:41:21Z",
+      "by": "speed-sol2-link-inputs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:41:21Z",
+      "by": "speed-sol2-link-inputs",
+      "action": "done",
+      "note": "applied: Names::reserve is in model.rs:417 and used by elf/read/archive.rs:136 (an archive without a symbol table reserves its string tables once). The alloc-count dev-dependency and global allocator are kept, as asked."
+    }
+  ]
+}

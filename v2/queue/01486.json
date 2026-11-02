@@ -1,0 +1,24 @@
+{
+  "id": "01486",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "harness/v2/frontend/cases/trait/provided_write_fmt_runs.rs",
+    "harness/v2/frontend/cases/trait/provided_write_fmt_runs.stdout"
+  ],
+  "what": "## frontend case: a provided method an impl leaves out compiles and runs (Write::write_fmt)\n\nThe compile-and-run test for 214/57 (db's NoItem for a provided method; db fixed at the source 01:53, codegen keeps impl_method). Add these two files as written (harness is not codegen's path).\n\n`harness/v2/frontend/cases/trait/provided_write_fmt_runs.rs`:\n\n```rust\n//@ expect: accept\n//@ edition: 2021\n// Impls that leave out `Write::write_fmt` (a counter's, `StderrLock`'s) run the trait's\n// provided body: called directly, by `write!`, and through a `dyn Write` vtable slot.\nuse std::io::{self, Write};\nstruct Count(usize);\nimpl Write for Count {\n    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {\n        self.0 += bytes.len();\n        Ok(bytes.len())\n    }\n    fn flush(&mut self) -> io::Result<()> {\n        Ok(())\n    }\n}\nfn main() {\n    let mut count = Count(0);\n    count.write_fmt(format_args!(\"{}-{}\", 12, 345)).unwrap();\n    write!(count, \"{:>4}\", 6).unwrap();\n    let slot: &mut dyn Write = &mut count;\n    slot.write_fmt(format_args!(\"{}\", \"seven\")).unwrap();\n    let mut err = io::stderr().lock();\n    err.write_fmt(format_args!(\"to stderr {}\\n\", 8)).unwrap();\n    let slot: &mut dyn Write = &mut err;\n    writeln!(slot, \"to stderr through dyn\").unwrap();\n    println!(\"{}\", count.0);\n}\n```\n\n`harness/v2/frontend/cases/trait/provided_write_fmt_runs.stdout`:\n\n```\n15\n```\n\n(Count: \"12-345\" 6 + \"   6\" 4 + \"seven\" 5 = 15.) Red on the 01:40 tree with db's old NoItem: `trait Write method write_fmt for [Count]: the impl found has no method of that name`.",
+  "state": "open",
+  "created": "2026-11-01T09:57:59Z",
+  "updated": "2026-11-01T09:57:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T09:57:59Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Hegel's settings for blaze's property tests (docs/contributing.md, "Property tests"). A test runs
+# 256 cases unless it names its own count; `HEGEL_TEST_CASES=<n>` raises every test that doesn't,
+# for a long run. Failing examples are not written into the tree.
+[profiles.development]
+test_cases = 256
+database = "disabled"
+
+[profiles.ci]
+test_cases = 256

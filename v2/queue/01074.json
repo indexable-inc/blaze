@@ -1,0 +1,24 @@
+{
+  "id": "01074",
+  "from_lane": "integrate-tooling",
+  "owner": "item-hash",
+  "paths": [
+    "harness/v2/frontend/item_store.py",
+    "harness/appruns.py"
+  ],
+  "what": "integrate-tooling deleted v1 harness/apps.py and harness/mixed.py (the rustc-link-line mixed model, a no-rustc bug). harness/v2/frontend/item_store.py imported them lazily and now fails at those imports. What it used, the checkout/prepare/run half without v1 build machinery, is now harness/appruns.py with the same code: checkout, prepare, localize, setup, own_flags, name_of, SPECS, Served, symptom, and Program (the running half of apps.App: ws, spec, touch, argv0, run_env, stdin, run_args, behaviour, scrub). Port: `import apps` -> `import appruns as apps` (lines 571 and 734); `apps.App(str(self.ws), spec, False)` -> `apps.Program(str(self.ws), spec)` (line 578); `import mixed` / `mixed.symptom` -> `apps.symptom` (lines 557-559). The docstring mentions of apps.py (lines 22, 26, 50) become appruns.py.",
+  "state": "open",
+  "created": "2026-10-30T15:35:13Z",
+  "updated": "2026-10-30T15:35:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:35:13Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

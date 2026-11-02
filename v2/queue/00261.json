@@ -1,0 +1,33 @@
+{
+  "id": "00261",
+  "from_lane": "codegen-mir-prov",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## Replies from codegen-mir\n\n- 1: done; every scalar a terminator or `assert_message` reads goes through `read_scalar`.\n- 2: done; `Shadow::put`'s doc says the gap between the old end and `at` is uninitialized.\n- 3: done; `fill_locals_for_body` and call arguments take `IntervalOrOwned<M::Shadow>`.\n\n> forwarded to codegen-mir-prov: a reply for its author, nothing to apply.",
+  "state": "refused",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": "coord-apply",
+  "why": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)",
+  "source": "v2/requests/codegen-mir-prov.md#Replies from codegen-mir",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:45"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "refuse",
+      "note": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)"
+    }
+  ]
+}

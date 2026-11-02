@@ -12,6 +12,15 @@ the README's numbers with them) by a bot commit. A platform's numbers compare wi
 and with its own history, not with another platform's: the machines differ in more than their
 architecture. The rest of this page says how, so that anyone can check it or run it again.
 
+Every number on this page is blaze v1's: each table names the commit it measured, all from
+2026-10-20 to 2026-10-25, before v2 replaced v1 on 2026-10-30. No run of v2 has been published.
+`harness/bench.py` now picks the backend as v2 does, by the profile (`cranelift` is the dev
+profile, `llvm` the release profile on both sides), but has not run against v2 yet
+([harness.md](harness.md#timing)). Where this page says what the daemon does (hands an edit to
+cargo, builds cold with cargo, leaves crates to rustc), it says what v1 did; v2 never hands a
+build to cargo or rustc. v2's targets are in [v2/plan/goals/targets.md](v2/plan/goals/targets.md),
+and `harness/v2/budgets.py` is what measures them.
+
 - [How fast an edit builds](#how-fast-an-edit-builds)
 - [How much memory and disk it takes](#how-much-memory-and-disk-it-takes)
 - [How fast the built programs run](#how-fast-the-built-programs-run)
@@ -315,7 +324,7 @@ Release with dev checks: `cargo build --release` with `-C overflow-checks=on -C 
 
 </details>
 
-Measured by hand with `harness/bench.py --runtime` (harness/runbench.py), or by the `bench-readme` workflow (a project measured on its own, by its own workflow) on each platform's benchmark machine once it is registered. Raw JSON: [macOS arm64](benchmarks/runtime-macos-arm64.json), [Linux aarch64](benchmarks/runtime-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-linux-x86-64.json); bun: [macOS arm64](benchmarks/runtime-bun-macos-arm64.json), [Linux aarch64](benchmarks/runtime-bun-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-bun-linux-x86-64.json).
+Measured by v1's runbench.py on each platform's benchmark machine, the last results before v2, which has no runtime bench yet. Raw JSON: [macOS arm64](benchmarks/runtime-macos-arm64.json), [Linux aarch64](benchmarks/runtime-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-linux-x86-64.json); bun: [macOS arm64](benchmarks/runtime-bun-macos-arm64.json), [Linux aarch64](benchmarks/runtime-bun-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-bun-linux-x86-64.json).
 <!-- runbench:end -->
 
 ## What is measured
@@ -327,7 +336,7 @@ state.
 
 | Phase | What happens | blaze | cargo |
 |---|---|---|---|
-| Cold | build from an empty target directory and an empty blaze store; crates are already downloaded | the build returns (cargo builds the first time) and then the daemon loads the workspace in the background; both are reported | `cargo build` |
+| Cold | build from an empty target directory and an empty blaze store; crates are already downloaded | the build returns (under v1, cargo built the first time) and then the daemon loads the workspace in the background; both are reported | `cargo build` |
 | Cold, warm store | after everything else, `--cold-runs` times: a second copy of the project with an empty target directory and a daemon of its own, but the store the measured copy filled with its cold build and edits (as a second checkout of the same project, or a teammate's store, would have) | build and daemon ready, as cold | |
 | Nothing changed | build again with no edit | | |
 | Edit a function | one statement is added to a function in the main crate | | incremental |
@@ -336,13 +345,14 @@ state.
 | Edit a generic function | a statement in a generic function used at many types (ripgrep and nushell) | | incremental |
 | Add a function | a new function in the main crate, called from the function of "Edit a function" | | incremental |
 | Add a struct field | a struct gets one more field (`_bench_edit: ()`) and every place that builds it sets it; in a library crate where there is one (nushell's `nu-protocol::Alias`, built in `nu-parser`) | | incremental |
-| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to end the same way under both | | |
+| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to pass under blaze by its own verdict (cargo is only timed) | | |
 | Runtime | (ripgrep) the program blaze linked, cargo's debug build and cargo's release build run the same search over the toolchain's own library source | | |
 
 The edits do not change what the program does. After the first edit of each kind the program
-blaze linked is run and has to print what cargo's prints (exit status, stdout and stderr); in
-the runtime phase all three programs have to print the same. A run in which any program differs
-is not published (`benchreport.py` refuses it and the workflow fails).
+blaze linked is run and has to print what the program of blaze's cold build printed (exit
+status, stdout and stderr); in the runtime phase each of the three programs has to exit 0. cargo
+is the speed baseline, not the answer (2026-10-30: no harness compares blaze's output with
+cargo's). A run in which a program is wrong is not published (`benchreport.py` refuses it and the workflow fails).
 
 Each edit is made and taken back `--runs` times (5 in CI). The summary tables show the median of
 the edits; the results below also show the fastest and slowest run of each side, and the raw JSON keeps
@@ -353,8 +363,8 @@ build.
 Cold is `--cold-runs` runs of each (5 in CI), each with a new target directory, home and store;
 the store size after it is kept too.
 
-An edit the daemon hands to cargo (a fallback: blaze always builds what cargo would) is measured
-once, marked `(c)` in the tables, and shows about cargo's time.
+An edit v1's daemon handed to cargo (a fallback) was measured once, marked `(c)` in the tables,
+and shows about cargo's time. v2 has no such fallback: what it can't build stops with an error.
 
 ## Memory and disk
 
@@ -364,16 +374,16 @@ side leaves behind. [The summary](#how-much-memory-and-disk-it-takes) is at the 
 
 | Number | blaze | cargo |
 |---|---|---|
-| Peak, each phase and edit | the most `blaze build`, the daemon and every process under either held at once: cargo when the client hands it the build, its rustc, build scripts and linker, the daemon's workers and what they run | the most `cargo build`, rustc, build scripts and the linker held at once |
+| Peak, each phase and edit | the most `blaze build`, the daemon and every process under either held at once: under v1, cargo when the client handed it the build, its rustc, build scripts and linker, the daemon's workers and what they run | the most `cargo build`, rustc, build scripts and the linker held at once |
 | Largest process | the peak of the largest of those processes on its own | the same |
 | Daemon between edits | what the daemon and its workers hold once it is ready, after nothing changed, after each kind of edit and at the end of the run, with the number of builds so far: memory that grows with every edit shows here | |
 | On disk | the target directory, the store and blaze's home | the target directory |
 | Cold, warm store | the peak, and what the daemon holds once ready | |
 | Runtime | the peak of the program blaze linked while it runs | the peak of cargo's debug and release programs |
 
-`harness/runbench.py` (runtime parity) adds the peak of each program while it runs, the size of
+v1's runbench.py (runtime parity) added the peak of each program while it runs, the size of
 each binary, and the peak of each build: `cargo build --release` against blaze's whole-program
-LLVM build.
+LLVM build. v2 has no runtime bench yet.
 
 **How.** One helper, `harness/memory.py`, measures all of it, and every harness that reports
 memory uses it. It combines two readings:
@@ -416,7 +426,7 @@ shows. Two runs of the Mac's measurement gave the same peaks within 1%.
 **Disk** is the blocks the files use, a file with several hard links once
 (`memory.disk_mb`). On Linux each block is counted once however many files share it: a
 copy the file system made by sharing the blocks (a reflink, which `std::fs::copy` makes on
-XFS and Btrfs, and which blaze's copies of rustc's objects and libraries are) takes no
+XFS and Btrfs, and which v1's copies of rustc's objects and libraries were) takes no
 more disk than the one file, and is counted so, where `du` counts it once per file. The
 kernel says which blocks are shared (`FIEMAP`); where it does not, a file is counted as
 `du` counts it. On macOS a clone is counted as `du` counts it, once per file.
@@ -467,15 +477,17 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 - blaze's store starts empty for each project and backend and for every cold run. "Cold, warm
   store" is the one phase that starts with a store, and it is reported apart. On a machine
   the store is one for every project, so the Store column is what a project adds to a store
-  that has nothing of it. `store_added_mb` in the results is what it adds to one that has
-  what the projects before it in the run stored: the disk of its entries whose keys none of
-  them had (a pack's size shared among its entries by the length of their values).
+  that has nothing of it. Results from v1 also have `store_added_mb`, what it added to one
+  that had what the projects before it stored; v2's bench does not measure it.
 - The machine runs nothing else: it is a dedicated instance used only by this workflow.
 
 ## Tiers
 
-Each project is measured with each code producer blaze has: Cranelift (the default, in the
-summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). Cranelift is measured
+Each project was measured with each code producer v1 had: Cranelift (the default, in the
+summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, `BACKENDS` in
+`harness/bench.py`). v2 refuses those variables and picks the backend from the profile's
+`opt-level` (0 and 1 Cranelift, the rest LLVM; `crates/blaze-codegen/src/plan.rs`), so a v2
+tier is a profile: `bench.py`'s `BACKENDS` gives the release profile's `--release` for `llvm`. Cranelift is measured
 with blaze as it is installed and released, without the `llvm` feature (`BLAZE_BIN`), and LLVM
 with a build that has it (`BLAZE_LLVM_BIN`): a binary that links libLLVM loads it each time it
 starts, about 6 ms on the benchmark machine, and every `blaze` starts it once. A new tier
@@ -537,8 +549,10 @@ of 7 to 28), the same 30 edits each ([raw JSON](benchmarks/hotpatch/macbook.json
 On macOS blaze also patches a running program without a restart: a program that links
 `blaze-live` (`harness/live`, as small as this one) takes an edit in a median of 12.5 ms (p90
 28.0, p99 48.9) when it goes through `blaze build`, and 4.0 ms (p90 11.6, p99 13.8) when an
-editor sends it over the daemon's socket (`harness/live_latency.py --program probe cargo socket`,
-30 edits each, same MacBook, [raw JSON](benchmarks/live/macbook-probe-cargo.json)). That is the
+editor sent it over the daemon's socket (`harness/live_latency.py --program probe cargo socket`,
+30 edits each, same MacBook, [raw JSON](benchmarks/live/macbook-probe-cargo.json); the socket mode
+is refused now that the editor commits through blaze-api, until it is a client of
+`blaze_api::client`). That is the
 flow to set against subsecond's; the restart flow above is what blaze does where it cannot
 patch, today Linux.
 
@@ -647,15 +661,16 @@ labelled `bench-regression` with a table of what moved (or comments on the one a
 writes the table to the run's summary and fails.
 
 Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs every night on
-main on a GitHub macOS arm64 runner (`macos-15`), times socket, burst and replay edits of the
-four live programs (`harness/live_latency.py`, [live.md](live.md#latency-under-typing)), appends
+main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
+`blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
+until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
 one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl` and checks the p50
 and p90 of each program and mode (floor 1 ms). A shared runner is noisier than the benchmark
 machine; the band widens with the spread its own history shows.
 
 ## Run it yourself
 
-On any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
+As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
 
 ```
 nix develop .#bench
@@ -683,22 +698,23 @@ every table and chart again from the stored results.
 ## Caveats
 
 - Live edits (the patch applied to a running program) work on macOS on Apple silicon only and are
-  measured there by `harness/live_latency.py`, per keystroke under typing as well as one edit at
-  a time: [live.md](live.md#latency-under-typing) has the numbers from a MacBook, and
+  measured there by `harness/live_latency.py`, one edit at a time through `blaze build` (its
+  per-keystroke modes wait on a `blaze_api::client` port): [live.md](live.md#latency-under-typing)
+  has the numbers once measured on a MacBook, and
   `history/macos-arm64-live.jsonl` the runs.
 - One machine, one OS. The numbers on a laptop will differ; the ratios are what carries over.
 - Cold is the least precise number here: five runs at most, each minutes long on the large
   projects.
 - The setups compared are measured on ripgrep and nushell only (`--setups-on`): seven more
   builds of every step on every project would make the nightly run too long for one machine.
-- An edit is a small, fixed change. A larger change (many functions, a new type) costs more;
-  `harness/agents.py` makes random edits of the kinds coding agents make.
+- An edit is a small, fixed change. A larger change (many functions, a new type) costs more.
 - axum's output is not checked (it is a server); its build is.
 - ripgrep's runtime is one short workload (tens of milliseconds, over 16 threads), so it says more
   about start-up and directory walking than about generated code; the program blaze linked has
   had the edits spliced into it and taken back, as a program in use would.
-- Cold for `blaze build` is cargo's own build (the daemon is not loaded yet), so it matches
-  plain cargo; the daemon then loads the workspace in the background ("Daemon ready after").
+- Cold for v1's `blaze build` was cargo's own build (the daemon was not loaded yet), so it
+  matched plain cargo; the daemon then loaded the workspace in the background ("Daemon ready
+  after"). v2's cold build is the daemon's own.
 - The C compiler comes from Nix (gcc 16) with the wrapper's hardening turned off, as a
   distribution's gcc behaves; it is the same for both sides. Nix's linker wrapper runs
   `realpath` for each library directory of the shell on every link cargo makes (blaze's links
@@ -709,8 +725,8 @@ every table and chart again from the stored results.
 
 ## What the 2026-10-21 run found
 
-The results below come from two runs on dev-aws-7 (16 cores of a c7i.16xlarge, blaze
-`2b2f2dcd5b`): ripgrep to nushell on both tiers in one, bevy and helix on Cranelift with one
+A record of v1. The results below come from two runs on dev-aws-7 (16 cores of a c7i.16xlarge,
+blaze `2b2f2dcd5b`): ripgrep to nushell on both tiers in one, bevy and helix on Cranelift with one
 cold run each in the second, since helix with its test targets needs more memory than the
 machine has. blaze loses or fails on these:
 

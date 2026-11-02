@@ -1,34 +1,35 @@
-"""storerevisions.py: a fresh daemon on a checkout edited before it started, or on the undo of
+"""storerevisions.py: a fresh v2 daemon on a checkout edited before it started, or on the undo of
 that edit, gets nothing stale from a store another revision filled. Linux and macOS.
 
-    uv run --frozen python harness/storerevisions.py '{"blaze_bin": "target/release/blaze-engine"}'
-    uv run --frozen python harness/storerevisions.py '{"blaze_bin": "...", "cases": ["leaf", "layout"], "jobs": 2}'
+    uv run --frozen python harness/storerevisions.py '{"blaze": "target/release/blaze"}'
+    uv run --frozen python harness/storerevisions.py '{"blaze": "...", "cases": ["leaf", "layout"], "jobs": 2}'
 
-`blaze_bin` names the blaze-engine a build made; `blaze` is found beside it. `cases` picks some
-of CASES (all of them by default), `jobs` how many cases run at once (3; each runs two daemons at a time). The JSON is inline, a file's
-path, or `-` for stdin. Python 3.13, from the workspace at the repository's root. The backend is
-the environment's (BLAZE_BACKEND), as for every harness.
+`blaze` is the v2 command line. `cases` picks some of CASES (all of them by default), `jobs` how
+many cases run at once (3; each runs two daemons at a time). The JSON is inline, a file's path,
+or `-` for stdin. Python 3.13, from the workspace at the repository's root.
 
-Today the store keys a checkout crate's functions by the crate's source hash, so any edit makes
-a fresh worker lower the crate again. A per-function key would let it reuse what an edit did not
-touch (#1336, #1291); this is that key's acceptance test. Each case changes one thing a
-function's code depends on without the function's own text changing: a callee's body, an inline
-helper folded into a caller and into a constant's array length, a public return type with a
-caller in another crate, an import rebound to another function, a module constant a `match`
-reads, the field a method reads, a struct's layout, a constant table's contents, layout and enum
-discriminants. For each:
+v2's store keys every value by its schema, the code that made it and every input it was made
+from (#1439, docs/v2-store.md "Keys"): a key that misses an input is a bug, and this is that
+bug's acceptance test (#1336, #1291). Each case changes one thing a function's code depends on
+without the function's own text changing: a callee's body, an inline helper folded into a
+caller and into a constant's array length, a public return type with a caller in another
+crate, an import rebound to another function, a module constant a `match` reads, the field a
+method reads, a struct's layout, a constant table's contents, layout and enum discriminants.
+A daemon keeps its store in `<home>/v2/store`, so a build "from a store" is a fresh daemon in a
+home of its own whose store starts as a copy of that one. For each case:
 
 - checkout B, a copy of A at another path, is edited before any daemon has seen it, and built
   from a copy of the store holding A only;
-- B is also built cold, in a store holding the standard library only: what B has to print;
-- the undo, B's copy with the edit taken back, is built from that store, which holds B only and
-  nothing of A, so no exact hit for A can hide a dependency the key left out.
+- B is also built cold, from a copy of a store holding the standard library only: what B has
+  to print;
+- the undo, B's copy with the edit taken back, is built from a copy of that cold build's store,
+  which holds B only and nothing of A, so no exact hit for A can hide an input a key left out.
 
 Each build is a fresh daemon with a home of its own and an empty target directory, and the
 program runs with no arguments and with one. B from A's store has to print what B prints cold,
 the undo what A printed, and the edit has to change what is printed (else the case tests
-nothing). It does not ask for anything to be reused: it prints what the workers say they found
-in the store and compiled, for when #1291 makes that more than nothing.
+nothing). It does not ask for anything to be reused: it prints what each build's `blaze-work`
+line says it found in the store and compiled.
 
 Adapted from astral-experiments/blaze#66, #69, #70, #74 and #78 (Charlie Marsh), whose
 `test:storerevisions` was the check for their per-function proofs: the fixture and the edit-B-
@@ -37,8 +38,8 @@ blaze's own cold build, so the check runs nothing of rustc's, and it asserts no 
 """
 
 import asyncio
+import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -55,11 +56,14 @@ Case = Literal[
 BUILD_SECS = 900
 RUN_SECS = 60
 IDLE_SECS = 120
+# Read by blaze or cargo from the caller's environment; set here alone.
+SCRUBBED = ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
+            "BLAZE_HOME", "XDG_RUNTIME_DIR")
 
 
 @dataclass(frozen=True)
 class Input:
-    blaze_bin: str
+    blaze: str
     cases: tuple[Case, ...] = get_args(Case)
     jobs: int = 3
 
@@ -187,7 +191,6 @@ CASES: dict[Case, tuple[str, str, str]] = {
     "table-tag": ("lib/src/tables.rs", "Idle = 1, Other = 7", "Idle = 7, Other = 1"),
 }
 assert all(FILES[file].count(old) == 1 for file, old, _ in CASES.values())
-STORE_LINE = re.compile(r"^store: (\d+) functions found, (\d+) compiled and added$", re.MULTILINE)
 
 
 class Failed(Exception):
@@ -196,31 +199,29 @@ class Failed(Exception):
 
 @dataclass(frozen=True)
 class Env:
-    bin_dir: Path
+    blaze: Path
     root: Path
 
-    def of(self, home: Path, store: Path) -> dict[str, str]:
-        env = dict(os.environ, PATH=f"{self.bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=str(home),
-                   BLAZE_CACHE=str(store), BLAZE_STATS="1", RUST_BACKTRACE="0")
-        for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
-            env.pop(name, None)
+    def of(self, home: Path) -> dict[str, str]:
+        env = {name: value for name, value in os.environ.items() if name not in SCRUBBED}
+        env.update(BLAZE_HOME=str(home), RUST_BACKTRACE="0")
         return env
 
 
 async def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], secs: float) -> str:
-    """What `argv` printed, both streams; a Failed naming the step, the command, its exit status
-    and the end of what it said when it fails or takes longer than `secs`."""
+    """What `argv` printed on stdout, then stderr; a Failed naming the step, the command, its
+    exit status and the end of what it said when it fails or takes longer than `secs`."""
     proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.STDOUT)
+                                                stderr=asyncio.subprocess.PIPE)
     try:
         async with asyncio.timeout(secs):
-            out, _ = await proc.communicate()
+            out, err = await proc.communicate()
     except TimeoutError:
         proc.kill()
-        out, _ = await proc.communicate()
-        said = out.decode(errors="replace")
+        out, err = await proc.communicate()
+        said = (out + err).decode(errors="replace")
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} took more than {secs:.0f} s:\n{said[-3000:]}") from None
-    said = out.decode(errors="replace")
+    said = out.decode(errors="replace") + err.decode(errors="replace")
     if proc.returncode != 0:
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} exited {proc.returncode}:\n{said[-3000:]}")
     return said
@@ -247,41 +248,61 @@ def edit(ws: Path, file: str, old: str, new: str) -> None:
     path.write_text(text.replace(old, new))
 
 
+def messages(said: str, reason: str) -> list[dict[str, object]]:
+    """The `--message-format=json` lines of `reason` in what a build printed."""
+    out: list[dict[str, object]] = []
+    for line in said.splitlines():
+        if line.startswith("{") and reason in line:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(message, dict) and message.get("reason") == reason:
+                out.append(message)
+    return out
+
+
 @dataclass(frozen=True)
 class Built:
     printed: tuple[str, str]
     found: int
     compiled: int
+    # The home's store as the daemon left it, for a later build to start from a copy of.
+    store: Path
 
 
-async def build(env: Env, ws: Path, store: Path, label: str, exe: str) -> Built:
-    """A fresh daemon of its own home builds `ws` from `store` and stops; what the program prints
-    with no argument and with one, and what its workers say they took from the store."""
+async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> Built:
+    """A fresh daemon of its own home, its store a copy of `seed` (or empty), builds `ws` and
+    stops; what the program prints with no argument and with one, and what the build says it
+    took from the store and compiled."""
     if (ws / "target").exists():
         raise Failed(f"{label}: {ws} has a target directory before its first build")
     home = Path(tempfile.mkdtemp(prefix="h", dir=env.root))
-    variables = env.of(home, store)
+    store = home / "v2" / "store"
+    if seed is not None:
+        shutil.copytree(seed, store)
+    variables = env.of(home)
+    blaze = str(env.blaze)
     try:
-        await run(f"{label}: the first build", ["blaze", "build"], ws, variables, BUILD_SECS)
-        # The first build can come before the daemon is up; the program is the one it built.
-        async with asyncio.timeout(BUILD_SECS):
-            while "[blaze]" not in await run(f"{label}: a build the daemon serves", ["blaze", "build"], ws, variables,
-                                             BUILD_SECS):
-                await asyncio.sleep(0.5)
-        program = ws / "target" / "debug" / exe
-        printed = (await run(f"{label}: the program", [str(program)], ws, variables, RUN_SECS),
-                   await run(f"{label}: the program with an argument", [str(program), "second"], ws, variables, RUN_SECS))
-        # What the daemon does after a build (writing the store) is done before it is stopped,
-        # so the store a later build copies holds all of this one.
-        async with asyncio.timeout(IDLE_SECS):
-            while re.search(r"loading|building",
-                            await run(f"{label}: the daemon's status", ["blaze", "status"], ws, variables, IDLE_SECS)):
-                await asyncio.sleep(0.25)
+        said = await run(f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS)
+        programs = [m["executable"] for m in messages(said, "compiler-artifact")
+                    if m.get("executable") and isinstance(m.get("target"), dict) and m["target"].get("name") == exe]
+        if not programs:
+            raise Failed(f"{label}: the build names no executable of {exe}:\n{said[-3000:]}")
+        program = str(programs[-1])
+        printed = (await run(f"{label}: the program", [program], ws, variables, RUN_SECS),
+                   await run(f"{label}: the program with an argument", [program, "second"], ws, variables, RUN_SECS))
+        worked = messages(said, "blaze-work")
+        if len(worked) != 1:
+            raise Failed(f"{label}: {len(worked)} `blaze-work` lines; a build says what it did once:\n{said[-3000:]}")
     finally:
-        await run(f"{label}: stopping the daemon", ["blaze", "stop"], ws, variables, IDLE_SECS)
-    logs = "".join(p.read_text(errors="replace") for p in sorted(home.glob("*/*/log")))
-    counts = [(int(f), int(c)) for f, c in STORE_LINE.findall(logs)]
-    return Built(printed, sum(f for f, _ in counts), sum(c for _, c in counts))
+        # `blaze stop` makes what the daemon keeps durable before it ends, so a copy of the
+        # store taken after it holds all of this build.
+        await run(f"{label}: stopping the daemon", [blaze, "stop"], ws, variables, IDLE_SECS)
+    found, compiled = worked[0].get("found"), worked[0].get("compiled")
+    if not isinstance(found, int) or not isinstance(compiled, int):
+        raise Failed(f"{label}: the `blaze-work` line has no counts: {worked[0]}")
+    return Built(printed, found, compiled, store)
 
 
 async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, original: Built,
@@ -292,16 +313,13 @@ async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, orig
     edited = checkout(a, at / "b")
     edit(edited, file, old, new)
     cold = checkout(edited, at / "b-cold")
-    from_a, only_b = at / "store-from-a", at / "store-only-b"
-    shutil.copytree(only_a, from_a)
-    shutil.copytree(std_only, only_b)
     async with jobs:
         async with asyncio.TaskGroup() as group:
-            forward = group.create_task(build(env, edited, from_a, f"{name}: B from A's store", "store_app"))
-            reference = group.create_task(build(env, cold, only_b, f"{name}: B cold", "store_app"))
+            forward = group.create_task(build(env, edited, only_a, f"{name}: B from A's store", "store_app"))
+            reference = group.create_task(build(env, cold, std_only, f"{name}: B cold", "store_app"))
         undo = checkout(cold, at / "undo")
         edit(undo, file, new, old)
-        restored = await build(env, undo, only_b, f"{name}: the undo from B's store", "store_app")
+        restored = await build(env, undo, reference.result().store, f"{name}: the undo from B's store", "store_app")
     wrong: list[str] = []
     if reference.result().printed == original.printed:
         wrong.append(f"{name}: the edit changes nothing the program prints, {original.printed!r}: the case tests nothing")
@@ -318,23 +336,23 @@ async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, orig
 
 
 async def main(args: Input) -> None:
-    engine = Path(args.blaze_bin).resolve()
-    if not (engine.parent / "blaze").is_file():
-        fail(SCRIPT, f"blaze_bin: no blaze beside {engine}")
+    blaze = Path(args.blaze).resolve()
+    if not blaze.is_file():
+        fail(SCRIPT, f"blaze: no blaze at {blaze}")
     if args.jobs < 1:
         fail(SCRIPT, f"jobs: at least 1, not {args.jobs}")
     if sys.platform not in ("linux", "darwin"):
         fail(SCRIPT, f"Linux and macOS only, not {sys.platform}")
     # A daemon's socket is under its home, and a socket's path has to be short: macOS's
     # temporary directory is too long a start.
-    env = Env(engine.parent, Path(tempfile.mkdtemp(prefix="bz-revs-", dir="/tmp")).resolve())
+    env = Env(blaze, Path(tempfile.mkdtemp(prefix="bz-revs-", dir="/tmp")).resolve())
     print(f"work: {env.root}", flush=True)
     try:
-        std_only = env.root / "store-std"
-        await build(env, write(env.root / "seed" / "ws", SEED), std_only, "the standard library's store", "std_seed")
-        a, only_a = write(env.root / "a" / "ws", FILES), env.root / "store-only-a"
-        shutil.copytree(std_only, only_a)
-        original = await build(env, a, only_a, "A", "store_app")
+        seeded = await build(env, write(env.root / "seed" / "ws", SEED), None, "the standard library's store", "std_seed")
+        std_only = seeded.store
+        a = write(env.root / "a" / "ws", FILES)
+        original = await build(env, a, std_only, "A", "store_app")
+        only_a = original.store
         print(f"A printed {original.printed!r}", flush=True)
         jobs = asyncio.Semaphore(args.jobs)
         async with asyncio.TaskGroup() as group:

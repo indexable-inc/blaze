@@ -1,0 +1,33 @@
+{
+  "id": "00349",
+  "from_lane": "mem-db-infer-method",
+  "owner": "db",
+  "paths": [],
+  "what": "## Rules that do not fit\n\nNone of R1-R8 fails here. Two notes for mem-db-infer:\n\n- R3 and `blaze_radix`: `radix::sort_by_key` allocates its pair scratch on the global heap above\n  64 items, and `sort_copy_by_key_in` takes a global `&mut Vec<T>`. I2 avoids it with\n  `sort_unstable_by_key` and a total key; a frame-generic radix sort (`sort_by_key_in(frame, ..)`)\n  would be blaze-radix's (lane mem) to add if a sort here shows up in a profile.\n- R1 in entry points that hir and MIR call per expression (`has_drop_glue`,\n  `is_ty_uninhabited_from`): `frame::task` per call is correct but costs a task push; the `_in`\n  forms let their callers pass the frame they have, which their parts should do.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:46): notes, nothing to apply.",
+  "state": "applied",
+  "created": "2026-10-30T03:35:03Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-method.md#Rules that do not fit",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-method.md:3100"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:46): notes, nothing to apply."
+    }
+  ]
+}

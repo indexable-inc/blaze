@@ -1,0 +1,35 @@
+{
+  "id": "00265",
+  "from_lane": "requests-subtree-hash",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/format/speed-of-light.md"
+  ],
+  "what": "## for the coordinator (`docs/v2/plan/lanes/format/speed-of-light.md`, \"An edit\")\n\nWhat: \"What stands in the way\" says the parse could carry each node's hash, \"computed bottom-up\nwhile the tree is built\". Replace that bullet with:\n\n> - **Carried hashes:** `FlatTree::subtree_hash` keeps the hash of every node that costs 4 KiB\n>   or more to hash, made the first time it is asked for, and an incremental reparse carries it\n>   for the subtrees the edit does not change. So an unchanged anchor's `tree_hash` is one load\n>   (a popcount rank and a slot) once `body.rs` reads it, and an edit costs the reparse plus\n>   hashing the anchors it changed, each once. They are made when asked, not while the tree is\n>   built: a parent's BLAKE3 pass is not made of its children's, so building them bottom-up\n>   would rehash every ancestor of an edit up to the root, the whole file, on every edit.\n\nWhy: the bullet names a design that was not taken and says an edit stays O(file) \"until then\";\nthe plan should say what was built and why it differs.\n\n> forwarded to the coordinator (`docs/`; format is DONE, so its lane notes have no writer): listed in requests' report.",
+  "state": "applied",
+  "created": "2026-10-30T02:46:25Z",
+  "updated": "2026-10-30T08:30:27Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/requests-subtree-hash.md#for the coordinator (`docs/v2/plan/lanes/format/speed-of-light.md`, \"An edit\")",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-subtree-hash.md:58"
+    },
+    {
+      "at": "2026-10-30T08:30:27Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:30:27Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/lanes/format/speed-of-light.md, the body-hash section: the \"What stands in the way\" bullet replaced by \"Carried hashes\" as asked, checked against syntax-tree flat.rs (KEEP = 4096, subtree_hash via rank and slot). Dropped \"once body.rs reads it\": body.rs tree_hash already calls FlatTree::subtree_hash."
+    }
+  ]
+}

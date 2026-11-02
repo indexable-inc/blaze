@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::Profiles;
+use blaze_manifest::files::Disk;
 use blaze_manifest::{Config, Context, Workspace};
 
 /// A fresh directory holding `files`, each a path under it and its text.
@@ -24,13 +25,13 @@ fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
     dunce::canonicalize(root).unwrap()
 }
 
-fn context(root: &Path) -> Context {
+fn context(root: &Path) -> Context<Disk> {
     let env = [("CARGO_HOME".to_owned(), root.join("cargo-home").display().to_string())];
     Context::new(Config::load(root, env, &[]).unwrap())
 }
 
 /// The workspace at `root`, or the error reading it, with its causes.
-fn workspace<'c>(ctx: &'c Context) -> anyhow::Result<Workspace<'c>> {
+fn workspace<'c>(ctx: &'c Context<Disk>) -> anyhow::Result<Workspace<'c, Disk>> {
     let manifest = root_manifest(None, ctx)?;
     Workspace::new(&manifest, ctx)
 }

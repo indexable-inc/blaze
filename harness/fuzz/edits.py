@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # pyright: basic
-"""edits.py: generated edits, what the daemon makes of each against a cold cargo build.
+"""edits.py: generated edits, what the daemon makes of each against a cold blaze build.
 
-usage: edits.py smoke '{"backends": ["cranelift"]}'             a short run on fixed seeds, for CI
+usage: edits.py smoke '{"profiles": ["dev"]}'                  a short run on fixed seeds, for CI
        edits.py run '{"seed": "S", "rounds": N, "steps": K}'      N programs from seed S, K edits each
        edits.py run '{"seed": "S", "first": R, "rounds": 1}'      round R of that run again
        edits.py check '{"files": ["FILE.rs"]}'                   the sequences under found/edits/, each again
@@ -13,11 +13,12 @@ input) with the fields of its class below (Smoke, Run, Check, Report); a field i
 is refused. Run it in the repository's Python workspace: `uv run --frozen python
 harness/fuzz/edits.py ...` from the root.
 
-A round is one generated program (`gen.py`) under a daemon that keeps its binary up to date,
-as `splices.py` runs one. Each step edits the source, asks the daemon for the binary (which it
-splices, patches or links in full, as it sees fit) and builds the same source with cargo from
-nothing. A finding is a step whose binary prints something else than cargo's, a step the
-daemon refused, a daemon that died, or one that panicked and went on. An edit rustc turns down is not shown to the daemon.
+A round is one generated program (`gen.py`) under one daemon. Each step edits the source, asks
+the daemon for the program by `blaze build`, and builds the same source in an empty home
+(`rebuild.Project.fresh`). A finding is a step whose program prints something else than the
+fresh one, a step the daemon refused, a daemon that died, or one that panicked and went on. An
+edit the fresh build turns down is not shown to the daemon. A profile picks the backend: v2
+compiles dev with Cranelift and release with LLVM.
 
 The edits:
   regen.run         the body of a case's `run`, generated anew
@@ -56,11 +57,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen
-import linkline
-from difftest import BLAZE, TARGET_ARGS, Fixture, built, minimize, sysroot_rlibs
-from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
+from rebuild import Project, scratch
+from store import MANIFEST, PROFILE_ARGS, differences, edition_of
 
-EDITS = os.path.join(FOUND, "edits")
+EDITS = os.path.join(HERE, "found", "edits")
 # The line between one source and the next in a file under found/edits/.
 THEN = "//// then"
 SCALARS = {
@@ -285,102 +285,53 @@ class Editor:
         return f"the source of step {back}"
 
 
-class Daemon:
-    """A cargo project, a daemon that keeps its binary up to date, and cargo's own build beside it."""
+PROGRAM = "fz"
+# What a step whose source the fresh build turned down shows of it: it was not shown to the daemon.
+NOT_FRESH = "not accepted by a fresh build"
 
-    def __init__(self, directory, edition, backend, text):
+
+class Daemon:
+    """A cargo project of one generated program, the daemon that builds it after each edit, and
+    fresh builds of it (rebuild.Project)."""
+
+    def __init__(self, directory, edition, profile, text):
         self.dir = directory
-        self.ws, self.work, self.cold = (os.path.join(directory, name) for name in ("ws", "work", "cold"))
+        self.edition, self.profile = edition, profile
+        self.ws = os.path.join(directory, "ws")
         os.makedirs(os.path.join(self.ws, "src"))
-        os.makedirs(self.work)
         Path(self.ws, "Cargo.toml").write_text(MANIFEST.format(edition=edition))
         self.main = os.path.join(self.ws, "src", "main.rs")
         Path(self.main).write_text(text)
-        self.env = {**os.environ, **BACKENDS[backend]}
-        self.fx = Fixture(self.ws, ["fz"], ["-p", "fz"], touch=self.main)
-        self.fx.rustc_build()
-        obj, patch, self.binary = (os.path.join(self.work, f"fz.{name}") for name in ("o", "patch.o", "bin"))
-        link = linkline.with_output(linkline.ahead(list(self.fx.link_args), [patch, obj], BLAZE), self.binary)
-        symbols = [x for rlib in self.fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        self.ask = [
-            "--crate",
-            "fz",
-            "--out",
-            obj,
-            "--patch",
-            patch,
-            "--link-cmd",
-            linkline.join(link),
-            "--binary",
-            self.binary,
-            *symbols,
-        ]
-        self.socket, self.log = os.path.join(self.work, "blaze.sock"), os.path.join(self.work, "daemon.log")
-        with open(self.log, "a") as out:
-            self.process = subprocess.Popen(
-                [BLAZE, self.ws, *TARGET_ARGS, "--socket", self.socket, *self.ask],
-                stderr=out,
-                stdout=out,
-                env=self.env,
-            )
-        began = time.time()
-        while "watching" not in Path(self.log).read_text():
-            if self.process.poll() is not None or time.time() - began > 600:
-                raise SystemExit(f"the daemon did not start:\n{Path(self.log).read_text()[-2000:]}")
-            time.sleep(0.05)
+        self.project = Project(self.ws, os.path.join(directory, "work"))
+        self.log = self.project.started().log_path
 
     def sync(self, text):
-        """Writes the source and asks the daemon for the binary. Returns its reply and how it linked."""
+        """Writes the source and asks the daemon for the program: `storelib.Built`."""
         Path(self.main).write_text(text)
-        seen = len(Path(self.log).read_text())
-        try:
-            reply = subprocess.run(
-                [BLAZE, "sync", self.socket, *self.ask],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=self.env,
-            )
-            said = (reply.stdout + reply.stderr).strip()
-        except subprocess.TimeoutExpired:
-            said = "no reply after 600s"
-        links = re.findall(r"^link: \S+ \((.*)\)$", Path(self.log).read_text()[seen:], re.MULTILINE)
-        if not links:
-            return said, "no link"
-        if links[-1].startswith("spliced"):
-            return said, "spliced"
-        reason = re.search(r"not spliced: (.*)", links[-1])
-        return said, "full: " + (reason.group(1) if reason else "not asked to splice")
+        return self.project.build(PROGRAM, *PROFILE_ARGS[self.profile])
 
-    def cargo(self, text):
-        """What cargo's build of the source from nothing prints, or None when rustc turns it down."""
+    def cold(self, text):
+        """What a fresh build of the source does, or None when it turns the source down."""
         Path(self.main).write_text(text)
-        build = subprocess.run(
-            ["cargo", "build", "-q", *TARGET_ARGS],
-            check=False,
-            cwd=self.ws,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "CARGO_TARGET_DIR": self.cold, "CARGO_INCREMENTAL": "0"},
-        )
-        return run(built(self.cold, "fz")) if build.returncode == 0 else None
+        return self.project.fresh(PROGRAM, *PROFILE_ARGS[self.profile])
 
     def alive(self):
-        return self.process.poll() is None
+        return self.project.daemon is not None and self.project.daemon.alive()
 
     def gone(self):
         """Whether the daemon has exited, given a moment to: its reply can come before it does."""
+        daemon = self.project.daemon
+        if daemon is None:
+            return True
         try:
-            self.process.wait(timeout=3)
+            daemon.process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             return False
         return True
 
     def close(self):
-        self.process.kill()
-        self.process.wait()
-        shutil.rmtree(self.fx.work, ignore_errors=True)
+        if self.alive():
+            self.project.stop()
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -391,36 +342,32 @@ def panic_of(log):
 
 
 def verdict(daemon, text, expected):
-    """Shows the daemon a source. Returns what went wrong (None when nothing did), how it linked, and the time."""
+    """Shows the daemon a source. Returns what went wrong (None when nothing did) and the time."""
     began = time.time()
-    reply, how = daemon.sync(text)
+    built = daemon.sync(text)
     took = int((time.time() - began) * 1000)
-    if not reply.startswith("ok") and daemon.gone():
-        return "died: " + panic_of(Path(daemon.log).read_text()), how, took
-    if not reply.startswith("ok"):
-        return "refused: " + reply[:300], how, took
-    found = differences(expected, run(daemon.binary))
-    return (
-        (f"differs in {found[0].case}: {found[0].key}\n{found[0].detail[:1500]}" if found else None),
-        how,
-        took,
-    )
+    if (built.status != 0 or not built.executable) and daemon.gone():
+        return "died: " + panic_of(Path(daemon.log).read_text()), took
+    if built.status != 0 or not built.executable:
+        return "refused: " + built.said.strip()[-300:], took
+    found = differences(expected, daemon.project.ran(built))
+    return (f"differs in {found[0][:1500]}" if found else None), took
 
 
 def modules_of(cases, names=None):
     return [(case.name, case.lines) for case in cases if names is None or case.name in names]
 
 
-def replay(work, edition, backend, sources):
+def replay(work, edition, profile, sources):
     """A fresh daemon shown each of the sources in turn, each a list of modules. Returns what
     went wrong at the first step that did, or None."""
     texts = [gen.render(modules) for modules in sources]
-    daemon = Daemon(tempfile.mkdtemp(prefix="replay-", dir=work), edition, backend, texts[0])
+    daemon = Daemon(tempfile.mkdtemp(prefix="replay-", dir=work), edition, profile, texts[0])
     try:
         for at, text in enumerate(texts):
-            expected = daemon.cargo(text)
+            expected = daemon.cold(text)
             if expected is None:
-                return f"step {at}: not accepted by rustc"
+                return f"step {at}: {NOT_FRESH}"
             wrong = verdict(daemon, text, expected)[0]
             if wrong:
                 return f"step {at}: {wrong}"
@@ -430,7 +377,7 @@ def replay(work, edition, backend, sources):
         daemon.close()
 
 
-def reduce_pair(work, edition, backend, before, after, budget):
+def reduce_pair(work, edition, profile, before, after, budget):
     """Drops the cases the finding does not need from the source before the edit and the one after.
     Returns the two as modules, or None when a daemon that has only seen the one before gets
     the one after right: the finding needs the edits before it."""
@@ -441,7 +388,7 @@ def reduce_pair(work, edition, backend, before, after, budget):
             return False
         tests[0] += 1
         return (
-            replay(work, edition, backend, [modules_of(before, names), modules_of(after, names)]) is not None
+            replay(work, edition, profile, [modules_of(before, names), modules_of(after, names)]) is not None
         )
 
     names = [case.name for case in after if any(case.name == other.name for other in before)]
@@ -451,12 +398,33 @@ def reduce_pair(work, edition, backend, before, after, budget):
     return [modules_of(before, names), modules_of(after, names)]
 
 
-def write_found(tag, edition, backend, kind, what, wrong, sources, alone):
+def minimize(items, fails):
+    """Delta debugging: a smaller list for which `fails` still holds."""
+    n = 2
+    while len(items) >= 2:
+        size = max(len(items) // n, 1)
+        chunks = [items[i : i + size] for i in range(0, len(items), size)]
+        for i, chunk in enumerate(chunks):
+            rest = [x for j, c in enumerate(chunks) if j != i for x in c]
+            if fails(chunk):
+                items, n = chunk, 2
+                break
+            if len(chunks) > 2 and fails(rest):
+                items, n = rest, max(n - 1, 2)
+                break
+        else:
+            if size == 1:
+                break
+            n = min(n * 2, len(items))
+    return items
+
+
+def write_found(tag, edition, profile, kind, what, wrong, sources, alone):
     """Files a finding under found/edits/: the sources a daemon is to be shown in turn."""
     os.makedirs(EDITS, exist_ok=True)
     path = os.path.join(EDITS, f"{tag}.rs")
     head = [
-        f"// Found by edits.py: seed {tag}, edition {edition}, backend {backend}.",
+        f"// Found by edits.py: seed {tag}, edition {edition}, profile {profile}.",
         f"// The edit ({kind}): {what}",
         f"// Again: edits.py check '{json.dumps({'files': [os.path.basename(path)]})}'"
         if alone
@@ -482,34 +450,35 @@ def read_found(path):
     return sources, edition
 
 
-def check(paths, backends, work):
+def check(paths, profiles, work):
     """Each file given, or all of found/edits/: whether a daemon shown its sources in turn gets one wrong."""
-    paths = paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs"))
+    paths = paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs")) if os.path.isdir(EDITS) else paths
     wrong = 0
     for path in paths:
         path = path if os.path.exists(path) else os.path.join(EDITS, path)
         sources, edition = read_found(path)
-        for backend in backends:
-            said = replay(work, edition, backend, sources)
+        for profile in profiles:
+            said = replay(work, edition, profile, sources)
             wrong += said is not None
             print(
-                f"{'WRONG    ' if said else 'same     '} {os.path.basename(path)} ({backend}) {(said or '').splitlines()[0][:200] if said else ''}",
+                f"{'WRONG    ' if said else 'same     '} {os.path.basename(path)} ({profile}) {(said or '').splitlines()[0][:200] if said else ''}",
                 flush=True,
             )
     return wrong
 
 
-def round_of(seed, cases, steps, backend, work, out, budget):
-    """One program and its edits under one backend. Returns what each step came to."""
+def round_of(seed, cases, steps, profile, work, out, budget):
+    """One program and its edits under one profile. Returns what each step came to."""
     editor = Editor(seed, cases)
     edition = edition_of(seed)
-    # The seed names the result files, and kept out of the socket path it cannot make it too long.
-    daemon = Daemon(tempfile.mkdtemp(prefix=f"{backend}-", dir=work), edition, backend, editor.text())
+    daemon = Daemon(tempfile.mkdtemp(prefix=f"{profile}-", dir=work), edition, profile, editor.text())
     rows = []
     try:
-        expected = daemon.cargo(editor.text())
-        wrong, how, took = verdict(daemon, editor.text(), expected)
-        rows.append({"kind": "start", "what": "", "how": how, "ms": took, "wrong": wrong})
+        expected = daemon.cold(editor.text())
+        if expected is None:
+            raise SystemExit(f"the fresh build of the program as generated failed: {seed}")
+        wrong, took = verdict(daemon, editor.text(), expected)
+        rows.append({"kind": "start", "what": "", "how": "built", "ms": took, "wrong": wrong})
         for step in range(steps):
             if not daemon.alive():
                 break
@@ -518,21 +487,19 @@ def round_of(seed, cases, steps, backend, work, out, budget):
             if edit is None:
                 continue
             kind, what = edit
-            expected = daemon.cargo(editor.text())
+            expected = daemon.cold(editor.text())
             if expected is None or expected[0] == "timeout":
-                rows.append(
-                    {"kind": kind, "what": what, "how": "not accepted by rustc", "ms": 0, "wrong": None}
-                )
+                rows.append({"kind": kind, "what": what, "how": NOT_FRESH, "ms": 0, "wrong": None})
                 editor.back()
                 continue
-            wrong, how, took = verdict(daemon, editor.text(), expected)
-            row = {"kind": kind, "what": what, "how": how, "ms": took, "wrong": wrong}
+            wrong, took = verdict(daemon, editor.text(), expected)
+            row = {"kind": kind, "what": what, "how": "built", "ms": took, "wrong": wrong}
             if wrong and wrong.startswith("differs"):
-                pair = reduce_pair(work, edition, backend, before, editor.cases, budget)
+                pair = reduce_pair(work, edition, profile, before, editor.cases, budget)
                 sources = pair or [modules_of(before), modules_of(editor.cases)]
                 row["found"] = [
                     write_found(
-                        f"{seed}-s{step}-{backend}", edition, backend, kind, what, wrong, sources, bool(pair)
+                        f"{seed}-s{step}-{profile}", edition, profile, kind, what, wrong, sources, bool(pair)
                     )
                 ]
             rows.append(row)
@@ -546,20 +513,20 @@ def round_of(seed, cases, steps, backend, work, out, budget):
                 {"kind": "end", "what": "", "how": "", "ms": 0, "wrong": "panicked: " + panic_of(log)}
             )
         if any(row["wrong"] for row in rows):
-            shutil.copy(daemon.log, os.path.join(out, f"{seed}-{backend}.daemon.log"))
+            shutil.copy(daemon.log, os.path.join(out, f"{seed}-{profile}.daemon.log"))
     finally:
         daemon.close()
     return rows
 
 
 def one(job):
-    seed, cases, steps, backends, work, out, budget = job
-    result = {"seed": seed, "backends": {}}
-    for backend in backends:
+    seed, cases, steps, profiles, work, out, budget = job
+    result = {"seed": seed, "profiles": {}}
+    for profile in profiles:
         try:
-            result["backends"][backend] = round_of(seed, cases, steps, backend, work, out, budget)
+            result["profiles"][profile] = round_of(seed, cases, steps, profile, work, out, budget)
         except SystemExit as error:
-            result["backends"][backend] = [
+            result["profiles"][profile] = [
                 {"kind": "start", "what": "", "how": "no daemon", "ms": 0, "wrong": f"died: {error}"}
             ]
     Path(out, f"{seed}.json").write_text(json.dumps(result))
@@ -567,9 +534,9 @@ def one(job):
 
 
 def say(result):
-    for backend, rows in result["backends"].items():
+    for profile, rows in result["profiles"].items():
         wrong = [row for row in rows if row["wrong"]]
-        print(f"{result['seed']} {backend}: {len(rows) - 1} edits, {len(wrong)} findings", flush=True)
+        print(f"{result['seed']} {profile}: {len(rows) - 1} edits, {len(wrong)} findings", flush=True)
         for row in wrong:
             print(f"  {row['kind']} ({row['what']}): {row['wrong'].splitlines()[0][:200]}", flush=True)
             for path in row.get("found", []):
@@ -584,40 +551,37 @@ def report(directory):
         if name.endswith(".json")
     ]
     findings = 0
-    for backend in sorted({backend for result in results for backend in result["backends"]}):
-        rows = [row for result in results for row in result["backends"].get(backend, [])]
+    for profile in sorted({profile for result in results for profile in result["profiles"]}):
+        rows = [row for result in results for row in result["profiles"].get(profile, [])]
         edits = [
             row
             for row in rows
-            if row["kind"] not in ("start", "end") and row["how"] != "not accepted by rustc"
+            if row["kind"] not in ("start", "end") and row["how"] != NOT_FRESH
         ]
         wrong = [row for row in rows if row["wrong"]]
         findings += len(wrong)
         kinds = collections.Counter(row["wrong"].split(":")[0].split(" in ")[0] for row in wrong)
         print(
-            f"{backend}: {len(results)} programs, {len(edits)} edits shown to the daemon, "
-            f"{sum(row['how'] == 'not accepted by rustc' for row in rows)} edits rustc turned down, {len(wrong)} findings"
+            f"{profile}: {len(results)} programs, {len(edits)} edits shown to the daemon, "
+            f"{sum(row['how'] == NOT_FRESH for row in rows)} edits a fresh build turned down, {len(wrong)} findings"
             + "".join(f", {count} {kind}" for kind, count in sorted(kinds.items()))
         )
         print("  edit                 shown  wrong")
         for kind in sorted({row["kind"] for row in edits}):
             of_kind = [row for row in edits if row["kind"] == kind]
             print(f"  {kind:20} {len(of_kind):5}  {sum(bool(row['wrong']) for row in of_kind):5}")
-        print("  how the daemon linked")
-        for how, count in collections.Counter(row["how"] for row in edits).most_common():
-            print(f"  {count:5}  {how[:110]}")
     return findings
 
 
 SCRIPT = "edits.py"
-type Backend = Literal["cranelift", "llvm", "llvm-O0", "llvm-full"]
+type ProfileName = Literal["dev", "release"]
 
 
 @dataclass(frozen=True)
 class Smoke:
-    """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then found/edits/ again."""
+    """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then whatever is under found/edits/ again."""
 
-    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    profiles: tuple[ProfileName, ...] = ("dev", "release")
     jobs: int = 2
     # The builds a reduction may take.
     reduce: int = 12
@@ -636,7 +600,7 @@ class Run:
     steps: int = 12
     jobs: int = 2
     reduce: int = 12
-    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    profiles: tuple[ProfileName, ...] = ("dev", "release")
     out: str | None = None
     work: str | None = None
 
@@ -645,7 +609,7 @@ class Run:
 class Check:
     # Files under found/edits/ (or paths); none is all of them.
     files: tuple[str, ...] = ()
-    backends: tuple[Backend, ...] = ("cranelift", "llvm")
+    profiles: tuple[ProfileName, ...] = ("dev", "release")
     work: str | None = None
 
 
@@ -662,19 +626,19 @@ def positive(**fields):
 
 
 def directory(path, prefix):
-    path = path or tempfile.mkdtemp(prefix=prefix)
+    path = path or scratch(prefix)
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def rounds(seed, first, count, cases, steps, it):
     """Runs rounds `first` .. `first + count` of `seed` and reports them. Returns (findings, out, work)."""
-    if not it.backends:
-        fail(SCRIPT, "backends is empty: name at least one")
+    if not it.profiles:
+        fail(SCRIPT, "profiles is empty: name at least one")
     positive(jobs=it.jobs, reduce=it.reduce)
     out, work = directory(it.out, "blaze-edits-out-"), directory(it.work, "blaze-edits-")
     jobs = [
-        (f"{seed}-{index}", cases, steps, list(it.backends), work, out, it.reduce)
+        (f"{seed}-{index}", cases, steps, list(it.profiles), work, out, it.reduce)
         for index in range(first, first + count)
     ]
     with concurrent.futures.ProcessPoolExecutor(it.jobs) as pool:
@@ -688,7 +652,7 @@ def main():
         case ["smoke", text]:
             it = parse(Smoke, text, SCRIPT)
             findings, out, work = rounds("smoke", 0, 2, 4, 8, it)
-            findings += check([], list(it.backends), work)
+            findings += check([], list(it.profiles), work)
         case ["run", text]:
             it = parse(Run, text, SCRIPT)
             if it.first < 0:
@@ -697,9 +661,9 @@ def main():
             findings, out, _ = rounds(it.seed, it.first, it.rounds, it.cases, it.steps, it)
         case ["check", text]:
             it = parse(Check, text, SCRIPT)
-            if not it.backends:
-                fail(SCRIPT, "backends is empty: name at least one")
-            sys.exit(1 if check(list(it.files), list(it.backends), directory(it.work, "blaze-edits-")) else 0)
+            if not it.profiles:
+                fail(SCRIPT, "profiles is empty: name at least one")
+            sys.exit(1 if check(list(it.files), list(it.profiles), directory(it.work, "blaze-edits-")) else 0)
         case ["report", text]:
             sys.exit(1 if report(parse(Report, text, SCRIPT).dir) else 0)
         case _:

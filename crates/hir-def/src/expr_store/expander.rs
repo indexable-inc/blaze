@@ -2,16 +2,15 @@
 
 use std::mem;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::CfgOptions;
 use drop_bomb::DropBomb;
 use hir_expand::{
     AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, InFile, Lookup, MacroCallId,
-    eager::EagerCallBackFn, mod_path::ModPath, span_map::SpanMap,
+    eager::EagerCall, mod_path::ModPath, span_map::SpanMap,
 };
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
-use syntax::ast::HasAttrs;
-use syntax::{AstNode, Parse, ast};
+use syntax::{ast as tag, view as ast, view::AstNode};
 use tt::TextRange;
 
 use crate::{
@@ -31,7 +30,7 @@ pub(super) struct Expander<'db> {
 
 impl<'db> Expander<'db> {
     pub(super) fn new(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         current_file_id: HirFileId,
         def_map: &'db DefMap,
     ) -> Expander<'db> {
@@ -47,7 +46,7 @@ impl<'db> Expander<'db> {
     /// An expander of what is written in a part of `current_file_id` that is lowered as a tree
     /// of its own, with the maps of that part ([`crate::expr_store::body::BodySyntax`]).
     pub(super) fn within(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         current_file_id: HirFileId,
         def_map: &'db DefMap,
         span_map: &'db RealSpanMap,
@@ -77,7 +76,7 @@ impl<'db> Expander<'db> {
         self.span_map.span_for_range(range).ctx
     }
 
-    pub(super) fn hygiene_for_range(&self, db: &dyn SourceDatabase, range: TextRange) -> HygieneId {
+    pub(super) fn hygiene_for_range(&self, db: &Db, range: TextRange) -> HygieneId {
         match self.span_map {
             SpanMap::ExpansionSpanMap(span_map) => {
                 HygieneId::new(span_map.span_at(range.start()).ctx.opaque_and_semiopaque(db))
@@ -88,31 +87,45 @@ impl<'db> Expander<'db> {
 
     pub(super) fn is_cfg_enabled(
         &self,
-        owner: &dyn HasAttrs,
+        owner: ast::AnyHasAttrs<'_>,
         cfg_options: &CfgOptions,
     ) -> Result<(), cfg::CfgExpr> {
-        AttrFlags::is_cfg_enabled_for(owner, cfg_options)
+        AttrFlags::is_cfg_enabled_in(owner, cfg_options)
     }
 
-    pub(super) fn enter_expand<T: ast::AstNode>(
+    /// Expands `macro_call`, giving the expansion's root as a `T`: a view of the expansion's
+    /// tree, which the database keeps (`'db`).
+    pub(super) fn enter_expand<T: AstNode<'db>>(
         &mut self,
-        db: &'db dyn SourceDatabase,
-        macro_call: ast::MacroCall,
+        db: &'db Db,
+        macro_call: ast::MacroCall<'_>,
         krate: Crate,
         resolver: impl Fn(&ModPath, SyntaxContext) -> Option<MacroId>,
-        eager_callback: EagerCallBackFn<'_>,
-    ) -> Result<ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>>, UnresolvedMacro> {
+        eager_calls: &mut Vec<EagerCall>,
+    ) -> Result<ExpandResult<Option<(Mark<'db>, Option<T>)>>, UnresolvedMacro> {
         // FIXME: within_limit should support this, instead of us having to extract the error
         let mut unresolved_macro_err = None;
 
         let result = self.within_limit(db, |this| {
-            let macro_call = this.in_file(&macro_call);
+            let macro_call = this.in_file(macro_call);
 
-            let expands_to = hir_expand::ExpandTo::from_call_site(macro_call.value);
-            let ast_id = AstId::new(macro_call.file_id, this.ast_id_map().ast_id(macro_call.value));
+            let expands_to = match hir_expand::ExpandTo::of_call_site_view(macro_call.value) {
+                Ok(it) => it,
+                Err(parent) => {
+                    return ExpandResult::only_err(ExpandError::other(
+                        this.span_map.span_for_range(macro_call.value.syntax().text_range()),
+                        // alloc: an error's message, on the error path
+                        format!("blaze can't tell what a macro call in a `{parent:?}` expands to"),
+                    ));
+                }
+            };
+            let ast_id = AstId::new(
+                macro_call.file_id,
+                this.ast_id_map().ast_id_of_view::<tag::MacroCall>(macro_call.value),
+            );
             let path = macro_call.value.path().and_then(|path| {
                 let range = path.syntax().text_range();
-                let mod_path = ModPath::from_src(db, path, &mut |range| {
+                let mod_path = ModPath::from_src_view(db, path, &mut |range| {
                     this.span_map.span_for_range(range).ctx
                 })?;
                 let call_site = this.span_map.span_for_range(range);
@@ -136,7 +149,7 @@ impl<'db> Expander<'db> {
                 this.macro_depth + 1,
                 this.recursion_limit,
                 |path| resolver(path, call_site.ctx).map(|it| it.definition(db)),
-                eager_callback,
+                eager_calls,
             ) {
                 Ok(call_id) => call_id,
                 Err(resolve_err) => {
@@ -149,11 +162,11 @@ impl<'db> Expander<'db> {
         if let Some(err) = unresolved_macro_err { Err(err) } else { Ok(result) }
     }
 
-    pub(super) fn enter_expand_id<T: ast::AstNode>(
+    pub(super) fn enter_expand_id<T: AstNode<'db>>(
         &mut self,
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         call_id: MacroCallId,
-    ) -> ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>> {
+    ) -> ExpandResult<Option<(Mark<'db>, Option<T>)>> {
         self.within_limit(db, |_this| ExpandResult::ok(Some(call_id)))
     }
 
@@ -181,11 +194,11 @@ impl<'db> Expander<'db> {
         self.current_file_id
     }
 
-    fn within_limit<F, T: ast::AstNode>(
+    fn within_limit<F, T: AstNode<'db>>(
         &mut self,
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         op: F,
-    ) -> ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>>
+    ) -> ExpandResult<Option<(Mark<'db>, Option<T>)>>
     where
         F: FnOnce(&mut Self) -> ExpandResult<Option<MacroCallId>>,
     {
@@ -213,12 +226,13 @@ impl<'db> Expander<'db> {
             ));
         }
 
-        let res = call_id.parse_macro_expansion(db);
+        let res: &'db ExpandResult<_> = call_id.parse_macro_expansion(db);
 
+        // clone: error path
         let err = err.or_else(|| res.err.clone());
         ExpandResult {
             value: {
-                let parse = res.value.0.clone().cast::<T>();
+                let parse = T::cast(res.value.0.root());
 
                 self.macro_depth += 1;
                 let old_file_id = std::mem::replace(&mut self.current_file_id, call_id.into());

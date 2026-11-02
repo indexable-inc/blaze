@@ -1,6 +1,7 @@
 use super::CargoResult;
 use super::features::{CliFeatures, RequestedFeatures};
 use crate::interning::InternedString;
+use crate::persistent;
 use crate::{Dependency, PackageId, SourceId, Summary};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,7 +98,7 @@ pub(super) type FeaturesSet = Rc<BTreeSet<InternedString>>;
 
 /// Resolver behavior, used to opt-in to new behavior that is
 /// backwards-incompatible via the `resolver` field in the manifest.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum ResolveBehavior {
     /// V1 is the original resolver behavior.
     V1,
@@ -120,13 +121,12 @@ impl ResolveBehavior {
         }
     }
 
-    pub fn to_manifest(&self) -> String {
+    pub fn to_manifest(&self) -> &'static str {
         match self {
             ResolveBehavior::V1 => "1",
             ResolveBehavior::V2 => "2",
             ResolveBehavior::V3 => "3",
         }
-        .to_owned()
     }
 }
 
@@ -268,12 +268,12 @@ pub(super) struct RemainingDeps {
     /// the data is augmented by the insertion time.
     /// This insures that no two items will cmp eq.
     /// Forcing the `OrdSet` into a multi set.
-    data: im_rc::OrdSet<(DepsFrame, u32)>,
+    data: persistent::OrdSet<(DepsFrame, u32)>,
 }
 
 impl RemainingDeps {
     pub(super) fn new() -> RemainingDeps {
-        RemainingDeps { time: 0, data: im_rc::OrdSet::new() }
+        RemainingDeps { time: 0, data: persistent::OrdSet::new() }
     }
     pub(super) fn push(&mut self, x: DepsFrame) {
         let insertion_time = self.time;
@@ -357,6 +357,7 @@ impl ConflictReason {
 /// If resolving a dependency fails then this represents an incompatibility,
 /// that dependency will never be resolve while all of these packages are active.
 /// This is useless if the packages can't be simultaneously activated for other reasons.
+// BTreeMap: the conflict trie is keyed by these keys in order, and errors list them in order.
 pub(super) type ConflictMap = BTreeMap<PackageId, ConflictReason>;
 
 pub(super) struct RcVecIter<T> {
@@ -388,6 +389,6 @@ impl<T> RcVecIter<T> {
 // Not derived to avoid `T: Clone`
 impl<T> Clone for RcVecIter<T> {
     fn clone(&self) -> RcVecIter<T> {
-        RcVecIter { vec: self.vec.clone(), offset: self.offset }
+        RcVecIter { vec: Rc::clone(&self.vec), offset: self.offset }
     }
 }

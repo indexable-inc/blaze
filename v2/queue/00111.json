@@ -1,0 +1,24 @@
+{
+  "id": "00111",
+  "from_lane": "safety-tb",
+  "owner": "safety",
+  "paths": [
+    "Cargo.lock",
+    "crates/blaze-check/src/lib.rs"
+  ],
+  "what": "## From safety-tb (2026-10-29): `crate::borrows` is done; what `check` needs to call\n\nFor safety-check (`check.rs`, `check/valid.rs`); no change to the parent's files.\n\n- **Per-thread frames.** `Borrows::set_thread(ThreadId)` picks the thread whose stack\n  `push_frame`, `pop_frame` and function-entry retags act on (main until set). Miri keeps\n  protected tags per frame of each thread, so frames of different threads return in any\n  order. `check` must call it on every thread switch before any call, return or retag\n  (`fail/tree_borrows/spurious_read.rs` needs it).\n- **Read-only memory.** `NewPermission::writes()` says whether a retag of a non-empty range\n  writes through the parent (implicit writes). Miri's `tb_reborrow` refuses that as\n  `WriteToReadOnly` before the tree sees it, so `check` checks mutability first when\n  `writes()` holds (`implicit_writes/static_memory_modification.rs`).\n- `check/valid.rs::retag` should pass `with_implicit_writes(true)` under\n  `-Zmiri-tree-borrows-implicit-writes`, except for `#[rustc_no_writable]` callees.\n- `Borrows::gc_due()` / `GC_EVERY`: call `gc` when due with every tag memory and the\n  evaluator hold.\n- `cells` is `check`'s to compute as Miri's `visit_freeze_sensitive`: each `UnsafeCell`\n  field's bytes, and a whole non-`Freeze` union or multi-variant enum.\n- `RetagMode::Raw`/`None` and a `&mut`/`Box` to a `!Unpin` pointee are no-ops (`Ok(None)`).\n  Accesses, frees and retags of a non-empty range of a dead allocation panic: memory checks\n  liveness first.\n\n> forwarded to safety: between its children.\n\n### M1 update (safety-model, 19:2x): `blaze-check` depends on no workspace crate\n\n`blaze-core` now depends on `blaze-ids` (fix-radix), which will have model tests, so\n`blaze-check` dropped its `blaze-core` dependency (it keeps its own copy of SplitMix64). Its\ndependencies are now `rustc-hash`, `libc` (Unix) and `windows-sys` (Windows): the `Cargo.lock`\nentry of M1 lists those three. `crates/blaze-check/src/lib.rs` exists, so M1 1 (the workspace\ndependency) can go in.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From safety-tb (2026-10-29): `crate::borrows` is done; what `check` needs to call",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:943"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00187",
+  "from_lane": "requests-db-fixture",
+  "owner": "cargo",
+  "paths": [
+    "crates/load-cargo/src/lib.rs",
+    "crates/load-cargo"
+  ],
+  "what": "## From requests-db-fixture (2026-10-29): `const_macro::enable` is gone (`crates/load-cargo/src/lib.rs:408`)\n\nWhat: delete the `if const_macros { ide_db::const_macro::enable(&*db); }` block in\n`crates/load-cargo/src/lib.rs` (L407-409).\n\nWhy: `hir_ide::const_macro::enable` (re-exported through `hir` and `ide-db`) is deleted. It\nregistered salsa's `HirDatabase` downcaster so the const-macro expander, handed a\n`&dyn SourceDatabase`, could get the `HirDatabase` back. The expander now takes `&Db`\n(`hir_expand::proc_macro::ProcMacroExpander::expand`), and `HirDatabase` is hir-ty's sealed\nextension trait over `Db` with no downcaster, so there is nothing to enable: const macros\nwork on every `Db`. If `const_macros` is then unused there, it goes too.\n\n> forwarded to cargo (`crates/load-cargo/`) (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:57Z",
+  "updated": "2026-10-30T14:35:22Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": "v2/requests/requests.md#From requests-db-fixture (2026-10-29): `const_macro::enable` is gone (`crates/load-cargo/src/lib.rs:408`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests.md:76"
+    },
+    {
+      "at": "2026-10-30T12:52:16Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:35:22Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "load-cargo deleted 07:32:46 (01043); const macros load through blaze-lower const_macros.rs instead (00985)."
+    }
+  ]
+}

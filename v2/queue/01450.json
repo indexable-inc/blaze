@@ -1,0 +1,24 @@
+{
+  "id": "01450",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty/src/next_solver/allocation.rs"
+  ],
+  "what": "hir-ty-mir tests/mir alloc_budget::lowering_allocates_the_kept_body_and_its_setup_only (01441, 9 vs 65 extras at 8 vs 64 statements): MIR lowering of an integer/char/bool/float literal (hir-ty-mir lower.rs lower_literal_to_operand, const_bytes) boxes its bytes and Operand::from_concrete_const -> Allocation::new interns them; for a value already interned (every repeated `1u32`) ALLOCATIONS.intern finds the row and drops the Box: one heap allocation per literal that nothing keeps. Ask: a lookup by borrowed bytes that boxes only on a vacant row. In crates/hir-ty/src/next_solver/interner.rs table::Values add `pub(crate) fn intern_with<K: Hash + ?Sized, V: Erase<Static = T>>(&self, key: &K, eq: impl Fn(&T) -> bool, make: impl FnOnce() -> V) -> NonZeroU32` (hash_of(key) must equal hash_of of the value; find, then lock, then make() only on Entry::Vacant), and in next_solver/allocation.rs `pub fn from_bytes(ty: Ty<db>, memory: &[u8]) -> Self` for an empty memory map, whose key hashes as AllocationData does (ty, then the bytes as [u8], then MemoryMap::Empty). When it lands I move lower_literal_to_operand (and Operand::from_bytes callers in lowering) to it in hir-ty-mir; the budget test stays as is (lowering must not grow with the body).",
+  "state": "open",
+  "created": "2026-11-01T04:03:17Z",
+  "updated": "2026-11-01T04:03:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:03:17Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

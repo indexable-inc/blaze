@@ -1,0 +1,35 @@
+{
+  "id": "00866",
+  "from_lane": "fix-front-def",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-ids/src/lib.rs"
+  ],
+  "what": "blaze_ids::Hasher has no `opt_part`, but v2 code calls it as an inherent chained method: base-db lib.rs:208,437, input.rs:260,263,879; blaze-items key.rs:89-90; hir-def deps/key.rs:217, deps/reads.rs:211 (E0599 in the front-def check). base-db content.rs:81 documents `opt_bytes` as \"what Hasher::opt_part hashes\", so add to crates/blaze-ids/src/lib.rs `impl Hasher`, encoding exactly as opt_bytes does (0 for None, else 1 then a u64-length-prefixed part): `pub fn opt_part(&mut self, part: Option<impl AsRef<[u8]>>) -> &mut Hasher { match part { None => self.update(&[0]), Some(part) => self.update(&[1]).part(part.as_ref()) } }`. Callers pass Option<&str> and Option<String> (process_env_var, Version::to_string), so the generic takes both without a clone.",
+  "state": "applied",
+  "created": "2026-10-30T09:12:30Z",
+  "updated": "2026-10-30T10:00:07Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:12:30Z",
+      "by": "fix-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:07Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:00:07Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "already in the tree: crates/blaze-ids/src/lib.rs:202 Hasher::opt_part (blaze-ids is format's)"
+    }
+  ]
+}

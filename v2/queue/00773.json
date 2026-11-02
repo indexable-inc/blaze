@@ -1,0 +1,30 @@
+{
+  "id": "00773",
+  "from_lane": "hot-sweep-cg-mod",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/traits.rs",
+    "crates/hir-ty-codegen/patch.rs"
+  ],
+  "what": "## `StoredParamEnvAndCrate` derives `Copy`\n\n- What: in `crates/hir-ty/src/traits.rs`, `#[derive(Debug, Clone, PartialEq, Eq, Hash)]` on\n  `pub struct StoredParamEnvAndCrate` becomes `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]`.\n- Why: both fields are already `Copy` (`StoredClauses` is a `NonZeroU32` row index from\n  `impl_stored_interned_slice!`, `Crate` is a salsa input id), so it is 8 bytes of plain data.\n  `hir-ty-codegen/patch.rs` and `mod.rs` pass it by value into salsa queries once per\n  instance on the live-patch and lowering paths, written today as `env.clone()`; the hot lint\n  flags each. With `Copy` those become `*env`/`env`. Changes no behavior.\n- Dependency: `crates/hir-ty-codegen/patch.rs` already relies on this (`*env` / by-value\n  uses where `env.clone()` was). It won't compile until this is applied.",
+  "state": "refused",
+  "created": "2026-10-30T07:21:22Z",
+  "updated": "2026-10-30T08:40:16Z",
+  "taken_by": null,
+  "why": "already done: crates/hir-ty/src/traits.rs:56 derives Copy on StoredParamEnvAndCrate.",
+  "source": "v2/requests/hot-sweep-cg-mod.md#`StoredParamEnvAndCrate` derives `Copy`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-cg-mod.md:3"
+    },
+    {
+      "at": "2026-10-30T08:40:16Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done: crates/hir-ty/src/traits.rs:56 derives Copy on StoredParamEnvAndCrate."
+    }
+  ]
+}

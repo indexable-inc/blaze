@@ -1,0 +1,35 @@
+{
+  "id": "01172",
+  "from_lane": "no-fallback-tools",
+  "owner": "no-fallback-link",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "blaze-vfs Vfs::restore (crates/blaze-vfs/src/image.rs:196-233) passes over an image that does not open, that the journal does not start from, or whose disks section is refused, and loads the journal alone (same tree, slower start); the reason is only in Recovered::image (ImageUse::Refused/Unnamed, disks: Some(why)). The daemon (crates/blaze-cargo/src/serve/daemon.rs, where it reads ImageUse) should make a refused or corrupt image an error naming why, not a quiet slower start (no-fallback: a slow path when the fast one refuses). ImageUse::None (no image yet) stays a cold start.",
+  "state": "applied",
+  "created": "2026-10-30T23:22:44Z",
+  "updated": "2026-10-31T03:10:34Z",
+  "taken_by": "no-fallback-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:22:44Z",
+      "by": "no-fallback-tools",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:10:34Z",
+      "by": "no-fallback-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T03:10:34Z",
+      "by": "no-fallback-link",
+      "action": "done",
+      "note": "already in the tree (no-fallback-link-cargo): daemon.rs vfs_used: ImageUse::Unnamed, Corrupt, Malformed are StartError::Image(ImageFault::Vfs(VfsFault::..)); ImageUse::None/Unopened stay; ImageUse::Refused (missing section or another schema, the same rule as the database) is Started::tree, printed at start. A disks refusal is Started::disks: blaze-vfs open_disks gives it only as a String, so a corrupt disks section cannot yet be told from another schema; that is 01169 (owner vfs). Tests: daemon.rs vfs_used tests."
+    }
+  ]
+}

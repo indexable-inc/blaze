@@ -1,0 +1,29 @@
+{
+  "id": "01370",
+  "from_lane": "tests-diag",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "test-utils minicore.rs, region default / builtin_impls: add `impl Default for bool` (`false`), as core has; also `char` (`\\x00`) and `()` while there. Without it blaze-diagnostics tests::lints::syntax::delims::values::a_labelled_break_of_a_name_before_a_block_keeps_its_parentheses (rustc's check-pass tests/ui/lint/unused/unused-parens-labeled-break-issue-143256.rs: `let i = Default::default(); if (break 'outer i) {..}`) gets E0277 `bool: Default`. One line: `impl_default! { false; bool }` next to the integer ones.",
+  "state": "applied",
+  "created": "2026-11-01T00:05:21Z",
+  "updated": "2026-11-01T00:55:37Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:05:21Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:55:37Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "minicore builtin_impls: Default for bool (false), char (NUL) and (); unbuilt, next round"
+    }
+  ]
+}

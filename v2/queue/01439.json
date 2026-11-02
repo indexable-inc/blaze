@@ -1,0 +1,36 @@
+{
+  "id": "01439",
+  "from_lane": "repro",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script.rs",
+    "crates/blaze-cargo/src/serve/unit/compile.rs"
+  ],
+  "what": "A registry dependency's build script is run before its link writes the binary, so every crate with one (zmij, serde_core, serde_json, object 0.39.1) fails: `failed to run custom build command for zmij v1.0.21` / `blaze: could not run <target>/debug/build/zmij/<h>/out/build_script_build: No such file or directory (os error 2)`, and `link: <that path> (first link)` is printed after the failure. The binary exists afterwards (valid arm64 Mach-O, mtime = the end of the job). Deterministic (4 of 4 on blaze b2wt-target/debug/blaze of 19:44, segment fix in). A package's own build script and a path dependency's both run fine, so the gap is the registry script's exec reading a file only written with the job's outputs. This is what self9's #9 (zmij, serde_core) and the serde_json stall (#8) were. Tests: crates/blaze-engine/tests/repro.rs a_registry_dependencys_build_script_runs (zmij alone, prints 1.5) and a_dependency_std_also_uses_builds (object 0.39.1, prints Little). Detail: /tmp/blaze-lanes/v2-repro.md #11.",
+  "state": "applied",
+  "created": "2026-11-01T03:29:50Z",
+  "updated": "2026-11-01T05:51:49Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:29:50Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:02:47Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T05:51:49Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "green in round 24 (9661f55b99): blaze_cargo 384/0, blaze_units 148/0, blaze_lower all passing"
+    }
+  ]
+}

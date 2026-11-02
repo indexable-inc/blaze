@@ -1,0 +1,30 @@
+{
+  "id": "00956",
+  "from_lane": "drop-oracles",
+  "owner": "fastcompile-macros",
+  "paths": [
+    "harness/v2/macroeval_corpus.py",
+    "crates/blaze-macro-eval/tests/corpus.rs"
+  ],
+  "what": "Andrew 2026-10-30 dropped every harness that compares blaze with rustc or cargo (docs/harness.md; AGENTS.md best-long-term-design now says prove it on real crates own test suites and fuzzing of blaze own invariants). macroeval_corpus.py holds blaze-macro-eval token for token to the pinned nightly rustc build of each macro (the `reference` step, cargo build at ~300-306). Please drop the rustc reference and hold the evaluator to what the corpus states itself: the macros own expected expansions or the corpus crates own tests passing when built with blaze expansions, plus the kept-expansion checks (kept.rs), which are blaze against itself. engine.reference_env stays for fetching only.",
+  "state": "applied",
+  "created": "2026-10-30T11:58:50Z",
+  "updated": "2026-10-30T12:05:45Z",
+  "taken_by": "fastcompile-macros",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T11:58:50Z",
+      "by": "drop-oracles",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T12:05:45Z",
+      "by": "fastcompile-macros",
+      "action": "done",
+      "note": "rustc reference dropped (harness reference and server steps, config server/dylibs, Reference::Toolchain); corpus.rs holds calls to their own checks and to blaze`s other hosts (wasm, native); new fixture tests ws/calls/src/tests.rs (serde/thiserror/tokio/own macros behavior) run by the harness `fixture` step via blaze test -p corpus-calls; reference_env kept for cargo fetch only. Not built; harness selftest needs the uv env (not run)."
+    }
+  ]
+}

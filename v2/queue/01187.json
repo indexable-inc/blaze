@@ -1,0 +1,35 @@
+{
+  "id": "01187",
+  "from_lane": "tests-misc-front2",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs"
+  ],
+  "what": "expr_use_visitor.rs:959 walks a compound assignment (`BinaryOp::Assignment { op: Some(..) }`) with consume_expr(lhs) always. rustc_hir_typeck expr_use_visitor `ExprKind::AssignOp`: `if is_method_call(expr) { consume_expr(lhs) } else { mutate_expr(lhs) }; consume_expr(rhs)` (writeback strips the method for builtin scalar ops). So in `let mut n = 0u32; let mut add = |k: u32| n += k;` v2 captures `n` by shared ref when no &mut autoref was recorded (fixture minicore without `add`), and borrowck reports E0594 on `n += k`: hir-ty-borrowck differential::analyses::borrowck_reports_rustcs_codes_at_rustcs_spans_in_both_modes (`closures` of check/tests.rs CLEAN). Fix: port the rustc branch (method resolution recorded for the expr -> consume_expr(lhs), else mutate_expr(lhs)).",
+  "state": "applied",
+  "created": "2026-10-30T23:56:44Z",
+  "updated": "2026-10-31T13:54:50Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:56:44Z",
+      "by": "tests-misc-front2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:53:12Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:54:50Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "hir-ty infer/closure/analysis/expr_use_visitor.rs walk_expr: a compound assignment (BinaryOp::Assignment { op: Some }) now ports rustc ExprKind::AssignOp: method resolution recorded for the expr -> consume_expr(lhs) (its &mut autoref borrows), else mutate_expr(lhs); consume_expr(rhs). The op: None arm keeps consuming both. Unit test for hir-ty-mir closure_captures.rs queued to tests-misc-front2."
+    }
+  ]
+}

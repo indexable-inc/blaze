@@ -1,10 +1,33 @@
+use std::fmt::Debug;
 use std::ops::Deref;
 
 use rustc_type_ir::solve::{
-    Certainty, FetchEligibleAssocItemResponse, Goal, NoSolution, VisibleForLeakCheck,
+    ComputeGoalFastPathOutcome, FastPathDepth, FetchEligibleAssocItemResponse, Goal, NoSolution,
+    VisibleForLeakCheck,
 };
-use rustc_type_ir::{self as ty, InferCtxtLike, Interner, TypeFoldable};
+use rustc_type_ir::transmute::Answer;
+use rustc_type_ir::{
+    self as ty, CanonicalizerState, Const, InferCtxtLike, Interner, Region, TypeFoldable,
+};
 
+use crate::solve::SearchStorage;
+
+/// `SolverDelegate` is one of the two traits in the `rustc_type_ir` shared abstraction layer
+/// between rustc and rust-analyzer abstracting over the [InferCtxt][inferctxt-doc], which had to be
+/// split due to coherence reasons:
+/// - `SolverDelegate` contains the parts depending on trait-solving logic, to provide functionality
+///   in `rustc_trait_selection`, and is implemented by a [simple wrapper over
+///   `InferCtxt`][inferctxt-wrapper-doc] there,
+/// - [InferCtxtLike] contains the other parts, and is implemented [directly on
+///   `InferCtxt`][inferctxtlike-impl-doc].
+///
+/// More information can also be found in the dedicated chapter in the dev-guide, in [this
+/// section][dev-guide].
+///
+/// [inferctxt-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_infer/infer/struct.InferCtxt.html
+/// [inferctxt-wrapper-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_trait_selection/solve/delegate/struct.SolverDelegate.html
+/// [inferctxtlike-impl-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_infer/infer/struct.InferCtxt.html#impl-InferCtxtLike-for-InferCtxt%3C'tcx%3E
+/// [dev-guide]: https://rustc-dev-guide.rust-lang.org/solve/sharing-crates-with-rust-analyzer.html#trait-inferctxtlike-and-trait-solverdelegate
 pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     type Infcx: InferCtxtLike<Interner = Self::Interner>;
     type Interner: Interner;
@@ -23,22 +46,30 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         span: <Self::Interner as Interner>::Span,
-    ) -> Option<Certainty>;
+        depth: FastPathDepth,
+    ) -> ComputeGoalFastPathOutcome<Self::Interner>;
 
-    fn fresh_var_for_kind_with_span(
+    fn fresh_var_for_kind(
         &self,
         arg: <Self::Interner as Interner>::GenericArg,
         span: <Self::Interner as Interner>::Span,
+        universe: ty::UniverseIndex,
     ) -> <Self::Interner as Interner>::GenericArg;
 
     // FIXME: Uplift the leak check into this crate.
     fn leak_check(&self, max_input_universe: ty::UniverseIndex) -> Result<(), NoSolution>;
 
-    fn evaluate_const(
+    /// Evaluate a const, normalizing the type of the resulting value with `normalize_ty`.
+    /// Returns `Ok(None)` if the const is too generic, and `Err(_)` only if `normalize_ty`
+    /// failed.
+    fn evaluate_const<E: Debug>(
         &self,
         param_env: <Self::Interner as Interner>::ParamEnv,
-        uv: ty::UnevaluatedConst<Self::Interner>,
-    ) -> Option<<Self::Interner as Interner>::Const>;
+        alias_const: ty::AliasConst<Self::Interner>,
+        normalize_ty: impl FnOnce(
+            ty::Unnormalized<Self::Interner, <Self::Interner as Interner>::Ty>,
+        ) -> Result<<Self::Interner as Interner>::Ty, E>,
+    ) -> Result<Option<Const<Self::Interner>>, E>;
 
     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!
     fn well_formed_goals(
@@ -50,6 +81,15 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>;
+
+    /// [`Self::make_deduplicated_region_constraints`], appended to `into`: an implementation
+    /// that writes them there directly allocates nothing once `into` has room.
+    fn make_deduplicated_region_constraints_into(
+        &self,
+        into: &mut Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>,
+    ) {
+        into.extend(self.make_deduplicated_region_constraints());
+    }
 
     fn instantiate_canonical<V>(
         &self,
@@ -87,6 +127,31 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         src: <Self::Interner as Interner>::Ty,
         dst: <Self::Interner as Interner>::Ty,
-        assume: <Self::Interner as Interner>::Const,
-    ) -> Result<Certainty, NoSolution>;
+        assume: Const<Self::Interner>,
+    ) -> Result<Answer<Region<Self::Interner>, <Self::Interner as Interner>::Ty>, NoSolution>;
+
+    /// Obtain canonicalizer state, either by allocating it afresh (the default) or by reusing
+    /// previously allocated state.
+    fn obtain_canonicalizer_state(&self) -> CanonicalizerState<Self::Interner> {
+        Default::default()
+    }
+
+    /// Release canonicalizer state, either by deallocating it (the default) or by clearing it and
+    /// stashing it for later reuse.
+    fn release_canonicalizer_state(&self, _: CanonicalizerState<Self::Interner>) {}
+
+    /// The search graph's storage for a root goal. The delegate may keep it between root goals
+    /// (on its worker); the default makes a fresh one.
+    fn obtain_search_storage(&self) -> SearchStorage<Self::Interner> {
+        Default::default()
+    }
+
+    /// Takes back what [`Self::obtain_search_storage`] gave, emptied.
+    fn release_search_storage(&self, _storage: SearchStorage<Self::Interner>) {}
+
+    fn emit_next_solver_overflow_fcw(
+        &self,
+        goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
+        span: <Self::Interner as Interner>::Span,
+    );
 }

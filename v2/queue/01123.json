@@ -1,0 +1,35 @@
+{
+  "id": "01123",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R5 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md): span is below base-db and interns `SyntaxContextImpl` (span hygiene.rs:62) with 14 methods generic over the database; it can't name base_db::Db, but plumbing's `Interned` has `type Db` concrete. Ask: interned ingredients' generated functions generic over `D: Database` (interning and `interned_fields` touch only `db.storage()`: `intern<I>(storage: &Storage, ..)`, `interned_fields<I>(storage, id)`), so span keeps `fn x<D: Database>(self, db: &D)`; span's tests use a local `struct TestDb(Storage); impl Database for TestDb` (allowed in tests?).",
+  "state": "applied",
+  "created": "2026-10-30T21:59:10Z",
+  "updated": "2026-10-30T22:08:31Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:10Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:30Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract: input/interned/tracked plumbing takes &Storage (generic over D: Database); tests may define TestDb(Storage)."
+    }
+  ]
+}

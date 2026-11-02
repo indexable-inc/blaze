@@ -1,0 +1,29 @@
+{
+  "id": "01135",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify-macros",
+  "paths": [
+    "crates/blaze-query-macros"
+  ],
+  "what": "Contract additions (docs/v2/plan/lanes/db/query-unify.md, The contract, edited by query-unify-engine): (1) every trait gains `const FILE: &str` (Function, Input, Interned, Tracked): generate `const FILE: &str = file!();`; that is how the Vtable carries file!() (Vtable::function::<C>() reads C::FILE). (2) `Interned::ids_of(fields: &Self::Fields, out: &mut Vec<Id>)`: push each AsId field id, call NamesIds::names_ids for fields that implement it, in field order; Storage::ids_of dispatches to it (01127). (3) `unshareable_reads<D: Database>(db: &D)` returns (); `ReadKind::{Function, InputField(u32), TrackedField(u32), Interned}`; `pump_barrier<R>(f) -> R`; Cancelled is an enum with throw/catch; `input_new<I, const N: usize>` asserts N == FIELDS. (4) A hidden key interned struct must have NAME `f::interned_arguments`: interned_arguments(storage, id) strips that suffix from the owner name.",
+  "state": "taken",
+  "created": "2026-10-30T22:13:13Z",
+  "updated": "2026-10-30T22:17:59Z",
+  "taken_by": "query-unify-macros",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:13:13Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:17:59Z",
+      "by": "query-unify-macros",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "id": "01083",
+  "from_lane": "integrate-load",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "01067 (pack) is written, unbuilt. Please (1) add blaze-wasm-pack = { path = \"crates/blaze-wasm/pack\" } to root [workspace.dependencies] and a Cargo.lock entry for package blaze-wasm-pack (its registry deps rustc-hash 2.1.2, serde 1.0.228, triomphe 0.1.15 already resolve in the root lock) plus blaze-wasm-pack in blaze-cargo's dependency list; blaze-cargo/Cargo.toml has it as a path dependency for now, switch it to `blaze-wasm-pack.workspace = true` once the root entry exists. (2) Check blaze-api, blaze-ui, blaze-cargo (lib and tests) and fuzz/targets/api_envelope.rs: SCHEMA 15, Request::Pack, Response::Packed, ResponseRef::Packed, Work::Pack, serve Does::Pack + Jobs::pack (a second plane request after the check build, whose one answer task owns the writer), serve/unit/pack.rs, `blaze pack -p PACKAGE --out PATH` in cli/inspect.rs. Send each error to integrate-load.",
+  "state": "applied",
+  "created": "2026-10-30T16:07:34Z",
+  "updated": "2026-10-31T19:05:48Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:07:34Z",
+      "by": "integrate-load-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T19:05:48Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "root blaze-wasm-pack path entry, its Cargo.lock entry and blaze-cargo blaze-wasm-pack.workspace = true are in; blaze-api, blaze-cargo and fuzz api_envelope check and test clean since round 10 (844fdd3314), round 11b 81a41a7baf."
+    }
+  ]
+}

@@ -1,23 +1,42 @@
 //! Transcriber takes a template, like `fn $ident() {}`, a set of bindings like
 //! `$ident => foo`, interpolates variables in the template, to get `fn foo() {}`
 
+use std::alloc::Allocator;
+
+use blaze_mem::frame::Frame;
 use intern::{Symbol, sym};
 use span::{Edition, Span};
 use stdx::itertools::Itertools;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
 use crate::{
-    ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
-    expander::{Binding, Bindings, Fragment},
-    parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
+    ExpandError, ExpandErrorKind, ExpandResult, MadeIdents, MetaTemplate,
+    expander::{Binding, Bindings, Fragment, TokensOrigin},
+    parser::{Binder, ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
+/// Why [`Bindings::get_fragment`] gave no fragment.
+enum Miss {
+    /// The innermost repetition is past its last round, which `expand_repeat` drops with all
+    /// it made, so no error is made for it.
+    Ended,
+    Error(ExpandError),
+}
+
+impl From<ExpandError> for Miss {
+    fn from(it: ExpandError) -> Self {
+        Miss::Error(it)
+    }
+}
+
 impl<'t> Bindings<'t> {
-    fn get(&self, name: &MetaVar, span: Span) -> Result<&Binding<'t>, ExpandError> {
-        match self.inner.get(name) {
+    /// The binding of `name`, numbered `binder` when its rule was defined.
+    fn get(&self, binder: Binder, name: &MetaVar, span: Span) -> Result<Binding, ExpandError> {
+        match self.root(binder) {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
+                // alloc: an error.
                 ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.sym().as_str()))),
             )),
         }
@@ -25,17 +44,20 @@ impl<'t> Bindings<'t> {
 
     fn get_fragment(
         &self,
+        binder: Binder,
         name: &MetaVar,
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
-    ) -> Result<Fragment<'t>, ExpandError> {
+    ) -> Result<Fragment<'t>, Miss> {
         macro_rules! binding_err {
-            ($($arg:tt)*) => { ExpandError::binding_error(span, format!($($arg)*)) };
+            // alloc: an error.
+            ($($arg:tt)*) => { Miss::Error(ExpandError::binding_error(span, format!($($arg)*))) };
         }
 
-        let mut b = self.get(name, span)?;
-        for nesting_state in nesting.iter_mut() {
+        let mut b = self.get(binder, name, span)?;
+        let innermost = nesting.len().wrapping_sub(1);
+        for (depth, nesting_state) in nesting.iter_mut().enumerate() {
             nesting_state.hit = true;
             b = match b {
                 Binding::Fragment(_) => break,
@@ -43,18 +65,30 @@ impl<'t> Bindings<'t> {
                     nesting_state.at_end = true;
                     break;
                 }
-                Binding::Nested(bs) => bs.get(nesting_state.idx).ok_or_else(|| {
-                    nesting_state.at_end = true;
-                    binding_err!("could not find nested binding `{name}`")
-                })?,
+                Binding::Nested { start, len } => {
+                    match self.iteration(start, len, nesting_state.idx) {
+                        Some(it) => it,
+                        None => {
+                            nesting_state.at_end = true;
+                            return Err(match depth == innermost {
+                                true => Miss::Ended,
+                                false => binding_err!("could not find nested binding `{name}`"),
+                            });
+                        }
+                    }
+                }
                 Binding::Empty => {
                     nesting_state.at_end = true;
-                    return Err(binding_err!("could not find empty binding `{name}`"));
+                    return Err(match depth == innermost {
+                        true => Miss::Ended,
+                        false => binding_err!("could not find empty binding `{name}`"),
+                    });
                 }
             };
         }
         match b {
-            Binding::Fragment(f) => Ok(f.clone()),
+            // clone: bindings hold views only; the matcher makes no owned fragment.
+            Binding::Fragment(f) => Ok(self.fragment(f).clone()),
             // emit some reasonable default expansion for missing bindings,
             // this gives better recovery than emitting the `$fragment-name` verbatim
             Binding::Missing(it) => Ok({
@@ -110,7 +144,7 @@ impl<'t> Bindings<'t> {
                 }
                 Fragment::TokensOwned(builder.build())
             }),
-            Binding::Nested(_) => {
+            Binding::Nested { .. } => {
                 Err(binding_err!("expected simple binding, found nested binding `{name}`"))
             }
             Binding::Empty => {
@@ -120,15 +154,25 @@ impl<'t> Bindings<'t> {
     }
 }
 
-pub(super) fn transcribe(
+/// The output is made in the worker's builder and written out once, by `build`: into the global
+/// allocator keeping its words (`TopSubtreeBuilder::build`), or into a caller's frame
+/// (`TopSubtreeBuilder::build_in`).
+pub(super) fn transcribe<'a, A: Allocator>(
     template: &MetaTemplate,
-    bindings: &Bindings<'_>,
+    bindings: &'a Bindings<'a>,
+    frame: &'a Frame,
+    build: impl FnOnce(TopSubtreeBuilder) -> tt::TopSubtree<A>,
     marker: impl Fn(&mut Span) + Copy,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site };
-    let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(ctx.call_site));
-    expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| builder.build())
+) -> ExpandResult<(tt::TopSubtree<A>, MadeIdents)> {
+    let mut ctx =
+        ExpandCtx { bindings, nesting: Vec::new_in(frame), call_site, made: MadeIdents::new() };
+    let mut builder = tt::TopSubtreeBuilder::with_capacity(
+        tt::Delimiter::invisible_spanned(ctx.call_site),
+        template.0.len() + bindings.token_trees(),
+    );
+    expand_subtree(&mut ctx, template, &mut builder, marker)
+        .map(|()| (build(builder), ctx.made))
 }
 
 #[derive(Debug)]
@@ -145,8 +189,10 @@ struct NestingState {
 #[derive(Debug)]
 struct ExpandCtx<'a> {
     bindings: &'a Bindings<'a>,
-    nesting: Vec<NestingState>,
+    nesting: Vec<NestingState, &'a Frame>,
     call_site: Span,
+    /// The spans of the identifiers `${concat(..)}` made, kept with the expansion.
+    made: MadeIdents,
 }
 
 fn expand_subtree_with_delimiter(
@@ -174,11 +220,13 @@ fn expand_subtree(
     'ops: while let Some(op) = ops.next() {
         match op {
             Op::Literal(it) => builder.push(tt::Leaf::from({
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 let mut it = it.clone();
                 marker(&mut it.span);
                 it
             })),
             Op::Ident(it) => builder.push(tt::Leaf::from({
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 let mut it = it.clone();
                 marker(&mut it.span);
                 it
@@ -200,9 +248,10 @@ fn expand_subtree(
                     expand_subtree_with_delimiter(ctx, tokens, builder, Some(delimiter), marker);
                 err = err.or(e);
             }
-            Op::Var { name, id, .. } => {
+            Op::Var { name, id, binder, .. } => {
+                let follower = Follower::of(ops.peek().copied());
                 let ExpandResult { value: (), err: e } =
-                    expand_var(ctx, name, *id, Follower::of(ops.peek().copied()), builder, marker);
+                    expand_var(ctx, name, *binder, *id, follower, builder, marker);
                 err = err.or(e);
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
@@ -210,9 +259,13 @@ fn expand_subtree(
                     expand_repeat(ctx, subtree, *kind, separator.as_deref(), builder, marker);
                 err = err.or(e);
             }
-            Op::Ignore { name, id } => {
+            Op::Ignore { name, id, binder } => {
                 // Expand the variable, but ignore the result. This registers the repetition count.
-                let e = ctx.bindings.get_fragment(name, *id, &mut ctx.nesting, marker).err();
+                let e =
+                    match ctx.bindings.get_fragment(*binder, name, *id, &mut ctx.nesting, marker) {
+                        Err(Miss::Error(e)) => Some(e),
+                        Ok(_) | Err(Miss::Ended) => None,
+                    };
                 // FIXME: The error gets dropped if there were any previous errors.
                 // This should be reworked in a way where the errors can be combined
                 // and reported rather than storing the first error encountered.
@@ -240,8 +293,9 @@ fn expand_subtree(
                     suffix_len: 0,
                 }));
             }
-            Op::Count { name, depth } => {
-                let mut binding = match ctx.bindings.get(name, ctx.call_site) {
+            Op::Count { name, depth, binder } => {
+                let bindings = ctx.bindings;
+                let mut binding = match bindings.get(*binder, name, ctx.call_site) {
                     Ok(b) => b,
                     Err(e) => {
                         err = err.or(Some(e));
@@ -255,8 +309,8 @@ fn expand_subtree(
                             // `count()` will report an error.
                             break;
                         }
-                        Binding::Nested(bs) => {
-                            if let Some(b) = bs.get(state.idx) {
+                        Binding::Nested { start, len } => {
+                            if let Some(b) = bindings.iteration(start, len, state.idx) {
                                 binding = b;
                             } else {
                                 state.at_end = true;
@@ -275,7 +329,7 @@ fn expand_subtree(
                     }
                 }
 
-                let res = count(binding, 0, *depth);
+                let res = count(bindings, binding, 0, *depth);
 
                 builder.push(tt::Leaf::Literal(tt::Literal {
                     text_and_suffix: sym::Integer::get(res),
@@ -285,7 +339,7 @@ fn expand_subtree(
                 }));
             }
             Op::Concat { elements, span: concat_span } => {
-                let mut concatenated = String::new();
+                let mut concatenated = blaze_mem::scratch::lend_string();
                 for element in elements {
                     match element {
                         ConcatMetaVarExprElem::Ident(ident) => {
@@ -296,18 +350,20 @@ fn expand_subtree(
                             // escaping is used most of the times for characters that are invalid in identifiers.
                             concatenated.push_str(lit.text())
                         }
-                        ConcatMetaVarExprElem::Var(var) => {
+                        ConcatMetaVarExprElem::Var { ident: var, binder } => {
                             // Handling of repetitions in `${concat}` isn't fleshed out in rustc, so we currently
                             // err at it.
                             // FIXME: Do what rustc does for repetitions.
                             let var_value = match ctx.bindings.get_fragment(
-                                &MetaVar::new(var.sym.clone(), var.span),
+                                *binder,
+                                &MetaVar::new(var.sym, var.span),
                                 var.span,
                                 &mut ctx.nesting,
                                 marker,
                             ) {
                                 Ok(var) => var,
-                                Err(e) => {
+                                Err(Miss::Ended) => continue,
+                                Err(Miss::Error(e)) => {
                                     if err.is_none() {
                                         err = Some(e);
                                     };
@@ -366,6 +422,7 @@ fn expand_subtree(
                 let needs_raw =
                     parser::SyntaxKind::from_keyword(&concatenated, Edition::LATEST).is_some();
                 let is_raw = if needs_raw { tt::IdentIsRaw::Yes } else { tt::IdentIsRaw::No };
+                ctx.made.push(result_span);
                 builder.push(tt::Leaf::Ident(tt::Ident {
                     is_raw,
                     span: result_span,
@@ -402,6 +459,7 @@ impl Follower {
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
     v: &MetaVar,
+    binder: Binder,
     id: Span,
     follower: Follower,
     builder: &mut tt::TopSubtreeBuilder,
@@ -410,14 +468,20 @@ fn expand_var(
     // We already handle $crate case in mbe parser
     debug_assert!(*v.sym() != sym::crate_);
 
-    match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
+    match ctx.bindings.get_fragment(binder, v, id, &mut ctx.nesting, marker) {
         Ok(fragment) => {
             match fragment {
                 // rustc spacing is not like ours. Ours is like proc macros', it dictates how puncts will actually be joined.
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
                 // Basically, a metavariable can never be joined with whatever after it.
-                Fragment::Tokens { tree, origin } => {
-                    let _ = origin;
+                Fragment::Tokens { tree, origin: TokensOrigin::Grouped } => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tree.strip_invisible());
+                    builder.close(span);
+                }
+                Fragment::Tokens { tree, origin: TokensOrigin::Raw | TokensOrigin::Ast } => {
                     builder.extend_with_tt_alone(tree);
                 }
                 Fragment::TokensOwned(tt) => {
@@ -488,7 +552,8 @@ fn expand_var(
             };
             ExpandResult::ok(())
         }
-        Err(e) if matches!(e.inner.1, ExpandErrorKind::UnresolvedBinding(_)) => {
+        Err(Miss::Ended) => ExpandResult::ok(()),
+        Err(Miss::Error(e)) if matches!(e.inner.1, ExpandErrorKind::UnresolvedBinding(_)) => {
             // Note that it is possible to have a `$var` inside a macro which is not bound.
             // For example:
             // ```
@@ -504,14 +569,14 @@ fn expand_var(
             // We just treat it a normal tokens
             let mut span = id;
             marker(&mut span);
-            let sym = v.sym().clone();
+            let sym = *v.sym();
             builder.extend([
                 tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span }),
                 tt::Leaf::from(tt::Ident { sym, span, is_raw: tt::IdentIsRaw::No }),
             ]);
             ExpandResult::ok(())
         }
-        Err(e) => ExpandResult::only_err(e),
+        Err(Miss::Error(e)) => ExpandResult::only_err(e),
     }
 }
 
@@ -533,16 +598,16 @@ fn expand_repeat(
     let initial_restore_point = builder.restore_point();
     let mut restore_point = builder.restore_point();
     loop {
-        let ExpandResult { value: (), err: e } =
-            expand_subtree_with_delimiter(ctx, template, builder, None, marker);
+        // An iteration's tokens go straight into the output: an invisible group around them
+        // would be taken out again (an `O(n)` shift of the builder each time), which leaves the
+        // same tokens.
+        let ExpandResult { value: (), err: e } = expand_subtree(ctx, template, builder, marker);
         let nesting_state = ctx.nesting.last_mut().unwrap();
         if nesting_state.at_end || !nesting_state.hit {
             break;
         }
         nesting_state.idx += 1;
         nesting_state.hit = false;
-
-        builder.remove_last_subtree_if_invisible();
 
         restore_point = builder.restore_point();
 
@@ -571,7 +636,9 @@ fn expand_repeat(
                 leaf
             };
             match sep {
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 Separator::Ident(ident) => builder.push(marked(ident.clone().into())),
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 Separator::Literal(lit) => builder.push(marked(lit.clone().into())),
                 Separator::Puncts(puncts) => {
                     for &punct in puncts {
@@ -580,6 +647,7 @@ fn expand_repeat(
                 }
                 Separator::Lifetime(punct, ident) => {
                     builder.push(marked((*punct).into()));
+                    // clone: a leaf: a symbol, a span and a flag or two, no heap.
                     builder.push(marked(ident.clone().into()));
                 }
             };
@@ -667,13 +735,21 @@ fn fix_up_and_push_path_tt(
 
 /// Handles `${count(t, depth)}`. `our_depth` is the recursion depth and `count_depth` is the depth
 /// defined by the metavar expression.
-fn count(binding: &Binding<'_>, depth_curr: usize, depth_max: usize) -> usize {
+fn count(
+    bindings: &Bindings<'_>,
+    binding: Binding,
+    depth_curr: usize,
+    depth_max: usize,
+) -> usize {
     match binding {
-        Binding::Nested(bs) => {
+        Binding::Nested { start, len } => {
             if depth_curr == depth_max {
-                bs.len()
+                len as usize
             } else {
-                bs.iter().map(|b| count(b, depth_curr + 1, depth_max)).sum()
+                (0..len as usize)
+                    .filter_map(|idx| bindings.iteration(start, len, idx))
+                    .map(|b| count(bindings, b, depth_curr + 1, depth_max))
+                    .sum()
             }
         }
         Binding::Empty => 0,

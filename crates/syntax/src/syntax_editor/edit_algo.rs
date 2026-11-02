@@ -2,7 +2,8 @@
 
 use std::{cmp::Ordering, ops::Range};
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
+use blaze_ids::radix;
 use stdx::format_to;
 use syntax_tree::TextRange;
 
@@ -94,7 +95,7 @@ impl EditPlan {
         }
 
         let mut entries = vec![PlanEntry::default(); changes.len()];
-        let mut regions_by_tree = FxHashMap::<SyntaxNode, Vec<ChangedRegion>>::default();
+        let mut regions_by_tree = HashMap::<SyntaxNode, Vec<ChangedRegion>>::default();
 
         for (index, change) in changes.iter().enumerate() {
             let target_tree = change.target_parent().tree_top();
@@ -207,7 +208,7 @@ impl EditPlan {
         changes: &[Change],
         mut node_depth: impl FnMut(SyntaxNode) -> usize,
     ) -> bool {
-        let mut previous = FxHashMap::<(SyntaxNode, usize), TextRange>::default();
+        let mut previous = HashMap::<(SyntaxNode, usize), TextRange>::default();
         for change in changes {
             if !matches!(change.change_kind(), ChangeKind::Replace | ChangeKind::ReplaceRange) {
                 continue;
@@ -448,12 +449,8 @@ impl TreeState {
         }
 
         let parent = parent_path.resolve(&self.root).and_then(SyntaxElement::into_node).unwrap();
-        let green = syntax_tree::GreenNodeData::splice_children(
-            parent.green(),
-            deleted.clone(),
-            inserted.into_iter().map(PreparedElement::into_green),
-        );
-        self.root = SyntaxNode::new_root(parent.replace_with(green));
+        let inserted: Vec<SyntaxElement> = inserted.into_iter().map(|it| it.syntax).collect();
+        self.root = parent.splice_children(deleted.clone(), &inserted);
         self.edits.push(PathEdit::Splice {
             parent: parent_path,
             deleted,
@@ -466,7 +463,7 @@ impl TreeState {
         let NodeOrToken::Node(node) = replacement.syntax else {
             panic!("root node replacement should be a node")
         };
-        self.root = SyntaxNode::new_root(node.green().to_owned());
+        self.root = node.clone_subtree();
         self.changed.clear();
         if track_as_changed {
             self.changed.push(SyntaxPath { child_indices: Vec::new() });
@@ -540,20 +537,9 @@ struct PreparedElement {
     annotations: Vec<TrackedAnnotation>,
 }
 
-impl PreparedElement {
-    fn into_green(
-        self,
-    ) -> syntax_tree::NodeOrToken<syntax_tree::GreenNode, syntax_tree::GreenToken> {
-        match self.syntax {
-            SyntaxElement::Node(node) => NodeOrToken::Node(node.green().to_owned()),
-            SyntaxElement::Token(token) => NodeOrToken::Token(token.green().to_owned()),
-        }
-    }
-}
-
 /// Owns all evolving trees involved in executing an edit plan.
 struct TreeStore {
-    states: FxHashMap<SyntaxNode, TreeState>,
+    states: HashMap<SyntaxNode, TreeState>,
 }
 
 impl TreeStore {
@@ -562,7 +548,7 @@ impl TreeStore {
         annotations: Vec<(SyntaxElement, SyntaxAnnotation)>,
         mappings: &SyntaxMapping,
     ) -> Self {
-        let mut states = FxHashMap::<SyntaxNode, TreeState>::default();
+        let mut states = HashMap::<SyntaxNode, TreeState>::default();
         for (order, (element, annotation)) in annotations.into_iter().enumerate() {
             let element = mappings.upmap_element(&element);
             let tree = element.tree_top();
@@ -643,9 +629,9 @@ impl TreeStore {
             .into_iter()
             .filter_map(|path| path.resolve(&new_root))
             .collect::<Vec<_>>();
-        changed_elements.sort_by_key(|element| element.text_range().start());
+        radix::sort_by_key(&mut changed_elements, |element| u32::from(element.text_range().start()));
 
-        let mut annotations = FxHashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>>::default();
+        let mut annotations = HashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>>::default();
         for annotation in state.annotations {
             if let Some(element) = annotation.path.resolve(&new_root) {
                 annotations
@@ -657,7 +643,9 @@ impl TreeStore {
         let annotations = annotations
             .into_iter()
             .map(|(annotation, mut elements)| {
-                elements.sort_by_key(|(order, element)| (*order, element.text_range().start()));
+                radix::sort_by_key(&mut elements, |(order, element)| {
+                    radix::pack_64(*order as u64, u32::from(element.text_range().start()).into())
+                });
                 (annotation, elements.into_iter().map(|(_, element)| element).collect())
             })
             .collect();
@@ -670,7 +658,7 @@ impl TreeStore {
 pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     let SyntaxEditor { root, changes, annotations, make } = editor;
     let mappings = make.take();
-    let mut node_depths = FxHashMap::<SyntaxNode, usize>::default();
+    let mut node_depths = HashMap::<SyntaxNode, usize>::default();
     let mut node_depth = |node: SyntaxNode| {
         *node_depths.entry(node).or_insert_with_key(|node| node.ancestors().count())
     };
@@ -682,7 +670,7 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
             return SyntaxEdit {
                 old_root: root.clone(),
                 new_root: root,
-                annotations: FxHashMap::default(),
+                annotations: HashMap::default(),
                 changed_elements: Vec::new(),
             };
         }

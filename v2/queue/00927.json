@@ -1,0 +1,27 @@
+{
+  "id": "00927",
+  "from_lane": "speed-sol2-format",
+  "owner": "format",
+  "paths": [
+    "crates/parser/src/grammar/",
+    "crates/parser/src/parser.rs",
+    "crates/parser/src/event.rs",
+    "crates/parser/src/output.rs",
+    "crates/parser/src/shortcuts.rs"
+  ],
+  "what": "The parse from tokens to tree is about 2.5x its bound by count (docs/v2/plan/lanes/format/speed-of-light.md: the grammar section and 'The parse driver: events to the tree builder (speed-sol2-format)'). What is left after the step counter, the pad, the Marker and the kind tests is the production structure (calls and kind tests that one table-driven dispatch would merge) and two passes the output does not need: event::process (events to Output words, about 10 instructions an event at 3.1 events a token) and intersperse_trivia_outline (Output words and the lexed tokens to the sink). The fix is speed-syntax.md's postorder rewrite: the grammar writes the tree builder's words directly, attaching trivia as it goes and patching forward parents in place. It rewrites grammar/ (about 9,000 lines) and the sinks in syntax and syntax-tree, so it needs proof's measurement of where the cycles go first (the estimate is +-50%), with the parser's test_data and termination tests passing at each step. For lane format when next started.",
+  "state": "open",
+  "created": "2026-10-30T09:51:08Z",
+  "updated": "2026-10-30T09:51:08Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:51:08Z",
+      "by": "speed-sol2-format",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

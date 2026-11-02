@@ -1,0 +1,35 @@
+{
+  "id": "00421",
+  "from_lane": "codegen-v2-mem-blob",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs"
+  ],
+  "what": "## 2. To cargo-daemon-units (`crates/blaze-cargo/src/serve/unit/codegen.rs:286`): `Lookup::read`\n\nmem-codegen-unit 0.4 is marked DONE, but `Reading`'s impl still has\n`fn get(..) -> Result<Option<Vec<u8>>, String>`. `driver::Lookup` is now\n`fn read(&self, key: &Key) -> Result<Option<&[u8]>, String>`, so the impl becomes 0.4's text:\n\n```rust\nimpl blaze_codegen::driver::Lookup for Reading<'_> {\n    fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {\n        match self.store.get(self.guard, key) {\n            Ok(entry) => Ok(entry.map(|it| it.bytes)),\n            // alloc: an error\n            Err(corrupt) => Err(corrupt.to_string()),\n        }\n    }\n}\n```\n\n`Build::run` and `Build::tier_up` take `store: &impl Lookup` now (dedyn-v2 1). The caller at\n`serve/unit/codegen.rs:322` passes `&store`, a concrete `Reading`, so it needs no change.\n\n> forwarded to cargo (`serve/unit/codegen.rs`) (requests, pass 21; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T04:08:34Z",
+  "updated": "2026-10-31T20:29:29Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/codegen-v2-mem-blob.md#2. To cargo-daemon-units (`crates/blaze-cargo/src/serve/unit/codegen.rs:286`): `Lookup::read`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-v2-mem-blob.md:23"
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:29Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "in the tree: serve/unit/codegen.rs:512 Reading implements driver::Lookup::read, borrowing the store's bytes"
+    }
+  ]
+}

@@ -13,22 +13,34 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-drop_bomb = "0.1.5"
-ra-ap-rustc_lexer.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-phf.workspace = true
+rustc_lexer.workspace = true
 rustc-literal-escaper.workspace = true
+smallvec.workspace = true
+stdx.workspace = true
 tracing.workspace = true
 
 edition.workspace = true
-winnow = { version = "0.7.13", default-features = false }
+winnow.workspace = true
 
 [dev-dependencies]
-expect-test = "1.5.1"
+crossbeam-channel.workspace = true
+expect-test.workspace = true
 
-stdx.workspace = true
+blaze-alloc-count.workspace = true
+hegeltest.workspace = true
+
+[[bench]]
+name = "lex"
+harness = false
 
 [features]
 default = []
 in-rust-tree = []
+# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone, for the fuzz target.
+fuzz = []
 
 [lints]
 workspace = true

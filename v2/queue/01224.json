@@ -1,0 +1,29 @@
+{
+  "id": "01224",
+  "from_lane": "tests-misc-stencil",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/",
+    "crates/hir-expand/src/",
+    "crates/hir-def/src/attrs.rs",
+    "crates/hir-def/src/signatures.rs",
+    "crates/hir-def/src/deps/",
+    "crates/hir-def/src/macro_reach.rs",
+    "crates/base-db/src/reparse.rs"
+  ],
+  "what": "hir-def tests in round3b-test.log (d79d33bf1c) whose cause is in db's hir-def/hir-expand/base-db source (not test expectations); output per test in /tmp/blaze-lanes/hirdef-round3b-failures.log ('---- <test> stdout'), last panic per test in /tmp/blaze-lanes/stencil-hirdef-3b-last.txt.\n(1) nameres semantics vs the old collector: trait_imports::imports_from_a_trait_of_a_dependency (`use dep::Tr::*; use dep::Tr::g;` gives g as glob, the explicit import must win); trait_imports::a_trait_item_from_a_macro_in_the_crate_being_collected_is_reported (h and the legacy m appear, expected neither); mod_resolution::trait_item_imports_differing_crate (a trait glob from another crate without the feature imports 4 names, expected none); differential::own_fixtures/nameres_tests_macros/macro_expansion_tests/nameres_tests_globs_imports_paths, generated::generated_crates_agree, delta::tests::random (4), driver::tests (collect_crate_equals_the_old_collector; name_records_equal_the_old_ones 'imports go through bindings: ([], [1,1,2,0,0])'), frozen::tests::checking_finds_a_difference: old and new def maps differ.\n(2) hir-expand: builtin derive errors point at `derive` instead of the derive path (builtin_errors::from_derive_errors, coerce_pointee_errors_have_their_code; rustc points at `From`/`CoercePointee`); builtin_errors::a_fragments_node_maps_up_to_its_metavariable; regression::eager_concat_bytes_panic message changed to 'cannot concatenate numeric literals'.\n(3) attrs: a_body_edit_runs_no_attribute_query: a body edit reruns AttrFlags::query_ and field_attr_flags in the read after the write (file_outline changes because later items' offsets shift); the_word_index_flags_every_attribute_as_the_string_match_did differs on #[stable(always)].\n(4) budgets: macro_expansion_tests::budgets an_expansion_miss_allocates_its_result_alone (22 allocations), lang_item notable_traits_miss_is_its_result (4, budget 1), signatures::budgets::enum_variants_miss_is_its_map (12, budget 2).\n(5) signatures::relative_tests (6): a_body_edit_lowers_no_signature, a_body_edit_runs_no_signature_syntax, the_outline_keeps_a_body_an_inner_attribute_may_start, the_outline_leaves_out_each_body_of_its_own_anchor, and two at base-db reparse.rs:269 'a reparse whose tree is not the whole parse's' (an_edit_of_another_item_lowers_none_of_this_one, moved_source_maps_are_the_files).\n(6) deps::tests every_dependency_is_stored_and_served (241), served_parts_are_the_store_s_bytes (779), serving_a_crate_at_a_time_adds_to_what_was_served (900: image_of(raw, core/lib) none); macro_reach::tests::only_an_opaque_macro_of_a_module_takes_part (tests.rs:134 no entry for key).\nAlready test-side (tests-misc-stencil, uncommitted): the maintainer-in-write counting tests (incremental, delta/facts trace, backdate, worklist, features, macros marks), differential file list, uses.rs extern-crate text, item_scope/find_path sizes, src/tests counts. docs/v2/plan/lanes/db/speed-hir-nameres-scope.md:32 still says Entry is 40 bytes; the const assert says 36.",
+  "state": "open",
+  "created": "2026-10-31T02:09:03Z",
+  "updated": "2026-10-31T02:09:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:09:03Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

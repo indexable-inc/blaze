@@ -1,0 +1,39 @@
+{
+  "id": "00723",
+  "from_lane": "dedup",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-sha256",
+    "v2/requests/coordinator.md",
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/build.rs",
+    "crates/blaze-engine/build.rs"
+  ],
+  "what": "## dedup: blaze-cargo's build-script SHA-256 onto blaze-sha256\n\nFrom `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). The four SHA-256 copies\n(`blaze-cargo/build.rs`, `blaze-engine/build.rs`, `blaze-link/src/macho/sha256.rs`,\n`blaze-splice/src/sha256.rs`) are now one crate, `crates/blaze-sha256` (no dependencies;\n`digest`, `fast`, and a streaming `Sha256` with `new`/`update`/`finish` that never allocates;\nSHA-NI on x86-64, ARMv8 SHA-256 on aarch64, portable otherwise; every copy's tests moved there plus\na proptest against the build scripts' copy). Its workspace dependency line is requested in\n`v2/requests/coordinator.md` (\"## dedup: workspace dependency `blaze-sha256`\").\n\n1. `crates/blaze-cargo/Cargo.toml`: add\n\n       [build-dependencies]\n       blaze-sha256.workspace = true\n\n2. `crates/blaze-cargo/build.rs`:\n   - doc lines 1-3, before: \"The SHA-256 is written here rather than taken from `sha2`, as in\n     crates/blaze-engine/build.rs: a build dependency is built for the machine that builds.\"\n     after: \"The SHA-256 is `blaze-sha256`'s, which has no dependencies, rather than `sha2`'s:\n     a build dependency is built for the machine that builds (see crates/blaze-engine/build.rs).\"\n   - after `use std::path::PathBuf;` add `use blaze_sha256::Sha256;` (as `use blaze_sha256::Sha256;`\n     on its own line after a blank line, the external-crate group).\n   - delete everything from `/// SHA-256 (FIPS 180-4).` (line 55) to the end of the file (the\n     `Sha256` struct, `K`, and `impl Sha256`). The call site (`Sha256::new()`,\n     `hash.update(&..)`, `hash.finish()`) is unchanged: `update` returns `&mut Sha256`, `finish`\n     takes `&self` and returns `[u8; 32]`.\n\n> forwarded to cargo (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:56:24Z",
+  "taken_by": "unify-cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedup: blaze-cargo's build-script SHA-256 onto blaze-sha256",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2906"
+    },
+    {
+      "at": "2026-10-30T08:55:49Z",
+      "by": "unify-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:56:24Z",
+      "by": "unify-cargo",
+      "action": "done",
+      "note": "already in the tree: crates/blaze-cargo/build.rs uses blaze_sha256::Sha256 and has no copy; Cargo.toml has [build-dependencies] blaze-sha256.workspace = true. crates/blaze-engine/build.rs is outside unify-cargo (unify parent)."
+    }
+  ]
+}

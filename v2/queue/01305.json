@@ -1,0 +1,29 @@
+{
+  "id": "01305",
+  "from_lane": "tests-diag",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-lints/src/check.rs"
+  ],
+  "what": "Lands with blaze-diagnostics' model.rs change in the same commit, or blaze-lints stops compiling. diag::Expansion gained `opaque: bool` (rustc's ExpnData::diagnostic_opaque: a builtin macro's expansion; no 'this error originates in' note names it, as the pinned rustc's emitter does). blaze-lints/src/check.rs:1418 must set it like blaze-diagnostics' Cx::expansion_of does. Replace `Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site })` with `let opaque = !matches!(call.loc(db).def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..)); Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site, opaque })`. rust-analyzer shows that line as the only E0063.",
+  "state": "applied",
+  "created": "2026-10-31T15:01:52Z",
+  "updated": "2026-10-31T16:42:42Z",
+  "taken_by": "tests-diag",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:01:52Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:42:42Z",
+      "by": "tests-diag",
+      "action": "done",
+      "note": "applied by tests-diag at the coordinator's ask (round 9 check); rust-analyzer 0 errors"
+    }
+  ]
+}

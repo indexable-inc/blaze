@@ -1,0 +1,24 @@
+{
+  "id": "00100",
+  "from_lane": "diagnostics-items-resolve",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lib.rs",
+    "docs/v2/plan/design/unsafe.md"
+  ],
+  "what": "## 6. `#![forbid(unsafe_code)]` on `blaze-diagnostics` (diagnostics)\n\nWhere: `crates/blaze-diagnostics/src/lib.rs`.\n\nWhat: add `#![forbid(unsafe_code)]`.\n\nWhy: `docs/v2/plan/design/unsafe.md`: a crate with no unsafe module forbids it. The crate has\nno `unsafe` of its own (`rg` finds it only inside test sources, as Rust text in strings), and\nnothing in this lane needs it: the speed here comes from not running on a clean build and from\n`macro_def_error::check`'s allocation-free single pass, not from unchecked access.\n\n> forwarded to diagnostics: its own `src/lib.rs`.",
+  "state": "open",
+  "created": "2026-10-30T01:04:03Z",
+  "updated": "2026-10-30T01:04:03Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-resolve.md#6. `#![forbid(unsafe_code)]` on `blaze-diagnostics` (diagnostics)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-resolve.md:85"
+    }
+  ]
+}

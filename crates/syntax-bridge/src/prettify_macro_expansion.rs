@@ -15,19 +15,17 @@ pub enum PrettifyWsKind {
 }
 
 /// Renders a [`SyntaxNode`] with whitespace inserted between tokens that require them.
-///
-/// This is an internal API that is only exported because `mbe` needs it for tests and cannot depend
-/// on `hir-expand`. For any purpose other than tests, you are supposed to use the `prettify_macro_expansion`
-/// from `hir-expand` that handles `$crate` for you.
-#[deprecated = "use `hir_expand::prettify_macro_expansion()` instead"]
+/// Each `$crate` token is replaced with what `dollar_crate_replacement` gives it.
 pub fn prettify_macro_expansion(
     syn: SyntaxNode,
-    dollar_crate_replacement: &mut dyn FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
+    dollar_crate_replacement: &mut impl FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
     inspect_mods: impl FnOnce(&[(Position, PrettifyWsKind)]),
 ) -> SyntaxNode {
     let mut indent = 0;
     let mut last: Option<SyntaxKind> = None;
+    // alloc: the edits, once an expansion shown to a person.
     let mut mods = Vec::new();
+    // alloc: the edits, once an expansion shown to a person.
     let mut dollar_crate_replacements = Vec::new();
     let (editor, syn) = SyntaxEditor::new(syn);
 
@@ -35,12 +33,16 @@ pub fn prettify_macro_expansion(
     let after = Position::after;
 
     let do_indent = |pos: fn(_) -> Position, token: &SyntaxToken, indent| {
+        // clone: a token handle for the edit's position, in text made for a person to read.
         (pos(token.clone()), PrettifyWsKind::Indent(indent))
     };
-    let do_ws =
-        |pos: fn(_) -> Position, token: &SyntaxToken| (pos(token.clone()), PrettifyWsKind::Space);
-    let do_nl =
-        |pos: fn(_) -> Position, token: &SyntaxToken| (pos(token.clone()), PrettifyWsKind::Newline);
+    // clone: a token handle for the edit's position, in text made for a person to read.
+    let do_ws = |pos: fn(_) -> Position, token: &SyntaxToken| {
+        (pos(token.clone()), PrettifyWsKind::Space) // clone: as above.
+    };
+    let do_nl = |pos: fn(_) -> Position, token: &SyntaxToken| {
+        (pos(token.clone()), PrettifyWsKind::Newline) // clone: as above.
+    };
 
     for event in syn.preorder_with_tokens() {
         let token = match event {
@@ -56,6 +58,7 @@ pub fn prettify_macro_expansion(
                     _ => false,
                 };
                 if (!is_last_child && is_non_last_newline) || is_always_newline {
+                    // clone: a node handle for the edit's position, as above.
                     mods.push((Position::after(node.clone()), PrettifyWsKind::Indent(indent)));
                     if node.parent().is_some() {
                         mods.push((Position::after(node), PrettifyWsKind::Newline));
@@ -69,6 +72,7 @@ pub fn prettify_macro_expansion(
             && token.text() == "$crate"
             && let Some(replacement) = dollar_crate_replacement(&token, editor.make())
         {
+            // clone: a token handle for the edit, as above.
             dollar_crate_replacements.push((token.clone(), replacement));
         }
         let tok = &token;
@@ -181,6 +185,7 @@ pub fn prettify_macro_expansion(
         editor.delete(it);
     }
 
+    // clone: the new root's handle, out of the edit it belongs to.
     editor.finish().new_root().clone()
 }
 
@@ -194,7 +199,6 @@ mod tests {
     use super::*;
     use expect_test::{Expect, expect};
 
-    #[expect(deprecated)]
     fn check_pretty(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let ra_fixture = stdx::trim_indent(ra_fixture);
         let source_file = syntax::ast::SourceFile::parse(&ra_fixture, span::Edition::CURRENT);
@@ -217,6 +221,43 @@ mod tests {
             });
             editor.finish().new_root().clone()
         }
+    }
+
+    #[test]
+    fn replaces_each_dollar_crate() {
+        // `$crate::x` as an expansion has it: `$crate` one identifier, which no parse makes.
+        let mut builder = syntax::SyntaxTreeBuilder::default();
+        builder.start_node(SOURCE_FILE);
+        builder.start_node(PATH);
+        builder.start_node(PATH);
+        builder.start_node(PATH_SEGMENT);
+        builder.start_node(NAME_REF);
+        builder.token(IDENT, "$crate");
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        builder.token(T![::], "::");
+        builder.start_node(PATH_SEGMENT);
+        builder.start_node(NAME_REF);
+        builder.token(IDENT, "x");
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        let syn = builder.finish().syntax_node();
+
+        let mut asked = Vec::new();
+        let pretty = prettify_macro_expansion(
+            syn,
+            &mut |token, make| {
+                asked.push(token.text().to_owned());
+                Some(make.ident("krate"))
+            },
+            |_| (),
+        );
+        assert_eq!(asked, ["$crate"]);
+        let pretty = pretty.to_string();
+        assert!(pretty.contains("krate::x") && !pretty.contains('$'), "{pretty}");
     }
 
     #[test]

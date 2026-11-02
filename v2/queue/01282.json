@@ -1,0 +1,29 @@
+{
+  "id": "01282",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/pattern_type_not_lowered.rs"
+  ],
+  "what": "hir-ty PatternTypeUnsupported lost ExclusiveEnd and OpenEnd: hir-def already lowers a..b and a.. inclusive as rustc lower_excluded_range_end / lower_ty_pat_range_end do (closes 01239), so only Pattern is left. In pattern_type_not_lowered.rs delete the two arms `PatternTypeUnsupported::ExclusiveEnd => ...` and `PatternTypeUnsupported::OpenEnd => ...` (lines 24-25), keeping `PatternTypeUnsupported::Pattern => \"pattern not supported in pattern types\"`. blaze-diagnostics does not compile with the hir-ty edit until then.",
+  "state": "applied",
+  "created": "2026-10-31T14:24:57Z",
+  "updated": "2026-10-31T14:35:40Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:24:57Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:35:40Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "applied by the coordinator in 9a0082f403 (round 8 check found the two arms left)"
+    }
+  ]
+}

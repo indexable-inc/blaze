@@ -1,0 +1,41 @@
+{
+  "id": "00222",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/diagnostics.md",
+    "crates/stdx/src/list.rs",
+    "crates/stdx/src/lib.rs",
+    "crates/stdx/Cargo.toml",
+    "crates/blaze-doc",
+    "Cargo.toml",
+    "crates/stdx"
+  ],
+  "what": "## dedup: stdx::list, one English list (from dedup-sim-diag, 2026-10-29)\n\nFrom `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). Thirteen\ncopies of rustc's three English list forms: eleven in blaze-diagnostics (their callers are\n`v2/requests/diagnostics.md` `## dedup: one copy of each span, list and lookup helper`, part\n5), `blaze-doc/src/markdown.rs` `or_list`, and `misc.rs` `tokens_to_string`. A small text\nhelper used across crates goes in `stdx` (dedup's ownership table).\n\n### 1. New `crates/stdx/src/list.rs`\n\n```rust\n//! Lists in English as rustc's diagnostics write them: \"a\", \"a and b\", then three forms of\n//! three or more.\n\nuse std::fmt::{Display, Write};\n\n/// How a list of three or more joins its last item.\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Join {\n    /// \"a, b, and c\": `DiagArgValue::StrListSepByAnd`, `DiagSymbolList`.\n    And,\n    /// \"a, b, or c\": the parser's `tokens_to_string`, rustdoc's lists of choices.\n    Or,\n    /// \"a, b and c\": `rustc_lint_defs::listify` and the type checker's `listify`.\n    AndNoSerialComma,\n}\n\n/// `items` joined as `join` says, each in backquotes when `quote`; \"\" when there are none.\npub fn list<I>(items: I, join: Join, quote: bool) -> String\nwhere\n    I: IntoIterator,\n    I::IntoIter: ExactSizeIterator,\n    I::Item: Display,\n{\n    let (pair, last) = match join {\n        Join::And => (\" and \", \", and \"),\n        Join::Or => (\" or \", \", or \"),\n        Join::AndNoSerialComma => (\" and \", \" and \"),\n    };\n    let quote = if quote { \"`\" } else { \"\" };\n    let items = items.into_iter();\n    let len = items.len();\n    let mut out = String::new(); // alloc: a diagnostic's text, on its error path\n    for (at, item) in items.enumerate() {\n        let sep = match (at, len) {\n            (0, _) => \"\",\n            (1, 2) => pair,\n            (at, _) if at + 1 == len => last,\n            _ => \", \",\n        };\n        let _ = write!(out, \"{sep}{quote}{item}{quote}\");\n    }\n    out\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{Join, list};\n\n    /// The copies' form, a slice match with `join`: the reference.\n    fn reference(items: &[String], join: Join) -> String {\n        let (pair, last) = match join {\n            Join::And => (\" and \", \", and \"),\n            Join::Or => (\" or \", \", or \"),\n            Join::AndNoSerialComma => (\" and \", \" and \"),\n        };\n        match items {\n            [] => String::new(),\n            [one] => one.clone(),\n            [a, b] => format!(\"{a}{pair}{b}\"),\n            [init @ .., end] => format!(\"{}{last}{end}\", init.join(\", \")),\n        }\n    }\n\n    #[test]\n    fn lists_are_joined_as_rustc_joins_them() {\n        assert_eq!(list([\"avx\"], Join::And, false), \"avx\");\n        assert_eq!(list([\"avx\", \"bmi2\"], Join::And, false), \"avx and bmi2\");\n        assert_eq!(list([\"avx\", \"bmi2\", \"fma\"], Join::And, false), \"avx, bmi2, and fma\");\n        assert_eq!(list([\"a\", \"b\", \"c\"], Join::Or, true), \"`a`, `b`, or `c`\");\n        assert_eq!(list([\"a\", \"b\", \"c\"], Join::AndNoSerialComma, true), \"`a`, `b` and `c`\");\n        assert_eq!(list([\"a\"], Join::AndNoSerialComma, true), \"`a`\");\n        assert_eq!(list(Vec::<&str>::new(), Join::Or, true), \"\");\n    }\n\n    proptest::proptest! {\n        #[test]\n        fn list_is_the_slice_matchs(items in proptest::collection::vec(\"[ab ,]{0,3}\", 0..6), quote: bool) {\n            for join in [Join::And, Join::Or, Join::AndNoSerialComma] {\n                let quoted: Vec<String> =\n                    items.iter().map(|it| if quote { format!(\"`{it}`\") } else { it.clone() }).collect();\n                proptest::prop_assert_eq!(list(&items, join, quote), reference(&quoted, join));\n            }\n        }\n    }\n}\n```\n\n`crates/stdx/src/lib.rs`: `pub mod list;` after `pub mod assert;` (after `pub mod\nedit_distance;` if that request is in). `crates/stdx/Cargo.toml`: `[dev-dependencies]\nproptest.workspace = true` (dev only).\n\n### 2. `crates/blaze-doc`\n\n`src/markdown.rs:389` `or_list(&[String])` is `stdx::list::list(items, Join::Or, false)`;\ndelete it, its callers call that. `Cargo.toml` `[dependencies]` gains `stdx.workspace = true`.\n\n> forwarded to the coordinator: `crates/stdx` and `crates/blaze-doc` are its, not requests'; on requests' coordinator list (requests, pass 29).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:33:40Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: stdx::list, one English list (from dedup-sim-diag, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:2621"
+    },
+    {
+      "at": "2026-10-30T08:33:08Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:33:40Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "New crates/stdx/src/list.rs (`list(items, Join, quote)`, Join::{And, Or, AndNoSerialComma}, unit test and proptest against the slice-match form), `pub mod list;` in stdx lib.rs (proptest dev-dep was already there). crates/blaze-doc/src/markdown.rs: or_list deleted, its caller uses stdx::list::list(.., Join::Or, false); blaze-doc/Cargo.toml gains stdx. blaze-diagnostics copies (diagnostics.md part 5) are diagnostics lane."
+    }
+  ]
+}

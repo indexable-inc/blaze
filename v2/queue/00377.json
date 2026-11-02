@@ -1,0 +1,33 @@
+{
+  "id": "00377",
+  "from_lane": "mem-db-infer-closure",
+  "owner": "db",
+  "paths": [],
+  "what": "## Speed\n\nSizes on 64-bit: `Projection` 16 bytes; `PlaceBuf` 48 (base type 4, base 12, frame `Vec` 32);\n`SourceStack` and `Sources` at most 40 each; `PlaceWithOrigin` about 88; a captured use in\n`capture_information` about 96; `CapturedPlaceBuf` about 104. Result: `Place` 32 (was 40),\n`CapturedPlace` about 56 (was about 96).\n\nPer 1,000-expression body, taking 10 closures holding 300 of the expressions, 150 place chains\nwith projections, 100 copies of such places, 30 source stacks of 3 or more, 60 captured uses, 20\nmin captures and 10 fake reads (the closure-heavy end of real code):\n\n| temporary | bytes per run | frame allocations | before (global allocations) |\n|---|---|---|---|\n| projections of place chains (`push_projection`) | 150 × 64 = 9.6 KB | 150 | 150, plus regrowth past 4 |\n| copies of places with projections | 100 × about 40 = 4 KB | 100 | 100, plus 1 per spilled origin list |\n| source stacks of 3 or more | 30 × 16 = 0.5 KB | 30 | 30, plus `ThinVec` regrowth |\n| `capture_information`, the processed copy | 2 × 60 × 96 = 11.5 KB (with doubling, up to 23 KB) | about 14 | about 14, plus a clone of every entry with its projections and sources (about 120) |\n| `MinCapturesBuf` (roots, lists, index), dedup set | about 7 KB | about 30 | `IndexMap` per closure (2 + growth), a `Vec` per root, a set per call |\n| fake reads, upvar types | about 1.2 KB | about 20 | about 20 |\n| A3's skipped copies and `FulfillmentCtxt`s | 0 | 0 | 60 copies and 60 `FulfillmentCtxt`s |\n| total | about 35 to 45 KB, reclaimed at the run's end | about 345 | about 600, each with a free |\n\nAt 2 ns a frame allocation against 15 to 25 ns global (plus the free), that is about 0.7 µs per\nrun against about 12 µs before, not counting the 60 `FulfillmentCtxt`s A3 no longer makes. The\nresult itself is about 75 global allocations (20 captures × projections and sources, their\nstacks of 3 or more, 3 per closure), each made once at its size, where before there were about\ntwice as many with growth and `shrink_to_fit` reallocations.\n\nThe bound: categorising an expression costs at least one `deeply_resolve_ignoring_regions` and\nusually a `structurally_resolve_type`, 50 to 100 ns; the temporaries now add about 2.3 ns per\nclosure-body expression (0.7 µs / 300), 2 to 5% of the pass, so the pass is within 10% of doing\nits type work alone. The remaining allocations are the place values the algorithm needs to exist\nat once (a place and its copy for each scrutinee, arm, subpattern and adjustment); keeping two\nprojections inline would drop the 150 chain allocations (0.3 µs, under 1% of the pass) and add a\nbranch to every projection access, so it is not taken. The result's allocations are the ones the\nparent's budget allows (its clone count).\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:38): notes; nothing to edit.",
+  "state": "applied",
+  "created": "2026-10-30T03:38:22Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-closure.md#Speed",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-closure.md:2267"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:38): notes; nothing to edit."
+    }
+  ]
+}

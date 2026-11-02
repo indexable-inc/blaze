@@ -1,0 +1,41 @@
+{
+  "id": "01165",
+  "from_lane": "filters",
+  "owner": "no-fallback-link-native",
+  "paths": [
+    "crates/blaze-link/src/target.rs"
+  ],
+  "what": "crates/blaze-link/src/target.rs Line::find (around line 1035): every -l library is searched by one is_file() stat per (search dir x candidate file name), uncached, on every link: a link with 30 libraries over 15 dirs and 2 names each is ~900 stats, most answering not-there. A filter does not fit (the answer must come from the directory); the fast form is one read_dir per search dir per link, its names in a set, then a probe per (dir, name), so the misses cost no syscall. Keep the first-dir-first-name order. Lane filters (Andrew: hot membership tests where a definite no skips real work) found it; not changed by filters.",
+  "state": "applied",
+  "created": "2026-10-30T23:16:20Z",
+  "updated": "2026-10-31T14:46:19Z",
+  "taken_by": "no-fallback-link-native",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:16:20Z",
+      "by": "filters",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from link (no live window) to no-fallback-link-native, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:19Z",
+      "by": "no-fallback-link-native",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:46:19Z",
+      "by": "no-fallback-link-native",
+      "action": "done",
+      "note": "target.rs: Line::may_have reads each search dir once per link (listing: ASCII-lowercased names, None when it or an entry cannot be read, which leaves names to a stat); find and default_library skip (dir, file) pairs the listing rules out, then stat as before, so first-dir-first-name order and case-insensitive file systems are unchanged. Non-ASCII names and names not starting with a plain component always stat. Tests: target/tests.rs a_search_directory_is_listed_with_its_names_case_folded, libq case in a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_one. ra clean, hot_lint 0, not compiled."
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+[package]
+name = "target-features"
+description = "rustc's target feature tables as a u16 enum and bitsets, with what each feature implies per arch, built in const; below cfg"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+
+[lints]
+workspace = true

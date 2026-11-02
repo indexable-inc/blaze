@@ -1,0 +1,23 @@
+{
+  "id": "01394",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres/collector.rs"
+  ],
+  "what": "Check: rustc injects `#[macro_use] extern crate std;` (core under no_std; rustc_builtin_macros/src/standard_library_imports.rs), so every #[macro_export] macro of std (format!, println!, vec!) is in the macro_use prelude. hir-def collector.rs inject_std_extern_crate defines the name but calls no import_macros_from_extern_crate, so a fixture std whose prelude does not re-export its macros gives `cannot find macro `format` in this scope` (tests::lints::bodies::types::casts::static_mut_refs::static_mut_refs_e2021/e2024 before I added `pub use crate::format;` to their std prelude). If real crates reach std's macros only through the prelude, a crate's use of a #[macro_export] macro of std that std's prelude does not re-export would fail where rustc accepts it (superset-of-rust). Import the injected crate's exported macros as MacroUse(None), as uses.rs already names.",
+  "state": "open",
+  "created": "2026-11-01T00:25:13Z",
+  "updated": "2026-11-01T00:25:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:25:13Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

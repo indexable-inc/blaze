@@ -1,0 +1,53 @@
+{
+  "id": "01225",
+  "from_lane": "tests-engine",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/traits.rs"
+  ],
+  "what": "is_impossible_associated_item (traits.rs:281) now calls a provided method impossible where rustdoc keeps it: blaze-doc tests::provided_methods_that_cannot_apply_are_left_out (round3d-test.log, tests.rs:569) gets [\"Item\"] for `impl<A: Clone> Each for Finds<A> { type Item = shapes::Square; }`, where `fn borrowed(&self) where for<'a> &'a Self::Item: Copy` must stay (a shared reference is always Copy). The same clause passes for `impl Each for Squares` and `impl<'a> Each for Borrows<'a>`, so it is the impl type parameter: in TypingMode::Coherence its fresh ?A leaves `<Finds<?A> as Each>::Item` unnormalized (?A: Clone ambiguous) and the goal under the binder comes back an error, not ambiguity. It passed before v2: the pre-v2 version (git show 8586c6e64a:crates/hir-ty/src/traits.rs) normalized each trait clause through `knowable` with structurally_normalize_ty (an alias under a binder judged as written) and skipped a goal it could not know; v2 (5719e9d7fb era) dropped that block for DbInterner::new_with(db, krate). Fix at its owner: restore that per-clause handling on top of the local-crate interner, or evaluate each clause on its own and count only a definite NoSolution as impossible (ambiguity and overflow may apply, as rustc`s is_impossible_associated_item does with `!result.may_apply()`). The test is right: rustdoc lists `borrowed` there. From tests-engine (edit-only; reads the next round`s log).",
+  "state": "applied",
+  "created": "2026-10-31T02:10:42Z",
+  "updated": "2026-11-01T12:46:54Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:10:42Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:03:32Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from items (no live window) to no-fallback-front-ty, which owns hir-ty traits. Still fails in round 7c (adc8bbbf04): blaze-doc tests::provided_methods_that_cannot_apply_are_left_out, tests.rs:569."
+    },
+    {
+      "at": "2026-10-31T14:03:38Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T23:44:34Z",
+      "by": "no-fallback-front-ty",
+      "action": "reassign",
+      "note": "no-fallback-front-ty -> no-fallback-front-ty: Handed over per no-fallback-front: next1 localized it to the elided impl lifetime lowering to a region error (hir-def side via no-fallback-front-def). My notes: the vendored coherence paths (unknowable candidate, trait_ref_is_knowable, leak check) match rustc; see /tmp/blaze-lanes/v2-no-fallback-front-ty.md."
+    },
+    {
+      "at": "2026-10-31T23:45:20Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T12:46:54Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "front-ty batch (01358, in round 31 d4d8268391): blaze-doc tests::provided_methods_that_cannot_apply_are_left_out passes on the round 31 tree (test-blazedoc.log, 04:47)"
+    }
+  ]
+}

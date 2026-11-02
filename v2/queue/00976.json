@@ -1,0 +1,37 @@
+{
+  "id": "00976",
+  "from_lane": "integrate-load",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-wasm/src/pack/record.rs",
+    "crates/blaze-wasm/Cargo.toml",
+    "crates/blaze-wasm/src/main.rs"
+  ],
+  "what": "blaze-wasm (its own workspace, excluded from the root; coordinator's) is the last user of load-cargo/project-model/ide-db outside v1: `pack::record` (record.rs L19-167) loads a cargo workspace with project_model::ProjectWorkspace::load, runs build scripts through `run_build_scripts` (cargo check, so rustc: a no-rustc bug) and the sysroot's proc-macro server, then load_cargo::load_workspace into a RootDatabase. integrate-load is deleting load-cargo and project-model (integrate-ide deletes ide-db), after which blaze-wasm no longer builds. v2's way: the units from blaze_units' query, lowered with blaze_lower::lower, build scripts run and proc macros built by `blaze serve` (blaze_cargo::serve), so `record` takes the daemon's lowered front end (`&blaze_lower::Lowered`, or `&Db` + the crates) instead of loading one, and the `pack` command gets it from a serve job (e.g. a `blaze build --target wasm32-unknown-unknown` job's front end). Decide: (a) integrate-load rewrites record.rs onto blaze_lower over a job's front end (needs a serve work kind that hands the Lowered to a callback: lane cargo), or (b) `pack` is dropped from blaze-wasm. Until then deleting load-cargo/project-model breaks only this excluded workspace.",
+  "state": "applied",
+  "created": "2026-10-30T12:52:15Z",
+  "updated": "2026-10-30T14:32:09Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:15Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:31:52Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:32:09Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "Decided (a): `pack` stays (it is how a real workspace reaches the in-browser compiler). integrate-load rewrites crates/blaze-wasm/src/pack/record.rs onto blaze_lower over a `blaze serve` job's front end (units from blaze_units, build scripts and proc macros run sandboxed by the daemon, no cargo check and no sysroot proc-macro server: those were no-rustc bugs), adding the serve work kind that hands the job's `&Lowered` to the recorder in blaze-cargo (integrate-load owns blaze-cargo). Queued to integrate-load as a follow-up."
+    }
+  ]
+}

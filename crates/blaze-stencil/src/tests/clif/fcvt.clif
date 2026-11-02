@@ -1,0 +1,623 @@
+; Follows cranelift/filetests/filetests/runtests/conversion.clif (and fcvt-sat.clif,
+; fcvt_to_sint.clif, fcvt_to_uint.clif, fcvt_from_sint.clif, fcvt_from_uint.clif, fdemote.clif,
+; fpromote.clif, bitcast.clif), for the stencil set: scalar conversions between f32/f64 and the
+; integers. `fcvt_to_sint`/`fcvt_to_uint` to i32 and i64: truncation toward zero, each type's
+; boundaries (the largest float below 2^(n-1) or 2^n converts, the next traps; f64 reaches
+; past i32's MIN by up to one), -0.9 to unsigned is 0, NaN and both infinities trap; the `_sat`
+; forms on the same values (saturating, NaN to 0); `fcvt_from_sint`/`fcvt_from_uint` from i8 to
+; i64, with ties to even and u64's MAX rounding up to 2^64 (including a u64 that rounding
+; through f64 first would get wrong); `fpromote` and `fdemote` (ties, overflow to Inf, subnormal
+; results, NaN); `bitcast` between i32/f32 and i64/f64 both ways. Float to i8 and i16 is in
+; fcvt-narrow.clif: Cranelift 0.136's x86-64 backend does not lower it, and one such function
+; here would stop this whole file's code on x86-64.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %f32_to_i32(f32) -> i32 {
+block0(v0: f32):
+    v1 = fcvt_to_sint.i32 v0
+    return v1
+}
+; run: %f32_to_i32(0x0.0) == 0
+; run: %f32_to_i32(-0x0.0) == 0
+; run: %f32_to_i32(0x1.0p0) == 1
+; run: %f32_to_i32(-0x1.0p0) == -1
+; run: %f32_to_i32(0x1.8p0) == 1
+; run: %f32_to_i32(-0x1.8p0) == -1
+; run: %f32_to_i32(0x1.fffffep-1) == 0
+; run: %f32_to_i32(-0x1.ccccccp-1) == 0
+; run: %f32_to_i32(0x1.4p3) == 10
+; run: %f32_to_i32(-0x1.3p3) == -9
+; run: %f32_to_i32(0x0.000002p-126) == 0
+; run: %f32_to_i32(0x1.fffffep30) == 0x7fffff80
+; run: %f32_to_i32(-0x1.0p31) == 0x80000000
+; trap: %f32_to_i32(0x1.0p31)
+; trap: %f32_to_i32(-0x1.000002p31)
+; trap: %f32_to_i32(0x1.fffffep127)
+; trap: %f32_to_i32(+Inf)
+; trap: %f32_to_i32(-Inf)
+; trap: %f32_to_i32(+NaN)
+; trap: %f32_to_i32(-NaN)
+
+function %f32_to_i64(f32) -> i64 {
+block0(v0: f32):
+    v1 = fcvt_to_sint.i64 v0
+    return v1
+}
+; run: %f32_to_i64(0x0.0) == 0
+; run: %f32_to_i64(-0x0.0) == 0
+; run: %f32_to_i64(0x1.8p0) == 1
+; run: %f32_to_i64(-0x1.8p0) == -1
+; run: %f32_to_i64(-0x1.ccccccp-1) == 0
+; run: %f32_to_i64(0x1.000002p23) == 8388609
+; run: %f32_to_i64(0x1.0p31) == 2147483648
+; run: %f32_to_i64(-0x1.000002p31) == -2147483904
+; run: %f32_to_i64(0x1.fffffep62) == 0x7fffff8000000000
+; run: %f32_to_i64(-0x1.0p63) == 0x8000000000000000
+; trap: %f32_to_i64(0x1.0p63)
+; trap: %f32_to_i64(-0x1.000002p63)
+; trap: %f32_to_i64(+Inf)
+; trap: %f32_to_i64(-Inf)
+; trap: %f32_to_i64(+NaN)
+
+function %f64_to_i32(f64) -> i32 {
+block0(v0: f64):
+    v1 = fcvt_to_sint.i32 v0
+    return v1
+}
+; run: %f64_to_i32(0x0.0) == 0
+; run: %f64_to_i32(-0x0.0) == 0
+; run: %f64_to_i32(0x1.8p0) == 1
+; run: %f64_to_i32(-0x1.4p1) == -2
+; run: %f64_to_i32(0x1.fffffffffffffp-1) == 0
+; run: %f64_to_i32(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_i32(0x0.0000000000001p-1022) == 0
+; run: %f64_to_i32(0x1.fffffffcp30) == 0x7fffffff
+; run: %f64_to_i32(0x1.fffffffep30) == 0x7fffffff
+; run: %f64_to_i32(-0x1.0p31) == 0x80000000
+; run: %f64_to_i32(-0x1.00000001fffffp31) == 0x80000000
+; trap: %f64_to_i32(0x1.0p31)
+; trap: %f64_to_i32(-0x1.00000002p31)
+; trap: %f64_to_i32(0x1.0p32)
+; trap: %f64_to_i32(+Inf)
+; trap: %f64_to_i32(-Inf)
+; trap: %f64_to_i32(+NaN)
+
+function %f64_to_i64(f64) -> i64 {
+block0(v0: f64):
+    v1 = fcvt_to_sint.i64 v0
+    return v1
+}
+; run: %f64_to_i64(0x0.0) == 0
+; run: %f64_to_i64(-0x0.0) == 0
+; run: %f64_to_i64(0x1.8p0) == 1
+; run: %f64_to_i64(-0x1.8p0) == -1
+; run: %f64_to_i64(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_i64(0x1.0p53) == 9007199254740992
+; run: %f64_to_i64(-0x1.00000002p31) == -2147483649
+; run: %f64_to_i64(0x1.fffffffffffffp62) == 0x7ffffffffffffc00
+; run: %f64_to_i64(-0x1.0p63) == 0x8000000000000000
+; trap: %f64_to_i64(0x1.0p63)
+; trap: %f64_to_i64(-0x1.0000000000001p63)
+; trap: %f64_to_i64(+Inf)
+; trap: %f64_to_i64(-Inf)
+; trap: %f64_to_i64(+NaN)
+
+function %f32_to_u32(f32) -> i32 {
+block0(v0: f32):
+    v1 = fcvt_to_uint.i32 v0
+    return v1
+}
+; run: %f32_to_u32(0x0.0) == 0
+; run: %f32_to_u32(-0x0.0) == 0
+; run: %f32_to_u32(0x1.8p0) == 1
+; run: %f32_to_u32(-0x1.ccccccp-1) == 0
+; run: %f32_to_u32(0x1.0p31) == 0x80000000
+; run: %f32_to_u32(0x1.fffffep31) == 0xffffff00
+; trap: %f32_to_u32(0x1.0p32)
+; trap: %f32_to_u32(-0x1.0p0)
+; trap: %f32_to_u32(+Inf)
+; trap: %f32_to_u32(-Inf)
+; trap: %f32_to_u32(+NaN)
+
+function %f32_to_u64(f32) -> i64 {
+block0(v0: f32):
+    v1 = fcvt_to_uint.i64 v0
+    return v1
+}
+; run: %f32_to_u64(0x0.0) == 0
+; run: %f32_to_u64(-0x0.0) == 0
+; run: %f32_to_u64(0x1.8p0) == 1
+; run: %f32_to_u64(-0x1.ccccccp-1) == 0
+; run: %f32_to_u64(0x1.0p32) == 0x100000000
+; run: %f32_to_u64(0x1.0p63) == 0x8000000000000000
+; run: %f32_to_u64(0x1.fffffep63) == 0xffffff0000000000
+; trap: %f32_to_u64(0x1.0p64)
+; trap: %f32_to_u64(-0x1.0p0)
+; trap: %f32_to_u64(+Inf)
+; trap: %f32_to_u64(-Inf)
+; trap: %f32_to_u64(+NaN)
+
+function %f64_to_u32(f64) -> i32 {
+block0(v0: f64):
+    v1 = fcvt_to_uint.i32 v0
+    return v1
+}
+; run: %f64_to_u32(0x0.0) == 0
+; run: %f64_to_u32(-0x0.0) == 0
+; run: %f64_to_u32(0x1.8p0) == 1
+; run: %f64_to_u32(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_u32(0x1.0p31) == 0x80000000
+; run: %f64_to_u32(0x1.fffffffep31) == 0xffffffff
+; run: %f64_to_u32(0x1.ffffffffp31) == 0xffffffff
+; trap: %f64_to_u32(0x1.0p32)
+; trap: %f64_to_u32(-0x1.0p0)
+; trap: %f64_to_u32(+Inf)
+; trap: %f64_to_u32(-Inf)
+; trap: %f64_to_u32(+NaN)
+
+function %f64_to_u64(f64) -> i64 {
+block0(v0: f64):
+    v1 = fcvt_to_uint.i64 v0
+    return v1
+}
+; run: %f64_to_u64(0x0.0) == 0
+; run: %f64_to_u64(-0x0.0) == 0
+; run: %f64_to_u64(0x1.8p0) == 1
+; run: %f64_to_u64(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_u64(0x1.0p63) == 0x8000000000000000
+; run: %f64_to_u64(0x1.fffffffffffffp63) == 0xfffffffffffff800
+; trap: %f64_to_u64(0x1.0p64)
+; trap: %f64_to_u64(-0x1.0p0)
+; trap: %f64_to_u64(+Inf)
+; trap: %f64_to_u64(-Inf)
+; trap: %f64_to_u64(+NaN)
+
+function %f32_to_i32_sat(f32) -> i32 {
+block0(v0: f32):
+    v1 = fcvt_to_sint_sat.i32 v0
+    return v1
+}
+; run: %f32_to_i32_sat(0x0.0) == 0
+; run: %f32_to_i32_sat(0x1.8p0) == 1
+; run: %f32_to_i32_sat(-0x1.8p0) == -1
+; run: %f32_to_i32_sat(-0x1.ccccccp-1) == 0
+; run: %f32_to_i32_sat(0x1.fffffep30) == 0x7fffff80
+; run: %f32_to_i32_sat(-0x1.0p31) == 0x80000000
+; run: %f32_to_i32_sat(0x1.0p31) == 0x7fffffff
+; run: %f32_to_i32_sat(-0x1.000002p31) == 0x80000000
+; run: %f32_to_i32_sat(0x1.fffffep127) == 0x7fffffff
+; run: %f32_to_i32_sat(+Inf) == 0x7fffffff
+; run: %f32_to_i32_sat(-Inf) == 0x80000000
+; run: %f32_to_i32_sat(+NaN) == 0
+; run: %f32_to_i32_sat(-NaN) == 0
+
+function %f32_to_i64_sat(f32) -> i64 {
+block0(v0: f32):
+    v1 = fcvt_to_sint_sat.i64 v0
+    return v1
+}
+; run: %f32_to_i64_sat(0x0.0) == 0
+; run: %f32_to_i64_sat(-0x1.8p0) == -1
+; run: %f32_to_i64_sat(-0x1.ccccccp-1) == 0
+; run: %f32_to_i64_sat(0x1.fffffep62) == 0x7fffff8000000000
+; run: %f32_to_i64_sat(-0x1.0p63) == 0x8000000000000000
+; run: %f32_to_i64_sat(0x1.0p63) == 0x7fffffffffffffff
+; run: %f32_to_i64_sat(-0x1.000002p63) == 0x8000000000000000
+; run: %f32_to_i64_sat(+Inf) == 0x7fffffffffffffff
+; run: %f32_to_i64_sat(-Inf) == 0x8000000000000000
+; run: %f32_to_i64_sat(+NaN) == 0
+
+function %f64_to_i32_sat(f64) -> i32 {
+block0(v0: f64):
+    v1 = fcvt_to_sint_sat.i32 v0
+    return v1
+}
+; run: %f64_to_i32_sat(0x0.0) == 0
+; run: %f64_to_i32_sat(-0x1.4p1) == -2
+; run: %f64_to_i32_sat(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_i32_sat(0x1.fffffffcp30) == 0x7fffffff
+; run: %f64_to_i32_sat(0x1.fffffffep30) == 0x7fffffff
+; run: %f64_to_i32_sat(-0x1.0p31) == 0x80000000
+; run: %f64_to_i32_sat(-0x1.00000001fffffp31) == 0x80000000
+; run: %f64_to_i32_sat(0x1.0p31) == 0x7fffffff
+; run: %f64_to_i32_sat(-0x1.00000002p31) == 0x80000000
+; run: %f64_to_i32_sat(0x1.fffffffffffffp1023) == 0x7fffffff
+; run: %f64_to_i32_sat(+Inf) == 0x7fffffff
+; run: %f64_to_i32_sat(-Inf) == 0x80000000
+; run: %f64_to_i32_sat(+NaN) == 0
+; run: %f64_to_i32_sat(-NaN) == 0
+
+function %f64_to_i64_sat(f64) -> i64 {
+block0(v0: f64):
+    v1 = fcvt_to_sint_sat.i64 v0
+    return v1
+}
+; run: %f64_to_i64_sat(0x0.0) == 0
+; run: %f64_to_i64_sat(-0x1.8p0) == -1
+; run: %f64_to_i64_sat(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_i64_sat(0x1.fffffffffffffp62) == 0x7ffffffffffffc00
+; run: %f64_to_i64_sat(-0x1.0p63) == 0x8000000000000000
+; run: %f64_to_i64_sat(0x1.0p63) == 0x7fffffffffffffff
+; run: %f64_to_i64_sat(-0x1.0000000000001p63) == 0x8000000000000000
+; run: %f64_to_i64_sat(+Inf) == 0x7fffffffffffffff
+; run: %f64_to_i64_sat(-Inf) == 0x8000000000000000
+; run: %f64_to_i64_sat(+NaN) == 0
+
+function %f32_to_u32_sat(f32) -> i32 {
+block0(v0: f32):
+    v1 = fcvt_to_uint_sat.i32 v0
+    return v1
+}
+; run: %f32_to_u32_sat(0x0.0) == 0
+; run: %f32_to_u32_sat(0x1.8p0) == 1
+; run: %f32_to_u32_sat(-0x1.ccccccp-1) == 0
+; run: %f32_to_u32_sat(-0x1.0p0) == 0
+; run: %f32_to_u32_sat(0x1.0p31) == 0x80000000
+; run: %f32_to_u32_sat(0x1.fffffep31) == 0xffffff00
+; run: %f32_to_u32_sat(0x1.0p32) == 0xffffffff
+; run: %f32_to_u32_sat(+Inf) == 0xffffffff
+; run: %f32_to_u32_sat(-Inf) == 0
+; run: %f32_to_u32_sat(+NaN) == 0
+; run: %f32_to_u32_sat(-NaN) == 0
+
+function %f32_to_u64_sat(f32) -> i64 {
+block0(v0: f32):
+    v1 = fcvt_to_uint_sat.i64 v0
+    return v1
+}
+; run: %f32_to_u64_sat(0x0.0) == 0
+; run: %f32_to_u64_sat(-0x1.ccccccp-1) == 0
+; run: %f32_to_u64_sat(-0x1.0p0) == 0
+; run: %f32_to_u64_sat(0x1.0p63) == 0x8000000000000000
+; run: %f32_to_u64_sat(0x1.fffffep63) == 0xffffff0000000000
+; run: %f32_to_u64_sat(0x1.0p64) == 0xffffffffffffffff
+; run: %f32_to_u64_sat(+Inf) == 0xffffffffffffffff
+; run: %f32_to_u64_sat(-Inf) == 0
+; run: %f32_to_u64_sat(+NaN) == 0
+
+function %f64_to_u32_sat(f64) -> i32 {
+block0(v0: f64):
+    v1 = fcvt_to_uint_sat.i32 v0
+    return v1
+}
+; run: %f64_to_u32_sat(0x0.0) == 0
+; run: %f64_to_u32_sat(0x1.8p0) == 1
+; run: %f64_to_u32_sat(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_u32_sat(-0x1.0p0) == 0
+; run: %f64_to_u32_sat(0x1.0p31) == 0x80000000
+; run: %f64_to_u32_sat(0x1.fffffffep31) == 0xffffffff
+; run: %f64_to_u32_sat(0x1.ffffffffp31) == 0xffffffff
+; run: %f64_to_u32_sat(0x1.0p32) == 0xffffffff
+; run: %f64_to_u32_sat(+Inf) == 0xffffffff
+; run: %f64_to_u32_sat(-Inf) == 0
+; run: %f64_to_u32_sat(+NaN) == 0
+
+function %f64_to_u64_sat(f64) -> i64 {
+block0(v0: f64):
+    v1 = fcvt_to_uint_sat.i64 v0
+    return v1
+}
+; run: %f64_to_u64_sat(0x0.0) == 0
+; run: %f64_to_u64_sat(-0x1.ccccccccccccdp-1) == 0
+; run: %f64_to_u64_sat(-0x1.0p0) == 0
+; run: %f64_to_u64_sat(0x1.0p63) == 0x8000000000000000
+; run: %f64_to_u64_sat(0x1.fffffffffffffp63) == 0xfffffffffffff800
+; run: %f64_to_u64_sat(0x1.0p64) == 0xffffffffffffffff
+; run: %f64_to_u64_sat(+Inf) == 0xffffffffffffffff
+; run: %f64_to_u64_sat(-Inf) == 0
+; run: %f64_to_u64_sat(+NaN) == 0
+
+function %i8_to_f32(i8) -> f32 {
+block0(v0: i8):
+    v1 = fcvt_from_sint.f32 v0
+    return v1
+}
+; run: %i8_to_f32(0) == 0x0.0
+; run: %i8_to_f32(1) == 0x1.0p0
+; run: %i8_to_f32(-1) == -0x1.0p0
+; run: %i8_to_f32(127) == 0x1.fcp6
+; run: %i8_to_f32(-128) == -0x1.0p7
+
+function %i8_to_f64(i8) -> f64 {
+block0(v0: i8):
+    v1 = fcvt_from_sint.f64 v0
+    return v1
+}
+; run: %i8_to_f64(0) == 0x0.0
+; run: %i8_to_f64(-1) == -0x1.0p0
+; run: %i8_to_f64(127) == 0x1.fcp6
+; run: %i8_to_f64(-128) == -0x1.0p7
+
+function %i16_to_f32(i16) -> f32 {
+block0(v0: i16):
+    v1 = fcvt_from_sint.f32 v0
+    return v1
+}
+; run: %i16_to_f32(0) == 0x0.0
+; run: %i16_to_f32(-1) == -0x1.0p0
+; run: %i16_to_f32(32767) == 0x1.fffcp14
+; run: %i16_to_f32(-32768) == -0x1.0p15
+
+function %i16_to_f64(i16) -> f64 {
+block0(v0: i16):
+    v1 = fcvt_from_sint.f64 v0
+    return v1
+}
+; run: %i16_to_f64(0) == 0x0.0
+; run: %i16_to_f64(-1) == -0x1.0p0
+; run: %i16_to_f64(32767) == 0x1.fffcp14
+; run: %i16_to_f64(-32768) == -0x1.0p15
+
+function %i32_to_f32(i32) -> f32 {
+block0(v0: i32):
+    v1 = fcvt_from_sint.f32 v0
+    return v1
+}
+; run: %i32_to_f32(0) == 0x0.0
+; run: %i32_to_f32(-1) == -0x1.0p0
+; run: %i32_to_f32(16777216) == 0x1.0p24
+; run: %i32_to_f32(16777217) == 0x1.0p24
+; run: %i32_to_f32(16777218) == 0x1.000002p24
+; run: %i32_to_f32(16777219) == 0x1.000004p24
+; run: %i32_to_f32(-16777217) == -0x1.0p24
+; run: %i32_to_f32(-16777219) == -0x1.000004p24
+; run: %i32_to_f32(2147483519) == 0x1.fffffep30
+; run: %i32_to_f32(2147483647) == 0x1.0p31
+; run: %i32_to_f32(-2147483648) == -0x1.0p31
+
+function %i32_to_f64(i32) -> f64 {
+block0(v0: i32):
+    v1 = fcvt_from_sint.f64 v0
+    return v1
+}
+; run: %i32_to_f64(0) == 0x0.0
+; run: %i32_to_f64(-1) == -0x1.0p0
+; run: %i32_to_f64(16777217) == 0x1.000001p24
+; run: %i32_to_f64(2147483647) == 0x1.fffffffcp30
+; run: %i32_to_f64(-2147483648) == -0x1.0p31
+
+function %i64_to_f32(i64) -> f32 {
+block0(v0: i64):
+    v1 = fcvt_from_sint.f32 v0
+    return v1
+}
+; run: %i64_to_f32(0) == 0x0.0
+; run: %i64_to_f32(-1) == -0x1.0p0
+; run: %i64_to_f32(16777217) == 0x1.0p24
+; run: %i64_to_f32(0x10000010000) == 0x1.0p40
+; run: %i64_to_f32(0x10000010001) == 0x1.000002p40
+; run: %i64_to_f32(0x10000030000) == 0x1.000004p40
+; run: %i64_to_f32(-1099511824384) == -0x1.000004p40
+; run: %i64_to_f32(0x7fffffffffffffff) == 0x1.0p63
+; run: %i64_to_f32(0x8000000000000000) == -0x1.0p63
+
+function %i64_to_f64(i64) -> f64 {
+block0(v0: i64):
+    v1 = fcvt_from_sint.f64 v0
+    return v1
+}
+; run: %i64_to_f64(0) == 0x0.0
+; run: %i64_to_f64(-1) == -0x1.0p0
+; run: %i64_to_f64(0x1fffffffffffff) == 0x1.fffffffffffffp52
+; run: %i64_to_f64(0x20000000000001) == 0x1.0p53
+; run: %i64_to_f64(0x20000000000003) == 0x1.0000000000002p53
+; run: %i64_to_f64(-9007199254740993) == -0x1.0p53
+; run: %i64_to_f64(0x7fffffffffffffff) == 0x1.0p63
+; run: %i64_to_f64(0x8000000000000000) == -0x1.0p63
+
+function %u8_to_f32(i8) -> f32 {
+block0(v0: i8):
+    v1 = fcvt_from_uint.f32 v0
+    return v1
+}
+; run: %u8_to_f32(0) == 0x0.0
+; run: %u8_to_f32(1) == 0x1.0p0
+; run: %u8_to_f32(0x80) == 0x1.0p7
+; run: %u8_to_f32(0xff) == 0x1.fep7
+
+function %u8_to_f64(i8) -> f64 {
+block0(v0: i8):
+    v1 = fcvt_from_uint.f64 v0
+    return v1
+}
+; run: %u8_to_f64(0) == 0x0.0
+; run: %u8_to_f64(0x80) == 0x1.0p7
+; run: %u8_to_f64(0xff) == 0x1.fep7
+
+function %u16_to_f32(i16) -> f32 {
+block0(v0: i16):
+    v1 = fcvt_from_uint.f32 v0
+    return v1
+}
+; run: %u16_to_f32(0) == 0x0.0
+; run: %u16_to_f32(0x8000) == 0x1.0p15
+; run: %u16_to_f32(0xffff) == 0x1.fffep15
+
+function %u16_to_f64(i16) -> f64 {
+block0(v0: i16):
+    v1 = fcvt_from_uint.f64 v0
+    return v1
+}
+; run: %u16_to_f64(0) == 0x0.0
+; run: %u16_to_f64(0x8000) == 0x1.0p15
+; run: %u16_to_f64(0xffff) == 0x1.fffep15
+
+function %u32_to_f32(i32) -> f32 {
+block0(v0: i32):
+    v1 = fcvt_from_uint.f32 v0
+    return v1
+}
+; run: %u32_to_f32(0) == 0x0.0
+; run: %u32_to_f32(1) == 0x1.0p0
+; run: %u32_to_f32(0x01000001) == 0x1.0p24
+; run: %u32_to_f32(0x01000003) == 0x1.000004p24
+; run: %u32_to_f32(0x80000000) == 0x1.0p31
+; run: %u32_to_f32(0xffffff00) == 0x1.fffffep31
+; run: %u32_to_f32(0xffffff7f) == 0x1.fffffep31
+; run: %u32_to_f32(0xffffff80) == 0x1.0p32
+; run: %u32_to_f32(0xffffffff) == 0x1.0p32
+
+function %u32_to_f64(i32) -> f64 {
+block0(v0: i32):
+    v1 = fcvt_from_uint.f64 v0
+    return v1
+}
+; run: %u32_to_f64(0) == 0x0.0
+; run: %u32_to_f64(0x80000000) == 0x1.0p31
+; run: %u32_to_f64(0xffffffff) == 0x1.fffffffep31
+
+function %u64_to_f32(i64) -> f32 {
+block0(v0: i64):
+    v1 = fcvt_from_uint.f32 v0
+    return v1
+}
+; run: %u64_to_f32(0) == 0x0.0
+; run: %u64_to_f32(1) == 0x1.0p0
+; run: %u64_to_f32(0x0000000001000001) == 0x1.0p24
+; run: %u64_to_f32(0x7fffffffffffffff) == 0x1.0p63
+; run: %u64_to_f32(0x8000000000000000) == 0x1.0p63
+; run: %u64_to_f32(0x8000008000000000) == 0x1.0p63
+; run: %u64_to_f32(0x8000008000000001) == 0x1.000002p63
+; run: %u64_to_f32(0x8000018000000000) == 0x1.000004p63
+; run: %u64_to_f32(0xffffff7fffffffff) == 0x1.fffffep63
+; run: %u64_to_f32(0xffffff8000000000) == 0x1.0p64
+; run: %u64_to_f32(0xffffffffffffffff) == 0x1.0p64
+
+function %u64_to_f64(i64) -> f64 {
+block0(v0: i64):
+    v1 = fcvt_from_uint.f64 v0
+    return v1
+}
+; run: %u64_to_f64(0) == 0x0.0
+; run: %u64_to_f64(1) == 0x1.0p0
+; run: %u64_to_f64(0x001fffffffffffff) == 0x1.fffffffffffffp52
+; run: %u64_to_f64(0x0020000000000001) == 0x1.0p53
+; run: %u64_to_f64(0x7fffffffffffffff) == 0x1.0p63
+; run: %u64_to_f64(0x8000000000000000) == 0x1.0p63
+; run: %u64_to_f64(0x8000000000000400) == 0x1.0p63
+; run: %u64_to_f64(0x8000000000000401) == 0x1.0000000000001p63
+; run: %u64_to_f64(0xfffffffffffffbff) == 0x1.fffffffffffffp63
+; run: %u64_to_f64(0xfffffffffffffc00) == 0x1.0p64
+; run: %u64_to_f64(0xffffffffffffffff) == 0x1.0p64
+
+function %fpromote(f32) -> f64 {
+block0(v0: f32):
+    v1 = fpromote.f64 v0
+    return v1
+}
+; run: %fpromote(0x0.0) == 0x0.0
+; run: %fpromote(-0x0.0) == -0x0.0
+; run: %fpromote(0x1.0p0) == 0x1.0p0
+; run: %fpromote(-0x1.8p1) == -0x1.8p1
+; run: %fpromote(0x1.555556p-2) == 0x1.555556p-2
+; run: %fpromote(0x1.fffffep127) == 0x1.fffffep127
+; run: %fpromote(-0x1.fffffep127) == -0x1.fffffep127
+; run: %fpromote(0x1.0p-126) == 0x1.0p-126
+; run: %fpromote(0x0.000002p-126) == 0x1.0p-149
+; run: %fpromote(-0x0.000002p-126) == -0x1.0p-149
+; run: %fpromote(0x0.fffffep-126) == 0x1.fffffcp-127
+; run: %fpromote(+Inf) == +Inf
+; run: %fpromote(-Inf) == -Inf
+; run: %fpromote(+NaN) == +NaN
+; run: %fpromote(-NaN) == +NaN
+
+function %fdemote(f64) -> f32 {
+block0(v0: f64):
+    v1 = fdemote.f32 v0
+    return v1
+}
+; run: %fdemote(0x0.0) == 0x0.0
+; run: %fdemote(-0x0.0) == -0x0.0
+; run: %fdemote(0x1.0p0) == 0x1.0p0
+; run: %fdemote(-0x1.8p1) == -0x1.8p1
+; run: %fdemote(0x1.5555555555555p-2) == 0x1.555556p-2
+; run: %fdemote(0x1.000001p0) == 0x1.0p0
+; run: %fdemote(0x1.0000010000001p0) == 0x1.000002p0
+; run: %fdemote(0x1.000003p0) == 0x1.000004p0
+; run: %fdemote(-0x1.000003p0) == -0x1.000004p0
+; run: %fdemote(0x1.fffffefffffffp127) == 0x1.fffffep127
+; run: %fdemote(0x1.ffffffp127) == +Inf
+; run: %fdemote(0x1.0p128) == +Inf
+; run: %fdemote(-0x1.0p128) == -Inf
+; run: %fdemote(0x1.fffffffffffffp1023) == +Inf
+; run: %fdemote(0x1.0p-126) == 0x1.0p-126
+; run: %fdemote(0x1.fffffcp-127) == 0x0.fffffep-126
+; run: %fdemote(0x1.0p-149) == 0x0.000002p-126
+; run: %fdemote(0x1.8p-149) == 0x0.000004p-126
+; run: %fdemote(0x1.0p-150) == 0x0.0
+; run: %fdemote(0x1.0000000000001p-150) == 0x0.000002p-126
+; run: %fdemote(-0x1.0p-200) == -0x0.0
+; run: %fdemote(0x0.0000000000001p-1022) == 0x0.0
+; run: %fdemote(+Inf) == +Inf
+; run: %fdemote(-Inf) == -Inf
+; run: %fdemote(+NaN) == +NaN
+; run: %fdemote(-NaN) == +NaN
+
+function %bitcast_i32_f32(i32) -> f32 {
+block0(v0: i32):
+    v1 = bitcast.f32 v0
+    return v1
+}
+; run: %bitcast_i32_f32(0) == 0x0.0
+; run: %bitcast_i32_f32(0x80000000) == -0x0.0
+; run: %bitcast_i32_f32(0x3f800000) == 0x1.0p0
+; run: %bitcast_i32_f32(0xc0400000) == -0x1.8p1
+; run: %bitcast_i32_f32(1) == 0x0.000002p-126
+; run: %bitcast_i32_f32(0x7f7fffff) == 0x1.fffffep127
+; run: %bitcast_i32_f32(0x7f800000) == +Inf
+; run: %bitcast_i32_f32(0xff800000) == -Inf
+; run: %bitcast_i32_f32(0x7fc00000) == +NaN
+
+function %bitcast_f32_i32(f32) -> i32 {
+block0(v0: f32):
+    v1 = bitcast.i32 v0
+    return v1
+}
+; run: %bitcast_f32_i32(0x0.0) == 0
+; run: %bitcast_f32_i32(-0x0.0) == 0x80000000
+; run: %bitcast_f32_i32(0x1.0p0) == 0x3f800000
+; run: %bitcast_f32_i32(-0x1.8p1) == 0xc0400000
+; run: %bitcast_f32_i32(0x0.000002p-126) == 1
+; run: %bitcast_f32_i32(0x1.fffffep127) == 0x7f7fffff
+; run: %bitcast_f32_i32(+Inf) == 0x7f800000
+; run: %bitcast_f32_i32(-Inf) == 0xff800000
+; run: %bitcast_f32_i32(+NaN) == 0x7fc00000
+; run: %bitcast_f32_i32(-NaN) == 0xffc00000
+; run: %bitcast_f32_i32(+NaN:0x1) == 0x7fc00001
+; run: %bitcast_f32_i32(+sNaN:0x1) == 0x7f800001
+
+function %bitcast_i64_f64(i64) -> f64 {
+block0(v0: i64):
+    v1 = bitcast.f64 v0
+    return v1
+}
+; run: %bitcast_i64_f64(0) == 0x0.0
+; run: %bitcast_i64_f64(0x8000000000000000) == -0x0.0
+; run: %bitcast_i64_f64(0x3ff0000000000000) == 0x1.0p0
+; run: %bitcast_i64_f64(0xc008000000000000) == -0x1.8p1
+; run: %bitcast_i64_f64(1) == 0x0.0000000000001p-1022
+; run: %bitcast_i64_f64(0x7fefffffffffffff) == 0x1.fffffffffffffp1023
+; run: %bitcast_i64_f64(0x7ff0000000000000) == +Inf
+; run: %bitcast_i64_f64(0xfff0000000000000) == -Inf
+; run: %bitcast_i64_f64(0x7ff8000000000000) == +NaN
+
+function %bitcast_f64_i64(f64) -> i64 {
+block0(v0: f64):
+    v1 = bitcast.i64 v0
+    return v1
+}
+; run: %bitcast_f64_i64(0x0.0) == 0
+; run: %bitcast_f64_i64(-0x0.0) == 0x8000000000000000
+; run: %bitcast_f64_i64(0x1.0p0) == 0x3ff0000000000000
+; run: %bitcast_f64_i64(-0x1.8p1) == 0xc008000000000000
+; run: %bitcast_f64_i64(0x0.0000000000001p-1022) == 1
+; run: %bitcast_f64_i64(0x1.fffffffffffffp1023) == 0x7fefffffffffffff
+; run: %bitcast_f64_i64(+Inf) == 0x7ff0000000000000
+; run: %bitcast_f64_i64(-Inf) == 0xfff0000000000000
+; run: %bitcast_f64_i64(+NaN) == 0x7ff8000000000000
+; run: %bitcast_f64_i64(-NaN) == 0xfff8000000000000
+; run: %bitcast_f64_i64(+NaN:0x1) == 0x7ff8000000000001
+; run: %bitcast_f64_i64(+sNaN:0x1) == 0x7ff0000000000001

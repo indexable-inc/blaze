@@ -1,0 +1,42 @@
+{
+  "id": "00318",
+  "from_lane": "usercode-wire-macros",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/usercode.md",
+    "crates/blaze-macro-wasm/Cargo.toml",
+    "fuzz/targets/macro_wasm_wire.rs",
+    "fuzz/README.md",
+    "tools/v2/hot_lint.py",
+    "crates/blaze-macro-wasm/src/lib.rs",
+    "v2/requests/usercode-wire.md",
+    "crates/blaze-macro-wasm"
+  ],
+  "what": "## usercode-wire-macros: what the column wire needs outside its paths\n\nFrom `usercode-wire-macros` (report `/tmp/blaze-lanes/v2-usercode-wire-macros.md`), items 3\nand 4 of `v2/requests/usercode.md` `## frontend-tokens`.\n\n- `crates/blaze-macro-wasm/Cargo.toml` (usercode): `ra-ap-rustc_lexer` is no longer used by the\n  crate: its lexer is `blaze_expand::bridge::lex` now. Remove the line.\n- `fuzz/targets/macro_wasm_wire.rs` (fuzz lane): the module now writes, and the host reads,\n  tt's columns (`TopSubtree::write_wire` layout, each span part named `{file_id: index,\n  ast_id: 0, ctx: 0}` with the sites at indices 0..=2, read with `read_wire`). Its `Wire`\n  writer, seeds, dictionary and the \"2 trees per 15 bytes\" bound are of the old stream format\n  and want redoing: seeds from `write_wire` of lexed trees with the part rows rewritten, and a\n  bound of one token tree per 16 bytes (a node is 2 words and its span 2). `fuzz/README.md`'s\n  row with it. `HOST_VERSION` is now `blaze v2 wasm proc-macro host 2`.\n- `tools/v2/hot_lint.py`: `{\"crates\": [...]}` fails with `typed_input: crates has a type it\n  does not read: list[str]`, so a crate outside `HOT` can't be linted.\n- Not done here, outside these paths: the forwarded `## dedup: LEB128` request above\n  (`blaze-macro-wasm/Cargo.toml` and `carried_list`, neither of which this lane owns); back to\n  usercode-wire.\n- `crates/blaze-macro-wasm/src/lib.rs` (usercode-wire): on a store hit `expand` still\n  allocates before its lookup in `guest_env` (a `collect` per call) and `package_dir`; the\n  rest of a hit (span parts, shapes, input and attribute bytes, the kept output's parts) now\n  reuses this thread's room (`Scratch`, `Reused`), so those two are what's left besides the\n  output tree.\n\n> forwarded to usercode-wire-macros (from requests, pass 17; told by tmux).\n> applied (usercode-wire-macros): `ra-ap-rustc_lexer` removed from `blaze-macro-wasm/Cargo.toml`\n> (manifest lint passes). Moot: `hot_lint.py` takes `{\"crates\": [...]}` now; the LEB128 item was\n> applied (see its section). Still open, not this lane's paths and past its context: the fuzz\n> target `fuzz/targets/macro_wasm_wire.rs` and its README row (fuzz lane), and the `guest_env` /\n> `package_dir` allocations on a hit (usercode-wire, `blaze-macro-wasm/src/lib.rs`).\n> forwarded (usercode-wire): `src/lib.rs` is not usercode-wire's. The `guest_env` / `package_dir` item is `v2/requests/usercode-wire.md` section 6, which usercode forwarded to usercode-hot-macros (the lane holding `crates/blaze-macro-wasm/`).",
+  "state": "applied",
+  "created": "2026-10-30T03:23:40Z",
+  "updated": "2026-10-30T08:35:15Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/usercode-wire-macros.md#usercode-wire-macros: what the column wire needs outside its paths",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-wire-macros.md:22"
+    },
+    {
+      "at": "2026-10-30T08:31:29Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:35:15Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "blaze-macro-wasm/Cargo.toml: ra-ap-rustc_lexer was already gone. fuzz/targets/macro_wasm_wire.rs rewritten for tt columns: seeds are blaze_expand::bridge::wire::relative of lexed trees with the three sites packed first (as blaze_macro_wasm::decode names them), dictionary of tt MAGIC, part rows, WIDE and NARROW, bound one token tree per 16 bytes, a test that a part past the expansion is refused; fuzz/README.md row; fuzz/Cargo.toml gains blaze-expand. hot_lint crates fixed (00026). The macro-wasm hit allocations and the LEB128 dedup stay with usercode-wire, as the request says."
+    }
+  ]
+}

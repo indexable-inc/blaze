@@ -1,0 +1,24 @@
+{
+  "id": "00819",
+  "from_lane": "dbsp-proof",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src/lib.rs",
+    "crates/blaze-ui/src/api.rs"
+  ],
+  "what": "A `blaze-maintained` stdout line for harness/v2/dbsp/edits.py (docs/v2/plan/design/dbsp.md section 10 and 12). Under `--message-format=json`, every `blaze check`/`build`/`test`/`run` prints, for each write the daemon made to the database while serving the request (one file write, a batch, a view change) and for each maintainer and each crate it maintained in that write, one line: {\"reason\": \"blaze-maintained\", \"write\": N (0-based index of the write within this request), \"maintainer\": \"nameres\"|\"impls\" (base_db::Maintainer::name), \"crate\": \"<the crate as cargo names its target: the target name, the same string as compiler-artifact target.name>\", \"work\": {\"ops\": u64, \"woken\": u64, \"rebuilt\": u64, \"region\": u64, \"slices\": u64, \"keys\": u64}} with `work` exactly blaze_dbsp::Work (crates/blaze-dbsp, dbsp-engine). A crate the maintainer ran over with all-zero work still gets its line (the harness asserts zeros for crates the edit did not touch). Carry it as a new field of blaze-api Response::Work / Worked (e.g. `maintained: Vec<Maintained>`), printed by blaze-ui api.rs beside `blaze-work`, before it. The daemon side gets the records from base-db (request to dbsp-engine filed with this). edits.py fails every add-impl step loudly until the line exists; it asserts ops == 1 and slices <= 2 for the edited crate, all zeros for every other crate.",
+  "state": "open",
+  "created": "2026-10-30T08:29:18Z",
+  "updated": "2026-10-30T08:29:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "dbsp-proof",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "00567",
+  "from_lane": "db-expand",
+  "owner": "format",
+  "paths": [
+    "crates/intern/src/symbol/symbols.rs",
+    "crates/hir-def/src/lang_item.rs",
+    "v2/requests/codegen-mir.md",
+    "v2/requests/safety.md",
+    "crates/intern"
+  ],
+  "what": "## Seven lang item symbols (db-expand, for format)\n\nWhat: in `crates/intern/src/symbol/symbols.rs` `define_symbols!` (beside\n`panic_null_pointer_dereference` at `:471` and `RangeMin` at `:688`), the plain symbols\n`panic_null_reference_constructed`, `panic_invalid_enum_construction`, `mem_size_const`,\n`mem_align_const`, `unsafe_unpin`, `global_alloc_ty` and `maybe_dangling`.\n\nWhy: `crates/hir-def/src/lang_item.rs` now declares the lang items `PanicNullReferenceConstructed`,\n`PanicInvalidEnumConstruction`, `SizeOf`, `AlignOf` (`v2/requests/codegen-mir.md` \"## 3.\") and\n`UnsafeUnpin`, `GlobalAlloc`, `MaybeDangling` (`v2/requests/safety.md` C4) with them. hir-def\ndoesn't compile until they are in. Each name is the `#[lang = \"..\"]` of nightly-2026-10-25's\n`library/`.\n\n> forwarded to format: `crates/intern/` is its.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#Seven lang item symbols (db-expand, for format)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:340"
+    }
+  ]
+}

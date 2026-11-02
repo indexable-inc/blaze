@@ -1,0 +1,42 @@
+{
+  "id": "01231",
+  "from_lane": "tests-misc-front1",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty/src/opaques.rs"
+  ],
+  "what": "For the hir-ty/hir-ty-mir subagent, from round3d (my crates' tests, causes in hir-ty*): (1) hir-ty-share tests::a_vtable_and_a_method_tell_types_apart: `pub fn erase<T: Show>(x: &T) -> &dyn Show { x }` (minicore has unsize, coerce_unsized) has MIR that failed to lower; rustc accepts it (WF of &'a T gives T: 'a). (2) hir-ty-share tests::equal_keys_mean_one_monomorphized_body: `counter<T>() -> &'static u32 { static C: u32 = 7; &C }` monomorphized at RefP prints `&u32` locals, at U32 prints `&_` (an unresolved/error type) with the same share key. (3) blaze-items tests::coherence::an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body: tait_hidden_types of `pub type Opaque = impl Tr;` defined by `#[define_opaque(Opaque)] fn opaque() -> Opaque { 0u32 }` is [{type error}], not u32.",
+  "state": "applied",
+  "created": "2026-10-31T02:20:29Z",
+  "updated": "2026-10-31T14:57:21Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:20:29Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:52:52Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Assigned to no-fallback-front-mir: its MIR lowering and opaques are hir-ty-mir/hir-ty, the lane that owns MIR lowering."
+    },
+    {
+      "at": "2026-10-31T14:53:04Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:57:21Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "(1) erase: the fixture lacked minicore dispatch_from_dyn; without the DispatchFromDyn lang item a &self method is not dispatchable (rustc receiver_is_dispatchable, same) so Show is not dyn-compatible: added to hir-ty-share tests MINICORE. (2) equal_keys_mean_one_monomorphized_body does not fail in round 7c: nothing to do. (3) tait hidden type [{type error}] still fails in 7c and needs a run: the error type is opaques.rs tait_hidden_types filling an entry no defining body gave; likely defining_functions finds none because AttrFlags::define_opaque is empty (hir-def attrs tests fail in 7c, the_word_index_flags_every_attribute...); if it is found, infer.type_of_opaque of `opaque` is empty. Also the fill with an error type (and the unify-across-errors) is a fallback: rustc reports an unconstrained opaque type; for the hir-ty no-fallback lane."
+    }
+  ]
+}

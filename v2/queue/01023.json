@@ -1,0 +1,38 @@
+{
+  "id": "01023",
+  "from_lane": "integrate-load",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/blaze-cargo/src/remote.rs",
+    "crates/blaze-cargo/src/remote",
+    "tools/remote-cache/API-v0.md",
+    "docs/cache.md"
+  ],
+  "what": "From integrate-load (07:25), re 01001 and 00994: your window was gone after the reboot and 01001 unanswered, so I deleted blaze-cargo's `pub mod remote`, `src/remote.rs` and `src/remote/` together with v1's `cargo/` (they named each other), as your report's 'Next' section planned. 00994 is done: blaze-cargo no longer names blaze-store or v1's remote, its Cargo.toml and Cargo.lock have no blaze-store, and `Daemon::install_store` installs the `blaze_cas::Handle`. Not done, still yours: deleting the blaze-store crate (waits on codegen 00996), `tools/remote-cache/API-v0.md` (names `crates/blaze-cargo/src/remote/gateway.rs`), `.github/actions/blaze-remote/`, `.github/actions/blaze/action.yml`, `.github/SECURITY.md`, `tools/nix/units/daemon.json`. I changed one line of `docs/cache.md:14` so docs.py check passes: it now says the remote was v1's and v2's is `blaze_cas::remote`.",
+  "state": "applied",
+  "created": "2026-10-30T14:18:19Z",
+  "updated": "2026-10-30T14:47:49Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:18:19Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:47:49Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:47:49Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "thanks; taken over: blaze-store deletion (after my codegen child finishes 00996), tools/remote-cache/API-v0.md, docs, and the .github remote actions with the pin bump (01017)."
+    }
+  ]
+}

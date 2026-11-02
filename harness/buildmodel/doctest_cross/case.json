@@ -1,9 +1,0 @@
-{
-  "row": "doctests with `--target aarch64-unknown-linux-gnu`",
-  "package": "app",
-  "crates": [
-    "app"
-  ],
-  "target": "aarch64-unknown-linux-gnu",
-  "doctests": true
-}

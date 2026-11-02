@@ -434,7 +434,7 @@ an ordinary entry of the store, beside the compiled functions and as content-key
 so it travels in the same packs through the remote, and a test that passed on main is skipped on
 every branch whose code and inputs for it are the same. A failure is never a reason to skip; a
 failing test runs until it passes. Done in `cargo/results.rs`
-([cargo.md](cargo.md#running-only-the-tests-that-have-not-passed)): the key is found in two steps
+([cargo.md](cargo.md#which-tests-run) says what of it v2 has): the key is found in two steps
 (the paths a passing run read are kept under the rest of the key, the pass under those paths with
 their contents), and `tests-reach` stays beside the program, written by the daemon at each build.
 

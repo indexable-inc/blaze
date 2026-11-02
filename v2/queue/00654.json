@@ -1,0 +1,38 @@
+{
+  "id": "00654",
+  "from_lane": "db-audit-dbsub",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/hir/src/evict.rs",
+    "crates/hir/src/tests.rs",
+    "v2/requests/db-salsa.md"
+  ],
+  "what": "## db-audit-dbsub: to lane codegen, free MIR and compiled values after a build (2026-10-29)\n\nWhat: in `crates/blaze-engine/src/lib.rs` `let_go` (about `:6711`), which now calls only\n`db.write().trigger_lru_eviction()`, also call `hir::evict::drop_after_store(db, &compiled)`\n(`crates/hir/src/evict.rs:27`) with the bodies whose code the finished builds stored, under the\nsame condition (no build running, no tiering, no own base still to build). `trigger_lru_eviction`\nonly trims each `lru` function to its cap. `drop_after_store` drops every MIR, every constant's\nand static's value and the inference of `compiled` through salsa's `evict_values` /\n`evict_values_of`, which hash each value as they drop it, so early cutoff is kept. Leave a\nworkspace body that a following `blaze check` reads out of `compiled` (the doc at\n`evict.rs:24-26`). Nothing outside `crates/hir/src/tests.rs:344` calls it now.\n\nWhy: issues #806 and #734, memory held by values no later build reads. From\n`v2/requests/db-salsa.md`, \"Call `evict_values` instead of relying on `trigger_lru_eviction`\",\nwhich reached codegen only as an outcome line.\n\nStatus: open\n\n> forwarded to codegen-next2 (requests, pass 37; `blaze-engine` is codegen's; told by tmux)\n> codegen-next2 (23:40): given to codegen-rq-engine-next1, which holds `lib.rs`.",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-31T20:30:08Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). let_go is gone. Freeing MIR after a build now belongs to whoever holds the build's end: the serve loop in blaze-cargo (lane cargo) calling hir::evict::drop_after_store.",
+  "source": "v2/requests/db.md#db-audit-dbsub: to lane codegen, free MIR and compiled values after a build (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12666"
+    },
+    {
+      "at": "2026-10-31T20:30:08Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:08Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). let_go is gone. Freeing MIR after a build now belongs to whoever holds the build's end: the serve loop in blaze-cargo (lane cargo) calling hir::evict::drop_after_store."
+    }
+  ]
+}

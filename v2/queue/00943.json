@@ -1,0 +1,26 @@
+{
+  "id": "00943",
+  "from_lane": "speed-core-clones",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-core/src/journal.rs",
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-vfs/src/watch.rs",
+    "crates/blaze-cargo/src/serve/heads.rs"
+  ],
+  "what": "Done::Changed { files: Vec<FileName> } and Journaled::files / lost (blaze-core lib.rs:570, journal.rs:329) allocate one Box<str> per changed name (FileName is Box<str>): fsevents.rs:863/997, iocp/usn.rs:312/402/435/455/489/533, watch.rs:291, sim/journal.rs. A restart catch-up of thousands of names is thousands of allocations. Exact edit: make both `files` fields the packed `journal::Names` (one bytes buffer plus u32 starts, already in journal.rs with push/push_joined) and give Names an `iter() -> impl Iterator<Item = &str>` and `sort_dedup()`; drivers push_joined into a kept Names instead of building FileNames; consumers blaze-vfs watch.rs and lib.rs, blaze-cargo serve/heads.rs iterate &str. Why: one or two allocations per batch instead of one per name, and names stay contiguous for the vfs lookup. Needs a differential test that the old Vec<FileName> and the new Names give the same sorted, deduped names over seeded batches.",
+  "state": "open",
+  "created": "2026-10-30T10:30:48Z",
+  "updated": "2026-10-30T10:30:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:30:48Z",
+      "by": "speed-core-clones",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

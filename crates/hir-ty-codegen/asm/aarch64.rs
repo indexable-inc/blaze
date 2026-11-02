@@ -7,6 +7,7 @@
 use std::fmt::Write;
 
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
+use smallvec::SmallVec;
 
 use super::{ObjectFormat, Operand, SYMBOL, Wrapper};
 
@@ -43,6 +44,7 @@ impl Reg {
             return if OPERANDS.contains(&number) {
                 Ok(Reg::Gpr(number))
             } else {
+                // alloc: the error's message
                 Err(format!("inline assembly that uses `{name}`"))
             };
         }
@@ -56,11 +58,13 @@ impl Reg {
             || name == "zt0"
             || numbered('p').is_some()
             || numbered('z').is_some();
+        // alloc: the error's message
         if scratch { Ok(Reg::Scratch) } else { Err(format!("the register `{name}`")) }
     }
 
-    /// The name by which an instruction moves `size` bytes through the register.
-    fn sized(self, size: u32) -> Result<String, String> {
+    /// The name by which an instruction moves `size` bytes through the register: its letter
+    /// and number.
+    fn sized(self, size: u32) -> Result<(char, u8), String> {
         let prefix = match (self, size) {
             (Reg::Gpr(_), 1 | 2 | 4) => 'w',
             (Reg::Gpr(_), 8) => 'x',
@@ -70,35 +74,47 @@ impl Reg {
             (Reg::Vector(_), 8) => 'd',
             (Reg::Vector(_), 16) => 'q',
             _ => {
+                // alloc: the error's message
                 return Err(format!(
                     "an inline assembly operand of {size} bytes in such a register"
                 ));
             }
         };
         match self {
-            Reg::Gpr(number) | Reg::Vector(number) => Ok(format!("{prefix}{number}")),
+            Reg::Gpr(number) | Reg::Vector(number) => Ok((prefix, number)),
             Reg::Scratch => {
+                // alloc: the error's message
                 Err("an inline assembly operand in a register with no value".to_owned())
             }
         }
     }
 
-    /// The instruction that moves `size` bytes between the register and the slot.
-    fn transfer(self, load: bool, size: u32, offset: u32) -> Result<String, String> {
+    /// Writes the line of the instruction that moves `size` bytes between the register and
+    /// the slot.
+    fn transfer(
+        self,
+        text: &mut String,
+        load: bool,
+        size: u32,
+        offset: u32,
+    ) -> Result<(), String> {
         let narrow = match (self, size) {
             (Reg::Gpr(_), 1) => "b",
             (Reg::Gpr(_), 2) => "h",
             _ => "",
         };
         let instruction = if load { "ldr" } else { "str" };
-        Ok(format!("{instruction}{narrow} {}, [x19, #{offset}]", self.sized(size)?))
+        let (prefix, number) = self.sized(size)?;
+        _ = writeln!(text, "{instruction}{narrow} {prefix}{number}, [x19, #{offset}]");
+        Ok(())
     }
 }
 
-/// How LLVM's inline assembly names the general register `name` names, if it is one.
-pub(super) fn llvm_register(name: &str) -> Option<String> {
+/// The number of the general register `name` names, if it is one: LLVM's inline assembly
+/// names it `{x<number>}`.
+pub(super) fn llvm_register(name: &str) -> Option<u8> {
     match Reg::named(name) {
-        Ok(Reg::Gpr(number)) => Some(format!("{{x{number}}}")),
+        Ok(Reg::Gpr(number)) => Some(number),
         _ => None,
     }
 }
@@ -110,7 +126,7 @@ pub(super) fn wrapper(
     operands: &[Operand<'_>],
 ) -> Result<Wrapper, String> {
     // The registers the operands name come first: a class takes one of what is left.
-    let mut regs = vec![None; operands.len()];
+    let mut regs: SmallVec<[Option<Reg>; 8]> = SmallVec::from_elem(None, operands.len());
     for (index, operand) in operands.iter().enumerate() {
         if let Operand::Reg { reg: InlineAsmRegOrRegClass::Reg(name), .. } = operand {
             regs[index] = Some(Reg::named(name.as_str())?);
@@ -126,24 +142,29 @@ pub(super) fn wrapper(
             "reg" => OPERANDS.into_iter().map(Reg::Gpr).find(free),
             "vreg" => (0..32).map(Reg::Vector).find(free),
             "vreg_low16" => (0..16).map(Reg::Vector).find(free),
+            // alloc: the error's message
             _ => return Err(format!("the register class `{class}`")),
         };
         let Some(found) = found else {
+            // alloc: the error's message
             return Err(format!("inline assembly with more `{class}` operands than registers"));
         };
         regs[index] = Some(found);
     }
 
-    let kept: Vec<Reg> = KEPT
-        .map(Reg::Gpr)
-        .chain(KEPT_VECTORS.map(Reg::Vector))
-        .filter(|reg| regs.contains(&Some(*reg)))
-        .collect();
+    let mut kept: SmallVec<[Reg; 17]> = SmallVec::new();
+    kept.extend(
+        KEPT.map(Reg::Gpr)
+            .chain(KEPT_VECTORS.map(Reg::Vector))
+            .filter(|reg| regs.contains(&Some(*reg))),
+    );
     let mut slot_size = kept.len() as u32 * 8;
+    // alloc: the wrapper's offsets, part of the output
     let mut offsets = vec![None; operands.len()];
     for (index, operand) in operands.iter().enumerate() {
         let Operand::Reg { size: Some(size), .. } = *operand else { continue };
         if !size.is_power_of_two() || size > 16 {
+            // alloc: the error's message
             return Err(format!("an inline assembly operand of {size} bytes"));
         }
         slot_size = slot_size.next_multiple_of(size);
@@ -159,16 +180,17 @@ pub(super) fn wrapper(
         })
     };
 
+    // alloc: the wrapper's text, the output
     let mut text = format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nstp x29, x30, [sp, #-32]!\nmov x29, sp\n\
          str x19, [sp, #16]\nmov x19, x0\n"
     );
     for (at, reg) in kept.iter().enumerate() {
-        _ = writeln!(text, "{}", reg.transfer(false, 8, at as u32 * 8)?);
+        reg.transfer(&mut text, false, 8, at as u32 * 8)?;
     }
     for (reg, size, offset, input, _) in values() {
         if input {
-            _ = writeln!(text, "{}", reg.transfer(true, size, offset)?);
+            reg.transfer(&mut text, true, size, offset)?;
         }
     }
     for piece in template {
@@ -185,13 +207,14 @@ pub(super) fn wrapper(
                 continue;
             }
             (Some(Operand::Label), _) => {
-                text.push_str(&super::label(format, index));
+                _ = write!(text, "{}", super::label(format, index));
                 continue;
             }
             (_, Some(Reg::Gpr(number))) => {
                 match modifier {
                     None | Some('x') => _ = write!(text, "x{number}"),
                     Some('w') => _ = write!(text, "w{number}"),
+                    // alloc: the error's message
                     Some(other) => return Err(format!("the operand modifier `{other}`")),
                 }
                 continue;
@@ -199,8 +222,10 @@ pub(super) fn wrapper(
             (_, Some(Reg::Vector(number))) => match modifier {
                 None => ('v', number),
                 Some(it @ ('v' | 'q' | 'd' | 's' | 'h' | 'b')) => (it, number),
+                // alloc: the error's message
                 Some(other) => return Err(format!("the operand modifier `{other}`")),
             },
+            // alloc: the error's message
             _ => return Err("an inline assembly template that names no operand".to_owned()),
         };
         _ = write!(text, "{}{}", prefix.0, prefix.1);
@@ -210,7 +235,7 @@ pub(super) fn wrapper(
     if returns {
         for (reg, size, offset, _, output) in values() {
             if output {
-                _ = writeln!(text, "{}", reg.transfer(false, size, offset)?);
+                reg.transfer(&mut text, false, size, offset)?;
             }
         }
         if super::labels(operands).next().is_some() {
@@ -230,7 +255,7 @@ pub(super) fn wrapper(
     if returns || jumped {
         _ = writeln!(text, "{}:", super::done(format));
         for (at, reg) in kept.iter().enumerate() {
-            _ = writeln!(text, "{}", reg.transfer(true, 8, at as u32 * 8)?);
+            reg.transfer(&mut text, true, 8, at as u32 * 8)?;
         }
         text.push_str("ldr x19, [sp, #16]\nldp x29, x30, [sp], #32\nret\n");
     }

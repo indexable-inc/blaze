@@ -11,22 +11,25 @@ authors.workspace = true
 
 
 [dependencies]
-la-arena.workspace = true
-salsa = { workspace = true, optional = true }
-rustc-hash.workspace = true
-hashbrown.workspace = true
+blaze-hash.workspace = true
+blaze-query = { workspace = true, optional = true }
 text-size.workspace = true
+unicode-width.workspace = true
 
 # local deps
-vfs.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-mem.workspace = true
 syntax.workspace = true
 stdx.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 syntax.workspace = true
 
 [features]
-default = ["salsa"]
+default = ["query"]
+query = ["dep:blaze-query"]
 in-rust-tree = []
 
 [lints]

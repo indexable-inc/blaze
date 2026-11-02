@@ -17,16 +17,18 @@
 //! Promoted locals are never SSA here: the code generator gives them their constant and skips
 //! what assigns them.
 
-use rustc_hash::FxHashSet;
+use blaze_mem::Frame;
 
 use crate::mir::{
-    LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind, return_slot,
+    LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind,
+    framed::{Bits, bits_in, block_index, local_index},
+    return_slot,
     transform::Ctx,
 };
 
 use super::{
-    Dominators, Location, Mention, local_id, local_index, locals::remove_unused_definitions,
-    map_place, reverse_postorder, visit_statement, visit_terminator,
+    Dominators, Location, Mention, local_id, locals::remove_unused_definitions, map_place,
+    reverse_postorder, visit_statement, visit_terminator,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,7 +57,12 @@ impl Assignments {
     }
 }
 
-fn def_dominates(def: Def, at: Location, dominators: &Dominators, single_pred: &[bool]) -> bool {
+fn def_dominates(
+    def: Def,
+    at: Location,
+    dominators: &Dominators<'_>,
+    single_pred: &Bits<'_>,
+) -> bool {
     match def {
         Def::Argument => true,
         Def::Assignment(def) if def.block == at.block => def.index < at.index,
@@ -63,34 +70,41 @@ fn def_dominates(def: Def, at: Location, dominators: &Dominators, single_pred: &
         // The value is there on the edge into `target`; with the call as the only way in, it
         // is there wherever `target` dominates.
         Def::CallReturn { target: Some(target) } => {
-            single_pred[super::block_index(target)] && dominators.dominates(target, at.block)
+            single_pred.contains(block_index(target)) && dominators.dominates(target, at.block)
         }
         Def::CallReturn { target: None } => false,
     }
 }
 
-struct Ssa {
-    assignments: Vec<Assignments>,
+struct Ssa<'f> {
+    assignments: Vec<Assignments, &'f Frame>,
     /// The SSA locals in the order of their assignments, in reverse postorder.
-    order: Vec<LocalId>,
-    borrowed: Vec<bool>,
+    order: Vec<LocalId, &'f Frame>,
+    borrowed: Bits<'f>,
 }
 
-fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
+fn ssa_locals<'f, 'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &'f Frame) -> Ssa<'f> {
     let count = body.locals.len();
-    let dominators = Dominators::new(body);
-    let mut preds = vec![0u32; body.basic_blocks.len()];
+    let dominators = Dominators::new(body, frame);
+    let preds = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32);
     for (_, block) in body.basic_blocks.iter() {
         if let Some(terminator) = &block.terminator {
-            for target in super::successors(&terminator.kind) {
-                preds[super::block_index(target)] += 1;
+            for target in terminator.kind.all_successors() {
+                preds[block_index(target)] += 1;
             }
         }
     }
-    let single_pred: Vec<bool> = preds.iter().map(|&it| it == 1).collect();
-    let mut assignments = vec![Assignments::Empty; count];
-    let mut order = Vec::new();
-    let mut borrowed = vec![false; count];
+    let mut single_pred: Bits<'_> = bits_in(preds.len(), frame);
+    for (block, &it) in preds.iter().enumerate() {
+        if it == 1 {
+            single_pred.insert(block);
+        }
+    }
+    let mut assignments = Vec::with_capacity_in(count, frame);
+    assignments.resize(count, Assignments::Empty);
+    // A local goes in once, as a parameter or when its first assignment is seen.
+    let mut order = Vec::with_capacity_in(count, frame);
+    let mut borrowed: Bits<'f> = bits_in(count, frame);
     for &param in &body.param_locals {
         assignments[local_index(param)] = Assignments::One(Def::Argument);
         order.push(param);
@@ -101,7 +115,7 @@ fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
     for &(local, _) in &body.upvars_in_place {
         assignments[local_index(local)] = Assignments::Many;
     }
-    let check_dominates = |assignments: &mut Vec<Assignments>, local: LocalId, at: Location| {
+    let check_dominates = |assignments: &mut [Assignments], local: LocalId, at: Location| {
         let slot = &mut assignments[local_index(local)];
         let dominated = match *slot {
             Assignments::One(def) => def_dominates(def, at, &dominators, &single_pred),
@@ -132,13 +146,14 @@ fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
             assignments[local_index(local)] = Assignments::Many;
         }
         Mention::SharedBorrow => {
-            borrowed[local_index(local)] = true;
-            check_dominates(&mut assignments, local, at);
+            borrowed.insert(local_index(local));
+            check_dominates(&mut assignments[..], local, at);
         }
-        Mention::Read => check_dominates(&mut assignments, local, at),
+        Mention::Read => check_dominates(&mut assignments[..], local, at),
         Mention::Storage => (),
     };
-    for block in reverse_postorder(body) {
+    let rpo = reverse_postorder(body, frame);
+    for &block in rpo.iter() {
         let data = &body.basic_blocks[block];
         for (index, statement) in data.statements.iter().enumerate() {
             visit_statement(&statement.kind, Location { block, index }, &mut on_mention);
@@ -149,7 +164,7 @@ fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
         }
     }
     for (local, decl) in body.locals.iter() {
-        if borrowed[local_index(local)]
+        if borrowed.contains(local_index(local))
             && !crate::drop::is_freeze(&ctx.infcx, decl.ty.as_ref(), ctx.env)
         {
             assignments[local_index(local)] = Assignments::Many;
@@ -160,8 +175,13 @@ fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
 }
 
 /// rustc's `compute_copy_classes`: for each local, the local it is a copy of, itself if none.
-fn copy_classes(ssa: &Ssa, body: &MirBody<'_>) -> Vec<LocalId> {
-    let mut copies: Vec<LocalId> = (0..body.locals.len()).map(local_id).collect();
+fn copy_classes<'f>(
+    ssa: &Ssa<'_>,
+    body: &MirBody<'_>,
+    frame: &'f Frame,
+) -> Vec<LocalId, &'f Frame> {
+    let mut copies = Vec::with_capacity_in(body.locals.len(), frame);
+    copies.extend((0..body.locals.len()).map(local_id));
     let is_ssa =
         |local: LocalId| matches!(ssa.assignments[local_index(local)], Assignments::One(_));
     let is_temp = |local: LocalId| local != return_slot() && !body.param_locals.contains(&local);
@@ -183,7 +203,7 @@ fn copy_classes(ssa: &Ssa, body: &MirBody<'_>) -> Vec<LocalId> {
             continue;
         }
         let head = copies[local_index(rhs)];
-        if ssa.borrowed[local_index(local)] {
+        if ssa.borrowed.contains(local_index(local)) {
             continue;
         }
         if local == return_slot() {
@@ -206,15 +226,21 @@ fn copy_classes(ssa: &Ssa, body: &MirBody<'_>) -> Vec<LocalId> {
 /// rustc's `CopyProp`. With `lifetimes` (rustc's `emit_lifetime_markers`), storage markers of
 /// a class are kept where rustc would keep them; here they all go, which rustc does when
 /// `lifetimes` is off and which is always correct.
-pub(super) fn copy_prop<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, lifetimes: bool) {
+pub(super) fn copy_prop<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    lifetimes: bool,
+    frame: &Frame,
+) {
     let _ = lifetimes;
-    let ssa = ssa_locals(ctx, body);
-    let copies = copy_classes(&ssa, body);
-    let mut unified: FxHashSet<LocalId> = FxHashSet::default();
+    let ssa = ssa_locals(ctx, body, frame);
+    let copies = copy_classes(&ssa, body, frame);
+    // Only probed: which locals are in a class of more than one.
+    let mut unified: Bits<'_> = bits_in(body.locals.len(), frame);
     for (index, &head) in copies.iter().enumerate() {
         if local_id(index) != head {
-            unified.insert(head);
-            unified.insert(local_id(index));
+            unified.insert(local_index(head));
+            unified.insert(index);
         }
     }
     if unified.is_empty() {
@@ -225,7 +251,7 @@ pub(super) fn copy_prop<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, lifetimes:
         for statement in &mut block.statements {
             if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
                 statement.kind
-                && unified.contains(&local)
+                && unified.contains(local_index(local))
             {
                 statement.kind = StatementKind::Nop;
             }
@@ -236,8 +262,9 @@ pub(super) fn copy_prop<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, lifetimes:
     let copy_moves = |operand: &mut crate::mir::Operand| {
         if let OperandKind::Move(place) = &operand.kind
             && place.projection.as_slice().first() != Some(&ProjectionElem::Deref)
-            && unified.contains(&place.local)
+            && unified.contains(local_index(place.local))
         {
+            // clone: a place's refcount, kept in the body
             operand.kind = OperandKind::Copy(place.clone());
         }
     };
@@ -251,11 +278,10 @@ pub(super) fn copy_prop<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, lifetimes:
         }
     }
     body.walk_places(|place| map_place(place, &mut lookup));
-    let mut bindings = la_arena::ArenaMap::default();
-    for (binding, &local) in body.binding_locals.iter() {
-        bindings.insert(binding, lookup(local));
+    // Every binding keeps its slot: the map is the one a rebuild would make.
+    for (_, local) in body.binding_locals.iter_mut() {
+        *local = lookup(*local);
     }
-    body.binding_locals = bindings;
     for (_, block) in body.basic_blocks.iter_mut() {
         for statement in &mut block.statements {
             if let StatementKind::Assign(to, Rvalue::Use(operand)) = &statement.kind
@@ -267,5 +293,5 @@ pub(super) fn copy_prop<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>, lifetimes:
         }
         block.statements.retain(|it| !matches!(it.kind, StatementKind::Nop));
     }
-    remove_unused_definitions(body);
+    remove_unused_definitions(body, frame);
 }

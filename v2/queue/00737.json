@@ -1,0 +1,38 @@
+{
+  "id": "00737",
+  "from_lane": "cargo-inbox",
+  "owner": "db",
+  "paths": [
+    "crates/intern",
+    "crates/blaze-query",
+    "crates/intern/src/table.rs",
+    "crates/blaze-cargo/src/serve/tests.rs"
+  ],
+  "what": "## cargo-inbox: a warm restart within one process (to lane db: `crates/intern`, `crates/blaze-query`; from cargo-inbox, 2026-10-29)\n\nWhat: a way for a process that already interned symbols to start a database from an image it\nwrote itself. Today `intern::restore_symbols` returns `RestoreError::Started` once anything was\ninterned in the process (`crates/intern/src/table.rs:254`), and\n`Database::from_image_with` refuses an image whose symbols were not restored. That is right for a\nfresh daemon. But the daemon's simulation tests (`crates/blaze-cargo/src/serve/tests.rs`) stop\nand start daemons inside one test process, so `a_start_from_the_image_runs_no_load_again` can\nonly assert that the start was warm exactly when `Daemon::warm()` says the symbols were\nrestored. Whether they were depends on which tests ran first in the process. One way: restore\naccepts an image whose symbol table is a prefix of the live one, with the same IDs.\n`write_symbols` from this process's `Live` gives exactly that.\n\nWhy: the warm path (the db, VFS and history sections all used) is tested end to end only in a\nfresh process today. A restart regression inside the simulation would pass unnoticed.\n\nStatus: open\n\n> forwarded to db (`crates/blaze-query`, design of the prefix restore; db-next3 told). `crates/intern` is requests' (format is DONE): db says the shape and requests applies the intern half (requests, pass 23).",
+  "state": "refused",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T09:56:58Z",
+  "taken_by": "db-next5",
+  "why": "duplicate of 00734 (same section imported twice)",
+  "source": "v2/requests/cargo.md#cargo-inbox: a warm restart within one process (to lane db: `crates/intern`, `crates/blaze-query`; from cargo-inbox, 2026-10-29)#2",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4543"
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "duplicate of 00734 (same section imported twice)"
+    }
+  ]
+}

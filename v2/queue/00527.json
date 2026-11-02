@@ -1,0 +1,25 @@
+{
+  "id": "00527",
+  "from_lane": "dedyn",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/check.rs",
+    "v2/requests/diagnostics-speed-lints.md",
+    "crates/blaze-diagnostics/src/emit.rs"
+  ],
+  "what": "## dedyn: check.rs, emit.rs: keep two `dyn`s, justified on the line\n\nFrom `dedyn-diag` (report `/tmp/blaze-lanes/v2-dedyn-diag.md`), 2026-10-29, based on the files\nas of 21:00. Comment-only; no behavior change.\n\n`crates/blaze-diagnostics/src/check.rs`: `&dyn Files` in `check_crate`, `check_crate_with` and\n`run` is the caller's file naming, called once per span named beside the `String` it returns\n(see the same request for `cx.rs` in `v2/requests/diagnostics-speed-lints.md`); a generic would\ncopy every pass. In `check_crate` and `check_crate_with`:\n\n```rust\n    files: &dyn Files,\n```\n\nbecomes\n\n```rust\n    files: &dyn Files, // dyn: the caller's file names, read once per span named\n```\n\nand in `run`, before:\n\n```rust\nfn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {\n```\n\nafter:\n\n```rust\n// dyn: `files` is the caller's file names, read once per span named\nfn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {\n```\n\n`crates/blaze-diagnostics/src/emit.rs`, the field of `Sources`: the caller's file reader\n(blaze-cargo's, blaze-lints', the tests'), called once per file, the first time a diagnostic\nnames it (`names` caches it, `UNREAD` included). Before:\n\n```rust\n    read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,\n```\n\nafter:\n\n```rust\n    read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>, // dyn: the caller's file reader, once per file read\n```\n\nStatus: open\n\n> forwarded to diagnostics (diagnostics-next1) (requests, pass 19; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#dedyn: check.rs, emit.rs: keep two `dyn`s, justified on the line",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4324"
+    }
+  ]
+}

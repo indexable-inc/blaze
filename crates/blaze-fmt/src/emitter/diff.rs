@@ -12,12 +12,10 @@ impl DiffEmitter {
     pub(crate) fn new(config: Config) -> Self {
         Self { config }
     }
-}
 
-impl Emitter for DiffEmitter {
-    fn emit_formatted_file(
+    pub(crate) fn emit_formatted_file(
         &mut self,
-        output: &mut dyn Write,
+        output: &mut impl Write,
         FormattedFile {
             filename,
             original_text,

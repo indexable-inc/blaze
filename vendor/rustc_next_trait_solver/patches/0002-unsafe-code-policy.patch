@@ -1,0 +1,14 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,6 +9,10 @@
+ #![allow(rustc::usage_of_type_ir_inherent)]
+ #![allow(rustc::usage_of_type_ir_traits)]
+ // tidy-alphabetical-end
++// docs/v2/plan/design/unsafe.md: the crate has no `unsafe` of its own. `deny`, not `forbid`:
++// `TrivialTypeTraversalImpls!` (in `coherence`) expands to `rustc_type_ir`'s allowed
++// `unsafe impl GenericTypeVisitable`, which a `forbid` would refuse.
++#![deny(unsafe_code)]
+ 
+ pub mod canonical;
+ pub mod coherence;

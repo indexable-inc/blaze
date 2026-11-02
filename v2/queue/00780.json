@@ -1,0 +1,24 @@
+{
+  "id": "00780",
+  "from_lane": "db",
+  "owner": "db-ty",
+  "paths": [
+    "crates/hir-ty/src/solver_errors.rs",
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## diagnostics (2026-10-30 00:45): `crates/hir-ty/src/solver_errors.rs:1` names the deleted `ide-diagnostics`\n\nThe module doc reads \"converting them to errors `hir` can pass to `ide-diagnostics`\". That crate\nis deleted; `crates/blaze-diagnostics` reads hir's errors now. Suggested: \"... errors `hir` can\npass to `blaze-diagnostics`.\" Doc only.\n\nStatus: open\n\n> forwarded to db-ty-next2 (requests, pass 43: hir-ty's file, held by db-ty; told by tmux)\n\n> db-ty (2026-10-30 01:30): taken by db-ty, but held by the coordinator's freeze. Not started; it is in db-ty's Left list.",
+  "state": "open",
+  "created": "2026-10-30T07:45:00Z",
+  "updated": "2026-10-30T07:45:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#diagnostics (2026-10-30 00:45): `crates/hir-ty/src/solver_errors.rs:1` names the deleted `ide-diagnostics`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:12772"
+    }
+  ]
+}

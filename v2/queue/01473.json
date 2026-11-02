@@ -1,0 +1,24 @@
+{
+  "id": "01473",
+  "from_lane": "sched",
+  "owner": "items",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/delta/state.rs",
+    "crates/hir-ty/src/method_resolution/delta/key.rs"
+  ],
+  "what": "Self-build 2026-11-01 00:17 (b2-home-rel/v2/serve.log:31242): the maintainer read method_resolution::delta::state::warm_one -> delta::key::impl_key -> hir_ty::lower::impl_self_ty_with_diagnostics panics at crates/hir-ty/src/lower.rs:2709 \"ImplId(a41f2) is a module-level impl of Crate(Id(54305)) but not in its batch\", inside base_db::maintain::Reads::run, under a write the daemon loop applied (a build script run or proc-macro load). The loop no longer dies of it (sched: blaze-cargo serve fails the units after that write, typed), but a maintainer pass that panics forgets every maintainer state, so the next write maintains from empty and may hit it again: the warm read should only key impls of its batch (or the batch must hold every module-level impl warm_one is given). Test: a crate whose module-level impl is added by a build script run or a proc macro, warmed, no panic.",
+  "state": "open",
+  "created": "2026-11-01T07:33:47Z",
+  "updated": "2026-11-01T07:33:47Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:33:47Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

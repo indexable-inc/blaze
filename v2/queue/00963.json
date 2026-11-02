@@ -1,0 +1,42 @@
+{
+  "id": "00963",
+  "from_lane": "drop-oracles",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/mirdump.rs",
+    "crates/blaze-engine/src/consteval.rs",
+    "crates/blaze-engine/src/borrowck.rs",
+    "crates/blaze-engine/src/lib.rs",
+    "crates/hir-ty-mir/src/mir/pretty.rs",
+    "crates/hir-ty-mir/src/mir/optimize.rs",
+    "crates/hir-ty-codegen/fragment.rs",
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "harness/mirparity.py, borrowck_ui.py, consteval_ui.py, difftest.py, layoutdiff.py and harness/corpus are deleted (Andrew 2026-10-30: no harness compares blaze with rustc). crates/blaze-engine/src/{mirdump.rs,consteval.rs,borrowck.rs} have modes that existed to feed those harnesses (a MIR dump in rustc -Zunpretty=mir form, E0080 and borrowck verdicts scored against rustc): delete what has no other caller, or keep it saying what it is for now. Also reword the comments naming the deleted harnesses in crates/blaze-engine/src/lib.rs, hir-ty-mir/src/mir/{pretty.rs,optimize.rs}, hir-ty-codegen/{fragment.rs,mod.rs}.",
+  "state": "refused",
+  "created": "2026-10-30T12:43:06Z",
+  "updated": "2026-10-31T20:30:07Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:43:06Z",
+      "by": "drop-oracles",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

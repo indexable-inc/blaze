@@ -1,0 +1,28 @@
+{
+  "id": "00677",
+  "from_lane": "codegen-rq-lower",
+  "owner": "codegen-rq-columns",
+  "paths": [
+    "crates/hir-ty-codegen/unwind.rs",
+    "crates/hir-ty-codegen/v2/unwind.rs",
+    "crates/hir-ty-codegen/llvm/emitted.rs",
+    "crates/hir-ty-codegen/v2/backend.rs",
+    "v2/backend.rs",
+    "v2/side.rs"
+  ],
+  "what": "## From codegen-rq-lower (2026-10-29): three one-line switches onto `unwind.rs` and `debuginfo.rs`\n\n`crates/hir-ty-codegen/unwind.rs` now writes a function's FDE instructions itself\n(`unwind::Fde::write`): Cranelift's x86-64 and AArch64 rows are made once from the code's\nunwind instructions (`SystemV::rows`, differential-tested against Cranelift's\n`create_unwind_info`), and written as gimli writes them (tested byte for byte), with no\n`FrameTable`, no CIE clone, no read-back and nothing allocated but the output.\n`UnwindParts::Dwarf::fde` is an `unwind::Fde<'_>` now, not a gimli `FrameDescriptionEntry`,\nso the first edit is needed for the crate to build. `debuginfo::SlotPlaces` keeps its slots\nsorted (`SlotPlaces::new`), and `SlotPlaces::of` is a binary search, so every place that\nbuilds one with a struct literal must go through `new` (the other two edits).\n\n1. **To codegen-rq-columns, `crates/hir-ty-codegen/v2/unwind.rs`** (`Common`, lines 58-71 and\n   82-88). Before:\n   ```rust\n   struct Common {\n       made: CommonInformationEntry,\n       /// Its fields as read back, with an FDE of no instructions.\n       entry: Entry,\n   }\n\n   impl Common {\n       /// The instructions of one function's FDE, written after the shared CIE and read back.\n       fn fde(&self, fde: gimli::write::FrameDescriptionEntry) -> Result<Vec<u8>, String> {\n           Entry::of(self.made.clone(), fde).map(|it| it.fde)\n       }\n   }\n   ```\n   After:\n   ```rust\n   struct Common {\n       /// Its fields as read back, with an FDE of no instructions.\n       entry: Entry,\n   }\n\n   impl Common {\n       /// The instructions of one function's FDE, as they are written after the shared CIE.\n       fn fde(&self, fde: crate::unwind::Fde<'_>) -> Result<Vec<u8>, String> {\n           // alloc: the function's FDE, kept with its code\n           let mut out = Vec::new();\n           fde.write(self.entry.code_align, self.entry.data_align, &mut out)?;\n           Ok(out)\n       }\n   }\n   ```\n   and in `common`, `Ok(Common { made, entry })` becomes `Ok(Common { entry })`. The call in\n   `convert` (`common.fde(fde)?`) is unchanged. `Entry::of` stays for the CIE.\n\n   > applied by codegen-rq-columns (2026-10-29): as written; `common` now moves `made` into\n   > `Entry::of` (no clone, nothing else keeps it). The tests use `Entry::of` only, unchanged.\n2. **To codegen-rq-features, `crates/hir-ty-codegen/llvm/emitted.rs:468`** (`Emitted::slots`).\n   Before: `(!places.frame_base.is_empty()).then_some(places)`. After:\n   `(!places.frame_base.is_empty()).then(|| SlotPlaces::new(places.frame_base, places.slots))`.\n   LLVM's DWARF lists variables in its own order; without this a variable whose slot is out\n   of order is not found, so it is not described.\n\n   > applied by codegen-rq-features (2026-10-29): as written.\n3. **To codegen-fc-stencil, `crates/hir-ty-codegen/v2/backend.rs:1007`** (`stencil_slots`).\n   Before: `Ok(SlotPlaces { frame_base: vec![cranelift_codegen::gimli::DW_OP_reg0.0 + base], slots: places })`.\n   After: `Ok(SlotPlaces::new(vec![cranelift_codegen::gimli::DW_OP_reg0.0 + base], places))`.\n   `named` is in the IR builder's order, not the slots'.\n\n   > applied, checked by codegen-rq-features (2026-10-29): `stencil_slots` ends with\n   > `SlotPlaces::new(..)` already (`v2/backend.rs`), so nothing was left to change.\n\nWhat a benchmark should confirm, once the tree builds: per Cranelift function, the FDE costs\none allocation (its bytes) and well under 100 ns, against about five allocations, a CIE\nre-encode and a parse before; and `describe_variables` / `side::of` stay linear in the\nvariables of a function with thousands of named locals.\n\n> forwarded to codegen-rq-columns (item 1), codegen-rq-features-next1 (item 2) and codegen-next2 (item 3; codegen-fc-stencil is DONE and closed) (requests, pass 37; told by tmux)\n> item 3 applied by codegen (codegen-next2, 2026-10-29 23:45): `stencil_slots` goes through\n> `SlotPlaces::new`, as written. The other two struct literals, in `v2/side.rs`'s tests, list\n> their slots in order already.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#From codegen-rq-lower (2026-10-29): three one-line switches onto `unwind.rs` and `debuginfo.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:11037"
+    }
+  ]
+}

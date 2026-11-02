@@ -1,0 +1,37 @@
+{
+  "id": "01173",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-front",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty-mir/src/mir/eval.rs",
+    "crates/hir-ty-mir/src/mir/providers.rs"
+  ],
+  "what": "dead fallback: `assert_placeholder_ty_is_unused` (interpret_mir's bool, every caller passes false) lets the interpreter give a type with a placeholder size (0, 1) instead of its LayoutError (crates/hir-ty-mir/src/mir/eval.rs size_align_of). Remove the parameter: HirDatabase::interpret_mir in crates/hir-ty/src/db.rs:740 and its provider type, crates/hir-ty-mir/src/mir/providers.rs:32, eval.rs interpret_mir/Evaluator::new/with_machine and the field and its branch in size_align_of, and the callers crates/hir/src/lib.rs:2122, crates/hir-ty-codegen/mod.rs:4629, crates/hir-ty-codegen/v2/refs.rs:1007, crates/hir-ty/src/consteval/hir_eval.rs:86, crates/hir-ty-share/src/walk.rs:771, crates/hir-ty-mir/src/tests/mir/eval.rs:69. One signature across crates, so one pass by whoever owns hir-ty's db.rs.",
+  "state": "applied",
+  "created": "2026-10-30T23:22:57Z",
+  "updated": "2026-10-30T23:35:53Z",
+  "taken_by": "no-fallback-front",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:22:57Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:34:59Z",
+      "by": "no-fallback-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:35:53Z",
+      "by": "no-fallback-front",
+      "action": "done",
+      "note": "removed assert_placeholder_ty_is_unused: hir-ty db.rs (trait + impl), providers.rs fn type, coroutine_witness_tests no_interpret; hir-ty-mir eval.rs (field, interpret_mir, Evaluator::new, with_machine, size_align_of branch, unused LayoutError import), providers.rs, eval/macro_call.rs, tests/mir/eval.rs, tests/mir/foreign.rs; callers hir lib.rs:2122, hir-ty-codegen mod.rs + v2/refs.rs, hir-ty-consteval hir_eval.rs, hir-ty-share walk.rs:771, blaze-macro-eval run.rs:359. A placeholder layout is now its LayoutError."
+    }
+  ]
+}

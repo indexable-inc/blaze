@@ -1,6 +1,0 @@
-[workspace]
-members = ["app", "dep"]
-resolver = "2"
-
-[profile.dev.package.dep]
-opt-level = 3

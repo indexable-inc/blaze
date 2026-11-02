@@ -1,0 +1,23 @@
+{
+  "id": "00079",
+  "from_lane": "core-windows",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/tests.rs"
+  ],
+  "what": "## 2. `tests.rs`: run the shared scripts on `Iocp`\n\n- What: beside the `Uring` and `Kqueue` runs in `crates/blaze-core/src/tests.rs` (`script`,\n  `processes_and_sockets`, `a_sandbox_is_made_by_the_confine_or_refused`), a\n  `#[cfg(windows)]` run on `crate::iocp::Iocp::new(&root, 2).unwrap()` (and\n  `.confined(Arc::new(..))` for the confined one). The scripts' processes are `/bin/sh` today,\n  so on Windows the processes script needs `%SystemRoot%\\System32\\cmd.exe /d /c ...` commands,\n  or stays Unix-only (`iocp.rs`'s own tests cover processes on Windows).\n- Where: `crates/blaze-core/src/tests.rs` (core's).\n- Why: those scripts are where every driver is held to one meaning. `Iocp` has every effect,\n  `pub fn confined(self, Arc<dyn Confine>) -> Iocp` and `pub fn local_addr(&self, Tag)`, with\n  the same meaning as on `Threads`, `Uring` and `Kqueue`.\n\n> forwarded to core: `crates/blaze-core/src/tests.rs` is lane core's.",
+  "state": "open",
+  "created": "2026-10-30T00:47:49Z",
+  "updated": "2026-10-30T00:47:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-windows.md#2. `tests.rs`: run the shared scripts on `Iocp`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-windows.md:38"
+    }
+  ]
+}

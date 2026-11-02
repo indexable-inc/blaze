@@ -1,0 +1,36 @@
+{
+  "id": "00308",
+  "from_lane": "mem-db-def",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "tools/v2/manifest_lint.py"
+  ],
+  "what": "## H1. Manifests (owners: `db-expand-inputs2-next1` for base-db, `db-expand-macros-next1` for hir-expand, `db-expand-next2` for hir-def, `db-next2` for hir)\n\nEach of the four `Cargo.toml`s, in `[dependencies]` beside the local deps:\n\n```toml\nblaze-mem.workspace = true\nhashbrown.workspace = true\n```\n\nand in `[dev-dependencies]` (base-db has it already, `Cargo.toml:36`):\n\n```toml\nblaze-alloc-count.workspace = true\n```\n\nWhy: every change below names `blaze_mem::{frame, scratch, Tag, AppendVec, Column}`; frame maps\nare `hashbrown::HashMap<K, V, FxBuildHasher, &Frame>`, whose `A: Allocator` needs hashbrown's\n`nightly` feature (mem-db's root request; `hashbrown` is already a root workspace dependency).\nRun `tools/v2/manifest_lint.py` after.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:42): in the tree: `hashbrown` and `blaze-mem` in base-db's, hir-expand's, hir-def's and hir's `Cargo.toml` (outcome lines under H3).",
+  "state": "applied",
+  "created": "2026-10-30T03:19:23Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-def.md#H1. Manifests (owners: `db-expand-inputs2-next1` for base-db, `db-expand-macros-next1` for hir-expand, `db-expand-next2` for hir-def, `db-next2` for hir)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-def.md:31"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:42): in the tree: `hashbrown` and `blaze-mem` in base-db's, hir-expand's, hir-def's and hir's `Cargo.toml` (outcome lines under H3)."
+    }
+  ]
+}

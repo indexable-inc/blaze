@@ -1,0 +1,36 @@
+{
+  "id": "00093",
+  "from_lane": "usercode-macros",
+  "owner": "fastcompile",
+  "paths": [
+    "docs/v2/plan/lanes/usercode/macros.md",
+    "crates/blaze-expand/src/native"
+  ],
+  "what": "## 5a. fastcompile: take the proc-macro bridge\n\nWhat blaze has of the bridge, for change 20, is in docs/v2/plan/lanes/usercode/macros.md,\n\"For fastcompile: the proc-macro bridge\": blaze's own `proc_macro`, the shims it calls, span\nnumbering, the wire format and lexer, questions as keyed inputs, keys, stateful macros, and the\n`difference` comparison. Take `crates/blaze-expand/src/native/` (the bridge) into your crate\nwhen you want it, by telling me (or the usercode lane) and I'll drop it from blaze-expand.\n\n> forwarded to fastcompile.",
+  "state": "applied",
+  "created": "2026-10-30T00:52:12Z",
+  "updated": "2026-10-30T14:24:28Z",
+  "taken_by": "fastcompile-queue",
+  "why": null,
+  "source": "v2/requests/usercode-macros.md#5a. fastcompile: take the proc-macro bridge",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros.md:97"
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:24:28Z",
+      "by": "fastcompile-queue",
+      "action": "done",
+      "note": "Change 20's, taken up by crates/blaze-macro-eval/ (child fastcompile-macros): the proc-macro bridge, its evaluator and expander (src/expander.rs) live there; see docs/v2/plan/lanes/fastcompile/ and /tmp/blaze-lanes/v2-fastcompile-macros.md."
+    }
+  ]
+}

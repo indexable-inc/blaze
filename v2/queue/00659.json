@@ -1,0 +1,23 @@
+{
+  "id": "00659",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-items/src/hash.rs"
+  ],
+  "what": "## 9. items (optional, speed): spans of a body form and a by-move code query\n\nWhere: `crates/blaze-items/src/hash.rs`.\n\nWhat: `ItemHashes::code` rebuilds each body's span ids from `mir_body`, `mir_body_for_closure`\nand `mir_body_for_coroutine_by_move` and hashes them beside `code_hash`/`closure_code`/\n`coroutine_code`, and has no by-move code query. A code hash that already covers the span ids\nthe MIR names, and a `coroutine_by_move_code` query, would hash each body once in one place.\n\nWhy: hash once (principles.md); today the MIR's spans are walked twice per body.\n\n> forwarded to coordinator: lane items is DONE and this is a restructure of its hashing (`hash.rs`) with a new code query, optional: new work for a lane the coordinator names, not an edit.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#9. items (optional, speed): spans of a body form and a by-move code query",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:693"
+    }
+  ]
+}

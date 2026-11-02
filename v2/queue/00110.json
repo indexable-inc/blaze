@@ -1,0 +1,23 @@
+{
+  "id": "00110",
+  "from_lane": "speed-hir-store",
+  "owner": "safety",
+  "paths": [
+    "crates/hir-def/src"
+  ],
+  "what": "## From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz\n\nPaths: `crates/hir-def/src/{hir.rs,hir/,expr_store.rs,expr_store/}`. Three `unsafe` blocks,\neach with a `// SAFETY:` naming the invariant and where it is upheld; none is new in the\ncolumns work:\n- `hir/persist.rs` `syntax_context(raw)`: `SyntaxContext::from_u32` behind a safe function,\n  the one place persisted contexts are trusted (the item tree's decode calls it too). It refuses\n  `u32::MAX`; any other value is trusted because the store's `blaze_format::read_verified`\n  checks the buffer's content hash before `read`.\n- `expr_store/lower.rs` `module_path` (~L2812) and `collect_block_` (~L3089): `to_static` on\n  salsa ids that don't outlive the query they were made in (the comments say why). This is\n  the same lifetime erasure as speed-hir-nameres' section above, and the same fix applies\n  wherever that one lands.\n`hir-def` has `unsafe` in other modules (`lib.rs`, `nameres/`, `dyn_map.rs`, `visibility.rs`),\nso `#![forbid(unsafe_code)]` on the crate is not possible yet.\n\nParsers of untrusted bytes, in `expr_store/persist.rs`:\n`<ExpressionStore as Persist>::read` then `ExpressionStoreRef::decode()`, `<Body as Persist>::read`\nthen `BodyRef::decode()`, `<ExpressionStoreSourceMap as Persist>::read` then `.decode()`, and\n`<BodySourceMap as Persist>::read` then `.decode()`, each giving `Result<_, FormatError>`.\n- Zero-copy: the `Ref` types read kinds, counts and the sorted source-key columns in place,\n  bounds-checked by `Slice::follow`. `read` checks kind bytes, one data word per kind, the\n  side-table offsets, and the source keys' strict order. `decode` copies each column once and\n  runs `HirColumns::check` / `TypeColumns::check` (every id, list range and side-table index in\n  bounds). A bad id that gets past them panics on use (slice indexing); it is never UB.\n- **For a fuzz target**: decoding arbitrary bytes is safe, but the contexts it yields through\n  `syntax_context` are only trusted because of the hash check. So a target that skips\n  `read_verified` must not hand decoded `SyntaxContext`s (hygiene ids, spans) to a database:\n  compare and drop them. Or it should fuzz behind `read_verified` and mutate only payloads\n  whose hash it recomputes.\n- Seeds: the encoded stores from `expr_store/tests/body.rs` (`EVERY_VARIANT`) and\n  `tests/signatures.rs`, through `assert_store_round_trip`.\n\n> forwarded to safety: its fuzz and audit children.\n\n### From safety-race: answers to safety-check (2026-10-29)\n\n- Added `Races::all_terminated(&self) -> bool` (Miri `have_all_terminated`: every thread, `main`\n  included). Call `exit()` for `main` first, then check it.\n- `rmw(&mut self, alloc, range, ord, site) -> Result<(), RaceError>` is right, called **once per\n  successful RMW** for both halves (Miri `validate_atomic_rmw` does the load and the store\n  clocks together): no separate atomic `read` before it. Then `store_value(alloc, range, ord,\n  new_bytes, Some(old_bytes))`. A failed compare-exchange is `failed_cxchg` instead.\n- Thread names: `thread_name(&self, ThreadId) -> Option<&str>` (Miri `get_thread_name`; `main`\n  is `Some(\"main\")`) and `thread_display_name(&self, ThreadId) -> String` (`unnamed-N`, which\n  Miri's reports use; `<unnamed>` is only its `Debug` output). `RaceError` already carries\n  both names in `RacingOp::thread_name`.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:895"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00291",
+  "from_lane": "frontend-tree-move-expand",
+  "owner": "frontend-tree",
+  "paths": [
+    "crates/syntax",
+    "crates/syntax/src/view.rs"
+  ],
+  "what": "## frontend-tree-move-expand: `Typed` for `ast::Macro`, and `Arc` in `view.rs` (crates/syntax `src/view.rs`)\n\nNeeds nothing first. (`Typed` for `Either` is diag-lower's heading above; hir-expand's twins\nneed it too.)\n\n1. File `crates/syntax/src/view.rs`. Old:\n\n   ```rust\n   pub trait Typed {\n       type Of<'t>: AstNode<'t>;\n   }\n   ```\n\n   New:\n\n   ```rust\n   pub trait Typed {\n       type Of<'t>: AstNode<'t>;\n   }\n\n   impl Typed for crate::ast::Macro {\n       type Of<'t> = Macro<'t>;\n   }\n   ```\n\n   Why: `AstId<ast::Macro>` (every macro definition: `MacroDefKind`, `decl_macro_expander`) is\n   hand-written in `ast/node_ext.rs`, so the generator gave it no `Typed`, and\n   `AstId::<ast::Macro>::to_view(db)` needs one. `view::Macro<'t>` (`view/node_ext.rs`) is its\n   `AstNode<'t>` twin.\n\n2. File `crates/syntax/src/view.rs`. Old:\n\n   ```rust\n   use std::marker::PhantomData;\n   ```\n\n   New:\n\n   ```rust\n   use std::{marker::PhantomData, sync::Arc};\n   ```\n\n   Why: `pub fn root<'t, N: AstNode<'t>>(tree: &'t Arc<FlatTree>)` (L189) names `Arc`, which\n   nothing in the file imports.\n\n> forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 25).\n> frontend-tree (2026-10-29): both applied: `impl Typed for crate::ast::Macro` and the `Arc`\n> import (`use std::{marker::PhantomData, sync::Arc};`).",
+  "state": "applied",
+  "created": "2026-10-30T02:59:37Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/frontend-tree.md#frontend-tree-move-expand: `Typed` for `ast::Macro`, and `Arc` in `view.rs` (crates/syntax `src/view.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-tree.md:228"
+    },
+    {
+      "at": "2026-10-30T07:49:59Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "impl Typed for ast::Macro and for Either<L, R> in crates/syntax/src/view.rs (~171), Arc import added; test view/tests.rs either_and_macro_pointers_view_their_nodes"
+    }
+  ]
+}

@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """worktrees.py: several checkouts of one workspace built by one daemon.
 
-The stress workspace is copied COUNT times. The daemon is started in the first copy with the
-others as `--also`; each step edits files of some checkouts and asks for the program of some by
-`blaze sync SOCKET --project ...`. Every program asked for is run and compared with what
-`cargo build` of that checkout prints.
+The stress workspace is copied COUNT times, and each copy is built by `blaze build` in it with
+one home, so one daemon builds them all. Each step edits files of some checkouts and asks for
+the program of some. Every program asked for is run and held to what a fresh build of that
+checkout does (rebuild.py).
 
-With `--join` the daemon is started in the first copy alone, and the others join it when they
-are first asked for. With `--together` the programs of a step are asked for at once.
+With `--together` the programs of a step are asked for at once.
 """
-import os, shlex, shutil, subprocess, sys, tempfile, time
+import os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from rebuild import WRONG, Project, copy, scratch
+from storelib import Failed
 
 COUNT = 3
 MID, APP = "mid/src/lib.rs", "app/src/main.rs"
@@ -25,9 +24,7 @@ NOTE = "app/src/note.txt"
 MORE = "app/src/more.rs"
 # Of the workspace and of no package.
 SHARED = "shared.txt"
-# Not the same in any two runs either: with `BLAZE_CACHE` a run has what the last one compiled.
-RUN = os.getpid()
-# (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones cargo rejects)
+# (what the step is, [(checkout, file, old or None to write it, new or None to remove it)], checkouts asked for in order, the ones that are not Rust)
 STEPS = [
     ("nothing edited, the others asked for the first time", [], [1, 2, 0], []),
     ("nothing edited, all again", [], [0, 1, 2], []),
@@ -58,172 +55,92 @@ STEPS = [
        "pub fn here() -> &'static str {\n    env!(\"CARGO_MANIFEST_DIR\")\n}\n\npub fn seeded() -> u32 {"),
       (1, APP, 'println!("{}", HERE);', 'println!("{} {}", HERE, smid::here());')],
      [1, 0, 2, 1], []),
-    ("that file edited in one", [(2, SHARED, f"shared of 2 in {RUN}", "shared anew")], [0, 2, 1], []),
-    ("and made what another has", [(2, SHARED, "shared anew", f"shared of 0 in {RUN}")], [2, 1, 0], []),
-    # The checkout is loaded again, and the others are left as they are.
+    ("that file edited in one", [(2, SHARED, "shared of 2", "shared anew")], [0, 2, 1], []),
+    ("and made what another has", [(2, SHARED, "shared anew", "shared of 0")], [2, 1, 0], []),
     ("the manifest of one changed in what no crate reads",
      [(0, "app/Cargo.toml", "[package]", "[package.metadata]\nnote = 1\n\n[package]")], [1, 2, 0, 1], []),
+    ("a manifest edited in one",
+     [(2, "mid/Cargo.toml", "[dependencies]", "[features]\nmore = []\n\n[dependencies]")], [2, 0, 1], []),
+    ("that one edited", [(2, MID, AREA + " + 2", AREA + " + 9")], [0, 2, 1], []),
+    ("and another", [(0, MID, AREA + " + 2", AREA + " + 3")], [0, 2, 1], []),
 ]
-# Cargo may build that checkout another way now, so it can't be read as the first any more. A
-# checkout that is loaded is turned down for it.
-if "--overlay" in sys.argv:
-    STEPS += [
-        ("a manifest edited in one",
-         [(2, "mid/Cargo.toml", "[dependencies]", "[features]\nmore = []\n\n[dependencies]")], [2, 0, 1], []),
-        ("that one edited", [(2, MID, AREA + " + 2", AREA + " + 9")], [0, 2, 1], []),
-        ("and another", [(0, MID, AREA + " + 2", AREA + " + 3")], [0, 2, 1], []),
-    ]
 
 
-# With `--overlay` the others are not loaded at all: each is read as the first with other files.
-OVERLAY = "--overlay" in sys.argv
-# With `--split` the others join the first and share the packages that are the same in both.
-SPLIT = "--split" in sys.argv
-# With `--thin` the checkouts start out with the same included file, so that the others are
-# read as the first with other files from their first build on.
-THIN = "--thin" in sys.argv
-# With `--slow` every build of a checkout read as another counts as a long one, so that the
-# daemon gives up on reading them so and loads them.
-if "--slow" in sys.argv:
-    os.environ["BLAZE_SLOW_SWITCH_MS"] = "0"
-JOIN = "--join" in sys.argv or SPLIT or THIN
-
-
-def splice(program):
-    """Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full."""
-    return ["--binary", program["bin"]]
-
-
-def logged(log_path, since):
-    """What the daemon logged from byte `since` on, at most its last 300 lines."""
-    with open(log_path, errors="replace") as log:
-        log.seek(since)
-        lines = log.readlines()
-    return "".join("    daemon: " + line for line in lines[-300:])
-
-
-def unanswered(daemon, log_path, since):
-    """Prints where the daemon's threads wait and what it logged in the step, for a request it never answered."""
-    stacks = ["sample", str(daemon.pid), "2"] if sys.platform == "darwin" else \
-        ["gdb", "-p", str(daemon.pid), "-batch", "-ex", "thread apply all bt"]
+def unanswered(daemon):
+    """Prints where the daemon's threads wait and what it logged, for a build it never answered."""
+    pid = daemon.process.pid
+    stacks = ["sample", str(pid), "2"] if sys.platform == "darwin" else ["gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt"]
     try:
         print(subprocess.run(stacks, capture_output=True, text=True, timeout=60).stdout[-60000:], flush=True)
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"    no stacks of the daemon: {error}", flush=True)
-    print(logged(log_path, since), flush=True)
+    print("".join("    daemon: " + line for line in daemon.log().splitlines(True)[-300:]), flush=True)
     daemon.kill()
+
+
+def checkout(work, at):
+    ws = copy(os.path.join(HERE, "stress"), os.path.join(work, f"checkout{at}"))
+    open(os.path.join(ws, NOTE), "w").write(f"note of {at}\n")
+    main_rs = os.path.join(ws, APP)
+    text = open(main_rs).read()
+    assert "fn main() {" in text
+    text += '\nconst HERE: &str = env!("CARGO_MANIFEST_DIR");\n'
+    open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);\n    println!("shared {}", smid::shared());', 1))
+    # A crate no step edits includes a file of the workspace that is outside its package.
+    open(os.path.join(ws, SHARED), "w").write(f"shared of {at}")
+    mid_rs = os.path.join(ws, MID)
+    text = open(mid_rs).read()
+    assert "pub fn seeded() -> u32 {" in text
+    open(mid_rs, "w").write(text.replace("pub fn seeded() -> u32 {", "pub fn shared() -> &'static str {\n    include_str!(\"../../shared.txt\")\n}\n\npub fn seeded() -> u32 {", 1))
+    return ws
 
 
 def main():
-    # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
-    work = os.path.realpath(tempfile.mkdtemp(prefix="blaze-worktrees-"))
-    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    crates = ["sapp", "sbase", "smid"]
-    checkouts = []
-    for at in range(COUNT):
-        ws = os.path.join(work, f"checkout{at}")
-        shutil.copytree(os.path.join(HERE, "stress"), ws, ignore=shutil.ignore_patterns("target"))
-        open(os.path.join(ws, NOTE), "w").write(f"note of {1 if THIN else at}\n")
-        main_rs = os.path.join(ws, APP)
-        text = open(main_rs).read()
-        assert "fn main() {" in text
-        text += '\nconst HERE: &str = env!("CARGO_MANIFEST_DIR");\n'
-        open(main_rs, "w").write(text.replace("fn main() {", 'fn main() {\n    print!("{}", include_str!("note.txt"));\n    println!("{}", HERE);\n    println!("shared {}", smid::shared());', 1))
-        # A crate no step edits includes a file of the workspace that is outside its package.
-        open(os.path.join(ws, SHARED), "w").write(f"shared of {at} in {RUN}")
-        mid_rs = os.path.join(ws, MID)
-        text = open(mid_rs).read()
-        assert "pub fn seeded() -> u32 {" in text
-        open(mid_rs, "w").write(text.replace("pub fn seeded() -> u32 {", "pub fn shared() -> &'static str {\n    include_str!(\"../../shared.txt\")\n}\n\npub fn seeded() -> u32 {", 1))
-        # A checkout read as the first one links what rustc built of the first.
-        if not (OVERLAY and checkouts):
-            fx = Fixture(ws, crates, ["-p", "sapp"])
-            fx.rustc_build()
-        obj, patch, binary = (os.path.join(work, f"sapp{at}.{n}") for n in ("o", "patch.o", "bin"))
-        link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
-        symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        checkouts.append({"ws": ws, "obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link),
-                          "symbols": symbols, "reference": os.path.join(work, f"reference{at}")})
-    first = checkouts[0]
-    out = open(log_path, "a")
-    daemon = subprocess.Popen(
-        [BLAZE, first["ws"], *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"],
-         *[x for other in checkouts[1:] if not JOIN and not OVERLAY for x in ("--also", other["ws"])]],
-        stderr=out, stdout=out,
-        env={**os.environ, **({"BLAZE_OVERLAY": "1"} if OVERLAY else {}), "BLAZE_SPLIT": "1" if SPLIT else "0"})
-    while "watching" not in open(log_path).read():
-        if daemon.poll() is not None:
-            raise SystemExit(f"the daemon did not start: {log_path}")
-        time.sleep(0.05)
-
-    def run(path):
-        try:
-            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
-        except Exception as error:
-            return f"did not run: {error}"
-        return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
-
+    together = "--together" in sys.argv
+    work = scratch("blaze-worktrees-")
+    first = Project(checkout(work, 0), os.path.join(work, "c0"))
+    checkouts = [first] + [Project(checkout(work, at), os.path.join(work, f"c{at}"), serves=first) for at in range(1, COUNT)]
     wrong = asked = 0
-    for what, edits, order, broken in STEPS:
-        # From the end of the step before: what the daemon did meanwhile is part of this one.
-        since, wrong_before = os.path.getsize(log_path), wrong
-        for at, path, old, new in edits:
-            path = os.path.join(checkouts[at]["ws"], path)
-            if old is None:
-                open(path, "w").write(new)
-                continue
-            if new is None:
-                os.remove(path)
-                continue
-            text = open(path).read()
-            assert old in text, (what, old)
-            open(path, "w").write(text.replace(old, new, 1))
-        time.sleep(0.02)
-        print(what, flush=True)
-        together = "--together" in sys.argv
-
-        def ask(at):
-            checkout = checkouts[at]
-            return time.time(), subprocess.Popen(
-                [BLAZE, "sync", socket, "--project", checkout["ws"], "--crate", "sapp", "--out", checkout["obj"],
-                 "--patch", checkout["patch"], "--link-cmd", checkout["link"], *splice(checkout), *checkout["symbols"]],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-        # A program asked for twice in a step is asked for the second time after the others.
-        asking = {at: ask(at) for at in order} if together else {}
-        for at in order:
-            checkout = checkouts[at]
-            began, reply = asking.pop(at, None) or ask(at)
-            try:
-                reply = reply.communicate(timeout=120)[0].strip()
-            except subprocess.TimeoutExpired:
-                print(f"    checkout {at} NO ANSWER in 120 s; the daemon's threads and what it logged in the step:", flush=True)
-                unanswered(daemon, log_path, since)
-                raise
-            took = (time.time() - began) * 1000
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
-                                   text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
-            assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
-            if daemon.poll() is not None:
-                verdict = "DAEMON DIED"
-            elif at in broken:
-                verdict = "refused" if not reply.startswith("ok") else "ANSWERED OK"
-            elif not reply.startswith("ok"):
-                verdict = "REFUSED"
-            else:
-                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
-                verdict = "same" if same else "DIFFERENT OUTPUT"
-            asked += 1
-            wrong += verdict.isupper()
-            print(f"    checkout {at} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
-            if daemon.poll() is not None:
-                raise SystemExit(f"the daemon died: {log_path}")
-        if wrong > wrong_before:
-            print(f"    what the daemon logged in the step:\n{logged(log_path, since)}", flush=True)
-    daemon.kill()
-    print(f"{asked - wrong} of {asked} right; log {log_path}")
+    try:
+        for what, edits, order, broken in STEPS:
+            wrong_before = wrong
+            for at, path, old, new in edits:
+                path = os.path.join(checkouts[at].ws, path)
+                if old is None:
+                    open(path, "w").write(new)
+                    continue
+                if new is None:
+                    os.remove(path)
+                    continue
+                text = open(path).read()
+                assert old in text, (what, old)
+                open(path, "w").write(text.replace(old, new, 1))
+            print(what, flush=True)
+            # A program asked for twice in a step is asked for the second time after the others.
+            asking = {at: (time.time(), checkouts[at].asking("sapp")) for at in order} if together else {}
+            for at in order:
+                project = checkouts[at]
+                began, client = asking.pop(at, None) or (time.time(), project.asking("sapp"))
+                try:
+                    built = project.answer(client, "sapp")
+                except Failed:
+                    print(f"    checkout {at} NO ANSWER; the daemon's threads and what it logged:", flush=True)
+                    unanswered(first.daemon)
+                    raise
+                took = (time.time() - began) * 1000
+                verdict, said = project.held(built, "sapp", broken=at in broken)
+                asked += 1
+                wrong += verdict in WRONG
+                print(f"    checkout {at} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}", flush=True)
+                if verdict == "DAEMON DIED":
+                    raise SystemExit(f"the daemon died: its log is in {first.home}")
+            if wrong > wrong_before and first.daemon is not None:
+                print("".join("    daemon: " + line for line in first.daemon.log().splitlines(True)[-300:]), flush=True)
+    finally:
+        first.stop()
+    print(f"{asked - wrong} of {asked} right")
+    if not wrong:
+        shutil.rmtree(work, ignore_errors=True)
     sys.exit(1 if wrong else 0)
 
 

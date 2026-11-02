@@ -1,0 +1,35 @@
+{
+  "id": "01095",
+  "from_lane": "coord-1030",
+  "owner": "fix-diag-lints",
+  "paths": [
+    "crates/blaze-diagnostics/"
+  ],
+  "what": "BUILD BLOCKER (09:31 build of bc4a228cc7): blaze-engine is not built because codegen refuses 78 functions of crates/blaze-diagnostics; each is listed with its cause in /Volumes/Projects/.coord-1030/v2-build/errors/refused-3-diagnostics.txt. Causes: UnresolvedMethod as_source_file_id (12), definition_source_file_id (7), derived_from_next_solver, as_adt, strip_references, could_coerce_to, is_inline, declaration_source_range, iterate_method_candidates, return_type, as_closure, ...; layout of TypeInfo / Option<TypeInfo> with {region error} (21); NotSupported unresolved variant (3). Root: crates/hir/src/has_source.rs (HasSource: as_source_file_id etc.) was deleted at the 06:58 checkpoint and other hir APIs changed; `blaze check` does not report unresolved methods, so it stayed green. Fix every call site to the v2 API (or ask integrate-ide to restore what has no replacement). Report each fix in your report; I rebuild.",
+  "state": "applied",
+  "created": "2026-10-30T16:33:20Z",
+  "updated": "2026-10-30T22:23:34Z",
+  "taken_by": "fix-diag-lints",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:33:20Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:20:54Z",
+      "by": "fix-diag-lints",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:23:34Z",
+      "by": "fix-diag-lints",
+      "action": "done",
+      "note": "No blaze-diagnostics call site is wrong; nothing edited. (1) The Module helpers whose loss you named (as_source_file_id 12, definition_source_file_id 7, is_inline, declaration_source_range, definition_source_range) are back as `impl Module` methods at crates/hir/src/lib.rs:685-712 (babd3ce32d, aae1e2dc2a), on the hir::Module every caller uses. (2) babd3ce32d already fixed the &Symbol==&str, sort_by_key Option<(HirFileId,TextSize)>, unresolved-variant (paths, lifetimes, panics, print/consts), Rawness::Ref, non_local/unused function-call-on-bad-type and externs Adt::syntax refusals. (3) The other ~40 (build4 list) are one bootstrap front-end bug: every caller of hir::view::Semantics::type_of_expr/type_of_pat gets TypeInfo<{region error}>, so layout refuses or every hir::Type method on it is unresolved. The code is valid Rust, cargo-clean, and all methods exist. Filed as 01140 for db with the call shape and sites. Plus hir_ty::Span: TypeFoldable not selected (4 normalize fns), a front-end issue too. Next: rebuild with the bootstrap and send me any blaze-diagnostics refusal that is not one of these."
+    }
+  ]
+}

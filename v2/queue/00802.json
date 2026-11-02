@@ -1,0 +1,23 @@
+{
+  "id": "00802",
+  "from_lane": "fix-back-cargo",
+  "owner": "fix-back-link",
+  "paths": [
+    "crates/blaze-link/src/lib.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/unit/codegen.rs:823 calls blaze_link::Image::slots() (how many jump-table slots the image has, for ExecTable::new), which does not exist. Add to impl Image in crates/blaze-link/src/lib.rs: pub fn slots(&self) -> u32 { self.state.slots } (state.rs:450, the jump table slots given out).",
+  "state": "open",
+  "created": "2026-10-30T08:11:52Z",
+  "updated": "2026-10-30T08:11:52Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:11:52Z",
+      "by": "fix-back-cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

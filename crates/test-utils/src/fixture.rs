@@ -64,7 +64,7 @@
 
 use std::iter;
 
-use rustc_hash::FxHashMap;
+use blaze_hash::HashMap;
 use stdx::trim_indent;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -118,11 +118,12 @@ pub struct Fixture {
     /// Specifies environment variables.
     ///
     /// Syntax: `env:PATH=/bin,RUST_LOG=debug`
-    pub env: FxHashMap<String, String>,
+    pub env: HashMap<String, String>,
     /// Specifies extra crate-level attributes injected at the top of the crate root file.
     /// This must be used with `crate` meta.
     ///
-    /// Syntax: `crate-attr:no_std crate-attr:features(f16,f128) crate-attr:cfg(target_arch="x86")`
+    /// Syntax: `crate-attr:no_std crate-attr:features(f16,f128) crate-attr:cfg(target_arch="x86")`;
+    /// a value with a space is quoted: `crate-attr:"doc = "a b""`.
     pub crate_attrs: Vec<String>,
     /// Introduces a new source root. This file **and the following
     /// files** will belong the new source root. This must be used
@@ -285,7 +286,7 @@ impl FixtureWithProjectMeta {
     //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b env:OUTDIR=path/to,OTHER=foo
     fn parse_meta_line(meta: &str, line: usize) -> Fixture {
         let meta = meta.trim();
-        let mut components = meta.split_ascii_whitespace();
+        let mut components = meta_components(meta);
 
         let path = components.next().expect("fixture meta must start with a path").to_owned();
         assert!(path.starts_with('/'), "fixture path does not start with `/`: {path:?}");
@@ -296,7 +297,7 @@ impl FixtureWithProjectMeta {
         let mut extern_prelude = None;
         let mut edition = None;
         let mut cfgs = Vec::new();
-        let mut env = FxHashMap::default();
+        let mut env = HashMap::default();
         let mut introduce_new_source_root = None;
         let mut library = false;
         for component in components {
@@ -307,6 +308,7 @@ impl FixtureWithProjectMeta {
 
             let (key, value) =
                 component.split_once(':').unwrap_or_else(|| panic!("invalid meta line: {meta:?}"));
+            let value = value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
             match key {
                 "crate" => krate = Some(value.to_owned()),
                 "deps" => deps = value.split(',').map(|it| it.to_owned()).collect(),
@@ -362,6 +364,32 @@ impl FixtureWithProjectMeta {
             library,
         }
     }
+}
+
+/// Splits a meta line on whitespace, except that a value starting with `"` (`key:"a b"`) runs to
+/// the next `"` followed by whitespace or the end of the line, quotes included.
+fn meta_components(meta: &str) -> impl Iterator<Item = &str> {
+    let mut rest = meta.trim_ascii_start();
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let word_end = rest.find(|c: char| c.is_ascii_whitespace()).unwrap_or(rest.len());
+        let end = match rest[..word_end].find(":\"") {
+            Some(colon) if !rest[..colon].contains(':') => {
+                let value = colon + 2;
+                rest[value..]
+                    .match_indices('"')
+                    .map(|(at, _)| value + at + 1)
+                    .find(|&after| rest[after..].chars().next().is_none_or(|c| c.is_ascii_whitespace()))
+                    .unwrap_or_else(|| panic!("unterminated quoted value in meta line: {meta:?}"))
+            }
+            _ => word_end,
+        };
+        let (component, tail) = rest.split_at(end);
+        rest = tail.trim_ascii_start();
+        Some(component)
+    })
 }
 
 impl MiniCore {
@@ -592,6 +620,26 @@ mod m;
     );
     assert_eq!("/lib.rs", meta.path);
     assert_eq!(2, meta.env.len());
+}
+
+#[test]
+fn parse_fixture_takes_a_quoted_crate_attr_with_spaces() {
+    let FixtureWithProjectMeta { fixture: parsed, .. } = FixtureWithProjectMeta::parse(
+        r#"
+//- /main.rs crate:main crate-attr:"feature(yeet_expr)]fn main(){}#[inline" crate-attr:"doc = "a b"" crate-attr:cfg(target_arch="x86") edition:2021
+fn f() {}
+"#,
+    );
+    let meta = &parsed[0];
+    assert_eq!(
+        vec![
+            "feature(yeet_expr)]fn main(){}#[inline".to_owned(),
+            "doc = \"a b\"".to_owned(),
+            "cfg(target_arch=\"x86\")".to_owned()
+        ],
+        meta.crate_attrs
+    );
+    assert_eq!(Some("2021".to_owned()), meta.edition);
 }
 
 #[test]

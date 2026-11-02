@@ -1,0 +1,38 @@
+{
+  "id": "00353",
+  "from_lane": "usercode-wire",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/proc-macro-srv",
+    "vendor/proc-macro-srv/crates/proc-macro-srv-cli",
+    "crates/proc-macro-api",
+    "crates/proc-macro-srv"
+  ],
+  "what": "## 4. coordinator: the proc-macro server blaze runs speaks version 8 (`vendor/proc-macro-srv/`)\n\nWhat: the server blaze starts is `vendor/proc-macro-srv/crates/proc-macro-srv-cli`, on its own\nvendored copy of `proc-macro-api` (version 6). The client negotiates, so it keeps sending\n`FlatTree` JSON to it, which works but leaves the wire format unused. To use the wire format,\neither build the CLI on `crates/proc-macro-api` and `crates/proc-macro-srv`, or port the\nhandling into the vendored copy. Handling `ExpandMacroWire` means: read `trees` with\n`proc_macro_srv::TokenStream::read_wire(bytes, &mut scratch, &mut proc_macro_api::wire::raw_part, join)`\n(the attribute starts at the byte count the first read returns; `scratch` is a reused\n`Vec<u8>` that holds the bytes when a deserialized buffer doesn't start at a 4-byte boundary), take the three sites with\n`WireSpan::resolve(&mut raw_part)`, write the output with `TokenStream::write_wire(call_site,\n&mut out)`, answer `Response::ExpandMacroWire` (with tracked env vars and paths in the\nbidirectional protocol's `ExpandMacroWireResponse`), and report `CURRENT_API_VERSION` 8.\n\nWhy: frontend-tokens item 2. Until then, expansions pay for the JSON `FlatTree` both ways.\n\n> forwarded to the coordinator (`vendor/proc-macro-srv/`) (from requests, pass 16; on requests' coordinator list).",
+  "state": "refused",
+  "created": "2026-10-30T03:35:14Z",
+  "updated": "2026-10-30T08:28:49Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "already done: vendor/proc-macro-srv was deleted (2f9a618943) and crates/proc-macro-srv-cli is built on crates/proc-macro-api and crates/proc-macro-srv; main_loop.rs handles ExpandMacroWire in both protocols (ExpandMacroWireResponse in bidirectional) and reports CURRENT_API_VERSION = WIRE_TREES = 8.",
+  "source": "v2/requests/usercode-wire.md#4. coordinator: the proc-macro server blaze runs speaks version 8 (`vendor/proc-macro-srv/`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-wire.md:80"
+    },
+    {
+      "at": "2026-10-30T08:28:49Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:28:49Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "already done: vendor/proc-macro-srv was deleted (2f9a618943) and crates/proc-macro-srv-cli is built on crates/proc-macro-api and crates/proc-macro-srv; main_loop.rs handles ExpandMacroWire in both protocols (ExpandMacroWireResponse in bidirectional) and reports CURRENT_API_VERSION = WIRE_TREES = 8."
+    }
+  ]
+}

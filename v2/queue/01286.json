@@ -1,0 +1,44 @@
+{
+  "id": "01286",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty/src/consteval/hir_eval.rs",
+    "crates/hir-ty-mir/src/mir/location.rs",
+    "crates/parser",
+    "crates/hir-ty-mir/src/mir/eval/shim.rs"
+  ],
+  "what": "round 7c hir-ty-mir failures that are not fixture fixes (no-fallback-front-mir took the fixture ones). (1) consteval::hir_eval the_shape 7/10, the_checks 11/15, generated_programs_match 21 outside: hir_eval::by_hir now refuses constants it took; in the_checks exactly the 4 shifts (SHL, SHR, SHL_NEG, E::X = 1 << 64) are out, in the_shape C and X (shifts) and one more. Needs a run with a print of which owner falls out and why (crates/hir-ty/src/consteval/hir_eval.rs Program::of / Compiler::binary; maybe a new inference diagnostic or adjustment on a shift). (2) tests/mir source_names::file_follows_the_names_the_build_gives: after name_sources the constant is still the placeholder `file`: file_source_path reports an untracked read when SourceNames does not exist and name_sources does synthetic_write(HIGH); under blaze_query that no longer invalidates the memo (query-unify). Also a fallback: with no SourceNames, location::placed gives None and the evaluator keeps the expander`s placeholder `file` instead of an error; mine to fix once (2) is settled. (3) tests::mir::eval expression_macro_of_one_expression_and_a_semicolon and statement_macro_last_in_another_statement_macro: the cases rustc rejects (a crate`s own macro `{ 5u32; }` as a block`s value; `{ outer!() }` of several statements) now evaluate Ok: parser/expansion (crates/parser grammar edits in the tree). (4) const_trait_derive_const: NotSupported(evaluating builtin derive impls), a missing evaluator feature (hir-ty-mir eval) for a later batch.",
+  "state": "applied",
+  "created": "2026-10-31T14:27:56Z",
+  "updated": "2026-11-01T00:53:47Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:27:56Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:50:08Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> no-fallback-front-mir: split: (1) to no-fallback-front-ty, (2) to query-unify, (3) to tests-misc as new items; left here: (4) const_trait_derive_const NotSupported evaluating builtin derive impls, and the location::placed None fallback after (2)"
+    },
+    {
+      "at": "2026-11-01T00:53:47Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:53:47Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "left after the split: (a) location::placed fallback removed: placed gives None only for an expression that is not a file!() literal, and an error (no source names, naming name_sources, or no place in a source file) instead of the placeholder `file`; tests/mir source_names checks the refusal before naming. (b) the builtin-derive refusal in eval.rs names derive, method and self type; why const_trait_derive_const still meets one needs a run, moved to a new item. ra clean but for the workspace-wide stale blaze_query macro error (FIELD_NAMES) on every input struct."
+    }
+  ]
+}

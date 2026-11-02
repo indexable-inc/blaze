@@ -1,0 +1,36 @@
+{
+  "id": "00221",
+  "from_lane": "frontend-fast-borrowck-proof",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-borrowck/src/lib.rs",
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## frontend-fast-borrowck-proof: `hot_lint.py` reads files of `#[cfg(test)] mod x;` as hot code\n\n`crates/hir-ty-borrowck/src/lib.rs` declares `#[cfg(test)] mod budget;` and\n`#[cfg(test)] mod differential;`, and `differential.rs` has `mod old;` (`differential/old.rs`,\n`differential/old/*.rs`): all test only, but `in_test_module` sees only `#[cfg(test)]` blocks\ninside a file and `main` skips only `tests/` and `*tests.rs`, so they are reported, all test\ncode. The fix, in `tools/v2/hot_lint.py`: a file is test code when the module that declares it\ndoes so under `#[cfg(test)]`, or is itself test code.\n\n```python\ndef parent_module(path: Path) -> Path | None:\n    \"\"\"The file that declares `path`'s module: `lib.rs`/`main.rs`/`mod.rs` beside it, or\n    `<dir>.rs` for a file in `<dir>/`.\"\"\"\n    if path.stem in (\"lib\", \"main\"):\n        return None\n    here = path.parent if path.stem != \"mod\" else path.parent.parent\n    names = [\"lib.rs\", \"main.rs\", \"mod.rs\"]\n    found = [here / it for it in names if (here / it).is_file() and here / it != path]\n    if path.stem == \"mod\" or not found:\n        found.append(here.with_suffix(\".rs\"))\n    return next((it for it in found if it.is_file()), None)\n\n\ndef declared_for_tests(path: Path, depth: int = 0) -> bool:\n    \"\"\"Whether `path`'s module is declared `#[cfg(test)] mod <name>;`, here or by an\n    ancestor module.\"\"\"\n    parent = parent_module(path)\n    if parent is None or depth > 16:\n        return False\n    stem = path.parent.name if path.stem == \"mod\" else path.stem\n    decl = re.compile(rf\"^\\s*(pub(\\([^)]*\\))?\\s+)?mod\\s+{re.escape(stem)}\\s*;\")\n    lines = parent.read_text(errors=\"ignore\").splitlines()\n    for i, line in enumerate(lines):\n        if decl.match(line):\n            j = i - 1\n            while j >= 0 and lines[j].strip().startswith(\"#[\"):\n                if re.match(r\"#\\[cfg\\((all\\()?test\\b\", lines[j].strip()):\n                    return True\n                j -= 1\n    return declared_for_tests(parent, depth + 1)\n```\n\nand in `main`, `... or name.endswith(\"tests.rs\") or declared_for_tests(path):`. (A `mod`\ndeclared inside a `#[cfg(test)] mod tests { .. }` block is already caught by depth; this is the\nout-of-line case.)\n\nStatus: open\n\n> forwarded to the coordinator (`tools/`): on requests' coordinator list (requests, pass 24).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:31:24Z",
+  "taken_by": "coord-apply",
+  "why": null,
+  "source": "v2/requests/coordinator.md#frontend-fast-borrowck-proof: `hot_lint.py` reads files of `#[cfg(test)] mod x;` as hot code",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:1746"
+    },
+    {
+      "at": "2026-10-30T08:31:24Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:24Z",
+      "by": "coord-apply",
+      "action": "done",
+      "note": "tools/v2/hot_lint.py: Input.crates is tuple[str, ...] (any name under crates/ or a path from the root; a missing crate or a run reading no file exits 2); a test cfg is any predicate only test/fuzz builds set (test, all(test, ..), any(test, feature = \"fuzz\"), fuzzing); files of out-of-line #[cfg(test)] mod x; (and their submodule dirs) and #[path] sources from tests/ are skipped, as is a file under #![cfg(test)]; comments and string/raw-string/char literals are blanked over the whole file (multi-line too) before both the brace count and the checks; \\bvec!\\[ so smallvec! is not a fresh Vec; HOT gains vendor/salsa, vendor/salsa-macros, vendor/salsa-macro-rules and fuzz (fuzz/targets stays unread, as tests are), blaze-diagnostics was already in; blaze-tier (no such crate) dropped."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00910",
+  "from_lane": "speed-sol2-store",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "Hand a write buffer back on completion, so the store commits pack bytes with one copy fewer. Where: crates/blaze-core/src/lib.rs `Done`: add `WrittenAt(Vec<u8>)` as the completion of `Effect::WriteAt` (the bytes it was given, untouched, capacity kept), and give `Done::Failed` (or a new `FailedWrite { error, bytes }`) the same buffer for a failed `WriteAt`; every driver (uring, kqueue, iocp, sim) returns the Vec it wrote from. Why: blaze-cas commits a pack by copying pack memory into a fresh Vec for each WriteAt (crates/blaze-cas/src/lib.rs, the `Effect::WriteAt` push in the commit, `pack.memory[..].to_vec()`), because a failed write must be retried from the same bytes. That copy runs serially on the store thread at about 0.1 ns a byte plus page faults on the fresh Vec, against NVMe at 0.14 ns a byte: with the drain copy it puts a commit about 3x off the device bound (docs/v2/plan/lanes/store/speed-of-light.md, \"Packs and the commit\"). With the buffer handed back, blaze-cas moves the drained tail into the effect and takes it back on completion or failure; store (speed-sol2-store) makes that edit once this lands.",
+  "state": "open",
+  "created": "2026-10-30T09:38:49Z",
+  "updated": "2026-10-30T09:38:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:38:49Z",
+      "by": "speed-sol2-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

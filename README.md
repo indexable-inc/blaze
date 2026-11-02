@@ -24,8 +24,9 @@ curl -fsSL https://ix.dev/blaze | sh
 ```
 
 For macOS on Apple silicon and Linux, with or without Rust installed: blaze builds with its own
-Rust, whatever rustup or the project pins, and downloads it once (about 125 to 160 MB; none when
-rustup already has that same nightly). Rather use crates.io or Nix?
+Rust, whatever rustup or the project pins, and the installer downloads it once (about 125 to
+160 MB; none when rustup already has that same nightly; v2's blaze cannot fetch it yet:
+[toolchain.md](docs/toolchain.md)). Rather use crates.io or Nix?
 [Other ways to install](docs/install.md).
 
 That installs **stable**: a release that passed the heavy tests (real projects on macOS and
@@ -48,11 +49,13 @@ blaze build   # like cargo build
 ```
 
 The first build loads your project and compiles every crate of it, with no cargo build and no
-rustc. Then change a function and build again: it's back in milliseconds, and the `Finished` line
-says `[blaze]`. The other cargo commands (`fmt`, `clippy`, `doc`, `tree` and the rest) are blaze's
-own too, and run no cargo.
+rustc. Then change a function and build again: blaze's daemon, still running, builds only what
+the edit changed. blaze answers `build`, `check`, `run`, `test` and `bench`; other cargo
+commands are not blaze's yet.
 
 ## How fast
+
+These numbers are blaze v1's; v2 has not been measured yet.
 
 - Edits rebuild <!-- benchheadline:start -->**10× faster** on macOS arm64, **24× faster** on Linux aarch64 and **11× faster** on Linux x86-64<!-- benchheadline:end --> than with `cargo build`, on average over real projects.
 - **About 20 ms** from saving a file to a running program using the new code, with
@@ -71,16 +74,14 @@ Every project, platform, chart, and the memory and disk it takes: [benchmarks](d
 
 ## How it works
 
-blaze runs beside cargo and keeps your project compiled in memory. After an edit it compiles only
-the functions you changed and writes them into the program cargo already built, instead of linking
-it again from scratch. A program that opts in can take the new code while it keeps running.
-[More](docs/architecture.md).
+blaze's daemon keeps your project compiled in memory, with no cargo or rustc under it. After an
+edit it compiles only the functions you changed and links the program again with its own linker.
+[More](docs/v2/plan.md).
 
 ## Good to know
 
-- **macOS on Apple silicon and Linux.** Windows x86-64 (MSVC) builds and takes live edits
-  through blaze too, run by hand and not in CI, with no installer and no sandbox yet
-  ([platforms.md](docs/platforms.md#windows-x86-64-msvc)).
+- **macOS on Apple silicon and Linux.** Windows has no installer, and v2 has not been run there
+  ([v1 on Windows](docs/platforms.md#windows-x86-64-msvc)).
 - **blaze is its own toolchain.** It builds every project with its own Rust, `blaze-2026-10-27`
   (today the nightly of that date), whatever the project pins; stable code and
   `#![feature(...)]` code build. Your toolchain and CI stay the final word
@@ -96,9 +97,8 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 - [Install](docs/install.md): requirements, crates.io, Nix
 - [Using blaze](docs/usage.md): day to day, rebuild on save, making plain `cargo build` use blaze
 - [Benchmarks](docs/benchmarks.md): every number, how it's measured, and on what machines
-- [How it works](docs/architecture.md): a map of the code
+- [How it works](docs/v2/plan.md): the plan of blaze v2, and a map of its crates
 - [Cargo compatibility](docs/cargo.md): every command, flag and setting
-- [Hot reload](docs/live.md): changing a running program
 - [CI runner](docs/ci-runner.md) and [roadmap](docs/roadmap.md): where blaze is going
 - [Contributing](docs/contributing.md)
 
@@ -109,7 +109,8 @@ nix run github:indexable-inc/blaze#life
 ```
 
 This opens a Game of Life window. On macOS on Apple silicon you can change its rules, colours and
-speed while it runs; elsewhere the window runs without live edits. It needs Nix, and builds blaze
+speed while it runs (live edits are blaze v1's; v2 does not have them yet); elsewhere the window
+runs without live edits. It needs Nix, and builds blaze
 from source the first time.
 
 ![Editing the running Game of Life: rule, colours and speed change live](docs/demo.avif)

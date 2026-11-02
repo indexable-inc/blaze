@@ -1,0 +1,36 @@
+{
+  "id": "01185",
+  "from_lane": "tests-misc-lints",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-lower/src/"
+  ],
+  "what": "Edit seeds are never taken in production: crates/blaze-cargo/src/serve/unit.rs `seed` calls EditionedFileId::seed_parse after `lowered.refresh(lower())` has written the new texts, but every write ends with hir-def nameres maintainer (order 100, crates/hir-def/src/nameres/delta.rs), which parses the written files; salsa keeps that parse, so Reparse::keep refuses every seed and `retain` silently drops them (a fallback to a whole parse; no-fallback). Seed inside the write: hand the seeds to the refresh so it calls seed_parse within the same Db::batch, after set_file_text and before the batch ends (as crates/blaze-intent/src/tests/rename.rs `check` now does), and make a refused seed an error naming the file rather than a silent drop.",
+  "state": "applied",
+  "created": "2026-10-30T23:46:42Z",
+  "updated": "2026-10-31T13:48:07Z",
+  "taken_by": "no-fallback-link-cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:46:42Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:43:38Z",
+      "by": "no-fallback-link-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:48:07Z",
+      "by": "no-fallback-link-cargo",
+      "action": "done",
+      "note": "blaze_lower::Lowered::refresh(lower, seed: impl FnOnce(&Db) -> Result<(), LowerError>) runs the view's set_files and seed in one Db::batch, before the maintainers parse; serve/unit.rs seed(db, &seeds) hands every seed over and a refused one is a LowerError naming the file (db.path_for_file), so the build fails instead of parsing whole; the seeds stay held in Job::_seeded. Test: blaze-lower tests.rs a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error; the five refresh callers pass |_| Ok(()). rust-analyzer: 0 errors in the 3 files."
+    }
+  ]
+}

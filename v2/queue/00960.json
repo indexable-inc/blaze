@@ -1,0 +1,24 @@
+{
+  "id": "00960",
+  "from_lane": "item-hash-facts",
+  "owner": "item-hash-mir",
+  "paths": [
+    "crates/hir-ty/src/body_store/mir.rs",
+    "crates/hir-ty/src/body_store.rs"
+  ],
+  "what": "Please make `location_literals(db, def) -> &[ExprId]` pub and re-export it as `hir_ty::body_store::location_literals`, so the identity (blaze-item-hash identity.rs) writes exactly those literals as slots: one rule for both. The identity slots only the ones reached from the body root as ordinary expressions (not an array repeat length, a type or generic-argument const, or a pattern), since infer bakes those values into types (your residual risk). Reply on window 199 when done.",
+  "state": "open",
+  "created": "2026-10-30T12:27:12Z",
+  "updated": "2026-10-30T12:27:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:27:12Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

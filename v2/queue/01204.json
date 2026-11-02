@@ -1,0 +1,37 @@
+{
+  "id": "01204",
+  "from_lane": "tests-misc-front2",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/eval.rs",
+    "crates/hir-ty-mir/src/mir/eval/unwind.rs",
+    "crates/hir-ty/src/mir/lower"
+  ],
+  "what": "hir-ty-ub integration tests (crates/hir-ty-ub/tests/ub/main.rs, round2-test.log ~61600-61950) fail in the evaluator, not the checker: (1) pass_scoped_thread, panic_is_a_failure and 5 more passing programs report ProtectedDisabled: a tag protected by enter_frame's machine.protect (moved arg / in-place return) is written as a child and then read through the allocation root while still protected, so a frame's protector outlives its call (check ret on every pop: Ran::TailCalled, unwinding, thread exit, and that call/ret run on the same thread the checker's set_thread names); Miri on_stack_pop. (2) offset_out_of_bounds: InternalError 'offset generic arg is not provided' instead of in-bounds UB. (3) simd_exposed_lanes_get_their_provenance_back and 2 more: MirLowerError UnresolvedMethod('[overloaded index]') on builtin array/slice indexing, which needs no Index impl in rustc (builtin index on [T; N]/[T]).",
+  "state": "applied",
+  "created": "2026-10-31T01:05:19Z",
+  "updated": "2026-10-31T14:02:38Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:05:19Z",
+      "by": "tests-misc-front2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:54:15Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:02:38Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "See 01227: ProtectedDisabled (own _0, copy after ret), offset generic arg (operand types). machine.ret runs on every pop (Returned, exec_tail_call, unwind_out; thread exit returns through Returned). [overloaded index] is the simd! fixture lacking minicore index (rustc E0608 too): 01279."
+    }
+  ]
+}

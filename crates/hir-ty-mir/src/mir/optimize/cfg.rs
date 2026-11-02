@@ -3,24 +3,27 @@
 //! `RemoveUnneededDrops`, `UnreachablePropagation`, `AddCallGuards::CriticalCallEdges` and the
 //! part of `CleanupPostBorrowck` that applies here.
 
-use rustc_hash::FxHashSet;
+use blaze_mem::Frame;
+use la_arena::Arena;
 
 use crate::{
     MemoryMap,
     mir::{
         BasicBlock, BasicBlockId, MirBody, Operand, OperandKind, Rvalue, StatementKind,
-        SwitchTargets, Terminator, TerminatorKind, transform::Ctx,
+        SwitchTargets, Terminator, TerminatorKind,
+        framed::{Bits, bits_in, block_id, block_index},
+        transform::Ctx,
     },
     next_solver::ConstKind,
 };
 use rustc_type_ir::inherent::IntoKind;
 
-use super::{block_id, block_index, renumber_blocks, successors, successors_mut};
+use super::{renumber_blocks, successors_mut};
 
 /// rustc's `CleanupPostBorrowck` and `EraseDerefTemps` for what lowering here makes:
 /// `FakeRead`s and the false edges only borrow checking reads go, and a `CopyForDeref` is the
 /// copy it is. Also the storage markers lowering gives parameters, which rustc's never have.
-pub(super) fn cleanup_post_borrowck(body: &mut MirBody<'_>) {
+pub(super) fn cleanup_post_borrowck(body: &mut MirBody<'_>, _frame: &Frame) {
     let params = &body.param_locals;
     for (_, block) in body.basic_blocks.iter_mut() {
         if let Some(terminator) = &mut block.terminator
@@ -40,7 +43,7 @@ pub(super) fn cleanup_post_borrowck(body: &mut MirBody<'_>) {
             if let StatementKind::Assign(_, rvalue) = &mut statement.kind
                 && let Rvalue::CopyForDeref(place) = rvalue
             {
-                let place = place.clone();
+                let place = place.clone(); // clone: a place's refcount, kept in the body
                 *rvalue = Rvalue::Use(Operand { kind: OperandKind::Copy(place), span: None });
             }
         }
@@ -50,38 +53,41 @@ pub(super) fn cleanup_post_borrowck(body: &mut MirBody<'_>) {
 /// rustc's `simplify_cfg`: goto chains collapsed, a block with one predecessor that jumps to
 /// it merged into that one, a switch whose targets are all one block made a `goto`, and the
 /// blocks nothing reaches removed.
-pub(super) fn simplify_cfg(body: &mut MirBody<'_>) {
+pub(super) fn simplify_cfg(body: &mut MirBody<'_>, frame: &Frame) {
     let start = block_index(body.start_block);
-    let mut blocks: Vec<BasicBlock> =
-        std::mem::take(&mut body.basic_blocks).into_iter().map(|(_, it)| it).collect();
-    CfgSimplifier::new(&mut blocks, start).simplify();
-    remove_dead_blocks(body, blocks, start);
+    CfgSimplifier::new(body.basic_blocks.as_mut(), start, frame).simplify();
+    remove_dead_blocks(body, start, frame);
 }
 
-struct CfgSimplifier<'a> {
+struct CfgSimplifier<'a, 'f> {
     blocks: &'a mut [BasicBlock],
-    pred_count: Vec<u32>,
+    pred_count: &'f mut [u32],
+    frame: &'f Frame,
+    /// `collapse_goto_chain`'s gotos, reused across calls.
+    chain: Vec<(usize, Terminator), &'f Frame>,
 }
 
-impl<'a> CfgSimplifier<'a> {
-    fn new(blocks: &'a mut [BasicBlock], start: usize) -> Self {
-        let mut pred_count = vec![0u32; blocks.len()];
+impl<'a, 'f> CfgSimplifier<'a, 'f> {
+    fn new(blocks: &'a mut [BasicBlock], start: usize, frame: &'f Frame) -> Self {
+        let pred_count = frame.alloc_slice_fill_with(blocks.len(), |_| 0u32);
         pred_count[start] = 1;
-        for block in reachable(blocks, start) {
+        let mut order = Vec::with_capacity_in(blocks.len(), frame);
+        reachable_into(blocks, start, &mut order, frame);
+        for &block in &order {
             if let Some(terminator) = &blocks[block].terminator {
-                for target in successors(&terminator.kind) {
+                for target in terminator.kind.all_successors() {
                     pred_count[block_index(target)] += 1;
                 }
             }
         }
-        CfgSimplifier { blocks, pred_count }
+        CfgSimplifier { blocks, pred_count, frame, chain: Vec::new_in(frame) }
     }
 
     fn simplify(mut self) {
         for block in self.blocks.iter_mut() {
             block.statements.retain(|it| !matches!(it.kind, StatementKind::Nop));
         }
-        let mut merged: Vec<usize> = Vec::new();
+        let mut merged: Vec<usize, &Frame> = Vec::new_in(self.frame);
         loop {
             let mut changed = false;
             for bb in 0..self.blocks.len() {
@@ -125,7 +131,8 @@ impl<'a> CfgSimplifier<'a> {
     }
 
     fn collapse_goto_chain(&mut self, start: &mut BasicBlockId, changed: &mut bool) {
-        let mut terminators: Vec<(usize, Terminator)> = Vec::new();
+        let mut terminators = std::mem::replace(&mut self.chain, Vec::new_in(self.frame));
+        terminators.clear();
         let mut current = block_index(*start);
         while let Some(terminator) = self.take_terminator_if_simple_goto(current) {
             let TerminatorKind::Goto { target } = terminator.kind else { unreachable!() };
@@ -147,9 +154,14 @@ impl<'a> CfgSimplifier<'a> {
             }
             self.blocks[current].terminator = Some(terminator);
         }
+        self.chain = terminators;
     }
 
-    fn merge_successor(&mut self, merged: &mut Vec<usize>, terminator: &mut Terminator) -> bool {
+    fn merge_successor(
+        &mut self,
+        merged: &mut Vec<usize, &Frame>,
+        terminator: &mut Terminator,
+    ) -> bool {
         let target = match terminator.kind {
             TerminatorKind::Goto { target } if self.pred_count[block_index(target)] == 1 => {
                 block_index(target)
@@ -178,33 +190,41 @@ impl<'a> CfgSimplifier<'a> {
     }
 }
 
-/// The blocks reachable from `start`, in preorder.
-fn reachable(blocks: &[BasicBlock], start: usize) -> Vec<usize> {
-    let mut seen = vec![false; blocks.len()];
-    let mut order = Vec::new();
-    let mut stack = vec![start];
+/// The blocks reachable from `start`, in preorder, after what `out` holds.
+fn reachable_into(
+    blocks: &[BasicBlock],
+    start: usize,
+    out: &mut Vec<usize, &Frame>,
+    frame: &Frame,
+) {
+    let mut seen: Bits<'_> = bits_in(blocks.len(), frame);
+    let mut stack = Vec::with_capacity_in(blocks.len(), frame);
+    stack.push(start);
     while let Some(block) = stack.pop() {
-        if std::mem::replace(&mut seen[block], true) {
+        if !seen.insert(block) {
             continue;
         }
-        order.push(block);
+        out.push(block);
         if let Some(terminator) = &blocks[block].terminator {
-            for target in successors(&terminator.kind).into_iter().rev() {
-                if !seen[block_index(target)] {
+            for target in terminator.kind.all_successors().rev() {
+                if !seen.contains(block_index(target)) {
                     stack.push(block_index(target));
                 }
             }
         }
     }
-    order
 }
 
 /// rustc's `remove_dead_blocks`: the blocks `start` does not reach go, and of the reachable
 /// blocks that are nothing but `unreachable` all but one go. The rest keep their order.
-fn remove_dead_blocks(body: &mut MirBody<'_>, blocks: Vec<BasicBlock>, start: usize) {
-    let mut keep = vec![false; blocks.len()];
-    for block in reachable(&blocks, start) {
-        keep[block] = true;
+fn remove_dead_blocks(body: &mut MirBody<'_>, start: usize, frame: &Frame) {
+    let count = body.basic_blocks.len();
+    let blocks: &[BasicBlock] = body.basic_blocks.as_mut();
+    let mut order = Vec::with_capacity_in(count, frame);
+    reachable_into(blocks, start, &mut order, frame);
+    let mut keep: Bits<'_> = bits_in(count, frame);
+    for &block in &order {
+        keep.insert(block);
     }
     let empty_unreachable = |block: &BasicBlock| {
         !block.is_cleanup
@@ -214,24 +234,37 @@ fn remove_dead_blocks(body: &mut MirBody<'_>, blocks: Vec<BasicBlock>, start: us
                 Some(TerminatorKind::Unreachable)
             )
     };
-    let mut map = vec![None; blocks.len()];
-    let mut kept = Vec::with_capacity(blocks.len());
+    let map = frame.alloc_slice_fill_with(count, |_| None::<usize>);
+    let mut kept = 0;
     let mut kept_unreachable = None;
-    for (index, block) in blocks.into_iter().enumerate() {
-        if !keep[index] {
+    for (index, block) in blocks.iter().enumerate() {
+        if !keep.contains(index) {
             continue;
         }
-        if empty_unreachable(&block) {
+        if empty_unreachable(block) {
             if let Some(it) = kept_unreachable {
                 map[index] = Some(it);
                 continue;
             }
-            kept_unreachable = Some(kept.len());
+            kept_unreachable = Some(kept);
         }
-        map[index] = Some(kept.len());
-        kept.push(block);
+        map[index] = Some(kept);
+        kept += 1;
     }
-    renumber_blocks(body, kept, &map);
+    // Every block kept, each where it was: the map is the identity, and renumbering would
+    // leave the body as it is.
+    if kept == count {
+        return;
+    }
+    let mut arena = Arena::with_capacity(kept);
+    for (index, (_, block)) in std::mem::take(&mut body.basic_blocks).into_iter().enumerate() {
+        // A repeated empty `unreachable` maps to the one kept before it.
+        if map[index] == Some(arena.len()) {
+            arena.alloc(block);
+        }
+    }
+    body.basic_blocks = arena;
+    renumber_blocks(body, map);
 }
 
 /// The value of a constant operand of a scalar type, as its bits.
@@ -262,18 +295,19 @@ fn is_constant(operand: &Operand) -> bool {
 /// rustc's `SimplifyConstCondition`: a switch on a constant is a `goto`, and so is an assert
 /// of a constant that holds. The constant may be written to the place the condition reads
 /// by the statement just before.
-pub(super) fn simplify_const_condition(body: &mut MirBody<'_>) {
+pub(super) fn simplify_const_condition(body: &mut MirBody<'_>, _frame: &Frame) {
     for (_, block) in body.basic_blocks.iter_mut() {
+        // Borrowed from the statements while the terminator, another field, is rewritten.
         let before = match block.statements.last().map(|it| &it.kind) {
             Some(StatementKind::Assign(place, Rvalue::Use(value))) if is_constant(value) => {
-                Some((place.clone(), value.clone()))
+                Some((place, value))
             }
             _ => None,
         };
         let known = |operand: &Operand| -> Option<u128> {
             match &operand.kind {
                 OperandKind::Copy(place) | OperandKind::Move(place) => {
-                    let (written, value) = before.as_ref()?;
+                    let (written, value) = before?;
                     (written == place).then(|| constant_bits(value)).flatten()
                 }
                 _ => constant_bits(operand),
@@ -298,7 +332,11 @@ pub(super) fn simplify_const_condition(body: &mut MirBody<'_>) {
 }
 
 /// rustc's `RemoveUnneededDrops`: a drop of what has nothing to drop is a `goto`.
-pub(super) fn remove_unneeded_drops<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) {
+pub(super) fn remove_unneeded_drops<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    frame: &Frame,
+) {
     let mut changed = false;
     let mut blocks = std::mem::take(&mut body.basic_blocks);
     for (_, block) in blocks.iter_mut() {
@@ -313,34 +351,35 @@ pub(super) fn remove_unneeded_drops<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>
     }
     body.basic_blocks = blocks;
     if changed {
-        simplify_cfg(body);
+        simplify_cfg(body, frame);
     }
 }
 
 /// rustc's `AddCallGuards::CriticalCallEdges`: a call that may unwind and returns to a block
 /// with more than one predecessor returns to a new block that only jumps there.
-pub(super) fn critical_call_edges(body: &mut MirBody<'_>) {
-    let mut pred_count = vec![0u32; body.basic_blocks.len()];
+pub(super) fn critical_call_edges(body: &mut MirBody<'_>, frame: &Frame) {
+    let pred_count = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32);
     for (_, block) in body.basic_blocks.iter() {
         if let Some(terminator) = &block.terminator {
-            for target in successors(&terminator.kind) {
+            for target in terminator.kind.all_successors() {
                 pred_count[block_index(target)] = pred_count[block_index(target)].saturating_add(1);
             }
         }
     }
-    let work: Vec<BasicBlockId> = body
-        .basic_blocks
-        .iter()
-        .filter(|(_, block)| {
-            matches!(
-                block.terminator.as_ref().map(|it| &it.kind),
-                Some(TerminatorKind::Call { target: Some(target), cleanup: Some(_), .. })
-                    if pred_count[block_index(*target)] > 1
-            )
-        })
-        .map(|(id, _)| id)
-        .collect();
-    for source in work {
+    let mut work: Vec<BasicBlockId, &Frame> = Vec::new_in(frame);
+    work.extend(
+        body.basic_blocks
+            .iter()
+            .filter(|(_, block)| {
+                matches!(
+                    block.terminator.as_ref().map(|it| &it.kind),
+                    Some(TerminatorKind::Call { target: Some(target), cleanup: Some(_), .. })
+                        if pred_count[block_index(*target)] > 1
+                )
+            })
+            .map(|(id, _)| id),
+    );
+    for &source in &work {
         let (span, is_cleanup, destination) = {
             let block = &body.basic_blocks[source];
             let terminator = block.terminator.as_ref().expect("filtered");
@@ -350,7 +389,7 @@ pub(super) fn critical_call_edges(body: &mut MirBody<'_>) {
             (terminator.span, block.is_cleanup, target)
         };
         let guard = body.basic_blocks.alloc(BasicBlock {
-            statements: Vec::new(),
+            statements: Vec::new(), // alloc: none, a kept block with no statements
             terminator: Some(Terminator {
                 span,
                 kind: TerminatorKind::Goto { target: destination },
@@ -368,11 +407,11 @@ pub(super) fn critical_call_edges(body: &mut MirBody<'_>) {
 /// a target out of a switch: a block that can only go on to `unreachable` is unreachable
 /// itself, and a switch loses the targets that are. A block with `asm!` in it is never taken
 /// for unreachable, since a block that does not return is one that ends in `unreachable` here.
-pub(super) fn unreachable_propagation(body: &mut MirBody<'_>) {
-    let mut unreachable: FxHashSet<BasicBlockId> = FxHashSet::default();
-    let mut order = super::reverse_postorder(body);
-    order.reverse();
-    for bb in order {
+pub(super) fn unreachable_propagation(body: &mut MirBody<'_>, frame: &Frame) {
+    let mut unreachable: Bits<'_> = bits_in(body.basic_blocks.len(), frame);
+    let order = super::reverse_postorder(body, frame);
+    let mut kept: Vec<(u128, BasicBlockId), &Frame> = Vec::new_in(frame);
+    for &bb in order.iter().rev() {
         let block = &mut body.basic_blocks[bb];
         if block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_))) {
             continue;
@@ -380,15 +419,17 @@ pub(super) fn unreachable_propagation(body: &mut MirBody<'_>) {
         let Some(terminator) = &mut block.terminator else { continue };
         let is_unreachable = match &terminator.kind {
             TerminatorKind::Unreachable => true,
-            TerminatorKind::Goto { target } if unreachable.contains(target) => {
+            TerminatorKind::Goto { target } if unreachable.contains(block_index(*target)) => {
                 terminator.kind = TerminatorKind::Unreachable;
                 true
             }
             TerminatorKind::SwitchInt { discr, targets } => {
                 let otherwise = targets.otherwise();
-                let otherwise_unreachable = unreachable.contains(&otherwise);
-                let kept: Vec<(u128, BasicBlockId)> =
-                    targets.iter().filter(|(_, it)| !unreachable.contains(it)).collect();
+                let otherwise_unreachable = unreachable.contains(block_index(otherwise));
+                kept.clear();
+                kept.extend(
+                    targets.iter().filter(|(_, it)| !unreachable.contains(block_index(*it))),
+                );
                 let new_targets = SwitchTargets::new(kept.iter().copied(), otherwise);
                 let count = new_targets.all_targets().len();
                 let new = match (count, otherwise_unreachable) {
@@ -397,7 +438,7 @@ pub(super) fn unreachable_propagation(body: &mut MirBody<'_>) {
                     (2, true) => Some(TerminatorKind::Goto { target: kept[0].1 }),
                     _ if count == targets.all_targets().len() => None,
                     _ => Some(TerminatorKind::SwitchInt {
-                        discr: discr.clone(),
+                        discr: discr.clone(), // clone: the kept switch's operand, a handle
                         targets: new_targets,
                     }),
                 };
@@ -410,10 +451,10 @@ pub(super) fn unreachable_propagation(body: &mut MirBody<'_>) {
             _ => false,
         };
         if is_unreachable {
-            unreachable.insert(bb);
+            unreachable.insert(block_index(bb));
         }
     }
-    for bb in unreachable {
-        body.basic_blocks[bb].statements.clear();
+    for bb in unreachable.iter() {
+        body.basic_blocks[block_id(bb)].statements.clear();
     }
 }

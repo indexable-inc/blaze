@@ -1,0 +1,32 @@
+{
+  "id": "01441",
+  "from_lane": "coordinator",
+  "owner": "sol-all-ty",
+  "paths": [
+    "crates/hir-ty-borrowck/src/budget.rs",
+    "crates/hir-ty/src/next_solver",
+    "crates/hir-ty/src/tests/budget.rs",
+    "crates/hir-ty-mir"
+  ],
+  "what": "Allocation-budget tests fail in round 19 (71269b1fd5), 10 across 3 crates: hir-ty-borrowck budget::a_typical_clean_body_allocates_nothing (budget.rs:156: 3 allocations, panic_display 92 bytes, on a clean body), a_body_with_errors_allocates_its_diagnostics_alone, a_large_clean_body_and_smaller_ones_after_it_allocate_nothing; hir-ty next_solver::budget_tests (4: warm goal resolution / cached canonical response / global cache allocate), tests::budget::a_cold_infer_allocates_its_result_alone; hir-ty-mir alloc_budget::lowering_allocates_the_kept_body_and_its_setup_only. Find what allocates (panic_display formatting on a clean path looks like one) and remove it, or fix the budget if the allocation is the design. Log: /Volumes/Projects/.coord-1030/v2-build/round19-test.log.",
+  "state": "taken",
+  "created": "2026-11-01T03:47:27Z",
+  "updated": "2026-11-01T03:48:37Z",
+  "taken_by": "sol-all-ty",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:47:27Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:48:37Z",
+      "by": "sol-all-ty",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "00285",
+  "from_lane": "coordinator",
+  "owner": "lints",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-lints/src/blaze/tests.rs",
+    "Cargo.toml",
+    "crates/blaze-lints/Cargo.toml"
+  ],
+  "what": "## coordinator: at integration\n\n- Delete `tools/v2/hot_lint.py` once blaze-lints' `blaze::` lints build and their tests (its\n  patterns as fixtures, `crates/blaze-lints/src/blaze/tests.rs`) pass, and add to the root\n  `Cargo.toml` `[workspace.lints.blaze]` with `std_hashmap = \"deny\"`; in each crate of\n  hot_lint.py's `HOT` list, `[lints.blaze] hot = \"deny\"` (its `[lints]` then stops being only\n  `workspace = true`: cargo's `[lints]` can't extend the workspace's, so the hot crates spell\n  out the workspace table and add `blaze`). Point common.md's hot_lint step at\n  `blaze clippy`.\n- `crates/blaze-lints/Cargo.toml` drops `ide-db` and gains `base-db`, `hir-def`, `hir-ty`,\n  `salsa`, `triomphe` (all workspace dependencies already): no new workspace dependency.\n\n> forwarded to the coordinator, for integration: deleting `tools/v2/hot_lint.py`, the hot crates' `[lints.blaze]`, common.md and blaze-lints' manifest are its. requests adds the root `[workspace.lints.blaze] std_hashmap = \"deny\"` only then: before blaze-lints' lints build, cargo would warn about the unknown tool.",
+  "state": "open",
+  "created": "2026-10-30T02:56:54Z",
+  "updated": "2026-10-30T02:56:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints.md#coordinator: at integration",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints.md:124"
+    }
+  ]
+}

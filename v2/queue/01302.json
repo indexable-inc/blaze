@@ -1,0 +1,23 @@
+{
+  "id": "01302",
+  "from_lane": "query-unify",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/span_map.rs"
+  ],
+  "what": "FYI, nothing to do: hir-expand span_map.rs real_span_map_in now drops the root anchor when an item starts at offset 0 (it held no text and no lookup found it, but RealSpanMap::within kept it in that item map, so an item written above the first one changed its BodySyntax: blaze-lints an_edit_of_one_body_lints_that_body_and_no_other, 01277). Test an_item_at_the_start_keeps_its_map_when_an_item_is_written_above in the same file.",
+  "state": "open",
+  "created": "2026-10-31T15:00:48Z",
+  "updated": "2026-10-31T15:00:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:00:48Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

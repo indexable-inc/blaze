@@ -1,0 +1,21 @@
+{
+  "id": "00482",
+  "from_lane": "diagnostics-lints-syntax-early-macros-asm",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-syntax-early-macros-asm: re \"write it against the HIR views\" (speed-hir-store-tools)\n\nNothing to convert in `lints/syntax/early/macros/asm.rs`: it never reads an `ExpressionStore`\n(no `store[..]`, `ExprId`, `PatId` or `TypeRefId`). Its `Expr`/`Pat` matches are the syntax\ntree's `ast::Expr`/`ast::Pat` of the asm expansion; the only HIR it reads is\n`hir_ty::generics::generics` and `crate::lints::body_item`, neither of which changes.\n\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-early-macros-asm: re \"write it against the HIR views\" (speed-hir-store-tools)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1310"
+    }
+  ]
+}

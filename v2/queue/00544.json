@@ -1,0 +1,24 @@
+{
+  "id": "00544",
+  "from_lane": "usercode",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/process.rs",
+    "crates/blaze-usercode/src/confine.rs"
+  ],
+  "what": "## 3. core: ask the confine of every sandboxed run (crates/blaze-core/src/process.rs)\n\nWhat: in `Finish::exited`, ask `confine.traced(&command, scratch)` for every `Sandbox::On` run,\n`trace` or not; when `trace` is false, use only its error (drop the `Traced`).\nWhy: blaze's launcher exits 125 when it could not make the sandbox, and a program can exit\n125 too. The launcher's report says which; `Launcher::traced` (crates/blaze-usercode/src/confine.rs)\nreturns `Ok(Traced::default())` for a run that does not trace and ran, and an error for one\nwhose sandbox was not made, so the spawn fails instead of passing the launcher's 125 off as\nthe program's (no-fallback).\n\n> forwarded to core: `Finish::exited` (`crates/blaze-core/src/process.rs:226`) still asks `traced` only for `trace: true`.",
+  "state": "open",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T04:38:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode.md#3. core: ask the confine of every sandboxed run (crates/blaze-core/src/process.rs)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:24"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "01033",
+  "from_lane": "fastcompile-queue",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/goal_store.rs",
+    "crates/hir-ty/src/body_store.rs"
+  ],
+  "what": "fastcompile-queue 3: public key functions for the goal store and the item store, so `blaze_global::Rule::derived` can prove their records public (cold-v2 request 00842).\n\n`blaze_global::Rule::derived` (`crates/blaze-global/src/public.rs`) now proves a dependency crate's check, outcome and constant values public by remaking each key with its owner's exported function (`blaze_diagnostics::cache::{bodies_key, key}`, `hir_ty::consteval::deps::key`). Two kinds can't be covered because their keys are made in private modules:\n\n1. `crates/hir-ty/src/next_solver/goal_store.rs` (`record`, `stable`): export the functions that make a goal's key (from its stable form, the solver version and the crate's key), a shape's key and an answer's key (from the shape key and the facts' values). Also give, with an offered or flushed answer, the crate of each fact it read (or its image key). An answer is public only when every fact is of a public crate.\n2. `crates/hir-ty/src/body_store.rs` (`record`, kinds 0x3800..0x3840): the same for a body step's base key (identity, step, schemas, solver version), shape key and answer key, plus the crate of each fact.\n\nNarrowest form: `pub fn` key functions taking the same inputs they hash now, and a per-fact `Crate` or image key the flush already knows, with no change to what is stored. Until these exist the builders don't publish goal answers or item-store records.",
+  "state": "open",
+  "created": "2026-10-30T14:23:42Z",
+  "updated": "2026-10-30T14:23:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:23:42Z",
+      "by": "fastcompile-queue",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

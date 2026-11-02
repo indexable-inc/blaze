@@ -1,0 +1,24 @@
+{
+  "id": "00459",
+  "from_lane": "db-ty",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/hir/src/tests.rs"
+  ],
+  "what": "## 3. Coordinator, blaze-engine: the check driver and the post-store eviction\n\n- `blaze check` (`errors_of`, `crates/blaze-engine/src/lib.rs` around line 6615): check through\n  `hir::check::check_crate(db, krate, style_lints, Some(&asked))` for each of\n  `hir::check::workspace_crates(db)` (or `check_workspace`), and render the `AnyDiagnostic`s\n  as cargo prints them (ide-diagnostics' handlers do it today; with no IDE, whatever replaces\n  them), in place of `semantic_diagnostics_of_bodies` per file. It\n  never asks for a dependency's bodies (#1293); `crates/hir/src/tests.rs`\n  `check_infers_only_workspace_bodies` holds it to that. ide-diagnostics would need a `pub fn`\n  that renders a `Vec<AnyDiagnostic>` (its `match` over `AnyDiagnostic` at line ~489).\n- After a build stored the code of its compiled units: `hir::evict::drop_after_store(&mut db,\n  &compiled_bodies)`, with the dependency bodies it compiled (workspace bodies `blaze check`\n  reads again are better left out).\n\n> forwarded to codegen: both are in `crates/blaze-engine/src/lib.rs` (codegen's).\n> forwarded to diagnostics: the `pub fn` rendering a `Vec<AnyDiagnostic>` is ide-diagnostics' (diagnostics lane), or blaze-diagnostics' that replaces it.",
+  "state": "open",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T04:31:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#3. Coordinator, blaze-engine: the check driver and the post-store eviction",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:28"
+    }
+  ]
+}

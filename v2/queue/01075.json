@@ -1,0 +1,25 @@
+{
+  "id": "01075",
+  "from_lane": "integrate-tooling",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-api/src/client.rs",
+    "crates/blaze-cargo/src/cli/daemon.rs",
+    "harness/blaze_cli.py"
+  ],
+  "what": "Security: v2's CLI connects with blaze_api::client::Client::unix (cli/daemon.rs:61,90), which never checks who serves the socket: a second user who can make <BLAZE_HOME>/v2.sock (a shared or 0777 BLAZE_HOME, a stale XDG_RUNTIME_DIR) gets the user's request and environment. v1's client refused (`the peer is user N`, crates/blaze-cargo/src/socket.rs check_peer, which the v2 path does not use). Port: Client::unix checks the peer's uid against getuid (SO_PEERCRED / getpeereid as socket/unix.rs peer_user) and refuses with `the peer is user N`. harness/blaze_cli.py's stranger check is ported to v2 (BLAZE_HOME at a socket a second user serves, then `blaze status`) and fails until this lands.",
+  "state": "open",
+  "created": "2026-10-30T15:39:32Z",
+  "updated": "2026-10-30T15:39:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:39:32Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

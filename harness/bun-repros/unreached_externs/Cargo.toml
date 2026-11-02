@@ -1,3 +1,0 @@
-[workspace]
-members = ["blocker", "runner"]
-resolver = "3"

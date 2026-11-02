@@ -1,0 +1,26 @@
+{
+  "id": "00854",
+  "from_lane": "speed",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/hir-def/src/hir.rs",
+    "crates/hir-def/src/hir/type_ref.rs"
+  ],
+  "what": "Switch la-arena to the vendored copy with the RawIdx niche (speed-hir's request; vendor/la-arena/ is in). In one change: root Cargo.toml:201 `la-arena = { version = \"0.3.1\" }` -> `la-arena = { path = \"vendor/la-arena\" }`; Cargo.lock's la-arena entry drops source/checksum; and two exact size asserts in hir-def drop from 16 to 12, or hir-def stops compiling: crates/hir-def/src/hir.rs:175 `size_of::<MatchArm>() == 16` -> `== 12` (and the comment at 168-171 loses its 'Option<ExprId> is 8 bytes ... would be 12' sentence), crates/hir-def/src/hir/type_ref.rs:336 `size_of::<RefType>() == 16` -> `== 12` (and the comment at 331-333 loses its 'RefType would be 12 ... 8 bytes today' sentence). Why: every Option<ExprId/PatId/TypeRefId/LabelId> goes from 8 to 4 bytes (data.md budgets). Checked: of the 131 exact size asserts in the crates that use la-arena, only these two change; nothing builds an index from u32::MAX. hir-def's two files are free (speed-hir, mem-format DONE); exact text also in v2/requests/speed.md.",
+  "state": "open",
+  "created": "2026-10-30T08:54:45Z",
+  "updated": "2026-10-30T08:54:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:54:45Z",
+      "by": "speed",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

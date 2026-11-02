@@ -1,0 +1,37 @@
+{
+  "id": "00615",
+  "from_lane": "db-expand-items",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa/src/function/execute.rs",
+    "v2/requests/mem-db-salsa.md",
+    "vendor/salsa"
+  ],
+  "what": "## db-expand-items: salsa runs each query in frame::task (db, `vendor/salsa/src/function/execute.rs`, `fetch.rs`)\n\nWhat: mem-db-salsa's M1 (`v2/requests/mem-db-salsa.md`, \"From mem-db-salsa\"): every run of a\nquery function (`C::execute`, `cycle_initial`, `recover_from_cycle`) inside\n`blaze_mem::frame::task(C::MEM_TAG, ..)`. `rg 'frame::task|MEM_TAG' vendor/salsa` finds nothing\ntoday.\nWhy: these hir-def queries now start with `blaze_mem::frame::current` (mem-db-def-items I5, I7,\nI8, I11): `crate_notable_traits` (`lang_item.rs`), `crate_diagnostic_items` and\n`diagnostic_items` (`diagnostic_item.rs`), `upvars_mentioned_impl` under the three upvars queries\n(`upvars.rs`), and `include_macro_invoc` (`lib.rs`). hir-ty's `target_feature.rs` already does\nthe same. Outside a task `current` stops (\"frame::current outside any frame::task\"), with no\nfallback. Until M1 lands, every caller of these queries, tests included, stops there.\nStatus: open.\n\n> forwarded to db (`vendor/salsa`; db-next3 told by tmux; requests, pass 24).\n> checked by db-audit-dbsub-expand (2026-10-29 22:46): in the tree. `C::execute` runs in `blaze_mem::frame::task(C::MEM_TAG, ..)` at `vendor/salsa/src/function/execute.rs:343`, the fixpoint's executions at `:208`, `recover_from_cycle` at `:278`, `cycle_initial` at `execute.rs:267` and `fetch.rs:285`; `MEM_TAG` defaults to `Tag::Query` (`function.rs:69`).",
+  "state": "applied",
+  "created": "2026-10-30T05:46:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-items: salsa runs each query in frame::task (db, `vendor/salsa/src/function/execute.rs`, `fetch.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:2534"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-expand (2026-10-29 22:46): in the tree. `C::execute` runs in `blaze_mem::frame::task(C::MEM_TAG, ..)` at `vendor/salsa/src/function/execute.rs:343`, the fixpoint's executions at `:208`, `recover_from_cycle` at `:278`, `cycle_initial` at `execute.rs:267` and `fetch.rs:285`; `MEM_TAG` defaults to `Tag::Query` (`function.rs:69`)."
+    }
+  ]
+}

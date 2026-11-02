@@ -1,0 +1,24 @@
+{
+  "id": "00489",
+  "from_lane": "diagnostics-lints-syntax-delims",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/lib.rs",
+    "docs/v2/plan/design/unsafe.md"
+  ],
+  "what": "## diagnostics-lints-syntax-delims: `#![forbid(unsafe_code)]` on blaze-diagnostics\n\nWhat: add `#![forbid(unsafe_code)]` to `crates/blaze-diagnostics/src/lib.rs`.\nWhere: `crates/blaze-diagnostics/src/lib.rs` (the lane parent's).\nWhy: `docs/v2/plan/design/unsafe.md` says a crate with no unsafe module forbids `unsafe_code`.\n`rg` finds no `unsafe` block, fn or impl in the crate's Rust; the only hits are rustc's\nerror-code docs in `emit/codes/*.md` and the sources the UI tests lint.\n\n> forwarded to diagnostics: its own `src/lib.rs`.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-syntax-delims: `#![forbid(unsafe_code)]` on blaze-diagnostics",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1560"
+    }
+  ]
+}

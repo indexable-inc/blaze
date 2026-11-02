@@ -1,0 +1,38 @@
+{
+  "id": "00017",
+  "from_lane": "format",
+  "owner": "coordinator",
+  "paths": [
+    "crates/syntax-bridge/src/tests.rs",
+    "crates/syntax/src/parsing.rs",
+    "crates/syntax-bridge",
+    "crates/syntax"
+  ],
+  "what": "## format-tree\n\n1. **Drop the green twin from an outline test** — `crates/syntax-bridge/src/tests.rs`\n   (`an_outline_has_the_token_trees_of_a_full_parse`). Green trees are gone from\n   `syntax-tree` (format-edit, decisions.md: rowan goes entirely), so `SyntaxNode::new_root`\n   and `SyntaxNode::green` no longer exist. Delete line 197,\n   `let green = SyntaxNode::new_root(full.green().to_owned());`, and line 222,\n   `assert_eq!(token_tree(&green), expected, \"{path}\");`. Nothing else changes: the test still\n   compares the outline with the full parse, which is what it is for (`SyntaxNode` stays\n   imported: the test's `in_full` closure uses it). Why: without this, `syntax-bridge`'s\n   tests don't build.\n   Status: done by speed-span-tt\n2. **`expand_lazy` returns its errors** — `crates/syntax/src/parsing.rs` (format-parse).\n   format-parse's request 3 has landed in `syntax-tree`: `Expand` is now\n   `fn(SyntaxKind, &str, u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`, and\n   `FlatTree::part_errors(at)` gives a lazy node's errors, absolute. `syntax` doesn't build\n   until `expand_lazy` matches. The least edit: make it return\n   `(FlatTree, Vec<(TextRange, Box<str>)>)`, bind `errors` instead of `_errors` from\n   `build_tree`, and end with\n   `(tree, errors.into_iter().map(|it| (it.range(), it.to_string().into())).collect())`.\n   The ranges must be relative to `text` (the part's own text), which is what `build_tree`\n   gives over `Arc::from(text)`. The `ILLEGAL_FLOAT` error, whose position is a token count\n   in the file and not an offset, is format-parse's call, as in `body_parser_errors`. Then\n   `errors_of` can read `tree.part_errors(at)` (parsing the part if needed) in place of\n   `body_parser_errors`.\n\n> forwarded to format: `crates/syntax-bridge/` and `crates/syntax/` are lane format's, between its children.",
+  "state": "refused",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T08:25:26Z",
+  "taken_by": "coord-apply-front",
+  "why": "already done: syntax-bridge tests.rs has no SyntaxNode::new_root/green(); syntax/src/parsing.rs expand_lazy returns its errors and errors_of_into reads them via body_errors -> tree.part_errors(at), with ILLEGAL_FLOAT handled.",
+  "source": "v2/requests/format.md#format-tree",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:408"
+    },
+    {
+      "at": "2026-10-30T08:25:25Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:26Z",
+      "by": "coord-apply-front",
+      "action": "refuse",
+      "note": "already done: syntax-bridge tests.rs has no SyntaxNode::new_root/green(); syntax/src/parsing.rs expand_lazy returns its errors and errors_of_into reads them via body_errors -> tree.part_errors(at), with ILLEGAL_FLOAT handled."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "00090",
+  "from_lane": "usercode-macros",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine",
+    "crates/blaze-engine/src/lib.rs"
+  ],
+  "what": "## 1. `crates/blaze-engine`: install blaze-expand with the content store\n\nWhere: `crates/blaze-engine/src/lib.rs`, the call `blaze_expand::install();` (about line 8890).\n\nWhy: expansions are kept in `blaze_cas::Store` through `blaze_usercode::index::{find, keep}`,\nnot in `blaze-store`; blaze-expand needs the store, the toolchain's id and what warm servers\npass through. `install` now returns an error for a bad `BLAZE_PROC_MACRO_CACHE` (only unset,\n`keep` or `check`; `off`, `0` and the other old modes are gone). `BLAZE_NATIVE_MACROS` is\ngone with the native expanders (section 5).\n\n```rust\nlet environment = proc_macro_api::warm::Environment::new();\nblaze_expand::install(blaze_expand::Expansions {\n    store: the_daemons_cas_store.clone(),       // Arc<RwLock<blaze_cas::Store>>\n    toolchain: the_pinned_toolchains_content_id, // blaze_ids::ContentId\n    environment: environment.clone(),\n})?;\n```\n\nand, per request, before expanding: `environment.pass(the_requests_env)?` (a\n`Vec<(OsString, OsString)>` of the variables passed through to proc macros; a non-UTF-8 one is\nan error naming it).\n\n`blaze_macro_wasm::flush()` now flushes only machine code and verdicts; expansions are in the\nCAS store, which the engine flushes as it does any other.\n\n> forwarded to codegen: `crates/blaze-engine/src/lib.rs` is codegen's.",
+  "state": "refused",
+  "created": "2026-10-30T00:52:12Z",
+  "updated": "2026-10-31T20:30:04Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/usercode-macros.md#1. `crates/blaze-engine`: install blaze-expand with the content store",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-macros.md:8"
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

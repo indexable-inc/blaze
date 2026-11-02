@@ -4,19 +4,28 @@
 //! Follows clippy's `clippy_lints/src/format_args.rs` (`check_useless_borrows_in_formatting`)
 //! at rust-lang/rust 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0).
 
-use rustc_hash::FxHashSet;
-use syntax::{AstNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use super::format::{self, Arg, Trait};
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "useless_borrows_in_formatting";
+const LINT: super::Implemented = super::Implemented::UselessBorrowsInFormatting;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, call: ast::MacroCall<'t>) {
     if !cx.on(LINT) {
         return;
     }
     let Some(format) = format::of(cx, call) else { return };
+    // Only a borrow written as an argument is peeled: one without asks for no type.
+    let borrowed = (0..format.arg_count).any(|index| {
+        format.arg(index).is_some_and(|it| matches!(it.peel_parens(), ast::Expr::RefExpr(_)))
+    });
+    if !borrowed {
+        return;
+    }
     let (Some(display), Some(debug), Some(sized)) = (
         cx.std_trait(&["core", "fmt", "Display"]),
         cx.std_trait(&["core", "fmt", "Debug"]),
@@ -24,23 +33,23 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
     ) else {
         return;
     };
-    // The same argument taken twice is one diagnostic, as rustc emits a diagnostic once.
-    let mut seen: FxHashSet<TextRange> = FxHashSet::default();
-    for placeholder in &format.placeholders {
+    // The same argument taken twice is one diagnostic, as rustc emits a diagnostic once. Few
+    // are found in one call, so the ones reported are kept in a list.
+    let mut seen: Vec<TextRange> = Vec::new();
+    for placeholder in format.placeholders() {
         let fmt_trait = match placeholder.format_trait {
             Trait::Display => display,
             Trait::Debug => debug,
             Trait::Other => continue,
         };
-        for arg in
-            [Some(&placeholder.arg), placeholder.width.as_ref(), placeholder.precision.as_ref()]
-        {
+        for arg in [Some(placeholder.arg), placeholder.width, placeholder.precision] {
             let Some(Arg::Index(index)) = arg else { continue };
-            let Some(expr) = format.args.get(*index) else { continue };
+            let Some(expr) = format.arg(index) else { continue };
             let Some((range, peeled, message)) = peel(cx, expr, fmt_trait, sized) else { continue };
-            if !seen.insert(range) {
+            if seen.contains(&range) {
                 continue;
             }
+            seen.push(range);
             let span = cx.span(range);
             cx.lint(
                 LINT,
@@ -55,22 +64,25 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
 
 /// Where `arg` is written, what it is with the borrows that change nothing peeled, and the
 /// help saying which.
-fn peel(
-    cx: &Cx<'_, '_, '_>,
-    arg: &ast::Expr,
+fn peel<'t>(
+    cx: &Cx<'_, 't>,
+    arg: ast::Expr<'t>,
     fmt_trait: hir::Trait,
     sized: hir::Trait,
-) -> Option<(TextRange, String, &'static str)> {
+) -> Option<(TextRange, &'t str, &'static str)> {
+    if !matches!(arg.peel_parens(), ast::Expr::RefExpr(_)) {
+        return None;
+    }
     let range = cx.original_range(arg.syntax())?;
     let db = cx.db();
     let mut only_mutable = true;
     let mut has_mutable = false;
-    let mut peeled = arg.clone();
+    let mut peeled = arg;
     // rustc's HIR has no parentheses: `&(x)` is a borrow of `x` written `(x)`.
-    while let ast::Expr::RefExpr(borrow) = strip_parens(&peeled)
+    while let ast::Expr::RefExpr(borrow) = peeled.peel_parens()
         && borrow.raw_token().is_none()
         && let Some(inner) = borrow.expr()
-        && let Some(ty) = cx.ty(&strip_parens(&inner))
+        && let Some(ty) = cx.ty(inner.peel_parens())
         && ty.impls_trait(db, sized, &[])
         && ty.impls_trait(db, fmt_trait, &[])
     {
@@ -93,12 +105,3 @@ fn peel(
     Some((range, peeled, message))
 }
 
-fn strip_parens(expr: &ast::Expr) -> ast::Expr {
-    let mut expr = expr.clone();
-    while let ast::Expr::ParenExpr(paren) = &expr
-        && let Some(inner) = paren.expr()
-    {
-        expr = inner;
-    }
-    expr
-}

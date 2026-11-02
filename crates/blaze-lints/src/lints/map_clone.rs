@@ -6,33 +6,31 @@
 //! `Clone::clone` as a path, passed or called in the closure.
 
 use hir::{Adjust, AsAssocItem as _, Mutability};
-use ide_db::famous_defs::FamousDefs;
-use syntax::{
-    AstNode,
-    ast::{self, HasArgList as _, HasGenericArgs as _, HasName as _},
-};
+use syntax::{TextRange, view as ast};
+
+use ast::{AstNode as _, HasArgList as _, HasGenericArgs as _, HasName as _};
 
 use super::utils;
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "map_clone";
+const LINT: super::Implemented = super::Implemented::MapClone;
 
-pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
-    if !cx.on(LINT) {
+pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
+    if !cx.on(LINT) || utils::method_name(expr) != Some("map") {
         return;
     }
-    let Some(call) = utils::method_call(cx, expr) else { return };
     let ast::Expr::MethodCallExpr(method) = expr else { return };
-    if call.name != "map" || call.args.len() != 1 || !should_run_lint(cx, method, &call.receiver) {
+    let Some(call) = utils::method_call(cx, expr) else { return };
+    let [ast::Expr::ClosureExpr(closure)] = *call.args() else { return };
+    if !should_run_lint(cx, method, call.receiver) {
         return;
     }
-    let ast::Expr::ClosureExpr(closure) = &call.args[0] else { return };
     let (Some(param), Some(body)) =
         (closure.param_list().and_then(|it| it.params().next()), closure.body())
     else {
         return;
     };
-    let body = utils::peel_blocks(&body);
+    let body = utils::peel_blocks(body);
     let (Some(range), Some(receiver)) = (cx.range(expr.syntax()), cx.range(call.receiver.syntax()))
     else {
         return;
@@ -40,18 +38,18 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     match param.pat() {
         Some(ast::Pat::RefPat(pat)) if pat.mut_token().is_none() => {
             if let Some(ast::Pat::IdentPat(inner)) = pat.pat()
-                && plain(&inner)
-                && names(&body, &inner)
+                && plain(inner)
+                && names(body, inner)
             {
                 lint_explicit_closure(cx, expr, range, receiver, true);
             }
         }
-        Some(ast::Pat::IdentPat(binding)) if plain(&binding) => match &body {
+        Some(ast::Pat::IdentPat(binding)) if plain(binding) => match body {
             ast::Expr::PrefixExpr(deref) if deref.op_kind() == Some(ast::UnaryOp::Deref) => {
                 if let Some(inner) = deref.expr()
-                    && names(&inner, &binding)
+                    && names(inner, binding)
                     && cx
-                        .ty(&inner)
+                        .ty(inner)
                         .and_then(|it| it.as_reference())
                         .is_some_and(|(_, m)| m == Mutability::Shared)
                 {
@@ -63,12 +61,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
                 let (Some(obj), Some(name)) = (clone.receiver(), clone.name_ref()) else { return };
                 if name.text() != "clone"
                     || clone.arg_list().is_some_and(|it| it.args().next().is_some())
-                    || !names(&obj, &binding)
+                    || !names(obj, binding)
                 {
                     return;
                 }
                 let clone_trait = cx.lang_trait(hir::LangItem::Clone);
-                let Some(function) = cx.sema().resolve_method_call(clone) else { return };
+                let Some(function) = cx.method(clone) else { return };
                 if clone_trait.is_none()
                     || function
                         .as_assoc_item(db)
@@ -77,11 +75,11 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
                 {
                     return;
                 }
-                let adjustments = cx.sema().expr_adjustments(&obj).unwrap_or_default();
+                let adjustments = cx.adjustments(obj).unwrap_or_default();
                 if adjustments.iter().any(|it| matches!(it.kind, Adjust::Deref(Some(_)))) {
                     return;
                 }
-                let Some(obj_ty) = cx.ty(&obj) else { return };
+                let Some(obj_ty) = cx.ty(obj) else { return };
                 match obj_ty.as_reference() {
                     Some((inner, Mutability::Shared)) => {
                         let copy = inner.is_copy(db);
@@ -89,7 +87,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
                     }
                     Some(_) => {}
                     None => {
-                        let span = cx.span(syntax::TextRange::new(receiver.end(), range.end()));
+                        let span = cx.span(TextRange::new(receiver.end(), range.end()));
                         cx.lint(
                             LINT,
                             expr.syntax(),
@@ -113,15 +111,15 @@ pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
 
 /// clippy's `should_run_lint`: `map` of `Iterator`, or of `Option` or `Result` not called on
 /// what `as_ref` gives, which `useless_asref` says better.
-fn should_run_lint(
-    cx: &Cx<'_, '_, '_>,
-    method: &ast::MethodCallExpr,
-    receiver: &ast::Expr,
+fn should_run_lint<'t>(
+    cx: &Cx<'_, 't>,
+    method: ast::MethodCallExpr<'t>,
+    receiver: ast::Expr<'t>,
 ) -> bool {
     let db = cx.db();
-    let Some(function) = cx.sema().resolve_method_call(method) else { return false };
+    let Some(function) = cx.method(method) else { return false };
     let Some(item) = function.as_assoc_item(db) else { return false };
-    let famous = FamousDefs(cx.sema(), cx.krate());
+    let famous = cx.famous();
     let iterator = famous.core_iter_Iterator();
     if iterator.is_some() && item.container_or_implemented_trait(db) == iterator {
         return true;
@@ -141,12 +139,12 @@ fn should_run_lint(
 }
 
 /// A binding by value, of nothing more: rustc's `BindingMode::NONE` with no subpattern.
-fn plain(pat: &ast::IdentPat) -> bool {
+fn plain(pat: ast::IdentPat<'_>) -> bool {
     pat.ref_token().is_none() && pat.mut_token().is_none() && pat.pat().is_none()
 }
 
 /// clippy's `ident_eq`: `expr` is a path of one segment, the binding's name.
-fn names(expr: &ast::Expr, binding: &ast::IdentPat) -> bool {
+fn names(expr: ast::Expr<'_>, binding: ast::IdentPat<'_>) -> bool {
     let ast::Expr::PathExpr(path) = expr else { return false };
     let Some(path) = path.path() else { return false };
     let (Some(segment), Some(name)) = (path.segment(), binding.name()) else { return false };
@@ -155,11 +153,11 @@ fn names(expr: &ast::Expr, binding: &ast::IdentPat) -> bool {
         && segment.name_ref().is_some_and(|it| it.text() == name.text())
 }
 
-fn lint_explicit_closure(
-    cx: &mut Cx<'_, '_, '_>,
-    expr: &ast::Expr,
-    range: syntax::TextRange,
-    receiver: syntax::TextRange,
+fn lint_explicit_closure<'t>(
+    cx: &mut Cx<'_, 't>,
+    expr: ast::Expr<'t>,
+    range: TextRange,
+    receiver: TextRange,
     is_copy: bool,
 ) {
     let (message, method) = if is_copy && cx.conf().meets(msrvs::ITERATOR_COPIED) {

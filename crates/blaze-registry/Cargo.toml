@@ -15,31 +15,35 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-blaze-resolve = { path = "../blaze-resolve" }
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-resolve.workspace = true
 blaze-source.workspace = true
-rustc-hash.workspace = true
+# The index's lines and `[source]` replacement, read as the load reads them.
+blaze-units.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
 semver = { workspace = true, features = ["serde"] }
 url.workspace = true
-percent-encoding = "2"
-# The parser cargo 1.99 parses a dependency's `target` with: the same crate and version.
-cargo-platform = "0.3.3"
-sha2 = "0.10"
-flate2 = "1"
-tar = { version = "0.4.46", default-features = false }
-filetime = "0.2.29"
-blaze-store.workspace = true
+percent-encoding.workspace = true
+blaze-sha256.workspace = true
+flate2 = { workspace = true, features = ["default"] }
+tar.workspace = true
+filetime.workspace = true
+# Where `.crate` files are kept, by their sha256.
+blaze-cas.workspace = true
+blaze-ids.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true
 # The HTTP stack the rest of blaze uses (crates/blaze-engine/Cargo.toml): hyper 1 over rustls with ring.
-hyper = { version = "1", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
-http-body-util = "0.1"
-tokio = { version = "1.47", features = ["rt-multi-thread", "sync", "time"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { workspace = true, features = ["http1", "native-tokio", "ring", "tls12"] }
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -1,0 +1,94 @@
+; Follows cranelift/filetests/filetests/runtests/ctz.clif, for the stencil set: `ctz` of
+; `i8` to `i64`, 0 giving the width. The `i128` form is i128-bitops.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %ctz_i8(i8) -> i8 {
+block0(v0: i8):
+    v1 = ctz v0
+    return v1
+}
+; run: %ctz_i8(0) == 8
+; run: %ctz_i8(1) == 0
+; run: %ctz_i8(-1) == 0
+; run: %ctz_i8(-128) == 7
+; run: %ctz_i8(127) == 0
+; run: %ctz_i8(-127) == 0
+; run: %ctz_i8(126) == 1
+; run: %ctz_i8(2) == 1
+; run: %ctz_i8(100) == 2
+; run: %ctz_i8(-77) == 0
+; run: %ctz_i8(8) == 3
+; run: %ctz_i8(16) == 4
+; run: %ctz_i8(64) == 6
+; run: %ctz_i8(15) == 0
+; run: %ctz_i8(-16) == 4
+; run: %ctz_i8(120) == 3
+
+function %ctz_i16(i16) -> i16 {
+block0(v0: i16):
+    v1 = ctz v0
+    return v1
+}
+; run: %ctz_i16(0) == 16
+; run: %ctz_i16(1) == 0
+; run: %ctz_i16(-1) == 0
+; run: %ctz_i16(0x8000) == 15
+; run: %ctz_i16(0x7fff) == 0
+; run: %ctz_i16(0x8001) == 0
+; run: %ctz_i16(0x7ffe) == 1
+; run: %ctz_i16(2) == 1
+; run: %ctz_i16(0x3039) == 0
+; run: %ctz_i16(0xa460) == 5
+; run: %ctz_i16(128) == 7
+; run: %ctz_i16(256) == 8
+; run: %ctz_i16(0x4000) == 14
+; run: %ctz_i16(255) == 0
+; run: %ctz_i16(-256) == 8
+; run: %ctz_i16(0x5678) == 3
+
+function %ctz_i32(i32) -> i32 {
+block0(v0: i32):
+    v1 = ctz v0
+    return v1
+}
+; run: %ctz_i32(0) == 32
+; run: %ctz_i32(1) == 0
+; run: %ctz_i32(-1) == 0
+; run: %ctz_i32(0x80000000) == 31
+; run: %ctz_i32(0x7fffffff) == 0
+; run: %ctz_i32(0x80000001) == 0
+; run: %ctz_i32(0x7ffffffe) == 1
+; run: %ctz_i32(2) == 1
+; run: %ctz_i32(0x075bcd15) == 0
+; run: %ctz_i32(0xc521974f) == 0
+; run: %ctz_i32(0x00008000) == 15
+; run: %ctz_i32(0x00010000) == 16
+; run: %ctz_i32(0x40000000) == 30
+; run: %ctz_i32(0x0000ffff) == 0
+; run: %ctz_i32(0xffff0000) == 16
+; run: %ctz_i32(0x12345678) == 3
+
+function %ctz_i64(i64) -> i64 {
+block0(v0: i64):
+    v1 = ctz v0
+    return v1
+}
+; run: %ctz_i64(0) == 64
+; run: %ctz_i64(1) == 0
+; run: %ctz_i64(-1) == 0
+; run: %ctz_i64(0x8000000000000000) == 63
+; run: %ctz_i64(0x7fffffffffffffff) == 0
+; run: %ctz_i64(0x8000000000000001) == 0
+; run: %ctz_i64(0x7ffffffffffffffe) == 1
+; run: %ctz_i64(2) == 1
+; run: %ctz_i64(0x123456789abcdef0) == 4
+; run: %ctz_i64(0xf0123456789abcdf) == 0
+; run: %ctz_i64(0x0000000080000000) == 31
+; run: %ctz_i64(0x0000000100000000) == 32
+; run: %ctz_i64(0x4000000000000000) == 62
+; run: %ctz_i64(0x00000000ffffffff) == 0
+; run: %ctz_i64(0xffffffff00000000) == 32
+; run: %ctz_i64(0x1234567812345678) == 3

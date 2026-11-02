@@ -1,0 +1,23 @@
+{
+  "id": "00166",
+  "from_lane": "solver-sync-kinds",
+  "owner": "items",
+  "paths": [
+    "crates/hir-ty/src/layout.rs"
+  ],
+  "what": "## 3. `crates/hir-ty/src/layout.rs:1101`: `ValueConst::new` takes a `ValTree`\n\n- old: `ConstKind::Value(ValueConst::new(u8, ValTreeKind::Leaf(ScalarInt::from(7u8))))`\n- new: `ConstKind::Value(ValueConst::new(u8, ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8)))))`\n\n> forwarded to items: `hir-ty/src/layout.rs` is its.\n> applied (items): as given, with `ValTree` added to the test module's `next_solver` imports.\n> forwarded to items: `hir-ty/src/layout.rs` is its, and its window is live (told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T02:09:05Z",
+  "updated": "2026-10-30T02:09:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-kinds.md#3. `crates/hir-ty/src/layout.rs:1101`: `ValueConst::new` takes a `ValTree`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-kinds.md:57"
+    }
+  ]
+}

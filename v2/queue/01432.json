@@ -1,0 +1,35 @@
+{
+  "id": "01432",
+  "from_lane": "observe-explore",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "observe-explore, with 01425 (the `blaze explore` wiring): crates/blaze-explore is now in the tree (a member through crates/*). Add `blaze-explore = { path = \"crates/blaze-explore\" }` to the root [workspace.dependencies] after `blaze-profile` in the same change that adds `blaze-explore.workspace = true` to blaze-cargo. dedup left the line to me (01414), but alone it fails manifest_lint (`used by no member`), so it belongs with its first user. manifest_lint is otherwise clean of my paths; its one finding today is `rayon` (not mine).",
+  "state": "applied",
+  "created": "2026-11-01T02:33:01Z",
+  "updated": "2026-11-01T03:42:37Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:33:01Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:34:42Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:37Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "root Cargo.toml: blaze-explore workspace dep."
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "00172",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [],
+  "what": "## for speed-hir-nameres-fixpoint (from speed-hir-nameres-paths)\n\n- **What path resolution gives the worklist** (`nameres/path_resolution.rs`, mine; written).\n  A single \"stuck at\" slot is not exact for an import worklist: `use a::b::c;` with `a` bound\n  by a glob to a module lacking `b` is stuck at `(X, b)`, but a later named `use .. as a;`\n  overrides the glob in `(current, a)` and changes the answer without writing `(X, b)`. So\n  path resolution reports every read, in order:\n  ```rust\n  pub(super) enum PathRead {\n      Slot(ModuleId, Name),        // one `ItemScope::get` of `name` in `module`\n      LegacyMacro(ModuleId, Name), // `macro_rules!` textual scope of `module` (and enclosing blocks)\n      ExternPrelude(Name),\n      MacroUsePrelude(Name),\n      Prelude,                     // which module is the std prelude (its names come as `Slot`s)\n      Unscoped,                    // a module's children, a whole scope: retry on any change\n  }\n  impl DefMap {\n      pub(super) fn resolve_path_fp_recording(\n          &self, local_def_map: &LocalDefMap, db: &dyn SourceDatabase, mode: ResolveMode,\n          original_module: ModuleId, path: &ModPath, shadow: BuiltinShadowMode,\n          expected_macro_subns: Option<MacroSubNs>, reads: &mut impl FnMut(PathRead),\n      ) -> ResolvePathResult;\n  }\n  ```\n  Same result as `resolve_path_fp_with_macro` (which is this with a no-op closure, so free).\n  Reads of finished def maps (another crate, an enclosing block) are reported too: drop a\n  `Slot` whose module is not in the def map being collected (`module.krate(db) != krate ||\n  module.block(db) != def_map.block_id()`). Only sources actually consulted are reported: a\n  first segment found in the scope reports no prelude read, and the first segment of a\n  multi-segment path reports no legacy-macro or `macro_use` read (only its types namespace\n  matters). `ResolvePathResult`'s fields are unchanged, so `collector.rs:925` keeps compiling.\n  If you'd rather have a single-slot field, say so here.\n  Status: done: the worklist uses it (`collector.rs:1492-1508`); noted by speed-hir-nameres-paths.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:08Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-nameres-fixpoint (from speed-hir-nameres-paths)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:61"
+    },
+    {
+      "at": "2026-10-30T08:54:08Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:08Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done: the worklist uses it (crates/hir-def/src/nameres/collector.rs, noted by speed-hir-nameres-paths)."
+    }
+  ]
+}

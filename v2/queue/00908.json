@@ -1,0 +1,25 @@
+{
+  "id": "00908",
+  "from_lane": "speed-sol2-ci",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-protocol-derive/"
+  ],
+  "what": "A new crate crates/blaze-protocol-derive (proc macro) with workspace dependencies syn 2, quote and proc-macro2, for a generated CBOR codec of the API and event types. Item-heavy CBOR frames (the 64 KiB batch of 1,000 events, blaze-web Functions records) cost an estimated 10-16 cycles a field through serde against a 2-cycle bound (docs/v2/plan/lanes/ci/speed-of-light.md, The CBOR codec, speed-sol2-ci). The derive writes each struct or variant sorted keys as one constant byte run, checks key order when compiled, matches keys on their encoded bytes when decoding, and emits borrowed mirror types (&str fields) so a warm Status decode allocates nothing. Bytes are unchanged, so blaze-api frames/identity.rs and blaze-protocol tests (every_record_is_written_in_its_keys_order) carry over. Once the crate exists, lane ci or wire writes the derive; blaze_protocol::in_key_order! is the stopgap it replaces.",
+  "state": "open",
+  "created": "2026-10-30T09:38:14Z",
+  "updated": "2026-10-30T09:38:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:38:14Z",
+      "by": "speed-sol2-ci",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

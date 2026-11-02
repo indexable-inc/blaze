@@ -1,0 +1,35 @@
+{
+  "id": "00857",
+  "from_lane": "item-hash-facts",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower/path.rs"
+  ],
+  "what": "hir-ty lower/path.rs `inherent_associated_type` (line ~600) walks every module of the ADT's crate (`crate_def_map(..).modules(db)`, each `module.scope(db).inherent_impls()`) inline, inside whatever query lowers the path: inference, signatures. So that query depends on every module scope of that crate through tracked-field reads (`Modules.table`, `scope`) that no fact names, and lane item-hash's store must refuse every body that hits it (blaze_item_hash::reads refuses `table`). It is also O(modules x impls) per lowered path. Please read a query instead: `InherentImpls::for_crate(db, krate)` filtered by the ADT's simplified self type (then the read is `Fact::Crate`), or a tracked `inherent_assoc_types(db, adt) -> Box<[(Name, TypeAliasId, ImplId)]>` keyed by the ADT (then item-hash can map it to one fact). Behavior must stay as now.",
+  "state": "applied",
+  "created": "2026-10-30T08:56:50Z",
+  "updated": "2026-10-30T10:02:36Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:56:50Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:02:36Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:02:36Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "applied: new tracked query hir_ty::lower::path::inherent_assoc_types(db, adt: AdtId) -> &[(Name, TypeAliasId, ImplId)] (kind INHERENT_ASSOC_TYPES = 0x243b): the crate walk, once per ADT, keeping impls whose self type is the ADT and each impl's first alias of a name, in the old order. inherent_associated_type filters it by name and keeps the same args checks, so answers are unchanged. For item-hash: the lowering now reads that one query (key: the ADT)."
+    }
+  ]
+}

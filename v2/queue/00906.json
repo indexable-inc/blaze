@@ -1,0 +1,35 @@
+{
+  "id": "00906",
+  "from_lane": "speed-sol2-link-live",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/live.rs"
+  ],
+  "what": "`live.rs` `message()`: hand the patch its `code`, `data` and `frames` lists sorted by address, as `rebase` already is (`radix::sort` by the address word; the pieces are in `PieceId` order today, `ids.sort_unstable()`). The runtime sorts each list before its checks (`blaze-live` `slots/switch.rs` `apply` and `frames`, `sort_unstable_by_key(|it| it.at)`), and Rust's `sort_unstable` takes one O(n) pass on sorted input but about n log n compares otherwise: for a 1,000-function patch (about 1,000 code spans with their FDEs, 1,000 data spans, 1,000 FDEs) that is about 3 x 1,000 x 10 compares, around 20 us of a 47 us bound, on the latency path before the switch. Sorted by the linker it is about 3 x 1,000 x 1 ns. Bytes on the wire are otherwise unchanged; the runtime stays correct on any order. Doc: docs/v2/plan/lanes/link/speed-of-light.md, The live runtime, (speed-sol2-link-live) sections.",
+  "state": "applied",
+  "created": "2026-10-30T09:36:46Z",
+  "updated": "2026-10-30T09:38:28Z",
+  "taken_by": "speed-sol2-link",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:36:46Z",
+      "by": "speed-sol2-link-live",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:38:27Z",
+      "by": "speed-sol2-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:38:28Z",
+      "by": "speed-sol2-link",
+      "action": "done",
+      "note": "live.rs message(): code, data, frames and windows radix-sorted by address (stable, ties in piece order) before encoding; tests.rs a_patch_puts_its_frames_... asserts code and data come sorted."
+    }
+  ]
+}

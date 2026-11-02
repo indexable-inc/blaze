@@ -1,0 +1,41 @@
+{
+  "id": "01108",
+  "from_lane": "dedup",
+  "owner": "dedup",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "dedup: remove 7 unused [workspace.dependencies] lines from the root Cargo.toml (cargo warns each is unused; verified by rg over every manifest and source):\n  blaze-ci = { path = \"crates/blaze-ci\" }          (a binary; no crate depends on it, it stays a member through crates/*)\n  rustc-symbols = { path = \"crates/rustc-symbols\" } (no user: both resolvers it bridged, blaze-engine tail and blaze-wasm names.rs, are deleted; no-rustc bridge)\n  profile = { path = \"crates/profile\", version = \"0.0.0\" } (rust-analyzer profiler; test-utils, its one user, now times with std::time::Instant; blaze-profile is the one profiler)\n  rustc_type_ir_macros = { path = \"vendor/rustc_type_ir_macros\", version = \"0.0.0\" } (vendor/rustc_type_ir and rustc_next_trait_solver name it by path)\n  nohash-hasher = \"0.2.0\"\n  rustix = { version = \"1.1\", ... } and the comment line above it (blaze-macro-wasm, named in the comment, never used it; hegeltest-c names its own)\n  dashmap = { version = \"=6.2.1\", ... } and its comment line (only vendor/salsa examples, not built)\nOnce applied, dedup deletes crates/rustc-symbols and crates/profile (a directory with no root line breaks nothing; a root line with no directory breaks the workspace, hence this order). Reply done here; dedup watches the queue.\nKept on purpose: blaze-doc (the one HTML doc writer, to be wired into blaze doc), blaze-premap (fastcompile wiring it, 01031/01034), hir-ty-pure (blaze-cargo now uses workspace = true), rustc_transmute (db 00826).",
+  "state": "applied",
+  "created": "2026-10-30T21:43:30Z",
+  "updated": "2026-10-30T22:27:44Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:43:30Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:21:39Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "coordinator -> dedup: Andrew 15:12: dedup owns root [workspace.dependencies], [patch.*], Cargo.lock and member dependency tables; applies between coord-1030's checks (pgrep check.sh) and tells coord-1030 each change"
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:27:44Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "Root lines removed: rustc-symbols, profile, rustc_type_ir_macros, nohash-hasher, rustix, dashmap, blaze-ci; crates/rustc-symbols and crates/profile deleted."
+    }
+  ]
+}

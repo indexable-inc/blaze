@@ -1,0 +1,21 @@
+{
+  "id": "00156",
+  "from_lane": "diagnostics-items-ast",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-items-ast: no second E0197 or E0449 or \"at least one trait\"\n\nWhat:\n\n- `lower/trait_impl_incorrect_safety.rs` gives nothing for an inherent impl: hir's\n  `TraitImplIncorrectSafety` with `should_be_safe` fires for `unsafe impl Foo {}` too\n  (`hir/src/diagnostics.rs`), and rustc's error there is the parser's E0197 \"inherent impls\n  cannot be unsafe\", which `items::impl_` gives.\n- `lower/parse.rs` gives nothing for the `syntax` crate's validation errors \"Unnecessary\n  visibility qualifier\" (`syntax/src/validation.rs` line 314) and \"At least one trait is\n  required for an object type\" (lines 422 and 435), if it lowers them at all: E0449 is\n  `items::visibility`'s, \"at least one trait must be specified\" `types::impl_trait`'s.\n\nWhy: no error twice.\n\n> for: diagnostics-items (owners of `lower/`).\n> forwarded to diagnostics: between its own children.",
+  "state": "open",
+  "created": "2026-10-30T01:52:14Z",
+  "updated": "2026-10-30T01:52:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-items-ast.md#diagnostics-items-ast: no second E0197 or E0449 or \"at least one trait\"",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-items-ast.md:61"
+    }
+  ]
+}

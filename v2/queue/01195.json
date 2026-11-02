@@ -1,0 +1,29 @@
+{
+  "id": "01195",
+  "from_lane": "no-fallback-front",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-wasm/src/lib.rs"
+  ],
+  "what": "blaze-wasm project() (crates/blaze-wasm/src/lib.rs:294-311): the no-std-uses-core fallback is gone (hir-def inject_prelude now reports E0463 can-not-find-crate-for-std and gives no prelude). The playground graph is app + core with no std, so mark them as rustc needs: give the add closure a 4th arg attrs: Vec<String> passed as add_crate_root crate_attrs (now Vec::new()); core gets vec![\"no_core\".to_owned()], app gets vec![\"no_std\".to_owned()]. Without it the app loses its core prelude.",
+  "state": "applied",
+  "created": "2026-10-31T00:27:31Z",
+  "updated": "2026-10-31T14:15:55Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:27:31Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:15:55Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "blaze-wasm project(): the add closure takes the crate attributes; the app gets no_std. core gets none: the page gives real core sources, whose lib.rs says #![no_core] itself, so a crate attribute would be one rustc never sees. Uncompiled (ra has no blaze-wasm crate loaded); round 8 checks it with 01230/01233."
+    }
+  ]
+}

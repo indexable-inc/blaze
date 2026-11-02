@@ -1,4 +1,4 @@
-use base_db::all_crates;
+use base_db::{Db, all_crates};
 use expect_test::expect;
 
 use itertools::Itertools;
@@ -1035,6 +1035,32 @@ b! { static = #[] ();}
     );
 }
 
+/// An item-position call past `recursion_limit` is reported (rustc's "recursion limit reached
+/// while expanding"), never dropped in silence.
+#[test]
+fn macro_expansion_overflow_is_reported() {
+    compute_crate_def_map(
+        r#"
+#![recursion_limit = "8"]
+macro_rules! m { () => { m!(); }; }
+m!();
+"#,
+        |db, def_map| {
+            let overflows: Vec<String> = (def_map.diagnostics(db).iter())
+                .filter_map(|it| match &it.kind {
+                    crate::nameres::diagnostics::DefDiagnosticKind::MacroError {
+                        path,
+                        err: hir_expand::ExpandErrorKind::RecursionOverflow,
+                        ..
+                    } => Some(path.display(db, Edition::CURRENT).to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(overflows, ["m"]);
+        },
+    );
+}
+
 #[test]
 fn macros_defining_macros() {
     check(
@@ -1142,7 +1168,7 @@ macro_rules! mbe {
 
 #[test]
 fn collects_derive_helpers() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #![crate_type="proc-macro"]
 struct TokenStream;
@@ -1152,7 +1178,8 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
     TokenStream
 }
 "#,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
@@ -1571,7 +1598,7 @@ pub struct Url {}
 
 #[test]
 fn macro_use_imports_all_macro_types() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main deps:lib
 #[macro_use]
@@ -1593,7 +1620,8 @@ struct TokenStream;
 #[proc_macro_attribute]
 fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
     "#,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
@@ -1898,14 +1926,8 @@ struct HugeExpander;
 impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
     fn expand(
         &self,
-        _: &dyn base_db::SourceDatabase,
-        _: &crate::tt::TopSubtree,
-        _: Option<&crate::tt::TopSubtree>,
-        _: &base_db::Env,
-        _: span::Span,
-        call_site: span::Span,
-        _: span::Span,
-        _: String,
+        _: &Db,
+        hir_expand::proc_macro::ProcMacroCall { call_site, .. }: hir_expand::proc_macro::ProcMacroCall<'_>,
     ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
         let text = format!(
             "macro_rules! ignore {{ ($($t:tt)*) => {{}}; }} ignore! {{ {} }} pub struct Big;",
@@ -1915,6 +1937,7 @@ impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
             .unwrap())
     }
 
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
     fn eq_dyn(&self, other: &dyn hir_expand::proc_macro::ProcMacroExpander) -> bool {
         other.type_id() == std::any::TypeId::of::<Self>()
     }
@@ -1937,7 +1960,7 @@ pub fn huge(_attr: TokenStream, _item: TokenStream) -> TokenStream {
             disabled: false,
         },
     )];
-    let db = TestDB::with_files_extra_proc_macros(
+    let db = fixture::db_with_proc_macros(
         r#"
 //- proc_macros: huge
 //- /main.rs crate:main
@@ -1945,7 +1968,8 @@ pub fn huge(_attr: TokenStream, _item: TokenStream) -> TokenStream {
 extern "C" {}
 "#,
         proc_macros,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db)
         .iter()
         .find(|krate| {

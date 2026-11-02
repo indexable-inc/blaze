@@ -1,28 +1,38 @@
+mod backdate;
 mod globs;
 mod imports;
 mod incremental;
 mod macros;
 mod mod_resolution;
+mod paths;
+mod prelude;
+mod primitive_shadow;
+mod stale_ids;
+mod trait_imports;
+mod uses;
+mod worklist;
+mod batch_order;
+mod views;
 
 use expect_test::{Expect, expect};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     nameres::{DefMap, crate_def_map},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 fn compute_crate_def_map(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     cb: impl FnOnce(&TestDB, &DefMap),
 ) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     cb(&db, crate_def_map(&db, krate));
 }
 
 fn render_crate_def_map(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     crate_def_map(&db, krate).dump(&db)
 }
@@ -78,6 +88,52 @@ extern {
             - ext : value
         "#]],
     );
+}
+
+#[test]
+fn blaze_reassociate_is_an_inert_attribute_and_blaze_no_tool() {
+    use hir_expand::{
+        mod_path::{ModPath, PathKind},
+        name::Name,
+    };
+
+    compute_crate_def_map("//- /lib.rs\n#[blaze::reassociate]\nfn f() {}\n", |db, def_map| {
+        let path = |segments: &[&str]| {
+            ModPath::from_segments(PathKind::Plain, segments.iter().map(|it| Name::new_root(it)))
+        };
+        assert!(def_map.is_builtin_or_registered_attr(&path(&["blaze", "reassociate"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["blaze", "cache"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["blaze"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["other", "reassociate"])));
+        assert!(def_map.diagnostics(db).is_empty(), "{:?}", def_map.diagnostics(db));
+    });
+}
+
+/// rustc's `builtin_attrs.rs` at the pinned nightly lists `sanitize` (feature `sanitize`) and
+/// not `no_sanitize`, which it removed in 1.91.
+#[test]
+fn sanitize_is_a_builtin_attribute_and_no_sanitize_is_not() {
+    use hir_expand::{
+        mod_path::{ModPath, PathKind},
+        name::Name,
+    };
+
+    let fixture = r#"
+//- /lib.rs
+#![feature(sanitize)]
+#[sanitize(address = "off", thread = "off")]
+fn f() {}
+#[sanitize(realtime = "nonblocking")]
+mod m {}
+"#;
+    compute_crate_def_map(fixture, |db, def_map| {
+        let path = |segments: &[&str]| {
+            ModPath::from_segments(PathKind::Plain, segments.iter().map(|it| Name::new_root(it)))
+        };
+        assert!(def_map.is_builtin_or_registered_attr(&path(&["sanitize"])));
+        assert!(!def_map.is_builtin_or_registered_attr(&path(&["no_sanitize"])));
+        assert!(def_map.diagnostics(db).is_empty(), "{:?}", def_map.diagnostics(db));
+    });
 }
 
 #[test]
@@ -719,8 +775,8 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
-            - _ : type
+            - _ : type (import)
+            - _ : type (import)
             - tr : type
 
             crate::tr
@@ -747,13 +803,13 @@ use crate::reex::*;
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (glob)
             - reex : type
             - tr : type
 
             crate::reex
-            - _ : type
-            - _ : type
+            - _ : type (import)
+            - _ : type (import)
 
             crate::tr
             - PrivTr : type
@@ -780,7 +836,7 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (glob)
         "#]],
     );
 }
@@ -824,7 +880,7 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (import)
             - Tr : type value
             - tr : type
 
@@ -855,8 +911,8 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
-    use base_db::{SourceDatabase as _, salsa::Setter as _};
-    let mut db = TestDB::with_files(
+    use blaze_query::db::Durability;
+    let mut db = fixture::db(
         r#"
 //- /main.rs
 #![cfg(never)]
@@ -866,7 +922,8 @@ mod __blaze_test_harness {
     pub fn main() {}
 }
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     let root = krate.root_file_id(&db).file_id(&db);
     // The same module written only in source follows the crate's cfg.
@@ -874,7 +931,7 @@ mod __blaze_test_harness {
         crate
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.file_text(root).set_appended_root_module(&mut db).to(Some("__blaze_test_harness"));
+    db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW);
     expect![[r#"
         crate
         - __blaze_test_harness : type
@@ -883,7 +940,7 @@ mod __blaze_test_harness {
         - main : value
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.file_text(root).set_appended_root_module(&mut db).to(None);
+    db.set_appended_root_module(root, None, Durability::LOW);
     expect![[r#"
         crate
     "#]]
@@ -1016,4 +1073,133 @@ use some_module::unknown_func;
             - unknown_func : value
         "#]],
     )
+}
+
+#[test]
+fn diagnostics_of_a_module_are_its_own_in_push_order() {
+    compute_crate_def_map(
+        r#"
+//- /lib.rs
+mod a;
+mod b;
+mod c;
+use missing::one;
+use a::missing_two;
+//- /a.rs
+use missing::three;
+use crate::missing_four;
+//- /b.rs
+use missing::five;
+//- /c.rs
+"#,
+        |db, def_map| {
+            let mut seen = 0;
+            let mut with_any = 0;
+            for (module, _) in def_map.modules(db) {
+                let filtered: Vec<_> =
+                    def_map.diagnostics(db).iter().filter(|it| it.in_module == module).collect();
+                let of: Vec<_> = def_map.diagnostics_of(db, module).collect();
+                assert_eq!(of, filtered);
+                seen += of.len();
+                with_any += usize::from(!of.is_empty());
+            }
+            assert_eq!(seen, def_map.diagnostics(db).len());
+            assert_eq!(with_any, 3);
+        },
+    );
+}
+
+#[test]
+fn impls_keep_their_order_and_their_reservation_bit() {
+    use crate::{
+        ImplId, Lookup,
+        attrs::AttrFlags,
+        nameres::frozen::{self, Frozen, Mode},
+        src::HasSource,
+    };
+    use syntax::view::AstNode;
+
+    let mut db = fixture::db(
+        r#"
+trait Tr {}
+struct A;
+struct B;
+struct C;
+struct D;
+impl Tr for A {}
+#[rustc_reservation_impl = "reserved"]
+impl Tr for B {}
+impl B {}
+#[cfg_attr(all(), rustc_reservation_impl = "reserved by cfg_attr")]
+impl Tr for C {}
+#[cfg_attr(any(), rustc_reservation_impl = "not reserved")]
+impl Tr for D {}
+"#,
+    )
+    .into_db();
+    let krate = db.fetch_test_crate();
+    {
+        let def_map = crate_def_map(&db, krate);
+        let scope = def_map.module(&db, def_map.root).scope(&db);
+        let start =
+            |it: ImplId| it.lookup(&db).source_view(&db).value.syntax().text_range().start();
+        let impls: Vec<ImplId> = scope.impls().collect();
+        assert_eq!(impls.len(), 5);
+        assert!(impls.windows(2).all(|it| start(it[0]) < start(it[1])), "declaration order");
+
+        let reserved = |it: &ImplId| {
+            AttrFlags::query(&db, (*it).into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL)
+        };
+        let trait_impls: Vec<ImplId> = scope.trait_impls().collect();
+        let expected: Vec<ImplId> =
+            trait_impls.iter().filter(|it| !reserved(it)).copied().collect();
+        assert_eq!(trait_impls.len(), 4);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(scope.trait_impls_without_reservation().collect::<Vec<_>>(), expected);
+        assert_eq!(scope.inherent_impls().count(), 1);
+    }
+
+    let bytes = frozen::encode(&db, krate).unwrap();
+    let frozen = Frozen { bytes: bytes.into(), mode: Mode::Verify };
+    frozen::set(&mut db, [(krate, frozen)].into_iter().collect());
+    let def_map = crate_def_map(&db, krate);
+    let scope = def_map.module(&db, def_map.root).scope(&db);
+    assert_eq!(scope.trait_impls_without_reservation().count(), 2);
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+#[test]
+fn an_adts_variants_are_itself_or_its_enums_in_order() {
+    use hir_expand::name::Name;
+    use intern::Symbol;
+
+    use crate::{AdtId, ModuleDefId, VariantId};
+
+    let name = |s: &str| Name::new_symbol_root(Symbol::intern(s));
+    compute_crate_def_map(
+        r#"
+struct S;
+union U { a: u8 }
+enum E { A, B(u8), C {} }
+enum Empty {}
+"#,
+        |db, def_map| {
+            let scope = def_map.module(db, def_map.root).scope(db);
+            let adt = |s: &str| match scope.get(&name(s)).take_types() {
+                Some(ModuleDefId::AdtId(it)) => it,
+                it => panic!("`{s}` is not an adt: {it:?}"),
+            };
+            let variants = |s: &str| adt(s).variants(db).collect::<Vec<_>>();
+
+            let AdtId::StructId(s) = adt("S") else { panic!("`S` is a struct") };
+            assert_eq!(variants("S"), [VariantId::StructId(s)]);
+            let AdtId::UnionId(u) = adt("U") else { panic!("`U` is a union") };
+            assert_eq!(variants("U"), [VariantId::UnionId(u)]);
+            let AdtId::EnumId(e) = adt("E") else { panic!("`E` is an enum") };
+            let declared = &e.enum_variants(db).variants;
+            let of = |s: &str| VariantId::EnumVariantId(declared[&name(s)].0);
+            assert_eq!(variants("E"), [of("A"), of("B"), of("C")]);
+            assert_eq!(variants("Empty"), Vec::<VariantId>::new());
+        },
+    );
 }

@@ -1,0 +1,23 @@
+{
+  "id": "01237",
+  "from_lane": "integrate-engine",
+  "owner": "coordinator",
+  "paths": [
+    "/Volumes/Projects/.coord-1030/ra/ra.py"
+  ],
+  "what": "ra.py (from integrate-engine): two things seen 19:35-19:55. (1) `diag` with a crate dir whose sources are not under src/ (crates/hir-ty-codegen keeps mod.rs, lib path set in Cargo.toml) raises FileNotFoundError .../hir-ty-codegen/src in the handler; the client then gets an empty reply, with no `ra:` line and exit 0, which reads as clean. Suggest: expand dirs by globbing *.rs, and have the client exit nonzero on an empty reply. (2) The main.sock server restarted at least 3 times in 20 minutes (19:38, 19:52, 19:58). Each restart drops queries in flight, again as empty replies, and costs ~3 min of indexing. A first query of hir-ty-codegen takes ~6 min. My round-2 files (hir-ty-codegen backend, debuginfo, fncache, fragment, home, mod, stable, type_id, unwind, unwind/seh) have one clean result (sve.rs: 0 errors); the rest are queued.",
+  "state": "open",
+  "created": "2026-10-31T02:51:45Z",
+  "updated": "2026-10-31T02:51:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:51:45Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

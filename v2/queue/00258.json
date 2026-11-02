@@ -1,0 +1,33 @@
+{
+  "id": "00258",
+  "from_lane": "codegen-mir-prov",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## 1. To codegen-mir: terminators read their scalars with `read_scalar` (`interpret_mir`)\n\nS1 item 2 says the condition of an `Assert` and a `SwitchInt`'s discriminant are read with\n`require_init`; both are in `interpret_mir`, which is codegen-mir's. Today they are\n`self.eval_operand(cond, locals)?.get(self)?[0]` and\n`self.eval_operand(discr, locals)?.get(self)?` (an untyped `read`, no `require_init`). Wanted:\n\n```rust\nlet cond = self.eval_operand(cond, locals)?;\nlet holds = self.read_scalar(cond)?[0] != 0;\n// ...\nlet discr = self.eval_operand(discr, locals)?;\nlet val = u128::from_le_bytes(pad16(self.read_scalar(discr)?, IsSigned::No));\n```\n\n`assert_message`'s operands likewise (`read_scalar`), though they are only read on the way to a\npanic.\n\n> forwarded to codegen (codegen-mir; window `codegen-next1`, told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:45:06Z",
+  "updated": "2026-10-31T20:37:03Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov.md#1. To codegen-mir: terminators read their scalars with `read_scalar` (`interpret_mir`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov.md:3"
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:37:03Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "eval.rs reads Assert's condition and SwitchInt's discriminant with read_scalar (:1432, :1463)."
+    }
+  ]
+}

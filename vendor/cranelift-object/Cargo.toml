@@ -1,10 +1,10 @@
-# cranelift-object 0.136.2 from crates.io, patched for blaze: see SOURCE.md.
+# cranelift-object 0.137.1 from crates.io, patched for blaze: see SOURCE.md.
 
 [package]
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 name = "cranelift-object"
-version = "0.136.2"
+version = "0.137.1"
 authors = ["The Cranelift Project Developers"]
 build = false
 autolib = false
@@ -35,7 +35,7 @@ version = "1.0.103"
 default-features = false
 
 [dependencies.cranelift-codegen]
-version = "0.136.2"
+version = "0.137.1"
 features = [
     "unwind",
     "std",
@@ -43,11 +43,11 @@ features = [
 default-features = false
 
 [dependencies.cranelift-control]
-version = "0.136.2"
+version = "0.137.1"
 default-features = false
 
 [dependencies.cranelift-module]
-version = "0.136.2"
+version = "0.137.1"
 
 [dependencies.gimli]
 version = "0.33.0"

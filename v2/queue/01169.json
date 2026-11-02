@@ -1,0 +1,41 @@
+{
+  "id": "01169",
+  "from_lane": "no-fallback-link-cargo",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-vfs/src/image.rs"
+  ],
+  "what": "no-fallback (AGENTS.md rule 3): crates/blaze-vfs/src/image.rs `open_disks` returns `Result<Disks, String>` and `ImageUse::{Used,Resumed}.disks: Option<String>`, so the daemon cannot tell a disks section of another schema (a rule: the watchers scan) from a corrupt or out-of-file one (an error: the start should stop). Please make it a typed enum, e.g. `DisksUnused { Refused(Refused), Corrupt(Corrupt), Outside, Malformed(&static str) }`, with Display; blaze-cargo serve/daemon.rs `vfs_used` then puts Refused in `Started.disks` and returns a `VfsFault` for the rest (no-fallback-link-cargo does that side).",
+  "state": "applied",
+  "created": "2026-10-30T23:21:10Z",
+  "updated": "2026-10-31T14:45:35Z",
+  "taken_by": "no-fallback-tools",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:21:10Z",
+      "by": "no-fallback-link-cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from vfs (no live window) to no-fallback-tools, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:15Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:45:35Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "blaze-vfs: DisksUnused {Refused, Corrupt, Outside, Malformed(&static str)} with Display/Error, exported; open_disks returns it; ImageUse Used/Resumed disks: Option<DisksUnused>; Disks::open returns Result<_, &static str>; test a_corrupt_disks_section_is_named_not_taken_for_another_schema. rust-analyzer clean in blaze-vfs; blaze-cargo daemon.rs:418/421/1030 is no-fallback-link-cargo (told)."
+    }
+  ]
+}

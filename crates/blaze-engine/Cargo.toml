@@ -15,15 +15,19 @@ homepage.workspace = true
 keywords.workspace = true
 categories = ["development-tools::build-utils", "compilers"]
 
-# The engine is a library, so its parts can become crates of their own; its comments' code blocks
-# are not doctests.
 [lib]
 doctest = false
 
-# The program `blaze` and blaze-rustc run. Its tests are the library's.
+# The program `blaze`, under the name tooling and the release archives know it by. `blaze`
+# itself is `src/bin/blaze.rs`. Their tests are the library's.
 [[bin]]
 name = "blaze-engine"
 path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "blaze"
+path = "src/bin/blaze.rs"
 test = false
 
 # `cargo binstall blaze-engine`: the archive the release workflow makes for each target, named and
@@ -36,100 +40,48 @@ pkg-fmt = "tgz"
 disabled-strategies = ["quick-install"]
 
 [dependencies]
-# The cargo drop-in and the modules under it: its modules are the engine's (`crate::cargo`,
-# `crate::trace`, ...) by the `use` at the top of lib.rs.
-blaze-cargo = { path = "../blaze-cargo" }
-blaze-splice = { path = "../blaze-splice" }
-memchr = "2"
+# blaze's cargo: the client, the daemon, the sandbox launcher, the release this is.
+blaze-cargo.workspace = true
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-cfg.workspace = true
-toolchain.workspace = true
-intern.workspace = true
-memmap2 = "0.9"
-wasmparser = { version = "0.236", default-features = false, features = ["std"] }
-wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
-object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
-# The archive of a `staticlib`, as rustc writes it.
-ar_archive_writer = "0.5.3"
-rustc-demangle = "0.1.28"
-# Where rustc's object says a static LLVM split up is (`symbols::whole_in_dwarf`).
-gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
-rustc-hash.workspace = true
-salsa.workspace = true
-same-file = "1"
-dunce = "1"
-sha2 = "0.10"
-shlex = "2"
-toml.workspace = true
-cargo_metadata.workspace = true
-
-hir.workspace = true
-hir-def.workspace = true
-hir-ty.workspace = true
-hir-ty-mir.workspace = true
+# The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
-hir-ty-borrowck.workspace = true
-blaze-expand.workspace = true
-blaze-macro-wasm.workspace = true
-blaze-store.workspace = true
-blaze-doc.workspace = true
-blaze-lints.workspace = true
-blaze-profile.workspace = true
-tracing.workspace = true
 blaze-graph.workspace = true
-blaze-protocol.workspace = true
-ide-db.workspace = true
-ide-diagnostics.workspace = true
-pulldown-cmark.workspace = true
-load-cargo.workspace = true
-proc-macro-api.workspace = true
-project-model.workspace = true
-vfs.workspace = true
-triomphe.workspace = true
-paths.workspace = true
-syntax.workspace = true
-tokio = { version = "1.47", features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
+mimalloc.workspace = true
+# mimalloc on the huge pages `blaze-mem` chose (`huge.rs`).
+libmimalloc-sys = { workspace = true, features = ["extended"] }
+blaze-mem.workspace = true
+# A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
+# (`versions.rs`).
+parking_lot.workspace = true
+toml.workspace = true
+toml_edit = { workspace = true, features = ["display", "parse"] }
+# The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
+# `B3SUMS`.
+blaze-registry.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+tar = { workspace = true, features = ["default"] }
+flate2 = { workspace = true, features = ["rust_backend"] }
 url.workspace = true
-# `blaze pin` writes the version into the manifest, its layout and comments kept (`versions.rs`).
-toml_edit = { version = "=0.25.12", default-features = false, features = ["display", "parse"] }
-tar = "0.4.44"
-# The releases of blaze a workspace pins arrive as `.tar.gz` (`versions.rs`).
-flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
-zstd = "0.13.3"
-blaze-live = { path = "../blaze-live" }
-# blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
-# feature `wasi`.
-blaze-wasi = { path = "../blaze-wasi" }
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-tikv-jemallocator = "0.5.4"
-
+# A build script's `rustc` (`as_rustc.rs`): a probe loaded with the standard library, lowered
+# into the front end and checked as `blaze check` checks a crate.
+base-db.workspace = true
+blaze-diagnostics.workspace = true
+blaze-lower.workspace = true
+blaze-query.workspace = true
+blaze-units = { workspace = true, features = ["query"] }
+blaze-vfs.workspace = true
+cfg.workspace = true
+hir.workspace = true
+intern.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.47", features = ["net"] }
-object = { version = "0.37", default-features = false, features = ["write", "elf"] }
-test-fixture.workspace = true
-tempfile = "3"
-
-[target.'cfg(windows)'.dependencies]
-mimalloc = { version = "0.1.46", default-features = false }
-find-msvc-tools = "0.1"
-uds_windows = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
+blaze-alloc-count.workspace = true
 
 [features]
-# Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
-heap-profile = ["tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
-
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 
-# Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
-# (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.
-wasi = ["blaze-cargo/wasi"]
 
 [lints]
 workspace = true

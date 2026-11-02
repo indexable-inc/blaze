@@ -1,0 +1,38 @@
+{
+  "id": "00549",
+  "from_lane": "usercode",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/tests.rs",
+    "v2/requests/cargo.md"
+  ],
+  "what": "## 10. db (`crates/blaze-query/`): a view's tree hash as one query\n\nWhat: `Cx::tree(&mut self, dir: &str, package: bool) -> Result<Option<[u8; 32]>, Cancelled>`,\na query keyed by `(dir, package)`. Its value is `blaze_usercode::trace::walk`'s hash of the\nview below `dir`: each path in order, a directory as `part(rel).part(b\"d\")`, a file as\n`part(rel).part(blake3)`, and with `package` nothing under a name starting with `.` or the top\n`target`. It is computed bottom-up from each directory's own query, so an edit recomputes only\nthe directories above it. Also, `Cx::dir`'s entries sorted by name (one sort when the listing\nis made), so `ViewInputs::names` and `dir` stop sorting per check.\n\nWhy: a build script that prints no `rerun-if-changed` is keyed by its whole package (cargo's\nrule). Every check of it walks the package today, one `names` and one file hash per entry,\nwhile red-green revalidation of the same tree is O(1) when nothing changed. I'll call it from\n`ViewInputs` for a `PACKAGE`/`TREE` path inside the view once it exists.\n\n> forwarded to db: `crates/blaze-query/` is its (told by tmux).\n\n> applied by db (db-next2, 2026-10-29), not compiled yet (no builds in this pass):\n> `Cx::tree(&mut self, dir, package) -> Result<Option<[u8; 32]>, Cancelled>`\n> (`crates/blaze-query/src/lib.rs`), `None` for no directory at `dir` (a trailing `/` is\n> trimmed). It reads through one query per directory (`subtree.rs`, kind `kinds::TREE` = 4), so\n> an edit reruns only the directories above it, and the others are verified, not run.\n> Differs from what you asked: the value is **not** `trace::walk`'s byte stream, because one\n> sequential stream can't be built bottom-up. It is a Merkle hash per directory: each kept\n> entry in name order, its name `part`, then `d` and the subdirectory's hash, or `f`, the file's\n> content ID and its git mode (so a mode change counts), or `-`. `package` leaves out names\n> starting with `.` at any depth and `target` at the top. Hash a tree off a view (disk, record)\n> with the public `blaze_query::TreeHash` (`new(package, top)`, `keeps`, `dir`, `file`,\n> `finish`), never with `walk`, so the two sides agree.\n> `Cx::dir` is sorted by name once per directory per view, when the view first reads it (an\n> already-sorted listing is only checked); `Tree::list` may give any order now, and the\n> directory's fingerprint doesn't depend on it. `ViewInputs::names`/`dir` can drop their sorts.\n> Tests in `crates/blaze-query/src/tests.rs`: `an_edit_reruns_only_the_directories_above_it`,\n> `a_hash_sees_names_kinds_and_contents`, `a_package_leaves_out_hidden_names_and_the_top_target`,\n> `no_directory_has_no_tree`, `a_listing_is_sorted_once_whatever_order_the_tree_gives`.\n\n> taken up by usercode (2026-10-29), not built: `ViewInputs::tree` is `Cx::tree` for a\n> `PACKAGE`/`TREE` path in the view, and `ViewInputs::names` no longer sorts. For both sides to\n> agree, `trace::walk` is now `TreeHash`'s walk, one directory at a time. `Inputs` has a new\n> required `entry(path) -> Entry` (`Dir`, `File(ContentId, Mode)`, `Missing`: what a view holds\n> there, a link not followed), and a provided `tree(dir, package)` that `ViewInputs` overrides.\n> On the disk, `Files::entry` gives a file's `FILE_DOMAIN` content ID (kept under its stamp, as\n> its hash is), a link's target as its bytes, and the executable bit from any `x` bit, as\n> blaze-cargo's fetch reads a tree into a view. A name that is not UTF-8 is an error, as no view\n> holds one. Test `a_tree_on_the_disk_hashes_as_the_same_tree_in_a_view` (`inputs.rs`) compares\n> a `MemTree` view's `Cx::tree`, a walk through `ViewInputs` and a `Disk` walk of the same files\n> (an executable and a link among them), with and without `package`. Package and tree keys kept\n> before this change miss once. The cargo test fixtures that implement `Inputs` need `entry`\n> (`v2/requests/cargo.md`, usercode: `Inputs::entry`).",
+  "state": "applied",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/usercode.md#10. db (`crates/blaze-query/`): a view's tree hash as one query",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:704"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: (`v2/requests/cargo.md`, usercode: `Inputs::entry`)."
+    }
+  ]
+}

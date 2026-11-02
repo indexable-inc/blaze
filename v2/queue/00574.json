@@ -1,0 +1,23 @@
+{
+  "id": "00574",
+  "from_lane": "db-expand-macros",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/ide-diagnostics/src/handlers/macro_error.rs"
+  ],
+  "what": "## db-expand-macros: the macro-error tests' expectations (diagnostics, `crates/ide-diagnostics/src/handlers/macro_error.rs`)\n\nWhat: update the tests expecting \"expected string literal\", \"failed to load file\" and\n\"`OUT_DIR` not set, build scripts may have failed to run\" and their spans: `env!`/`include!`\nerrors are rustc's now (e.g. \"environment variable `X` not defined at compile time\" with\nrustc's help), spanned from the macro path to the closing delimiter.\n\n> forwarded to diagnostics (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-macros: the macro-error tests' expectations (diagnostics, `crates/ide-diagnostics/src/handlers/macro_error.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:805"
+    }
+  ]
+}

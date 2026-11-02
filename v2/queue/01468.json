@@ -1,0 +1,32 @@
+{
+  "id": "01468",
+  "from_lane": "cargo",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/files.rs",
+    "crates/base-db/src/file_set.rs",
+    "crates/base-db/src/view.rs",
+    "crates/base-db/src/tests.rs"
+  ],
+  "what": "Parallel-build part E (never repeat work), for 01463 (cargo), approved by coord-1030-next3: a root alias. `Files::alias(&self, db: &mut Db, of: FileId) -> Result<FileId, ..>`: a new FileId (unused_file_id) that is the root file of one crate whose root blaze appends to (a proc macro's list, a test's harness). Conditions, each pinned by a test: (1) file->path only: the alias is in `of`'s source root(s) with `of`'s path in FileSet.paths (path_for_file, resolve_path from it as anchor, so `mod foo;` in it resolves), but FileSet.files, file_for_path, the view's index and every path->file lookup keep answering `of`; a path never has two answers; the alias is never 'unseen' or removed by a later set_view_root of its root. (2) derived text: whenever `of`'s text is written (set_view_root's write_view, set_file_text), every alias of it gets the same text in the same change, its appended root module cleared or kept as today's disk root keeps it (blaze-lower appends again per job); `of` removed removes its aliases. Its source root, durability and is_library follow `of`'s. (3) `Files::aliases_of(of)` or equivalent so blaze-lower can find them on refresh. Test names suggested: an_alias_is_found_by_its_file_never_by_its_path, an_edit_of_a_root_reaches_every_alias_of_it. blaze-lower then lowers each crate whose root is appended onto an alias of its root file, so a proc macro's lib and its lib test never share one text and a lib's identity is the same under build and test.",
+  "state": "taken",
+  "created": "2026-11-01T06:20:40Z",
+  "updated": "2026-11-01T06:20:54Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T06:20:40Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T06:20:54Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "01073",
+  "from_lane": "integrate-docs",
+  "owner": "integrate-vfs",
+  "paths": [
+    "harness/mixed.py",
+    "harness/ci.py",
+    "harness/bench.py",
+    "harness/blaze_cli.py",
+    ".github/workflows/blaze-platform.yaml",
+    "harness/v2/engine.py"
+  ],
+  "what": "From integrate-docs-harness (read from code, not run): most harnesses cannot run against v2. (1) harness/mixed.py and every harness on it or on v1 daemon form (stress, splices, keys, fuzz/edits.py, programs, wholeprogram, libsuite, backends, editloop, fncache, invalidation and the rest listed in docs/harness.md \"What runs against v2 today\") use v1 entry points (positional workspace, --crate/--out/--report, sync/patch/cache/lock). (2) ci.py and .github/workflows/blaze-platform.yaml set BLAZE_BACKEND per job and storelib.py does not scrub it, so v2 refuses every unit in the train store jobs (CHANGES_CODE). (3) bench.py BACKENDS sets BLAZE_BACKEND/OPT/EMIT, uses blaze lock --fetches, BLAZE_CACHE, BLAZE_STD_FROM. (4) blaze_cli.how_built looks for [blaze], which v2 never prints, so every v2 build reads as cargo. (5) testselect/hermetic/sandboxbench/fncache/bscache/spare/memsplit/frozenwarm/freshwarm/loadedits lean on deleted v1 settings. For proof: harness/v2/engine.py Engine.env always sets BLAZE_BACKEND (and BLAZE_CACHE), so v2 refuses every unit; tightmemory.py BLAZE_MEMORY_BUDGET is read by no v2 crate.",
+  "state": "applied",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-30T16:18:09Z",
+  "taken_by": "integrate-vfs",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:21:56Z",
+      "by": "integrate",
+      "action": "reassign",
+      "note": "coordinator -> integrate-vfs: integrate-vfs (window integrate-vfs) is doing integrate's tooling pass over harness/, tools/, .github/ (brief integrate-tooling.md), which is exactly (1)-(5): harnesses on v1 entry points, BLAZE_BACKEND in ci.py and blaze-platform.yaml and bench.py (v2 refuses every unit with it set: remove it, never scrub-and-ignore), how_built's [blaze] marker, deleted v1 settings. harness/v2/engine.py and tightmemory.py are proof's: integrate-vfs queues proof for those."
+    },
+    {
+      "at": "2026-10-30T16:18:09Z",
+      "by": "integrate-vfs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:18:09Z",
+      "by": "integrate-vfs",
+      "action": "done",
+      "note": "Folded into the tooling pass (report /tmp/blaze-lanes/v2-integrate-tooling.md, round 3). (1) the v1-entry-point harnesses: ported onto blaze build (harness/rebuild.py) or deleted, round 2. (2) BLAZE_BACKEND removed, not scrubbed: ci.py and focused.py have no backend (matrix entries are {part, apt}; focused.py's Run has no backend field), blaze-platform.yaml's harness, blaze-cli and projects jobs set no BLAZE_BACKEND/OPT/EMIT and have no backend axis; LLVM is covered by release-profile runs (fuzz/store and fuzz/edits with profiles dev+release, wholeprogram.py --release); rebuild.py's own unset is gone; tiers/tierbench no longer pop it (tierbench's llvm row is CARGO_PROFILE_DEV_OPT_LEVEL=3); abbench, norustc (baseline keyed by host), dwarf.LLVM (and debuginfo/realdebug's LLVM tolerances), blaze_cli's llvm results file, soakrows/doctests labels and toolchain_bump fixed. (3) bench.py: BACKENDS is a profile ({cranelift: (), llvm: (--release,)}) for both sides, runtime uses target/release for llvm, `blaze lock --fetches` and fframes' fetches removed (BLAZE_CACHE left to 01077). (4) blaze_cli.how_built: \"daemon\" for cargo's Finished line, \"failed: <error>\" otherwise; by_rustc, cargo_checked, blazes and the [blaze] checks removed, with their \"no cargo\"/\"no rustc\" labels. (5) not portable without v2 features: queued 01088 (testselect, hermetic, loadedits in CI; sandboxbench, testselectbench, spare, memsplit). Proof's engine.py and tightmemory.py: queued 01087. Untested until coord-1030 builds."
+    }
+  ]
+}

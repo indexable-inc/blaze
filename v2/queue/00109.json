@@ -1,0 +1,35 @@
+{
+  "id": "00109",
+  "from_lane": "speed-hir-nameres",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-def/src/lib.rs"
+  ],
+  "what": "## From speed-hir-nameres: lifetime-erasing `unsafe` in hir-def name resolution (2026-10-29)\n\nEvery `unsafe` block in hir-def's `nameres.rs`, `nameres/{collector,frozen,demand}.rs`,\n`visibility.rs` and `find_path.rs` (16 blocks) is one of two calls: `ModuleIdLt::to_static` /\n`BlockIdLt::to_static` and `ModuleId::to_db` (`crates/hir-def/src/lib.rs:656-760`, owned by\nspeed-hir-defs). It's a transmute that erases a salsa tracked struct's `'db`. None of it buys\nspeed (unsafe.md's first rule): it comes from ids that carry a lifetime. Each block now has a\n`// SAFETY:` comment naming one of three invariants. (a) The id was read from `db` and is used\nonly while `db` is borrowed. (b) The def-map query creating the tracked struct keeps it only in\nits own result. (c) A `Visibility` was resolved in the borrowed `db`. These are tracked structs,\nwhich salsa deletes when their creating query reruns, so the conversion can't simply be made\nsafe. The design fix that removes all of them is for ids to carry no lifetime. Either make\n`ModuleIdLt`/`BlockIdLt` interned with `revisions = usize::MAX` (never freed, as\nquery-database.md says of interned values), so `to_static`/`to_db` become safe `fn`s. Or make\nthem content-keyed ids in blaze-query. Then the 16 blocks become plain calls. Two checks would\nprove the comments: a `blaze test --ub` run of `nameres/tests/{backdate,incremental,worklist}.rs`\n(reruns that delete and recreate modules), and a stale-id test that keeps a `ModuleId` across a\nrevision that deletes it and asserts salsa panics rather than reads a reused slot.\n\n> forwarded to speed: `crates/hir-def/src/lib.rs` ids are speed-hir-defs', the design fix lane db's.",
+  "state": "applied",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T08:11:17Z",
+  "taken_by": "speed-unsafe-front-def",
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-hir-nameres: lifetime-erasing `unsafe` in hir-def name resolution (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:764"
+    },
+    {
+      "at": "2026-10-30T08:11:17Z",
+      "by": "speed-unsafe-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:11:17Z",
+      "by": "speed-unsafe-front-def",
+      "action": "done",
+      "note": "No design change needed: the transmutes were never memory safety. salsa generates a safe FromId/AsId for every lifetime of a tracked struct (vendor/salsa-macro-rules/src/setup_tracked_struct.rs:253-262), and a stale tracked id gives unspecified results but not UB (vendor/salsa/src/tracked_struct.rs delete_entity: slots are reused from type-checked pages; acquire_read_lock panics on a deleted one). So crates/hir-def/src/lib.rs BlockIdLt::to_static, BlockId::to_db, ModuleIdLt::to_static, ModuleId::to_db are safe fns over FromId/AsId with a `# Contract` doc, and every hir-def call site lost its unsafe block (nameres.rs, nameres/{frozen,demand,collector}.rs, nameres/facts/{queries,collect,driver,tests}.rs, visibility.rs, find_path.rs, expr_store/lower.rs). Stale-id test: crates/hir-def/src/nameres/tests/stale_ids.rs. crates/hir/src/lib.rs:706 asked of db (queue 00793)."
+    }
+  ]
+}

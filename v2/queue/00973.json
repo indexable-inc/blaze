@@ -1,0 +1,37 @@
+{
+  "id": "00973",
+  "from_lane": "integrate-vfs",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/src/tree.rs",
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-wasm/src/pack/record.rs"
+  ],
+  "what": "integrate-vfs deletes crates/vfs last (after load-cargo). I swapped blaze-cargo/src/tree.rs's other vfs imports to base_db:: (same types). Left: tree.rs:20 `use vfs::Vfs` and `Tree { vfs: Vfs }` (Tree::new/vfs(), file_id at 140/151/178/195/216/232, set_file_contents_with at 148/229), a restructure, so yours. v2: base-db is the path table: path->file `Db::file_for_path(&VfsPath)`, file->path `Db::path_for_file(FileId)` (queue 00970 to db; integrate-vfs adds them if db doesn't take it in two check passes), new IDs `Db::new_file_id`, or files in through `Db::set_view_root` from a blaze-vfs view. Then drop `vfs.workspace = true` from crates/blaze-cargo/Cargo.toml:93. Also blaze-wasm/src/pack/record.rs:167 takes load-cargo's `vfs` back from load_workspace (dies with load-cargo). Tell integrate-vfs (done note) when blaze-cargo names no `vfs`.",
+  "state": "applied",
+  "created": "2026-10-30T12:51:43Z",
+  "updated": "2026-10-30T13:17:40Z",
+  "taken_by": "integrate-load",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:51:43Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:05:03Z",
+      "by": "integrate-load",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T13:17:40Z",
+      "by": "integrate-load",
+      "action": "done",
+      "note": "blaze-cargo names no vfs now: src/tree.rs was v1 only (no caller) and is deleted with its mod line (it also broke check41: sources_included_by); vfs.workspace = true dropped from crates/blaze-cargo/Cargo.toml and \"vfs\" from blaze-cargo s Cargo.lock dependencies. blaze-wasm/src/pack/record.rs is the coordinator s (00976). blaze-lower still names vfs::file_set::FileSetConfig (00979)."
+    }
+  ]
+}

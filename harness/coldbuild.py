@@ -9,22 +9,23 @@ no `cargo build` (docs/no-rustc.md, step K, #91).
 
 The fixtures are a workspace of a program, an example and a library with a build script,
 built from nothing by `blaze build` (dev, then release) and `blaze run --example`:
-each executable has to be where cargo puts it and print what cargo's build of the same source
-does, and no `cargo build` may run (cargo would leave `.fingerprint` in the target directory).
-An edit to a body after the first build is built by the daemon on what it loaded. A program that reaches a function blaze cannot compile fails its build with what it is, exit
+each executable has to be where cargo puts it and print what its source says (`KAPP_PRINT`,
+`KEX_PRINT`), and no `cargo build` may run (cargo would leave `.fingerprint` in the target
+directory). An edit to a body after the first build is built by the daemon on what it loaded. A program that reaches a function blaze cannot compile fails its build with what it is, exit
 101, and leaves no executable and no cargo build behind. A program whose own crates have writable
 statics (`OnceLock`, `Mutex`, atomics, `static mut`) that `main` reaches is run by
-`blaze run`, dev and `--release`, and has to print what it should, as cargo's build does:
-blaze defines those statics itself, with no rustc symbol behind them.
+`blaze run`, dev and `--release`, and has to print what it should (`STATICS_PRINT`): blaze
+defines those statics itself, with no rustc symbol behind them.
 
-`bench` does the same for bench.py's projects, the program run with bench.py's `run`
-arguments, and says how long blaze's cold build took against cargo's, then its body and
-signature edits (bench.py's) against cargo's incremental build of each. The edits are built
-by the daemon's worker on what it loaded for the cold build. The standard library comes from
-a remote `blaze-engine std` made once, as a release's does.
+`bench` does the same for bench.py's projects: each program is run with bench.py's `run`
+arguments and must not be killed by a signal or panic out of `main` (exit 101). It says how
+long blaze's cold build took against cargo's, the speed baseline, then its body and signature
+edits (bench.py's) against cargo's incremental build of each. The edits are built by the
+daemon's worker on what it loaded for the cold build, and each program has to print what
+blaze's build of the edited source from nothing prints (`blaze_cli.Scratch`). The standard
+library's crates are units of each project's cold build like any other.
 
-BLAZE_BIN names the blaze built; blaze is found next to it. Linux, as allblaze.py;
-`statics` on macOS too.
+BLAZE_BIN names the blaze built; blaze is found next to it. Linux; `statics` on macOS too.
 """
 import os, re, shutil, subprocess, sys, tempfile, time
 
@@ -172,6 +173,10 @@ calls 5 seen ["main", "t0", "t1", "t2", "t3"] total 55
 frames 0 1 2
 kstate ["a", "b"] 1 2
 """
+# kapp's stdout by profile, and what its caught panic says on stderr.
+KAPP_PRINT = 'from the build script {"a": 3, "b": 1, "c": 1}\ncaught true in kapp v0.3.1\n%s\n'
+KAPP_PANIC = "index out of bounds: the len is 0 but the index is 1"
+KEX_PRINT = 'kex ["a", "b", "a"] 2\n'
 
 
 def write(root, files):
@@ -181,11 +186,8 @@ def write(root, files):
             f.write(text)
 
 
-def env_for(root, remote=None):
-    env = base_env(os.path.join(root, "home"))
-    if remote:
-        env["BLAZE_STD_FROM"] = remote
-    return env
+def env_for(root):
+    return base_env(os.path.join(root, "home"))
 
 
 def blaze(ws, env, *args):
@@ -196,7 +198,8 @@ def blaze(ws, env, *args):
 
 
 def cargo(ws, env, target, *args):
-    """cargo's own build of the same source, into a target directory of its own."""
+    """cargo's own build of the same source, into a target directory of its own: the speed
+    baseline of `bench`."""
     env = dict(env, CARGO_TARGET_DIR=target)
     start = time.monotonic()
     ran = subprocess.run(["cargo", *args], cwd=ws, env=env, capture_output=True, text=True, timeout=TIMEOUT)
@@ -223,7 +226,7 @@ def cargo_built(target):
 
 
 def statics(root, env, check):
-    """`blaze run` of STATICS, dev and release: it prints STATICS_PRINT, as cargo's does."""
+    """`blaze run` of STATICS, dev and release: it prints STATICS_PRINT."""
     ws = os.path.join(root, "statics")
     write(ws, STATICS)
     for flags in ([], ["--release"]):
@@ -233,9 +236,6 @@ def statics(root, env, check):
         check(f"{named} of a program's own writable statics runs", (ran.returncode, ran.stdout) == (0, STATICS_PRINT),
               f"blaze's: exit {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
         check("  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
-        reference, _ = cargo(ws, env, os.path.join(root, "statics-ref"), "run", "-q", *flags)
-        check("  ... and cargo's build prints the same", (reference.returncode, reference.stdout) == (0, STATICS_PRINT),
-              f"cargo's: exit {reference.returncode} {reference.stdout!r}\n{reference.stderr}")
     return ws
 
 
@@ -272,10 +272,9 @@ def whole(root, env, check):
         check(f"`blaze build {' '.join(flags)}` from nothing builds", ran.returncode == 0, said)
         check(f"  ... no build is cargo's", "building with cargo" not in said and not cargo_built(os.path.join(ws, "target")), said)
         program = os.path.join(ws, "target", profile, "kapp")
-        reference, _ = cargo(ws, env, os.path.join(root, "ref"), "build", *flags)
-        assert reference.returncode == 0, reference.stderr[-3000:]
         ours = printed(program) if os.path.exists(program) else None
-        check(f"  ... target/{profile}/kapp prints what cargo's does", ours == printed(os.path.join(root, "ref", profile, "kapp")),
+        check(f"  ... target/{profile}/kapp prints what its source says",
+              ours is not None and ours[:2] == (0, KAPP_PRINT % profile) and KAPP_PANIC in ours[2],
               f"blaze's printed {ours!r}")
         if profile == "debug":
             # The daemon's worker has the workspace loaded: an edit is built on what it has.
@@ -296,9 +295,8 @@ def whole(root, env, check):
                 f.write(source)
     shutil.rmtree(os.path.join(ws, "target"))
     ran, _ = blaze(ws, env, "run", "-q", "--example", "kex", "--", "a", "b", "a")
-    reference, _ = cargo(ws, env, os.path.join(root, "ref"), "run", "-q", "--example", "kex", "--", "a", "b", "a")
-    check("`blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (reference.returncode, reference.stdout),
-          f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}\ncargo's: {reference.stdout!r}")
+    check("`blaze run --example kex` from nothing runs it", (ran.returncode, ran.stdout) == (0, KEX_PRINT),
+          f"blaze's: {ran.returncode} {ran.stdout!r}\n{ran.stderr}")
     check("  ... and it is in target/debug/examples", os.path.exists(os.path.join(ws, "target", "debug", "examples", "kex")))
 
     for package, whose in (("kbad", "its own"), ("kuses", "a library's")):
@@ -315,9 +313,15 @@ def whole(root, env, check):
 EDITS = ("body", "signature")
 
 
+def programs(debug):
+    """The executables of a profile's directory."""
+    return [b for b in os.listdir(debug) if os.path.isfile(os.path.join(debug, b)) and os.access(os.path.join(debug, b), os.X_OK)]
+
+
 def edited(ws, root, name, env, build, changes, spec):
     """How long blaze's build of the edit `changes` took, then cargo's, and what was wrong with
-    blaze's, if anything. Each side builds the source as it was again after."""
+    blaze's, if anything: its programs have to print what blaze's build of the edited source
+    from nothing does. Each side builds the source as it was again after."""
     import bench as benchpy
     benchpy.write_edit(ws, changes, False)
     ours, took = blaze(ws, env, "build", *build)
@@ -328,12 +332,14 @@ def edited(ws, root, name, env, build, changes, spec):
     elif "building with cargo" in said or cargo_built(os.path.join(ws, "target")):
         why = "CARGO BUILT IT"
     elif spec.get("run") is not None:
-        debug = os.path.join(ws, "target", "debug")
-        reference = os.path.join(root, f"{name}-ref", "debug")
-        bins = [b for b in os.listdir(debug) if os.path.isfile(os.path.join(debug, b)) and os.access(os.path.join(debug, b), os.X_OK)]
-        if not all(printed(os.path.join(debug, b), spec["run"], ws, env) == printed(os.path.join(reference, b), spec["run"], ws, env)
-                   for b in bins):
-            why = "OUTPUT DIFFERS"
+        _, fresh = blaze_cli.Scratch(ws, env).cargo("build", *build, timeout=TIMEOUT)
+        debug, scratch = os.path.join(ws, "target", "debug"), os.path.join(ws, "target-scratch", "debug")
+        if fresh.returncode != 0:
+            why = "FAILS FROM NOTHING: " + (fresh.stderr.strip().splitlines() or [""])[-1][:160]
+        elif not all(printed(os.path.join(debug, b), spec["run"], ws, env) == printed(os.path.join(scratch, b), spec["run"], ws, env)
+                     for b in programs(debug)):
+            why = "OUTPUT DIFFERS FROM NOTHING"
+        shutil.rmtree(os.path.join(ws, "target-scratch"), ignore_errors=True)
     target = os.path.join(root, f"{name}-ref")
     _, cargo_took = cargo(ws, env, target, "build", *build)
     benchpy.write_edit(ws, changes, True)
@@ -345,34 +351,34 @@ def edited(ws, root, name, env, build, changes, spec):
 def bench(names, keep=False):
     import bench as benchpy
     root = tempfile.mkdtemp(prefix="blaze-coldbuild-bench-", dir="/tmp")
-    remote, made = benchpy.shipped_std(BLAZE, "cranelift", root)
     rows, wrong = [], 0
     for name in names:
         spec = benchpy.PROJECTS[name]
         ws = os.path.join(root, name)
         shutil.copytree(blaze_cli.fetch(name, spec), ws, symlinks=True,
                         ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(env_for(os.path.join(root, f"{name}-h"), remote), **spec.get("env", {}))
+        env = dict(env_for(os.path.join(root, f"{name}-h")), **spec.get("env", {}))
         subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
         build = spec.get("build", [])
         reference, cargo_took = cargo(ws, env, os.path.join(root, f"{name}-ref"), "build", *build)
         ours, took = blaze(ws, env, "build", *build)
         said = ours.stdout + ours.stderr
         verdict = "builds"
-        if reference.returncode != 0:
-            verdict = "cargo's build fails"
-        elif ours.returncode != 0:
+        if ours.returncode != 0:
             verdict = "FAILS: " + (said.strip().splitlines() or [""])[-1][:160]
         elif "building with cargo" in said or cargo_built(os.path.join(ws, "target")):
             verdict = "CARGO BUILT IT"
         elif spec.get("run") is not None:
             debug = os.path.join(ws, "target", "debug")
-            bins = [b for b in os.listdir(debug) if os.path.isfile(os.path.join(debug, b)) and os.access(os.path.join(debug, b), os.X_OK)]
-            same = all(printed(os.path.join(debug, b), spec["run"], ws, env)
-                       == printed(os.path.join(root, f"{name}-ref", "debug", b), spec["run"], ws, env) for b in bins)
-            verdict = "same output" if same and bins else "OUTPUT DIFFERS"
+            bins = programs(debug)
+            ended = [printed(os.path.join(debug, b), spec["run"], ws, env)[0] for b in bins]
+            crashed = [f"{b} exited {code}" for b, code in zip(bins, ended) if code < 0 or code == 101]
+            verdict = ("CRASHES: " + ", ".join(crashed)[:160]) if crashed else "runs" if bins else "NO PROGRAM"
+        if reference.returncode != 0:
+            # The baseline is gone, blaze's build is not: it is judged all the same.
+            verdict += "; cargo's build fails"
         edits = ""
-        if verdict in ("same output", "builds"):
+        if verdict.startswith(("runs", "builds")):
             for kind in EDITS:
                 changes = spec.get("edits", {}).get(kind)
                 if changes is None:
@@ -383,10 +389,10 @@ def bench(names, keep=False):
                     verdict = f"{kind} edit {why}"
                     break
         subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
-        wrong += verdict not in ("same output", "builds", "cargo's build fails")
+        wrong += not verdict.startswith(("runs", "builds"))
         rows.append((name, verdict, took, cargo_took))
         print(f"{name:12} {verdict:40} blaze {took:7.1f}s  cargo {cargo_took:7.1f}s{edits}", flush=True)
-    print(f"standard library made once in {made:.1f}s; under {root}")
+    print(f"under {root}")
     if wrong:
         sys.exit(1)
     if not keep:

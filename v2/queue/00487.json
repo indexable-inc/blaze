@@ -1,0 +1,36 @@
+{
+  "id": "00487",
+  "from_lane": "diagnostics-lints-bodies-types-casts",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs",
+    "crates/test-utils"
+  ],
+  "what": "## diagnostics-lints-bodies-types-casts: three things of core minicore lacks (`crates/test-utils/src/minicore.rs`; test-utils)\n\n`static-mut-refs.rs` and `static-mut-refs-interior-mutability{,-no-sugg}.rs` (tests in\n`tests/lints/bodies/types/casts/static_mut_refs.rs`) need, as core writes them:\n1. `Result::unwrap` (`impl<T, E> Result<T, E> { pub fn unwrap(self) -> T where E: fmt::Debug }`,\n   under `result` with `fmt`): `MUTEX.lock().unwrap()`.\n2. `fmt::rt::Argument::new_debug` (under `fmt`): `format!(\"{:?}\", Z)` lowers to it.\n3. `impl<T: Debug, const N: usize> Debug for [T; N]` (under `fmt`): `Z` is `&[i32; 3]` (minicore has `Debug for &T`).\nWithout them these tests get an unresolved-method / unmet-bound error besides the lint.\n\n> forwarded to coordinator: `crates/test-utils/` is \"every other path\" in `crates.md`, not among the paths `requests` applies.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T08:32:10Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-casts: three things of core minicore lacks (`crates/test-utils/src/minicore.rs`; test-utils)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1524"
+    },
+    {
+      "at": "2026-10-30T08:32:09Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:10Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/test-utils/src/minicore.rs: `Result::unwrap` (E: Debug, region fmt inside result), `fmt::rt::Argument::new_debug`, and `impl<T: Debug, const N: usize> Debug for [T; N]` in fmt builtin_impls."
+    }
+  ]
+}

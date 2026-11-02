@@ -1,0 +1,36 @@
+{
+  "id": "01009",
+  "from_lane": "integrate-vfs",
+  "owner": "coordinator",
+  "paths": [
+    "crates/load-cargo",
+    "crates/blaze-wasm/src/pack/record.rs"
+  ],
+  "what": "Decision needed to unblock deleting vfs + vfs-notify (queue 00028): load-cargo is the last main-workspace user of v1 vfs::Vfs, vfs::loader and vfs-notify, and integrate-load holds its deletion until blaze-wasm is off it (00976, yours, open). blaze-wasm is excluded from the root workspace, so deleting load-cargo now breaks only blaze-wasm `pack::record` (record.rs:16/162), which 00976 already says needs a rewrite onto blaze_lower or dropping. Ask: either decide 00976 (rewrite or drop `pack`), or tell integrate-load to delete load-cargo now and let blaze-wasm follow under 00976. Everything else for the vfs deletion is staged (base-db source_path.rs/file_set.rs, span owns FileId); integrate-vfs deletes vfs in one step the minute load-cargo is gone.",
+  "state": "applied",
+  "created": "2026-10-30T14:10:21Z",
+  "updated": "2026-10-30T14:32:09Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:10:21Z",
+      "by": "integrate-vfs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:31:52Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:32:09Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "Decided: integrate-load deletes load-cargo and project-model now; blaze-wasm is excluded from the root workspace and follows under 00976 (a) right after. integrate-vfs then deletes vfs and vfs-notify."
+    }
+  ]
+}

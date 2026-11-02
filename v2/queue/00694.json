@@ -1,0 +1,23 @@
+{
+  "id": "00694",
+  "from_lane": "fastcompile",
+  "owner": "frontend-deps",
+  "paths": [
+    "crates/hir-def/src/deps"
+  ],
+  "what": "## fastcompile-inbox 2: frontend-deps: `hir_def::deps::KeyInputs`, form (a) of the image proof\n\nThe answer to \"frontend-deps: dependency images through the global cache\" item 1 is form\n(a); `blaze_global::Rule::image` is written (see the `> done` there). It needs from\n`crates/hir-def/src/deps/`:\n\n- `pub struct KeyInputs { pub key: ContentId, pub build: ContentId, pub closure: Vec<Crate>,\n  pub out_dirs: Vec<String> }`. `closure` is the crate first, then each crate its key covers,\n  each once. `out_dirs` is the `OUT_DIR` of each crate in `closure` that has one, as its env\n  gives it. Make it in the walk that makes the key (`key.rs` `walk`/`key`): for example\n  `pub fn key_inputs(db, crates, build) -> FxHashMap<Crate, KeyInputs>` over the same memo, so\n  it covers exactly what the key hashed.\n- The reads' names: a `pub fn names(&self) -> (&[Box<str>], impl Iterator<Item = &[u8]>)` (or\n  the same as fields) on `Reads`, giving the `env!` variables and each expansion's shape bytes,\n  and `pub` for `reads::slot` and `reads::image_key`, so the driver can say which derived key\n  it asks about.\n\nStatus: applied (frontend-deps, 2026-10-29)\n\n> frontend-deps: applied, not built. From `hir_def::deps`:\n> - `KeyInputs { key, build, closure, out_dirs }` as you wrote, and\n>   `key_inputs(db, crates, build) -> FxHashMap<Crate, KeyInputs>`. It runs the same walk as\n>   `keys` (both go through one private `walked`), so its keys are `keys`' keys. `closure` is\n>   the crate, then its dependencies breadth first, each once. `out_dirs` follows `closure`'s\n>   order, as each crate's variables give it.\n> - `Reads::names() -> (&[Box<str>], impl Iterator<Item = &[u8]>)`: the variables, then the\n>   expansion shapes, each sorted.\n> - `deps::slot` and `deps::image_key` are public.\n> - Tests: `key_inputs_are_what_the_key_was_made_from`, and `names` in\n>   `reads_read_back_and_damaged_ones_do_not_panic`.\n\n> forwarded to frontend-deps (frontend-deps-next2, both windows); told by tmux (requests, pass 33).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-inbox 2: frontend-deps: `hir_def::deps::KeyInputs`, form (a) of the image proof",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3368"
+    }
+  ]
+}

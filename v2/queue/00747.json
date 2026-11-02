@@ -1,0 +1,37 @@
+{
+  "id": "00747",
+  "from_lane": "requests-backend-axis",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-manifest/src/profiles.rs",
+    "crates/blaze-cargo/src/cargo/cli.rs",
+    "harness/v2/engine.py"
+  ],
+  "what": "## requests-backend-axis 3: coordinator: the `codegen-backend` gate as cargo has it (`crates/blaze-manifest/src/profiles.rs`)\n\nWhat: `validate_profile_layer` takes `codegen-backend` when the build has `-Zcodegen-backend`\n(`Invocation::unstable`, which `crates/blaze-cargo/src/cargo/cli.rs` already collects) or\n`[unstable] codegen-backend = true` in the configuration, as nightly cargo does\n(`cli_unstable.codegen_backend` beside the manifest's `cargo-features`). Today only the\nmanifest's `cargo-features = [\"codegen-backend\"]` opens it (`profiles.rs`, \"blaze does not\nread those\"). The other `-Z` gates can follow the same path, but this request is only for\nthis one.\n\nWhy: the harness sets the backend from the command line (`-Zcodegen-backend --config\n'profile.dev.codegen-backend=\"stencil\"'`, see `harness/v2/engine.py`, `dev_backend_args`). It\ncannot add `cargo-features` to a corpus crate's manifest without changing the tree that\ncargo, the reference, builds.\n\nOwner: coordinator (`blaze-manifest` is one of the cargo crates crates.md leaves to the\ncoordinator).\n\n> forwarded to the coordinator: `blaze-manifest` is its (listed in requests' report).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T08:38:42Z",
+  "taken_by": "coord-apply-manifests",
+  "why": null,
+  "source": "v2/requests/requests-backend-axis.md#requests-backend-axis 3: coordinator: the `codegen-backend` gate as cargo has it (`crates/blaze-manifest/src/profiles.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-backend-axis.md:70"
+    },
+    {
+      "at": "2026-10-30T08:38:42Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:38:42Z",
+      "by": "coord-apply-manifests",
+      "action": "done",
+      "note": "blaze-manifest: CliUnstable gains codegen_backend (from -Zcodegen-backend and [unstable] codegen-backend, config/mod.rs + schema.rs); validate_profiles/validate_profile/validate_profile_layer take &CliUnstable and require Feature::codegen_backend only when the flag is off, as cargo does (profiles.rs; callers manifest.rs to_real_manifest/to_virtual_manifest and get_config_profile pass config.unstable()). blaze-units/src/load.rs accepted -Z list gains codegen-backend (it refused it before). Test dependency.rs a_codegen_backend_profile_needs_its_cargo_feature_or_the_flag. cargo-next2 told."
+    }
+  ]
+}

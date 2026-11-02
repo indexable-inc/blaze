@@ -1,0 +1,36 @@
+{
+  "id": "00372",
+  "from_lane": "mem-db-infer-closure",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/unify.rs",
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "## `closure.rs`\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:38): C0-C2 applied below by db-mem-infer-a-closure.\n\n### C0. Impl header (line 51)\n\nBefore `impl<'db> InferenceContext<'db> {`; after `impl<'db, 'f> InferenceContext<'db, 'f> {`.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> applied by db-mem-infer-a-closure (21:24): as written.\n\n### C1. A new closure's data (lines 306-315, and the import on line 12)\n\nBefore:\n\n```rust\n        self.result.closures_data.insert(\n            closure_expr,\n            ClosureData {\n                liberated_sig: StoredFnSig::new(liberated_sig),\n                fake_reads: Box::default(),\n                min_captures: IndexMap::default(),\n                kind_origin: None,\n            },\n        );\n```\n\nAfter: `min_captures: Default::default(),` (no allocation, as before), and line 12 `use\nindexmap::IndexMap;` is deleted. Analysis fills `min_captures` once (A4); `walk_captures`\nremoves and reinserts entries of `closures_data`, which allocates nothing.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> applied by db-mem-infer-a-closure (21:24): as written; also expr X4's `CoerceMany::new(liberated_sig.output(), self.frame)` at the return coercion.\n\n### C2. Supplied closure signature (lines 1020-1041)\n\nBefore:\n\n```rust\n        let (supplied, bound_vars) =\n            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs));\n        let supplied_arguments: Vec<_> = supplied\n            .into_iter()\n            .map(|input| match input {\n                // The solver takes no type with a lifetime bound outside it.\n                Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),\n                Some(ty) => self.process_user_written_ty(ty),\n                None => self.table.next_ty_var(closure_expr.into()),\n            })\n            .collect();\n\n        Binder::bind_with_vars(\n            interner.mk_fn_sig(\n                supplied_arguments,\n                supplied_return,\n```\n\nAfter (`mk_fn_sig` takes any `IntoIterator<Item = Ty>` and interns from it; `interner` is a\n`Copy` local, so the closure's borrow of `self` does not conflict; the type variables are made in\nthe same order, after `supplied_return`'s, as before):\n\n```rust\n        let (supplied, bound_vars) =\n            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs));\n        let supplied_arguments = supplied.into_iter().map(|input| match input {\n            // The solver takes no type with a lifetime bound outside it.\n            Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),\n            Some(ty) => self.process_user_written_ty(ty),\n            None => self.table.next_ty_var(closure_expr.into()),\n        });\n\n        Binder::bind_with_vars(\n            interner.mk_fn_sig(\n                supplied_arguments,\n                supplied_return,\n```\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> applied by db-mem-infer-a-closure (21:24): in the combined form of `mem-db-infer.md` 6.1 (with lower 22: `supplied` is a frame `Vec` the call fills, `bound_vars` its return).\n\n### What `closure.rs` still allocates, and whose it is\n\nSignature deduction has no per-closure lists of its own: the obligations and bounds it reads come\nfrom other parts.\n\n| site | what | owner, and what to do |\n|---|---|---|\n| lines 413, 678, 1080 `self.table.obligations_for_self_ty(vid, UseSubtyping::No)` | `SmallVec<[PredicateObligation; 4]>` per closure with an inferred expected type; spills (1 global) on a 5th pending obligation of the variable, which real code reaches (`F: Fn(..) + Send + Clone + 'static` with its projections) | mem-db-infer-ctx (`unify.rs:212`): return a frame `Vec` or take a visitor; both callers only iterate |\n| line 440 `rustc_type_ir::elaborate::elaborate(..)` | the `Elaborator`'s stack `Vec` and visited set (global), per closure deduced from predicates | vendor `rustc_type_ir`, mem-db-solver |\n| line 923 `PredicateObligations::new()` | the solver's obligation list for the supplied-vs-expected check | mem-db-solver (its type) |\n| line 1021 `lower_closure_params` | returns `Vec<Option<Ty>>` | mem-db-lower (`lower.rs:1110`) |\n| C2 `mk_fn_sig` | `Tys::new_from_iter` collects into `SmallVec<[Ty; 8]>` before interning (spills above 7 parameters) | next_solver interner, mem-db-solver |\n| line 311 `Box::default()`, C1 `Default::default()` | empty results | none: no allocation |\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:38): notes, each row settled by its owner: `obligations_for_self_ty` stays (mem-db-infer-ctx.md U3, crates/hir-ty/src/infer/unify.rs:215), `lower_closure_params` fills the caller's `Extend` (crates/hir-ty/src/lower.rs:1195), the solver rows are mem-db-solver's.",
+  "state": "applied",
+  "created": "2026-10-30T03:38:22Z",
+  "updated": "2026-10-30T09:56:54Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-closure.md#`closure.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-closure.md:636"
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:54Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:38): notes, each row settled by its owner: `obligations_for_self_ty` stays (mem-db-infer-ctx.md U3, crates/hir-ty/src/infer/unify.rs:215), `lower_closure_params` fills the caller's `Extend` (crates/hir-ty/src/lower.rs:1195), the solver rows are mem-db-solver's."
+    }
+  ]
+}

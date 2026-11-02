@@ -6,12 +6,11 @@ use hir_def::TraitId;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     Interner,
-    solve::{BuiltinImplSource, CandidateSource, Certainty, inspect::ProbeKind},
+    solve::{BuiltinImplSource, CandidateSource, Certainty, ParamEnvSource, inspect::ProbeKind},
 };
 
 use crate::{
     Span,
-    db::InternedOpaqueTyId,
     next_solver::{
         AnyImplId, Const, ErrorGuaranteed, GenericArgs, Goal, TraitRef, Ty, TypeError,
         infer::{
@@ -23,7 +22,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SelectionError<'db> {
     /// The trait is not implemented.
     Unimplemented,
@@ -37,10 +36,6 @@ pub enum SelectionError<'db> {
     NotConstEvaluatable(NotConstEvaluatable),
     /// Exceeded the recursion depth during type projection.
     Overflow(OverflowError),
-    /// Computing an opaque type's hidden type caused an error (e.g. a cycle error).
-    /// We can thus not know whether the hidden type implements an auto trait, so
-    /// we should not presume anything about it.
-    OpaqueTypeAutoTraitLeakageUnknown(InternedOpaqueTyId<'db>),
     /// Error for a `ConstArgHasType` goal
     ConstArgHasWrongType { ct: Const<'db>, ct_ty: Ty<'db>, expected_ty: Ty<'db> },
 }
@@ -136,7 +131,7 @@ pub enum OverflowError {
     Canonical,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SignatureMismatchData<'db> {
     pub(crate) found_trait_ref: TraitRef<'db>,
     pub(crate) expected_trait_ref: TraitRef<'db>,
@@ -222,14 +217,19 @@ impl<'db, N> ImplSource<'db, N> {
     where
         F: FnMut(N) -> M,
     {
+        // The `collect`s below map `Vec<N>`'s `IntoIter` into a `Vec<M>`: std collects that in
+        // place when `M` fits `N`'s buffer, and a zero-sized `M` needs no buffer.
         match self {
             ImplSource::UserDefined(i) => ImplSource::UserDefined(ImplSourceUserDefinedData {
                 impl_def_id: i.impl_def_id,
                 args: i.args,
+                // alloc: in place or zero-sized, see above.
                 nested: i.nested.into_iter().map(f).collect(),
             }),
+            // alloc: in place or zero-sized, see above.
             ImplSource::Param(n) => ImplSource::Param(n.into_iter().map(f).collect()),
             ImplSource::Builtin(source, n) => {
+                // alloc: in place or zero-sized, see above.
                 ImplSource::Builtin(source, n.into_iter().map(f).collect())
             }
         }
@@ -301,7 +301,7 @@ impl<'db> ProofTreeVisitor<'db> for Select {
 
         // Don't winnow until `Certainty::Yes` -- we don't need to winnow until
         // codegen, and only on the good path.
-        if matches!(goal.result().unwrap(), Certainty::Maybe { .. }) {
+        if matches!(goal.result().unwrap(), Certainty::Maybe(_)) {
             return ControlFlow::Break(Ok(None));
         }
 
@@ -332,9 +332,9 @@ fn candidate_should_be_dropped_in_favor_of<'db>(
     victim: &InspectCandidate<'_, 'db>,
     other: &InspectCandidate<'_, 'db>,
 ) -> bool {
-    // Don't winnow until `Certainty::Yes` -- we don't need to winnow until
-    // codegen, and only on the good path.
-    if matches!(other.result().unwrap(), Certainty::Maybe { .. }) {
+    // Don't winnow until `Certainty::Yes` -- we don't need to winnow until constant evaluation or
+    // codegen.
+    if matches!(other.result().unwrap(), Certainty::Maybe(_)) {
         return false;
     }
 
@@ -374,28 +374,41 @@ fn candidate_should_be_dropped_in_favor_of<'db>(
             victim.goal().infcx().interner.impl_specializes(other_def_id, victim_def_id)
         }
 
+        // Prefer impl candidates over global where clause candidates. Unless `generic_const_args`
+        // is enabled, we currently don't use an empty environment when resolving and evaluating
+        // constants to lower them to patterns. If we don't drop where clause candidates here, we
+        // can fail to select impl candidates (#162331).
+        (
+            CandidateSource::ParamEnv(ParamEnvSource::Global),
+            CandidateSource::Impl(_) | CandidateSource::BuiltinImpl(_),
+        ) => true,
+
         _ => false,
     }
 }
 
 fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Selection<'db>> {
-    if let Certainty::Maybe { .. } = cand.shallow_certainty() {
+    if let Certainty::Maybe(_) = cand.shallow_certainty() {
         return None;
     }
 
     let nested = match cand.result().expect("expected positive result") {
+        // alloc: an empty `Vec` does not allocate.
         Certainty::Yes => Vec::new(),
-        Certainty::Maybe { .. } => cand
+        Certainty::Maybe(_) => cand
             .instantiate_nested_goals(span)
             .into_iter()
             .map(|nested| {
                 Obligation::new(
                     nested.infcx().interner,
-                    ObligationCause::dummy(),
+                    ObligationCause::new(span),
                     nested.goal().param_env,
                     nested.goal().predicate,
                 )
             })
+            // The selection owns its nested obligations: one exact-size buffer per ambiguous
+            // selection, and `lookup_impl_method`'s memo runs a selection once per key.
+            // alloc: the returned selection owns these; once per memoized key.
             .collect(),
     };
 
@@ -428,4 +441,35 @@ fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Sele
             panic!("didn't expect to assemble trait candidate from {:#?}", cand.kind())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvaluationResult::*, ImplSource};
+    use rustc_type_ir::solve::BuiltinImplSource;
+
+    #[test]
+    fn evaluation_results_are_ordered_by_strength() {
+        assert!(EvaluatedToOk.must_apply_considering_regions());
+        assert!(EvaluatedToOkModuloRegions.must_apply_modulo_regions());
+        assert!(!EvaluatedToOkModuloOpaqueTypes.must_apply_modulo_regions());
+        assert!(EvaluatedToAmbigStackDependent.may_apply());
+        assert!(!EvaluatedToErr.may_apply());
+        assert!(EvaluatedToAmbigStackDependent.is_stack_dependent());
+        assert_eq!(EvaluatedToOk.max(EvaluatedToAmbig).max(EvaluatedToErr), EvaluatedToErr);
+    }
+
+    /// `find_matching_impl` maps a selection's nested obligations into registrations (`()`);
+    /// mapping to a same-sized or zero-sized value reuses the buffer.
+    #[test]
+    fn impl_source_map_reuses_its_buffer() {
+        let param = ImplSource::<u32>::Param((0..64).collect());
+        let builtin = ImplSource::<u32>::Builtin(BuiltinImplSource::Misc, (0..64).collect());
+        let (param, builtin) =
+            blaze_alloc_count::assert_at_most(0, "ImplSource::map in place", || {
+                (param.map(|n| n + 1), builtin.map(|_| ()))
+            });
+        assert_eq!(param.borrow_nested_obligations(), &(1..65).collect::<Vec<u32>>()[..]);
+        assert_eq!(builtin.nested_obligations().len(), 64);
+    }
 }

@@ -1,0 +1,37 @@
+{
+  "id": "00331",
+  "from_lane": "usercode-hot-core",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-testsel/src/select.rs",
+    "crates/blaze-usercode/src/test/select.rs",
+    "crates/blaze-testsel"
+  ],
+  "what": "## 2. `blaze-testsel` (fastcompile): drop `Clone` from `Choice` and `Why`, then from `test::Input`\n\n- **Where:** `crates/blaze-testsel/src/select.rs`: `#[derive(Clone, PartialEq, Eq, Debug)]` on\n  `pub enum Choice` and on `pub enum Why`, whose `Why::Read(Input)` holds\n  `blaze_usercode::test::Input`.\n- **What:** remove `Clone` from both if nothing clones them, then remove it from `pub enum\n  Input` in `crates/blaze-usercode/src/test/select.rs`, the only selection type there that\n  still derives it.\n- **Why:** an `Input` is a path or a variable name for an explanation; `blaze-usercode`'s own\n  `Why` and `Decision` no longer derive `Clone`.\n\n> forwarded to fastcompile (rerouted by usercode-hot-core; pass 16 had sent it to its author).\n> returned by usercode-hot-core: this is a request *from* usercode-hot-core, for fastcompile, which owns `crates/blaze-testsel/`; usercode-hot-core can't edit it. Still needed: `Choice` and `Why` derive `Clone` at `select.rs:56-82`. Once fastcompile lands it, usercode-hot-core drops `Input`'s `Clone`.",
+  "state": "applied",
+  "created": "2026-10-30T03:32:09Z",
+  "updated": "2026-10-30T14:21:25Z",
+  "taken_by": "fastcompile-testsel",
+  "why": null,
+  "source": "v2/requests/usercode-hot-core.md#2. `blaze-testsel` (fastcompile): drop `Clone` from `Choice` and `Why`, then from `test::Input`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-hot-core.md:23"
+    },
+    {
+      "at": "2026-10-30T14:21:25Z",
+      "by": "fastcompile-testsel",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:21:25Z",
+      "by": "fastcompile-testsel",
+      "action": "done",
+      "note": "`Choice` and `Why` in crates/blaze-testsel/src/select.rs derive `PartialEq, Eq, Debug` only; nothing in blaze-testsel or blaze-cargo cloned either (`Choice::Cached` and `Why::Read(input)` are moved). `Cached` keeps `Clone` (its `Basis` is copied out of the selector's summary). `test::Input`'s `Clone` is usercode's to drop: queued to usercode. Not built."
+    }
+  ]
+}

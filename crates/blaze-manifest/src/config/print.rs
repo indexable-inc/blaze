@@ -11,12 +11,10 @@ use anyhow::{Context as _, bail};
 use cargo_platform::Cfg;
 
 use super::Config;
+use crate::files::Files;
 use super::target::{CompileKind, Flags};
 
-/// What rustc answers to the arguments given, run as cargo runs it: `Err` when it fails.
-pub type Rustc<'a> = dyn FnMut(&[String]) -> anyhow::Result<String> + 'a;
-
-impl Config {
+impl<F: Files> Config<F> {
     /// The rustc cargo runs, as `GlobalContext::get_tool`: `RUSTC` (against the current
     /// directory when it has a separator), else `build.rustc`. `None` is cargo's default,
     /// the toolchain's own rustc.
@@ -57,13 +55,14 @@ impl Config {
     /// The flags every rustc of a unit of `kind` gets in a build for `requested`, and the
     /// target's `cfg` under them, as cargo's `TargetInfo::new` finds them: `rustflags` without
     /// the `cfg` tables first, then again with the `cfg` rustc prints under those, at most
-    /// twice, warning when they still differ. `cfg` is rustc's answer for those flags.
+    /// twice, warning when they still differ. `cfg` is rustc's answer for those flags. `rustc`
+    /// answers the arguments given as the rustc cargo runs would, `Err` when it fails.
     pub fn target_rustflags(
         &self,
         requested: &[CompileKind],
         host: &str,
         kind: &CompileKind,
-        rustc: &mut Rustc<'_>,
+        rustc: &mut impl FnMut(&[String]) -> anyhow::Result<String>,
     ) -> anyhow::Result<(Vec<String>, Vec<Cfg>)> {
         let mut rustflags = self.extra_args(requested, host, None, kind, Flags::Rust)?;
         let mut turn = 0;
@@ -96,7 +95,7 @@ impl Config {
         targets: &[String],
         what: &str,
         rustc_args: &[String],
-        rustc: &mut Rustc<'_>,
+        rustc: &mut impl FnMut(&[String]) -> anyhow::Result<String>,
     ) -> anyhow::Result<String> {
         let verbose = rustc(&["-vV".to_owned()])?;
         let host = verbose

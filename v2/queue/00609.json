@@ -1,0 +1,39 @@
+{
+  "id": "00609",
+  "from_lane": "db-ty",
+  "owner": "db",
+  "paths": [
+    "vendor/rustc_type_ir",
+    "vendor/rustc_next_trait_solver",
+    "v2/requests/db-ty-types.md",
+    "v2/requests/db-ty-solver.md",
+    "docs/v2/plan/lanes/db.md"
+  ],
+  "what": "## 11. Lane db (parent): `vendor/rustc_type_ir` and `vendor/rustc_next_trait_solver` for db-ty's children\n\nWhat: let `db-ty-types` change `vendor/rustc_type_ir` and `db-ty-solver` change\n`vendor/rustc_next_trait_solver`, or apply their requests (`v2/requests/db-ty-types.md`,\n`v2/requests/db-ty-solver.md`).\nWhy: \"types and the trait solver are u32-indexed tables\" (`docs/v2/plan/lanes/db.md`, Done when) is half in\nthose crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.\n\n> forwarded to db: both vendor crates are lane db's own; db-ty is its child.\n> checked by db-audit-dbsub (2026-10-29 22:40): a permission, no edit of its own: lane db applies both children's vendor requests; each is settled under its own section in `v2/requests/db-ty-types.md` and `db-ty-solver.md` (audited by db-audit-dbsub-tysmall).",
+  "state": "applied",
+  "created": "2026-10-30T05:40:00Z",
+  "updated": "2026-10-30T09:56:55Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty.md#11. Lane db (parent): `vendor/rustc_type_ir` and `vendor/rustc_next_trait_solver` for db-ty's children",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:142"
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:55Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub (2026-10-29 22:40): a permission, no edit of its own: lane db applies both children's vendor requests; each is settled under its own section in `v2/requests/db-ty-types.md` and `db-ty-solver.md` (audited by db-audit-dbsub-tysmall)."
+    }
+  ]
+}

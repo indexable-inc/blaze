@@ -1,191 +1,126 @@
 //! Things related to generic args in the next-trait-solver (`GenericArg`, `GenericArgs`, `Term`).
 //!
-//! Implementations of `GenericArg` and `Term` are pointer-tagged instead of an enum (rustc does
-//! the same). This is done to save memory (which also helps speed) - one `GenericArg` is a machine
-//! word instead of two, while matching on it is basically as cheap. The implementation for both
+//! Implementations of `GenericArg` and `Term` are tagged rows instead of an enum (rustc tags a
+//! pointer the same way). This is done to save memory (which also helps speed) - one `GenericArg`
+//! is a `u32`, while matching on it is basically as cheap. The implementation for both
 //! `GenericArg` and `Term` is shared in [`GenericArgImpl`]. This both simplifies the implementation,
 //! as well as enables a noop conversion from `Term` to `GenericArg`.
 
-use std::{hint::unreachable_unchecked, marker::PhantomData, ptr::NonNull};
+use std::{marker::PhantomData, num::NonZeroU32};
 
 use arrayvec::ArrayVec;
 use hir_def::{GenericDefId, GenericParamId, hir::generics::LifetimeParamData};
-use intern::InternedRef;
 use rustc_type_ir::{
-    ClosureArgs, ConstVid, CoroutineArgs, CoroutineClosureArgs, FallibleTypeFolder,
-    GenericTypeVisitable, Interner, TyVid, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor,
-    Variance,
+    ClosureArgs, CoroutineArgs, CoroutineClosureArgs, FallibleTypeFolder, GenericTypeVisitable,
+    Interner, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor, Variance,
     inherent::{GenericArg as _, GenericsOf, IntoKind, SliceLike, Term as _, Ty as _},
     relate::{Relate, VarianceDiagInfo},
     walk::TypeWalker,
 };
 
+use crate::db::HirDatabase;
 use crate::next_solver::{
-    ConstInterned, RegionInterned, TyInterned, impl_foldable_for_interned_slice,
-    impl_foldable_for_stored_type, interned_slice,
+    impl_foldable_for_interned_slice, impl_foldable_for_stored_type, interned_slice,
+    interner::table,
 };
 
 use super::{
-    Const, DbInterner, EarlyParamRegion, ErrorGuaranteed, ParamConst, Region, SolverDefId, Ty,
-    generics::Generics,
+    Const, ConstExt, DbInterner, EarlyParamRegion, ErrorGuaranteed, InternedConst,
+    InternedRegion, ParamConst, Region, RegionExt, SolverDefId, Ty, generics::Generics,
 };
 
 pub type GenericArgKind<'db> = rustc_type_ir::GenericArgKind<DbInterner<'db>>;
 pub type TermKind<'db> = rustc_type_ir::TermKind<DbInterner<'db>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 struct GenericArgImpl<'db> {
     /// # Invariant
     ///
-    /// Contains an [`InternedRef`] of a [`Ty`], [`Const`] or [`Region`], bit-tagged as per the consts below.
-    ptr: NonNull<()>,
+    /// The row of a [`Ty`], [`Const`] or [`Region`] in its table, shifted left by two, with the
+    /// tag of its kind (the consts below) in the low two bits.
+    packed: NonZeroU32,
     _marker: PhantomData<(Ty<'db>, Const<'db>, Region<'db>)>,
 }
 
-// SAFETY: We essentially own the `Ty`, `Const` or `Region`, and they are `Send + Sync`.
-unsafe impl Send for GenericArgImpl<'_> {}
-unsafe impl Sync for GenericArgImpl<'_> {}
+const _: () = assert!(size_of::<Option<GenericArgImpl<'static>>>() == 4);
 
 impl<'db> GenericArgImpl<'db> {
-    const KIND_MASK: usize = 0b11;
-    const PTR_MASK: usize = !Self::KIND_MASK;
-    const TY_TAG: usize = 0b00;
-    const CONST_TAG: usize = 0b01;
-    const REGION_TAG: usize = 0b10;
+    const KIND_MASK: u32 = 0b11;
+    const TY_TAG: u32 = 0b00;
+    const CONST_TAG: u32 = 0b01;
+    const REGION_TAG: u32 = 0b10;
+
+    #[inline]
+    fn pack(row: NonZeroU32, tag: u32) -> Self {
+        // A row is at most `table::LAST_ROW`, so two bits are free above it.
+        debug_assert!(row.get() <= table::LAST_ROW);
+        let packed = NonZeroU32::new((row.get() << 2) | tag).expect("a row is at least 1");
+        Self { packed, _marker: PhantomData }
+    }
+
+    #[inline]
+    fn row(self) -> NonZeroU32 {
+        NonZeroU32::new(self.packed.get() >> 2).expect("`pack` shifted a row of at least 1")
+    }
 
     #[inline]
     fn new_ty(ty: Ty<'db>) -> Self {
-        Self {
-            // SAFETY: We create it from an `InternedRef`, and it's never null.
-            ptr: unsafe {
-                NonNull::new_unchecked(
-                    ty.interned
-                        .as_raw()
-                        .cast::<()>()
-                        .cast_mut()
-                        .map_addr(|addr| addr | Self::TY_TAG),
-                )
-            },
-            _marker: PhantomData,
-        }
+        Self::pack(ty.row(), Self::TY_TAG)
     }
 
     #[inline]
-    fn new_const(ty: Const<'db>) -> Self {
-        Self {
-            // SAFETY: We create it from an `InternedRef`, and it's never null.
-            ptr: unsafe {
-                NonNull::new_unchecked(
-                    ty.interned
-                        .as_raw()
-                        .cast::<()>()
-                        .cast_mut()
-                        .map_addr(|addr| addr | Self::CONST_TAG),
-                )
-            },
-            _marker: PhantomData,
-        }
+    fn new_const(konst: Const<'db>) -> Self {
+        Self::pack(konst.0.row(), Self::CONST_TAG)
     }
 
     #[inline]
-    fn new_region(ty: Region<'db>) -> Self {
-        Self {
-            // SAFETY: We create it from an `InternedRef`, and it's never null.
-            ptr: unsafe {
-                NonNull::new_unchecked(
-                    ty.interned
-                        .as_raw()
-                        .cast::<()>()
-                        .cast_mut()
-                        .map_addr(|addr| addr | Self::REGION_TAG),
-                )
-            },
-            _marker: PhantomData,
-        }
+    fn new_region(region: Region<'db>) -> Self {
+        Self::pack(region.0.row(), Self::REGION_TAG)
     }
 
     #[inline]
     fn kind(self) -> GenericArgKind<'db> {
-        let ptr = self.ptr.as_ptr().map_addr(|addr| addr & Self::PTR_MASK);
-        // SAFETY: We can only be created from a `Ty`, a `Const` or a `Region`, and the tag will match.
-        unsafe {
-            match self.ptr.addr().get() & Self::KIND_MASK {
-                Self::TY_TAG => GenericArgKind::Type(Ty {
-                    interned: InternedRef::from_raw(ptr.cast::<TyInterned>()),
-                }),
-                Self::CONST_TAG => GenericArgKind::Const(Const {
-                    interned: InternedRef::from_raw(ptr.cast::<ConstInterned>()),
-                }),
-                Self::REGION_TAG => GenericArgKind::Lifetime(Region {
-                    interned: InternedRef::from_raw(ptr.cast::<RegionInterned>()),
-                }),
-                _ => unreachable_unchecked(),
+        match self.packed.get() & Self::KIND_MASK {
+            Self::TY_TAG => GenericArgKind::Type(Ty::at(self.row())),
+            Self::CONST_TAG => {
+                GenericArgKind::Const(rustc_type_ir::Const(InternedConst::at(self.row())))
             }
+            Self::REGION_TAG => {
+                GenericArgKind::Lifetime(rustc_type_ir::Region(InternedRegion::at(self.row())))
+            }
+            tag => unreachable!("`pack` gave a generic argument the tag {tag}"),
         }
     }
 
     #[inline]
     fn term_kind(self) -> TermKind<'db> {
-        let ptr = self.ptr.as_ptr().map_addr(|addr| addr & Self::PTR_MASK);
-        // SAFETY: We can only be created from a `Ty`, a `Const` or a `Region`, and the tag will match.
-        // It is the caller's responsibility (encapsulated within this module) to only call this with
-        // `Term`, which cannot be constructed from a `Region`.
-        unsafe {
-            match self.ptr.addr().get() & Self::KIND_MASK {
-                Self::TY_TAG => {
-                    TermKind::Ty(Ty { interned: InternedRef::from_raw(ptr.cast::<TyInterned>()) })
-                }
-                Self::CONST_TAG => TermKind::Const(Const {
-                    interned: InternedRef::from_raw(ptr.cast::<ConstInterned>()),
-                }),
-                _ => unreachable_unchecked(),
-            }
+        // It is the caller's responsibility (encapsulated within this module) to only call this
+        // with `Term`, which cannot be constructed from a `Region`.
+        match self.packed.get() & Self::KIND_MASK {
+            Self::TY_TAG => TermKind::Ty(Ty::at(self.row())),
+            Self::CONST_TAG => TermKind::Const(rustc_type_ir::Const(InternedConst::at(self.row()))),
+            tag => unreachable!("a term is a type or a constant, not the tag {tag}"),
         }
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+/// A generic argument as kept in a query result: its packed row, which stays valid in every
+/// revision, as an interned value is never freed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredGenericArg {
     ptr: GenericArgImpl<'static>,
-}
-
-impl Clone for StoredGenericArg {
-    #[inline]
-    fn clone(&self) -> Self {
-        match self.ptr.kind() {
-            GenericArgKind::Lifetime(it) => std::mem::forget(it.interned.to_owned()),
-            GenericArgKind::Type(it) => std::mem::forget(it.interned.to_owned()),
-            GenericArgKind::Const(it) => std::mem::forget(it.interned.to_owned()),
-        }
-        Self { ptr: self.ptr }
-    }
-}
-
-impl Drop for StoredGenericArg {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            match self.ptr.kind() {
-                GenericArgKind::Lifetime(it) => it.interned.decrement_refcount(),
-                GenericArgKind::Type(it) => it.interned.decrement_refcount(),
-                GenericArgKind::Const(it) => it.interned.decrement_refcount(),
-            }
-        }
-    }
 }
 
 impl StoredGenericArg {
     #[inline]
     fn new(value: GenericArg<'_>) -> Self {
-        let result = Self { ptr: GenericArgImpl { ptr: value.ptr.ptr, _marker: PhantomData } };
-        // Increase refcount.
-        std::mem::forget(result.clone());
-        result
+        Self { ptr: GenericArgImpl { packed: value.ptr.packed, _marker: PhantomData } }
     }
 
     #[inline]
     pub fn as_ref<'db>(&self) -> GenericArg<'db> {
-        GenericArg { ptr: self.ptr }
+        GenericArg { ptr: GenericArgImpl { packed: self.ptr.packed, _marker: PhantomData } }
     }
 }
 
@@ -342,7 +277,8 @@ impl<'db> IntoKind for GenericArg<'db> {
     }
 }
 
-impl<'db, V> GenericTypeVisitable<V> for GenericArg<'db>
+// SAFETY: the packed row is one type, region or constant, and this visits it as its kind.
+unsafe impl<'db, V> GenericTypeVisitable<V> for GenericArg<'db>
 where
     GenericArgKind<'db>: GenericTypeVisitable<V>,
 {
@@ -351,7 +287,8 @@ where
     }
 }
 
-impl<'db, V> GenericTypeVisitable<V> for Term<'db>
+// SAFETY: the packed row is one type or constant, and this visits it as its kind.
+unsafe impl<'db, V> GenericTypeVisitable<V> for Term<'db>
 where
     TermKind<'db>: GenericTypeVisitable<V>,
 {
@@ -672,19 +609,19 @@ impl<'db> rustc_type_ir::inherent::GenericArgs<DbInterner<'db>> for GenericArgs<
     fn type_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Ty {
         self.get(i)
             .and_then(|g| g.as_type())
-            .unwrap_or_else(|| Ty::new_error(DbInterner::conjure(), ErrorGuaranteed))
+            .unwrap_or_else(|| super::default_types().types.error)
     }
 
-    fn region_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Region {
+    fn region_at(self, i: usize) -> Region<'db> {
         self.get(i)
             .and_then(|g| g.as_region())
-            .unwrap_or_else(|| Region::error(DbInterner::conjure()))
+            .unwrap_or_else(|| super::default_types().regions.error)
     }
 
-    fn const_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Const {
+    fn const_at(self, i: usize) -> Const<'db> {
         self.get(i)
             .and_then(|g| g.as_const())
-            .unwrap_or_else(|| Const::error(DbInterner::conjure()))
+            .unwrap_or_else(|| super::default_types().consts.error)
     }
 
     fn split_closure_args(self) -> rustc_type_ir::ClosureArgsParts<DbInterner<'db>> {
@@ -808,24 +745,6 @@ impl<'db> Relate<DbInterner<'db>> for Term<'db> {
 
 impl<'db> rustc_type_ir::inherent::Term<DbInterner<'db>> for Term<'db> {}
 
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub enum TermVid {
-    Ty(TyVid),
-    Const(ConstVid),
-}
-
-impl From<TyVid> for TermVid {
-    fn from(value: TyVid) -> Self {
-        TermVid::Ty(value)
-    }
-}
-
-impl From<ConstVid> for TermVid {
-    fn from(value: ConstVid) -> Self {
-        TermVid::Const(value)
-    }
-}
-
 impl<'db> DbInterner<'db> {
     pub(super) fn mk_args(self, args: &[GenericArg<'db>]) -> GenericArgs<'db> {
         GenericArgs::new_from_slice(args)
@@ -837,5 +756,55 @@ impl<'db> DbInterner<'db> {
         T: rustc_type_ir::CollectAndApply<GenericArg<'db>, GenericArgs<'db>>,
     {
         T::collect_and_apply(iter, |xs| self.mk_args(xs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_type_ir::{InferConst, RegionKind, TyKind, UintTy, inherent::GenericArg as _};
+
+    use super::*;
+
+    fn u8_ty<'db>() -> Ty<'db> {
+        Ty::intern(TyKind::Uint(UintTy::U8))
+    }
+
+    fn re_static<'db>() -> Region<'db> {
+        Region::new_without_interner(RegionKind::ReStatic)
+    }
+
+    fn fresh_const<'db>() -> Const<'db> {
+        Const::new_without_interner(rustc_type_ir::ConstKind::Infer(InferConst::Fresh(3)))
+    }
+
+    #[test]
+    fn every_kind_of_arg_reads_back_as_itself() {
+        let ty = u8_ty();
+        let region = re_static();
+        let konst = fresh_const();
+        assert!(GenericArg::from(ty).kind() == GenericArgKind::Type(ty));
+        assert!(GenericArg::from(region).kind() == GenericArgKind::Lifetime(region));
+        assert!(GenericArg::from(konst).kind() == GenericArgKind::Const(konst));
+        assert!(GenericArg::from(region).as_term().is_none());
+    }
+
+    #[test]
+    fn a_region_arg_packs_the_handle_row() {
+        let region = re_static();
+        let arg = GenericArg::from(region);
+        assert!(arg.ptr.row() == region.0.row());
+        assert!(arg.ptr.packed.get() & GenericArgImpl::KIND_MASK == GenericArgImpl::REGION_TAG);
+    }
+
+    #[test]
+    fn every_kind_of_term_reads_back_as_itself_and_converts_for_free() {
+        let ty = u8_ty();
+        let konst = fresh_const();
+        let terms = [(Term::from(ty), TermKind::Ty(ty)), (Term::from(konst), TermKind::Const(konst))];
+        for (term, kind) in terms {
+            assert!(term.kind() == kind);
+            assert!(GenericArg::from(term).as_term() == Some(term));
+            assert!(!term.is_non_rigid_alias());
+        }
     }
 }

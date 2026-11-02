@@ -1,0 +1,36 @@
+{
+  "id": "01251",
+  "from_lane": "tests-engine",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/memo.rs"
+  ],
+  "what": "blaze-cargo serve::tests::a_build_whose_load_fails_before_its_units_ends_not_ok_and_the_daemon_answers_the_next (round6-test.log:3459, also cargo-test3) panics `a row never written` (table.rs:201 debug_assert in Rows::row) from Database::complete lib.rs:2004 (Pending::ColdMap arm: self.store.in_memory(&task, entry.memo)) -> memo.rs:621 in_memory -> :562 value -> :513 hot -> table.rs:239 get. The entry came from write_cold (lib.rs:2607), whose own in_memory(memo) on the same MemoId read the row, and the memo was pinned; Rows::committed only grows and the daemon never replaces its Database or Store (daemon.rs:547-556 make it once). So between ColdWrite and ColdMap the MemoId names a row the hot table does not hold: a memo freed and its id reused / table swapped by sweep or reclaim despite the pin, or entries from another Store. Test: a build whose manifest load fails (checkout `fail`), then Cargo.toml changed and a second build; panics in the second. Reproduce with `cargo test -p blaze-cargo --lib serve::tests::a_build_whose_load_fails` (debug assertions on). From tests-engine (edit-only).",
+  "state": "applied",
+  "created": "2026-10-31T12:08:41Z",
+  "updated": "2026-10-31T12:13:54Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:08:41Z",
+      "by": "tests-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:09:40Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T12:13:54Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Cause: Database::settle swaps in the image store (*self = new) but carried io.pending over as is, so a cold pack still being written or mapped kept ColdEntries naming the OLD store memos; its ColdMap completion then read them in the new store hot rows (never written there). Fix (blaze-query lib.rs, both trees): settle turns ColdWrite/ColdMap into Pending::Stale; its Written or Mapped completion removes the pack (Effect::Remove), the dropped store values being in the image. Tests a_cold_pack_written_across_a_settle_is_removed / a_cold_pack_mapped_across_a_settle_is_removed in blaze-query tests.rs. rust-analyzer clean; needs a cargo test of blaze-query and blaze-cargo serve::tests."
+    }
+  ]
+}

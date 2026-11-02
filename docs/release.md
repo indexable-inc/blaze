@@ -25,7 +25,8 @@ part of every crate's identity (`CARGO_PKG_VERSION`), so a version committed wit
 made every build of main after it miss blaze's store and rebuild all of blaze. A release's
 build is told which release it is by `BLAZE_RELEASE` (the tag), which release.yaml sets and
 only `crates/blaze-engine/build.rs` reads, the one crate that changes with every commit anyway;
-the rest of blaze is asked through `blaze_cargo::engine`. It says
+the program's `main` (`program.rs`) hands it to the rest of blaze (`blaze_cargo::release::set`)
+before any command runs. It says
 
     blaze 0.20261028.9 (fb82b09 2026-10-28)     a release: the version, the commit and its date (UTC)
     blaze 0.0.0-dev (fb82b09)                   a build of the tree: no release, and no pin names it
@@ -91,7 +92,8 @@ main's HEAD the same way (`train_release.py`): a tag through the API and release
 no commit. Both count every tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
-(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`. PGO is off for now (#870):
+(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS` (what a
+pinned release's fetch checks). PGO is off for now (#870):
 the release is built with `--no-pgo`.
 
 ## Promotion to stable
@@ -104,7 +106,8 @@ published archives, installed with `install.sh --version <v>` as a user installs
 (Apple silicon) and Linux (x86-64 and ARM64):
 
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
-  `Hello, world!`;
+  `Hello, world!` (v2's blaze has no `new` command, so a v2 release fails this check until it
+  has one or the check makes the package itself);
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
 - each application of the corpus (below), in two jobs of its own per platform: **works** (its
   dev and release builds run, its tests pass under `blaze test`) and **speed** (`harness/bench.py`

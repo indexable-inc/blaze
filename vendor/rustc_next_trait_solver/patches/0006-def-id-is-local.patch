@@ -1,0 +1,21 @@
+diff -ruN a/src/coherence.rs b/src/coherence.rs
+--- a/src/coherence.rs
++++ b/src/coherence.rs
+@@ -94,7 +94,7 @@
+ }
+ 
+ pub fn trait_ref_is_local_or_fundamental<I: Interner>(tcx: I, trait_ref: ty::TraitRef<I>) -> bool {
+-    trait_ref.def_id.is_local() || tcx.trait_is_fundamental(trait_ref.def_id)
++    trait_ref.def_id.is_local(tcx) || tcx.trait_is_fundamental(trait_ref.def_id)
+ }
+ 
+ TrivialTypeTraversalImpls! { IsFirstInputType, }
+@@ -298,7 +298,7 @@
+ 
+     fn def_id_is_local(&mut self, def_id: impl DefId<I>) -> bool {
+         match self.in_crate {
+-            InCrate::Local { .. } => def_id.is_local(),
++            InCrate::Local { .. } => def_id.is_local(self.infcx.cx()),
+             InCrate::Remote => false,
+         }
+     }

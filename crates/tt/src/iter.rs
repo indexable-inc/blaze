@@ -174,15 +174,7 @@ impl<'a> TtIter<'a> {
         if self.inner.is_empty() {
             return None;
         }
-        let mut slice = self.inner.slice;
-        match slice.advance()? {
-            TokenTree::Leaf(leaf) => Some(TtElement::Leaf(leaf)),
-            TokenTree::Subtree(subtree) => {
-                let nested_iter =
-                    TtIter { inner: TokenTreesView { len: subtree.usize_len(), slice } };
-                Some(TtElement::Subtree(subtree, nested_iter))
-            }
-        }
+        Some(element_at(self.inner).0)
     }
 
     /// Equivalent to `peek().is_none()`, but a bit faster.
@@ -208,7 +200,8 @@ impl<'a> TtIter<'a> {
     }
 
     pub fn from_savepoint(&self, savepoint: TtIterSavepoint<'a>) -> TokenTreesView<'a> {
-        TokenTreesView { slice: savepoint.0.slice, len: savepoint.0.len - self.inner.len }
+        let len = (savepoint.0.len() - self.inner.len()) as u32;
+        TokenTreesView { end: savepoint.0.start + len, ..savepoint.0 }
     }
 
     pub fn next_as_view(&mut self) -> Option<TokenTreesView<'a>> {
@@ -245,23 +238,35 @@ impl TtElement<'_> {
     }
 }
 
+/// The element `view` starts with, which it has, and where the next one starts.
+#[inline]
+fn element_at(view: TokenTreesView<'_>) -> (TtElement<'_>, u32) {
+    let (tree, at) = (view.tree, view.start);
+    match tree.is_subtree(at) {
+        false => (TtElement::Leaf(tree.leaf_at(at)), at + 1),
+        true => {
+            let subtree = tree.subtree_at(at);
+            let end = at + 1 + subtree.len;
+            let inner = TokenTreesView { tree, start: at + 1, end };
+            (TtElement::Subtree(subtree, TtIter { inner }), end)
+        }
+    }
+}
+
 impl<'a> Iterator for TtIter<'a> {
     type Item = TtElement<'a>;
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.inner.is_empty() {
             return None;
         }
-        self.inner.len -= 1;
-        let (tt, subtree_slice) = self.inner.slice.advance_skip_subtree()?;
-        match tt {
-            TokenTree::Leaf(leaf) => Some(TtElement::Leaf(leaf)),
-            TokenTree::Subtree(subtree) => {
-                self.inner.len -= subtree.usize_len();
-                let nested_iter = TtIter {
-                    inner: TokenTreesView { len: subtree.usize_len(), slice: subtree_slice },
-                };
-                Some(TtElement::Subtree(subtree, nested_iter))
-            }
-        }
+        let (element, next) = element_at(self.inner);
+        self.inner.start = next;
+        Some(element)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::from(!self.inner.is_empty()), Some(self.inner.len()))
     }
 }

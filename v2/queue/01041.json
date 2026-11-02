@@ -1,0 +1,35 @@
+{
+  "id": "01041",
+  "from_lane": "fastcompile-wire",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/driver/later.rs"
+  ],
+  "what": "## fastcompile-wire 3 (amends 01038 item 2): `Later`'s memo hit without its store put, and the put apart\n\nA lone memo hit is answered by the thread that read the ask (`blaze_lazy::runner`, `Compiler::hit`), and its bound is about 1.6 µs. `memoized` encodes the template's `Put` (`blob::encode`, an allocation and a copy of the template, about 0.15 µs) before the function is returned, which put the hit 19% over its bound (`docs/v2/plan/lanes/fastcompile/lazy.md`, Speed of light). blaze-lazy now keeps a hit's template after the askers are answered (`Compiler::hit_answered`, `compile::Source::keep_hit`). So in place of 01038 item 2:\n\n- `Later::memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<CompiledFunction, CodegenError>>`: the recorded shape's template instantiated, nothing encoded.\n- `Later::memo_put(&self, memo: &Memo, key: InstanceKey) -> Option<Put>`: the same template's put under `keys::template(&node.stored())`, `None` where `memo_hit` gives `None`.\n\n`Build::memo_hit` can stay as the pair joined (its test in `driver/tests/later.rs` compares it with `compile_kept`). Optional, for the rest of the 0.15 µs: the memo keeps a template's encoded bytes from its `put` in `fresh`, so `memo_put` copies them instead of encoding again.",
+  "state": "applied",
+  "created": "2026-10-30T14:29:40Z",
+  "updated": "2026-10-31T21:04:29Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:29:40Z",
+      "by": "fastcompile-wire",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:29Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:29Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-codegen/src/driver/later.rs: Later::memo_hit gives the function alone (no encode, no allocation on a miss), Later::memo_put gives the put; Build::memo_hit joins them"
+    }
+  ]
+}

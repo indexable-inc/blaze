@@ -1,0 +1,37 @@
+{
+  "id": "00829",
+  "from_lane": "item-hash-identity",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/deps/signatures.rs",
+    "crates/hir-def/src/deps/signatures/table.rs",
+    "crates/hir-def/src/lib.rs"
+  ],
+  "what": "item-hash: make the store relocation of crates/hir-def/src/deps/signatures/table.rs reachable from crates/hir-def/src/item_hash.rs (new, lane item-hash): `mod table;` in deps/signatures.rs becomes `pub(crate) mod table;` and `pub(super) fn relocate_store` becomes `pub(crate) fn relocate_store`. item_hash writes a body's ExpressionStore under `relocating` and relocates it exactly as a signature record does, so a body's identity bytes are the same in every database. No behavior change. Also: lane item-hash adds the line `pub mod item_hash;` to crates/hir-def/src/lib.rs (agreed in its brief).",
+  "state": "applied",
+  "created": "2026-10-30T08:35:10Z",
+  "updated": "2026-10-30T09:44:18Z",
+  "taken_by": "item-hash",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:35:10Z",
+      "by": "item-hash-identity",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:44:17Z",
+      "by": "item-hash",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:44:18Z",
+      "by": "item-hash",
+      "action": "done",
+      "note": "Applied as targeted edits (db window had not taken it): crates/hir-def/src/deps/signatures.rs `pub(crate) mod table;`, deps/signatures/table.rs `pub(crate) fn relocate_store`, crates/hir-def/src/lib.rs `pub mod item_hash;`. Visibility only, no behavior change."
+    }
+  ]
+}

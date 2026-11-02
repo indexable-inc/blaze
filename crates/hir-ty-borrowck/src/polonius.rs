@@ -4,9 +4,9 @@
 //! live, forwards for a covariant one, backwards for a contravariant one and both ways for an
 //! invariant one. A loan is in scope until the first point it is not live at.
 
-use rustc_hash::FxHashSet;
+use hir_ty::db::HirDatabase;
+use blaze_ids::radix;
 use rustc_type_ir::{Variance, inherent::IntoKind};
-use smallvec::SmallVec;
 
 use hir_ty::{
     mir::{MirBody, OperandKind, Rvalue, StatementKind},
@@ -15,10 +15,13 @@ use hir_ty::{
 
 use super::{
     Ctx,
+    bitset::bits,
     cfg::{Cfg, Location, index},
     intervals::IntervalSet,
     loans::Loans,
+    mem::{FVec, filled},
     regions::{Regions, Rv, rv_of},
+    relation::Csr,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,16 +32,17 @@ enum Direction {
 }
 
 /// The points each loan is live at.
-pub(super) fn live_loans<'db>(
-    ctx: &Ctx<'_, 'db>,
+pub(super) fn live_loans<'a, 'db>(
+    ctx: &Ctx<'a, 'db>,
     body: &MirBody<'db>,
-    cfg: &Cfg,
-    regions: &Regions<'db>,
+    cfg: &Cfg<'_>,
+    regions: &Regions<'_, 'db>,
     count: usize,
-    liveness: &[IntervalSet],
-    loans: &Loans,
-) -> Vec<IntervalSet> {
-    let mut directions: Vec<Option<Direction>> = vec![None; count];
+    liveness: &[IntervalSet<'_>],
+    loans: &Loans<'_>,
+) -> FVec<'a, IntervalSet<'a>> {
+    let frame = ctx.frame;
+    let mut directions = filled(frame, count, None::<Direction>);
     for &ty in &regions.local_tys {
         record_variances(ctx, ty, Variance::Covariant, &mut directions);
     }
@@ -59,45 +63,63 @@ pub(super) fn live_loans<'db>(
             }
         }
     }
-    let universal: FxHashSet<Rv> = regions.universals.iter().map(|&(rv, _)| rv).collect();
-    let direction = |rv: Rv| {
-        if universal.contains(&rv) {
-            Direction::Forward
-        } else {
-            // rustc falls back to both ways for a region it has no variance of.
-            directions.get(rv).copied().flatten().unwrap_or(Direction::Both)
+    // Indexed by region, read on every step of every loan's walk: a universal region flows
+    // forwards and is live everywhere; rustc falls back to both ways for a region it has no
+    // variance of.
+    let mut universal = bits(frame, count);
+    for &(rv, _) in &regions.universals {
+        if rv < count {
+            universal.insert(rv);
         }
+    }
+    let direction = |rv: Rv| match universal.contains(rv) {
+        true => Direction::Forward,
+        false => directions.get(rv).copied().flatten().unwrap_or(Direction::Both),
     };
-    // The points each region is live at; a universal region is live everywhere.
     let all = {
-        let mut all = IntervalSet::default();
+        let mut all = IntervalSet::new(frame);
         if cfg.points > 0 {
             all.insert_range(0, cfg.points - 1);
         }
         all
     };
-    let empty = IntervalSet::default();
-    let live_at =
-        |rv: Rv| if universal.contains(&rv) { &all } else { liveness.get(rv).unwrap_or(&empty) };
-    // The localized edges out of each region, by point.
-    let mut localized: Vec<Vec<(usize, Rv)>> = vec![Vec::new(); count];
-    let mut logical: Vec<SmallVec<[Rv; 4]>> = vec![SmallVec::new(); count];
-    for constraint in &regions.outlives {
-        if constraint.sup >= count || constraint.sub >= count {
-            continue;
-        }
-        match constraint.location {
-            Some(location) => localized[constraint.sup].push((cfg.point(location), constraint.sub)),
-            None => {
-                if !logical[constraint.sup].contains(&constraint.sub) {
-                    logical[constraint.sup].push(constraint.sub);
+    let empty = IntervalSet::new(frame);
+    let live_at = |rv: Rv| match universal.contains(rv) {
+        true => &all,
+        false => liveness.get(rv).unwrap_or(&empty),
+    };
+    // The edges out of each region: those that hold at one point, sorted by point, and those
+    // that hold everywhere, each sub once.
+    let constraints = &regions.outlives;
+    let mut localized: Csr<'_, (u32, u32)> = Csr::with_capacity(frame, count, constraints.len());
+    let mut logical: Csr<'_> = Csr::with_capacity(frame, count, constraints.len());
+    for sup in 0..count {
+        for &at in constraints.of_sup(sup) {
+            let sub = constraints.sub(at as usize);
+            if sub >= count {
+                continue;
+            }
+            match constraints.location(at as usize) {
+                Some(location) => localized.push((cfg.point(location) as u32, sub as u32)),
+                None => {
+                    if !logical.open().contains(&(sub as u32)) {
+                        logical.push(sub as u32);
+                    }
                 }
             }
         }
-    }
-    for edges in &mut localized {
-        edges.sort_unstable();
-        edges.dedup();
+        let edges = localized.open_mut();
+        radix::sort_copy_by_key(edges, |&(point, sub)| radix::pack_32(point, sub));
+        let mut len = 0;
+        for at in 0..edges.len() {
+            if len == 0 || edges[at] != edges[len - 1] {
+                edges[len] = edges[at];
+                len += 1;
+            }
+        }
+        localized.truncate_open(len);
+        localized.end_node();
+        logical.end_node();
     }
     let last_of =
         |block| cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() });
@@ -105,12 +127,13 @@ pub(super) fn live_loans<'db>(
     // The graph's nodes are a region at a point, but it is walked a run of points of one block
     // at a time: what reaches a region at a run of points reaches its subregions at all of
     // them, and a region live at a run of points flows along it.
-    let mut live = Vec::with_capacity(loans.loans.len());
-    let mut visited: Vec<IntervalSet> = vec![IntervalSet::default(); count];
-    let mut touched: Vec<Rv> = Vec::new();
-    let mut stack: Vec<(Rv, usize, usize)> = Vec::new();
-    for loan in &loans.loans {
-        let mut points = IntervalSet::default();
+    let mut live = Vec::with_capacity_in(loans.loans.len(), frame);
+    let mut visited = filled(frame, count, IntervalSet::new(frame));
+    let mut touched: FVec<'_, Rv> = Vec::new_in(frame);
+    let mut stack: FVec<'_, (Rv, usize, usize)> = Vec::new_in(frame);
+    let mut runs: FVec<'_, (usize, usize)> = Vec::new_in(frame);
+    for loan in loans.loans.iter() {
+        let mut points = IntervalSet::new(frame);
         for rv in touched.drain(..) {
             visited[rv].clear();
         }
@@ -127,14 +150,17 @@ pub(super) fn live_loans<'db>(
             let (first, last) = (cfg.point(Location { block, statement: 0 }), last_of(block));
             let region_live = live_at(region);
             let direction = direction(region);
-            for (start, end) in visited[region].insert_new(start, end) {
-                for &sub in &logical[region] {
-                    stack.push((sub, start, end));
+            visited[region].insert_new(start, end, &mut runs);
+            for &(start, end) in runs.iter() {
+                for &sub in logical.of(region) {
+                    stack.push((sub as Rv, start, end));
                 }
-                let edges = &localized[region];
-                let from = edges.partition_point(|&(point, _)| point < start);
-                for &(point, sub) in edges[from..].iter().take_while(|&&(point, _)| point <= end) {
-                    stack.push((sub, point, point));
+                let edges = localized.of(region);
+                let from = edges.partition_point(|&(point, _)| (point as usize) < start);
+                for &(point, sub) in
+                    edges[from..].iter().take_while(|&&(point, _)| point as usize <= end)
+                {
+                    stack.push((sub as Rv, point as usize, point as usize));
                 }
                 for (s, e) in region_live.runs_in(start, end) {
                     points.insert_range(s, e);
@@ -165,7 +191,7 @@ pub(super) fn live_loans<'db>(
                     if end < last {
                         follow(end + 1, last);
                     } else {
-                        for &successor in &cfg.successors[index(block)] {
+                        for &successor in cfg.successors(block) {
                             follow(
                                 cfg.point(Location { block: successor, statement: 0 }),
                                 last_of(successor),
@@ -186,7 +212,7 @@ fn record_variances<'db>(
     ctx: &Ctx<'_, 'db>,
     ty: Ty<'db>,
     variance: Variance,
-    directions: &mut Vec<Option<Direction>>,
+    directions: &mut FVec<'_, Option<Direction>>,
 ) {
     if variance == Variance::Bivariant {
         return;
@@ -252,17 +278,18 @@ fn record_variances<'db>(
                 }
             }
         }
-        TyKind::Alias(alias) => {
+        TyKind::Alias(_, alias) => {
             let variances = match alias.kind {
-                rustc_type_ir::AliasTyKind::Opaque { .. } => {
-                    super::regions::opaque_captures(ctx.db, alias.kind.def_id(), alias.args.len())
+                rustc_type_ir::AliasTyKind::Opaque { def_id } => {
+                    super::regions::opaque_captures(ctx.frame, ctx.db, def_id, alias.args.len())
                         .map(|it| {
-                            it.into_iter()
-                                .map(|captured| match captured {
+                            crate::mem::collect(
+                                ctx.frame,
+                                it.into_iter().map(|captured| match captured {
                                     true => Variance::Invariant,
                                     false => Variance::Bivariant,
-                                })
-                                .collect::<Vec<_>>()
+                                }),
+                            )
                         })
                 }
                 _ => None,
@@ -278,10 +305,16 @@ fn record_variances<'db>(
         TyKind::Closure(_, args)
         | TyKind::CoroutineClosure(_, args)
         | TyKind::Coroutine(_, args)
-        | TyKind::CoroutineWitness(_, args)
-        | TyKind::FnDef(_, args) => {
+        | TyKind::CoroutineWitness(_, args) => {
             record_args(ctx, args, None, variance.xform(Variance::Invariant), directions)
         }
+        TyKind::FnDef(_, args) => record_args(
+            ctx,
+            args.no_bound_vars().unwrap(),
+            None,
+            variance.xform(Variance::Invariant),
+            directions,
+        ),
         _ => (),
     }
 }
@@ -291,7 +324,7 @@ fn record_args<'db>(
     args: GenericArgs<'db>,
     variances: Option<&[Variance]>,
     variance: Variance,
-    directions: &mut Vec<Option<Direction>>,
+    directions: &mut FVec<'_, Option<Direction>>,
 ) {
     for (index, arg) in args.iter().enumerate() {
         let param = variances.and_then(|it| it.get(index)).copied().unwrap_or(Variance::Invariant);
@@ -304,7 +337,11 @@ fn record_args<'db>(
     }
 }
 
-fn record_region(region: Region<'_>, variance: Variance, directions: &mut Vec<Option<Direction>>) {
+fn record_region(
+    region: Region<'_>,
+    variance: Variance,
+    directions: &mut FVec<'_, Option<Direction>>,
+) {
     let Some(rv) = rv_of(region) else { return };
     let direction = match variance {
         Variance::Covariant => Direction::Forward,

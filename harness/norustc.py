@@ -14,7 +14,8 @@ each run and then become the real tool, linked with rustup under a name of its o
 A scenario ends once no counted tool runs and the log has been still for a while, so what the
 daemon does after a command is counted with it.
 
---record writes this platform's and backend's counts into the baseline, after a change that
+--record writes this platform's counts into the baseline (the fixture is built in the dev
+profile, which v2 compiles with Cranelift), after a change that
 lowered them. Where a count differs from run to run (cargo's own cache of what rustc answered
 is raced by the cargos blaze runs beside it), the baseline is the highest seen. --keep leaves the work directory. Linux and macOS: the stand-ins are shell
 scripts.
@@ -29,7 +30,7 @@ FIXTURE = os.path.join(HERE, "norustc", "fixture")
 BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
-PLACE = f"{SYSTEM}-{ARCH} {os.environ.get('BLAZE_BACKEND') or 'cranelift'}"
+PLACE = f"{SYSTEM}-{ARCH}"
 COUNTED = ("rustc", "rustdoc", "cargo")
 # How long the log has to be still, with no counted tool running, for a step to be over.
 STILL = 4
@@ -178,11 +179,9 @@ def main():
     # under them: six more runs that only ask in the cold build.
     for key in [k for k in env if k.endswith("RUSTFLAGS")]:
         del env[key]
-    env.update(RUSTUP_TOOLCHAIN=name, BLAZE_HOME=home, BLAZE_CACHE=os.path.join(work, "store"),
+    env.update(RUSTUP_TOOLCHAIN=name, BLAZE_HOME=home,
                PATH=os.path.dirname(os.path.abspath(BLAZE)) + os.pathsep + env["PATH"],
                CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
-    if os.environ.get("BLAZE_BACKEND"):
-        env["BLAZE_BACKEND"] = os.environ["BLAZE_BACKEND"]
     found, failed = {}, []
     try:
         for scenario, steps in SCENARIOS:

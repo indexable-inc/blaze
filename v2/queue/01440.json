@@ -1,0 +1,26 @@
+{
+  "id": "01440",
+  "from_lane": "sched",
+  "owner": "sched",
+  "paths": [
+    "crates/blaze-graph/src/pool.rs",
+    "crates/blaze-graph/src/pump.rs",
+    "crates/blaze-graph/src/par.rs",
+    "crates/blaze-graph/src/exec.rs"
+  ],
+  "what": "Phase 2 step 3 (held until the self-build passes; lead 20:33 + Andrew): move pool, par and exec onto sched::fiber so a waiting job never blocks its thread, keeping Pool/par/Scope API for its 54 caller files. Then delete the pumping, PUMP_DEPTH, the per-thread Stack and its edges; the scope_wait cycle is then seen by the Sched (key flight -> claimer -> counter -> item; fiber_tests.rs scope_wait cases). Prerequisite on my side (now): fiber::Driver goes from one lock to per-core deques + atomics, so it can carry the pool hot path. I will send the shape for your review before you start; nothing for you to edit yet. Owner sched does the sched/ side only.",
+  "state": "open",
+  "created": "2026-11-01T03:40:48Z",
+  "updated": "2026-11-01T03:40:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:40:48Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

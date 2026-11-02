@@ -1,0 +1,39 @@
+{
+  "id": "00356",
+  "from_lane": "mem-codegen-engine",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml",
+    "crates/blaze-engine/src/lib.rs",
+    "python/typed-input/src",
+    "tools/v2/manifest_lint.py",
+    "crates/blaze-engine"
+  ],
+  "what": "## 1. Depend on blaze-mem and blaze-alloc-count; the tests count allocations (required)\n\n`crates/blaze-engine/Cargo.toml`, under `[dependencies]`, after `blaze-live = { path =\n\"../blaze-live\" }` (line 100):\n\n```toml\nblaze-mem.workspace = true\n```\n\nand under `[dev-dependencies]` (line 111), first:\n\n```toml\nblaze-alloc-count.workspace = true\n```\n\n`crates/blaze-engine/src/lib.rs:4`, after the `#![allow(clippy::print_stderr, ..)]` line:\n\n```rust\n#![feature(allocator_api)]\n```\n\n`lib.rs:43-52`, before:\n\n```rust\n/// The daemon holds millions of small allocations and frees a file's worth of them on each\n/// edit, which the system allocator is slow at. jemalloc gives the system back more of what\n/// a build freed than mimalloc does. It is not built for Windows.\n#[cfg(unix)]\n#[global_allocator]\nstatic ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\n#[cfg(windows)]\n#[global_allocator]\nstatic ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;\n```\n\nafter:\n\n```rust\n/// The daemon holds millions of small allocations and frees a file's worth of them on each\n/// edit, which the system allocator is slow at. jemalloc gives the system back more of what\n/// a build freed than mimalloc does. It is not built for Windows.\n#[cfg(all(unix, not(test)))]\n#[global_allocator]\nstatic ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\n#[cfg(all(windows, not(test)))]\n#[global_allocator]\nstatic ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;\n\n/// The tests hold the hot paths to allocation budgets.\n#[cfg(test)]\n#[global_allocator]\nstatic ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;\n```\n\n`lib.rs:15-41`, the module list: add `mod memo;` between `mod manifest;` and `mod mirdump;`.\n\n- Why: requests 2 to 10 use `blaze_mem` (`Column`, `swiss::Index`, `Arena`, `Frame`,\n  `scratch`); `Vec::new_in` and `Vec<T, &Frame>` need `allocator_api`; the budget tests need the\n  counting allocator. The binaries still get jemalloc and mimalloc: `cfg(test)` is set only\n  for the lib's own test build.\n- Budget test: none of its own. After this change, run\n  `PYTHONPATH=python/typed-input/src python3 tools/v2/manifest_lint.py '{\"root\": \".\"}'`.\n\n> forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T03:38:01Z",
+  "updated": "2026-10-31T20:30:05Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": "v2/requests/mem-codegen-engine.md#1. Depend on blaze-mem and blaze-alloc-count; the tests count allocations (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-engine.md:60"
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:05Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

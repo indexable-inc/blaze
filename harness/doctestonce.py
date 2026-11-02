@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""The doctests of a workspace of three libraries, run by `cargo test --doc` and by
-`blaze test --doc`: blaze loads the workspace once for all of them, and they end as
-cargo's do, one library after another, each example reading where it runs and the variables
-as it does under rustdoc.
+"""The doctests of a workspace of three libraries, run by `blaze test --doc`: blaze loads the
+workspace once for all of them, and they run one library after another, each example reading
+where it runs and the variables as it does under rustdoc.
 
     BLAZE_BIN=../target/release/blaze-engine python3 doctestonce.py
 
-The steps: every example passes; an example of the first two libraries fails, and cargo stops
-after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`. In each, the exit status, the results of
-each library in turn, the `Doc-tests` lines and cargo's lines of what failed have to be
-cargo's, every example has to be blaze's (on macOS std's writable statics leave them to
-rustc, #255), and blaze has to have loaded the workspace once.
-A difference is WRONG and fails the run."""
+The steps: every example passes; an example of the first two libraries fails, and the run stops
+after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`.
+Each step is held to what its examples say (`STEPS`): the exit status, the libraries in turn
+(`Doc-tests` lines), how many examples of each passed and which items' examples failed, and the
+packages the run names as failed. Every example has to be blaze's (on macOS std's writable
+statics leave them to rustc, #255), and blaze has to have loaded the workspace once.
+Anything else is WRONG and fails the run."""
 import os
 import re
 import subprocess
 import sys
 import tempfile
 
-from buildmodel import doctest_report
+from doctests import doctest_report, outcomes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BLAZE = os.path.abspath(os.environ.get("BLAZE_BIN", os.path.join(HERE, "..", "target", "release", "blaze-engine")))
@@ -49,39 +49,44 @@ WORKSPACE = {
     "pub fn one() -> u32 {\n    1\n}\n",
 }
 
+ALL_PASS = [("alpha", 3, []), ("beta", 2, []), ("gamma", 1, [])]
+# Each step: its name, the arguments, the variables, the exit status, each library run in turn
+# with how many of its examples pass and the items whose examples fail, and the packages named
+# as failed. Without `--no-fail-fast` the run stops after the first library that fails.
 STEPS = [
-    ("every example passes", [], {}),
-    ("examples fail", [], {"DOCTEST_FAIL": "1"}),
-    ("examples fail, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL": "1"}),
-    ("one fails, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL_FIRST": "1"}),
+    ("every example passes", [], {}, 0, ALL_PASS, []),
+    ("examples fail", [], {"DOCTEST_FAIL": "1"}, 101, [("alpha", 2, ["double"])], ["alpha"]),
+    ("examples fail, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL": "1"}, 101,
+     [("alpha", 2, ["double"]), ("beta", 1, ["quadruple"]), ("gamma", 1, [])], ["alpha", "beta"]),
+    ("one fails, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL_FIRST": "1"}, 101,
+     [("alpha", 2, ["double"]), ("beta", 2, []), ("gamma", 1, [])], ["alpha"]),
 ]
 
 
-def tested(ws, command, args, extra, target_dir):
-    """How the doctests ended: the exit status, each library's results in turn, the
-    `Doc-tests` lines and cargo's lines of what failed, and all that was said beside."""
+def item_of(test):
+    """The item a doctest's libtest name documents (`src/lib.rs - double (line 5)`), "" for the crate's."""
+    found = re.search(r" - (?:(\S+) )?\(line \d+\)$", test)
+    return (found[1] or "") if found else test
+
+
+def tested(ws, args, extra, target_dir):
+    """How the doctests ended: the exit status, each library in turn as (name, examples passed,
+    items whose examples failed), the packages named as failed, and all that was said beside."""
     path = os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"]
     env = {**os.environ, **extra, "PATH": path, "CARGO_TARGET_DIR": target_dir}
-    run = subprocess.run([*(command or ["cargo"]), "test", "--doc", *args], cwd=ws, capture_output=True,
+    run = subprocess.run(["blaze", "test", "--doc", *args], cwd=ws, capture_output=True,
                          text=True, timeout=3600, env=env)
-    libraries = [doctest_report("running " + it) for it in re.split(r"(?m)^running ", run.stdout)[1:]]
-    # Cargo colors its lines under `CARGO_TERM_COLOR=always`, as CI has it; the text is compared.
+    # Colored under `CARGO_TERM_COLOR=always`, as CI has it; the text is read.
     said = re.sub(r"\x1b\[[0-9;]*m", "", run.stderr)
     doc_tests = re.findall(r"(?m)^\s*Doc-tests (\S+)$", said)
-    failed = re.findall(r"(?m)^(error: .*|    `-p .*)$", said)
-    return (run.returncode, libraries, doc_tests, failed), said
-
-
-def first_difference(want, got):
-    """Where cargo's and blaze's first differ, down to a line."""
-    if isinstance(want, list) and isinstance(got, list):
-        for w, g in zip(want, got):
-            if w != g:
-                return first_difference(w, g)
-        return f"cargo's has {len(want)}, blaze's {len(got)}"
-    if isinstance(want, str) and isinstance(got, str) and "\n" in want + got:
-        return first_difference(want.splitlines(), got.splitlines())
-    return f"cargo's {want!r}, blaze's {got!r}"
+    reports = [outcomes(doctest_report("running " + it)) for it in re.split(r"(?m)^running ", run.stdout)[1:]]
+    libraries = [(name, sum(how == "ok" for how in ended.values()),
+                  sorted(item_of(test) for test, how in ended.items() if how == "FAILED"))
+                 for name, ended in zip(doc_tests, reports)]
+    if len(doc_tests) != len(reports):
+        libraries.append(("?", len(reports), [f"{len(doc_tests)} `Doc-tests` lines"]))
+    failed = sorted(set(re.findall(r"`-p (\S+) --doc`", said)))
+    return (run.returncode, libraries, failed), said
 
 
 def main():
@@ -91,29 +96,30 @@ def main():
         for file, text in WORKSPACE.items():
             os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
             open(os.path.join(ws, file), "w").write(text)
-        for name, args, extra in STEPS:
-            want, _ = tested(ws, [], args, extra, os.path.join(scratch, "cargo"))
-            got, said = tested(ws, ["blaze"], args, extra, os.path.join(scratch, "blaze"))
+        for name, args, extra, *want in STEPS:
+            got, said = tested(ws, args, extra, os.path.join(scratch, "blaze"))
             loads = len(re.findall(r"(?m)^load workspace: ", said))
             left = re.findall(r"blaze: (?:the doctests are left to rustdoc|.* is rustc's): .*", said)
             built = sum(int(n) for n in re.findall(r"doctests: (\d+) built by blaze", said))
-            parts = ["exit status", "results", "`Doc-tests` lines", "lines of what failed"]
-            differs = [f"{part}: {first_difference(w, g)}"[:400] for part, w, g in zip(parts, want, got) if w != g]
+            examples = sum(passed + len(failed) for _, passed, failed in got[1])
+            parts = ["exit status", "libraries (name, passed, failed items)", "packages named as failed"]
+            wrong_parts = [f"{part}: {g!r}, and the examples say {w!r}"[:400]
+                           for part, w, g in zip(parts, want, got) if w != g]
             if loads != 1:
-                differs.append(f"the workspace was loaded {loads} times")
+                wrong_parts.append(f"the workspace was loaded {loads} times")
             if left:
-                differs.append(f"not blaze's: {left[0][:80]} ... {left[0][-160:]}")
-            if not want[1]:
-                differs.append("cargo ran no doctest")
-            verdict = "WRONG" if differs else "same"
-            wrong += bool(differs)
+                wrong_parts.append(f"not blaze's: {left[0][:80]} ... {left[0][-160:]}")
+            if built < examples:
+                wrong_parts.append(f"{built} examples built by blaze of the {examples} that ran")
+            verdict = "WRONG" if wrong_parts else "ok"
+            wrong += bool(wrong_parts)
             print(f"  {name:32} exit {got[0]:3}  {len(got[1])} libraries, {built} examples built by blaze, "
                   f"{loads} load{'s' if loads != 1 else ''}  {verdict}", flush=True)
-            for it in differs:
+            for it in wrong_parts:
                 print(f"    {it}", flush=True)
-            if differs and got[0] not in (0, want[0]):
+            if wrong_parts and got[0] not in (0, want[0]):
                 print(f"    blaze said: {said.strip()[-800:]!r}", flush=True)
-    print(f"{len(STEPS) - wrong}/{len(STEPS)} same")
+    print(f"{len(STEPS) - wrong}/{len(STEPS)} ok")
     sys.exit(1 if wrong else 0)
 
 

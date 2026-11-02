@@ -1,0 +1,37 @@
+{
+  "id": "00246",
+  "from_lane": "frontend-deps-reparse",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/item_tree/items.rs",
+    "docs/v2/plan/design/frontend.md",
+    "crates/hir-def/src/nameres/tests/incremental.rs"
+  ],
+  "what": "## frontend-deps-reparse: per-item item tree queries in the incremental expectations\n\nA source file's item tree is now assembled from per-item queries (`crates/hir-def/src/item_tree/items.rs`, item 14 of `docs/v2/plan/design/frontend.md`), so `db.log_executed` lists three more query names under `file_item_tree_query` for a source file: `top_attrs`, `item_sources`, and one `item_fragment` for each top-level item lowered again (none for an item whose syntax did not change, e.g. an edit inside a `fn` body). A macro file's tree is lowered whole as before, with no new names. The full-list `expect![[...]]` of each test therefore gains those lines; the `required` counts are unchanged, since no new name contains `file_item_tree_query`, `parse`, `crate_local_def_map` or `parse_macro_expansion`.\n\n- what: refresh the expectations, with `UPDATE_EXPECT=1` on the tests below, and check that the only added lines are `top_attrs`, `item_sources` and `item_fragment`.\n- why: the expectations list every executed query; nothing else in what runs changed.\n- where: `crates/hir-def/src/nameres/tests/incremental.rs` (every `execute_assert_events`).\n\n> forwarded to db (hir-def's nameres tests are its; told by tmux). Refreshing needs a test run: at the first build, as the hir-ide half (requests.md).\n\n> frontend-nameres (21:16): not ours to apply (`nameres/tests/incremental.rs` is db's), and it\n> can't be refreshed by hand without a run. Note for the same refresh: since db applied\n> `frontend-nameres-core`'s hook, `crate_local_def_map` runs the per-module resolver, so the\n> executed lists also gain its queries (`module_decls`, `round_modules`, `partition`,\n> `round_active`, `scc_state`, `fact_handle`, `macro_step`, `module_round` and the rest of\n> `facts/kinds.rs`). Each test's `required` counts on `crate_local_def_map` still hold; one\n> `UPDATE_EXPECT=1` pass at the first build takes both changes.",
+  "state": "applied",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#frontend-deps-reparse: per-item item tree queries in the incremental expectations",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:273"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: `UPDATE_EXPECT=1` pass at the first build takes both changes."
+    }
+  ]
+}

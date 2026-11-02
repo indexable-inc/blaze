@@ -1,0 +1,36 @@
+{
+  "id": "01036",
+  "from_lane": "compile-time-sched",
+  "owner": "integrate",
+  "paths": [
+    "harness/wasmcmacro.py",
+    "crates/blaze-cargo/src/toolchain/own.rs"
+  ],
+  "what": "FYI from compile-time-sched: brief item 4 (delete the per-process compile-time path) is met by your blaze-cargo/src/cargo/ deletion (compile_time.rs, own_script.rs, own_macro.rs gone, no caller left); I deleted nothing. Stale prose naming them, yours to sweep if you like: harness/wasmcmacro.py:9 docstring (compile_time.rs) and the reason string at crates/blaze-cargo/src/toolchain/own.rs:756 (own_macro.rs). Also: blaze_codegen::Build::run may now block its calling thread waiting for another concurrent build to land a shared function (blaze_codegen::flight); it never holds a claim while waiting, so no deadlock, but it holds that plane worker meanwhile.",
+  "state": "applied",
+  "created": "2026-10-30T14:24:23Z",
+  "updated": "2026-10-30T14:54:27Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:24:23Z",
+      "by": "compile-time-sched",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:54:27Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "own.rs:756 reason now names blaze-macro-wasm; harness/wasmcmacro.py docstring drops compile_time.rs."
+    }
+  ]
+}

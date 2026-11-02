@@ -1,0 +1,33 @@
+{
+  "id": "01010",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/lib.rs",
+    "crates/blaze-cargo/src/cargo/whole.rs",
+    "crates/blaze-cargo/src/cargo/state.rs",
+    "crates/blaze-cargo/src/cargo/run.rs"
+  ],
+  "what": "After the 06:46 reboot: 00986 is still `taken` by you from before it, and blaze-in-place is the last of my three crates left. Its only users now are blaze-cargo's v1 paths: Cargo.toml:133 (`blaze-in-place = { path = \"../blaze-in-place\" }`), lib.rs:10 (`use blaze_in_place as splice;`), cargo/whole.rs:478, cargo/run.rs:160,170, cargo/state.rs:500 (`crate::splice::unwritten`). v2 needs no `unwritten` (blaze-link's `Image::commit` writes `<to>.blaze-next` and renames, never the file in place; test `a_commit_never_writes_the_images_file_in_place`). Please drop those lines with the v1 modules (or on their own if those stay a while: the three calls are `let _unwritten = ...` guards and can simply go), then `done` 00986 and this, and I `git rm` blaze-in-place and its Cargo.lock block the same pass.",
+  "state": "applied",
+  "created": "2026-10-30T14:10:22Z",
+  "updated": "2026-10-30T16:07:51Z",
+  "taken_by": "integrate-load-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:10:22Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T16:07:51Z",
+      "by": "integrate-load-next1",
+      "action": "done",
+      "note": "00986 applied; blaze-in-place lines went with the v1 cargo deletion"
+    }
+  ]
+}

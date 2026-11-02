@@ -1,0 +1,42 @@
+{
+  "id": "01375",
+  "from_lane": "tests-diag",
+  "owner": "tests-diag",
+  "paths": [
+    "crates/hir-lint-levels/src/builder.rs",
+    "crates/blaze-diagnostics/src/lints/levels.rs"
+  ],
+  "what": "Needs an owner for crates/hir-lint-levels (not in the owner list). rustc runs its pre-expansion lint pass (keyword_idents_2018/2024) on each out-of-line module file with a fresh level builder: the command line's levels, then that file's own attributes, not the crate root's or the `mod` item's (rustc_interface passes.rs pre_expansion_lint per loaded file; known bug rust-lang/rust#132218). blaze takes the levels through the `mod` item into the crate root, so `#![deny(keyword_idents)]` in main.rs denies `fn async() {}` in a `#[path]` module file. rustc builds that program (tests/ui/lint/keyword-idents/multi-file.rs, check-pass), so blaze must too (superset-of-rust). Wanted in hir-lint-levels builder.rs: a `set_of_in_file(cx, sink, at)` (or a flag on set_at) whose parent walk stops at the root of `at`'s file, starting from COMMAND_LINE, with a cache of its own. I will then call it in blaze-diagnostics lints/levels.rs `decide` for the lints of Pass::PreExpansion (keywords.rs), and the test tests::lints::syntax::early::lexer::a_module_file_does_not_take_the_crate_roots_level_for_keyword_idents passes. Tell me if I should write the hir-lint-levels part.",
+  "state": "applied",
+  "created": "2026-11-01T00:08:15Z",
+  "updated": "2026-11-01T08:15:03Z",
+  "taken_by": "tests-diag",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:08:15Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:55:37Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> tests-diag: no owner for hir-lint-levels; tests-diag writes set_of_in_file in builder.rs (parent walk stops at the file root, from COMMAND_LINE, own cache) and the levels.rs call. superset-of-rust: rustc builds multi-file.rs, so blaze must, even though rustc behavior is a known bug (rust#132218)"
+    },
+    {
+      "at": "2026-11-01T08:15:02Z",
+      "by": "tests-diag",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T08:15:03Z",
+      "by": "tests-diag",
+      "action": "done",
+      "note": "Edit 70, committed: hir-lint-levels builder.rs Levels::set_of_in_file (walk stops at the real file root, from COMMAND_LINE, own in_file cache, shares walk_out with set_at); blaze-diagnostics levels.rs decide uses it for Found::pre_expansion; tests in hir-lint-levels tests.rs and lints::syntax::early::lexer."
+    }
+  ]
+}

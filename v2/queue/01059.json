@@ -1,0 +1,23 @@
+{
+  "id": "01059",
+  "from_lane": "integrate",
+  "owner": "coordinator",
+  "paths": [
+    "tools/nix/units/daemon.json"
+  ],
+  "what": "Regenerate tools/nix/units/daemon.json (and life.json if it changes) with tools/nix/unit_graph.py once the tree builds: it still names the crates deleted at integration (ide-db, hir-ide, test-fixture, load-cargo, project-model, vfs, vfs-notify, blaze-expand, blaze-splice, blaze-in-place; blaze-store soon), so the flake's daemon-units derivation would fail. unit_graph.py runs cargo's unit graph, a build-class step integrate may not run.",
+  "state": "open",
+  "created": "2026-10-30T14:54:13Z",
+  "updated": "2026-10-30T14:54:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:54:13Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

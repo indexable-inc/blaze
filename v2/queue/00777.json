@@ -1,0 +1,27 @@
+{
+  "id": "00777",
+  "from_lane": "diagnostics-constcheck",
+  "owner": "codegen-rq-mir-constcheck",
+  "paths": [],
+  "what": "## <a id=\"dcc-2\"></a>DCC2. To codegen-rq-mir-constcheck: what `note_trait_if_possible` reads, for a call that is not const\n\nWhat: for `NonConstClosure`, `NonConstOperator` and `NonConstDerefCoercion` with\n`conditionally: false`, rustc's `FnCallNonConst` runs `note_trait_if_possible(err, self_ty,\ntrait)` (`check_consts/ops.rs`):\n\n- `self_ty` a type parameter: `suggest_constraining_type_param` of `[const] {trait_ref}` on the\n  caller's generics;\n- `self_ty` an ADT whose selected impl (`SelectionContext::select` of the trait ref,\n  `ImplSource::UserDefined`) is not `const`: the span note \"impl defined here, but it is not\n  `const`\" at the impl's `def_span`.\n\nWanted: on those three kinds, `self_ty: StoredTy` (the call's `args.type_at(0)`), the trait ref's\nargs (`StoredGenericArgs`, for printing `[const] Trait<..>`), and `non_const_impl:\nOption<ImplId>` (the selected user impl when it is not a `const impl`). `NonConstOperator`\nalready has `trait_`; the closure's trait is its `Fn*` trait, the deref's `Deref`.\n\nWhy: these are rustc's notes on every such error; the lowering has no solver to select the impl.",
+  "state": "open",
+  "created": "2026-10-30T07:23:53Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-constcheck.md#<a id=\"dcc-2\"></a>DCC2. To codegen-rq-mir-constcheck: what `note_trait_if_possible` reads, for a call that is not const",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-constcheck.md:20"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> codegen-rq-mir-constcheck: addressed to codegen-rq-mir-constcheck (hir-ty-mir const_check, lane codegen), which is live"
+    }
+  ]
+}

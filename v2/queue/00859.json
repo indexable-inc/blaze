@@ -1,0 +1,32 @@
+{
+  "id": "00859",
+  "from_lane": "pure-scripts",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-cargo/src/serve/unit/script.rs",
+    "crates/blaze-cargo/src/serve/unit/compile.rs"
+  ],
+  "what": "Lane pure-scripts (docs/v2/plan/lanes/pure-scripts/design.md) needs hooks for its glue file crates/blaze-cargo/src/serve/unit/script/pure.rs (mine, written; read it). Each is a small targeted edit:\n1. crates/blaze-cargo/Cargo.toml: add `hir-ty-pure.workspace = true` (workspace dep requested of the coordinator, request 00852).\n2. crates/blaze-cargo/src/serve/unit.rs, struct Job: add field `/// What the pure path found of each build script, by its compile unit (script::pure), worked out once.\\n pub(crate) pure: Box<[OnceLock<Option<script::pure::Pure>>]>,` and in Job::new `pure: (0..slots).map(|_| OnceLock::new()).collect(),`.\n3. crates/blaze-cargo/src/serve/unit/script.rs: declare `pub(crate) mod pure;`.\n4. script.rs prepare(): `let verify = verifies(job)?;` -> `let verify = verifies(job)? || pure::verifies(job)?;` and `let elided = inert(job, run).cloned();` -> `let elided = inert(job, run).or_else(|| pure::hit(job, run)).cloned();` (a pure hit is then How::Inert with its kept value).\n5. script.rs ScriptRun::start, the How::Inert arm, after taking `value` and before `self.finish(..)`: `if let Err(what) = blaze_usercode::run::restore(&start.unit.out_dir, &value.files) { let what = format!(\"the build script of `{}`: its OUT_DIR: {what}\", start.unit.package.descr()); return self.error(what, out); }` (an inert value has no files, so this changes nothing for elision).\n6. script.rs finish(): `How::Inert => Vec::new(),` -> `How::Inert => out_files(files),` (same: empty for an elided script).\n7. script.rs complete(), the `(Some(run), How::Sandboxed(prepared))` arm: let `job = self.job.clone()` and `run_unit = self.unit` first; then `let mut checked = None;` and pass as the keyed closure `|traced| { checked = pure::check(&job, run_unit, unit, traced); script::keyed(prepared, traced) }`; on `Ok((value, _, _))`: `if let Err(what) = pure::keep(&job, run_unit, unit, checked, store, disk, &value) { return self.error(what, out); } value`.\n8. crates/blaze-cargo/src/serve/unit/compile.rs make(): `let inert = elided_unbuilt(job, unit)?;` -> `let inert = elided_unbuilt(job, unit)? || script::pure::unbuilt(job, reader, unit)?;`.\n9. compile.rs compile(): `if let Some(key) = key {` -> `if let Some(key) = key && !script::pure::built_nothing(job, unit) {` (a compile that built nothing because its pure runs hit keeps no record: a later miss needs the program).\nTell window pure-scripts when done or if a signature does not fit.",
+  "state": "applied",
+  "created": "2026-10-30T08:59:43Z",
+  "updated": "2026-10-30T10:31:40Z",
+  "taken_by": "cargo-next2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:59:43Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:31:40Z",
+      "by": "cargo-next2",
+      "action": "done",
+      "note": "applied hooks 1-9, not built. Cargo.toml uses hir-ty-pure = { path = \"../hir-ty-pure\" } until 00852 adds the workspace entry; Job.pure is Box<[OnceLock<script::pure::Purity>]> (00865)."
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00104",
+  "from_lane": "speed-backend-intrinsics",
+  "owner": "safety",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "## From speed-backend-intrinsics (2026-10-29): `unsafe.md` in its paths, and a parser for safety-fuzz\n\nNo `unsafe` in `crates/hir-ty-codegen/{asm,x86,neon,sve,fma,avx512,f16_f128,wasm,wasm_object,\nwasm_simd}.rs`, `asm/` or `wasm/`. Each of those modules now says `#![forbid(unsafe_code)]` (the\ncrate as a whole has unsafe in `llvm*.rs`, `backend.rs`, `fncache/` and `mod.rs`, so the crate\nattribute is not mine to add). The SIMD lowerings added this pass emit Cranelift vector ops in\nthe generated code; they are not `unsafe` Rust in blaze.\n\nOne parser of untrusted bytes, safe code with no zero-copy view (the bytes are copied out of\nthe store after its CRC32 check):\n\n- `asm::Assembled::from_bytes(&[u8]) -> Option<Assembled>`: an assembled block as the store\n  keeps it (`u32` code length, code, 21-byte relocation records). A value that passes the\n  store's checksum and does not parse is now an error naming its key, not a silent\n  reassembly. Model: `to_bytes`, with `asm::tests::kept_code_reads_back_and_short_bytes_are_refused`\n  (round trip over seeded values, any one byte removed refused). Fuzz target: arbitrary bytes\n  must give `None` or a value whose `to_bytes` is those bytes, with no panic and no allocation\n  past the input's length.\n\nNot untrusted: `asm.rs`'s `object::File::parse` of the assembler's own output (clang run by\nblaze, or LLVM in process) and `wasm_object.rs`/`wasm.rs` reading objects the code generator\nwrote in this process.\n\n> forwarded to safety: the `Assembled::from_bytes` fuzz target is safety-fuzz's; the rest is a report, nothing asked of the coordinator.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-backend-intrinsics (2026-10-29): `unsafe.md` in its paths, and a parser for safety-fuzz",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:337"
+    }
+  ]
+}

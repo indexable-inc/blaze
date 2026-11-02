@@ -1,0 +1,21 @@
+{
+  "id": "00401",
+  "from_lane": "mem-codegen-mir",
+  "owner": "codegen-mir",
+  "paths": [],
+  "what": "## 0. The shape of it\n\n- **Frames.** Every unit of per-body work runs in `blaze_mem::frame::task(Tag::Mir, |frame| ..)`:\n  - lowering a body (`lower_to_mir_with_store`, `promoted_mir_body_query`,\n    `lower_closure_body`);\n  - each pass of `run_passes` and `optimize`, one task per pass, so the frame is reset between\n    passes and the peak is the largest pass, not their sum;\n  - the per-body `Ctx` in an outer task around the passes, since its `needs_drop` cache lives\n    as long as the body's pipeline;\n  - `monomorphized`;\n  - `frame_storage_conflicts`.\n\n  A task inside the query executors' own per-run frame (mem-db's contract) just nests. Tasks\n  are never opened per statement or per call.\n- **What is kept.** The memoized `MirBody` is the query's result and stays owned (global\n  allocator). Its one copy is made where it is made today, and only there:\n  - `run_passes` (`transform.rs:133`, `let mut body = built.clone();`);\n  - `optimize` (`optimize.rs:94`, `let mut body = body.clone();`);\n  - `monomorphized` (`monomorphization.rs:382`, `let mut body = body.clone();`);\n  - lowering, which builds blocks, locals and the body's lists in the frame and copies each into\n    the result once, at its final size (§5.1, `MirLowerCtx::finish`).\n\n  The passes then change that copy in place and rebuild a container only when they removed\n  something from it.\n- **Exact budget technique.** `MirBody` holds no `Arc`. Its heap parts are `Arena`s, `Vec`s,\n  `ArenaMap`s, an `FxHashMap`, `Box<[Operand]>`s and spilled `SmallVec`s, and every type or\n  constant in it is an interned handle. So `measure(|| body.clone()).allocations` is the number\n  of heap blocks the body owns. A step that builds a body at exact size allocates exactly that\n  many, plus the per-body setup that the front end owns (the `InferCtxt`, the `Resolver`). The\n  tests measure that setup on its own and add it.\n- **Per-call scratch.** The interpreter's per-call paths, the type-name formatter that codegen\n  calls per function, and the tracing detail of `mir_body_query` stop allocating per call (§8,\n  §9).\n- **What depends on other crates** is in §11. Two of those changes are in `hir-ty`, and the\n  exact lowering budget waits for them.\n\n> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:53:21Z",
+  "updated": "2026-10-30T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-codegen-mir.md#0. The shape of it",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-mir.md:14"
+    }
+  ]
+}

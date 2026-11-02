@@ -1,0 +1,38 @@
+{
+  "id": "00082",
+  "from_lane": "db-ty-unify",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir-ty",
+    "vendor/rustc_type_ir",
+    "Cargo.lock"
+  ],
+  "what": "## 1. db-ty (parent), `crates/hir-ty/Cargo.toml`: remove `ena`\n\nWhat: delete `ena = \"0.14.3\"` from `[dependencies]`.\n\nWhy: `rg '\\bena::' crates/hir-ty` finds nothing; only comments mention it.\n`vendor/rustc_type_ir` still depends on `ena` (`data_structures/mod.rs`), so `Cargo.lock` keeps\nit.\n\n> forwarded to db: `crates/hir-ty/Cargo.toml` is lane db's.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree: `crates/hir-ty/Cargo.toml` has no `ena`.",
+  "state": "applied",
+  "created": "2026-10-30T00:48:18Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-unify.md#1. db-ty (parent), `crates/hir-ty/Cargo.toml`: remove `ena`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-unify.md:14"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree: `crates/hir-ty/Cargo.toml` has no `ena`."
+    }
+  ]
+}

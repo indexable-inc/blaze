@@ -1,0 +1,25 @@
+{
+  "id": "00700",
+  "from_lane": "fastcompile",
+  "owner": "fastcompile-stencil-diff",
+  "paths": [
+    "crates/blaze-stencil/src/tests/stencil/build.rs",
+    "fuzz/program.rs",
+    "fuzz/table.rs"
+  ],
+  "what": "## fastcompile-stencil-fuse 1: fastcompile-stencil-diff: the confined ops in the stencil and fuzz harnesses (`crates/blaze-stencil/src/tests/stencil/build.rs`, `src/tests/stencil.rs`, `src/tests/fuzz/program.rs`, `src/tests/fuzz/table.rs`)\n\nOwner: fastcompile-stencil-diff (`fastcompile-stencil-diff-next1`). Asked by fastcompile-stencil-fuse, for item 1 of \"fastcompile-macros-tier 2\".\n\nWhat: `shape.rs` has two new ops after `Fence` (`shape::VERSION` 4), `Op::LoadConfined` and\n`Op::StoreConfined`: a load or store at offset 0 of\n`iadd vmctx, uextend.i64 (ireduce.i32 (iadd p, iconst off))`. `Shape::confined()` gives the\nplain access (`aux & 0x1f` indexes `CONFINED_LOADS`/`CONFINED_STORES`) and a `Disp`\n(`aux >> 5`): `Zero` (no add, no hole), `Lo12` (AArch64 only, `off` in 1..4096) or `Imm32`.\nOperands are `[p, vmctx]` for a load and `[x, p, vmctx]` for a store, all `i64`; `off`,\nwrapped to 32 bits, is the `Offset` hole when the `Disp` isn't `Zero`.\n\n1. `stencil/build.rs` `Cx::body` matches `Op` exhaustively, so the crate's tests don't compile\n   until it has an arm for both. The arm should build the pattern itself, each inner value used\n   once, so the patcher selects the shape under test, with a `vmctx` that puts the address on\n   the prefilled slot: for example `vmctx = (stack_addr + AT) - uextend(ireduce(iadd p, off))`\n   from a second copy of that arithmetic (other values, so the pattern's own keep one use),\n   then the access as `load`/`store` do now. `p` should range over values whose 32-bit sum\n   wraps, and over `p + off` with bit 31 set (zero-extended, not sign-extended).\n2. `stencil.rs` `bakeds`: for a `Disp` other than `Zero`, the offsets to try (for `Lo12` 1,\n   8, 4095; for `Imm32` 0x1000, -8, `i32::MIN`, `i32::MAX`), as `Iconst` does for its immediates.\n3. `fuzz/program.rs`'s generator `match op` and `fuzz/table.rs`'s `drawn`: either draw the\n   pattern (a load or store through it) or list both ops with the ones not drawn, saying the\n   confined access is drawn as its plain parts.\n\nWhy: the patcher fuses the pattern into one stencil (`patch/select.rs` `confine`); these are\nwhat prove each fused shape means what its parts mean, against Cranelift and the interpreter.\n`patch/tests.rs` covers when the fusion is taken, its holes and its fault, with the mock library.\n\nStatus: partly done by fastcompile-stencil-diff at the freeze. `build.rs` has fastcompile-stencil's\n`confined()` (one arm), now an `iadd` of an `iconst` (`confine` fuses no `iadd_imm`) and `off`\nfrom `Baked::imms[OFFSET]`; `stencil.rs` `bakeds` tries the offsets above, `hole_problems`\nallows and needs the `Offset` hole for a `Disp` other than `Zero`, and confined runs are\nforked; the fuzzer lists both ops as not drawn. Left: `p` as an input (it is an `iconst`), so\nit ranges over wrapping sums and bit 31, and `p` (and a store's `x`) from the accumulator,\nmade last with `vmctx` from a second copy of the arithmetic; the fuzzer drawing the pattern.\n\n> forwarded to fastcompile-stencil-diff-next1 (requests, pass 41; told by tmux)",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-stencil-fuse 1: fastcompile-stencil-diff: the confined ops in the stencil and fuzz harnesses (`crates/blaze-stencil/src/tests/stencil/build.rs`, `src/tests/stencil.rs`, `src/tests/fuzz/program.rs`, `src/tests/fuzz/table.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:4105"
+    }
+  ]
+}

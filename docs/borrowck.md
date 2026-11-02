@@ -5,29 +5,28 @@ summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's ve
 # The borrow checker
 
 blaze has its own borrow checker, the crate `hir-ty-borrowck` in the front end
-(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR rust-analyzer
-lowers, the same MIR the code generator compiles, and it is meant to give exactly rustc's
-verdict: the same errors, on the same lines, and none where rustc gives none. It gives
-rustc's verdict on 95% of rustc's own borrow-check tests today, and on every one rustc
-accepts; how they are scored and what is left is below.
+(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR `hir-ty-mir`
+lowers (from rust-analyzer's lowering), the same MIR the code generator compiles, and it is meant to give exactly rustc's
+verdict: the same errors, on the same lines, and none where rustc gives none. At its last
+scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
+every one rustc accepts; how they were scored and what is left is below.
 
-It runs as part of rust-analyzer's diagnostics, so the daemon computes it for every edited
-file, and `blaze-engine borrowck` prints what it finds. The daemon refuses an edit it finds a
-borrow-check error in (below), but the checker still misses about a sixth of the errors
-rustc gives, so `cargo check` stays the final word.
+It runs as part of the front end's diagnostics (`crates/hir/src/diagnostics.rs`), in each
+unit's check beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), and `blaze
+check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
+checker still misses some errors rustc gives (What is left, below).
 
 ## Refusing builds
 
-An edit with a borrow-check error fails its build, with the file, line and error, as an edit
-with a type error does; under `blaze`, cargo then runs and rustc reports it.
-`BLAZE_BORROWCK_REFUSE=0` in the daemon's environment turns this off.
+A build with a borrow-check error fails, with the file, line and error, as one with a type
+error does: the unit's check failed, so what its codegen made is dropped. Nothing else runs;
+no cargo or rustc is asked.
 
 This is safe because the checker reports nothing on any test rustc accepts, nor on ripgrep,
 fd, bat, hyperfine, just, axum, nushell, helix or biome: a refused build is one rustc refuses too. A
-borrow-check error blaze reports where rustc reports none is a bug; `BLAZE_BORROWCK_REFUSE=0`
-works around it until it is fixed. What it does not do: it misses about a sixth of the
-errors rustc gives (it accepts code rustc rejects, listed below), so code with such an error
-still builds and runs from memory.
+borrow-check error blaze reports where rustc reports none is a bug. What it does not do: it
+misses some errors rustc gives (it accepts code rustc rejects, listed below), so code with
+such an error still builds.
 
 ## Modes
 
@@ -84,7 +83,7 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   `offset_of!`, which lowering computes as the address of a field of a value at address 0,
   is rustc's `NullOp::OffsetOf` and takes no reference.
 - Builtin derives are checked as rustc expands them (`rustc_builtin_macros/src/deriving`;
-  `blaze-engine borrowck` expands them, as `blaze check` and builds do). The methods derived for
+  `blaze check` and builds expand them so). The methods derived for
   a `#[repr(packed)]` struct copy each field out of it, `{ self.x }` at the field, rather
   than borrow it, so one that is not `Copy` is E0507 where the field is written; `Debug`
   takes the last field by one more reference, so an unsized one still becomes a
@@ -459,12 +458,14 @@ All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned n
   needs the `mut` of a captured variable when its body mutates it, and a name that starts
   with `_` is left alone, as rustc does. A body whose types have an error gets none, as
   rustc lints no body its type check failed. A source that denies it fails the build with it
-  ([no-rustc.md](no-rustc.md), step D), unless `BLAZE_BORROWCK_REFUSE=0`.
+  ([no-rustc.md](no-rustc.md), step D).
 
 ## How it is tested
 
-`harness/borrowck_ui.py <rust checkout>` scores it against rustc's own UI tests at the
-pinned nightly's commit: everything under `tests/ui/borrowck` and `tests/ui/nll`, every test
+It is proven by real crates checking clean and by its unit tests. Until 2026-10-30 a harness
+also scored it against rustc's own UI tests at the pinned nightly's commit (deleted with the
+other comparisons with rustc, [harness.md](harness.md)); what follows is how that scoring
+worked and its last result. It took everything under `tests/ui/borrowck` and `tests/ui/nll`, every test
 with a Polonius revision, and every other UI test whose expected output has a borrow-check
 error. Each revision of a test is a unit, read with the `--cfg`s rustc gets for it. What a
 unit should give is what the pinned nightly rustc gives on it, once with Polonius and once
@@ -500,19 +501,13 @@ With no borrow checker, the 246 units rustc accepts would pass. Now:
 | NLL | 1588 | 1585 (99.8%) | 227 of 227 | 1358 of 1361 |
 
 460 units are out of scope; 346 of them need a nightly feature (at 68be5dec, nightly-2026-10-27,
-rustc's tests at 12433c30). CI runs the scoring on Linux
-and fails below a floor a few units under the count there, on any error in a unit rustc
-accepts, and on any unit the checker panics on, as a panic hides every error in its file.
+rustc's tests at 12433c30).
 
-The other check is that it finds nothing in code rustc accepts.
-`blaze-engine borrowck --project DIR` checks a cargo workspace; its last line counts the files,
-errors and files it panicked on; a panic makes it fail. It refuses a workspace `cargo metadata`
-fails on: rust-analyzer would read it with `--no-deps`, whose crates have no dependencies, and
-every type of another crate would be an error the bodies using it do not show.
-`harness/borrowck_apps.py` runs it over every application of `apps/apps.json` at its pinned rev,
-with what `cargo metadata` needs that a clone lacks (bun's vendored crates, which its own build
-fetches), plus the harness's `corpus` and `mixfutures` crates (which CI checks too), and lists
-each app's errors and panics. At 68be5dec all 22 applications, `corpus` and `mixfutures` check
+The check that stays is that it finds nothing in code rustc accepts. v1's `borrowck_apps.py`
+checked every application of `apps/apps.json` at its pinned rev and listed each app's errors and
+panics. It ran v1's `blaze-engine borrowck --project`, which loaded the workspace through
+rust-analyzer and is gone, and was deleted on 2026-10-30; its v2 successor, over `blaze check`,
+is queued. At 68be5dec all 22 applications checked
 clean; at 47793534 nushell (53, E0716 in its tests), ruff (19, E0716 and "lifetime may not live
 long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 
@@ -608,7 +603,7 @@ changes to rust-analyzer were needed, each made as rustc does it:
   deref drops `boom()` first, so an `impl Trait` it returns keeps no borrow of the string
   alive (`impl-trait/wf-check-hidden-type.rs`).
 - Type lowering gives a trait object written without a lifetime, as a type argument, the
-  lifetime of its parameter's one outlives bound (`hir-ty/src/generics.rs`,
+  lifetime of its parameter's one outlives bound (`hir-ty/src/lower.rs`,
   `object_lifetime_default`, RFC 599): `Ref<'x, dyn Trait>` with `T: 'a + ?Sized` on `Ref`
   is `dyn Trait + 'x`, not `'static`. In an impl header, a trait object behind a reference
   whose lifetime is elided has that lifetime too (`hir-ty/src/lower.rs`, `impl_header`), as
@@ -661,8 +656,9 @@ missed rather than errors made up:
 
 ## What it costs
 
-On every edit the daemon runs the diagnostics of the edited files on a thread of its own,
-beside the build, so the check adds to an edit only when it takes longer than the build.
+A unit's check runs beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), so
+it adds to a build only when it takes longer than the codegen. The numbers below are v1's,
+whose daemon checked the edited files on a thread of their own beside the build.
 For an edit of the corpus's largest file, the check went from a median of 40 ms with the
 checker off to 52-74 ms with it on, while the build took 250-400 ms. A cold check of all of
 nushell used 10-25% more CPU time. Both were measured on a loaded machine, so read them as
@@ -670,21 +666,18 @@ rough.
 
 ## Speed
 
-The check runs on every edited file, so its time is on the edit's path. Two things keep it
+The check runs in every build of an edited crate, so its time is on the edit's path. Two things keep it
 small: an edit re-checks only the bodies it changed (the query reads each body's source map
 relative to its item, which moving the body does not change), and each check should cost a
 small fraction of type inference, which it needs anyway.
 
-`blaze-engine borrowck --project DIR --timings OUT.jsonl` goes through every body of a project's own
-crates on one thread. It infers and checks each body once cold, paying for the queries the body
-is the first to need (`infer_us`, `first_us`), then infers it and checks it in each mode as an
-edit of it costs in the daemon: the rest of the workspace answered and the trait solver's cache
-empty, as it is in a new revision (`infer_warm_us`, each mode's phases and sizes).
-`BLAZE_BORROWCK_ONLY=part` limits it to the bodies whose name contains `part`. Run it inside
-`nix develop`: without the toolchain's sysroot most bodies have inference errors and are not
-checked. `harness/borrowck_speed.py` runs it over the bench apps and reports totals, p50/p99/max
-and the slowest bodies; `--rustc TOOLCHAIN` measures rustc's own `mir_borrowck` and `typeck`
-with `-Zself-profile` as the baseline.
+The numbers below were measured with v1's `blaze-engine borrowck --project DIR --timings`, which
+went through every body of a project's own crates on one thread, inferring and checking each
+once cold (`infer_us`, `first_us`) and then as an edit of it costs in the daemon
+(`infer_warm_us`, each mode's phases and sizes). It loaded through rust-analyzer and is gone,
+and so is v1's `borrowck_speed.py`, which ran it over the bench apps and reported totals,
+p50/p99/max and the slowest bodies (`--rustc TOOLCHAIN` measured rustc's own `mir_borrowck` and
+`typeck` with `-Zself-profile` as the baseline); a v2 measure goes through `blaze check`.
 
 Before any speed work, on main 31b3345f (arm64 ix VM, 16 vCPUs): the checker's total
 without MIR lowering, beside type inference's, in ms, and its slowest body:
@@ -804,9 +797,6 @@ is 0.3 ms now. Nothing else moves (tools/bench/results/2026-10-27-borrowck-speed
 
 ## Debugging
 
-- `echo file.rs | blaze-engine borrowck --edition 2021` prints a file's diagnostics as JSON.
-- `BLAZE_BORROWCK_MIR=<function>` with that command, or with `--project`, prints the MIR
-  of a top-level function and its closures.
 - `BLAZE_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and
   loans; `BLAZE_BORROWCK_DEBUG=<function>` only those of that function and its closures,
   which a project needs.

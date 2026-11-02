@@ -1,0 +1,24 @@
+{
+  "id": "00691",
+  "from_lane": "fastcompile",
+  "owner": "coordinator",
+  "paths": [
+    "tools/pgo/pgo.py",
+    "tools/pgo/training.json"
+  ],
+  "what": "## fastcompile-sol-sched 2: coordinator: the release train's plain build as the PGO baseline (`.github/`, with fastcompile-sched 5)\n\nWhat: the release-train job of fastcompile-sched 5 passes `\"baseline\": \"<dir>\"` to\n`tools/pgo/pgo.py '{\"kind\": \"build\", ...}'`: a directory holding `blaze` and `blaze-engine`\nof the same commit, built `--profile dist --features llvm` with no profile flags, which the\ntrain builds anyway.\n\nWhy: `pgo.py` now times the measured turns (`tools/pgo/training.json` `measure`) with a plain\nbuild, the PGO build and the PGO and BOLT build, and refuses a release that saves under\n`min_speedup` (5%) of the plain time, so a profile that applied to nothing stops the release\ninstead of shipping 0%. With no `baseline` it builds the plain blaze itself, one more dist\nbuild per target (about a quarter of the pipeline); passing the train's own plain build saves\nthat. The pin records the speedup (`Pin.speedup`), and `profiles.json` entries of `builder:\n\"blaze\"` must name it.\n\nStatus: open\n\n> forwarded to the coordinator: `.github/` is its; on requests' coordinator list (requests, pass 33).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/fastcompile.md#fastcompile-sol-sched 2: coordinator: the release train's plain build as the PGO baseline (`.github/`, with fastcompile-sched 5)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile.md:3204"
+    }
+  ]
+}

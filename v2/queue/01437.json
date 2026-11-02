@@ -1,0 +1,35 @@
+{
+  "id": "01437",
+  "from_lane": "repro",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/stdlib/scripts.rs"
+  ],
+  "what": "blaze test refuses every crate: std's `test` package has a build script (library/test/build.rs at the pinned nightly 16d1ffac17) and PINNED in crates/blaze-units/src/stdlib/scripts.rs has no port of it, so `blaze test -p blaze-graph --test scope_wait` (binary b2wt-target/debug/blaze of 19:44, own BLAZE_HOME) stops after compiling std with: error: std's `test` build script: ... blaze has the output of none of that package's. No harness test can run under blaze until it is ported (rule blaze-builds-blaze). Ask: port library/test/build.rs into PINNED (pin its BLAKE3, print what it prints). Repro: any crate with a #[test], `blaze test`. Detail: /tmp/blaze-lanes/v2-repro.md #10.",
+  "state": "applied",
+  "created": "2026-11-01T03:10:40Z",
+  "updated": "2026-11-01T03:18:25Z",
+  "taken_by": "fix-back-cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:10:40Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:15:03Z",
+      "by": "fix-back-cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:18:25Z",
+      "by": "fix-back-cargo",
+      "action": "done",
+      "note": "Ported library/test/build.rs into crates/blaze-units/src/stdlib/scripts.rs: Script::Test, PINNED entry (test, test/build.rs, BLAKE3 70ac360f5b21e655e46643be153bc59cc8a89f7fc822683c76badef8545a1fc6), port_test prints rerun-if-changed=build.rs, rustc-check-cfg=cfg(enable_unstable_features), and rustc-cfg=enable_unstable_features when blaze rustc stand-in -vV for HOST says nightly or dev (it does). Refuses when RUSTC or HOST is unset. Tests in scripts/tests.rs. rust-analyzer: 0 errors; check-live gives the verdict."
+    }
+  ]
+}

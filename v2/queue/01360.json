@@ -1,0 +1,24 @@
+{
+  "id": "01360",
+  "from_lane": "tests-misc-stencil",
+  "owner": "format",
+  "paths": [
+    "crates/mbe/src",
+    "crates/hir-def/src/macro_expansion_tests/mbe/matching.rs"
+  ],
+  "what": "From 01223. macro_expansion_tests::mbe::matching::stmt_boundaries has failed since round 2: `m!(;;92;let x = 92; loop {};)` through ($($s:stmt)*) => (stringify!($($s |)*);) prints `|;` where the expectation has `| ;` for the empty statements. stringify! output is runtime behavior (a program sees the string), so this must match what the pinned nightly gives. Check that, and also whether the nightly accepts `;` as a `stmt` fragment at all (the test says `FIXME: this actually works OK under rustc`). Then fix the expander or the expectation.",
+  "state": "open",
+  "created": "2026-10-31T23:46:14Z",
+  "updated": "2026-10-31T23:46:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T23:46:14Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

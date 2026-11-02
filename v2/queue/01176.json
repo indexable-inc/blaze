@@ -1,0 +1,53 @@
+{
+  "id": "01176",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-front-def",
+  "paths": [
+    "crates/syntax/src/validation.rs"
+  ],
+  "what": "crates/syntax/src/validation.rs: report rustc \"integer literal is too large\" (rustc_session report_lit_error, LitError::IntTooLarge) for an IntNumber literal whose value does not fit u128 (view IntNumber::value() Err). hir-def hir.rs:275/278 Literal::from lowers it as 0 (error recovery), so the build must stop on the syntax error; today nothing reports it outside attributes.",
+  "state": "applied",
+  "created": "2026-10-30T23:27:07Z",
+  "updated": "2026-10-31T16:39:44Z",
+  "taken_by": "no-fallback-front-def",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:27:07Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from format (no live window) to tests-misc, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:15Z",
+      "by": "tests-misc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:44:07Z",
+      "by": "tests-misc",
+      "action": "refuse",
+      "note": "Not syntax validation: rustc keeps a literal as an unchecked token::Lit in the AST (ast::ExprKind::Lit, rust-lang/rust#102944) and reports LitError::IntTooLarge in rustc_ast_lowering (lower_lit -> report_lit_error), after cfg stripping, so `#[cfg(any())] fn f() { 999999999999999999999999999999999999999999; }` builds under rustc. crates/syntax/src/validation.rs runs over every literal of the file, cfg or not, and would reject that program (superset-of-rust). The error belongs where hir-def lowers the literal (hir.rs:275/278 Literal::from, from expr_store lower for exprs and pats): report it there as a body diagnostic and stop the build, instead of lowering 0. That is hir-def lowering, the requesting lane (no-fallback-front-def) or hir-def owner."
+    },
+    {
+      "at": "2026-10-31T16:35:04Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "tests-misc -> no-fallback-front-def: Refused by tests-misc: rustc reports IntTooLarge in AST lowering after cfg stripping (rust#102944), so a syntax-validation error would reject #[cfg(any())] code rustc builds. It belongs at hir-def Literal::from (hir.rs:275/278)."
+    },
+    {
+      "at": "2026-10-31T16:39:44Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "moved to hir-def lowering as tests-misc said: ExpressionStoreDiagnostics::IntLiteralTooLarge from ExprCollector::lower_literal (exprs, literal patterns, range ends), so cfg-removed code is never checked; persist tag 8, source_map moved(). Test expr_store::tests::body::an_integer_literal_past_u128_is_reported_unless_cfg_removes_it. hir arm and lowering queued to no-fallback-front-ty and no-fallback-tools (code in /tmp/blaze-lanes/01176-int-too-large.md)."
+    }
+  ]
+}

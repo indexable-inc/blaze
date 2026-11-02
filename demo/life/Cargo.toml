@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+blaze-api = { path = "../../crates/blaze-api" }
 blaze-live = { path = "../../crates/blaze-live" }
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
 

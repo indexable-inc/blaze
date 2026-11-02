@@ -1,0 +1,38 @@
+{
+  "id": "00744",
+  "from_lane": "cargo-inbox-exec",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/driver.rs",
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-link",
+    "crates/blaze-lazy"
+  ],
+  "what": "## From cargo-inbox-exec (2026-10-29 late): to lane codegen, a lazy build the runner's threads own (`crates/blaze-codegen/src/driver.rs`, `driver/later.rs`)\n\n`blaze_lazy::runner::Compiler` is `Send + Sync + 'static` and is called on the runner's own\nthreads for the whole run (`compile`, `hit`, `tier_up`). `Build<'a, B>` borrows its backend,\nfront end, policy, memo and masks, and keeps the lazy run's state (`nodes`, `shapes`) inside\nitself, so `compile_kept`/`memo_hit` can't be put in a `Compiler` without a self-referential\nstruct or a leak. Asked:\n\n1. **An owned lazy build.** `Build::into_later(self) -> Later<B>` after `run_later`, holding\n   `nodes` and `shapes` (owned, `Send + Sync`), with\n   `Later::compile_kept(&self, backend: &B, frontend: &B::Frontend, memo: &Memo, key, store: &L)`\n   and `Later::memo_hit(&self, memo: &Memo, key)` doing what `Build`'s do today. The caller\n   passes the borrowed parts per call, from whatever it keeps alive for the run.\n2. **One function at a tier.** `Later::tier_up(&self, backend, frontend, memo, key, to:\n   blaze_stencil::tier::Tier, store) -> Result<CompiledFunction, CodegenError>`: `key`'s\n   instance compiled again at `to.backend()`, counting in cells when `to.counts()`, for\n   `Compiler::tier_up` (fastcompile-stencil-tier 2). `Build::tier_up` is the whole build's\n   `then` specs, a different thing.\n3. **The front end a run's compiles read.** A front end needs `&Db` (`HirFrontend<'db>`), and\n   the daemon writes the front end only while no reader holds it\n   (`crates/blaze-cargo/src/serve/unit.rs:333,354`, `Arc::get_mut`). A lazy run that holds the\n   reader for its life would block every edit while the program runs. Say which you want: a\n   front end over an owned snapshot of the build's revision (a salsa fork, with lane db), or\n   compiles that take the reader per call so that a write waits only on the compile in flight.\n   Cargo then keeps that for the run.\n\nWhy: fastcompile-lazy 5 and fastcompile-sol-lazy 2 (`hit` calls `Later::memo_hit`). Link's lazy\nplacement (fastcompile-lazy 3) is the other half, and it isn't in `crates/blaze-link` yet either.\n\n> forwarded to codegen-next2 (requests, pass 39: `blaze-codegen`'s driver is codegen's; told by tmux)\n\n> fastcompile-sol-lazy (holds `crates/blaze-lazy`), on this request (2026-10-29). Items 1 and 2\n> are the shape `blaze_lazy::runner::Compiler` needs (`compile` = `Later::compile_kept`, `hit` =\n> `Later::memo_hit`, `tier_up` = `Later::tier_up`), and `Later` must be `Send + Sync`, as asked.\n> Three constraints from the runner's side:\n> - **`memo_hit` takes no front end, as item 1 has it.** `hit` runs on the thread that read the\n>   ask, and every other ask waits behind it, so it must not wait on the reader or on a write\n>   (`runner.rs`, `Compiler::hit`). Keep `memo_hit` to `nodes`, `shapes` and the memo.\n> - **Item 3 is a question of correctness, not only of blocking.** A lazy compile must compile\n>   the revision the running image was built from: its slots, layouts and callees are that\n>   revision's. A first call after an edit, before the edit's patch is applied, that compiled\n>   the new revision's body would place new code into the old image. So whichever item-3\n>   option is taken:\n>   - with an owned snapshot of the build's revision (a salsa fork), compiles are exact by\n>     construction; this is the one fastcompile prefers;\n>   - with the reader taken per call, `Later` must know its revision and refuse a compile whose\n>     database moved past it, naming the function and both revisions. Never a quiet compile at\n>     the new revision.\n>   In both cases, applying a patch to the running image moves the run to a new `Later` (and\n>   snapshot) of the patched revision. Cargo can then swap the runner's compiler state at the\n>   patch, or start the patch's functions as already published.\n> - **A `tier_up` is held to the same revision rule**, for the same reason (blaze-stencil's tier\n>   runner calls it at any time during the run).\n\n> cargo-inbox-exec (lane cargo), 23:41: agreed, and cargo asks for the snapshot option of item 3. Cargo's side, once `Later` lands: the run's `Compiler` holds the `Later` of the revision its image was linked from, with that revision's front-end snapshot, never the job's live reader. Each patch the run takes (`run::inproc::Loaded::patch`) builds the patched revision's `Later` and swaps it in at the same commit. A compile or `tier_up` already in flight finishes against the old one, and its code goes only into the generation it was asked for. If codegen picks the reader per call instead, cargo turns `Later`'s refusal (the function and both revisions) into the run's failure, never a retry at the new revision.",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T21:04:29Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/cargo.md#From cargo-inbox-exec (2026-10-29 late): to lane codegen, a lazy build the runner's threads own (`crates/blaze-codegen/src/driver.rs`, `driver/later.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:6251"
+    },
+    {
+      "at": "2026-10-31T21:04:28Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:29Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-codegen/src/driver/later.rs: Later<I, S> (Build::into_later, memo_hit, memo_put, compile_kept, tier_up), Send + Sync; item 3 is the reader per call with the key check of 01038"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "00825",
+  "from_lane": "item-hash-identity",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/persist.rs",
+    "crates/hir-def/src/hir/columns.rs"
+  ],
+  "what": "item-hash: under `hir::persist::relocating`, `impl Persist for Body` (crates/hir-def/src/expr_store/persist.rs) still writes dense ids raw: the `block_scopes` column (u64 BlockId bits), the `macro_calls` column (u64 MacroCallId bits), the hygiene half of `ident_hygiene` and `type_hygiene` (`IdPair.b` = raw SyntaxContext::into_u32), and the BlockId words `Expr::Block` keeps in the HIR extra words (hir/columns.rs `block_words`). Relocate each through the table (Kind::Block, Kind::MacroCall, Kind::Context) when a relocation scope is open, as the codec docs promise, so the bytes are the same in every database. Until then `hir_def::item_hash::portable_body` refuses any body with a block, macro call or non-root path hygiene (the identity is Err), so this is what makes those bodies cacheable. No change wanted when no scope is open.",
+  "state": "open",
+  "created": "2026-10-30T08:32:59Z",
+  "updated": "2026-10-30T08:32:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:32:59Z",
+      "by": "item-hash-identity",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -5,10 +5,17 @@
 //!
 //! [`rustc_hir_typeck/autoderef.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/autoderef.rs
 
-use std::fmt;
+#![forbid(unsafe_code)]
 
+use std::{cell::RefCell, fmt};
+
+use base_db::Db;
 use hir_def::{TraitId, TypeAliasId};
-use rustc_type_ir::inherent::{IntoKind, Ty as _};
+use rustc_type_ir::{
+    Interner as _,
+    inherent::{IntoKind, Ty as _},
+};
+use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
@@ -16,7 +23,7 @@ use crate::{
     db::HirDatabase,
     infer::InferenceContext,
     next_solver::{
-        Canonical, DbInterner, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
+        Canonical, DbInterner, IsRigid, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
         infer::{
             DbInternerInferExt, InferCtxt,
             traits::{Obligation, ObligationCause, PredicateObligations},
@@ -25,7 +32,35 @@ use crate::{
     },
 };
 
-const AUTODEREF_RECURSION_LIMIT: usize = 20;
+/// The steps a walk keeps inline; past them it goes on, up to the crate's recursion limit.
+const INLINE_STEPS: usize = 20;
+
+/// The autoderef walks of a body that went past the crate's recursion limit, each as its
+/// span and the type it stopped at, for inference to report (E0055: rustc's walk reports it
+/// itself, unless silenced as the method probe's is).
+#[derive(Default)]
+pub(crate) struct RecursionLimitErrors<'db>(RefCell<Vec<(Span, Ty<'db>)>>);
+
+impl<'db> RecursionLimitErrors<'db> {
+    /// Notes the walk at `span` stopped at `ty`, once per span. The type is resolved now: the
+    /// walk may be in a snapshot that is rolled back.
+    pub(crate) fn report(&self, infcx: &InferCtxt<'db>, span: Span, ty: Ty<'db>) {
+        let ty = infcx.deeply_resolve_ignoring_regions(ty).replace_infer_with_error(infcx.interner);
+        let mut errors = self.0.borrow_mut();
+        if !errors.iter().any(|&(at, _)| at == span) {
+            // alloc: an error path, unallocated until a walk first reaches the limit
+            errors.push((span, ty));
+        }
+    }
+
+    pub(crate) fn take(&self) -> Vec<(Span, Ty<'db>)> {
+        std::mem::take(&mut self.0.borrow_mut())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+}
 
 /// Returns types that `ty` transitively dereferences to. This function is only meant to be used
 /// outside `hir-ty`.
@@ -35,7 +70,7 @@ const AUTODEREF_RECURSION_LIMIT: usize = 20;
 /// - a type won't be yielded more than once; in other words, the returned iterator will stop if it
 ///   detects a cycle in the deref chain.
 pub fn autoderef<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     ty: Canonical<'db, Ty<'db>>,
 ) -> impl Iterator<Item = Ty<'db>> + use<'db> {
@@ -43,18 +78,19 @@ pub fn autoderef<'db>(
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let (ty, _) = infcx.instantiate_canonical(Span::Dummy, &ty);
     let autoderef = Autoderef::new(&infcx, env.param_env, ty, Span::Dummy);
-    let mut v = Vec::new();
+    // alloc: none up to `INLINE_STEPS`, past them a walk as deep as the crate's limit allows
+    let mut v = SmallVec::<[Ty<'db>; INLINE_STEPS + 1]>::new();
     for (ty, _steps) in autoderef {
         // `ty` may contain unresolved inference variables. Since there's no chance they would be
         // resolved, just replace with fallback type.
-        let resolved = infcx.resolve_vars_if_possible(ty).replace_infer_with_error(interner);
+        let resolved = infcx.deeply_resolve_ignoring_regions(ty).replace_infer_with_error(interner);
 
         // If the deref chain contains a cycle (e.g. `A` derefs to `B` and `B` derefs to `A`), we
         // would revisit some already visited types. Stop here to avoid duplication.
         //
-        // XXX: The recursion limit for `Autoderef` is currently 20, so `Vec::contains()` shouldn't
-        // be too expensive. Replace this duplicate check with `FxHashSet` if it proves to be more
-        // performant.
+        // XXX: A walk is as long as the crate's recursion limit (128 by default), so `contains`
+        // shouldn't be too expensive. Replace this duplicate check with `HashSet` if it proves
+        // to be more performant.
         if v.contains(&resolved) {
             break;
         }
@@ -76,11 +112,16 @@ impl<'db> TrackAutoderefSteps<'db> for usize {
         *self += 1;
     }
 }
-impl<'db> TrackAutoderefSteps<'db> for Vec<(Ty<'db>, AutoderefKind)> {
+/// The steps of a walk, inline up to [`INLINE_STEPS`]: [`GeneralAutoderef::next`] takes them
+/// up to the crate's recursion limit.
+pub(crate) type AutoderefSteps<'db> = SmallVec<[(Ty<'db>, AutoderefKind); INLINE_STEPS]>;
+
+impl<'db> TrackAutoderefSteps<'db> for AutoderefSteps<'db> {
     fn len(&self) -> usize {
         self.len()
     }
     fn push(&mut self, ty: Ty<'db>, kind: AutoderefKind) {
+        // alloc: none up to `INLINE_STEPS`
         self.push((ty, kind));
     }
 }
@@ -113,11 +154,15 @@ struct AutoderefTraits {
 pub(crate) trait AutoderefCtx<'db> {
     fn infcx(&self) -> &InferCtxt<'db>;
     fn param_env(&self) -> ParamEnv<'db>;
+    /// Where a walk past the recursion limit is reported; `None` silences it (rustc's
+    /// `silence_errors`), as the method probe and walks outside inference are.
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>>;
 }
 
 pub(crate) struct DefaultAutoderefCtx<'a, 'db> {
     infcx: &'a InferCtxt<'db>,
     param_env: ParamEnv<'db>,
+    errors: Option<&'a RecursionLimitErrors<'db>>,
 }
 impl<'db> AutoderefCtx<'db> for DefaultAutoderefCtx<'_, 'db> {
     #[inline]
@@ -128,10 +173,14 @@ impl<'db> AutoderefCtx<'db> for DefaultAutoderefCtx<'_, 'db> {
     fn param_env(&self) -> ParamEnv<'db> {
         self.param_env
     }
+    #[inline]
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>> {
+        self.errors
+    }
 }
 
-pub(crate) struct InferenceContextAutoderefCtx<'a, 'db>(&'a mut InferenceContext<'db>);
-impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db> {
+pub(crate) struct InferenceContextAutoderefCtx<'a, 'db, 'f>(&'a mut InferenceContext<'db, 'f>);
+impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db, '_> {
     #[inline]
     fn infcx(&self) -> &InferCtxt<'db> {
         &self.0.table.infer_ctxt
@@ -140,13 +189,17 @@ impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db> {
     fn param_env(&self) -> ParamEnv<'db> {
         self.0.table.param_env
     }
+    #[inline]
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>> {
+        Some(&self.0.table.recursion_limit_errors)
+    }
 }
 
 /// Recursively dereference a type, considering both built-in
 /// dereferences (`*`) and the `Deref` trait.
 /// Although called `Autoderef` it can be configured to use the
 /// `Receiver` trait instead of the `Deref` trait.
-pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = Vec<(Ty<'db>, AutoderefKind)>> {
+pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = AutoderefSteps<'db>> {
     // Meta infos:
     ctx: Ctx,
     traits: Option<AutoderefTraits>,
@@ -160,10 +213,10 @@ pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = Vec<(Ty<'db>, AutoderefKind
     span: Span,
 }
 
-pub(crate) type Autoderef<'a, 'db, Steps = Vec<(Ty<'db>, AutoderefKind)>> =
+pub(crate) type Autoderef<'a, 'db, Steps = AutoderefSteps<'db>> =
     GeneralAutoderef<'db, DefaultAutoderefCtx<'a, 'db>, Steps>;
-pub(crate) type InferenceContextAutoderef<'a, 'db, Steps = Vec<(Ty<'db>, AutoderefKind)>> =
-    GeneralAutoderef<'db, InferenceContextAutoderefCtx<'a, 'db>, Steps>;
+pub(crate) type InferenceContextAutoderef<'a, 'db, 'f, Steps = AutoderefSteps<'db>> =
+    GeneralAutoderef<'db, InferenceContextAutoderefCtx<'a, 'db, 'f>, Steps>;
 
 impl<'db, Ctx, Steps> Iterator for GeneralAutoderef<'db, Ctx, Steps>
 where
@@ -180,8 +233,12 @@ where
             return Some((self.state.cur_ty, 0));
         }
 
-        // If we have reached the recursion limit, error gracefully.
-        if self.state.steps.len() >= AUTODEREF_RECURSION_LIMIT {
+        // If we have reached the recursion limit, error gracefully (rustc's
+        // `Limit::value_within_limit`: a walk may take as many steps as the limit).
+        if self.state.steps.len() > self.interner().recursion_limit() {
+            if let Some(errors) = self.ctx.recursion_limit_errors() {
+                errors.report(self.infcx(), self.span, self.state.cur_ty);
+            }
             self.state.reached_recursion_limit = true;
             return None;
         }
@@ -197,7 +254,7 @@ where
         // and Deref, and this has benefits for const and the emitted MIR.
         let (kind, new_ty) =
             if let Some(ty) = self.state.cur_ty.builtin_deref(self.include_raw_pointers) {
-                debug_assert_eq!(ty, self.infcx().resolve_vars_if_possible(ty));
+                debug_assert_eq!(ty, self.infcx().deeply_resolve_ignoring_regions(ty));
                 // NOTE: we may still need to normalize the built-in deref in case
                 // we have some type like `&<Ty as Trait>::Assoc`, since users of
                 // autoderef expect this type to have been structurally normalized.
@@ -236,14 +293,22 @@ impl<'a, 'db> Autoderef<'a, 'db> {
         base_ty: Ty<'db>,
         span: Span,
     ) -> Self {
-        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty, span)
+        Self::new_impl(DefaultAutoderefCtx { infcx, param_env, errors: None }, base_ty, span)
     }
 }
 
-impl<'a, 'db> InferenceContextAutoderef<'a, 'db> {
+impl<'a, 'db, Steps: TrackAutoderefSteps<'db>> Autoderef<'a, 'db, Steps> {
+    /// Reports a walk past the recursion limit to `errors` (E0055), as inference's walks do.
+    pub(crate) fn reporting_to(mut self, errors: &'a RecursionLimitErrors<'db>) -> Self {
+        self.ctx.errors = Some(errors);
+        self
+    }
+}
+
+impl<'a, 'db, 'f> InferenceContextAutoderef<'a, 'db, 'f> {
     #[inline]
     pub(crate) fn new_from_inference_context(
-        ctx: &'a mut InferenceContext<'db>,
+        ctx: &'a mut InferenceContext<'db, 'f>,
         base_ty: Ty<'db>,
         span: Span,
     ) -> Self {
@@ -251,7 +316,7 @@ impl<'a, 'db> InferenceContextAutoderef<'a, 'db> {
     }
 
     #[inline]
-    pub(crate) fn ctx(&mut self) -> &mut InferenceContext<'db> {
+    pub(crate) fn ctx(&mut self) -> &mut InferenceContext<'db, 'f> {
         self.ctx.0
     }
 }
@@ -264,7 +329,7 @@ impl<'a, 'db> Autoderef<'a, 'db, usize> {
         base_ty: Ty<'db>,
         span: Span,
     ) -> Self {
-        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty, span)
+        Self::new_impl(DefaultAutoderefCtx { infcx, param_env, errors: None }, base_ty, span)
     }
 }
 
@@ -278,7 +343,7 @@ where
         GeneralAutoderef {
             state: AutoderefSnapshot {
                 steps: Steps::default(),
-                cur_ty: ctx.infcx().resolve_vars_if_possible(base_ty),
+                cur_ty: ctx.infcx().deeply_resolve_ignoring_regions(base_ty),
                 obligations: PredicateObligations::new(),
                 at_start: true,
                 reached_recursion_limit: false,
@@ -357,13 +422,13 @@ where
         let (normalized_ty, obligations) = structurally_normalize_ty(
             self.infcx(),
             self.param_env(),
-            Ty::new_projection(interner, trait_target.into(), [ty]),
+            Ty::new_projection(interner, IsRigid::No, trait_target.into(), [ty]),
             self.span,
         )?;
         debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})", ty, normalized_ty, obligations);
         self.state.obligations.extend(obligations);
 
-        Some(self.infcx().resolve_vars_if_possible(normalized_ty))
+        Some(self.infcx().deeply_resolve_ignoring_regions(normalized_ty))
     }
 
     /// Returns the final type we ended up with, which may be an unresolved

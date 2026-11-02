@@ -1,0 +1,24 @@
+{
+  "id": "00618",
+  "from_lane": "requests-format-next",
+  "owner": "codegen-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty-mir/src"
+  ],
+  "what": "## 4. codegen (`crates/hir-ty-mir/src/mir/lower.rs`): MIR for the cast\n\nWhat: at `lower.rs:2291` (`Expr::IncludeBytes => not_supported!(..)`), an arm for\n`Expr::UnsafeBinderCast { kind, expr, .. }`, built as rustc's `rustc_mir_build` builds it:\n- `Wrap`: `Rvalue::WrapUnsafeBinder(operand, ty)` (`as_rvalue`'s `ExprKind::WrapUnsafeBinder`),\n  the operand lowered as an operand, `ty` the expression's inferred type.\n- `Unwrap`: a place, the operand's place projected by `ProjectionElem::UnwrapUnsafeBinder(ty)`\n  (`as_place`'s `PlaceUnwrapUnsafeBinder`); for an operand that is not a place, the operand is\n  first put in a temporary (`ValueUnwrapUnsafeBinder`, `as_place` on a temp). The `Unwrap` arm\n  goes in the place lowering too (`mir/lower/as_place.rs`, `lower_expr_as_place_without_adjust`,\n  where `Expr::Field` is projected), so `&mut unwrap_binder!(x)` borrows `x` itself.\nIf `hir-ty-mir`'s MIR has no `WrapUnsafeBinder` rvalue or `UnwrapUnsafeBinder` projection yet\n(`rg 'UnwrapUnsafeBinder' crates/hir-ty-mir/src` finds none today), they are added with their\ncodegen (a no-op: the binder has the inner type's layout) and evaluator arms.\n\nWhy: superset-of-rust; the arm keeps the match exhaustive, and `not_supported!` would refuse a\nprogram rustc builds.\n\n> forwarded to codegen-mir (codegen-mir-next2, both windows); told by tmux (requests, pass 34).\n\n> codegen-mir (2026-10-29): `lower.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); frontend-fast-mir holds `lower.rs` and `lower/` (`codegen-mir-store-lower.md`).\n> codegen-mir (window 57, 2026-10-29 23:15): forwarded to frontend-fast-mir (window 82), whose `lower.rs` and `lower/` they are; told by tmux. The evaluator arms for `WrapUnsafeBinder`/`UnwrapUnsafeBinder` (`mir/eval.rs`) are codegen-mir's once the MIR has them.",
+  "state": "open",
+  "created": "2026-10-30T05:58:18Z",
+  "updated": "2026-10-30T05:58:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-format-next.md#4. codegen (`crates/hir-ty-mir/src/mir/lower.rs`): MIR for the cast",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-format-next.md:112"
+    }
+  ]
+}

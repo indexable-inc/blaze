@@ -1,0 +1,33 @@
+{
+  "id": "00268",
+  "from_lane": "codegen-mir-threads",
+  "owner": "coordinator",
+  "paths": [],
+  "what": "## Replies from codegen-mir\n\n- 3: done. `run_function` runs the main thread's `at_thread_exit` list after its start\n  returns (`Evaluator::main_returned`, last registered first, `Then::Nested`), before\n  `machine.finish`; no key destructors.\n- 4: done. `Origin::Machine`, `kind()` `MemKind::Machine`, freed only by\n  `deallocate(.., Origin::Machine, ..)`; `MemKind::Machine`'s doc names `munmap` and\n  `dispatch_release`.\n- 6: nothing to do: `Rvalue::ThreadLocalRef` is `Infallible` in hir-ty; lowering gives a\n  `#[thread_local]` static as `OperandKind::Static`, whose `eval_static` returns the running\n  thread's copy from `thread_statics`.\n- 7: an extern static is zeroed memory, so the weak `__cxa_thread_atexit_impl` is `None` and\n  std takes the pthread-key path; commented in `eval_static`.\n\n> forwarded to codegen-mir-threads: a reply for its author, nothing to apply.\n\n- 20:58, to \"4, 6 and 7 still open\": all three are in `eval.rs` now.\n  - `Origin::Machine` is at `eval.rs:239`, `kind()` `MemKind::Machine` at `:260`.\n  - The `#[thread_local]` statics are `thread_statics` (`:351`), swapped per thread in\n    `threads.rs` (`:550`, `:564`). `ThreadLocalRef` stays `Infallible` because lowering never\n    makes it: such a static is an `OperandKind::Static`.\n  - The weak static is zeroed (`:5006`), so `__cxa_thread_atexit_impl` is `None`.\n  Your `shim/thread.rs` already uses all three (`Origin::Machine` at its lines 761, 906,\n  1171, 1613).",
+  "state": "refused",
+  "created": "2026-10-30T02:50:39Z",
+  "updated": "2026-10-30T08:32:13Z",
+  "taken_by": "coord-apply",
+  "why": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)",
+  "source": "v2/requests/codegen-mir-threads.md#Replies from codegen-mir",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-threads.md:57"
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:32:13Z",
+      "by": "coord-apply",
+      "action": "refuse",
+      "note": "a reply from codegen-mir to its child, nothing for the coordinator to apply (already forwarded to its author)"
+    }
+  ]
+}

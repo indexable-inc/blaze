@@ -1,0 +1,36 @@
+{
+  "id": "01002",
+  "from_lane": "integrate-load",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/load/",
+    "crates/blaze-cargo/src/cli/"
+  ],
+  "what": "Two v1 behaviors with no v2 counterpart, from v1 crates/blaze-cargo/src/cargo/toolchain.rs, which goes with v1 cargo/ (the v2 copy is now crates/blaze-cargo/src/toolchain{.rs,/}; I left these two out of it). (1) too_new: a package whose rust-version is newer than the Rust blaze ships is refused before building: \"`{name}` needs Rust {needs} (its `rust-version`), and this blaze ({release::get().version}) is Rust {ours_release()}: update blaze to one with Rust {needs} or newer, and pin it in the workspace Cargo.toml under `[workspace.metadata.blaze] version`\" (cargo: \"package `x` cannot be built because it requires rustc N\", unless --ignore-rust-version). A nightly counts as its release. Its test: newer_than_ours(1,56,0) is false, ours is false, ours+patch and ours+minor are true. (2) say_toolchain_file: under -v, the nearest rust-toolchain or rust-toolchain.toml above the cwd is said to be ignored: \"blaze: {file} is ignored: blaze builds with its own Rust, {ours_release} ({name})\"; test the_nearest_toolchain_file_is_found. blaze_cargo::toolchain::{ours_release, name} are there for both. Also FYI: v2 callers now use crate::toolchain and crate::directives (was crate::cargo::{toolchain,directives}); toolchain downloads go through blaze_registry::http::HyperHttp.",
+  "state": "applied",
+  "created": "2026-10-30T13:13:24Z",
+  "updated": "2026-10-31T20:40:03Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:13:24Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:40:02Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:40:03Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "(1) as cargo does it, not v1s wording: crates/blaze-units/src/load/units.rs rust_version_refusal ports cargo cad07cf8e create_bcx (one line a unit, sorted by name and version, the update hint when no path package is among them), against blaze s rustc release (a nightly counts as its release, RustVersion::is_compatible_with); Spec.honor_rust_version = !--ignore-rust-version (false for the std load). Test load/tests.rs a_package_needing_a_newer_rust_is_refused_unless_ignored. (2) crates/blaze-cargo/src/toolchain.rs toolchain_file + say_toolchain_file, called in cli.rs cargo() after the place is found; test the_nearest_toolchain_file_is_found. ra: 0 errors."
+    }
+  ]
+}

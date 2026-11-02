@@ -1,0 +1,23 @@
+{
+  "id": "00889",
+  "from_lane": "speed-sol2-small",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/persist.rs"
+  ],
+  "what": "## speed-sol2-small: the persisted type table's writer ~3x its bound (solver-sync speed-of-light section 5)\n\n- Where: `crates/hir-ty/src/next_solver/persist.rs`, the writer's `FxHashMap` from a value to its place in the table being written (~30 cycles a probe; 10^4 values ~86 us).\n- Change: a column indexed by the value's global row (a `u32` per row, in a reused per-thread `Vec` that the writer resets by the rows it set), one line per value instead of a hash and a probe, ~10 cycles. Same bytes written (same order: first visit), so a round-trip test and a byte-equality test against today's writer over the fixtures.\n- Matters on a cold build and when many results change; a warm build writes only changed results.",
+  "state": "open",
+  "created": "2026-10-30T09:28:58Z",
+  "updated": "2026-10-30T09:28:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:28:58Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

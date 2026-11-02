@@ -1,0 +1,29 @@
+{
+  "id": "01408",
+  "from_lane": "observe",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "observe: blaze-engine forwards the feature `tracy` (Andrew, 2026-10-31: Tracy behind a compile-time feature, off by default). Under [features], next to llvm:\n# Sends every span, plot, build and task to Tracy v0.14.1 (docs/profiling.md); off by default.\ntracy = [\"blaze-cargo/tracy\"]\nApply it after cargo's `tracy = [\"blaze-profile/tracy\"]` lands (my request to cargo). It depends on dedup's root dep change. `blaze build --release -p blaze-engine --features tracy` is then how a Tracy build is made.",
+  "state": "refused",
+  "created": "2026-11-01T01:19:26Z",
+  "updated": "2026-11-01T01:23:44Z",
+  "taken_by": null,
+  "why": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:19:26Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:23:44Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "withdrawn by observe, the requester: Andrew's addenda 2 and 5 (17:53, 18:14) drop Tracy entirely and reorder the plan (Arrow schema, Parquet history, live readers over the daemon socket). Nothing in this request is wanted any more; observe files the replacement per step."
+    }
+  ]
+}

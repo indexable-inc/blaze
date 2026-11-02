@@ -13,14 +13,13 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-hash.workspace = true
 # Avoid adding deps here, this crate is widely used in tests it should compile fast!
-dissimilar = "1.0.10"
+dissimilar.workspace = true
 text-size.workspace = true
-rustc-hash.workspace = true
 
 paths.workspace = true
 stdx.workspace = true
-profile.workspace = true
 
 [lints]
 workspace = true

@@ -1,49 +1,41 @@
 #!/usr/bin/env python3
-"""debuginfo.py: what a debugger and a backtrace are told of blaze's code, against rustc's.
+"""debuginfo.py: what a debugger and a backtrace are told of blaze's code.
 
-Four programs are built by cargo and again with their crates from blaze: the corpus runner, the
-stress workspace and rung2 with a panic put into a copy of each, and a small program of its own
-that a daemon then follows through edits, each added to the linked binary where that can be done.
-Every one is run with RUST_BACKTRACE=1 and has to print, for each panic, the frames of the
-workspace's own files that the cargo build prints: the same functions at the same file and line.
+Programs are built by `blaze build`, each in an empty home: the stress workspace and rung2 with a
+panic put into a copy of each, a program of its own with panics behind inlined and `#[track_caller]`
+functions, and a small program of its own that a daemon then follows through edits, built again
+after each. Every one is run with RUST_BACKTRACE=1 and has to print,
+for each panic, frames of the workspace's own files at the places the source says the panic passes
+through: where it panics, and for the programs of its own every caller up to `main`, in order.
 `llvm-dwarfdump --verify` has to find nothing wrong with any of the binaries, and gdb has to stop
-at a line of a function blaze compiled, say where it is, and step to other lines of it.
+at a line of a function blaze compiled, say where it is, and step to other lines of it. At a line
+of a function of its own gdb has to print the parameters and locals as the source has them.
 
 On Windows what a debugger reads is the PDB `link.exe /DEBUG` writes from the CodeView of the
 objects, so `llvm-pdbutil` reads it in place of `llvm-dwarfdump`, and `cdb` is the debugger. Only
-lines and procedures are written there: no variable is told of, and the names of functions are
-held against the cargo build's by the last part of each, which the two spell differently
-(`pick::<u8>` for `pick<u8>`). A splice leaves the PDB as it was, and that is what is checked
-of it: the old lines stay true, and the code that was added has no line rather than a wrong one.
+lines and procedures are written there: no variable is told of.
 
-Then the cost: the time and the size of the corpus's object with and without debug info,
-whether blaze leaves it out when the profile says `debug = false`, and whether it works out
-the types of variables only when the profile asks for variables.
+Then the cost: the time and the size of the stress workspace's program with and without debug
+info, whether blaze leaves it out when the profile says `debug = false`, and whether a build that
+asks for variables, in a home whose store a build of lines alone filled, has them all.
 
-BLAZE_BACKEND=llvm   the same of LLVM's code. Its optimizer turns calls in tail position into
-                     jumps, so a frame the cargo build prints may be missing: those are counted.
---only NAME          one of: corpus stress rung2 edits callers locals types scopes rich profile cost
+Its programs are of the dev profile, which v2 compiles with Cranelift.
+
+--only NAME          one of: stress rung2 edits callers locals profile cost
 """
-import bisect, glob, os, re, shutil, struct, subprocess, sys, tempfile, time
+import bisect, os, re, shutil, struct, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "true")
-import linkline
-from difftest import Fixture, BLAZE, WINDOWS, sysroot_rlibs, built
+from dwarf import DWARFDUMP, OPTIMIZED_OUT, WINDOWS, Tally, dumped, held, own, own_ranges, panics, unit_of, units
+from rebuild import Project, copy, scratch
+from storelib import forget
 
-LLVM = os.environ.get("BLAZE_BACKEND") == "llvm"
-# The pinned LLVM's, on PATH in the flake's dev shell and in CI.
-DWARFDUMP = shutil.which("llvm-dwarfdump") or "llvm-dwarfdump"
 PDBUTIL = shutil.which("llvm-pdbutil") or os.path.join(os.environ.get("LLVM_SYS_231_PREFIX", r"C:\llvm"), "bin", "llvm-pdbutil.exe")
 CDB = shutil.which("cdb") or r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
 DEBUGGER = "cdb" if WINDOWS else "gdb"
 PANIC = 'if std::env::var_os("DEBUGINFO_PANIC").is_some() { drop(std::panic::take_hook()); panic!("deliberate"); }'
-# What rustc calls the code that drops a coroutine, which blaze has the coroutine itself do.
-DROP_GLUE = re.compile(r"^core::ptr::drop_glue::<(.*)>$")
-# The same in CodeView, where rustc calls a coroutine `async_fn$0` and what it keeps `async_fn_env$0`.
-COROUTINE = re.compile(r"\b(?:async_gen|async|gen)_(?:fn|block)\$(\d+)")
-DROP_GLUE_CODEVIEW = re.compile(r"^core::ptr::drop_glue<enum2\$<(.*)::(?:async_gen|async|gen)_(?:fn|block)_env\$(\d+)> >$")
 
 EDITS_TOML = """[package]
 name = "sline"
@@ -112,141 +104,6 @@ fn main() {
 LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline::Point {x: 3, y: -4}"),
           ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
           ("*borrowed", "sline::Point {x: 3, y: -4}")]
-OPTIMIZED_OUT = "<optimized out>"
-
-TYPES_MAIN = """#[derive(Clone, Copy)]
-struct Point { x: i32, y: i64 }
-struct Pair(u8, f64);
-#[derive(Clone, Copy)]
-enum Shape { Circle(u32), Rect { w: u16, h: u16 }, Dot }
-#[derive(Clone, Copy)]
-enum Level { Low = 1, Mid = 5, High = 9 }
-union Bits { whole: u32, half: u16 }
-
-fn show(width: u32, name: &str, big: [u64; 5]) -> u32 {
-    let point = Point { x: 3, y: -4 };
-    let pair = Pair(7, 1.5);
-    let tuple = (true, 'c', 9u64);
-    let shape = Shape::Rect { w: 4, h: 5 };
-    let circle = Shape::Circle(11);
-    let dot = Shape::Dot;
-    let level = Level::Mid;
-    let some = Some(42u32);
-    let none: Option<u32> = None;
-    let boxed: Option<&Point> = Some(&point);
-    let missing: Option<&Point> = None;
-    let ok: Result<u8, String> = Ok(3);
-    let list = vec![1i32, 2, 3];
-    let text = String::from("hello");
-    let slice = &list[1..];
-    let bits = Bits { whole: 0x10002 };
-    let borrowed = &point;
-    let sum = width + point.x as u32 + pair.0 as u32 + tuple.2 as u32 + big[4] as u32;
-    println!("{} {} {} {}", sum, name, borrowed.y, slice.len());
-    std::hint::black_box((&shape, &circle, &dot, &level, &some, &none, &boxed, &missing, &ok, &text, &bits, &tuple));
-    sum
-}
-
-fn main() {
-    println!("{}", show(10, "abc", [1, 2, 3, 4, 5]));
-}
-"""
-
-# Names bound more than once and names of an inner block. Each `// stop` is a line a debugger
-# stops at, where the names of SCOPED are asked for: the answer depends on the block.
-SCOPES_MAIN = """use std::hint::black_box;
-
-fn scoped(seed: u32) -> u64 {
-    let value = seed + 1;
-    black_box(value); // stop
-    let value = u64::from(value) * 3;
-    let total = {
-        let inner = value + 5;
-        let value = "text";
-        black_box(inner) + black_box(value.len() as u64) // stop
-    };
-    black_box(total); // stop
-    let mut sum = 0;
-    for step in 0..2u64 {
-        let value = [step, total];
-        sum += black_box(value[1]); // stop
-    }
-    match black_box(Some(sum)) {
-        Some(value) if value > 1 => black_box(value + total), // stop
-        _ => 0,
-    }
-}
-
-fn main() {
-    println!("{}", scoped(black_box(4)));
-}
-"""
-# Closures, what an `async fn` keeps, pointers to `dyn` and enums with fields or without a tag
-# of their own: the types a debugger's printers for Rust look into the shape of.
-RICH_MAIN = """use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-
-trait Named { fn name(&self) -> u32; }
-struct Dog { legs: u32 }
-impl Named for Dog { fn name(&self) -> u32 { self.legs } }
-enum Tree { Leaf, Node(Box<Tree>, u32) }
-enum Wide { A(u64, u8), B { text: &'static str }, C }
-
-struct Once(bool);
-impl Future for Once {
-    type Output = u32;
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u32> {
-        if self.0 { Poll::Ready(7) } else { self.0 = true; Poll::Pending }
-    }
-}
-
-async fn steps(start: u32) -> u32 {
-    let first = Once(false).await + start;
-    let kept = [first, 2];
-    let second = Once(false).await;
-    kept[0] + second
-}
-
-fn show(seed: u32) -> u32 {
-    let offset = seed + 1;
-    let mut count = 0u64;
-    let by_ref = |x: u32| x + offset;
-    let by_move = move |x: u32| x * offset;
-    let mut by_mut = || { count += 1; count };
-    let dog = Dog { legs: 4 };
-    let object: &dyn Named = &dog;
-    let boxed: Box<dyn Named> = Box::new(Dog { legs: 3 });
-    let leaf = Tree::Leaf;
-    let node = Tree::Node(Box::new(Tree::Leaf), 5);
-    let wide = Wide::A(9, 1);
-    let wide_b = Wide::B { text: "hi" };
-    let wide_c = Wide::C;
-    let nested: Option<Option<bool>> = Some(None);
-    let ordering = std::cmp::Ordering::Less;
-    let mut future = Box::pin(steps(seed));
-    let fresh = steps(seed);
-    let mut cx = Context::from_waker(Waker::noop());
-    let _ = future.as_mut().poll(&mut cx);
-    let once = &*future;
-    let _ = std::hint::black_box(&once);
-    let sum = by_ref(1) + by_move(2) + by_mut() as u32 + object.name() + boxed.name();
-    println!("{}", sum);
-    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested, &ordering, &fresh));
-    let _ = future.as_mut().poll(&mut cx);
-    let _ = future.as_mut().poll(&mut cx);
-    sum
-}
-
-fn main() {
-    println!("{}", show(std::hint::black_box(10)));
-}
-"""
-RICH = ["by_ref", "by_move", "by_mut", "object", "boxed", "leaf", "node", "wide", "wide_b", "wide_c", "nested",
-        "ordering", "fresh", "*once", "future"]
-SCOPED = ["seed", "value", "inner", "total", "sum", "step"]
-TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
-         "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
 
 # Panics behind functions rustc inlines even in a dev build, and behind `#[track_caller]` ones.
 CALLERS_MAIN = """use std::panic::{catch_unwind, Location};
@@ -337,66 +194,10 @@ EDITS = [
 ]
 
 
-def panics(stderr):
-    """The panics a run printed: where each says it was and what it said, and its frames as
-    [name, place]."""
-    found, lines = [], stderr.splitlines()
-    for at, line in enumerate(lines):
-        if "panicked at" in line:
-            said = lines[at + 1].strip() if at + 1 < len(lines) else ""
-            found.append((line.split("panicked at")[1].strip() + " " + said, []))
-        elif found and (frame := re.match(r"\s+\d+: (.*)", line)):
-            found[-1][1].append([frame.group(1).strip(), None])
-        elif found and found[-1][1] and (place := re.match(r"\s+at (.*)", line)):
-            found[-1][1][-1][1] = place.group(1).strip()
-    return found
-
-
-def last_part(name):
-    """What a function is called without what it is in and what it is given: `pick` of both
-    `sline::pick::<u8>`, which is how a symbol of rustc's reads, and `sline::pick<u8>`, which
-    is how rustc names it in CodeView. A closure keeps what it is a closure of."""
-    if glue := DROP_GLUE_CODEVIEW.match(name):
-        name = f"{glue.group(1)}::closure${glue.group(2)}"
-    name = COROUTINE.sub(r"closure$\1", name)
-    parts, depth, start, at = [], 0, 0, 0
-    while at < len(name):
-        if name[at] in "<({[":
-            depth += 1
-        elif name[at] in ")}]" or (name[at] == ">" and name[at - 1] != "-"):
-            depth -= 1
-        elif depth == 0 and name.startswith("::", at):
-            parts.append(name[start:at])
-            start, at = at + 2, at + 1
-        at += 1
-    parts = [re.sub(r"^\{closure#(\d+)\}$", r"closure$\1", part) for part in parts + [name[start:]]]
-    named = [part.split("<")[0] for part in parts if part and not part.startswith("<")] or [name]
-    keep = len(named) - 1
-    while keep > 0 and named[keep].startswith("closure$"):
-        keep -= 1
-    return "::".join(named[keep:])
-
-
-def own(frames):
-    """The frames of the workspace's own files, by function and file:line."""
-    kept = []
-    for name, place in frames:
-        place = place.replace("\\", "/") if place else ""
-        if not place.startswith("./"):
-            continue
-        if WINDOWS:
-            # A frame has no column there.
-            kept.append((last_part(name), place))
-            continue
-        glue = DROP_GLUE.match(name)
-        kept.append((glue.group(1) if glue else name, place.rsplit(":", 1)[0]))
-    return kept
-
-
-def within(ours, theirs):
-    """Whether `ours` is `theirs` with frames left out."""
-    rest = iter(theirs)
-    return all(frame in rest for frame in ours)
+def line_of(text, needle):
+    """The line of `text` that `needle` is on, counted from 1."""
+    assert text.count(needle) == 1, needle
+    return text[:text.index(needle)].count("\n") + 1
 
 
 def backtraces(binary, cwd, env=None):
@@ -405,107 +206,27 @@ def backtraces(binary, cwd, env=None):
     return panics(ran.stderr)
 
 
-BEHIND = "behind rustc"
+def sline(what, main):
+    """A crate `sline` of its own with `main` as its `src/main.rs`: (the run's directory, the crate)."""
+    work = scratch(f"blaze-debuginfo-{what}-")
+    ws = os.path.join(work, "ws")
+    os.makedirs(os.path.join(ws, "src"))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, main)):
+        open(os.path.join(ws, path), "w").write(text)
+    return work, ws
 
 
-# What is known to be wrong, and why.
-OPEN = set()
-
-
-class Tally:
-    def __init__(self):
-        self.wrong, self.open, self.lines = 0, 0, []
-
-    def say(self, what, verdict, more=""):
-        if what in OPEN and verdict.isupper():
-            more, verdict = f"{verdict}: {more}", "open"
-        elif what in OPEN:
-            more, verdict = f"{verdict}: take it out of OPEN in harness/debuginfo.py", "SAME NOW"
-        self.wrong += verdict.isupper()
-        # Open: nothing shown is wrong, but rustc -O -g shows a value this has optimized out.
-        self.open += verdict in (BEHIND, "open")
-        print(f"{what:58} {verdict:14} {more}", flush=True)
-
-
-def jumps_away(binary, name):
-    """Whether the function blaze compiled under that name leaves by jumping to another one
-    rather than calling it, so that it has no frame while the other runs. Its range is what the
-    debug info says, and the jump is read from the disassembly; None where that cannot be read."""
-    said = dumped(binary, f"--name={name}")
-    entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it]
-    if not entries and re.fullmatch(r"\w+(::\w+)*", name):
-        # A function with a symbol of its own is named by its last part and its mangled path.
-        parts = name.split("::")
-        said = dumped(binary, f"--name={parts[-1]}")
-        mangled = "".join(f"{len(part)}{part}" for part in parts)
-        entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it
-                   and re.search(rf'DW_AT_linkage_name\s+\("_R\w*?{mangled}"\)', it)]
-    ranges = [(low.group(1), high.group(1)) for it in entries
-              if (low := re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", it))
-              and (high := re.search(r"DW_AT_high_pc\s+\((0x[0-9a-f]+)\)", it))]
-    # A function whose entry is kept apart from the program has its code as a list of one range.
-    ranges += [ends for it in entries for ends in re.findall(r"\[(0x[0-9a-f]+), (0x[0-9a-f]+)\)", it)]
-    if not ranges or not shutil.which("objdump"):
-        return None
-    for low, high in ((int(low, 16), int(high, 16)) for low, high in ranges):
-        listed = subprocess.run(["objdump", "-d", "--no-show-raw-insn", f"--start-address={low:#x}",
-                                 f"--stop-address={high:#x}", binary], capture_output=True, text=True).stdout
-        targets = [int(it, 16) for it in re.findall(r"^\s*[0-9a-f]+:\s+(?:jmp|b)\s+([0-9a-f]+)\b", listed, re.M)]
-        if any(not low <= target < high for target in targets):
-            return True
-        # A call through a pointer in tail position is a jump through a register. A jump table's
-        # is one too, but has the function's code after it: the tail call is the last instruction.
-        last = re.findall(r"^\s*[0-9a-f]+:\s+(\S.*)$", listed, re.M)[-1:]
-        if last and re.match(r"(?:notrack\s+)?jmp\s+\*|br\s+x\d+\b", last[0]):
-            return True
-    return False
-
-
-def compare(tally, what, theirs, ours, binary=None):
-    """Holds the frames of each panic of blaze's binary against the cargo build's."""
-    differ, fewer, frames, shown, absent = 0, 0, 0, "", set()
-    for (their_at, their_frames), (our_at, our_frames) in zip(theirs, ours):
-        want, got = own(their_frames), own(our_frames)
-        frames += len(got)
-        if their_at == our_at and want == got:
-            continue
-        if LLVM and their_at == our_at and got and within(got, want):
-            fewer += 1
-            absent.update(frame[0] for frame in want if frame not in got)
-            continue
-        differ += 1
-        shown = shown or f"at {our_at}: {[g for g in got if g not in want][:2]} for {[w for w in want if w not in got][:2]}"
-    if not theirs or len(theirs) != len(ours):
-        return tally.say(what, "NOT THE PANICS", f"{len(ours)} for {len(theirs)}")
-    if not frames:
-        return tally.say(what, "NO FRAMES")
-    more = f"{len(theirs)} panics, {frames} frames"
-    if fewer:
-        # A frame may only be missing because its function left by a jump: anything else is a
-        # frame the debug info lost.
-        left = {name: jumps_away(binary, name) if binary and not WINDOWS else None for name in sorted(absent)}
-        kept = [name for name, jumps in left.items() if jumps is False]
-        if kept:
-            return tally.say(what, "FRAMES LOST", f"{more}; {kept[0]} calls and has no frame")
-        seen = sum(1 for jumps in left.values() if jumps)
-        more += (f", {fewer} with frames the optimizer left out: {seen} of {len(left)} functions seen to leave"
-                 f" by a jump, first {next(iter(left))[:60]}")
-    tally.say(what, "DIFFERENT" if differ else "same", more + (f"; {differ} differ, first {shown}" if differ else ""))
-
-
-def dumped(binary, *what):
-    """What `llvm-dwarfdump` says of the program, read from the files beside it too where a
-    unit's entries are kept apart (split DWARF), with their addresses as the program has them."""
-    return subprocess.run([DWARFDUMP, "--dwo", *what, binary], capture_output=True, text=True).stdout
-
-
-def units(binary):
-    """What each unit's own entry says. A unit kept apart is two entries, the one left in the
-    program with the addresses and the one beside it with the producer: they are put together."""
-    heads = [it.split("\n\n")[0] for it in dumped(binary, "--debug-info", "--show-children=0").split("DW_TAG_compile_unit")[1:]]
-    ident = lambda head: (re.search(r"DW_AT_GNU_dwo_id\s+\((\w+)\)", head) or [None, None])[1]
-    left = {ident(head): head for head in heads if ident(head) and "DW_AT_producer" not in head}
-    return [head + left.get(ident(head), "") for head in heads if "DW_AT_producer" in head or ident(head) not in left]
+def build(ws, package, home, env=None):
+    """`blaze build -p PACKAGE` of `ws` with the home `home` (an empty one unless a build was
+    there before) and `env`: the program, refused with what blaze said when it is not built."""
+    project = Project(ws, os.path.dirname(home), home=home, env=env, name=os.path.basename(home))
+    try:
+        built = project.build(package, "-p", package)
+    finally:
+        project.stop()
+    if built.status != 0 or not built.executable:
+        raise SystemExit(f"blaze build -p {package} in {ws} failed ({built.status}):\n{built.said[-3000:]}")
+    return built.executable
 
 
 class Image:
@@ -601,28 +322,6 @@ class Pdb:
         return next((name for begin, end, name in self.procedures if begin <= address < end), None)
 
 
-def stale(tally, what, theirs, ours, said):
-    """Holds the frames of a binary whose PDB a splice left behind against the cargo build's.
-
-    The PDB knows nothing of the code a splice adds, so a frame in it has no line, and the
-    name it gets is whatever symbol is nearest below. What has to hold is that no frame says
-    a line the cargo build does not, and that the daemon said `said` of the splice."""
-    if not theirs or len(theirs) != len(ours):
-        return tally.say(what, "NOT THE PANICS", f"{len(ours)} for {len(theirs)}")
-    wrong, lost, frames = 0, 0, 0
-    for (their_at, their_frames), (our_at, our_frames) in zip(theirs, ours):
-        want, got = own(their_frames), own(our_frames)
-        frames += len(want)
-        lost += len(want) - len(got)
-        wrong += their_at != our_at or not within(got, want)
-    if wrong:
-        return tally.say(what, "WRONG LINE", f"{wrong} of {len(theirs)} panics have a frame the cargo build does not")
-    if lost and not said:
-        return tally.say(what, "NOT SAID", f"{lost} of {frames} frames have no line and the daemon said nothing of the PDB")
-    tally.say(what, "stale" if lost else "same", f"{len(theirs)} panics, {lost} of {frames} frames without a line, none with a wrong one"
-              + (": the daemon says the PDB is of the code before the splice" if lost else ""))
-
-
 def verify(tally, what, binary):
     """Whether `llvm-dwarfdump --verify` finds the program sound."""
     if WINDOWS:
@@ -690,15 +389,6 @@ def frames_of(binary):
         length, _ = pointer(encoding & 0x0f, frame + 8 + size_of)
         ends[start] = start + length
     return ends
-
-
-def own_ranges(binary):
-    """Where the code of each function of blaze's is, as its units say."""
-    ours = set()
-    for unit in units(binary):
-        if re.search(r'DW_AT_producer\s+\("blaze[ "]', unit):
-            ours |= {(int(a, 16), int(b, 16)) for a, b in re.findall(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)", unit)}
-    return ours
 
 
 def unlined(binary):
@@ -855,11 +545,6 @@ def profiler(tally, what, binary, cwd, crates):
             print("\n".join("    perf: " + it.strip()[:160] for it in stack.strip().splitlines()[-12:]) + "\n    perf: --")
 
 
-def unit_of(binary, address):
-    producer = re.search(r'DW_AT_producer\s+\("([^"]*)"\)', dumped(binary, f"--lookup={address:#x}"))
-    return producer.group(1) if producer else "nothing"
-
-
 def debugger(tally, what, binary, cwd, place, env=None):
     """Has gdb stop at `place` (file:line), say where that is, and step on from there."""
     if WINDOWS:
@@ -958,32 +643,30 @@ def call_site(ours):
             return places[min(1, len(places) - 1)][1]
 
 
-def program(tally, what, workspace, crates, package, inject=None):
-    ws = workspace
-    if inject:
-        ws = tempfile.mkdtemp(prefix=f"blaze-debuginfo-{what}-")
-        shutil.copytree(workspace, ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
-        path, old, new = inject
-        text = open(os.path.join(ws, path)).read()
-        assert old in text, old
-        open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
-    env = {"DEBUGINFO_PANIC": "1"} if inject else {}
-    fx = Fixture(ws, crates, ["-p", package])
-    fx.rustc_build()
-    fx.blaze_build()
-    theirs, ours = backtraces(fx.reference, fx.ws, env), backtraces(fx.binary, fx.ws, env)
-    compare(tally, f"{what}: frames of each panic", theirs, ours, fx.binary)
-    verify(tally, what, fx.binary)
-    unwinding(tally, what, fx.binary)
+def program(tally, what, workspace, crates, package, inject):
+    """A copy of the workspace with a panic put in by `inject`, (file, old, new): its one panic
+    has to have a frame at the line of `new` the panic is on."""
+    work = scratch(f"blaze-debuginfo-{what}-")
+    ws = copy(workspace, os.path.join(work, "ws"))
+    path, old, new = inject
+    text = open(os.path.join(ws, path)).read()
+    assert old in text, old
+    text = text.replace(old, new, 1)
+    open(os.path.join(ws, path), "w").write(text)
+    env = {"DEBUGINFO_PANIC": "1"}
+    binary = build(ws, package, os.path.join(work, "home"))
+    ours = backtraces(binary, ws, env)
+    site = f"{path}:{line_of(text, PANIC)}"
+    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]])
+    verify(tally, what, binary)
+    unwinding(tally, what, binary)
     if place := call_site(ours):
-        debugger(tally, what, fx.binary, fx.ws, place[2:], env)
+        debugger(tally, what, binary, ws, place[2:], env)
     else:
         tally.say(f"{what}: {DEBUGGER}", "NO PLACE")
-    functions, count = described(fx.binary)
+    functions, count = described(binary)
     tally.say(f"{what}: what a debugger is told of", "counted", f"{functions} functions, {count} parameters and locals in them")
-    if not inject:
-        profiler(tally, what, fx.binary, fx.ws, crates + [package])
-    return fx
+    profiler(tally, what, binary, ws, crates + [package])
 
 
 def edits(tally, apart=False):
@@ -998,81 +681,57 @@ def edits(tally, apart=False):
     edited(tally, "edits")
 
 
+def edit_sites(text):
+    """Where the one panic of the program of EDITS_MAIN, as `text` has it, passes through: `must`
+    panics, called by `pick`, called (through `between` once it is there) by the closure of
+    `walk`, called by `walk` at the bottom of its recursion of three, called by `main`."""
+    at = lambda needle: f"{MAIN}:{line_of(text, needle)}"
+    sites = [("sline::must", at("None => panic!")), ("sline::pick", at("must(length)"))]
+    if "fn between(" in text:
+        sites.append(("sline::between", at('pick(&[1u8, 2, 3], at) + "."')))
+    sites += [(None, at("let run = |at: usize|")), ("sline::walk", at("run(7)"))]
+    sites += [("sline::walk", at("return walk(depth - 1)"))] * 2
+    return [sites + [("sline::main", at("walk(2)"))]]
+
+
 def edited(tally, part):
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-edits-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, EDITS_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    work = tempfile.mkdtemp(prefix="blaze-debuginfo-out-")
-    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference = os.path.join(work, "reference")
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    obj, patch, binary = (os.path.join(work, f"sline.{n}") for n in ("o", "patch.o", "bin"))
-    link = linkline.with_output(linkline.ahead(list(fx.link_args), [patch, obj], BLAZE), binary)
-    symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-    ask = ["--crate", "sline", "--out", obj, "--patch", patch, "--link-cmd", linkline.join(link), "--binary", binary, *symbols]
-    out = open(log_path, "a")
-    daemon = subprocess.Popen([BLAZE, ws, "--socket", socket, *ask], stderr=out, stdout=out)
-    while "watching" not in open(log_path).read():
-        if daemon.poll() is not None:
-            raise SystemExit(f"the daemon did not start: {open(log_path).read()[-2000:]}")
-        time.sleep(0.05)
-    spliced, linked, first = 0, True, []
-    for what, changes in EDITS:
-        seen = len(open(log_path).read())
-        text = open(os.path.join(ws, MAIN)).read()
-        for old, new in changes:
-            assert old in text, old
-            text = text.replace(old, new, 1)
-        open(os.path.join(ws, MAIN), "w").write(text)
-        time.sleep(0.02)
-        reply = subprocess.run([BLAZE, "sync", socket, *ask], capture_output=True, text=True, timeout=120)
-        cargo = subprocess.run(["cargo", "build", "-q"], cwd=ws, capture_output=True, text=True,
-                               env={**os.environ, "CARGO_TARGET_DIR": reference})
-        assert cargo.returncode == 0, cargo.stderr[-2000:]
-        if daemon.poll() is not None:
-            raise SystemExit(f"the daemon died at {what!r}: {log_path}")
-        links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
-        how = "not linked" if not links else "spliced" if links[-1].startswith("spliced") else "linked in full"
-        spliced += how == "spliced"
-        # The debug info a first splice after a link adds to is copied while the daemon waits
-        # (#12): what it copies itself is the section names, if any.
-        if how == "spliced" and linked and (copied := re.search(r", (\d+) copied$", links[-1])):
-            first.append(int(copied[1]))
-        linked = how == "linked in full" or (linked and how == "not linked")
-        if not (reply.stdout + reply.stderr).strip().startswith("ok"):
-            tally.say(f"{part}: {what}", "REFUSED", (reply.stdout + reply.stderr).strip()[:60])
-            continue
-        theirs, ours = backtraces(built(reference, "sline"), ws), backtraces(binary, ws)
-        if WINDOWS and how == "spliced":
-            said = "debug: the PDB is of the code before the splice" in open(log_path).read()[seen:]
-            stale(tally, f"{part}: {what} ({how})", theirs, ours, said)
-        else:
-            compare(tally, f"{part}: {what} ({how})", theirs, ours)
-        verify(tally, f"{part}: {what}", binary)
-        unwinding(tally, f"{part}: {what}", binary)
+    work, ws = sline("edits", EDITS_MAIN)
+    project = Project(ws, work)
+    binary = None
+    try:
+        for what, changes in EDITS:
+            text = open(os.path.join(ws, MAIN)).read()
+            for old, new in changes:
+                assert old in text, old
+                text = text.replace(old, new, 1)
+            open(os.path.join(ws, MAIN), "w").write(text)
+            built = project.build("sline", "-p", "sline")
+            if project.daemon is None or not project.daemon.alive():
+                raise SystemExit(f"the daemon died at {what!r}: its log is in {project.home}")
+            if built.status != 0 or not built.executable:
+                tally.say(f"{part}: {what}", "REFUSED", built.said.strip()[-60:])
+                continue
+            binary = built.executable
+            ours, sites = backtraces(binary, ws), edit_sites(text)
+            held(tally, f"{part}: {what}", ours, sites)
+            verify(tally, f"{part}: {what}", binary)
+            unwinding(tally, f"{part}: {what}", binary)
+    finally:
+        project.stop()
+    if binary is None:
+        return tally.say(f"{part}: the last binary", "NONE BUILT")
     ours = backtraces(binary, ws)
-    if WINDOWS and how == "spliced":
-        # The lines the PDB has are of code a jump now leads away from.
-        tally.say(f"{part}: the last binary: cdb", "not asked", "its PDB is of the code before the splices: BLAZE_SPLICE=0 asks")
-    elif place := call_site(ours):
+    if place := call_site(ours):
         debugger(tally, f"{part}: the last binary", binary, ws, place[2:])
     if not WINDOWS:
-        line = open(os.path.join(ws, MAIN)).read().split("must(length)")[0].count("\n") + 1
-        theirs, mine = (printed_by("gdb", it, ws, f"{MAIN}:{line}", ["at"])["at"] for it in (built(reference, "sline"), binary))
-        right = mine == theirs or (LLVM and mine == "<optimized out>")
-        tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
+        # `walk` asks for the item at 7, through `between` or not.
+        line = line_of(open(os.path.join(ws, MAIN)).read(), "must(length)")
+        mine = printed_by("gdb", binary, ws, f"{MAIN}:{line}", ["at"])["at"]
+        right = mine == "7"
+        tally.say(f"{part}: the last binary: gdb prints an argument", "as it is" if right else "NOT AS IT IS", f"at = {mine}")
     if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
         kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in units(binary))
         tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
-    daemon.kill()
-    if os.environ.get("BLAZE_SPLICE") != "0":
-        tally.say(f"{part}: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")
-    if sys.platform.startswith("linux") and first:
-        copied = max(first)
-        tally.say(f"{part}: first splices after a link", "copied nothing" if copied < 1 << 16 else "COPIED DEBUG INFO",
-                  f"{copied} bytes at most, of {len(first)}")
 
 
 def described(binary):
@@ -1092,47 +751,52 @@ def variables(tally):
     """Whether gdb prints the parameters and locals of a function of blaze's as they are.
 
     A value the optimizer did away with is to be said to be so, and is not counted as wrong."""
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-locals-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    fx.blaze_build()
-    verify(tally, "locals", fx.binary)
+    work, ws = sline("locals", LOCALS_MAIN)
+    binary = build(ws, "sline", os.path.join(work, "home"))
+    verify(tally, "locals", binary)
     if WINDOWS:
-        functions, count = described(fx.binary)
+        functions, count = described(binary)
         return tally.say("locals: cdb prints them", "GUESSED" if count else "not told of",
                          f"{count} described in {functions} functions: no types are written to `.debug$T` yet")
     line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
     commands = ["set pagination off", "set startup-with-shell off", f"break {MAIN}:{line}", "run",
                 *[x for name, _ in LOCALS for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
-    ran = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], fx.binary],
+    ran = subprocess.run(["gdb", "-q", "-nx", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
                          capture_output=True, text=True, errors="replace", cwd=ws, timeout=300)
     printed = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name, _ in LOCALS}
     right = [name for name, value in LOCALS if printed[name] and printed[name].group(1) == value]
-    functions, count = described(fx.binary)
+    functions, count = described(binary)
     gone = [name for name, _ in LOCALS if printed[name] and OPTIMIZED_OUT in printed[name].group(1)]
     wrong = [f"{name} = {printed[name].group(1) if printed[name] else 'unknown'}" for name, _ in LOCALS
              if name not in right and name not in gone]
-    fine, said = lost(gone, kept_by_rustc(ws, {f"{MAIN}:{line}": gone} if gone else {}))
-    tally.say("locals: gdb prints them", "NOT AS THEY ARE" if wrong else "printed" if fine else BEHIND,
+    said = f"; optimized out: {', '.join(gone)[:200]}" if gone else ""
+    tally.say("locals: gdb prints them", "NOT AS THEY ARE" if wrong else "printed",
               f"{len(right)} of {len(LOCALS)}, {len(gone)} optimized out, {count} described in {functions} functions"
               + (f", but {wrong[0][:50]}" if wrong else "") + said)
 
 
+def caller_sites():
+    """Where each panic of CALLERS_MAIN passes through, from where it panics to `main`'s
+    `catch_unwind`, in the order `main` runs the cases."""
+    at = lambda needle: f"{MAIN}:{line_of(CALLERS_MAIN, needle)}"
+    main = ("sline::main", at("catch_unwind(case)"))
+    return [
+        [("sline::always", at("items[at]")), ("sline::hinted", at("always(items, at) + 1")), ("sline::indexes", at("hinted(&[1, 2, 3]")), main],
+        [("sline::inner", at('value.expect("inner")')), ("sline::outer", at("inner(value) + 1")), ("sline::tracked", at("outer(None) + 1")), main],
+        [("sline::here", at('panic!("called from line')), ("sline::located", at("here() + 1")), main],
+        [(None, at('panic!("through a trait")')), ("sline::dynamic", at("it.must() + 1")), main],
+        [(None, at("value.unwrap() + 1")), ("sline::closure", at("take(None) + 1")), main],
+        [("sline::bound", at("let item = items[")), main],
+    ]
+
+
 def callers(tally):
-    """Whether panics behind inlined and `#[track_caller]` functions say where they were, and
-    have the frames a cargo build's have."""
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-callers-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, CALLERS_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    fx.blaze_build()
-    compare(tally, "callers: frames of each panic", backtraces(fx.reference, ws), backtraces(fx.binary, ws), fx.binary)
-    verify(tally, "callers", fx.binary)
+    """Whether panics behind inlined and `#[track_caller]` functions have a frame at every
+    place the source says they pass through."""
+    work, ws = sline("callers", CALLERS_MAIN)
+    binary = build(ws, "sline", os.path.join(work, "home"))
+    held(tally, "callers: frames of each panic", backtraces(binary, ws), caller_sites())
+    verify(tally, "callers", binary)
 
 
 def printed_by(debugger, binary, cwd, place, names):
@@ -1172,225 +836,36 @@ def printed_by(debugger, binary, cwd, place, names):
     return printed
 
 
-def optimized_out(ours, theirs):
-    """Whether gdb has no whole value for a name, and shows what part it has as it shows that of
-    rustc's build: the start of a value printed in part has to be the start of rustc's."""
-    if not ours or OPTIMIZED_OUT not in ours:
-        return False
-    part = ours.removesuffix(f" {OPTIMIZED_OUT}")
-    return part == ours or theirs is not None and theirs.startswith(part)
-
-
-def kept_by_rustc(ws, asked):
-    """Which of the values the optimizer of blaze's build did away with rustc's keeps: the
-    names gdb prints a value for at the same place of `rustc -O -g` on the same source, at
-    the level blaze optimizes at. `asked` is the names by their place. What rustc keeps,
-    blaze has to: LLVM has the value. The result is those names, each with its place."""
-    if not asked:
-        return []
-    env = dict(os.environ, CARGO_PROFILE_RELEASE_DEBUG="true", CARGO_TARGET_DIR=os.path.join(ws, "target-optimized"),
-               CARGO_PROFILE_RELEASE_OPT_LEVEL=os.environ.get("BLAZE_OPT", "2"))
-    out = subprocess.run(["cargo", "build", "--release", "-p", "sline"], cwd=ws, capture_output=True, text=True, env=env)
-    if out.returncode != 0:
-        raise SystemExit(f"cargo failed:\n{out.stderr[-3000:]}")
-    binary = os.path.join(ws, "target-optimized", "release", "sline")
-    kept = []
-    for place, names in asked.items():
-        theirs = printed_by("gdb", binary, ws, place, names)
-        kept += [f"{name} at {place}" for name in names
-                 if theirs[name] and not any(it in theirs[name] for it in (OPTIMIZED_OUT, "<synthetic pointer>", "not available"))]
-    return kept
-
-
-def lost(gone, kept):
-    """What is said of the values optimized out, and whether none of them is one rustc keeps."""
-    if not gone:
-        return True, ""
-    if kept:
-        return False, f"; rustc -O -g keeps {len(kept)} of them: {', '.join(kept)[:160]}"
-    return True, f"; rustc -O -g has none of them either: {', '.join(gone)[:200]}"
-
-
-# What lldb says of a block in several runs of a unit kept apart (split DWARF 4): it reads the
-# list of the runs without the unit's base in `.debug_ranges`, in a rustc build of more than one
-# unit as well, and shows no name of the block.
-LLDB_NO_RANGES = "which has a base that is less than the function's low PC"
-
-
-def lldb_path():
-    """The search path `rust-lldb` finds an `lldb` on, or None: distributions name theirs by version."""
-    if shutil.which("lldb"):
-        return os.environ["PATH"]
-    for found in sorted(glob.glob("/usr/lib/llvm-*/bin/lldb"), reverse=True):
-        return os.path.dirname(found) + os.pathsep + os.environ["PATH"]
-    return None
-
-
-def shown_by_lldb(binary, cwd, file, line, names):
-    """What `rust-lldb` shows for each of the names when stopped at a line, addresses aside."""
-    commands = [f"breakpoint set --file {file} --line {line}", "run", *[f"frame variable {name}" for name in names], "kill"]
-    ran = subprocess.run(["rust-lldb", "--batch", *[x for c in commands for x in ("-o", c)], binary],
-                         capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300,
-                         env={**os.environ, "PATH": lldb_path()})
-    shown = {}
-    for name in names:
-        found = re.search(rf"^\(lldb\) frame variable {re.escape(name)}\n(.*?)(?=^\(lldb\) )", ran.stdout, re.S | re.M)
-        # An address of nothing stays what it is: lldb shows bytes it has no place for as zeros.
-        shown[name] = re.sub(r"0x0*[1-9a-f][0-9a-f]*", "0x..", found.group(1).strip()) if found and found.group(1).strip() else None
-    return shown, ran.stderr.count(LLDB_NO_RANGES)
-
-
-def agreement(names, theirs, ours, lost=()):
-    """How many of the names a debugger shows as it does for a rustc build, which it has no
-    value for or only part of one, and which it shows otherwise. The names are returned with
-    what is said. `lost` are names known to have no whole value, for a debugger that does not
-    say so itself."""
-    partly = ("<synthetic pointer>", "not available")
-    gone = [name for name in names if ours[name] != theirs[name]
-            and (name in lost or optimized_out(ours[name], theirs[name]) or ours[name] and any(it in ours[name] for it in partly))]
-    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in names if ours[name] != theirs[name] and name not in gone]
-    unknown = [name for name in names if theirs[name] is None]
-    return (not wrong and not unknown, gone,
-            f"{len(names) - len(wrong) - len(gone)} of {len(names)}, {len(gone)} optimized out"
-            + (f", but {wrong[0][:160]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else ""))
-
-
-def rich(tally):
-    """Whether closures, the states of an `async fn`, pointers to `dyn` and enums are shown as
-    those of a rustc build are, by the toolchain's gdb and by its lldb."""
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-rich-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, RICH_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    fx.blaze_build()
-    verify(tally, "rich", fx.binary)
-    reference = os.path.join(ws, "target", "debug", "sline")
-    line = RICH_MAIN[:RICH_MAIN.index('println!("{}", sum)')].count("\n") + 1
-    gone = []
-    if shutil.which("rust-gdb"):
-        theirs = printed_by("rust-gdb", reference, ws, f"{MAIN}:{line}", RICH)
-        # A name of blaze's own for the table a `dyn` pointer has is no part of what is shown.
-        ours = {name: it and re.sub(r" <\.L[^>]*>", "", it)
-                for name, it in printed_by("rust-gdb", fx.binary, ws, f"{MAIN}:{line}", RICH).items()}
-        same, gone, said = agreement(RICH, theirs, ours)
-        fine, more = lost(gone, kept_by_rustc(ws, {f"{MAIN}:{line}": gone} if gone else {}))
-        tally.say("rich: rust-gdb shows them", "NOT AS RUSTC'S" if not same else "as rustc's" if fine else BEHIND, said + more)
-    else:
-        tally.say("rich: rust-gdb shows them", "not looked at", "no rust-gdb to ask")
-    if shutil.which("rust-lldb") and lldb_path():
-        theirs, _ = shown_by_lldb(reference, ws, MAIN, line, RICH)
-        ours, unread = shown_by_lldb(fx.binary, ws, MAIN, line, RICH)
-        # lldb shows zeros where a value is there in part, so what gdb found to be so is not held against it.
-        same, _, said = agreement(RICH, theirs, ours, gone)
-        if unread and not same:
-            tally.say("rich: rust-lldb shows them", "not looked at",
-                      f"this lldb reads {unread} runs of blocks kept apart from the wrong place; {said}")
-        else:
-            tally.say("rich: rust-lldb shows them", "as rustc's" if same else "NOT AS RUSTC'S", said)
-    else:
-        tally.say("rich: rust-lldb shows them", "not looked at", "no rust-lldb or no lldb to ask")
-
-
-def shapes(tally):
-    """Whether the debugger shows values of each kind of type as it shows those of a rustc build.
-
-    The one the toolchain wraps with its pretty-printers is asked, so a `Vec` or a `String` is
-    shown by what it holds only when the description has the shape the printers look for."""
-    debugger = shutil.which("rust-gdb")
-    if not debugger:
-        return tally.say("types: the debugger shows them", "not looked at", "no rust-gdb to ask")
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-types-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, TYPES_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    fx.blaze_build()
-    verify(tally, "types", fx.binary)
-    place = f"{MAIN}:{TYPES_MAIN[:TYPES_MAIN.index('println!')].count(chr(10)) + 1}"
-    theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, place, TYPES)
-    ours = printed_by(debugger, fx.binary, ws, place, TYPES)
-    unknown = [name for name in TYPES if theirs[name] is None]
-    out = [name for name in TYPES if optimized_out(ours[name], theirs[name])]
-    wrong = [f"{name} = {ours[name]}, not {theirs[name]}" for name in TYPES if ours[name] != theirs[name] and name not in out]
-    fine, said = lost(out, kept_by_rustc(ws, {place: out} if out else {}))
-    tally.say("types: the debugger shows them", "NOT AS RUSTC'S" if wrong or unknown else "as rustc's" if fine else BEHIND,
-              f"{len(TYPES) - len(wrong) - len(out)} of {len(TYPES)}, {len(out)} optimized out"
-              + (f", but {wrong[0][:90]}" if wrong else "") + (f", rustc's {unknown[0]} unknown" if unknown else "") + said)
-
-
-def scopes(tally):
-    """Whether a name is known where its block says and means the binding of that block: at
-    several lines the debugger is asked for the same names, and has to answer as it does for a
-    rustc build, also where the answer is that there is no such name."""
-    debugger = shutil.which("rust-gdb")
-    if not debugger:
-        return tally.say("scopes: names by their block", "not looked at", "no rust-gdb to ask")
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-scopes-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, SCOPES_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
-    fx.blaze_build()
-    verify(tally, "scopes", fx.binary)
-    stops = [at + 1 for at, line in enumerate(SCOPES_MAIN.split("\n")) if "// stop" in line]
-    asked = right = unknown = 0
-    wrong, gone = [], {}
-    for line in stops:
-        theirs = printed_by(debugger, os.path.join(ws, "target", "debug", "sline"), ws, f"{MAIN}:{line}", SCOPED)
-        ours = printed_by(debugger, fx.binary, ws, f"{MAIN}:{line}", SCOPED)
-        for name in SCOPED:
-            asked += 1
-            if ours[name] == theirs[name]:
-                right += 1
-                unknown += theirs[name] is None
-            elif optimized_out(ours[name], theirs[name]):
-                gone.setdefault(f"{MAIN}:{line}", []).append(name)
-            else:
-                wrong.append(f"{name} at line {line} = {ours[name]}, not {theirs[name]}")
-    names = [f"{name} at line {place.rsplit(':', 1)[1]}" for place, at in gone.items() for name in at]
-    fine, said = lost(names, kept_by_rustc(ws, gone))
-    tally.say("scopes: names by their block", "NOT AS RUSTC'S" if wrong else "as rustc's" if fine else BEHIND,
-              f"{right} of {asked} at {len(stops)} lines ({unknown} of them not a name there), {len(names)} optimized out"
-              + (f", but {'; '.join(wrong[:3])[:200]}" if wrong else "") + said)
-
-
 def settings(tally):
     """Whether the profile's settings for what a debugger reads are followed, or refused with the reason."""
-    ws = tempfile.mkdtemp(prefix="blaze-debuginfo-profile-")
-    os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, LOCALS_MAIN)):
-        open(os.path.join(ws, path), "w").write(text)
-    fx = Fixture(ws, ["sline"], ["-p", "sline"])
-    fx.rustc_build()
+    work, ws = sline("profile", LOCALS_MAIN)
+    binary, homes = None, 0
 
     def built(**profile):
-        """The object blaze writes under the settings: whether it has anything for a debugger, and how many variables."""
+        """The program blaze builds under the settings in an empty home: whether it has anything
+        for a debugger, and how many variables."""
+        nonlocal binary, homes
         names = {f"CARGO_PROFILE_DEV_{name.upper()}": value for name, value in profile.items()}
-        os.environ.update(names)
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        homes += 1
         try:
-            fx.blaze_build()
-            return sections(fx.objects[0])[1] > 0, described(fx.objects[0])[1], None
+            binary = build(ws, "sline", os.path.join(work, f"home-{homes}"), env=names)
+            return debug_bytes(binary) > 0, described(binary)[1], None
         except SystemExit as refused:
             return None, None, str(refused)
-        finally:
-            for name in names:
-                del os.environ[name]
 
     line = LOCALS_MAIN[:LOCALS_MAIN.index("println!")].count("\n") + 1
     names = [name for name, _ in LOCALS]
 
     def shown():
         """What gdb prints of the function's values in the program as it was last built."""
-        return printed_by("gdb", fx.binary, ws, f"{MAIN}:{line}", names)
+        return printed_by("gdb", binary, ws, f"{MAIN}:{line}", names)
 
     def apart():
-        """How many units of blaze's in the program have their entries in a file beside its object, which is there."""
-        named = re.findall(rf'DW_AT_producer\s+\("blaze[ "].*?DW_AT_GNU_dwo_name\s+\("({re.escape(fx.objects[0])}[^"]*\.dwo)"\)', "".join(units(fx.binary)), re.S)
-        return sum(os.path.exists(name) for name in named)
+        """How many units of blaze's in the program have their entries in a file beside it, which is there."""
+        named = re.findall(r'DW_AT_producer\s+\("blaze[ "].*?DW_AT_GNU_dwo_name\s+\("([^"]*\.dwo)"\)', "".join(units(binary)), re.S)
+        beside = os.path.dirname(binary)
+        return sum(os.path.exists(os.path.join(beside, name)) or os.path.exists(binary + ".dwp") for name in named)
 
     linked = None
     for what, profile, lines, locals_, split in (
@@ -1414,109 +889,84 @@ def settings(tally):
             more += "" if values == linked else " which are not the ones it prints of the program that has them linked"
         tally.say(f"profile: {what}", "followed" if followed else "NOT FOLLOWED", more)
         if split and not refused:
-            verify(tally, f"profile: {what}", fx.binary)
+            verify(tally, f"profile: {what}", binary)
+    shutil.rmtree(work, ignore_errors=True)
 
 
-def sections(path):
-    """The size of an object, and of the sections of it a debugger reads."""
+def debug_bytes(binary):
+    """The bytes of what a debugger reads of the program: its `.debug_` sections, or on Windows
+    the PDB the linker wrote beside it."""
     if WINDOWS:
-        data = open(path, "rb").read()
-        count, = struct.unpack_from("<H", data, 2)
-        headers = [struct.unpack_from("<8s8xI", data, 20 + 40 * i) for i in range(count)]
-        return len(data), sum(size for name, size in headers if name.startswith(b".debug$"))
-    read = subprocess.run(["size", "-A", path], capture_output=True, text=True).stdout
-    debug = sum(int(l.split()[1]) for l in read.splitlines() if l.startswith((".debug_", ".rela.debug_")))
-    return os.path.getsize(path), debug
+        _, name = Image(binary).pdb()
+        pdb = os.path.join(os.path.dirname(binary), os.path.basename(name or "none.pdb"))
+        return os.path.getsize(pdb) if os.path.exists(pdb) else 0
+    read = subprocess.run(["size", "-A", binary], capture_output=True, text=True).stdout
+    return sum(int(l.split()[1]) for l in read.splitlines() if l.startswith(".debug_"))
 
 
 def cost(tally):
-    """The corpus's object with and without debug info, and what the profile's setting does."""
-    fx = Fixture(os.path.join(HERE, "corpus"), ["cases"], ["-p", "runner"])
-    fx.rustc_build()
+    """The stress workspace's program with and without debug info, and what the profile's setting does."""
+    work = scratch("blaze-debuginfo-cost-")
+    ws = copy(os.path.join(HERE, "stress"), os.path.join(work, "ws"))
+    homes = 0
+
+    def fresh(setting, home=None):
+        """A build at `debug = setting` in an empty home (or `home`): (seconds, the program)."""
+        nonlocal homes
+        homes += 1
+        if home is None:
+            shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        began = time.time()
+        binary = build(ws, "sapp", home or os.path.join(work, f"home-{homes}"), env={"CARGO_PROFILE_DEV_DEBUG": setting})
+        return time.time() - began, binary
+
     measured = {}
-    for setting in ("0", "1"):
-        os.environ["BLAZE_DEBUGINFO"] = setting
+    for setting in ("false", "true"):
         times = []
         for _ in range(3):
-            began = time.time()
-            fx.blaze_build()
-            times.append(time.time() - began)
-        measured[setting] = (min(times), *sections(fx.objects[0]), os.path.getsize(fx.binary))
-    del os.environ["BLAZE_DEBUGINFO"]
-    (t0, s0, d0, b0), (t1, s1, d1, b1) = measured["0"], measured["1"]
-    told = f"{d1} of sections a debugger reads, {s1 - s0 - d1} of their relocations"
-    tally.say("cost: the corpus's object without debug info", "measured", f"{t0:.2f} s to compile and link, object {s0} bytes, binary {b0} bytes")
+            took, binary = fresh(setting)
+            times.append(took)
+        measured[setting] = (min(times), os.path.getsize(binary), debug_bytes(binary))
+    (t0, b0, d0), (t1, b1, d1) = measured["false"], measured["true"]
+    tally.say("cost: the stress workspace's program without debug info", "measured", f"{t0:.2f} s to build from nothing, program {b0} bytes")
     tally.say("cost: with it", "measured" if d1 and not d0 else "NO DIFFERENCE",
-              f"{t1:.2f} s ({(t1 / t0 - 1) * 100:+.1f}%), object {s1} bytes ({(s1 / s0 - 1) * 100:+.1f}%, {told}), binary {b1} bytes")
-    for setting, expected, typed in (("false", False, False), ("true", True, True), ("line-tables-only", True, False)):
-        os.environ["CARGO_PROFILE_DEV_DEBUG"] = setting
-        os.environ["BLAZE_MEMORY"] = memory = tempfile.mkdtemp(prefix="debuginfo-memory-")
-        try:
-            fx.blaze_build()
-        finally:
-            del os.environ["BLAZE_MEMORY"]
-        has = sections(fx.objects[0])[1] > 0
+              f"{t1:.2f} s ({(t1 / t0 - 1) * 100:+.1f}%), program {b1} bytes ({(b1 / b0 - 1) * 100:+.1f}%, {d1} of what a debugger reads)")
+    for setting, expected in (("false", False), ("true", True), ("line-tables-only", True)):
+        has = debug_bytes(fresh(setting)[1]) > 0
         tally.say(f"cost: the profile says debug = {setting}", ("described" if has else "left out") if has == expected else "NOT FOLLOWED")
-        # The types of variables are worked out only for a build that writes the variables:
-        # at `line-tables-only` they are thrown away, which on a large workspace was most of
-        # the cold build's memory.
-        told = told_types(memory)
-        shutil.rmtree(memory, ignore_errors=True)
-        tally.say(f"cost: types of variables at debug = {setting}",
-                  ("worked out" if told else "not worked out") if (told is not None and bool(told) == typed) else "NOT FOLLOWED",
-                  "no memory report" if told is None else f"{told} told of")
     # The store is shared by the builds of every profile, and what a build of lines alone
     # kept has no variables: a build that writes them is not to take it.
     name = "cost: debug = true after line-tables-only, from one store"
     if WINDOWS:
         tally.say(name, "not run", "it counts DWARF's variables")
     else:
-        def variables(settings, store):
-            """Builds at each of `settings` from one store, and the variables of the object and
-            what blaze's units of the binary tell of after each."""
-            before = os.environ.pop("BLAZE_CACHE", None)
-            if store:
-                os.environ["BLAZE_CACHE"] = tempfile.mkdtemp(prefix="debuginfo-store-")
-            told = []
-            try:
-                for setting in settings:
-                    os.environ["CARGO_PROFILE_DEV_DEBUG"] = setting
-                    fx.blaze_build()
-                    dump = subprocess.run([DWARFDUMP, "--debug-info", fx.objects[0]], capture_output=True, text=True).stdout
-                    told.append((dump.count("DW_TAG_variable"), described(fx.binary)))
-            finally:
-                if store:
-                    shutil.rmtree(os.environ.pop("BLAZE_CACHE"), ignore_errors=True)
-                if before is not None:
-                    os.environ["BLAZE_CACHE"] = before
-            return told
-        # Against a build at `true` from a store a build at `true` filled.
-        (_, first), (same, again) = variables(["true", "true"], True)
-        after = variables(["line-tables-only", "true"], True)[-1][0]
-        tally.say(name, "described" if after == same else "VARIABLES LOST", f"{after} variables, {same} after one at true")
+        alone = described(fresh("true")[1])
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        home = os.path.join(work, "shared")
+        fresh("line-tables-only", home)
+        forget(home)
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        after = described(fresh("true", home)[1])
+        tally.say(name, "described" if after == alone else "VARIABLES LOST",
+                  f"{after[0]} functions and {after[1]} variables, {alone[0]} and {alone[1]} from an empty home")
         # What a build takes from the store is what it would have compiled: Cranelift's cache
         # of code kept a frame without its last slots, and a root refused when compiled was
         # taken from the store (#242).
-        tally.say("cost: debug = true from the store a build at true filled", "described" if again == first else "NOT THE SAME",
-                  f"{again[0]} functions and {again[1]} variables, {first[0]} and {first[1]} from an empty store")
-    os.environ["CARGO_PROFILE_DEV_DEBUG"] = "true"
-
-
-def told_types(memory):
-    """How many types of variables the build told of, from the report `BLAZE_MEMORY` has it write."""
-    reports = glob.glob(os.path.join(memory, "*.tsv"))
-    if not reports:
-        return None
-    counts = [int(row[1]) for path in reports for row in (l.rstrip("\n").split("\t") for l in open(path))
-              if len(row) > 5 and row[0] == "query" and row[5] == "told_type"]
-    return max(counts, default=0)
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        home = os.path.join(work, "again")
+        fresh("true", home)
+        forget(home)
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+        again = described(fresh("true", home)[1])
+        tally.say("cost: debug = true from the store a build at true filled", "described" if again == alone else "NOT THE SAME",
+                  f"{again[0]} functions and {again[1]} variables, {alone[0]} and {alone[1]} from an empty home")
+    shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
     only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None
     tally = Tally()
     parts = {
-        "corpus": lambda: program(tally, "corpus", os.path.join(HERE, "corpus"), ["cases"], "runner"),
         "stress": lambda: program(tally, "stress", os.path.join(HERE, "stress"), ["sapp", "sbase", "smid"], "sapp",
                                   ("base/src/shapes.rs", "items.iter().map(|it| it.area()).sum()",
                                    "items.iter().map(|it| {\n        " + PANIC + "\n        it.area()\n    }).sum()")),
@@ -1525,15 +975,12 @@ def main():
         "edits": lambda: (edits(tally), edits(tally, apart=True)),
         "callers": lambda: callers(tally),
         "locals": lambda: variables(tally),
-        "types": lambda: shapes(tally),
-        "scopes": lambda: scopes(tally),
-        "rich": lambda: rich(tally),
         "profile": lambda: settings(tally),
         "cost": lambda: cost(tally),
     }
     if WINDOWS:
         # These ask gdb, lldb and `llvm-dwarfdump` of what only DWARF has so far.
-        for name in ("callers", "types", "scopes", "rich", "profile"):
+        for name in ("callers", "profile"):
             if only in (None, name):
                 tally.say(name, "not run", "CodeView has lines and procedures alone")
             del parts[name]
@@ -1542,7 +989,7 @@ def main():
         if only in (None, name):
             part()
     left = f", {tally.open} open" if tally.open else ""
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}{left} ({'llvm' if LLVM else 'cranelift'})")
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}{left}")
     sys.exit(1 if tally.wrong else 0)
 
 

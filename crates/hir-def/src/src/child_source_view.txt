@@ -1,0 +1,52 @@
+variant 0 field 0: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 207..220))
+variant 0 field 1: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 239..244))
+variant 0 field 2: FileId(EditionedFileId(Id(13312))) None
+variant 1 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 270..274))
+variant 1 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 310..319))
+variant 1 field 2: FileId(EditionedFileId(Id(13312))) None
+variant 2 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 337..343))
+variant 2 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 381..387))
+variant 2 field 2: FileId(EditionedFileId(Id(13312))) None
+variant 3 field 0: FileId(EditionedFileId(Id(13312))) None
+variant 4 field 0: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 417..419))
+variant 4 field 1: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 437..444))
+variant 4 field 2: FileId(EditionedFileId(Id(13312))) None
+variant 5 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 455..460))
+variant 5 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 462..479))
+variant 5 field 2: FileId(EditionedFileId(Id(13312))) None
+variant 6 field 0: FileId(EditionedFileId(Id(13312))) None
+generics 0 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 591..598))
+generics 0 type or const 1: FileId(EditionedFileId(Id(13312))) None
+generics 0 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 587..589))
+generics 0 lifetime 1: FileId(EditionedFileId(Id(13312))) None
+generics 1 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 182..189))
+generics 1 type or const 1: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 191..205))
+generics 1 type or const 2: FileId(EditionedFileId(Id(13312))) None
+generics 1 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 178..180))
+generics 1 lifetime 1: FileId(EditionedFileId(Id(13312))) None
+generics 2 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 261..262))
+generics 2 type or const 1: FileId(EditionedFileId(Id(13312))) None
+generics 2 lifetime 0: FileId(EditionedFileId(Id(13312))) None
+generics 3 type or const 0: FileId(EditionedFileId(Id(13312))) None
+generics 3 lifetime 0: FileId(EditionedFileId(Id(13312))) None
+generics 4 type or const 0: FileId(EditionedFileId(Id(13312))) None
+generics 4 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 398..400))
+generics 4 lifetime 1: FileId(EditionedFileId(Id(13312))) None
+generics 5 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TRAIT, 485..543))
+generics 5 type or const 1: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 498..499))
+generics 5 type or const 2: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 501..514))
+generics 5 type or const 3: FileId(EditionedFileId(Id(13312))) None
+generics 5 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 494..496))
+generics 5 lifetime 1: FileId(EditionedFileId(Id(13312))) None
+generics 6 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 561..562))
+generics 6 type or const 1: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 564..575))
+generics 6 type or const 2: FileId(EditionedFileId(Id(13312))) None
+generics 6 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 549..551))
+generics 6 lifetime 1: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 553..559))
+generics 6 lifetime 2: FileId(EditionedFileId(Id(13312))) None
+generics 7 type or const 0: FileId(EditionedFileId(Id(13312))) None
+generics 7 lifetime 0: FileId(EditionedFileId(Id(13312))) None
+generics 8 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 141..148))
+generics 8 type or const 1: FileId(EditionedFileId(Id(13312))) None
+generics 8 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 137..139))
+generics 8 lifetime 1: FileId(EditionedFileId(Id(13312))) None

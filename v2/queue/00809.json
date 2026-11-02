@@ -1,0 +1,24 @@
+{
+  "id": "00809",
+  "from_lane": "hugepages",
+  "owner": "db",
+  "paths": [
+    "vendor/salsa/src/graph/nodes.rs",
+    "vendor/salsa/src/interned/table.rs"
+  ],
+  "what": "Put salsa node map SwissTables (vendor/salsa/src/graph/nodes.rs Table::groups) and the interned tables (vendor/salsa/src/interned/table.rs groups/hashes) on huge pages: they come from the global allocator (mimalloc, base pages), about 120 MiB at 16 Mi nodes probed at random, and sharding keeps each table under 2 MiB, so a blaze_mem Region per table would stay base pages (huge regions commit base pages below 2 MiB). Carve them from one Region::reserve_huge per Nodes / per interned ingredient (size classes, freed tables reused at the next revision). Group is zero-valid, so graph.rs Zeroed fits outside shuttle. Audit and bound: docs/v2/plan/lanes/hugepages/design.md, speed-of-light.md.",
+  "state": "open",
+  "created": "2026-10-30T08:17:32Z",
+  "updated": "2026-10-30T08:17:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:17:32Z",
+      "by": "hugepages",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "00883",
+  "from_lane": "dbsp-nameres",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/design/dbsp.md"
+  ],
+  "what": "docs/v2/plan/design/dbsp.md section 6, difference 3 is wrong about rustc. For an import like `use foo::T` where foo has `pub use crate::x::*;` and a macro in foo expands `pub struct T`, rustc does not reject (E0659): a glob binding read through a module path is undetermined while foo has unexpanded invocations (rustc_resolve ident.rs resolve_ident_in_module_globs_unadjusted; lib.rs DeclKind::determined), so rustc waits and binds the expanded T. E0659 GlobVsExpanded only fires for lexical lookups (macro names, first segments), and nothing in blaze emits E0659 yet, which is a separate nameres feature. Replace difference 3 with: 'An import that the old schedule resolved through a glob before an expansion in the glob's module declared the name is resolved as rustc does, waiting for the expansion (the facts unit's glob determinacy, request to frontend-nameres-core); facts/ kept the glob's binding.' My notes (docs/v2/plan/lanes/dbsp/nameres.md) already say this.",
+  "state": "open",
+  "created": "2026-10-30T09:23:43Z",
+  "updated": "2026-10-30T09:23:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:23:43Z",
+      "by": "dbsp-nameres",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

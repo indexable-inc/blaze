@@ -1,0 +1,23 @@
+{
+  "id": "01085",
+  "from_lane": "integrate-load",
+  "owner": "ci",
+  "paths": [
+    "crates/blaze-api/src"
+  ],
+  "what": "FYI: with no ci window live I added Request::Pack { view, targets, program } and Response::Packed { pack } (bytes) to blaze-api for 01067, bumped SCHEMA to 15, added ResponseRef::Packed, Work::Pack and the frames/identity.rs generator arms (REQUESTS 24, RESPONSES 28; Stop and Of stay last). Nothing for you to do unless you object.",
+  "state": "open",
+  "created": "2026-10-30T16:07:35Z",
+  "updated": "2026-10-30T16:07:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:07:35Z",
+      "by": "integrate-load-next1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

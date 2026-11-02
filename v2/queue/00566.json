@@ -1,0 +1,42 @@
+{
+  "id": "00566",
+  "from_lane": "db-expand",
+  "owner": "codegen",
+  "paths": [
+    "crates/base-db/src/lib.rs",
+    "crates/ide-db/src/lib.rs",
+    "crates/hir-ide/src/test_db.rs",
+    "crates/hir/src/tests/db.rs",
+    "crates/blaze-diagnostics/src/tests/db.rs",
+    "crates/blaze-items/src/tests/db.rs",
+    "docs/v2/plan/lanes/db.md",
+    "crates/hir-ty-codegen/v2/tests/db.rs"
+  ],
+  "what": "## `SourceDatabase::run_all` replaces `fork` (db-expand, 10-29)\n\nWhat: decisions.md settles that the database is `Sync`, shared by reference, with no per-thread\nhandles, and that all parallel work is plane tasks. `fork` was a per-thread handle and the\ncollector spawned threads inside a query, so both are gone. `crates/base-db/src/lib.rs` now has,\nin place of `fork`:\n\n```rust\nfn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync));\n```\n\nIt runs `task(db, i)` for every `i` in `0..count` and returns once each has run. The collector\ncalls it for each round's expansions (`expand_all` in `nameres/collector.rs`) and for a crate's\ndependencies' def maps (`seed_with_top_level`). Each task only asks queries, so the order and the\nthreads they run on don't change any result; the collector reads the results in its own order.\n\nWhere, and what each does:\n\n- `crates/ide-db/src/lib.rs` (`RootDatabase`), coordinator: remove `fork`; implement `run_all`\n  on the database that blaze runs on. That is the parent db lane's Sync database\n  (`blaze-query`): post the `count` tasks as one batch of plane tasks on the shared worker pool\n  (`blaze_graph::exec`), each reading the database through `&self`, and have the calling thread\n  pump-wait for them (#1301: a waiting thread serves requests, and a nested request needing\n  what an outer one holds is cancelled and reposted). A panic in a task, salsa's cancellation\n  included, goes on from `run_all` on the calling thread once the batch is over. Until the\n  database is `Sync` no implementation can meet the decision. Running the tasks in order on\n  the calling thread would be a quiet serial fallback; don't do it.\n- `crates/hir-ide/src/test_db.rs`, `crates/hir/src/tests/db.rs` (db-ty),\n  `crates/blaze-diagnostics/src/tests/db.rs` and `crates/blaze-items/src/tests/db.rs`: remove\n  `fork` and implement `run_all` as a test database without a plane does, in order on the\n  calling thread:\n\n  ```rust\n  fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {\n      (0..count).for_each(|at| task(self, at));\n  }\n  ```\n\n  hir-def's `TestDB` (`RunOrder` in `test_db.rs`) also runs a batch reversed or strided, so\n  `nameres/tests/batch_order.rs` can check that no def map depends on the order.\n\nWhy: docs/v2/plan/lanes/db.md, \"One database, shared by every thread\", and its Done when item\n\"no salsa per-thread handles; expansion rounds are plane tasks\". This replaces the `fork`\nsection above.\n\n> applied: `crates/ide-db/src/lib.rs`: `fork` removed; `RootDatabase::run_all` submits each task to a `blaze_graph::pool::Pool` near the caller's group inside `Pool::scope` (which pump-waits on a worker), keeps the first panic and resumes it after the batch; `RootDatabase::set_pool(Arc<Pool>)` gives it the daemon's pool, and a database without one panics at its first non-empty batch, naming `set_pool` (no serial path). `ide-db` depends on `blaze-graph` (workspace). `crates/hir-ide/src/test_db.rs`: in order on the calling thread, as asked.\n> forwarded to db: `RootDatabase::run_all` passes `&RootDatabase` to pool jobs, so it compiles only once `salsa::Storage` (its `ZalsaLocal`) is `Sync`: db's, as db-expand's report says.\n> forwarded to diagnostics: `crates/blaze-diagnostics/src/tests/db.rs` still has `fork` and no `run_all`.\n> forwarded to items: `crates/blaze-items/src/tests/db.rs` has no `run_all`.\n> applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` runs `run_all` in order on the calling thread, as asked.\n> applied (items): the `fork` added to `crates/blaze-items/src/tests/db.rs` for the section above is removed, as `SourceDatabase` no longer has it.\n> forwarded to codegen: `crates/hir-ty-codegen/v2/tests/db.rs` has no `run_all`.",
+  "state": "applied",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-31T20:38:24Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/db-expand.md#`SourceDatabase::run_all` replaces `fork` (db-expand, 10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:196"
+    },
+    {
+      "at": "2026-10-31T20:38:24Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:38:24Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Nothing of codegen's calls fork; base_db::Db::run_all (db.rs:412) is the one way."
+    }
+  ]
+}

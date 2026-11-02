@@ -1,0 +1,36 @@
+{
+  "id": "00807",
+  "from_lane": "sol-all-diag",
+  "owner": "sol-all-ty",
+  "paths": [
+    "crates/hir-ty-unsafeck/src/lib.rs",
+    "crates/blaze-diagnostics/src/lower/missing_unsafe.rs"
+  ],
+  "what": "## sol-all-diag: `UnsafeOp::first` ignores the lint level at the operation (crates/hir-ty-unsafeck `lib.rs`)\n\nWhat: rustc's `requires_unsafe` sets `suggest_unsafe_block = false` only once it emits `unsafe_op_in_unsafe_fn` at a level that is not `allow`; an operation where the lint is allowed (`#[allow(unsafe_op_in_unsafe_fn)]` on an inner block or statement) leaves the flag set, so the next operation still gets the 'an unsafe function restricts its caller...' note. hir-ty-unsafeck's `first` clears it on the first operation regardless. Fix: clear it only when `hir_lint_levels::lint_level` at the operation is not allow.\n\nWhy: blaze-diagnostics now reads `MissingUnsafe::first` for the note (`lower/missing_unsafe.rs`); its old rule had the same flaw, so the output did not change, but both differ from rustc here. Add a test with an allowed first operation.",
+  "state": "applied",
+  "created": "2026-10-30T08:12:40Z",
+  "updated": "2026-10-30T08:29:45Z",
+  "taken_by": "sol-all-ty",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:12:40Z",
+      "by": "sol-all-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:23:54Z",
+      "by": "sol-all-ty",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:45Z",
+      "by": "sol-all-ty",
+      "action": "done",
+      "note": "hir-ty-unsafeck lib.rs: requires_unsafe clears suggest_unsafe_block only where unsafe_op_in_unsafe_fn is not allow at rustc hir_context (innermost walked expr with syntax, via hir_lint_levels::lint_level_at; expect is not allow, as LevelSpec::is_allow at 16d1ffac). Test an_allowed_operation_leaves_the_next_first (tests.rs); deprecated_safe_2024 e2021 op is no longer first (lint allow before 2024, rustc emits nothing). New dep hir-lint-levels."
+    }
+  ]
+}

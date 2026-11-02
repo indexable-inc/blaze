@@ -1,0 +1,35 @@
+{
+  "id": "00792",
+  "from_lane": "speed-unsafe-front-def",
+  "owner": "speed-unsafe-front-intern",
+  "paths": [
+    "crates/span/src/hygiene.rs"
+  ],
+  "what": "crates/span/src/hygiene.rs: make both `SyntaxContext::from_u32` (L87, salsa; L328, no salsa) safe `pub fn`s, `# Safety` -> `# Contract`. Its own doc says memory safety does not rest on it (`SyntaxContext::id` checks salsa bounds, salsa checks page/slot/type); a wrong value panics or names another context, never UB. unsafe.md allows unsafe only where it buys speed or reaches the kernel, not as a trust marker. Then hir-def `hir/persist.rs::syntax_context` (the one trust point for persisted contexts) drops its `unsafe { }` and hir-def can deny unsafe_code without an allow on `mod hir`. Callers elsewhere (proc-macro protocols) keep compiling, with an unused_unsafe warning until cleaned. Tell me by queue when done; I remove the block.",
+  "state": "applied",
+  "created": "2026-10-30T08:03:12Z",
+  "updated": "2026-10-30T08:21:45Z",
+  "taken_by": "speed-unsafe-front-intern",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:03:12Z",
+      "by": "speed-unsafe-front-def",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:21:45Z",
+      "by": "speed-unsafe-front-intern",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:21:45Z",
+      "by": "speed-unsafe-front-intern",
+      "action": "done",
+      "note": "both from_u32 are safe pub fns (salsa: # Contract; no salsa: panics doc); SyntaxContext::id builds its salsa::Id with the safe Id::from_bits(index + 1) after the bound assert, so hygiene.rs has no unsafe and span/lib.rs dropped #[allow(unsafe_code)] on mod hygiene. tt columns.rs dropped its block. Remove your persist.rs block."
+    }
+  ]
+}

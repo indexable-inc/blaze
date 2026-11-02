@@ -1,0 +1,37 @@
+{
+  "id": "00223",
+  "from_lane": "dedup",
+  "owner": "coordinator",
+  "paths": [
+    "v2/requests/frontend-tree.md",
+    "crates/blaze-lints/src/check.rs",
+    "crates/blaze-lints"
+  ],
+  "what": "## dedup: blaze-lints' `item_range` and `peel_parens` copies (from dedup-sim-diag, 2026-10-29)\n\nFrom `dedup-sim-diag`. After `v2/requests/frontend-tree.md` `## dedup:\nsyntax::view::written_range and Expr::peel_parens` is in:\n\n- `crates/blaze-lints/src/check.rs:1840` `item_range(node: ast::Node<'_>)` is\n  `syntax::view::written_range` (same rule; also copied in blaze-diagnostics, hir-expand,\n  hir-ty-mir). Replace the body with `syntax::view::written_range(node)`, or\n  `pub(crate) use syntax::view::written_range as item_range;`; drop `NodeOrToken` from the\n  imports if nothing else uses it.\n- Six copies of `ast::Expr::peel_parens` on views, each deleted with its calls written\n  `expr.peel_parens()`: `lints/needless_borrow.rs:188` `strip_parens`,\n  `lints/byte_char_slices.rs:90` `strip_parens`, `lints/useless_borrows_in_formatting.rs:108`\n  `strip_parens`, `lints/needless_borrows_for_generic_args.rs:170`,\n  `lints/collapsible_if.rs:84`, `lints/multiple_unsafe_ops_per_block.rs:180` `peel_parens`.\n\nNot taken: `blaze-fmt/src/ast/tokenstream.rs` `Spacing` repeats `tt::Spacing` (three variants\nand rustc's doc comment), but reusing it would add `tt` and its graph (`span`, `intern`,\n`blaze-mem`) to blaze-fmt for four lines; blaze-fmt's `peel_parens` is on its own\nrustc_ast port, not on syntax views.\n\n> forwarded to the coordinator: `crates/blaze-lints` is its (lane lints is DONE); on requests' coordinator list, after frontend-tree's `written_range` and `peel_parens` (requests, pass 29).",
+  "state": "applied",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T08:34:32Z",
+  "taken_by": "coord-apply-front",
+  "why": null,
+  "source": "v2/requests/coordinator.md#dedup: blaze-lints' `item_range` and `peel_parens` copies (from dedup-sim-diag, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:2730"
+    },
+    {
+      "at": "2026-10-30T08:34:32Z",
+      "by": "coord-apply-front",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:34:32Z",
+      "by": "coord-apply-front",
+      "action": "done",
+      "note": "crates/blaze-lints/src/check.rs: item_range is `pub(crate) use syntax::view::written_range as item_range;` (NodeOrToken stays, used elsewhere). The six view paren-peeling copies (needless_borrow, byte_char_slices, useless_borrows_in_formatting strip_parens; needless_borrows_for_generic_args, collapsible_if, multiple_unsafe_ops_per_block peel_parens) are deleted, every call now `expr.peel_parens()` (syntax/src/view/expr_ext.rs)."
+    }
+  ]
+}

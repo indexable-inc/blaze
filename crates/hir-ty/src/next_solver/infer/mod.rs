@@ -1,51 +1,55 @@
 //! Infer context the next-trait-solver.
 
 use std::cell::{Cell, RefCell};
+use std::mem;
 use std::ops::Range;
+use std::range::RangeInclusive;
 use std::sync::Arc;
 
 pub use BoundRegionConversionTime::*;
-use ena::unify as ut;
-use hir_def::{GenericParamId, TraitId};
+use hir_def::{ConstParamId, GenericParamId, TraitId, TypeParamId};
 use opaque_types::{OpaqueHiddenType, OpaqueTypeStorage};
-use region_constraints::{RegionConstraintCollector, RegionConstraintStorage};
+use region_constraints::{
+    RegionConstraintCollector, RegionConstraintStorage, SolverRegionConstraint,
+};
 use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt};
 use rustc_type_ir::{
-    ClosureKind, ConstVid, FloatVarValue, FloatVid, GenericArgKind, InferConst, InferTy,
-    IntVarValue, IntVid, OutlivesPredicate, RegionVid, TermKind, TyVid, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    AliasTermKind, CanonicalizerState, ClosureKind, ConstVid, FloatVarValue, FloatVid, InferConst,
+    InferTy, IntVarValue, IntVid, OutlivesClause, RegionVid, TermKind, TyVid, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
     error::{ExpectedFound, TypeError},
-    inherent::{
-        Const as _, GenericArg as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _,
-    },
+    inherent::{GenericArg as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _},
+    region_constraint::Assumptions,
 };
 use rustc_type_ir::{
     Upcast,
-    solve::{NoSolution, inspect},
+    solve::{NoSolution, TyOrConstInferVar, VisibleForLeakCheck, inspect},
 };
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use traits::{ObligationCause, PredicateObligations};
-use unify_key::{ConstVariableValue, ConstVidKey};
+use union_find::UnionFind;
+use unify_key::ConstVariableValue;
 
 pub use crate::next_solver::infer::traits::ObligationInspector;
 use crate::{
     Span,
     next_solver::{
-        ArgOutlivesPredicate, BoundConst, BoundRegion, BoundTy, BoundVariableKind, Goal, Predicate,
-        SolverContext,
+        ArgOutlivesClause, BoundConst, BoundRegion, BoundTy, BoundVariableKind, FxIndexMap, Goal,
+        NextSolverOverflow, Predicate, SolverContext,
         fold::BoundVarReplacerDelegate,
         infer::{at::ToTrace, select::EvaluationResult, traits::PredicateObligation},
         obligation_ctxt::ObligationCtxt,
+        recycle,
     },
 };
 
 use super::{
     AliasTerm, Binder, CanonicalQueryInput, CanonicalVarValues, Const, ConstKind, DbInterner,
     ErrorGuaranteed, GenericArg, GenericArgs, OpaqueTypeKey, ParamEnv, PolyCoercePredicate,
-    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesPredicate,
-    PolySubtypePredicate, Region, SolverDefId, SubtypePredicate, Term, TraitRef, Ty, TyKind,
-    TypingMode,
+    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesClause,
+    PolySubtypePredicate, Region, RegionConstraint, SolverDefId, SubtypePredicate, Term,
+    TraitRef, Ty, TyKind, TypingMode,
 };
 
 pub mod at;
@@ -60,8 +64,10 @@ pub mod resolve;
 pub mod select;
 pub(crate) mod snapshot;
 pub mod traits;
+pub(crate) mod touched;
 mod type_variable;
 mod unify_key;
+mod union_find;
 
 /// `InferOk<'db, ()>` is used a lot. It may seem like a useless wrapper
 /// around `PredicateObligations`, but it has one important property:
@@ -78,10 +84,6 @@ pub struct InferOk<'db, T> {
 }
 pub type InferResult<'db, T> = Result<InferOk<'db, T>, TypeError<DbInterner<'db>>>;
 
-pub(crate) type UnificationTable<'a, 'db, T> = ut::UnificationTable<
-    ut::InPlace<T, &'a mut ut::UnificationStorage<T>, &'a mut InferCtxtUndoLogs<'db>>,
->;
-
 fn iter_idx_range<T: From<u32> + Into<u32>>(range: Range<T>) -> impl Iterator<Item = T> {
     (range.start.into()..range.end.into()).map(Into::into)
 }
@@ -90,23 +92,25 @@ fn iter_idx_range<T: From<u32> + Into<u32>>(range: Range<T>) -> impl Iterator<It
 /// `RefCell` and are involved with taking/rolling back snapshots. Snapshot
 /// operations are hot enough that we want only one call to `borrow_mut` per
 /// call to `start_snapshot` and `rollback_to`.
-#[derive(Clone)]
 pub struct InferCtxtInner<'db> {
-    pub(crate) undo_log: InferCtxtUndoLogs<'db>,
+    pub(crate) undo_log: InferCtxtUndoLogs,
 
-    /// We instantiate `UnificationTable` with `bounds<Ty>` because the types
-    /// that might instantiate a general type variable have an order,
-    /// represented by its upper and lower bounds.
+    /// The type variables: which are equal, which are related by subtyping, and the known
+    /// type of each set.
     pub(crate) type_variable_storage: type_variable::TypeVariableStorage<'db>,
 
     /// Map from const parameter variable to the kind of const it represents.
-    pub(crate) const_unification_storage: ut::UnificationTableStorage<ConstVidKey<'db>>,
+    pub(crate) const_unification_storage: UnionFind<ConstVid, ConstVariableValue<'db>>,
+
+    /// The const parameter each variable made for one stands for (rustc's
+    /// `ConstVariableOrigin::param_def_id`), in variable order; sparse, as for type variables.
+    pub(crate) const_var_params: Vec<(ConstVid, ConstParamId)>,
 
     /// Map from integral variable to the kind of integer it represents.
-    pub(crate) int_unification_storage: ut::UnificationTableStorage<IntVid>,
+    pub(crate) int_unification_storage: UnionFind<IntVid, IntVarValue>,
 
     /// Map from floating variable to the kind of float it represents.
-    pub(crate) float_unification_storage: ut::UnificationTableStorage<FloatVid>,
+    pub(crate) float_unification_storage: UnionFind<FloatVid, FloatVarValue>,
 
     /// Tracks the set of region variables and the constraints between them.
     ///
@@ -155,26 +159,124 @@ pub struct InferCtxtInner<'db> {
     /// are deduced from the well-formedness of the witness's types, and are
     /// necessary because of the way we anonymize the regions in a coroutine,
     /// which may cause types to no longer be considered well-formed.
-    region_assumptions: Vec<ArgOutlivesPredicate<'db>>,
+    region_assumptions: Vec<ArgOutlivesClause<'db>>,
 
     /// Caches for opaque type inference.
     pub(crate) opaque_type_storage: OpaqueTypeStorage<'db>,
 }
 
+impl Clone for InferCtxtInner<'_> {
+    fn clone(&self) -> Self {
+        let mut inner = InferCtxtInner::empty_unallocated();
+        inner.clone_from(self);
+        inner
+    }
+
+    /// Field by field into `self`'s tables, keeping their capacity: a fork into the worker's
+    /// warm tables (`InferCtxt::fork`) allocates nothing.
+    fn clone_from(&mut self, source: &Self) {
+        let InferCtxtInner {
+            undo_log,
+            type_variable_storage,
+            const_unification_storage,
+            const_var_params,
+            int_unification_storage,
+            float_unification_storage,
+            region_constraint_storage,
+            region_obligations,
+            region_assumptions,
+            opaque_type_storage,
+        } = self;
+        *undo_log = source.undo_log;
+        type_variable_storage.clone_from(&source.type_variable_storage);
+        const_unification_storage.clone_from(&source.const_unification_storage);
+        const_var_params.clone_from(&source.const_var_params);
+        int_unification_storage.clone_from(&source.int_unification_storage);
+        float_unification_storage.clone_from(&source.float_unification_storage);
+        region_constraint_storage.clone_from(&source.region_constraint_storage);
+        region_obligations.clone_from(&source.region_obligations);
+        region_assumptions.clone_from(&source.region_assumptions);
+        opaque_type_storage.clone_from(&source.opaque_type_storage);
+    }
+}
+
 impl<'db> InferCtxtInner<'db> {
-    fn new() -> InferCtxtInner<'db> {
+    /// Tables that hold nothing and have allocated nothing. A context takes warm ones from its
+    /// worker instead (`next_solver::recycle`).
+    pub(crate) fn empty_unallocated() -> InferCtxtInner<'db> {
         InferCtxtInner {
             undo_log: InferCtxtUndoLogs::default(),
 
             type_variable_storage: Default::default(),
             const_unification_storage: Default::default(),
+            // alloc: an empty `Vec` does not allocate.
+            const_var_params: Vec::new(),
             int_unification_storage: Default::default(),
             float_unification_storage: Default::default(),
             region_constraint_storage: Some(Default::default()),
+            // alloc: an empty `Vec` does not allocate.
             region_obligations: vec![],
             region_assumptions: Default::default(),
             opaque_type_storage: Default::default(),
         }
+    }
+
+    /// Back to `empty_unallocated()` in every observable field, each table's capacity kept.
+    pub(crate) fn empty(&mut self) {
+        let InferCtxtInner {
+            undo_log,
+            type_variable_storage,
+            const_unification_storage,
+            const_var_params,
+            int_unification_storage,
+            float_unification_storage,
+            region_constraint_storage,
+            region_obligations,
+            region_assumptions,
+            opaque_type_storage,
+        } = self;
+        *undo_log = InferCtxtUndoLogs::default();
+        type_variable_storage.empty();
+        const_unification_storage.empty();
+        const_var_params.clear();
+        int_unification_storage.empty();
+        float_unification_storage.empty();
+        match region_constraint_storage {
+            Some(storage) => storage.empty(),
+            // Taken when regions were resolved.
+            None => *region_constraint_storage = Some(Default::default()),
+        }
+        region_obligations.clear();
+        region_assumptions.clear();
+        opaque_type_storage.empty();
+    }
+
+    /// Bytes its tables hold room for.
+    pub(crate) fn held(&self) -> usize {
+        self.type_variable_storage.held()
+            + self.const_unification_storage.held()
+            + self.const_var_params.capacity() * size_of::<(ConstVid, ConstParamId)>()
+            + self.int_unification_storage.held()
+            + self.float_unification_storage.held()
+            + self.region_constraint_storage.as_ref().map_or(0, RegionConstraintStorage::held)
+            + self.region_obligations.capacity() * size_of::<TypeOutlivesConstraint<'db>>()
+            + self.region_assumptions.capacity() * size_of::<ArgOutlivesClause<'db>>()
+            + self.opaque_type_storage.held()
+    }
+
+    /// Grows whenever a type, const, int or float variable is instantiated or unified, an
+    /// opaque type is registered, or a rollback undoes any of these, and never shrinks. Equal
+    /// counts mean equal variable and opaque-type state, so a goal stalled at the first gives
+    /// the same answer at the second. Region variables are not counted, as in rustc's
+    /// `ty_or_const_infer_var_changed`: the solver's input canonicalization makes every region
+    /// a fresh placeholder.
+    #[inline]
+    pub(crate) fn state_changes(&self) -> u64 {
+        self.type_variable_storage.changes()
+            + self.const_unification_storage.changes()
+            + self.int_unification_storage.changes()
+            + self.float_unification_storage.changes()
+            + self.opaque_type_storage.changes()
     }
 
     #[inline]
@@ -187,47 +289,95 @@ impl<'db> InferCtxtInner<'db> {
         &self,
         vid: TyVid,
     ) -> Option<&type_variable::TypeVariableValue<'db>> {
-        // Uses a read-only view of the unification table, this way we don't
-        // need an undo log.
-        self.type_variable_storage.eq_relations_ref().try_probe_value(vid)
+        // Reads the table without path halving, so a shared borrow is enough.
+        self.type_variable_storage.try_probe_value(vid)
     }
 
     #[inline]
     fn type_variables(&mut self) -> type_variable::TypeVariableTable<'_, 'db> {
-        self.type_variable_storage.with_log(&mut self.undo_log)
+        self.type_variable_storage.table()
     }
 
     #[inline]
     pub(crate) fn opaque_types(&mut self) -> opaque_types::OpaqueTypeTable<'_, 'db> {
-        self.opaque_type_storage.with_log(&mut self.undo_log)
+        let in_snapshot = self.undo_log.in_snapshot();
+        self.opaque_type_storage.table(in_snapshot)
     }
 
     #[inline]
-    pub(crate) fn int_unification_table(&mut self) -> UnificationTable<'_, 'db, IntVid> {
-        tracing::debug!(?self.int_unification_storage);
-        self.int_unification_storage.with_log(&mut self.undo_log)
+    pub(crate) fn int_unification_table(&mut self) -> &mut UnionFind<IntVid, IntVarValue> {
+        &mut self.int_unification_storage
     }
 
     #[inline]
-    pub(crate) fn float_unification_table(&mut self) -> UnificationTable<'_, 'db, FloatVid> {
-        self.float_unification_storage.with_log(&mut self.undo_log)
+    pub(crate) fn float_unification_table(&mut self) -> &mut UnionFind<FloatVid, FloatVarValue> {
+        &mut self.float_unification_storage
     }
 
     #[inline]
-    fn const_unification_table(&mut self) -> UnificationTable<'_, 'db, ConstVidKey<'db>> {
-        self.const_unification_storage.with_log(&mut self.undo_log)
+    fn const_unification_table(&mut self) -> &mut UnionFind<ConstVid, ConstVariableValue<'db>> {
+        &mut self.const_unification_storage
     }
 
     #[inline]
     pub fn unwrap_region_constraints(&mut self) -> RegionConstraintCollector<'db, '_> {
+        let in_snapshot = self.undo_log.in_snapshot();
         self.region_constraint_storage
             .as_mut()
             .expect("region constraints already solved")
-            .with_log(&mut self.undo_log)
+            .collector(in_snapshot)
     }
 }
 
-#[derive(Clone)]
+/// What an `InferCtxt` allocates: taken from the worker's shelf when one is built, and put
+/// back emptied when it drops (`next_solver::recycle`), so a warm worker builds contexts
+/// without allocating.
+pub(crate) struct InferTables<'db> {
+    pub(crate) inner: InferCtxtInner<'db>,
+    pub(crate) canonicalizer: CanonicalizerState<DbInterner<'db>>,
+    pub(crate) placeholder_assumptions: FxIndexMap<UniverseIndex, Assumptions<DbInterner<'db>>>,
+    pub(crate) next_solver_overflows: Vec<NextSolverOverflow<'db>>,
+}
+
+impl Default for InferTables<'_> {
+    fn default() -> Self {
+        InferTables {
+            inner: InferCtxtInner::empty_unallocated(),
+            canonicalizer: Default::default(),
+            placeholder_assumptions: Default::default(),
+            // alloc: an empty `Vec` does not allocate.
+            next_solver_overflows: Vec::new(),
+        }
+    }
+}
+
+impl<'db> InferTables<'db> {
+    /// Drops every value, keeping each table's capacity.
+    pub(crate) fn empty(&mut self) {
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self;
+        inner.empty();
+        canonicalizer.clear();
+        placeholder_assumptions.clear();
+        next_solver_overflows.clear();
+    }
+
+    /// Bytes it holds room for: what a shelf keeps the largest of.
+    pub(crate) fn held(&self) -> usize {
+        let canonicalizer = &self.canonicalizer;
+        self.inner.held()
+            + canonicalizer.variables.capacity() * size_of::<GenericArg<'db>>()
+            + canonicalizer.var_kinds.capacity()
+                * size_of::<rustc_type_ir::CanonicalVarKind<DbInterner<'db>>>()
+            + canonicalizer.variable_lookup_table.capacity()
+                * size_of::<(GenericArg<'db>, usize)>()
+            + canonicalizer.sub_root_lookup_table.capacity() * size_of::<(TyVid, usize)>()
+            + self.placeholder_assumptions.capacity()
+                * (size_of::<(UniverseIndex, Assumptions<DbInterner<'db>>)>() + size_of::<usize>())
+            + self.next_solver_overflows.capacity() * size_of::<NextSolverOverflow<'db>>()
+    }
+}
+
 pub struct InferCtxt<'db> {
     pub interner: DbInterner<'db>,
 
@@ -257,7 +407,30 @@ pub struct InferCtxt<'db> {
     /// bound.
     universe: Cell<UniverseIndex>,
 
+    /// The assumed well-formedness facts of each universe entered for a binder, from which the
+    /// solver derives the implied bounds of a `for<...>` (rustc's
+    /// `placeholder_assumptions_for_next_solver`). Like `universe`, not rolled back by snapshots.
+    placeholder_assumptions: RefCell<FxIndexMap<UniverseIndex, Assumptions<DbInterner<'db>>>>,
+
+    /// Whether a root goal that overflows is evaluated again with twice the recursion limit,
+    /// reporting rustc's `recursion_depth_exceeding_limit` warning when that holds. Off while such
+    /// a warning is being built, so it does not trigger itself.
+    enable_next_solver_overflow_fcw: Cell<bool>,
+
+    /// The goals that held only with the doubled recursion limit, for the caller to report.
+    next_solver_overflows: RefCell<Vec<NextSolverOverflow<'db>>>,
+
     obligation_inspector: Cell<Option<ObligationInspector<'db>>>,
+
+    /// Reused by each new canonicalizer, then cleared but not freed, so canonicalizing does not
+    /// allocate its tables anew each time.
+    pub(crate) canonicalizer_state: RefCell<CanonicalizerState<DbInterner<'db>>>,
+}
+
+impl<'db> Clone for InferCtxt<'db> {
+    fn clone(&self) -> Self {
+        self.fork()
+    }
 }
 
 /// See the `error_reporting` module for more details.
@@ -317,6 +490,7 @@ pub struct TypeOutlivesConstraint<'db> {
 /// Used to configure inference contexts before their creation.
 pub struct InferCtxtBuilder<'db> {
     interner: DbInterner<'db>,
+    enable_next_solver_overflow_fcw: bool,
 }
 
 pub trait DbInternerInferExt<'db> {
@@ -325,11 +499,17 @@ pub trait DbInternerInferExt<'db> {
 
 impl<'db> DbInternerInferExt<'db> for DbInterner<'db> {
     fn infer_ctxt(self) -> InferCtxtBuilder<'db> {
-        InferCtxtBuilder { interner: self }
+        InferCtxtBuilder { interner: self, enable_next_solver_overflow_fcw: true }
     }
 }
 
 impl<'db> InferCtxtBuilder<'db> {
+    /// Coherence turns this off: a spurious answer there must not change with the limit.
+    pub fn enable_next_solver_overflow_fcw(mut self, enable_next_solver_overflow_fcw: bool) -> Self {
+        self.enable_next_solver_overflow_fcw = enable_next_solver_overflow_fcw;
+        self
+    }
+
     /// Given a canonical value `C` as a starting point, create an
     /// inference context that contains each of the bound values
     /// within instantiated as a fresh variable. The `f` closure is
@@ -351,19 +531,38 @@ impl<'db> InferCtxtBuilder<'db> {
     }
 
     pub fn build(&mut self, typing_mode: TypingMode<'db>) -> InferCtxt<'db> {
-        // We do not allow creating an InferCtxt for an Interner without a crate, because this means
-        // an interner without a crate cannot access the cache, therefore constructing it doesn't need
-        // to reinit the cache, and we construct a lot of no-crate interners.
+        // Solving needs the crate's trait environment and solver cache.
         self.interner.expect_crate();
-        let InferCtxtBuilder { interner } = *self;
+        let InferCtxtBuilder { interner, enable_next_solver_overflow_fcw } = *self;
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            recycle::infer_tables();
         InferCtxt {
             interner,
             typing_mode,
-            inner: RefCell::new(InferCtxtInner::new()),
+            inner: RefCell::new(inner),
             tainted_by_errors: Cell::new(None),
             universe: Cell::new(UniverseIndex::ROOT),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
+            enable_next_solver_overflow_fcw: Cell::new(enable_next_solver_overflow_fcw),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
             obligation_inspector: Cell::new(None),
+            canonicalizer_state: RefCell::new(canonicalizer),
         }
+    }
+}
+
+impl Drop for InferCtxt<'_> {
+    fn drop(&mut self) {
+        // A context dropped by an unwind may be mid-change; its tables are freed, not kept.
+        if std::thread::panicking() {
+            return;
+        }
+        recycle::give_infer_tables(InferTables {
+            inner: mem::replace(self.inner.get_mut(), InferCtxtInner::empty_unallocated()),
+            canonicalizer: mem::take(self.canonicalizer_state.get_mut()),
+            placeholder_assumptions: mem::take(self.placeholder_assumptions.get_mut()),
+            next_solver_overflows: mem::take(self.next_solver_overflows.get_mut()),
+        });
     }
 }
 
@@ -543,14 +742,17 @@ impl<'db> InferCtxt<'db> {
     fn evaluate_obligation(&self, obligation: &PredicateObligation<'db>) -> EvaluationResult {
         self.probe(|snapshot| {
             let mut ocx = ObligationCtxt::new(self);
-            ocx.register_obligation(obligation.clone());
+            ocx.register_obligation(*obligation);
             let mut result = EvaluationResult::EvaluatedToOk;
-            for error in ocx.evaluate_obligations_error_on_ambiguity() {
-                if error.is_true_error() {
-                    return EvaluationResult::EvaluatedToErr;
+            ocx.evaluate_obligations_error_on_ambiguity_with(&mut |error| {
+                result = result.max(if error.is_true_error() {
+                    EvaluationResult::EvaluatedToErr
                 } else {
-                    result = result.max(EvaluationResult::EvaluatedToAmbig);
-                }
+                    EvaluationResult::EvaluatedToAmbig
+                });
+            });
+            if result == EvaluationResult::EvaluatedToErr {
+                return result;
             }
             if self.opaque_types_added_in_snapshot(snapshot) {
                 result = result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes);
@@ -578,7 +780,7 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn type_is_copy_modulo_regions(&self, param_env: ParamEnv<'db>, ty: Ty<'db>) -> bool {
-        let ty = self.resolve_vars_if_possible(ty);
+        let ty = self.deeply_resolve_ignoring_regions(ty);
 
         let Some(copy_def_id) = self.interner.lang_items().Copy else {
             return false;
@@ -599,7 +801,7 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn type_is_use_cloned_modulo_regions(&self, param_env: ParamEnv<'db>, ty: Ty<'db>) -> bool {
-        let ty = self.resolve_vars_if_possible(ty);
+        let ty = self.deeply_resolve_ignoring_regions(ty);
 
         let Some(use_cloned_def_id) = self.interner.lang_items().UseCloned else {
             return false;
@@ -608,32 +810,22 @@ impl<'db> InferCtxt<'db> {
         traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, use_cloned_def_id)
     }
 
-    pub fn unresolved_variables(&self) -> Vec<Ty<'db>> {
+    /// The root of each set of type, integer and float variables that is not yet known.
+    pub fn unresolved_root_variables(&self) -> (Vec<TyVid>, Vec<IntVid>, Vec<FloatVid>) {
         let mut inner = self.inner.borrow_mut();
-        let mut vars: Vec<Ty<'db>> = inner
-            .type_variables()
-            .unresolved_variables()
-            .into_iter()
-            .map(|t| Ty::new_var(self.interner, t))
-            .collect();
-        vars.extend(
-            (0..inner.int_unification_table().len())
-                .map(IntVid::from_usize)
-                .filter(|&vid| inner.int_unification_table().probe_value(vid).is_unknown())
-                .map(|v| Ty::new_int_var(self.interner, v)),
-        );
-        vars.extend(
-            (0..inner.float_unification_table().len())
-                .map(FloatVid::from_usize)
-                .filter(|&vid| inner.float_unification_table().probe_value(vid).is_unknown())
-                .map(|v| Ty::new_float_var(self.interner, v)),
-        );
-        vars
+        let ty = inner.type_variables().unresolved_root_variables();
+        let int = inner.int_unification_storage.roots_where(IntVarValue::is_unknown);
+        let float = inner.float_unification_storage.roots_where(FloatVarValue::is_unknown);
+        (ty, int, float)
     }
 
     #[instrument(skip(self), level = "debug")]
     pub fn sub_regions(&self, a: Region<'db>, b: Region<'db>) {
-        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(a, b);
+        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(
+            a,
+            b,
+            VisibleForLeakCheck::Yes,
+        );
     }
 
     /// Processes a `Coerce` predicate from the fulfillment context.
@@ -695,9 +887,9 @@ impl<'db> InferCtxt<'db> {
 
         self.enter_forall(predicate, |SubtypePredicate { a_is_expected, a, b }| {
             if a_is_expected {
-                Ok(self.at(cause, param_env).sub(a, b))
+                Ok(self.sub_raw(cause, param_env, a, b))
             } else {
-                Ok(self.at(cause, param_env).sup(b, a))
+                Ok(self.sup_raw(cause, param_env, b, a))
             }
         })
     }
@@ -705,9 +897,9 @@ impl<'db> InferCtxt<'db> {
     pub fn region_outlives_predicate(
         &self,
         _cause: &traits::ObligationCause,
-        predicate: PolyRegionOutlivesPredicate<'db>,
+        predicate: PolyRegionOutlivesClause<'db>,
     ) {
-        self.enter_forall(predicate, |OutlivesPredicate(r_a, r_b)| {
+        self.enter_forall(predicate, |OutlivesClause(r_a, r_b)| {
             self.sub_regions(r_b, r_a); // `b : a` ==> `a <= b`
         })
     }
@@ -735,6 +927,29 @@ impl<'db> InferCtxt<'db> {
         Ty::new_var(self.interner, vid)
     }
 
+    pub(crate) fn next_ty_var_for_param(
+        &self,
+        span: Span,
+        param: Option<TypeParamId>,
+    ) -> Ty<'db> {
+        let universe = self.universe();
+        let vid =
+            self.inner.borrow_mut().type_variables().new_var_for_param(universe, span, param);
+        Ty::new_var(self.interner, vid)
+    }
+
+    pub(crate) fn next_const_var_for_param(
+        &self,
+        span: Span,
+        param: Option<ConstParamId>,
+    ) -> Const<'db> {
+        let vid = self.next_const_vid(span);
+        if let Some(param) = param {
+            self.inner.borrow_mut().const_var_params.push((vid, param));
+        }
+        Const::new_var(self.interner, vid)
+    }
+
     pub fn next_const_var(&self, span: Span) -> Const<'db> {
         let vid = self.next_const_vid(span);
         Const::new_var(self.interner, vid)
@@ -749,7 +964,6 @@ impl<'db> InferCtxt<'db> {
             .borrow_mut()
             .const_unification_table()
             .new_key(ConstVariableValue::Unknown { span, universe })
-            .vid
     }
 
     pub fn next_const_var_in_universe(&self, universe: UniverseIndex, span: Span) -> Const<'db> {
@@ -794,10 +1008,17 @@ impl<'db> InferCtxt<'db> {
         Region::new_var(self.interner, region_var)
     }
 
-    pub fn next_term_var_of_kind(&self, term: Term<'db>, span: Span) -> Term<'db> {
-        match term.kind() {
-            TermKind::Ty(_) => self.next_ty_var(span).into(),
-            TermKind::Const(_) => self.next_const_var(span).into(),
+    pub fn next_term_var_of_alias_kind(&self, alias_term: AliasTerm<'db>, span: Span) -> Term<'db> {
+        match alias_term.kind {
+            AliasTermKind::ProjectionTy { .. }
+            | AliasTermKind::InherentTy { .. }
+            | AliasTermKind::OpaqueTy { .. }
+            | AliasTermKind::FreeTy { .. } => self.next_ty_var(span).into(),
+            AliasTermKind::FreeConst { .. }
+            | AliasTermKind::InherentConstSelf { .. }
+            | AliasTermKind::InherentConstImpl { .. }
+            | AliasTermKind::AnonConst { .. }
+            | AliasTermKind::ProjectionConst { .. } => self.next_const_var(span).into(),
         }
     }
 
@@ -822,7 +1043,7 @@ impl<'db> InferCtxt<'db> {
                 // region parameter definition.
                 self.next_region_var(span).into()
             }
-            GenericParamId::TypeParamId(_) => {
+            GenericParamId::TypeParamId(param) => {
                 // Create a type inference variable for the given
                 // type parameter definition. The generic parameters are
                 // for actual parameters that may be referred to by
@@ -831,9 +1052,11 @@ impl<'db> InferCtxt<'db> {
                 // used in a path such as `Foo::<T, U>::new()` will
                 // use an inference variable for `C` with `[T, U]`
                 // as the generic parameters for the default, `(T, U)`.
-                self.next_ty_var(span).into()
+                self.next_ty_var_for_param(span, Some(param)).into()
             }
-            GenericParamId::ConstParamId(_) => self.next_const_var(span).into(),
+            GenericParamId::ConstParamId(param) => {
+                self.next_const_var_for_param(span, Some(param)).into()
+            }
         }
     }
 
@@ -883,13 +1106,14 @@ impl<'db> InferCtxt<'db> {
 
     #[instrument(level = "debug", skip(self), ret)]
     pub fn clone_opaque_types(&self) -> Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> {
+        // alloc: once per body, for the opaque-type pass; none without opaque types.
         self.inner.borrow_mut().opaque_type_storage.iter_opaque_types().collect()
     }
 
     pub fn has_opaques_with_sub_unified_hidden_type(&self, ty_vid: TyVid) -> bool {
         let ty_sub_vid = self.sub_unification_table_root_var(ty_vid);
         let inner = &mut *self.inner.borrow_mut();
-        let mut type_variables = inner.type_variable_storage.with_log(&mut inner.undo_log);
+        let mut type_variables = inner.type_variable_storage.table();
         inner.opaque_type_storage.iter_opaque_types().any(|(_, hidden_ty)| {
             if let TyKind::Infer(InferTy::TyVar(hidden_vid)) = hidden_ty.ty.kind() {
                 let opaque_sub_vid = type_variables.sub_unification_table_root_var(hidden_vid);
@@ -905,18 +1129,21 @@ impl<'db> InferCtxt<'db> {
     #[inline(always)]
     pub fn can_define_opaque_ty(&self, id: impl Into<SolverDefId<'db>>) -> bool {
         match self.typing_mode_raw().assert_not_erased() {
-            TypingMode::Analysis { defining_opaque_types_and_generators } => {
-                defining_opaque_types_and_generators.contains(&id.into())
+            TypingMode::Typeck { defining_opaque_types_and_generators: defining_opaque_types }
+            | TypingMode::PostTypeckThroughBorrowck { defining_opaque_types } => {
+                defining_opaque_types.contains(&id.into())
             }
-            TypingMode::Coherence | TypingMode::PostAnalysis => false,
-            TypingMode::Borrowck { defining_opaque_types: _ } => unimplemented!(),
-            TypingMode::PostBorrowckAnalysis { defined_opaque_types: _ } => unimplemented!(),
+            TypingMode::Coherence
+            | TypingMode::Reflection
+            | TypingMode::PostBorrowck { .. }
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen => false,
         }
     }
 
     /// If `TyVar(vid)` resolves to a type, return that type. Else, return the
     /// universe index of `TyVar(vid)`.
-    pub fn probe_ty_var(&self, vid: TyVid) -> Result<Ty<'db>, UniverseIndex> {
+    pub fn try_resolve_ty_var(&self, vid: TyVid) -> Result<Ty<'db>, UniverseIndex> {
         use self::type_variable::TypeVariableValue;
 
         match self.inner.borrow_mut().type_variables().probe(vid) {
@@ -925,6 +1152,22 @@ impl<'db> InferCtxt<'db> {
         }
     }
 
+    /// If `vid` resolves to a type, return that type. Otherwise return the root variable id for `vid`.
+    pub fn shallow_resolve_ty_var_or_get_root(&self, vid: TyVid) -> Result<Ty<'db>, TyVid> {
+        let (root, value) = self.inner.borrow_mut().type_variables().probe_with_root_vid(vid);
+        value.known().ok_or(root)
+    }
+
+    /// Resolves a type one level:
+    ///
+    /// - a rigid type is returned as is;
+    /// - a type, int or float variable equated with a type returns that type;
+    /// - a variable equated only with other variables returns the root of their set, so the
+    ///   same set always gives the same variable (which caches rely on);
+    /// - anything else is returned as is.
+    ///
+    /// Types inside the result may still contain variables; see
+    /// [`Self::deeply_resolve_ignoring_regions`].
     pub fn shallow_resolve(&self, ty: Ty<'db>) -> Ty<'db> {
         if let TyKind::Infer(v) = ty.kind() {
             match v {
@@ -941,22 +1184,45 @@ impl<'db> InferCtxt<'db> {
                     //
                     // Note: if these two lines are combined into one we get
                     // dynamic borrow errors on `self.inner`.
-                    let known = self.inner.borrow_mut().type_variables().probe(v).known();
-                    known.map_or(ty, |t| self.shallow_resolve(t))
+                    let (root_vid, value) =
+                        self.inner.borrow_mut().type_variables().probe_with_root_vid(v);
+                    value.known().map_or_else(
+                        || if root_vid == v { ty } else { Ty::new_var(self.interner, root_vid) },
+                        |t| self.shallow_resolve(t),
+                    )
                 }
 
                 InferTy::IntVar(v) => {
-                    match self.inner.borrow_mut().int_unification_table().probe_value(v) {
+                    let (root, value) =
+                        self.inner.borrow_mut().int_unification_table().inlined_probe_key_value(v);
+                    match value {
                         IntVarValue::IntType(ty) => Ty::new_int(self.interner, ty),
                         IntVarValue::UintType(ty) => Ty::new_uint(self.interner, ty),
-                        IntVarValue::Unknown => ty,
+                        IntVarValue::Unknown => {
+                            if root == v {
+                                ty
+                            } else {
+                                Ty::new_int_var(self.interner, root)
+                            }
+                        }
                     }
                 }
 
                 InferTy::FloatVar(v) => {
-                    match self.inner.borrow_mut().float_unification_table().probe_value(v) {
+                    let (root, value) = self
+                        .inner
+                        .borrow_mut()
+                        .float_unification_table()
+                        .inlined_probe_key_value(v);
+                    match value {
                         FloatVarValue::Known(ty) => Ty::new_float(self.interner, ty),
-                        FloatVarValue::Unknown => ty,
+                        FloatVarValue::Unknown => {
+                            if root == v {
+                                ty
+                            } else {
+                                Ty::new_float_var(self.interner, root)
+                            }
+                        }
                     }
                 }
 
@@ -967,22 +1233,23 @@ impl<'db> InferCtxt<'db> {
         }
     }
 
+    /// [`Self::shallow_resolve`] for consts.
     pub fn shallow_resolve_const(&self, ct: Const<'db>) -> Const<'db> {
         match ct.kind() {
             ConstKind::Infer(infer_ct) => match infer_ct {
-                InferConst::Var(vid) => self
-                    .inner
-                    .borrow_mut()
-                    .const_unification_table()
-                    .probe_value(vid)
-                    .known()
-                    .unwrap_or(ct),
+                InferConst::Var(vid) => {
+                    let (root, value) =
+                        self.inner.borrow_mut().const_unification_table().inlined_probe_key_value(vid);
+                    value.known().unwrap_or_else(|| {
+                        if root == vid { ct } else { Const::new_var(self.interner, root) }
+                    })
+                }
                 InferConst::Fresh(_) => ct,
             },
             ConstKind::Param(_)
             | ConstKind::Bound(_, _)
             | ConstKind::Placeholder(_)
-            | ConstKind::Unevaluated(_)
+            | ConstKind::Alias(_, _)
             | ConstKind::Value(_)
             | ConstKind::Error(_)
             | ConstKind::Expr(_) => ct,
@@ -1001,12 +1268,37 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn root_const_var(&self, var: ConstVid) -> ConstVid {
-        self.inner.borrow_mut().const_unification_table().find(var).vid
+        self.inner.borrow_mut().const_unification_table().find(var)
+    }
+
+    /// If `ty` is an unresolved type variable, returns its root vid.
+    pub fn root_vid(&self, ty: Ty<'db>) -> Option<TyVid> {
+        let TyKind::Infer(InferTy::TyVar(vid)) = ty.kind() else { return None };
+        let (root, value) = self.inner.borrow_mut().type_variables().inlined_probe_with_vid(vid);
+        value.is_unknown().then_some(root)
+    }
+
+    /// Resolves a const var to a rigid const, if it was constrained to one,
+    /// or else the root const var in the unification table.
+    pub fn shallow_resolve_const_var(&self, vid: ConstVid) -> Const<'db> {
+        match self.try_resolve_const_var(vid) {
+            Ok(ct) => ct,
+            Err(_) => Const::new_var(self.interner, self.root_const_var(vid)),
+        }
+    }
+
+    /// Resolves a type var to a rigid type, if it was constrained to one,
+    /// or else the root type var in the unification table.
+    pub fn shallow_resolve_ty_var(&self, vid: TyVid) -> Ty<'db> {
+        match self.try_resolve_ty_var(vid) {
+            Ok(ty) => ty,
+            Err(_) => Ty::new_var(self.interner, self.root_var(vid)),
+        }
     }
 
     /// Resolves an int var to a rigid int type, if it was constrained to one,
     /// or else the root int var in the unification table.
-    pub fn opportunistic_resolve_int_var(&self, vid: IntVid) -> Ty<'db> {
+    pub fn shallow_resolve_int_var(&self, vid: IntVid) -> Ty<'db> {
         let mut inner = self.inner.borrow_mut();
         let value = inner.int_unification_table().probe_value(vid);
         match value {
@@ -1028,9 +1320,9 @@ impl<'db> InferCtxt<'db> {
         }
     }
 
-    /// Resolves a float var to a rigid int type, if it was constrained to one,
+    /// Resolves a float var to a rigid float type, if it was constrained to one,
     /// or else the root float var in the unification table.
-    pub fn opportunistic_resolve_float_var(&self, vid: FloatVid) -> Ty<'db> {
+    pub fn shallow_resolve_float_var(&self, vid: FloatVid) -> Ty<'db> {
         let mut inner = self.inner.borrow_mut();
         let value = inner.float_unification_table().probe_value(vid);
         match value {
@@ -1050,13 +1342,14 @@ impl<'db> InferCtxt<'db> {
         }
     }
 
-    /// Where possible, replaces type/const variables in
-    /// `value` with their final value. Note that region variables
-    /// are unaffected. If a type/const variable has not been unified, it
-    /// is left as is. This is an idempotent operation that does
-    /// not affect inference state in any way and so you can do it
-    /// at will.
-    pub fn resolve_vars_if_possible<T>(&self, value: T) -> T
+    /// Where possible, replaces type/const variables in `value` with their final value.
+    /// If a type/const variable has not (yet) been unified, it is left as is.
+    ///
+    /// This is an idempotent operation that does not affect inference state in any way,
+    /// which means it's safe to call this function at will.
+    ///
+    /// Region variables are unaffected.
+    pub fn deeply_resolve_ignoring_regions<T>(&self, value: T) -> T
     where
         T: TypeFoldable<DbInterner<'db>>,
     {
@@ -1066,11 +1359,23 @@ impl<'db> InferCtxt<'db> {
         if !value.has_non_region_infer() {
             return value;
         }
-        let mut r = resolve::OpportunisticVarResolver::new(self);
+        let mut r = resolve::DeepResolverIgnoringRegions::new(self);
         value.fold_with(&mut r)
     }
 
-    pub fn probe_const_var(&self, vid: ConstVid) -> Result<Const<'db>, UniverseIndex> {
+    /// Where possible, replaces type/const/region variables in `value` with their final value.
+    /// If a type/const/region variable has not (yet) been unified, it is left as is.
+    ///
+    /// This is an idempotent operation that does not affect inference state in any way,
+    /// which means it's safe to call this function at will.
+    pub fn deeply_resolve_via_unification_table<T>(&self, value: T) -> T
+    where
+        T: TypeFoldable<DbInterner<'db>>,
+    {
+        rustc_type_ir::InferCtxtLike::deeply_resolve_via_unification_table(self, value)
+    }
+
+    pub fn try_resolve_const_var(&self, vid: ConstVid) -> Result<Const<'db>, UniverseIndex> {
         match self.inner.borrow_mut().const_unification_table().probe_value(vid) {
             ConstVariableValue::Known { value } => Ok(value),
             ConstVariableValue::Unknown { span: _, universe } => Err(universe),
@@ -1082,6 +1387,24 @@ impl<'db> InferCtxt<'db> {
     /// No attempt is made to resolve `vid` to its root variable.
     pub fn type_var_span(&self, vid: TyVid) -> Span {
         self.inner.borrow_mut().type_variables().var_span(vid)
+    }
+
+    /// The span of `vid` and the type parameter it was made for, if any (rustc's
+    /// `type_var_origin`).
+    pub fn type_var_origin(&self, vid: TyVid) -> (Span, Option<GenericParamId>) {
+        let mut inner = self.inner.borrow_mut();
+        let param = inner.type_variable_storage.param(vid);
+        (inner.type_variables().var_span(vid), param.map(GenericParamId::TypeParamId))
+    }
+
+    /// The span of `vid` while it is unknown and the const parameter it was made for, if any
+    /// (rustc's `const_var_origin`).
+    pub fn const_var_origin(&self, vid: ConstVid) -> Option<(Span, Option<GenericParamId>)> {
+        let span = self.const_var_span(vid)?;
+        let inner = self.inner.borrow();
+        let params = &inner.const_var_params;
+        let param = params.binary_search_by_key(&vid, |&(vid, _)| vid).ok().map(|at| params[at].1);
+        Some((span, param.map(GenericParamId::ConstParamId)))
     }
 
     /// Returns the span of the const variable identified by `vid`
@@ -1106,14 +1429,14 @@ impl<'db> InferCtxt<'db> {
         value: Binder<'db, T>,
     ) -> T
     where
-        T: TypeFoldable<DbInterner<'db>> + Clone,
+        T: TypeFoldable<DbInterner<'db>>,
     {
-        if let Some(inner) = value.clone().no_bound_vars() {
-            return inner;
+        if value.as_ref().no_bound_vars().is_some() {
+            return value.skip_binder();
         }
 
-        let bound_vars = value.clone().bound_vars();
-        let mut args = Vec::with_capacity(bound_vars.len());
+        let bound_vars = value.bound_vars();
+        let mut args = smallvec::SmallVec::<[GenericArg<'db>; 8]>::with_capacity(bound_vars.len());
 
         for bound_var_kind in bound_vars {
             let arg: GenericArg<'db> = match bound_var_kind {
@@ -1125,10 +1448,10 @@ impl<'db> InferCtxt<'db> {
         }
 
         struct ToFreshVars<'db> {
-            args: Vec<GenericArg<'db>>,
+            args: smallvec::SmallVec<[GenericArg<'db>; 8]>,
         }
 
-        impl<'db> BoundVarReplacerDelegate<'db> for ToFreshVars<'db> {
+        impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToFreshVars<'db> {
             fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
                 self.args[br.var.index()].expect_region()
             }
@@ -1158,6 +1481,12 @@ impl<'db> InferCtxt<'db> {
 
     pub fn universe(&self) -> UniverseIndex {
         self.universe.get()
+    }
+
+    /// See `InferCtxtInner::state_changes`.
+    #[inline]
+    pub fn state_changes(&self) -> u64 {
+        self.inner.borrow().state_changes()
     }
 
     /// Creates and return a fresh universe that extends all previous
@@ -1200,45 +1529,31 @@ impl<'db> InferCtxt<'db> {
     /// are extremely hot (both in `traits::fulfill`'s checking of `stalled_on`
     /// inference variables), and it handles both `Ty` and `Const` without
     /// having to resort to storing full `GenericArg`s in `stalled_on`.
+    ///
+    /// A variable that is no longer the root of its set counts as changed: `shallow_resolve`
+    /// then returns the root, not the variable.
     #[inline(always)]
-    pub fn ty_or_const_infer_var_changed(&self, infer_var: TyOrConstInferVar) -> bool {
-        match infer_var {
-            TyOrConstInferVar::Ty(v) => {
-                use self::type_variable::TypeVariableValue;
+    pub fn ty_or_const_infer_var_changed(&self, var: TyOrConstInferVar) -> bool {
+        use self::type_variable::TypeVariableValue;
 
-                // If `inlined_probe` returns a `Known` value, it never equals
-                // `Infer(TyVar(v))`.
-                match self.inner.borrow_mut().type_variables().inlined_probe(v) {
-                    TypeVariableValue::Unknown { .. } => false,
-                    TypeVariableValue::Known { .. } => true,
-                }
-            }
-
-            TyOrConstInferVar::TyInt(v) => {
-                // If `inlined_probe_value` returns a value it's always a
-                // `Int(_)` or `UInt(_)`, which never matches a
-                // `Infer(_)`.
-                self.inner.borrow_mut().int_unification_table().inlined_probe_value(v).is_known()
-            }
-
-            TyOrConstInferVar::TyFloat(v) => {
-                // If `probe_value` returns a value it's always a
-                // `Float(_)`, which never matches a `Infer(_)`.
-                //
-                // Not `inlined_probe_value(v)` because this call site is colder.
-                self.inner.borrow_mut().float_unification_table().probe_value(v).is_known()
-            }
-
-            TyOrConstInferVar::Const(v) => {
-                // If `probe_value` returns a `Known` value, it never equals
-                // `ConstKind::Infer(InferConst::Var(v))`.
-                //
-                // Not `inlined_probe_value(v)` because this call site is colder.
-                match self.inner.borrow_mut().const_unification_table().probe_value(v) {
-                    ConstVariableValue::Unknown { .. } => false,
-                    ConstVariableValue::Known { .. } => true,
-                }
-            }
+        let inner = self.inner.borrow();
+        match var {
+            TyOrConstInferVar::Ty(vid) => !matches!(
+                inner.try_type_variables_probe_ref(vid),
+                Some(TypeVariableValue::Unknown { .. })
+            ),
+            TyOrConstInferVar::TyInt(vid) => !matches!(
+                inner.int_unification_storage.try_probe_value(vid),
+                Some(IntVarValue::Unknown)
+            ),
+            TyOrConstInferVar::TyFloat(vid) => !matches!(
+                inner.float_unification_storage.try_probe_value(vid),
+                Some(FloatVarValue::Unknown)
+            ),
+            TyOrConstInferVar::Const(vid) => !matches!(
+                inner.const_unification_storage.try_probe_value(vid),
+                Some(ConstVariableValue::Unknown { .. })
+            ),
         }
     }
 
@@ -1249,8 +1564,120 @@ impl<'db> InferCtxt<'db> {
         self.inner.borrow_mut().type_variables().sub_unification_table_root_var(var)
     }
 
-    fn sub_unify_ty_vids_raw(&self, a: rustc_type_ir::TyVid, b: rustc_type_ir::TyVid) {
+    pub fn sub_unify_ty_vids_raw(&self, a: rustc_type_ir::TyVid, b: rustc_type_ir::TyVid) {
         self.inner.borrow_mut().type_variables().sub_unify(a, b);
+    }
+
+    pub fn insert_placeholder_assumptions(
+        &self,
+        u: UniverseIndex,
+        assumptions: Assumptions<DbInterner<'db>>,
+    ) {
+        assert!(
+            !assumptions.type_outlives.has_escaping_bound_vars(),
+            "assumptions has escaping bound vars, which is indicative of a bug in how assumptions are handled: {:?}",
+            assumptions.type_outlives
+        );
+        assert!(
+            assumptions.region_outlives.base_edges().all(|r| !r.has_escaping_bound_vars()),
+            "assumptions has escaping bound vars, which is indicative of a bug in how assumptions are handled: {:?}",
+            assumptions.region_outlives
+        );
+        self.placeholder_assumptions.borrow_mut().insert(u, assumptions);
+    }
+
+    /// The assumptions of universe `u`. Panics when `u` has none: the solver asks only for
+    /// universes it entered with assumptions.
+    pub fn get_placeholder_assumptions(&self, u: UniverseIndex) -> Assumptions<DbInterner<'db>> {
+        match self.placeholder_assumptions.borrow().get(&u) {
+            // clone: `InferCtxtLike` returns it owned; reached only with assumptions on binders.
+            Some(assumptions) => assumptions.clone(),
+            None => panic!("no placeholder assumptions for universe {u:?}"),
+        }
+    }
+
+    /// Whether every universe in `range` has assumptions.
+    pub fn has_placeholder_assumptions(&self, range: RangeInclusive<UniverseIndex>) -> bool {
+        let assumptions = self.placeholder_assumptions.borrow();
+        (range.start.index()..=range.last.index())
+            .all(|u| assumptions.contains_key(&UniverseIndex::from_usize(u)))
+    }
+
+    /// rustc's `make_query_region_constraints`, given to `f` one at a time: each region
+    /// constraint `sub <= sup` as `sup: sub` with whether the leak check sees it, then each
+    /// registered type-outlives obligation, which it always sees. A reflexive `'a: 'a` says
+    /// nothing and is passed over. `f` runs with the tables borrowed, so it must not use `self`.
+    pub(crate) fn for_each_query_region_constraint(
+        &self,
+        mut f: impl FnMut(RegionConstraint<'db>, VisibleForLeakCheck),
+    ) {
+        let inner = self.inner.borrow();
+        let storage =
+            inner.region_constraint_storage.as_ref().expect("region constraints already solved");
+        for (constraint, visible) in storage.legacy_data.constraints.iter_with_visibility() {
+            let (sub, sup) = constraint.regions(self.interner);
+            if sub != sup {
+                f(RegionConstraint::Outlives(OutlivesClause(sup.into(), sub)), visible);
+            }
+        }
+        for it in inner.region_obligations() {
+            f(
+                RegionConstraint::Outlives(OutlivesClause(it.sup_type.into(), it.sub_region)),
+                VisibleForLeakCheck::Yes,
+            );
+        }
+    }
+
+    /// The region constraint the solver has built so far, with the span of each leaf.
+    pub fn get_solver_region_constraint(&self) -> SolverRegionConstraint<'db> {
+        self.inner
+            .borrow()
+            .region_constraint_storage
+            .as_ref()
+            .expect("region constraints already solved")
+            .solver_data
+            .get_constraint()
+    }
+
+    pub fn overwrite_solver_region_constraint(&self, constraint: SolverRegionConstraint<'db>) {
+        self.inner.borrow_mut().unwrap_region_constraints().overwrite_solver_constraint(constraint);
+    }
+
+    /// Adds `constraint` to the solver's region constraint with an `and`.
+    pub fn register_solver_region_constraint(&self, constraint: SolverRegionConstraint<'db>) {
+        self.inner.borrow_mut().unwrap_region_constraints().register_solver_constraint(constraint);
+    }
+
+    #[inline]
+    pub fn enable_next_solver_overflow_fcw(&self) -> bool {
+        self.enable_next_solver_overflow_fcw.get()
+    }
+
+    /// Runs `f` with the overflow warning off, so building one warning does not start another.
+    pub fn with_disabled_next_solver_overflow_fcw<R>(&self, f: impl FnOnce() -> R) -> R {
+        let prev = self.enable_next_solver_overflow_fcw.replace(false);
+        let ret = f();
+        self.enable_next_solver_overflow_fcw.set(prev);
+        ret
+    }
+
+    pub fn push_next_solver_overflow(&self, overflow: NextSolverOverflow<'db>) {
+        self.next_solver_overflows.borrow_mut().push(overflow);
+    }
+
+    /// The overflow warnings recorded so far, which the caller reports; leaves none behind.
+    pub fn take_next_solver_overflows(&self) -> Vec<NextSolverOverflow<'db>> {
+        std::mem::take(&mut *self.next_solver_overflows.borrow_mut())
+    }
+
+    /// How many overflow warnings are recorded and not yet taken; an evaluation that records
+    /// one changes it.
+    pub(crate) fn next_solver_overflow_count(&self) -> usize {
+        self.next_solver_overflows.borrow().len()
+    }
+
+    pub(crate) fn has_obligation_inspector(&self) -> bool {
+        self.obligation_inspector.get().is_some()
     }
 
     /// Attach a callback to be invoked on each root obligation evaluated in the new trait solver.
@@ -1274,54 +1701,6 @@ impl<'db> InferCtxt<'db> {
                 Err(_) => Err(NoSolution),
             };
             (inspector)(self, obligation, result, get_proof_tree());
-        }
-    }
-}
-
-/// Helper for [InferCtxt::ty_or_const_infer_var_changed] (see comment on that), currently
-/// used only for `traits::fulfill`'s list of `stalled_on` inference variables.
-#[derive(Copy, Clone, Debug)]
-pub enum TyOrConstInferVar {
-    /// Equivalent to `Infer(TyVar(_))`.
-    Ty(TyVid),
-    /// Equivalent to `Infer(IntVar(_))`.
-    TyInt(IntVid),
-    /// Equivalent to `Infer(FloatVar(_))`.
-    TyFloat(FloatVid),
-
-    /// Equivalent to `ConstKind::Infer(InferConst::Var(_))`.
-    Const(ConstVid),
-}
-
-impl TyOrConstInferVar {
-    /// Tries to extract an inference variable from a type or a constant, returns `None`
-    /// for types other than `Infer(_)` (or `InferTy::Fresh*`) and
-    /// for constants other than `ConstKind::Infer(_)` (or `InferConst::Fresh`).
-    pub fn maybe_from_generic_arg<'db>(arg: GenericArg<'db>) -> Option<Self> {
-        match arg.kind() {
-            GenericArgKind::Type(ty) => Self::maybe_from_ty(ty),
-            GenericArgKind::Const(ct) => Self::maybe_from_const(ct),
-            GenericArgKind::Lifetime(_) => None,
-        }
-    }
-
-    /// Tries to extract an inference variable from a type, returns `None`
-    /// for types other than `Infer(_)` (or `InferTy::Fresh*`).
-    fn maybe_from_ty<'db>(ty: Ty<'db>) -> Option<Self> {
-        match ty.kind() {
-            TyKind::Infer(InferTy::TyVar(v)) => Some(TyOrConstInferVar::Ty(v)),
-            TyKind::Infer(InferTy::IntVar(v)) => Some(TyOrConstInferVar::TyInt(v)),
-            TyKind::Infer(InferTy::FloatVar(v)) => Some(TyOrConstInferVar::TyFloat(v)),
-            _ => None,
-        }
-    }
-
-    /// Tries to extract an inference variable from a constant, returns `None`
-    /// for constants other than `ConstKind::Infer(_)` (or `InferConst::Fresh`).
-    fn maybe_from_const<'db>(ct: Const<'db>) -> Option<Self> {
-        match ct.kind() {
-            ConstKind::Infer(InferConst::Var(v)) => Some(TyOrConstInferVar::Const(v)),
-            _ => None,
         }
     }
 }
@@ -1370,4 +1749,136 @@ pub struct MemberConstraint<'db> {
 
     /// The options `O1..On`.
     pub choice_regions: Arc<Vec<Region<'db>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DbInternerInferExt, InferCtxt, TypingMode, traits::ObligationCause};
+    use crate::{
+        Span,
+        next_solver::{DbInterner, ParamEnv, budget_tests::fixture, recycle},
+    };
+
+    /// What a context's tables show from outside, for comparing one with a never-used one.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Observed {
+        open_snapshots: usize,
+        ty_vars: usize,
+        const_vars: usize,
+        int_vars: usize,
+        float_vars: usize,
+        region_vars: usize,
+        state_changes: u64,
+        const_var_params: usize,
+        region_obligations: usize,
+        region_assumptions: usize,
+        opaque_types: super::opaque_types::table::OpaqueTypeStorageEntries,
+        region_constraints: (usize, usize, usize),
+        placeholder_assumptions: usize,
+        overflows: usize,
+    }
+
+    fn observed(infcx: &InferCtxt<'_>) -> Observed {
+        let mut inner = infcx.inner.borrow_mut();
+        let region_constraints = {
+            let collector = inner.unwrap_region_constraints();
+            let data = collector.region_constraint_data();
+            (data.constraints.len(), data.member_constraints.len(), data.verifys.len())
+        };
+        Observed {
+            open_snapshots: inner.undo_log.num_open_snapshots(),
+            ty_vars: inner.type_variables().num_vars(),
+            const_vars: inner.const_unification_storage.len(),
+            int_vars: inner.int_unification_storage.len(),
+            float_vars: inner.float_unification_storage.len(),
+            region_vars: inner.unwrap_region_constraints().num_region_vars(),
+            state_changes: inner.state_changes(),
+            const_var_params: inner.const_var_params.len(),
+            region_obligations: inner.region_obligations.len(),
+            region_assumptions: inner.region_assumptions.len(),
+            opaque_types: inner.opaque_type_storage.num_entries(),
+            region_constraints,
+            placeholder_assumptions: infcx.placeholder_assumptions.borrow().len(),
+            overflows: infcx.next_solver_overflows.borrow().len(),
+        }
+    }
+
+    /// New type, int and const variables, two unified, a snapshot opened and rolled back
+    /// around more of them, and a region obligation.
+    fn use_context(infcx: &InferCtxt<'_>) {
+        let cause = ObligationCause::dummy();
+        let (a, b) = (infcx.next_ty_var(Span::Dummy), infcx.next_ty_var(Span::Dummy));
+        let _ = infcx.next_int_var();
+        let _ = infcx.next_const_var(Span::Dummy);
+        let ok = infcx.at(&cause, ParamEnv::empty()).eq(a, b).expect("two fresh variables unify");
+        assert!(ok.obligations.is_empty());
+        let snapshot = infcx.start_snapshot();
+        let c = infcx.next_ty_var(Span::Dummy);
+        let _ = infcx.at(&cause, ParamEnv::empty()).eq(a, c).expect("unify in the snapshot");
+        let _ = infcx.next_region_var(Span::Dummy);
+        infcx.rollback_to(snapshot);
+        infcx.register_type_outlives_constraint(a, infcx.interner.default_types().regions.statik);
+    }
+
+    fn build<'db>(interner: DbInterner<'db>) -> InferCtxt<'db> {
+        interner.infer_ctxt().build(TypingMode::non_body_analysis())
+    }
+
+    #[test]
+    fn a_recycled_context_is_a_new_one() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        // Each test runs on a thread of its own: this one's tables are new.
+        let fresh = observed(&build(interner));
+        let used = build(interner);
+        use_context(&used);
+        assert_ne!(observed(&used), fresh);
+        drop(used);
+        let recycled = build(interner);
+        assert!(recycled.inner.borrow().held() > 0, "the used context's tables came back");
+        assert_eq!(observed(&recycled), fresh);
+        // And it behaves as a new one.
+        use_context(&recycled);
+    }
+
+    #[test]
+    fn a_warm_context_allocates_nothing() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        use_context(&infcx);
+        drop(infcx);
+        blaze_alloc_count::assert_at_most(0, "a warm inference context", || {
+            let infcx = build(interner);
+            use_context(&infcx);
+        });
+    }
+
+    #[test]
+    fn a_warm_fork_allocates_nothing() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        for _ in 0..100 {
+            let _ = infcx.next_ty_var(Span::Dummy);
+        }
+        use_context(&infcx);
+        drop(infcx.fork());
+        blaze_alloc_count::assert_at_most(0, "a warm fork", || {
+            let fork = infcx.fork();
+            assert_eq!(fork.num_ty_vars(), infcx.num_ty_vars());
+        });
+    }
+
+    #[test]
+    fn a_huge_context_is_not_kept() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        let rows = recycle::KEEP_AT_MOST / size_of::<super::TypeOutlivesConstraint<'_>>() + 1;
+        infcx.inner.borrow_mut().region_obligations.reserve_exact(rows);
+        assert!(infcx.inner.borrow().held() > recycle::KEEP_AT_MOST);
+        drop(infcx);
+        assert_eq!(recycle::infer_tables().held(), 0);
+    }
 }

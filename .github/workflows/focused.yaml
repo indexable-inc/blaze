@@ -2,11 +2,11 @@
 # can affect, in minutes, in place of the train's every harness on every platform. By hand:
 #
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
-#   gh workflow run focused.yaml --ref <branch> -f harnesses='["splices.py"]' -f macos=true
+#   gh workflow run focused.yaml --ref <branch> -f harnesses='["loadedits.py"]' -f macos=true
 #
 # A name is a label of `ci.py list '{}'`, or its start up to a space (harness/focused.py). Each
-# supported platform builds blaze with the released blaze and runs the named harnesses that run there,
-# under both backends; a name that runs on none of a platform's backends fails that platform.
+# supported platform builds blaze with the released blaze and runs the named harnesses that run there;
+# a name that runs nowhere on a platform fails that platform. The profile picks the backend.
 # Its `blaze-<platform>` build is kept three days, for downstream.yaml's `build-run`.
 #
 # Astral's fork had a model pick these on every pull request (astral-experiments/blaze#7, #58);

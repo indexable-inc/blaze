@@ -7,14 +7,14 @@
 
 use hir::PathResolution;
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasArgList as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasArgList as _},
 };
 
 use super::utils;
 use crate::{check::Cx, diag::Applicability, sugg::Sugg};
 
-const LINT: &str = "needless_bool";
+const LINT: super::Implemented = super::Implemented::NeedlessBool;
 
 /// What a branch gives: a bool, or a `return` of one.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,13 +23,19 @@ enum Expression {
     RetBool(bool),
 }
 
-pub(super) fn check_if(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
+pub(super) fn check_if<'t>(cx: &mut Cx<'_, 't>, expr: ast::IfExpr<'t>) {
     if !cx.on(LINT) || !cx.in_file() {
         return;
     }
     let (Some(cond), Some(then), Some(ast::ElseBranch::Block(else_block))) =
         (expr.condition(), expr.then_branch(), expr.else_branch())
     else {
+        return;
+    };
+    let (Some(a), Some(b)) = (
+        fetch_bool_block(ast::Expr::BlockExpr(then)),
+        fetch_bool_block(ast::Expr::BlockExpr(else_block)),
+    ) else {
         return;
     };
     if matches!(cond, ast::Expr::LetExpr(_))
@@ -41,12 +47,6 @@ pub(super) fn check_if(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
     if utils::contains_comment(expr.syntax(), range) {
         return;
     }
-    let (Some(a), Some(b)) = (
-        fetch_bool_block(&ast::Expr::BlockExpr(then)),
-        fetch_bool_block(&ast::Expr::BlockExpr(else_block)),
-    ) else {
-        return;
-    };
     let span = cx.span(range);
     let (ret, not) = match (a, b) {
         (Expression::RetBool(true), Expression::RetBool(true))
@@ -75,7 +75,7 @@ pub(super) fn check_if(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
         (Expression::Bool(false), Expression::Bool(true)) => (false, true),
         _ => return,
     };
-    let mut snip = utils::sugg(cx, &cond);
+    let mut snip = utils::sugg(cx, cond);
     if not {
         snip = !snip;
     }
@@ -83,22 +83,22 @@ pub(super) fn check_if(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
         snip = snip.make_return();
     }
     let parent = expr.syntax().parent();
-    if parent.clone().and_then(ast::IfExpr::cast).is_some_and(|it| {
+    if parent.and_then(ast::IfExpr::cast).is_some_and(|it| {
         matches!(it.else_branch(), Some(ast::ElseBranch::IfExpr(inner)) if inner.syntax() == expr.syntax())
     }) {
         snip = snip.blockify();
     }
-    let parent_expr = parent.clone().and_then(ast::Expr::cast);
-    let is_receiver = matches!(&parent_expr, Some(ast::Expr::MethodCallExpr(call)) if call.receiver().is_some_and(|it| it.syntax() == expr.syntax()));
-    let is_operand = match &parent_expr {
+    let parent_expr = parent.and_then(ast::Expr::cast);
+    let is_receiver = matches!(parent_expr, Some(ast::Expr::MethodCallExpr(call)) if call.receiver().is_some_and(|it| it.syntax() == expr.syntax()));
+    let is_operand = match parent_expr {
         Some(ast::Expr::CastExpr(_) | ast::Expr::PrefixExpr(_)) => true,
         Some(ast::Expr::BinExpr(bin)) => {
             !matches!(bin.op_kind(), Some(ast::BinaryOp::Assignment { .. }))
         }
         _ => false,
     };
-    let is_stmt = parent.as_ref().is_some_and(|it| ast::ExprStmt::can_cast(it.kind()));
-    if (condition_needs_parentheses(&cond) && is_stmt) || is_receiver || is_operand {
+    let is_stmt = parent.is_some_and(|it| ast::ExprStmt::can_cast(it.kind()));
+    if (condition_needs_parentheses(cond) && is_stmt) || is_receiver || is_operand {
         snip = snip.maybe_paren();
     }
     cx.lint(
@@ -117,28 +117,31 @@ pub(super) fn check_if(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
 
 /// The early-return form: `if c { return Ok(true); } Ok(false)`, the last statement of a
 /// block and its tail, which is `Ok(c)`.
-pub(super) fn check_block(cx: &mut Cx<'_, '_, '_>, block: &ast::StmtList) {
+pub(super) fn check_block<'t>(cx: &mut Cx<'_, 't>, block: ast::StmtList<'t>) {
     if !cx.on(LINT) || !cx.in_file() {
         return;
     }
     let Some(tail) = block.tail_expr() else { return };
-    let statements: Vec<ast::Stmt> = block.statements().collect();
-    let Some(ast::Stmt::ExprStmt(last)) = statements.last() else { return };
+    let (mut previous, mut last) = (None, None);
+    for stmt in block.statements() {
+        previous = last.replace(stmt);
+    }
+    let Some(ast::Stmt::ExprStmt(last)) = last else { return };
     let Some(ast::Expr::IfExpr(if_expr)) = last.expr() else { return };
-    let Some(then_val) = guard_return(&if_expr) else { return };
+    let Some(then_val) = guard_return(if_expr) else { return };
     let Some(cond) = if_expr.condition() else { return };
     if cond.syntax().descendants().any(|it| ast::LetExpr::can_cast(it.kind())) {
         return;
     }
-    let Some((then_func, then_val)) = fetch_bool_and_wrapper(&then_val) else { return };
-    let Some((tail_func, tail_val)) = fetch_bool_and_wrapper(&tail) else { return };
-    if then_val == tail_val || !wrapper_ctors_match(cx, then_func.as_ref(), tail_func.as_ref()) {
+    let Some((then_func, then_val)) = fetch_bool_and_wrapper(then_val) else { return };
+    let Some((tail_func, tail_val)) = fetch_bool_and_wrapper(tail) else { return };
+    if then_val == tail_val || !wrapper_ctors_match(cx, then_func, tail_func) {
         return;
     }
     // Another guard before this one: replacing the last alone makes the block no simpler.
-    if let [.., ast::Stmt::ExprStmt(previous), _] = &statements[..]
+    if let Some(ast::Stmt::ExprStmt(previous)) = previous
         && let Some(ast::Expr::IfExpr(previous)) = previous.expr()
-        && guard_return(&previous).is_some()
+        && guard_return(previous).is_some()
     {
         return;
     }
@@ -147,11 +150,11 @@ pub(super) fn check_block(cx: &mut Cx<'_, '_, '_>, block: &ast::StmtList) {
     if utils::contains_comment(block.syntax(), range) {
         return;
     }
-    let mut snip: Sugg = utils::sugg(cx, &cond);
+    let mut snip: Sugg = utils::sugg(cx, cond);
     if !then_val {
         snip = !snip;
     }
-    let sugg = match &tail_func {
+    let sugg = match tail_func {
         Some(func) => format!("{}({snip})", cx.source_of(func.syntax())),
         None => snip.to_string(),
     };
@@ -166,26 +169,26 @@ pub(super) fn check_block(cx: &mut Cx<'_, '_, '_>, block: &ast::StmtList) {
 }
 
 /// What `if_expr`, an `if` without `else` whose block only returns, returns.
-fn guard_return(if_expr: &ast::IfExpr) -> Option<ast::Expr> {
+fn guard_return(if_expr: ast::IfExpr<'_>) -> Option<ast::Expr<'_>> {
     if if_expr.else_branch().is_some() {
         return None;
     }
     let then = if_expr.then_branch()?;
-    let ast::Expr::ReturnExpr(ret) = utils::peel_blocks_with_stmt(&ast::Expr::BlockExpr(then))
+    let ast::Expr::ReturnExpr(ret) = utils::peel_blocks_with_stmt(ast::Expr::BlockExpr(then))
     else {
         return None;
     };
     ret.expr()
 }
 
-fn fetch_bool_block(expr: &ast::Expr) -> Option<Expression> {
+fn fetch_bool_block(expr: ast::Expr<'_>) -> Option<Expression> {
     match utils::peel_blocks_with_stmt(expr) {
-        ast::Expr::ReturnExpr(ret) => Some(Expression::RetBool(fetch_bool_expr(&ret.expr()?)?)),
+        ast::Expr::ReturnExpr(ret) => Some(Expression::RetBool(fetch_bool_expr(ret.expr()?)?)),
         _ => Some(Expression::Bool(fetch_bool_expr(expr)?)),
     }
 }
 
-fn fetch_bool_expr(expr: &ast::Expr) -> Option<bool> {
+fn fetch_bool_expr(expr: ast::Expr<'_>) -> Option<bool> {
     let ast::Expr::Literal(literal) = utils::peel_blocks(expr) else { return None };
     match literal.kind() {
         ast::LiteralKind::Bool(it) => Some(it),
@@ -194,20 +197,28 @@ fn fetch_bool_expr(expr: &ast::Expr) -> Option<bool> {
 }
 
 /// The constructor around a bool literal, `Ok` of `Ok(true)`, if any, and the bool.
-fn fetch_bool_and_wrapper(expr: &ast::Expr) -> Option<(Option<ast::Expr>, bool)> {
+fn fetch_bool_and_wrapper(expr: ast::Expr<'_>) -> Option<(Option<ast::Expr<'_>>, bool)> {
     let expr = utils::peel_blocks(expr);
-    if let Some(value) = fetch_bool_expr(&expr) {
+    if let Some(value) = fetch_bool_expr(expr) {
         return Some((None, value));
     }
-    let ast::Expr::CallExpr(call) = &expr else { return None };
-    let [arg] = &call.arg_list()?.args().collect::<Vec<_>>()[..] else { return None };
+    let ast::Expr::CallExpr(call) = expr else { return None };
+    let mut args = call.arg_list()?.args();
+    let arg = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
     Some((Some(call.expr()?), fetch_bool_expr(arg)?))
 }
 
-fn wrapper_ctors_match(cx: &Cx<'_, '_, '_>, a: Option<&ast::Expr>, b: Option<&ast::Expr>) -> bool {
-    let ctor = |func: &ast::Expr| -> Option<hir::ModuleDef> {
+fn wrapper_ctors_match<'t>(
+    cx: &Cx<'_, 't>,
+    a: Option<ast::Expr<'t>>,
+    b: Option<ast::Expr<'t>>,
+) -> bool {
+    let ctor = |func: ast::Expr<'t>| -> Option<hir::ModuleDef> {
         let ast::Expr::PathExpr(path) = func else { return None };
-        match cx.sema().resolve_path(&path.path()?)? {
+        match cx.path(path.path()?)? {
             PathResolution::Def(def @ hir::ModuleDef::EnumVariant(_)) => Some(def),
             PathResolution::Def(def @ hir::ModuleDef::Adt(hir::Adt::Struct(_))) => Some(def),
             _ => None,
@@ -221,10 +232,9 @@ fn wrapper_ctors_match(cx: &Cx<'_, '_, '_>, a: Option<&ast::Expr>, b: Option<&as
 }
 
 /// Whether the condition, put first in a statement, would be read as a block.
-fn condition_needs_parentheses(expr: &ast::Expr) -> bool {
-    let mut inner = expr.clone();
+fn condition_needs_parentheses(mut inner: ast::Expr<'_>) -> bool {
     loop {
-        let next = match &inner {
+        let next = match inner {
             ast::Expr::BinExpr(it) => it.lhs(),
             ast::Expr::CallExpr(it) => it.expr(),
             ast::Expr::CastExpr(it) => it.expr(),

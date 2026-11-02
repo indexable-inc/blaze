@@ -1,20 +1,16 @@
-use ena::undo_log::UndoLogs;
-use rustc_type_ir::{OutlivesPredicate, TypeVisitableExt};
+use rustc_type_ir::{OutlivesClause, TypeVisitableExt};
 use tracing::{debug, instrument};
 
 use crate::next_solver::{
-    ArgOutlivesPredicate, GenericArgKind, Region, RegionOutlivesPredicate, Ty,
-    infer::{InferCtxt, TypeOutlivesConstraint, snapshot::undo_log::UndoLog},
+    ArgOutlivesClause, GenericArgKind, Region, RegionOutlivesClause, Ty,
+    infer::{InferCtxt, TypeOutlivesConstraint},
 };
 
 impl<'db> InferCtxt<'db> {
-    pub fn register_outlives_constraint(
-        &self,
-        OutlivesPredicate(arg, r2): ArgOutlivesPredicate<'db>,
-    ) {
+    pub fn register_outlives_constraint(&self, OutlivesClause(arg, r2): ArgOutlivesClause<'db>) {
         match arg.kind() {
             GenericArgKind::Lifetime(r1) => {
-                self.register_region_outlives_constraint(OutlivesPredicate(r1, r2));
+                self.register_region_outlives_constraint(OutlivesClause(r1, r2));
             }
             GenericArgKind::Type(ty1) => {
                 self.register_type_outlives_constraint(ty1, r2);
@@ -25,7 +21,7 @@ impl<'db> InferCtxt<'db> {
 
     pub fn register_region_outlives_constraint(
         &self,
-        OutlivesPredicate(r_a, r_b): RegionOutlivesPredicate<'db>,
+        OutlivesClause(r_a, r_b): RegionOutlivesClause<'db>,
     ) {
         // `'a: 'b` ==> `'b <= 'a`
         self.sub_regions(r_b, r_a);
@@ -38,9 +34,7 @@ impl<'db> InferCtxt<'db> {
     /// information).
     #[instrument(level = "debug", skip(self))]
     pub fn register_type_outlives_constraint_inner(&self, obligation: TypeOutlivesConstraint<'db>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.undo_log.push(UndoLog::PushTypeOutlivesConstraint);
-        inner.region_obligations.push(obligation);
+        self.inner.borrow_mut().region_obligations.push(obligation);
     }
 
     pub fn register_type_outlives_constraint(&self, sup_type: Ty<'db>, sub_region: Region<'db>) {
@@ -60,9 +54,7 @@ impl<'db> InferCtxt<'db> {
         });
     }
 
-    pub fn register_region_assumption(&self, assumption: ArgOutlivesPredicate<'db>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.undo_log.push(UndoLog::PushRegionAssumption);
-        inner.region_assumptions.push(assumption);
+    pub fn register_region_assumption(&self, assumption: ArgOutlivesClause<'db>) {
+        self.inner.borrow_mut().region_assumptions.push(assumption);
     }
 }

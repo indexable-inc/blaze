@@ -1,0 +1,38 @@
+{
+  "id": "00244",
+  "from_lane": "frontend-nameres",
+  "owner": "db",
+  "paths": [
+    "v2/requests/db.md",
+    "v2/requests/items.md",
+    "v2/requests/db-ty.md",
+    "crates/hir-def/src/nameres.rs"
+  ],
+  "what": "## impls\n\n- db (`v2/requests/db.md`, `## frontend-nameres-impls: re-export module_impls`): `pub use\n  self::facts::impls::{ModuleImpls, module_impls};` in `nameres.rs`, landing with core's\n  `mod facts;`; the allocation-budget test also needs speed-hir-store's counting-allocator hook\n  (items 2-4). Open.\n- items, applied by `requests` since items is DONE (`v2/requests/items.md`,\n  `## frontend-nameres-impls: per-module impl collection`): `TraitImpls`/`InherentImpls` built\n  per module from `module_impls` with per-(crate, trait) and per-(crate, type) buckets,\n  `in_crate_and_deps_for_trait_and_self_ty` and `blanket_in_crate_and_deps` reading each loaded\n  crate's bucket instead of `for_crate_and_deps`; blaze-items' `trait_impls_in`,\n  `inherent_impls_of` and `traits_in` per module; narrow.rs tests; hir-ide expectations. Open.\n- db-ty (`v2/requests/db-ty.md`, `## frontend-nameres-impls: kinds for the per-module impl\n  tables`): nine `kinds!` lines in `hir-ty/src/db.rs`, landing with the items request. Open.\n\n> forwarded to db and db-ty (their sections in `db.md`, `db-ty.md`). The items part is requests', held in `items.md` until both land.\n> checked by db-audit-other (22:40): in the tree. db's re-export is at `crates/hir-def/src/nameres.rs:107`. db-ty's nine kinds are in `hir-ty/src/db.rs` at `0x24b0..=0x24b8` (`v2/requests/db-ty.md` :649-655). requests-impls applied the items part (`v2/requests/items.md` `## frontend-nameres-impls`, :3795 onward).",
+  "state": "applied",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T09:56:52Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#impls",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:54"
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:52Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:40): in the tree. db's re-export is at `crates/hir-def/src/nameres.rs:107`. db-ty's nine kinds are in `hir-ty/src/db.rs` at `0x24b0..=0x24b8` (`v2/requests/db-ty.md` :649-655). requests-impls applied the items part (`v2/requests/items.md` `## frontend-nameres-impls`, :3795 onward)."
+    }
+  ]
+}

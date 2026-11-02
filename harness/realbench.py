@@ -88,15 +88,18 @@ def edit_text(kind, spec, text, r):
     return text.replace(anchor, anchor + stmt(r, indent))
 
 
-def base_env(home, store, target):
+def base_env(home, target):
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TERM_COLOR="never",
                CARGO_NET_OFFLINE="true", CARGO_TARGET_DIR=target, BLAZE_IDLE_SECS="0")
     env["PATH"] = os.path.dirname(BLAZE) + os.pathsep + env["PATH"]
-    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "BLAZE_CACHE"):
+    for name in ("RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL"):
         env.pop(name, None)
-    if store:
-        env["BLAZE_CACHE"] = store
     return env
+
+
+def store_of(home):
+    """Where the daemon of `home` keeps its store."""
+    return os.path.join(home, "v2", "store")
 
 
 async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):
@@ -219,20 +222,23 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     for path in (ws, other):
         if not os.path.isdir(path):
             shutil.copytree(source, path, symlinks=True)
-    warm_store = os.path.join(top, "store-warm")
+    warm_store = store_of(os.path.join(top, "home-store-fill-0"))
     row = dict(project=name, tag=spec["tag"], rev=spec["rev"], runs=runs)
-    cargo_env = base_env(os.path.join(top, "home-cargo"), None, tc)
+    cargo_env = base_env(os.path.join(top, "home-cargo"), tc)
     await run(["cargo", "fetch"], ws, dict(cargo_env, CARGO_NET_OFFLINE="false"), f"{name} fetch")
 
     async def stop(env, cwd):
         await run(["blaze", "stop"], cwd, env, f"{name} stop", check=False)
 
-    async def blaze_cold(label, store, i, cwd=ws, target=tr):
+    async def blaze_cold(label, seed, i, cwd=ws, target=tr):
+        """A build in a new home with no daemon: its store empty, or a copy of `seed`'s."""
         home = os.path.join(top, f"home-{label}-{i}")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home, mode=0o700)
+        if seed:
+            shutil.copytree(seed, store_of(home), symlinks=True)
         shutil.rmtree(target, ignore_errors=True)
-        env = base_env(home, store, target)
+        env = base_env(home, target)
         began = time.monotonic()
         took, _, _, err = await run(["blaze", "build"], cwd, env, f"{name} {label} {i} build")
         ready = await wait_ready(cwd, env, began, f"{name} {label} {i} ready")
@@ -241,8 +247,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
 
     if "cold" in parts:
         # The warm store: one blaze build of the same commit in the other checkout.
-        shutil.rmtree(warm_store, ignore_errors=True)
-        _, ready_b, env_b = await blaze_cold("store-fill", warm_store, 0, cwd=other, target=os.path.join(top, "t-b"))
+        _, ready_b, env_b = await blaze_cold("store-fill", None, 0, cwd=other, target=os.path.join(top, "t-b"))
         await stop(env_b, other)
         cargo_t, cold_b, cold_r, warm_b, warm_r = [], [], [], [], []
         for i in range(1, runs + 1):
@@ -250,12 +255,10 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} cargo cold {i}")
             cargo_t.append(took)
             print(f"  {'cargo cold':16} run {i}: {took:7.2f}s", flush=True)
-            store = os.path.join(top, f"store-empty-{i}")
-            shutil.rmtree(store, ignore_errors=True)
-            b, r, env = await blaze_cold("empty-store", store, i)
+            b, r, env = await blaze_cold("empty-store", None, i)
             cold_b.append(b); cold_r.append(r)
             await stop(env, ws)
-            shutil.rmtree(store, ignore_errors=True)
+            shutil.rmtree(env["BLAZE_HOME"], ignore_errors=True)
             b, r, env = await blaze_cold("warm-store", warm_store, i)
             warm_b.append(b); warm_r.append(r)
             if i < runs:
@@ -264,9 +267,9 @@ async def project(name, spec, work, runs, parts, pause=0.0):
                            warm_store_build=summary(warm_b), warm_store_ready=summary(warm_r), store_fill_ready=round(ready_b, 3))
         shutil.rmtree(os.path.join(top, "t-b"), ignore_errors=True)
     # The daemon of the last warm-store run serves what follows; start one if there is none.
-    env = base_env(os.path.join(top, "home-main"), warm_store, tr)
+    env = base_env(os.path.join(top, "home-main"), tr)
     if "cold" in parts:
-        env = base_env(os.path.join(top, f"home-warm-store-{runs}"), warm_store, tr)
+        env = base_env(os.path.join(top, f"home-warm-store-{runs}"), tr)
     else:
         os.makedirs(env["BLAZE_HOME"], mode=0o700, exist_ok=True)
         await run(["cargo", "build"], ws, cargo_env, f"{name} cargo setup")

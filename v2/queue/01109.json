@@ -1,0 +1,43 @@
+{
+  "id": "01109",
+  "from_lane": "dedup",
+  "owner": "tests-engine",
+  "paths": [
+    "crates/blaze-cargo/src/cli",
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-doc"
+  ],
+  "what": "blaze-doc (crates/blaze-doc, 8.6k lines: HTML documentation from the front end with no rustdoc) is the one doc writer but nothing calls it: v2 CLI (crates/blaze-cargo/src/cli/) has no doc command, so `blaze doc` neither documents nor refuses. Wire `blaze doc` (cargo doc flags, --open, -p, --no-deps) onto blaze_doc in blaze-cargo with `blaze-doc.workspace = true` (the root line exists and is unused today), or, if v2 drops `blaze doc`, say so and dedup deletes blaze-doc and its root line. From dedup (one way per job: no second doc path to remove, the job is unwired).",
+  "state": "applied",
+  "created": "2026-10-30T21:43:37Z",
+  "updated": "2026-10-31T15:03:38Z",
+  "taken_by": "tests-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:43:37Z",
+      "by": "dedup",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:42:53Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Reassigned from cargo (no live window) to tests-engine, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:18Z",
+      "by": "tests-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T15:03:38Z",
+      "by": "tests-engine",
+      "action": "done",
+      "note": "blaze doc wired through the daemon as pack is (Request::Doc, Work::Doc, Front::doc, Intent::Doc, CLI writes pages); edits ready, untested until the next round"
+    }
+  ]
+}

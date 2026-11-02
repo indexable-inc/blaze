@@ -95,6 +95,31 @@ pub struct Profile {
     pub hint_mostly_unused: Option<bool>,
 }
 
+impl Profile {
+    /// cargo's built-in `dev` profile as `--unit-graph` prints it for a dependency: nothing set
+    /// in a manifest, no `incremental` (cargo turns that on for members only).
+    pub fn dev() -> Profile {
+        Profile {
+            name: "dev".to_owned(),
+            opt_level: "0".to_owned(),
+            lto: "false".to_owned(),
+            codegen_backend: None,
+            codegen_units: None,
+            debuginfo: DebugInfo::Level(2),
+            split_debuginfo: None,
+            debug_assertions: true,
+            overflow_checks: true,
+            rpath: false,
+            incremental: false,
+            panic: "unwind".to_owned(),
+            strip: Strip::Deferred(Stripped::None),
+            rustflags: Vec::new(),
+            trim_paths: None,
+            hint_mostly_unused: None,
+        }
+    }
+}
+
 /// A `debug` level: by its number (`0`, `1`, `2`) or by its name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]

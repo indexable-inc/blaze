@@ -1,0 +1,35 @@
+{
+  "id": "00924",
+  "from_lane": "speed-sol2-small-lints",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/check.rs"
+  ],
+  "what": "blaze-engine lint requests redo per-request work blaze-lints can now skip. crates/blaze-engine/src/check.rs, Checker::lints (about line 502): (1) borrow paths instead of cloning a PathBuf per file per request: replace `let path_of = |file: vfs::FileId| self.located.get(&file).cloned();` with `let path_of = |file: vfs::FileId| self.located.get(&file).map(std::path::PathBuf::as_path);` (blaze_lints::serve::answer is generic over P: AsRef<Path> now, so this compiles as is). (2) keep the lint setups between requests: add a field `lint_setups: std::cell::RefCell<blaze_lints::serve::Setups>` to Checker (Default), call `blaze_lints::serve::answer_with(db, &scope.linted, &self.root, &path_of, &ask, &mut self.lint_setups.borrow_mut())` instead of `answer`, and call `self.lint_setups.borrow_mut().forget()` wherever the watcher reports a change to a file named `clippy.toml` or `.clippy.toml`. Why: today every request canonicalizes each package dir, stats clippy.toml/.clippy.toml in it and every ancestor, reads and parses the file and parses the flags: about 20 path syscalls (8 us) per package per request, 400 us for 50 packages, 4x the warm re-lint bound (docs/v2/plan/lanes/lints/speed-of-light.md, section The daemon request).",
+  "state": "refused",
+  "created": "2026-10-30T09:49:38Z",
+  "updated": "2026-10-31T20:30:07Z",
+  "taken_by": "codegen",
+  "why": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains.",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:49:38Z",
+      "by": "speed-sol2-small-lints",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:07Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "Gone: v1's engine tail was deleted at integration (2026-10-30, queue 00991); crates/blaze-engine is only the blaze program now (lib.rs is 30 lines). The code this changes no longer exists; v2's path is blaze-cargo serve + blaze-codegen units + blaze-link. Re-file against those owners if the need remains."
+    }
+  ]
+}

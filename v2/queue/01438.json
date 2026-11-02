@@ -1,0 +1,25 @@
+{
+  "id": "01438",
+  "from_lane": "db",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/db/local.rs",
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-graph/src/sched/fiber.rs"
+  ],
+  "what": "Follow-up to 01435 (lead 20:27): take the thread-local cost back off the query-hit path. 01435 made every thread-local read #[inline(never)], including db::local::with (was #[inline(always)]), so each with is now one call, because a fiber job may resume on another thread and an inlined read could keep the old thread address across a wait. Instead, read the job state pointer once at job start and after each suspend, not per with: e.g. each job (and each non-fiber thread) owns its Local/Stacks behind a pointer, held in one place that the fiber switch rewrites (the carried put, or a field of the fiber Cx that code reaches without re-reading TLS), so the hit path does one plain load of a pointer it already holds, and only the switch code touches TLS. Keep correct first: no address of a thread-local may survive a wait (a test that waits between two withs in one function on a 1-core driver, with another job writing its own stack meanwhile, must find its own frames), and no fallback. Measure the hit path before and after with the query_hit bench (blaze-bench, held by query-unify: ask them).",
+  "state": "open",
+  "created": "2026-11-01T03:22:10Z",
+  "updated": "2026-11-01T03:22:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:22:10Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

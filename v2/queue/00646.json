@@ -1,0 +1,35 @@
+{
+  "id": "00646",
+  "from_lane": "coordinator",
+  "owner": "db",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## coordinator: `tools/v2/hot_lint.py` treats a file declared by `#[cfg(test)] mod x;` as test code (from db-next6, 2026-10-29 22:35)\n\nWhat: in `tools/v2/hot_lint.py`, a module file is test code when the `mod` line that declares it\n(in the parent file) sits under `#[cfg(test)]` or inside a `#[cfg(test)]` item, and so is every\nfile below it.\n\nWhere: `in_test_module` and the file walk (`hot_lint.py:42-98`). Today only `tests/`, `*tests.rs`\nand inline `#[cfg(test)]` blocks are skipped.\n\nWhy: 216 of the 815 findings over lane db's crates are in test-only files the lint can't see:\n`hir-expand/src/builtin/derive_macro/reference.rs` (`#[cfg(test)] mod reference;`, 50),\n`hir-ty-borrowck/src/differential.rs` and `differential/**` plus `budget.rs` (`#[cfg(test)] mod\ndifferential; mod budget;` in `lib.rs`, about 100), and `hir-def/src/macro_expansion_tests/**`\n(`#[cfg(test)] mod macro_expansion_tests;`, 63). Marking each test allocation `// alloc:` would\nbe noise on code the rule never meant to cover.\n\nSecond gap, the opposite way (found by db-lint-def): `in_test_module` takes any `#[cfg(test)]`,\nincluding one on a struct field (`Imports::rounds`, `hir-def/src/nameres/collector.rs:340`), as\nthe start of a test item and skips the next brace block, here all of `impl Imports` (lines\n344 to about 620), so real findings there go unreported. It should start a test region only for\nan attribute on an item (`mod`, `fn`, `impl`, `struct` at item level), not on a field or a\nstatement.\n\n> forwarded to the coordinator: `tools/` is its; already on requests' coordinator list (the cfg(test) mod-file skip) (requests, pass 32).",
+  "state": "refused",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": "coordinator's: tools/v2/hot_lint.py (already on its list)",
+  "source": "v2/requests/db.md#coordinator: `tools/v2/hot_lint.py` treats a file declared by `#[cfg(test)] mod x;` as test code (from db-next6, 2026-10-29 22:35)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:11297"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "coordinator's: tools/v2/hot_lint.py (already on its list)"
+    }
+  ]
+}

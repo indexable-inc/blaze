@@ -1,0 +1,27 @@
+{
+  "id": "00833",
+  "from_lane": "sol-all-ty",
+  "owner": "db-ty",
+  "paths": [
+    "crates/hir-ty/src/lower.rs",
+    "crates/hir-ty/src/lower/path.rs",
+    "crates/hir-ty/src/lower/batch.rs",
+    "crates/hir-ty/src/lower/persist.rs",
+    "crates/hir-ty/src/infer.rs"
+  ],
+  "what": "## sol-all-ty: the type-lowering half of 00806 (sol-all-diag): record each TypeRefId path's TypeNs where lowering resolves it\n\nWhat: `PathLoweringContext::resolve_path_in_type_ns` (lower/path.rs) is where every type path's resolution is made; give `TyLoweringContext` an optional sink (a frame `DenseMap<TypeRefId, (TypeNs, u32 resolved segments)>`, set by the caller, `None` by default so no constructor changes) and fill it there, keyed by the `TypeRefId` `lower_ty_ext` is lowering. Inference sets it and freezes it into `InferenceResult` beside `qualifier_resolutions` (body type refs: let annotations, casts, turbofish, `<T>::f` anchors). For signatures, the queries that lower a store's type refs (fn_sig, field types, impl self/trait, predicates, defaults; lower/batch.rs batches) each return it in their `Lowered` side table, or one query per `ExpressionStoreOwnerId` lowers every path once with the item's resolver. Persist with the rest (lower/persist.rs, infer/persist.rs); `TypeNs::ModuleId` needs a relocatable module id first (check_cache/ids.rs has no Module kind).\n\nWhy: blaze-diagnostics' stability walk (lints/names/stability/walk.rs `path`) resolves each path again through `Semantics::resolve_path`, ~3,000 cycles each. sol-all-ty applied the value half (`InferenceResult::value_resolution`, which already existed, and the new `qualifier_resolution`); the type half touches lower.rs, which db-ty's window 54 resumes after the freeze, so it is filed to db-ty instead of edited blind. The per-segment (module prefix) resolutions the walk also needs are hir-def's, 00528.",
+  "state": "open",
+  "created": "2026-10-30T08:38:36Z",
+  "updated": "2026-10-30T08:38:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:38:36Z",
+      "by": "sol-all-ty",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

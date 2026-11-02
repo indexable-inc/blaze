@@ -1,8 +1,0 @@
-{
-  "row": "crate type `rlib`",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep"
-  ]
-}

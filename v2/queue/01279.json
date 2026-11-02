@@ -1,0 +1,41 @@
+{
+  "id": "01279",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "tests-misc",
+  "paths": [
+    "crates/hir-ty-ub/tests/ub/main.rs"
+  ],
+  "what": "From 01227: two hir-ty-ub tests/ub failures are the test programs, not the evaluator; rustc+Miri would reject or report them too. (1) simd! (3 simd tests, UnresolvedMethod([overloaded index])): `p.0[0]` needs an Index impl; rustc typeck resolves even array indexing through the Index lang item (try_index_step, then writeback strips it), so with `//- minicore: sized, copy` rustc gives E0608. Fix: `//- minicore: sized, copy, index` in the simd! macro. (2) pass_box leaks: the prelude`s `#[lang = \"owned_box\"] struct Box` has no Drop impl, and Box drop glue (as rustc`s elaboration) drops the contents then runs Box`s Drop impl, which is what frees; Miri would report the same leak. Fix: give the prelude Box `impl<T: ?Sized> Drop for Box<T>` calling __rust_dealloc(self.inner as *mut u8, size_of_val, align_of_val) (needs `drop` in minicore and the two intrinsics), or make pass_box free explicitly.",
+  "state": "applied",
+  "created": "2026-10-31T14:02:23Z",
+  "updated": "2026-11-01T03:50:32Z",
+  "taken_by": "tests-misc",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:02:23Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T00:50:08Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "coordinator -> tests-misc: part 1 done by coordinator (simd! minicore gets index, crates/hir-ty-ub/tests/ub/main.rs:947). Left: pass_box leak, prelude Box needs a Drop impl that frees (or pass_box frees explicitly); tests-misc owns hir-ty-ub tests/ub"
+    },
+    {
+      "at": "2026-11-01T00:50:31Z",
+      "by": "tests-misc",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:50:32Z",
+      "by": "tests-misc",
+      "action": "done",
+      "note": "pass_box passes in round 19 (71269b1fd5): its prelude Box has a Drop that frees; hir-ty-ub ub 336/0"
+    }
+  ]
+}

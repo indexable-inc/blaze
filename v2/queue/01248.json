@@ -1,0 +1,24 @@
+{
+  "id": "01248",
+  "from_lane": "filters",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/benches/impls.rs",
+    "crates/hir-ty/Cargo.toml"
+  ],
+  "what": "Add to round.sh beside query_hit: `cargo bench -p hir-ty --bench impls` (crates/hir-ty/benches/impls.rs, harness=false). It prints one line: cold time of the walk over every loaded crate vs crates_that_name, the ratio, and a gain or NO GAIN: remove crates_that_name; it asserts both find the same impls. On NO GAIN, revert crates_that_name and its three callers in crates/hir-ty/src/method_resolution.rs, method_resolution/naming_tests.rs, the CRATES_THAT_NAME kind in hir-ty/src/db.rs, the bench and its [[bench]] stanza (details in /tmp/blaze-lanes/v2-filters.md).",
+  "state": "open",
+  "created": "2026-10-31T12:04:54Z",
+  "updated": "2026-10-31T12:04:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:04:54Z",
+      "by": "filters",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

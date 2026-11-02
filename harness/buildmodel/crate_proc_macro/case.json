@@ -1,8 +1,0 @@
-{
-  "row": "crate type `proc-macro` (rustc's build of it is loaded; its expansion is compiled by blaze)",
-  "package": "app",
-  "crates": [
-    "app",
-    "macros"
-  ]
-}

@@ -1,0 +1,23 @@
+{
+  "id": "00105",
+  "from_lane": "speed-link-edge-macho-dylib",
+  "owner": "safety",
+  "paths": [
+    "crates/blaze-link/src/macho/tbd.rs"
+  ],
+  "what": "## From speed-link-edge-macho-dylib (2026-10-29): two parsers of untrusted bytes, for safety-fuzz\n\nThere is no `unsafe` in `crates/blaze-link/src/macho/tbd.rs` or `macho/dylib.rs`, and both now\nsay `#![forbid(unsafe_code)]`. The crate has unsafe in `elf.rs`, `macho.rs`, `macho/sha256.rs`,\n`macho/archive.rs` and `macho/input.rs`, so the crate attribute is not mine to add. Neither\nmodule makes a zero-copy view of its own: `dylib.rs` reads through `object`'s bounds-checked\nreaders, and `tbd.rs` keeps `u32` spans into the `&str` it was given. The input is a file the\nlink names (the SDK's or the user's), so it is untrusted. Both are safe code, so the targets are\nfor panics, hangs and memory that grows faster than the input. Each has a safe reference in its\ntests to compare against:\n\n- `tbd::read(name, text, arch, platform) -> Result<Shared, String>`: YAML text-based stubs.\n  - Fuzz target: arbitrary UTF-8, for each arch in {arm64, x86_64} and platform in {1, 2, 6}.\n  - Model: `tbd::tests::reference::read`, the previous reader kept whole. The result or the\n    error string must be equal. The only allowed difference is where the reference overflows\n    its stack: nesting deeper than 256, which the new reader refuses with an error.\n  - Seed corpus: the `generate` function in `tbd::tests`, the SDK's `libSystem.B.tbd`, and\n    `edges_match_reference`'s texts.\n  - Bounds: the tape is at most one 12-byte node per input byte plus the scratch buffer, which\n    holds at most one copy of the text; text of 2 GiB or more is refused.\n- `dylib::read(name, bytes, arch) -> Result<Shared, String>`: thin Mach-O dylibs.\n  - Fuzz target: arbitrary bytes. The useful part is the export trie, so also mutate only the\n    `LC_DYLD_EXPORTS_TRIE` or `LC_DYLD_INFO` range of a valid dylib.\n  - Model: `dylib::tests::reference_trie_exports`, the previous walk. The exports or the error\n    must be equal, as `trie_walk_matches_reference` checks.\n  - Seed corpus: `random_info` and `random_node` in `dylib::tests`.\n  - Bounds: the walk visits each trie byte at most once (a bitset), so a cycle is an error and\n    never a hang, and the edge stack is at most the trie's length.\n\nNeither needs anything from safety-audit, `--ub` or the model checker. They need only these\nfuzz targets, which belong in `fuzz/` (lane safety's).\n\n> forwarded to safety: fuzz targets for safety-fuzz.",
+  "state": "open",
+  "created": "2026-10-30T01:04:28Z",
+  "updated": "2026-10-30T01:04:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/safety.md#From speed-link-edge-macho-dylib (2026-10-29): two parsers of untrusted bytes, for safety-fuzz",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/safety.md:362"
+    }
+  ]
+}

@@ -385,7 +385,7 @@ macro_rules! create_config {
             }
 
             #[allow(unreachable_pub)]
-            pub fn print_docs(out: &mut dyn Write, include_unstable: bool) {
+            pub fn print_docs(out: &mut impl Write, include_unstable: bool) {
                 let style_edition = StyleEdition::Edition2015;
                 use std::cmp;
                 let max = 0;

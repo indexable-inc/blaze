@@ -13,24 +13,32 @@
 //! it drops the elements that have a path of their own one by one and the runs between them
 //! whole, from the back. If a drop of one part unwinds, the parts after it are dropped on the
 //! way out, as rustc's drop ladders do.
+//!
+//! What the pass keeps while it runs is in its frame; what it adds to the body is grown once,
+//! to its final size.
 
-use rustc_hash::FxHashMap;
+use std::ops::Range;
+
+use blaze_mem::Frame;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
+    db::HirDatabase,
     consteval::try_const_usize,
     mir::{
         BasicBlock, BasicBlockId, BorrowKind, FieldIndex, Local, LocalId, MirBody, MirLowerError,
         MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem,
         Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind,
+        framed::{bits_in, block_index},
     },
-    next_solver::{GenericArgs, Region, Ty, TyKind},
+    next_solver::{GenericArgs, Region, RegionExt, Ty, TyKind},
 };
 
 use super::{
     Ctx,
     move_paths::{
-        Change, InitAnalysis, InitState, Lookup, MoveData, PathId, Step, edge_effects, effects_at,
+        self, Change, Effects, InitAnalysis, InitState, Lookup, MoveData, PathId, Step,
+        edge_effects, successors,
     },
 };
 
@@ -63,60 +71,107 @@ enum Style {
     Open,
 }
 
-struct Elaborator<'a, 'db> {
-    ctx: &'a Ctx<'db>,
+/// `'c` is the frame of the body's pipeline, which the context's caches live in; `'f` is this
+/// pass's.
+struct Elaborator<'a, 'c, 'f, 'db> {
+    ctx: &'a Ctx<'c, 'db>,
     body: &'a mut MirBody<'db>,
-    data: &'a MoveData<'db>,
-    subtrees: Vec<Vec<PathId>>,
-    flags: FxHashMap<PathId, LocalId>,
+    data: &'a MoveData<'f, 'db>,
+    frame: &'f Frame,
+    /// By path: its flag, once it has one.
+    flags: &'f mut [Option<LocalId>],
+    flag_count: usize,
     /// Where each path may hold a value at the drop being elaborated.
-    state: InitState,
+    state: InitState<'f>,
     span: MirSpan,
     /// A block that goes on unwinding, for a drop outside a cleanup block that names none.
     resume: Option<BasicBlockId>,
 }
 
 /// A drop in the body as lowering made it, before it is elaborated.
-struct DropSite {
+struct DropSite<'f> {
     block: BasicBlockId,
     place: StoredPlace,
     target: BasicBlockId,
     unwind: Option<BasicBlockId>,
     is_cleanup: bool,
     span: MirSpan,
-    state: InitState,
+    state: InitState<'f>,
 }
 
-/// Flags to write once it is known which paths have one.
+/// A flag write once it is known which paths have one: to the flags of the subtree of `path`.
 struct FlagWrite {
-    paths: Vec<PathId>,
+    path: PathId,
     value: bool,
 }
 
-pub(super) fn elaborate_drops<'db>(
-    ctx: &Ctx<'db>,
-    body: &mut MirBody<'db>,
-) -> Result<(), MirLowerError<'db>> {
-    let live = super::move_paths::live_blocks(body);
-    let data = MoveData::gather(ctx, body, &live);
-    let analysis = InitAnalysis::run(ctx, &data, body, &live, &Default::default());
-    let dead_unwinds = analysis.dead_unwinds(ctx, &data, body);
+/// What drop elaboration's analyses found, for its rewrite.
+struct Analysed<'f, 'db> {
+    data: MoveData<'f, 'db>,
+    analysis: InitAnalysis<'f>,
+    effects: Effects<'f>,
+}
+
+/// The analyses drop elaboration starts from, without its rewrite: what the warm budget test
+/// holds to no allocation.
+pub(super) fn analyse<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &Frame) {
+    analysed(ctx, body, frame);
+}
+
+/// The live blocks, the move paths, both analyses and the drops that cannot unwind.
+fn analysed<'f, 'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+    frame: &'f Frame,
+) -> Analysed<'f, 'db> {
+    let blocks = body.basic_blocks.len();
+    let mut unreached = bits_in(blocks, frame);
+    for &it in &body.unreached {
+        unreached.insert(block_index(it));
+    }
+    let live = move_paths::live_blocks(body, &unreached, frame);
+    let data = MoveData::gather(ctx, body, &live, frame);
+    let mut effects = Effects::new_in(blocks, frame);
+    let none = bits_in(blocks, frame);
+    let analysis =
+        InitAnalysis::run(ctx, &data, body, &live, &unreached, &none, &mut effects, frame);
+    let dead_unwinds = analysis.dead_unwinds(ctx, &data, body, &mut effects, frame);
     let analysis = match dead_unwinds.is_empty() {
         true => analysis,
-        false => InitAnalysis::run(ctx, &data, body, &live, &dead_unwinds),
+        false => InitAnalysis::run(
+            ctx,
+            &data,
+            body,
+            &live,
+            &unreached,
+            &dead_unwinds,
+            &mut effects,
+            frame,
+        ),
     };
-    let subtrees: Vec<Vec<PathId>> = (0..data.paths.len()).map(|it| data.subtree(it)).collect();
-    let index = |id: BasicBlockId| id.into_raw().into_u32() as usize;
+    Analysed { data, analysis, effects }
+}
+
+pub(super) fn elaborate_drops<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    frame: &Frame,
+) -> Result<(), MirLowerError<'db>> {
+    let Analysed { data, analysis, mut effects } = analysed(ctx, body, frame);
+    let len = data.paths.len();
 
     // What the blocks do to the paths, and the state at each drop, from the body as it is.
-    let mut sites = Vec::new();
+    let mut sites = Vec::new_in(frame);
     // (block, statement after which the flags are written, writes)
-    let mut writes: Vec<(BasicBlockId, usize, FlagWrite)> = Vec::new();
-    // (block, target of its terminator, the paths that edge initializes)
-    let mut edge_writes: Vec<(BasicBlockId, BasicBlockId, Vec<PathId>)> = Vec::new();
-    let mut dead_drops = Vec::new();
+    let mut writes: Vec<(BasicBlockId, usize, FlagWrite), &Frame> = Vec::new_in(frame);
+    // (block, target of its terminator, the paths that edge initializes in `edge_paths`)
+    let mut edge_writes: Vec<(BasicBlockId, BasicBlockId, Range<u32>), &Frame> =
+        Vec::new_in(frame);
+    let mut edge_paths: Vec<PathId, &Frame> = Vec::new_in(frame);
+    let mut dead_drops = Vec::new_in(frame);
+    let mut state = InitState::bottom(len, frame);
     for (id, block) in body.basic_blocks.iter() {
-        let Some(entry) = &analysis.entry[index(id)] else {
+        let Some(entry) = &analysis.entry[block_index(id)] else {
             if let Some(TerminatorKind::Drop { target, .. }) =
                 block.terminator.as_ref().map(|it| &it.kind)
             {
@@ -124,9 +179,8 @@ pub(super) fn elaborate_drops<'db>(
             }
             continue;
         };
-        let mut state = entry.clone();
+        state.copy_from(entry);
         for at in 0..=block.statements.len() {
-            let effects = effects_at(ctx, &data, body, id, at);
             if at == block.statements.len()
                 && let Some(Terminator {
                     kind: TerminatorKind::Drop { place, target, unwind },
@@ -135,31 +189,32 @@ pub(super) fn elaborate_drops<'db>(
             {
                 sites.push(DropSite {
                     block: id,
-                    place: place.clone(),
+                    place: place.clone(), // clone: an interned place, a refcount
                     target: *target,
                     unwind: *unwind,
                     is_cleanup: block.is_cleanup,
                     span: *span,
-                    state: state.clone(),
+                    state: state.copy_in(frame),
                 });
                 break;
             }
-            for effect in &effects {
-                state.apply(&subtrees[effect.path], effect.change);
+            for &effect in effects.at(ctx, &data, body, id, at) {
+                state.apply(data.subtree(effect.path), effect.change);
                 let value = match effect.change {
                     Change::Init => true,
                     Change::Uninit => false,
                     Change::Borrowed => continue,
                 };
-                writes.push((id, at, FlagWrite { paths: subtrees[effect.path].clone(), value }));
+                writes.push((id, at, FlagWrite { path: effect.path, value }));
             }
         }
         if let Some(terminator) = &block.terminator {
-            for to in terminator.kind.successors() {
-                let initialized = edge_effects(ctx, &data, body, id, to);
-                if !initialized.is_empty() {
-                    let paths = initialized.iter().flat_map(|&it| subtrees[it].clone()).collect();
-                    edge_writes.push((id, to, paths));
+            for to in successors(&terminator.kind) {
+                let start = edge_paths.len() as u32;
+                edge_effects(ctx, &data, body, id, to, |path| edge_paths.push(path));
+                let end = edge_paths.len() as u32;
+                if end != start {
+                    edge_writes.push((id, to, start..end));
                 }
             }
         }
@@ -173,9 +228,10 @@ pub(super) fn elaborate_drops<'db>(
         ctx,
         body,
         data: &data,
-        subtrees,
-        flags: FxHashMap::default(),
-        state: InitState::bottom(data.paths.len()),
+        frame,
+        flags: frame.alloc_slice_fill_with(len, |_| None),
+        flag_count: 0,
+        state: InitState::bottom(len, frame),
         span: MirSpan::Unknown,
         resume: None,
     };
@@ -183,13 +239,15 @@ pub(super) fn elaborate_drops<'db>(
     // in block order, each path under the dropped one that may and may not hold a value there,
     // depth first and the child made last first, as rustc links a path's children. The flags
     // are locals in that order, which is where an `async` block keeps them.
+    let mut stack = Vec::new_in(frame);
     for site in &sites {
         let ty = site.place.as_ref().ty(elaborator.body, &ctx.infcx, ctx.env).ty;
         if !ctx.needs_drop(ty) {
             continue;
         }
         let Lookup::Exact(path) = data.lookup(ctx, &site.place) else { continue };
-        let mut stack = vec![path];
+        stack.clear();
+        stack.push(path);
         while let Some(at) = stack.pop() {
             if site.state.of(at) == (true, true) {
                 elaborator.flag(at);
@@ -198,7 +256,7 @@ pub(super) fn elaborate_drops<'db>(
         }
     }
     // After a drop the place holds nothing, whichever way the drop went.
-    let mut resets: Vec<(BasicBlockId, PathId)> = Vec::new();
+    let mut resets: Vec<(BasicBlockId, PathId), &Frame> = Vec::new_in(frame);
     for site in sites {
         elaborator.state = site.state;
         elaborator.span = site.span;
@@ -211,7 +269,7 @@ pub(super) fn elaborate_drops<'db>(
             Lookup::Untracked => {
                 elaborator.patch(site.block, |kind| {
                     *kind = TerminatorKind::Drop {
-                        place: site.place.clone(),
+                        place: site.place,
                         target: site.target,
                         unwind: site.unwind,
                     }
@@ -239,41 +297,40 @@ pub(super) fn elaborate_drops<'db>(
             }
             Unwind::InCleanup => Unwind::InCleanup,
         };
-        let start = elaborator.elaborate(site.place.clone(), path, succ, unwind)?;
+        let start = elaborator.elaborate(site.place, path, succ, unwind)?;
         elaborator.patch(site.block, |kind| *kind = TerminatorKind::Goto { target: start });
     }
 
-    let Elaborator { flags, body, subtrees, .. } = elaborator;
-    if flags.is_empty() {
+    let Elaborator { flags, flag_count, body, .. } = elaborator;
+    if flag_count == 0 {
         return Ok(());
     }
-    let span = MirSpan::Unknown;
-    let set = |paths: &[PathId], value: bool| -> Vec<Statement> {
-        paths
-            .iter()
-            .filter_map(|path| flags.get(path))
-            .map(|&flag| Statement {
-                kind: StatementKind::Assign(
-                    Place::from(flag).store(),
-                    Rvalue::Use(Operand::from_bytes(Box::new([value as u8]), ctx.bool_ty())),
-                ),
-                span,
-            })
-            .collect()
-    };
-    for (block, path) in resets {
-        let statements = set(&subtrees[path], false);
-        body.basic_blocks[block].statements.extend(statements);
+    let flags: &[Option<LocalId>] = flags;
+    let bool_ty = ctx.bool_ty();
+    // Each kept list of statements below is grown once, to its final size.
+    for &(block, path) in &resets {
+        let paths = data.subtree(path);
+        let block = &mut body.basic_blocks[block];
+        block.statements.reserve_exact(count(flags, paths));
+        set(&mut block.statements, flags, paths, false, bool_ty);
     }
-    for (from, to, paths) in edge_writes {
-        let statements = set(&paths, true);
-        if statements.is_empty() {
+    for (from, to, range) in edge_writes {
+        let paths = &edge_paths[range.start as usize..range.end as usize];
+        let n: usize = paths.iter().map(|&path| count(flags, data.subtree(path))).sum();
+        if n == 0 {
             continue;
+        }
+        let mut statements = Vec::with_capacity(n);
+        for &path in paths {
+            set(&mut statements, flags, data.subtree(path), true, bool_ty);
         }
         let is_cleanup = body.basic_blocks[from].is_cleanup;
         let edge = body.basic_blocks.alloc(BasicBlock {
             statements,
-            terminator: Some(Terminator { span, kind: TerminatorKind::Goto { target: to } }),
+            terminator: Some(Terminator {
+                span: MirSpan::Unknown,
+                kind: TerminatorKind::Goto { target: to },
+            }),
             is_cleanup,
         });
         let terminator = body.basic_blocks[from].terminator.as_mut().expect("a terminator");
@@ -285,36 +342,66 @@ pub(super) fn elaborate_drops<'db>(
     }
     // Written after the statement, or before the terminator: a statement that panics
     // unwinds with the paths as they were before it. The writes of one statement keep their
-    // order, which is the order of its effects.
-    let mut grouped: Vec<((BasicBlockId, usize), Vec<Statement>)> = Vec::new();
+    // order, which is the order of its effects. `grouped` is each (block, statement) with the
+    // end of its writes in `run`; the writes of one block are next to each other.
+    let mut grouped: Vec<((BasicBlockId, usize), u32), &Frame> = Vec::new_in(frame);
+    let mut run: Vec<Statement, &Frame> = Vec::new_in(frame);
     for (block, at, write) in writes {
-        let statements = set(&write.paths, write.value);
+        set(&mut run, flags, data.subtree(write.path), write.value, bool_ty);
+        let end = run.len() as u32;
         match grouped.last_mut() {
-            Some((key, all)) if *key == (block, at) => all.extend(statements),
-            _ => grouped.push(((block, at), statements)),
+            Some((key, last)) if *key == (block, at) => *last = end,
+            _ => grouped.push(((block, at), end)),
         }
     }
-    for ((block, at), statements) in grouped.into_iter().rev() {
-        if statements.is_empty() {
+    let mut from = 0;
+    let mut block_total: Option<(BasicBlockId, usize)> = None;
+    for &((block, _), end) in &grouped {
+        let n = end as usize - from;
+        from = end as usize;
+        match &mut block_total {
+            Some((current, total)) if *current == block => *total += n,
+            _ => {
+                if let Some((current, total)) = block_total {
+                    body.basic_blocks[current].statements.reserve_exact(total);
+                }
+                block_total = Some((block, n));
+            }
+        }
+    }
+    if let Some((current, total)) = block_total {
+        body.basic_blocks[current].statements.reserve_exact(total);
+    }
+    // From the back, so the indices of what is still to splice hold, and each drain takes the
+    // tail of `run`.
+    for group in (0..grouped.len()).rev() {
+        let ((block, at), end) = grouped[group];
+        let from = if group == 0 { 0 } else { grouped[group - 1].1 as usize };
+        if from == end as usize {
             continue;
         }
         let block = &mut body.basic_blocks[block];
         let at = (at + 1).min(block.statements.len());
-        block.statements.splice(at..at, statements);
+        block.statements.splice(at..at, run.drain(from..end as usize));
     }
     // Every flag starts clear, but those of what the body is given.
-    let mut flagged: Vec<PathId> = flags.keys().copied().collect();
-    flagged.sort_unstable();
-    let mut start = set(&flagged, false);
+    let mut n = flag_count;
     for param in body.entry_locals() {
         if let Some(path) = data.for_local(param) {
-            start.extend(set(&subtrees[path], true));
+            n += count(flags, data.subtree(path));
+        }
+    }
+    let mut start = Vec::with_capacity(n);
+    start.extend(flags.iter().filter_map(|&it| it).map(|flag| write_flag(flag, false, bool_ty)));
+    for param in body.entry_locals() {
+        if let Some(path) = data.for_local(param) {
+            set(&mut start, flags, data.subtree(path), true, bool_ty);
         }
     }
     body.start_block = body.basic_blocks.alloc(BasicBlock {
         statements: start,
         terminator: Some(Terminator {
-            span,
+            span: MirSpan::Unknown,
             kind: TerminatorKind::Goto { target: body.start_block },
         }),
         is_cleanup: false,
@@ -322,7 +409,37 @@ pub(super) fn elaborate_drops<'db>(
     Ok(())
 }
 
-impl<'db> Elaborator<'_, 'db> {
+/// How many of `paths` have a flag.
+fn count(flags: &[Option<LocalId>], paths: &[PathId]) -> usize {
+    paths.iter().filter(|&&path| flags[path].is_some()).count()
+}
+
+/// Writes `value` to the flag of each of `paths` that has one, in their order.
+fn set<'db>(
+    out: &mut impl Extend<Statement>,
+    flags: &[Option<LocalId>],
+    paths: &[PathId],
+    value: bool,
+    bool_ty: Ty<'db>,
+) {
+    out.extend(
+        paths
+            .iter()
+            .filter_map(|&path| flags[path])
+            .map(|flag| write_flag(flag, value, bool_ty)),
+    );
+}
+
+fn write_flag(flag: LocalId, value: bool, bool_ty: Ty<'_>) -> Statement {
+    // alloc: the constant's one byte, in the kept body
+    let value = Operand::from_bytes(Box::new([value as u8]), bool_ty);
+    Statement {
+        kind: StatementKind::Assign(Place::from(flag).store(), Rvalue::Use(value)),
+        span: MirSpan::Unknown,
+    }
+}
+
+impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
     fn patch(&mut self, block: BasicBlockId, f: impl FnOnce(&mut TerminatorKind)) {
         f(&mut self.body.basic_blocks[block].terminator.as_mut().expect("a terminator").kind)
     }
@@ -342,7 +459,7 @@ impl<'db> Elaborator<'_, 'db> {
 
     fn goto_block(&mut self, target: BasicBlockId, is_cleanup: bool) -> BasicBlockId {
         self.body.basic_blocks.alloc(BasicBlock {
-            statements: Vec::new(),
+            statements: Vec::new(), // alloc: empty, no allocation; the resets grow it once
             terminator: Some(Terminator { span: self.span, kind: TerminatorKind::Goto { target } }),
             is_cleanup,
         })
@@ -353,7 +470,7 @@ impl<'db> Elaborator<'_, 'db> {
             return resume;
         }
         let resume = self.body.basic_blocks.alloc(BasicBlock {
-            statements: Vec::new(),
+            statements: Vec::new(), // alloc: empty, no allocation
             terminator: Some(Terminator {
                 span: MirSpan::Unknown,
                 kind: TerminatorKind::UnwindResume,
@@ -369,11 +486,12 @@ impl<'db> Elaborator<'_, 'db> {
     }
 
     fn flag(&mut self, path: PathId) -> LocalId {
-        if let Some(&flag) = self.flags.get(&path) {
+        if let Some(flag) = self.flags[path] {
             return flag;
         }
         let flag = self.new_temp(self.ctx.bool_ty());
-        self.flags.insert(path, flag);
+        self.flags[path] = Some(flag);
+        self.flag_count += 1;
         flag
     }
 
@@ -383,7 +501,7 @@ impl<'db> Elaborator<'_, 'db> {
 
     fn style(&self, path: PathId, deep: bool) -> Style {
         let (init, uninit, multipart) = if deep {
-            let subtree = &self.subtrees[path];
+            let subtree = self.data.subtree(path);
             let (mut init, mut uninit) = (false, false);
             for &child in subtree {
                 let (i, u) = self.state.of(child);
@@ -427,7 +545,7 @@ impl<'db> Elaborator<'_, 'db> {
     ) -> BasicBlockId {
         self.new_block(
             unwind,
-            Vec::new(),
+            Vec::new(), // alloc: empty, no allocation
             TerminatorKind::Drop { place, target: succ, unwind: unwind.action() },
         )
     }
@@ -462,7 +580,7 @@ impl<'db> Elaborator<'_, 'db> {
                 let flag = self.flag(path);
                 self.new_block(
                     unwind,
-                    Vec::new(),
+                    Vec::new(), // alloc: empty, no allocation
                     TerminatorKind::SwitchInt {
                         discr: Operand {
                             kind: OperandKind::Copy(Place::from(flag).store()),
@@ -495,7 +613,7 @@ impl<'db> Elaborator<'_, 'db> {
     /// The block that starts the drops, and the one that does when unwinding.
     fn drop_ladder(
         &mut self,
-        mut fields: Vec<(StoredPlace, Option<PathId>)>,
+        mut fields: Vec<(StoredPlace, Option<PathId>), &'f Frame>,
         parent: PathId,
         succ: BasicBlockId,
         unwind: Unwind,
@@ -504,13 +622,16 @@ impl<'db> Elaborator<'_, 'db> {
             let ty = self.place_ty(place);
             self.ctx.needs_drop(ty)
         });
-        let in_cleanup = vec![Unwind::InCleanup; fields.len() + 1];
-        let unwind_ladder: Vec<Unwind> = match unwind {
-            Unwind::To(target) => self
-                .drop_halfladder(&in_cleanup, target, &fields, parent)?
-                .into_iter()
-                .map(Unwind::To)
-                .collect(),
+        let frame = self.frame;
+        let mut in_cleanup = Vec::with_capacity_in(fields.len() + 1, frame);
+        in_cleanup.resize(fields.len() + 1, Unwind::InCleanup);
+        let unwind_ladder = match unwind {
+            Unwind::To(target) => {
+                let half = self.drop_halfladder(&in_cleanup, target, &fields, parent)?;
+                let mut ladder = Vec::with_capacity_in(half.len(), frame);
+                ladder.extend(half.iter().map(|&it| Unwind::To(it)));
+                ladder
+            }
             Unwind::InCleanup => in_cleanup,
         };
         let normal = self.drop_halfladder(&unwind_ladder, succ, &fields, parent)?;
@@ -523,9 +644,11 @@ impl<'db> Elaborator<'_, 'db> {
         mut succ: BasicBlockId,
         fields: &[(StoredPlace, Option<PathId>)],
         parent: PathId,
-    ) -> Result<Vec<BasicBlockId>, MirLowerError<'db>> {
-        let mut ladder = vec![succ];
+    ) -> Result<Vec<BasicBlockId, &'f Frame>, MirLowerError<'db>> {
+        let mut ladder = Vec::with_capacity_in(fields.len() + 1, self.frame);
+        ladder.push(succ);
         for ((place, path), &unwind) in fields.iter().rev().zip(unwind_ladder) {
+            // clone: an interned place, a refcount
             succ = self.drop_subpath(place.clone(), *path, parent, succ, unwind)?;
             ladder.push(succ);
         }
@@ -550,15 +673,15 @@ impl<'db> Elaborator<'_, 'db> {
         base: &StoredPlace,
         count: usize,
         path: Option<PathId>,
-    ) -> Vec<(StoredPlace, Option<PathId>)> {
-        (0..count)
-            .map(|at| {
-                let field = FieldIndex(at as u32);
-                let place = Self::project(base, ProjectionElem::Field(field));
-                let sub = path.and_then(|path| self.data.find_child(path, Step::Field(field)));
-                (place, sub)
-            })
-            .collect()
+    ) -> Vec<(StoredPlace, Option<PathId>), &'f Frame> {
+        let mut fields = Vec::with_capacity_in(count, self.frame);
+        fields.extend((0..count).map(|at| {
+            let field = FieldIndex(at as u32);
+            let place = Self::project(base, ProjectionElem::Field(field));
+            let sub = path.and_then(|path| self.data.find_child(path, Step::Field(field)));
+            (place, sub)
+        }));
+        fields
     }
 
     fn open_drop(
@@ -636,21 +759,23 @@ impl<'db> Elaborator<'_, 'db> {
         let TyKind::Adt(adt, _) = ty.kind() else { unreachable!("a box is an ADT") };
         let variant = hir_def::VariantId::from_non_enum(adt.def_id()).expect("a box is a struct");
         let count = self.ctx.db.field_types(variant).iter().count();
-        let fields: Vec<_> = (0..count)
-            .map(|at| (Self::project(place, ProjectionElem::Field(FieldIndex(at as u32))), None))
-            .filter(|(place, _): &(StoredPlace, Option<PathId>)| {
-                self.ctx.needs_drop(self.place_ty(place))
-            })
-            .collect();
+        let mut fields = Vec::with_capacity_in(count, self.frame);
+        fields.extend(
+            (0..count)
+                .map(|at| Self::project(place, ProjectionElem::Field(FieldIndex(at as u32))))
+                .filter(|place| self.ctx.needs_drop(self.place_ty(place))),
+        );
         // The fields are dropped as they are, under the test of the flag of the box below.
         let mut fields_succ = succ;
         let mut fields_unwind = unwind;
-        for (field, _) in fields.iter().rev() {
+        for field in fields.iter().rev() {
             let unwind_here = fields_unwind;
+            // clone: an interned place, a refcount
             fields_succ = self.drop_block(field.clone(), fields_succ, unwind_here);
             if let Unwind::To(target) = fields_unwind {
-                fields_unwind =
-                    Unwind::To(self.drop_block(field.clone(), target, Unwind::InCleanup));
+                // clone: an interned place, a refcount
+                let cleanup = self.drop_block(field.clone(), target, Unwind::InCleanup);
+                fields_unwind = Unwind::To(cleanup);
             }
         }
         let destructor = self.destructor_call_block(place, ty, fields_succ, fields_unwind)?;
@@ -676,6 +801,7 @@ impl<'db> Elaborator<'_, 'db> {
         let borrow = Statement {
             kind: StatementKind::Assign(
                 Place::from(reference).store(),
+                // clone: an interned place, a refcount
                 Rvalue::Ref(BorrowKind::Mut { kind: MutBorrowKind::Default }, place.clone()),
             ),
             span: self.span,
@@ -684,6 +810,7 @@ impl<'db> Elaborator<'_, 'db> {
             Operand::from_fn(self.ctx.db, drop_fn, GenericArgs::new_from_slice(&[ty.into()]));
         let call = TerminatorKind::Call {
             func,
+            // alloc: the call's one argument, in the kept body
             args: Box::new([Operand {
                 kind: OperandKind::Move(Place::from(reference).store()),
                 span: None,
@@ -692,7 +819,9 @@ impl<'db> Elaborator<'_, 'db> {
             target: Some(succ),
             cleanup: unwind.action(),
             from_hir_call: false,
+            intrinsic: None,
         };
+        // alloc: the one statement of a kept block, at its size
         Ok(self.new_block(unwind, vec![borrow], call))
     }
 
@@ -707,13 +836,14 @@ impl<'db> Elaborator<'_, 'db> {
         unwind: Unwind,
     ) -> Result<BasicBlockId, MirLowerError<'db>> {
         let db = self.ctx.db;
-        let mut values = Vec::new();
-        let mut blocks = Vec::new();
+        let frame = self.frame;
+        let mut variants = Vec::new_in(frame);
+        variants.extend(id.enum_variants(db).variants.values().map(|&(variant, _)| variant));
+        let mut values = Vec::with_capacity_in(variants.len(), frame);
+        let mut blocks = Vec::with_capacity_in(variants.len() + 1, frame);
         let mut otherwise = false;
         let mut otherwise_needs_drop = false;
-        let variants: Vec<_> =
-            id.enum_variants(db).variants.values().map(|&(variant, _)| variant).collect();
-        for variant in variants {
+        for &variant in variants.iter() {
             let count = db.field_types(variant.into()).iter().count();
             match self.data.find_child(path, Step::Variant(variant.into())) {
                 Some(variant_path) => {
@@ -725,6 +855,7 @@ impl<'db> Elaborator<'_, 'db> {
                     }
                     let discr = db
                         .const_eval_discriminant(variant)
+                        // alloc: error path
                         .map_err(|e| MirLowerError::NotSupported(format!("discriminant: {e:?}")))?;
                     values.push(discr as u128);
                     blocks.push(self.drop_ladder(fields, path, succ, unwind)?.0);
@@ -744,6 +875,7 @@ impl<'db> Elaborator<'_, 'db> {
         } else if !otherwise_needs_drop {
             blocks.push(succ);
         } else {
+            // clone: an interned place, a refcount
             blocks.push(self.drop_block(place.clone(), succ, unwind));
         }
         let last = *blocks.last().expect("an enum with a variant to drop");
@@ -759,10 +891,14 @@ impl<'db> Elaborator<'_, 'db> {
         };
         let switch = self.new_block(
             unwind,
+            // alloc: the one statement of a kept block, at its size
             vec![read],
             TerminatorKind::SwitchInt {
                 discr: Operand { kind: OperandKind::Copy(Place::from(discr).store()), span: None },
-                targets: SwitchTargets::new(values.into_iter().zip(blocks), last),
+                targets: SwitchTargets::new(
+                    values.iter().copied().zip(blocks.iter().copied()),
+                    last,
+                ),
             },
         );
         Ok(self.flag_test_block(path, switch, succ, unwind))
@@ -782,7 +918,8 @@ impl<'db> Elaborator<'_, 'db> {
             Run(u64, u64),
             Element(u64, PathId),
         }
-        let mut parts = Vec::new();
+        let frame = self.frame;
+        let mut parts = Vec::new_in(frame);
         let mut run_start = Some(0);
         for at in 0..len {
             match self.data.find_child(path, Step::Element(at)) {
@@ -800,28 +937,33 @@ impl<'db> Elaborator<'_, 'db> {
         if let Some(start) = run_start {
             parts.push(Part::Run(start, len));
         }
-        let fields = parts
-            .iter()
-            .rev()
-            .filter(|part| !matches!(part, Part::Run(start, end) if start == end))
-            .map(|part| match *part {
-                Part::Run(start, end) => (
-                    Self::project(&place, ProjectionElem::Subslice { from: start, to: len - end }),
-                    None,
-                ),
-                Part::Element(at, element) => (
-                    Self::project(
-                        &place,
-                        ProjectionElem::ConstantIndex {
-                            offset: at,
-                            min_length: at + 1,
-                            from_end: false,
-                        },
+        let mut fields = Vec::with_capacity_in(parts.len(), frame);
+        fields.extend(
+            parts
+                .iter()
+                .rev()
+                .filter(|part| !matches!(part, Part::Run(start, end) if start == end))
+                .map(|part| match *part {
+                    Part::Run(start, end) => (
+                        Self::project(
+                            &place,
+                            ProjectionElem::Subslice { from: start, to: len - end },
+                        ),
+                        None,
                     ),
-                    Some(element),
-                ),
-            })
-            .collect();
+                    Part::Element(at, element) => (
+                        Self::project(
+                            &place,
+                            ProjectionElem::ConstantIndex {
+                                offset: at,
+                                min_length: at + 1,
+                                from_end: false,
+                            },
+                        ),
+                        Some(element),
+                    ),
+                }),
+        );
         Ok(self.drop_ladder(fields, path, succ, unwind)?.0)
     }
 }

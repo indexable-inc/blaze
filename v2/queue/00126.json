@@ -1,0 +1,37 @@
+{
+  "id": "00126",
+  "from_lane": "db-ty-infer",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src/check_cache/part.rs",
+    "docs/v2/plan/lanes/db.md"
+  ],
+  "what": "## 5. db-ty-db: the inference result's cold form\n\nWhat: when `infer`/`infer_anon_const` results are evicted to the store, their cold form is\n`InferenceResult::to_record(interner) -> InferenceRecord` (`impl blaze_format::Persist`), read\nback with `InferenceRecordRef::to_result(interner) -> Result<InferenceResult<'db>, FormatError>`;\na read that fails is an error naming the record, never a recomputation in its place.\nWhere: `crates/hir-ty/src/db.rs`, `evict.rs`.\nWhy: db-ty-shared.md rule 4, values in the format.\n\n> forwarded to db: between lane db's children.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/check_cache/part.rs:427`: the stored form is `InferenceRecord`, read with `to_result` and a failed read an error (`map_err(format_error)`), never a recomputation. `evict.rs`'s `drop_inference` drops the in-memory value only (salsa recomputes and backdates by fingerprint, the design of `docs/v2/plan/lanes/db.md` section 7), so nothing there needs the record.",
+  "state": "applied",
+  "created": "2026-10-30T01:10:15Z",
+  "updated": "2026-10-30T09:56:51Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-infer.md#5. db-ty-db: the inference result's cold form",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-infer.md:103"
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:51Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/check_cache/part.rs:427`: the stored form is `InferenceRecord`, read with `to_result` and a failed read an error (`map_err(format_error)`), never a recomputation. `evict.rs`'s `drop_inference` drops the in-memory value only (salsa recomputes and backdates by fingerprint, the design of `docs/v2/plan/lanes/db.md` section 7)"
+    }
+  ]
+}

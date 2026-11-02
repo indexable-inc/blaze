@@ -1,124 +1,113 @@
 //! A `quote!`-like API for crafting AST nodes.
 
-pub(crate) use syntax_tree::{GreenNode, GreenToken, NodeOrToken, SyntaxKind as RSyntaxKind};
+pub(crate) use syntax_tree::{FlatTreeBuilder, SyntaxKind as RSyntaxKind};
 
 macro_rules! quote_impl_ {
-    ( @append $children:ident ) => {}; // Base case.
+    ( @append $builder:ident ) => {}; // Base case.
 
-    ( @append $children:ident
+    ( @append $builder:ident
         $node:ident {
             $($tree:tt)*
         }
         $($rest:tt)*
     ) => {
         {
-            #[allow(unused_mut)]
-            let mut inner_children = ::std::vec::Vec::<$crate::ast::make::quote::NodeOrToken<
-                $crate::ast::make::quote::GreenNode,
-                $crate::ast::make::quote::GreenToken,
-            >>::new();
-            $crate::ast::make::quote::quote_impl!( @append inner_children
+            let kind = <$crate::ast::$node as $crate::ast::AstNode>::kind();
+            $builder.start_node($crate::ast::make::quote::RSyntaxKind(kind as u16));
+            $crate::ast::make::quote::quote_impl!( @append $builder
                 $($tree)*
             );
-            let kind = <$crate::ast::$node as $crate::ast::AstNode>::kind();
-            let node = $crate::ast::make::quote::GreenNode::new($crate::ast::make::quote::RSyntaxKind(kind as u16), inner_children);
-            $children.push($crate::ast::make::quote::NodeOrToken::Node(node));
+            $builder.finish_node();
         }
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
-    ( @append $children:ident
+    ( @append $builder:ident
         [ $token_kind:ident $token_text:expr ]
         $($rest:tt)*
     ) => {
-        $children.push($crate::ast::make::quote::NodeOrToken::Token(
-            $crate::ast::make::quote::GreenToken::new(
-                $crate::ast::make::quote::RSyntaxKind($crate::SyntaxKind::$token_kind as u16),
-                &$token_text,
-            ),
-        ));
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $builder.token(
+            $crate::ast::make::quote::RSyntaxKind($crate::SyntaxKind::$token_kind as u16),
+            &$token_text,
+        );
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
-    ( @append $children:ident
+    ( @append $builder:ident
         [$($token:tt)+]
         $($rest:tt)*
     ) => {
-        $children.push($crate::ast::make::quote::NodeOrToken::Token(
-            $crate::ast::make::quote::GreenToken::new(
-                $crate::ast::make::quote::RSyntaxKind($crate::T![ $($token)+ ] as u16),
-                const { $crate::T![ $($token)+ ].text() },
-            ),
-        ));
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $builder.token(
+            $crate::ast::make::quote::RSyntaxKind($crate::T![ $($token)+ ] as u16),
+            const { $crate::T![ $($token)+ ].text() },
+        );
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
-    ( @append $children:ident
+    ( @append $builder:ident
         $whitespace:literal
         $($rest:tt)*
     ) => {
         const { $crate::ast::make::quote::verify_only_whitespaces($whitespace) };
-        $children.push($crate::ast::make::quote::NodeOrToken::Token(
-            $crate::ast::make::quote::GreenToken::new(
-                $crate::ast::make::quote::RSyntaxKind($crate::SyntaxKind::WHITESPACE as u16),
-                $whitespace,
-            ),
-        ));
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $builder.token(
+            $crate::ast::make::quote::RSyntaxKind($crate::SyntaxKind::WHITESPACE as u16),
+            $whitespace,
+        );
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
-    ( @append $children:ident
+    ( @append $builder:ident
         # $var:ident
         $($rest:tt)*
     ) => {
-        $crate::ast::make::quote::ToNodeChild::append_node_child($var, &mut $children);
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $crate::ast::make::quote::ToNodeChild::append_node_child($var, &mut $builder);
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
-    ( @append $children:ident
+    ( @append $builder:ident
         #( $($repetition:tt)+ )*
         $($rest:tt)*
     ) => {
-        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $children
+        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $builder
             [] [] $($repetition)*
         );
-        $crate::ast::make::quote::quote_impl!( @append $children $($rest)* );
+        $crate::ast::make::quote::quote_impl!( @append $builder $($rest)* );
     };
 
     // Base case - no repetition var.
-    ( @extract_pounded_in_repetition $children:ident
+    ( @extract_pounded_in_repetition $builder:ident
         [ $($repetition:tt)* ] [ ]
     ) => {
         ::std::compile_error!("repetition in `ast::make::quote!()` without variable");
     };
 
     // Base case - repetition var found.
-    ( @extract_pounded_in_repetition $children:ident
+    ( @extract_pounded_in_repetition $builder:ident
         [ $($repetition:tt)* ] [ $repetition_var:ident ]
     ) => {
         ::std::iter::IntoIterator::into_iter($repetition_var).for_each(|$repetition_var| {
-            $crate::ast::make::quote::quote_impl!( @append $children $($repetition)* );
+            $crate::ast::make::quote::quote_impl!( @append $builder $($repetition)* );
         });
     };
 
-    ( @extract_pounded_in_repetition $children:ident
+    ( @extract_pounded_in_repetition $builder:ident
         [ $($repetition:tt)* ] [ $repetition_var1:ident ] # $repetition_var2:ident $($rest:tt)*
     ) => {
         ::std::compile_error!("repetition in `ast::make::quote!()` with more than one variable");
     };
 
-    ( @extract_pounded_in_repetition $children:ident
+    ( @extract_pounded_in_repetition $builder:ident
         [ $($repetition:tt)* ] [ ] # $repetition_var:ident $($rest:tt)*
     ) => {
-        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $children
+        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $builder
             [ $($repetition)* # $repetition_var ] [ $repetition_var ] $($rest)*
         );
     };
 
-    ( @extract_pounded_in_repetition $children:ident
+    ( @extract_pounded_in_repetition $builder:ident
         [ $($repetition:tt)* ] [ $($repetition_var:tt)* ] $non_repetition_var:tt $($rest:tt)*
     ) => {
-        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $children
+        $crate::ast::make::quote::quote_impl!( @extract_pounded_in_repetition $builder
             [ $($repetition)* $non_repetition_var ] [ $($repetition_var)* ] $($rest)*
         );
     };
@@ -136,19 +125,15 @@ pub(crate) use quote_impl_ as quote_impl;
 /// and no separator (`#("\n" #variable [>])*`), for any `IntoIterator`. Note that `Option`s are also `IntoIterator`,
 /// which can help when you want to conditionally include something along with an optional node.
 ///
-/// There needs to be one root node, and its type is returned.
+/// There needs to be one root node, and its type is returned. The node is the root of a flat
+/// tree of its own, built in one pass: interpolated nodes are copied into it.
 ///
 /// Be careful to closely match the Ungrammar AST, there is no validation for this!
 macro_rules! quote_ {
     ( $root:ident { $($tree:tt)* } ) => {{
-        #[allow(unused_mut)]
-        let mut root = ::std::vec::Vec::<$crate::ast::make::quote::NodeOrToken<
-            $crate::ast::make::quote::GreenNode,
-            $crate::ast::make::quote::GreenToken,
-        >>::with_capacity(1);
-        $crate::ast::make::quote::quote_impl!( @append root $root { $($tree)* } );
-        let root = root.into_iter().next().unwrap();
-        let root = $crate::SyntaxNode::new_root(root.into_node().unwrap());
+        let mut builder = $crate::ast::make::quote::FlatTreeBuilder::new();
+        $crate::ast::make::quote::quote_impl!( @append builder $root { $($tree)* } );
+        let root = $crate::SyntaxNode::new_flat_root(::std::sync::Arc::new(builder.finish()));
         <$crate::ast::$root as $crate::ast::AstNode>::cast(root).unwrap()
     }};
 }
@@ -157,26 +142,26 @@ pub(crate) use quote_ as quote;
 use crate::AstNode;
 
 pub(crate) trait ToNodeChild {
-    fn append_node_child(self, children: &mut Vec<NodeOrToken<GreenNode, GreenToken>>);
+    fn append_node_child(self, builder: &mut FlatTreeBuilder);
 }
 
 impl<N: AstNode> ToNodeChild for N {
-    fn append_node_child(self, children: &mut Vec<NodeOrToken<GreenNode, GreenToken>>) {
-        children.push((*self.syntax().clone_subtree().green()).to_owned().into());
+    fn append_node_child(self, builder: &mut FlatTreeBuilder) {
+        builder.node(self.syntax());
     }
 }
 
 impl<C: ToNodeChild> ToNodeChild for Option<C> {
-    fn append_node_child(self, children: &mut Vec<NodeOrToken<GreenNode, GreenToken>>) {
+    fn append_node_child(self, builder: &mut FlatTreeBuilder) {
         if let Some(child) = self {
-            child.append_node_child(children);
+            child.append_node_child(builder);
         }
     }
 }
 
 // This is useful when you want conditionally, based on some `bool`, to emit some code.
 impl ToNodeChild for () {
-    fn append_node_child(self, _children: &mut Vec<NodeOrToken<GreenNode, GreenToken>>) {}
+    fn append_node_child(self, _builder: &mut FlatTreeBuilder) {}
 }
 
 pub(crate) const fn verify_only_whitespaces(text: &str) {

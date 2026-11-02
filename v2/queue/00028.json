@@ -1,0 +1,38 @@
+{
+  "id": "00028",
+  "from_lane": "vfs",
+  "owner": "coordinator",
+  "paths": [
+    "crates/vfs",
+    "crates/vfs-notify",
+    "Cargo.toml",
+    "vendor/proc-macro-srv"
+  ],
+  "what": "## 4. integration: deleting `crates/vfs` and `crates/vfs-notify`\n\nWhat: remove both crates and their root `Cargo.toml` entries once nothing depends on them.\n\nWhy: v2 replaces them with `blaze-vfs` and `blaze-core`'s watch, but they are still used by\n`base-db` and `hir-*` (db), `ide-db`, `load-cargo`, `blaze-cargo`, `blaze-engine`, `blaze-doc`,\n`blaze-wasm`, `span` and `vendor/proc-macro-srv`, which other lanes own. Each must move to\n`blaze_vfs::Vfs` views (db: `Cx::file`) first; the vfs lane can't delete them before that.\n\n> forwarded to coordinator: at integration, once nothing uses them; `requests` removes their root entries then (in the report's integration list).",
+  "state": "applied",
+  "created": "2026-10-29T23:57:30Z",
+  "updated": "2026-10-30T14:35:27Z",
+  "taken_by": "integrate-vfs",
+  "why": null,
+  "source": "v2/requests/vfs.md#4. integration: deleting `crates/vfs` and `crates/vfs-notify`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/vfs.md:43"
+    },
+    {
+      "at": "2026-10-30T12:41:30Z",
+      "by": "integrate-vfs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:35:27Z",
+      "by": "integrate-vfs",
+      "action": "done",
+      "note": "vfs and vfs-notify deleted 07:34. FileId lives in span; VfsPath, AnchoredPath(Buf), FileSet, FileSetConfig(Builder) live in base-db (fst-free prefix table); base-db is the path table (set_view_root/new_file_id/file_for_path/path_for_file). Cargo.toml, Cargo.lock (plus orphans notify, notify-types, fsevent-sys, inotify(-sys), kqueue(-sys), walkdir) cleaned. tools/nix/units/daemon.json is generated and still names vfs: regenerate it."
+    }
+  ]
+}

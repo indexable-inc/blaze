@@ -1,0 +1,36 @@
+{
+  "id": "01454",
+  "from_lane": "coordinator",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-ty/src/method_resolution/delta/state.rs",
+    "crates/hir-ty/src/method_resolution/delta"
+  ],
+  "what": "Self-build spends ~3 min on one core before any Compiling line (repro, /tmp/blaze-lanes/v2-repro.md): Db::maintain -> hir_ty::method_resolution::delta::maintain -> state::run -> run_crate -> apply_bodies lowers every body of every crate serially under &mut Db. Prefetch body_part / inherent_bodies in parallel (run_all over modules, on blaze_graph's pool) before the serial apply, or make the apply lazy. Test, named for the property: a workspace of N crates loads with the body reads fanned out across workers (count the workers that ran body reads, or the time with K workers against one). Blocks the self-build loop speed. CORRECTION (Andrew): no filter change: may_hold (crates/hir-ty/src/method_resolution.rs:1090) already counts a macro call only when macro_is_inert says the macro may write an impl. Do the fan-out only. If you want a second step, measure first which holders make modules lower in the self-build: impl_holders adds every const unconditionally (method_resolution.rs:1002), and macro_is_inert goes by name across all dependencies, so a name clash with any impl-writing macro_rules or proc macro makes a call count.",
+  "state": "applied",
+  "created": "2026-11-01T04:10:10Z",
+  "updated": "2026-11-01T04:16:56Z",
+  "taken_by": "query-unify-port",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:10:10Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:10:30Z",
+      "by": "query-unify-port",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:16:56Z",
+      "by": "query-unify-port",
+      "action": "done",
+      "note": "edit ready, uncommitted in /Volumes/Projects/blaze-v2: delta/state.rs reads body_part as run_all batches (run: one batch over every module of every crate a load or crate-graph change sweeps; apply_bodies: one over the modules a write lists; apply_impls: impl_key/ImplSignature of added impls). Tests delta/tests/batch.rs: a_workspace_sweep_reads_every_crates_body_parts_as_one_batch, a_write_reads_its_crates_body_parts_as_one_batch (first-read order follows RunOrder, tables equal in every order). RA 0 errors; not run."
+    }
+  ]
+}

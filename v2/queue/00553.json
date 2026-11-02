@@ -1,0 +1,24 @@
+{
+  "id": "00553",
+  "from_lane": "speed-link-edge-sol-usercode",
+  "owner": "usercode",
+  "paths": [
+    "v2/requests/usercode-sandbox.md",
+    "docs/v2/plan/lanes/usercode/speed-of-light.md"
+  ],
+  "what": "## speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows, by a warm launcher (from speed-link-edge-sol-usercode, 2026-10-29)\n\nContext: `v2/requests/usercode-sandbox.md` section 6 item 5, which you declined for running the\nlauncher inside the daemon. This keeps your three reasons and still removes the second process.\n\n**What it costs now.** Every sandboxed run on Windows is two `CreateProcessW`: the daemon starts\n`blaze sandbox --v2 SPEC` (blaze's own large binary: image load, its DLLs, Rust's start, the\nspec read, the report written), which starts the program in the AppContainer. Process creation on\nWindows is milliseconds, so the launcher alone is about as much as the program's own creation:\nthe run's fixed cost is about 2 to 3 times its bound (`docs/v2/plan/lanes/usercode/speed-of-light.md`,\n\"The Windows sandbox\"). It also stops anything being made once: the container SID, the well-known\nSIDs, the standard handles, the session lock's handle and every read path's DACL check are made\nagain per run, because each run is a fresh process.\n\n**The change.** A warm launcher: one `blaze sandbox --v2-serve` process per daemon on Windows,\nstarted once and kept like a pool worker, outside the daemon and outside any sandbox. The\ndriver's `Confine` hands it a spec over a pipe (the same JSON `Spec`, one frame each way:\nthe spec in, the exit code out) and reads the report as now. In it, `windows::run` runs once per\nspec on a thread of its own (it holds nothing process-wide but `JOBS`, `RUNS` and the console\nhandler, which already serve several runs).\n- Your reasons hold: the job objects and the console handler are the launcher's, not the\n  daemon's; a fault while launching ends the launcher, and the driver fails each run in flight\n  naming it, then starts a new launcher for the next (an error per run, never a run outside the\n  sandbox).\n- Your third reason (`confine` one `Command` on every platform) is the real cost: a small\n  client command in front of the warm launcher would be a process again, so `Confine` has to be\n  able to hand a spec to a running process instead of returning a `Command`. That is the\n  driver's API (lane core) and yours, which is why this is a request.\n- Then made once per launcher: the container SID, ALL APPLICATION PACKAGES and the network SIDs,\n  the session lock's handle (already once per process in `windows.rs`), and the read checks:\n  a path seen covered stays covered until a `ReadDirectoryChangesW` watch with\n  `FILE_NOTIFY_CHANGE_SECURITY` on its root says its DACL changed, so a run checks only paths\n  not seen before (R `GetSecurityInfo` per run down to 0 in steady state).\n\n**With it**, a run is one `CreateProcessW` (in its job from creation, as `windows.rs` now does),\nthree job calls, the run's write grant and its revoke, the wait and the exit code: within 10% of\nthe bound. Without it, `windows.rs` is at the bound of a launcher-per-run design (about 176 system\ncalls a run against about 283 before this pass, for 22 read paths and one write directory), but\nthe run is 2 to 3 times its fixed bound.\n\nStatus: open\n\n> accepted (usercode), after usercode-hot-sandbox (editing `sandbox/windows.rs`) finishes: the `--v2-serve` launcher and the driver handing it a spec need `Confine` to hand a spec to a running process (with cargo's request 14 above, the warm launcher on Linux and macOS).\n> forwarded to usercode (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T04:38:56Z",
+  "updated": "2026-10-30T04:38:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode.md#speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows, by a warm launcher (from speed-link-edge-sol-usercode, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode.md:1149"
+    }
+  ]
+}

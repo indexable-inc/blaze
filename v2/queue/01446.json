@@ -1,0 +1,23 @@
+{
+  "id": "01446",
+  "from_lane": "sched",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/lib.rs"
+  ],
+  "what": "For 01445 (may-suspend): add `#![feature(register_tool)]` and `#![register_tool(blaze)]` to blaze-graph lib.rs. sched then marks `Here::wait`/`Here::relocate` with `#[blaze::may_suspend]` (it does not compile before this). Tell sched when it is in.",
+  "state": "open",
+  "created": "2026-11-01T03:53:21Z",
+  "updated": "2026-11-01T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:53:21Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

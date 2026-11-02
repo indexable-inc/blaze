@@ -1,0 +1,24 @@
+{
+  "id": "01140",
+  "from_lane": "fix-diag-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/semantics/view/analyze.rs",
+    "crates/blaze-diagnostics/src/cx.rs"
+  ],
+  "what": "## The bootstrap types every `hir::view::Semantics::type_of_expr`/`type_of_pat` result in blaze-diagnostics as `TypeInfo<'{region error}>`\n\nFrom build4 (/Volumes/Projects/.coord-1030/v2-build/errors/refused-4-diagnostics.txt, 10:03), about 40 of the 53 refusals in crates/blaze-diagnostics are one front-end bug. The code is valid Rust: cargo check is clean, and every method named exists at HEAD.\n\n- `crates/hir/src/semantics/view/analyze.rs:103`: `impl<'db> Semantics<'db> { pub fn type_of_expr(&self, expr: ast::Expr<'db>) -> Option<TypeInfo<'db>> }` (and `type_of_pat` at :114). `TypeInfo<'db>` is `crates/hir/src/semantics.rs:105`: `{ original: Type<'db>, adjusted: Option<Type<'db>> }`, built there by a struct literal with no lifetime args.\n- The callers reach it as a field, `cx.vsema.type_of_expr(e)`, with `struct Cx<'a, 'db> { pub vsema: hir::view::Semantics<'db>, .. }` (`crates/blaze-diagnostics/src/cx.rs:74`), often through `b.cx` or `self.k.cx`. About 50 calls in 30 files.\n- `type_of_expr` itself is not refused. Each caller is, in one of two ways:\n  (a) `layout of Option<TypeInfo<'{region error}>>` / `layout of TypeInfo<'{region error}>`: HasErrorType (21). Examples: lower/cannot_index_into.rs:61, lower/cast_to_unsized.rs:26, lower/unused_must_use.rs:40, lints/bodies/types/pointers.rs:55.\n  (b) `UnresolvedMethod` on the `hir::Type` read from it, or on a value built from that: as_closure (lower/closure_kind_mismatch.rs:24,42), could_coerce_to, strip_references, as_adt (lints/names/dead/mark.rs), as_reference, as_raw_ptr, is_unknown, return_type, derived_from_next_solver (lints/bodies/types/util.rs:153-154), iterate_method_candidates, and even `bool::then` / `Option::is_some_and` (lower/type_must_be_known.rs:884). These are the methods of `crates/hir/src/lib.rs` `impl<'db> Type<'db>` (4970-6313).\n- Contrast: other `Semantics<'db>` methods of the same shape, such as `resolve_path(&self, ast::Path<'db>) -> Option<PathResolution<'db>>` (analyze.rs:208) and `to_def2`, are not refused in the same callers.\n\nSeparately in that list, and not blaze-diagnostics': `<hir_ty::Span as TypeFoldable<DbInterner>>::fold_with: no impl of the trait was selected`, reached from deeply_normalize, which refuses 4 normalize fns.\n\nAsk: the instantiation the bootstrap gives `type_of_expr`'s `'db` at such a call (field of a struct behind `&`, method from an inherent impl in another module, return type built by a lifetime-less struct literal), a reproducer, and the fix in the front end. Regions should not reach layout at all: rustc erases them before layout_of.",
+  "state": "open",
+  "created": "2026-10-30T22:23:22Z",
+  "updated": "2026-10-30T22:23:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:23:22Z",
+      "by": "fix-diag-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

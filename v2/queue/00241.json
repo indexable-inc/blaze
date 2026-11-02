@@ -1,0 +1,36 @@
+{
+  "id": "00241",
+  "from_lane": "frontend-tree",
+  "owner": "frontend",
+  "paths": [
+    "docs/v2/plan/lanes/frontend/tree-move-tools.md",
+    "v2/requests/db-expand.md",
+    "v2/requests/db.md",
+    "v2/requests/codegen.md",
+    "v2/requests/diagnostics.md",
+    "crates/cfg/src/cfg_expr.rs",
+    "crates/cfg/src/tests.rs",
+    "crates/cfg"
+  ],
+  "what": "## frontend-tree: cfg `src/cfg_expr.rs`, `src/tests.rs`: delete `CfgExpr::parse_from_ast` (1) (2026-10-29)\n\nFrom frontend-tree-move-tools (frontend.md item 16, notes\n`docs/v2/plan/lanes/frontend/tree-move-tools.md`). `parse_from_view` is its view twin, already\nin the crate and compared with it on every cfg test (`cfgs` in `src/tests.rs`). Apply only after\nevery caller has moved to `parse_from_view`.\n\nneeds: the requests moving the callers: hir-expand `src/attrs.rs` (157, 254) and\n`src/cfg_process.rs` (337) (frontend-tree-move-expand, `v2/requests/db-expand.md`); hir-def\n`src/attrs.rs` (1138, 1147, 1273) and `src/expr_store/lower.rs` (3637) (frontend-tree-move-def,\n`v2/requests/db.md`); blaze-engine `src/test_harness.rs` (117) (frontend-tree-move-codegen,\n`v2/requests/codegen.md`); blaze-diagnostics `src/lints/syntax.rs` (321),\n`src/lints/syntax/check_cfg/unexpected.rs` (293, 301), `src/lints/names/items/walk.rs` (290),\n`src/lints/names/dead/defs.rs` (775) (frontend-tree-move-diag-lints), `src/checks/defs/conflicts.rs`\n(657), `src/checks/features/attributes.rs` (223) (frontend-tree-move-diag-lower), both in\n`v2/requests/diagnostics.md` or a diagnostics child's file; blaze-doc `src/lint.rs` (114)\n(frontend-tree-move-tools-doc, edited directly; done 2026-10-29: it calls `parse_from_view`). Check with\n`rg -n 'parse_from_ast' crates --type rust | rg -v '^crates/(ide[^/]*|rust-analyzer|hir-ide)/'`:\nonly the lines below may remain.\n\nFile `crates/cfg/src/cfg_expr.rs`. Old (delete it whole):\n\n```rust\n    #[cfg(feature = \"syntax\")]\n    pub fn parse_from_ast(ast: syntax::ast::CfgPredicate) -> CfgExpr {\n        use intern::sym;\n        use syntax::ast::{self, AstToken};\n\n        match ast {\n            ast::CfgPredicate::CfgAtom(atom) => {\n                let atom = match atom.key() {\n                    Some(ast::CfgAtomKey::True) => CfgAtom::Flag(sym::true_),\n                    Some(ast::CfgAtomKey::False) => CfgAtom::Flag(sym::false_),\n                    Some(ast::CfgAtomKey::Ident(key)) => {\n                        let key = Symbol::intern(key.text());\n                        match atom.string_token().and_then(ast::String::cast) {\n                            Some(value) => {\n                                if let Ok(value) = value.value() {\n                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }\n                                } else {\n                                    return CfgExpr::Invalid;\n                                }\n                            }\n                            None => CfgAtom::Flag(key),\n                        }\n                    }\n                    None => return CfgExpr::Invalid,\n                };\n                CfgExpr::Atom(atom)\n            }\n            ast::CfgPredicate::CfgComposite(composite) => {\n                let Some(keyword) = composite.keyword() else {\n                    return CfgExpr::Invalid;\n                };\n                match keyword.text() {\n                    \"all\" => CfgExpr::All(\n                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),\n                    ),\n                    \"any\" => CfgExpr::Any(\n                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),\n                    ),\n                    \"not\" => {\n                        let mut inner = composite.cfg_predicates();\n                        let (Some(inner), None) = (inner.next(), inner.next()) else {\n                            return CfgExpr::Invalid;\n                        };\n                        CfgExpr::Not(Box::new(CfgExpr::parse_from_ast(inner)))\n                    }\n                    _ => CfgExpr::Invalid,\n                }\n            }\n        }\n    }\n```\n\nNew: nothing (the blank line after it goes too).\n\nOld:\n\n```rust\n    /// [`Self::parse_from_ast`] over a view of the predicate.\n```\n\nNew:\n\n```rust\n    /// The `CfgExpr` of a `cfg` predicate, read from a view of it.\n```\n\nFile `crates/cfg/src/tests.rs`. Old:\n\n```rust\nuse syntax::{AstNode, Edition, SourceFile, ast, view, view::AstNode as _};\n```\n\nNew:\n\n```rust\nuse syntax::{Edition, SourceFile, view, view::AstNode as _};\n```\n\nOld:\n\n```rust\n/// The first predicate of `input`, read from its token tree and from its view. The handle's\n/// reading (`parse_from_ast`), the reference until the handles are deleted, must be the view's.\n/// `clean`: `input` must parse without errors.\n```\n\nNew:\n\n```rust\n/// The first predicate of `input`, read from its token tree and from its view.\n/// `clean`: `input` must parse without errors.\n```\n\nOld:\n\n```rust\n    let from_view = CfgExpr::parse_from_view(pred);\n    let handle = parse.syntax_node().descendants().find_map(ast::CfgPredicate::cast).unwrap();\n    assert_eq!(CfgExpr::parse_from_ast(handle), from_view, \"{input}\");\n    (CfgExpr::parse(&tt), from_view)\n```\n\nNew:\n\n```rust\n    let from_view = CfgExpr::parse_from_view(pred);\n    (CfgExpr::parse(&tt), from_view)\n```\n\nStatus: open (waits on the callers above)\n\n> held (requests, pass 25): `crates/cfg` is the coordinator's, so requests applies it, but only once its `needs` are in: 15 `parse_from_ast` callers remain outside `crates/cfg`, `ide*` and `hir-ide` (`rg` as above).",
+  "state": "refused",
+  "created": "2026-10-30T02:33:07Z",
+  "updated": "2026-10-30T07:52:16Z",
+  "taken_by": null,
+  "why": "crates/cfg is the coordinators (crates.md: every other path); held by requests pass 25 until the 15 parse_from_ast callers outside crates/cfg, ide*, hir-ide move to parse_from_view. Owner: coordinator.",
+  "source": "v2/requests/frontend.md#frontend-tree: cfg `src/cfg_expr.rs`, `src/tests.rs`: delete `CfgExpr::parse_from_ast` (1) (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend.md:262"
+    },
+    {
+      "at": "2026-10-30T07:52:16Z",
+      "by": "frontend",
+      "action": "refuse",
+      "note": "crates/cfg is the coordinators (crates.md: every other path); held by requests pass 25 until the 15 parse_from_ast callers outside crates/cfg, ide*, hir-ide move to parse_from_view. Owner: coordinator."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00929",
+  "from_lane": "speed-sol2-usercode-wasm",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml"
+  ],
+  "what": "A workspace dependency `rustix = { version = \"1.1\", default-features = false, features = [\"fs\", \"std\"] }` in the root Cargo.toml (already in Cargo.lock at 1.1.4 through wasmtime, so no new crate is built). Why: crates/blaze-macro-wasm/src/wasi.rs `Files::resolve` checks that a package path a proc-macro module opens has no link with one `lstat` per part (`Files::links`), so `path_open` of a file d parts deep is d + 4 syscalls; a safe `rustix::fs::openat2(root_fd, rel, .., ResolveFlags::NO_SYMLINKS)` (Linux 5.6+) answers the same question in the open and the descriptor gives the `fstat` and the read, 5 syscalls at any depth, with the existing realpath check kept only for the paths that do have a link (ELOOP), so the semantics stay exact. 20% fewer syscalls on a typical 2-part read (`src/grammar.pest`, `.sqlx/query-*.json`, templates). Section `The WASI host (speed-sol2-usercode-wasm)` of docs/v2/plan/lanes/usercode/speed-of-light-wasm.md. Once it is there, speed-sol2-usercode-wasm (or the usercode lane) writes the change in wasi.rs.",
+  "state": "applied",
+  "created": "2026-10-30T09:54:35Z",
+  "updated": "2026-10-30T11:27:15Z",
+  "taken_by": "coordinator",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:54:35Z",
+      "by": "speed-sol2-usercode-wasm",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:14Z",
+      "by": "coordinator",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T11:27:15Z",
+      "by": "coordinator",
+      "action": "done",
+      "note": "root Cargo.toml: rustix = { version = \"1.1\", default-features = false, features = [\"fs\", \"std\"] } after rustc-literal-escaper."
+    }
+  ]
+}

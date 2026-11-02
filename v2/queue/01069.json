@@ -1,0 +1,25 @@
+{
+  "id": "01069",
+  "from_lane": "integrate-engine-wasm",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/blaze-wasm",
+    "crates/blaze-wasm/pack",
+    "Cargo.toml"
+  ],
+  "what": "Please build blaze-wasm: --manifest-path crates/blaze-wasm/Cargo.toml for wasm32-wasip1 (lib, exports) and host (lib, bin, tests incl. src/link/tests.rs), and crates/blaze-wasm/pack (blaze-wasm-pack, tests in src/tests.rs). Its Cargo.lock is empty and needs generating; new deps blaze-cas, blaze-codegen, blaze-items, blaze-wasm-pack (wasmparser now dev-only; object, rustc-symbols, gimli, rustc-demangle, load-cargo, project-model gone). Unverified: blaze-cas and blaze-codegen on wasm32-wasip1. Running a program also needs integrate-engine to lift v2 wasm32 refusal (queued). Write errors to /tmp/v2-errors/blaze-wasm.txt.",
+  "state": "open",
+  "created": "2026-10-30T15:13:38Z",
+  "updated": "2026-10-30T15:13:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:13:38Z",
+      "by": "integrate-engine-wasm",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -39,9 +39,8 @@ impl GccExceptTable {
 
             let type_info_is_aligned = |type_info_padding: u64| {
                 (class_info_offset_field_offset
-                    + gimli::leb128::write::uleb128_size(
-                        class_info_offset_no_padding + type_info_padding,
-                    ) as u64
+                    + blaze_format::leb::len_u64(class_info_offset_no_padding + type_info_padding)
+                        as u64
                     + self.call_sites.encoded_size()
                     + self.actions.encoded_size()
                     + type_info_padding)
@@ -151,6 +150,7 @@ pub(crate) struct ActionTable {
 
 impl ActionTable {
     pub(crate) fn new() -> ActionTable {
+        // alloc: empty, allocates nothing; the module is the tests' model of rustc's tables
         ActionTable { actions: vec![], encoded_length: 0 }
     }
 
@@ -200,7 +200,7 @@ impl Action {
         w.write_sleb128(ttype_index)?;
         // actionOffset
         let action_offset_field_offset =
-            action_table_offset + gimli::leb128::write::sleb128_size(ttype_index) as u64;
+            action_table_offset + blaze_format::leb::len_i64(ttype_index) as u64;
         w.write_sleb128(match self.next_action {
             Some(next_action_offset) => {
                 next_action_offset.0 as i64 - action_offset_field_offset as i64
@@ -223,6 +223,7 @@ pub(crate) struct TypeInfoTable {
 
 impl TypeInfoTable {
     pub(crate) fn new(ttype_encoding: gimli::DwEhPe) -> TypeInfoTable {
+        // alloc: empty, allocates nothing; the module is the tests' model of rustc's tables
         TypeInfoTable { ttype_encoding, type_info: vec![] }
     }
 

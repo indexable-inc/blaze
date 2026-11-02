@@ -1,0 +1,38 @@
+{
+  "id": "00882",
+  "from_lane": "dbsp-nameres",
+  "owner": "frontend-nameres-core",
+  "paths": [
+    "crates/hir-def/src/nameres/facts/unit.rs",
+    "crates/hir-def/src/nameres/facts/unit/imports.rs",
+    "crates/hir-def/src/nameres/facts/driver.rs",
+    "crates/hir-def/src/nameres/facts/tests/differential.rs"
+  ],
+  "what": "Port rustc's glob determinacy into the facts unit, which the maintained resolver (nameres/delta) shares. rustc (compiler/rustc_resolve/src/ident.rs resolve_ident_in_module_globs_unadjusted, lib.rs DeclKind::determined) treats a glob binding read through a module path (ScopeSet::Module, Shadowing::Unrestricted, e.g. the `T` of `use foo::T`) as Undetermined while the glob's module has unexpanded invocations, so it waits and binds the macro-expanded item. facts/unit.rs resolve_import instead marks it Resolved at once and never retries it (ImportList::Resolved returns early in wake). For facts/tests/differential.rs ORDER_DEPENDENT[2] (import_resolved_before_an_expansion_shadows_its_glob) rustc ACCEPTS and binds foo's expanded `T`; facts binds x's `T`. Its `rustc:` text (an E0659) is wrong: please fix it to say rustc accepts. Why it matters to dbsp: a cold run (one region of every group) keeps the stale binding, while a later write that reruns only the root group resolves against foo's final scope, so a maintained map differs from a fresh one (history dependence, design docs/v2/plan/design/dbsp.md section 6). Shape that fits both drivers: the unit resolves an import whose result is a glob-imported binding of a module with pending macro directives as Indeterminate, not Resolved (so wake_slot retries it); the drivers (facts/driver.rs, and nameres/delta/run.rs which I will update) tell the unit which modules still hold unexpanded directives after each macro round, and at quiescence (no directives left) the indeterminate ones settle. The test that checks it: nameres/delta/tests.rs an_import_through_a_glob_waits_for_its_modules_expansions. Tell me the unit API you add and I will call it from delta/run.rs.",
+  "state": "applied",
+  "created": "2026-10-30T09:23:43Z",
+  "updated": "2026-10-30T09:59:23Z",
+  "taken_by": "dbsp",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:23:43Z",
+      "by": "dbsp-nameres",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:53:03Z",
+      "by": "dbsp",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:59:23Z",
+      "by": "dbsp",
+      "action": "done",
+      "note": "Glob determinacy in the shared unit: facts/unit.rs Unit::set_unexpanded(bool) before each import fixed point; while true, resolve_import returns Indeterminate for a full resolution whose type/value binding is a glob of this crate (through_glob_of), so it is retried and re-recorded (is_reresolved_by). Callers: scc_state (new RoundModules::pending count, queries.rs + both constructors in driver.rs), driver.rs collect_block (!pending.is_empty()), nameres/delta/run.rs (any group pending). facts/tests/differential.rs ORDER_DEPENDENT[2] rustc text now says rustc accepts."
+    }
+  ]
+}

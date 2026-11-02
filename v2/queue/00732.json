@@ -1,0 +1,35 @@
+{
+  "id": "00732",
+  "from_lane": "dedyn",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/load"
+  ],
+  "what": "## dedyn: `Files` is never `dyn` (blaze-manifest `files.rs`, blaze-units `load/`; user's call, 2026-10-29)\n\n> APPLIED by dedyn-files 2026-10-29 21:55: no `= Disk` default (v1 callers name `Disk`); `Config<F>` holds `files: F` (no `with_files`); blaze-units is `Snap`, generic only where its tests read a disk config (plan, kind_info, Sources::new). See /tmp/blaze-lanes/v2-dedyn-files.md.\n\n> Being applied in the tree by dedyn-files (dedyn, 2026-10-29 21:22): don't apply it again.\n\nAnswers the coordinator's note on request 1 (\"Use a closed set for `Files` ... (lane dedyn)\").\nEach `Files` call reads, lists or stats one path of the workspace load, many per load (every\nmanifest, config file, target candidate and glob directory). The set is closed: `Disk` (v1's\ncallers) and blaze-units' `Snap` (every query). blaze-manifest can't name `Snap` (blaze-units\ndepends on it), so: a generic with a default, and blaze-units concrete.\n\n> forwarded to cargo (blaze-units and, once crates.md grants it, blaze-manifest; the grant is on requests' coordinator list; told by tmux; requests, pass 22).\n\n### blaze-manifest (lane cargo writes `files.rs`, `Context::with_files`, `Config::load_with`)\n\n- `Context` and `Config` take the files by type, defaulting to `Disk` so v1's callers\n  (`blaze-cargo/src/cargo/compile_time.rs`, blaze-manifest's own) are unchanged:\n\n```rust\npub struct Context<F: Files = Disk> {\n    pub config: Config<F>,\n    pub(crate) ws_roots: RefCell<FxHashMap<PathBuf, WorkspaceRootConfig>>,\n}\nimpl<F: Files> Context<F> {\n    pub fn with_files(config: Config<F>, files: Rc<F>) -> Context<F>;\n}\nimpl Context { pub fn new(config: Config) -> Context { .. } } // Disk, as today\npub struct Config<F: Files = Disk> { .., files: Rc<F> }\nimpl<F: Files> Config<F> {\n    pub fn load_with(cwd: &Path, env: BTreeMap<String, String>, files: Rc<F>) -> anyhow::Result<Config<F>>;\n}\n```\n\n- Code size: each function that holds `F` is compiled twice (Disk, Snap), once after v1 goes.\n  Keep that part thin: read the bytes or names in the generic function and hand them to a\n  non-generic one that parses (TOML, targets, globs), so the parsers are compiled once.\n- No `Rc<dyn Files>` or `&dyn Files` anywhere.\n\n> forwarded to cargo (waits on the coordinator's blaze-manifest grant; requests, pass 22).\n\n### blaze-units (`crates/blaze-units/src/load/`, today's text)\n\n- `files.rs:893`: `struct Snap(..)` → `pub(crate) struct Snap(..)`.\n- `files.rs:1058`: `mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>, &Reads<'_>) -> ..` →\n  `mut step: impl FnMut(&mut Cx<'db>, Rc<Snap>, &Reads<'_>) -> ..`; doc line \"its `Files` is a\n  fresh handle\" stays.\n- `files.rs:1063`: `let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));` →\n  `let files = Rc::new(Snap(state.clone()));`\n- `manifest.rs:79`, `manifest.rs:173`: `files: Rc<dyn Files>,` → `files: Rc<Snap>,`\n- `manifest.rs:206`: `files: &dyn Files` → `files: &Snap`\n- `manifest.rs:254`: `Rc<dyn Files>` → `Rc<Snap>`\n- `config.rs:136`: `files: Rc<dyn Files>` → `files: Rc<Snap>`, returning `Config<Snap>`\n- `resolve.rs:74`: `files: &Rc<dyn Files>,` → `files: &Rc<Snap>,`\n- Each of `manifest.rs`, `config.rs`, `resolve.rs` adds `Snap` to its `use super::files::{..}`\n  (resolve.rs: `use super::files::{Reads, Snap};`), and keeps `use blaze_manifest::files::Files;`\n  for the trait's methods.\n\nNothing in blaze-units stays generic: it has one implementation.\n\n> forwarded to cargo (requests, pass 22).",
+  "state": "applied",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-31T20:29:31Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": "v2/requests/cargo.md#dedyn: `Files` is never `dyn` (blaze-manifest `files.rs`, blaze-units `load/`; user's call, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:4142"
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:29:31Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "applied by dedyn-files"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00385",
+  "from_lane": "usercode-mem",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/script/global/tests.rs"
+  ],
+  "what": "## 3. `blaze-cargo` (cargo): the test `Now` of `serve/unit/script/global/tests.rs` on the new trait (required)\n\n- **Where:** `crates/blaze-cargo/src/serve/unit/script/global/tests.rs:55-65`.\n- **What:**\n\n  ```rust\n      fn env(&mut self, _: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {\n          None\n      }\n\n      fn names(&mut self, _: &std::path::Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {\n          Ok(false)\n      }\n  ```\n\n- **Why:** the same as 2.\n\n> forwarded to usercode-mem (from requests, pass 17; told by tmux).\n> rerouted (usercode): to cargo; told by tmux.",
+  "state": "refused",
+  "created": "2026-10-30T03:40:17Z",
+  "updated": "2026-10-30T08:29:19Z",
+  "taken_by": "coord-apply-back",
+  "why": "already done: crates/blaze-cargo/src/serve/unit/script/global/tests.rs Now has env -> Option<&OsStr>, env_all -> &[..], names(path, &mut Names) -> Ok(false) and entry.",
+  "source": "v2/requests/usercode-mem.md#3. `blaze-cargo` (cargo): the test `Now` of `serve/unit/script/global/tests.rs` on the new trait (required)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-mem.md:85"
+    },
+    {
+      "at": "2026-10-30T08:29:18Z",
+      "by": "coord-apply-back",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:29:19Z",
+      "by": "coord-apply-back",
+      "action": "refuse",
+      "note": "already done: crates/blaze-cargo/src/serve/unit/script/global/tests.rs Now has env -> Option<&OsStr>, env_all -> &[..], names(path, &mut Names) -> Ok(false) and entry."
+    }
+  ]
+}

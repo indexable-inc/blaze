@@ -1,0 +1,43 @@
+{
+  "id": "00380",
+  "from_lane": "mem-codegen-unit",
+  "owner": "codegen",
+  "paths": [
+    "Cargo.toml",
+    "crates/blaze-mem",
+    "crates/blaze-wasm/Cargo.toml",
+    "crates/blaze-mem/src/os.rs",
+    "v2/backend.rs",
+    "tools/v2/hot_lint.py",
+    "crates/hir-ty-codegen/mod.rs",
+    "crates/blaze-cargo/src/serve/unit/codegen.rs",
+    "crates/blaze-cas/src/lib.rs"
+  ],
+  "what": "## 0. Prerequisites for other owners\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).\n\n### 0.1 Root `Cargo.toml` (coordinator): hashbrown's `nightly` feature\n\nhashbrown only takes a `core::alloc::Allocator` (what `&blaze_mem::Frame` is) with its `nightly`\nfeature; without it, its allocator parameter is its own `allocator-api2` trait, which `Frame` does\nnot implement. Change line 168:\n\n```toml\nhashbrown = { version = \"0.17.0\", features = [\"inline-more\"], default-features = false }\n```\n\nto:\n\n```toml\nhashbrown = { version = \"0.17.0\", features = [\"inline-more\", \"nightly\"], default-features = false }\n```\n\n`hir-ty-codegen` already depends on `hashbrown.workspace = true`. `blaze-codegen` needs no hash map\nin a frame.\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).\n\n### 0.2 `blaze-mem` on wasm32 (lane `mem`, `crates/blaze-mem`)\n\n`hir-ty-codegen` is also compiled to wasm32: `crates/blaze-wasm/Cargo.toml:28` builds it with its\n`wasm` feature. On that target `blaze_mem::os::reserve` (`crates/blaze-mem/src/os.rs:111-117`)\nreturns `Unsupported`, \"blaze-mem reserves address space on Linux, macOS and Windows only\". So after\n1.4, the first `frame::task` in `build()` stops the wasm32 compiler with that error. That is the\nright behaviour (no fallback), but it breaks `blaze-wasm` until `blaze-mem` can make a frame on\nwasm32. A wasm32 linear memory has no address space to reserve, and\n`frame::FRAME_RESERVE = 4 << 30` is all of a 32-bit space. What `blaze-mem` needs on\n`not(any(unix, windows))`:\n\n- `reserve` takes the bytes from the linear memory (`memory.grow`, or `std::alloc::alloc` of the\n  whole reserve, once per frame);\n- `commit` and `decommit` do nothing;\n- `FRAME_RESERVE` is a few MiB on `target_pointer_width = \"32\"`.\n\nEvery frame use below is on the native path. Of what `blaze-wasm` reaches, only `build()` (1.4) has\na frame; v2 refuses wasm units (`v2/backend.rs` `check_spec`). I am telling my parent\n(`mem-codegen`) of this in my report.\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).\n\n> done by mem (2026-10-29), as proposed. In `crates/blaze-mem/src/os.rs` on\n> `not(any(unix, windows))`, `reserve` takes the whole range once, zeroed, from the global\n> allocator, and `release` gives it back. `commit` does nothing, and `decommit` zeroes the range\n> so it reads zeros when committed again, as on Linux. On `not(target_pointer_width = \"64\")`,\n> `frame::FRAME_RESERVE` is 16 MB and `chunks::SPACE_BYTES` is 256 MB. Before this change,\n> blaze-mem did not even compile for wasm32: `4 << 30` and `256 << 30` overflow a 32-bit\n> `usize`. A caller elsewhere that reserves a 64-bit-sized `RegionVec` on wasm32 now stops with\n> `MemError` naming its tag (no fallback), which is the caller's to size per target.\n\n### 0.3 The hot lint never reads `hir-ty-codegen` (coordinator, `tools/v2/hot_lint.py`)\n\n- **It never reads `hir-ty-codegen`.** It reads `crates/<crate>/src` only (`hot_lint.py:89`).\n  `hir-ty-codegen`'s library root is `crates/hir-ty-codegen/mod.rs` with no `src/`, so the lint\n  reports nothing for it.\n- **Its `\"crates\"` input can't be given.** `{\"crates\": [...]}` fails with\n  `TypeError: typed_input: crates has a type it does not read: list[str]`.\n\nBoth gaps are the lint's. The `// alloc:` notes in this file are written for the lines the lint\nwould flag once it reads `hir-ty-codegen`.\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).\n\n### 0.4 `crates/blaze-cargo/src/serve/unit/codegen.rs:240` (lane `cargo-daemon-units`, DONE)\n\nThe one other implementor of `blaze_codegen::driver::Lookup`. It changes with 2.5, in the same\nchange, or the workspace stops building:\n\n```rust\nimpl blaze_codegen::driver::Lookup for Reading<'_> {\n    fn get(&self, key: &blaze_cas::Key) -> Result<Option<Vec<u8>>, String> {\n        match self.store.get(self.guard, key) {\n            Ok(entry) => Ok(entry.map(|it| it.bytes.to_vec())),\n            Err(corrupt) => Err(corrupt.to_string()),\n        }\n    }\n}\n```\n\nbecomes:\n\n```rust\nimpl blaze_codegen::driver::Lookup for Reading<'_> {\n    fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {\n        match self.store.get(self.guard, key) {\n            Ok(entry) => Ok(entry.map(|it| it.bytes)),\n            // alloc: an error\n            Err(corrupt) => Err(corrupt.to_string()),\n        }\n    }\n}\n```\n\n`self.store.get(self.guard, key)` gives an `Entry<'a>`, where `'a` is `Reading`'s lifetime\n(`store` and `guard` are both `&'a`, `crates/blaze-cas/src/lib.rs:403`). So its bytes outlive\nthe `&self` borrow `read` returns them under.\n\n`Entry::bytes` is `&'g [u8]`, verified by the store (`crates/blaze-cas/src/lib.rs:219`). The\nstore's hit was copied into a `Vec` on every read; now it is read in place.\n\n---\n\n> forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:39:13Z",
+  "updated": "2026-10-31T20:50:35Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/mem-codegen-unit.md#0. Prerequisites for other owners",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-codegen-unit.md:63"
+    },
+    {
+      "at": "2026-10-31T20:50:35Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:35Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "In the tree: hir-ty-codegen frame_map.rs and lent.rs, FunctionCx and Layouts on a Frame (mod.rs), blaze-codegen backend.rs Shape(ContentId), Lookup::read borrowed (driver.rs), template.rs and blob.rs views, v2/shape.rs of(.., frame); hot_lint reads crates without src (hot_lint.py:220)."
+    }
+  ]
+}

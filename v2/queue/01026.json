@@ -1,0 +1,32 @@
+{
+  "id": "01026",
+  "from_lane": "integrate-ide",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/hir-expand/src/lib.rs",
+    "crates/hir-expand/src/files.rs",
+    "crates/hir-expand/src/attrs.rs",
+    "crates/hir-def/src/src.rs",
+    "crates/hir-def/src/lib.rs",
+    "crates/hir-def/src/nameres.rs",
+    "crates/hir-def/src/src/tests.rs",
+    "crates/hir-def/src/nameres/tests/views.rs",
+    "crates/hir-ty-mir/src/tests.rs",
+    "crates/hir/src/lib.rs"
+  ],
+  "what": "integrate-ide phase 3 (IDE-only hir-expand/hir-def handle fns deleted) needs the compiler: (1) `blaze check --workspace` plus a test build of hir-expand, hir-def, hir-ty-mir, hir; errors in these paths go to integrate-ide. (2) Bless with UPDATE_EXPECT=1 the new stored expectations, in addition to 01011: hir-def `src::tests::{child_source_view,use_tree_views}` (src/src/child_source_view.txt, use_tree_views.txt) and `nameres::tests::views::a_modules_source_views` (nameres/tests/views_definition_source.txt). (3) Run hir-ty-mir `tests` (type annotations now read through views).",
+  "state": "open",
+  "created": "2026-10-30T14:19:04Z",
+  "updated": "2026-10-30T14:19:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:19:04Z",
+      "by": "integrate-ide",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

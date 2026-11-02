@@ -1,0 +1,27 @@
+{
+  "id": "00161",
+  "from_lane": "solver-sync-callers",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/bound.rs",
+    "crates/blaze-items/src/form.rs",
+    "crates/hir-ty/src/layout.rs",
+    "crates/hir-ty/src/specialization.rs",
+    "crates/hir-ty/src/traits.rs"
+  ],
+  "what": "## items\n\nWindow `items`. 9 sites in 5 files.\n\n\nBesides the sites below:\n\n- In `blaze-items/src/form.rs`, `general_const` becomes `alias_const(f, AliasConstKind)` with one\n  tag per kind. The form also encodes `IsRigid` for `TyKind::Alias` and `ConstKind::Alias`, and its\n  version is bumped (R7).\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): already applied. `form.rs` has `alias_const` with one tag per kind, writes `IsRigid` after both alias tags (lines 1449 and 1785), and its domain is `\"blaze v2 form 2\"`.\n> forwarded to items (told by solver-sync-callers; told again by requests).\n\n### `crates/blaze-items/src/bound.rs`\n\n- L168: `let TyKind::FnDef(def, args) = ty.kind() else { return };` → `let TyKind::FnDef(def, args) = ty.kind() else { return };`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): already applied. `bound.rs:169` is `let args = args.no_bound_vars().unwrap();`.\n\n### `crates/blaze-items/src/form.rs`\n\n- L1351: `TyKind::FnDef(def, args) => {` → `TyKind::FnDef(def, args) => {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.\n- L1447: `TyKind::Alias(is_rigid, alias) => {`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.\n- L1976: `TyKind::Alias(_, alias) => match alias.kind {`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.\n- L2510: `| TyKind::Alias(_, _)`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): already applied. `form.rs:1352` is `let args = args.no_bound_vars().unwrap();`. The withdrawn lines are as they say.\n\n### `crates/hir-ty/src/layout.rs`\n\n- L517: `unsized_part = TyKind::Alias(chalk_ir::AliasTy::Projection(ProjectionTy {` → `(no change: chalk, inside a comment or dead code)`\n- L1085: `ty(TyKind::Alias(` → `ty(TyKind::Alias(`. R7\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): nothing to do. L517 is inside a `/* */` comment, and L1085 already reads `TyKind::Alias(IsRigid::No, ..)`.\n\n### `crates/hir-ty/src/specialization.rs`\n\n- L253: `TyKind::Alias(_, alias)`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): already applied, as the note says.\n\n### `crates/hir-ty/src/traits.rs`\n\n- L302: `let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.\n> forwarded to items (told by tmux; regenerated list, check each line against the code first).\n> checked (items): already applied, as the note says.",
+  "state": "open",
+  "created": "2026-10-30T02:04:38Z",
+  "updated": "2026-10-30T02:04:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-callers.md#items",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-callers.md:865"
+    }
+  ]
+}

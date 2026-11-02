@@ -1,0 +1,6 @@
+f0:SOURCE_FILE@0..671, 622 elements; in-file root f0:SOURCE_FILE@0..671
+f1:LITERAL@0..11, 2 elements; in-file root f1:LITERAL@0..11
+f2:LITERAL@0..5, 2 elements; in-file root f2:LITERAL@0..5
+stringify! f0:MACRO_CALL@439..460: view f0:MACRO_CALL@439..460; in file f0:MACRO_CALL@439..460; range f0:439..460; syntax f0:MACRO_CALL@439..460; pointer f0:MACRO_CALL@439..460
+line! f0:MACRO_CALL@474..481: view f0:MACRO_CALL@474..481; in file f0:MACRO_CALL@474..481; range f0:474..481; syntax f0:MACRO_CALL@474..481; pointer f0:MACRO_CALL@474..481
+concat! f0:MACRO_CALL@495..557: view f0:MACRO_CALL@495..557; in file f0:MACRO_CALL@495..557; range f0:495..557; syntax f0:MACRO_CALL@495..557; pointer f0:MACRO_CALL@495..557

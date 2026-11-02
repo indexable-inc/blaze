@@ -1,16 +1,14 @@
 //! Things related to the Interner in the next-trait-solver.
 
-use std::{fmt, ops::ControlFlow};
+use std::{fmt, marker::PhantomData, num::NonZeroU32, ops::ControlFlow};
 
 use either::Either;
-use intern::{Interned, InternedRef, InternedSliceRef, impl_internable};
-use macros::GenericTypeVisitable;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
-pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
+pub use tls_db::{attach_db, attach_db_allow_change, fmt_with_attached_db, with_attached_db};
 
-use base_db::Crate;
+use base_db::{Crate, Db};
 use hir_def::{
     AdtId, CallableDefId, EnumId, GenericDefId, GenericParamId, HasModule, ItemContainerId,
     StructId, TraitId, TypeAliasId, UnionId, VariantId,
@@ -23,17 +21,21 @@ use hir_def::{
         TraitFlags, TraitSignature, UnionSignature,
     },
 };
+use intern::sym;
 use rustc_abi::ExternAbi;
+use rustc_abi::Size;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_type_ir::{
-    AliasTy, BoundVar, CoroutineWitnessTypes, DebruijnIndex, EarlyBinder, FlagComputation, Flags,
-    FnSigKind, GenericArgKind, GenericTypeVisitable, ImplPolarity, InferTy, Interner, TraitRef,
-    TypeFlags, TypeVisitableExt, Variance, VisitorResult,
+    AliasConstKind, BoundVar, BoundVarIndexKind, CanonicalParamEnvCache, ConstKind,
+    CoroutineWitnessTypes, DebruijnIndex, EarlyBinder, Flags, FnSigKind, GenericArgKind,
+    GenericTypeVisitable, ImplPolarity, InferTy, Interner, RegionKind, RegionVid, TraitRef,
+    TypeFlags, TypeVisitableExt, ValTreeKind, Variance, VisitorResult,
     error::TypeError,
     fast_reject,
-    inherent::{self, Const as _, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _},
+    inherent::{self, GenericArgs as _, GenericsOf, IntoKind, SliceLike as _, Span as _, Ty as _},
     lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem},
-    solve::{AdtDestructorKind, SizedTraitKind},
+    search_graph::RequiredDepth,
+    solve::{AdtDestructorKind, QueryResult, SizedTraitKind},
     try_visit,
 };
 
@@ -43,14 +45,14 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
-        AdtIdWrapper, AliasTermKind, AliasTyKind, AnyImplId, BoundConst, CallableIdWrapper,
+        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, BoundConst, CallableIdWrapper,
         CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper,
         Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId, FxIndexMap,
-        GeneralConstIdWrapper, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId,
-        ImplOrTraitAssocTyId, InherentAssocConstId, InherentAssocTermId, InherentAssocTyId,
-        LateParamRegion, OpaqueTyIdWrapper, OpaqueTypeKey, RegionAssumptions, ScalarInt,
-        SimplifiedType, SolverContext, SolverDefIds, TermId, TraitAssocConstId, TraitAssocTermId,
-        TraitAssocTyId, TraitIdWrapper, TypeAliasIdWrapper, UnevaluatedConst,
+        ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
+        InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst,
+        InternedRegion, LateParamRegionKind, OpaqueTyIdWrapper, OpaqueTypeKey, RegionAssumptions,
+        Scalar, ScalarInt, SimplifiedType, SolverContext, SolverDefIds, TermId, TraitAssocConstId,
+        TraitAssocTermId, TraitAssocTyId, TraitIdWrapper, TypeAliasIdWrapper,
         util::{ItemBounds, impl_super_outlives},
     },
 };
@@ -58,14 +60,19 @@ use crate::{
 use super::{
     Binder, BoundExistentialPredicates, BoundTy, BoundTyKind, Clause, ClauseKind, Clauses, Const,
     ErrorGuaranteed, ExprConst, ExternalConstraints, GenericArg, GenericArgs, ParamConst, ParamEnv,
-    ParamTy, PredefinedOpaques, Predicate, SolverDefId, Term, Ty, TyKind, Tys, ValTree, ValueConst,
+    ParamTy, PredefinedOpaques, Predicate, SolverDefId, StoredTy, Term, Ty, TyKind, Tys, ValTree,
+    ValueConst,
     abi::Safety,
+    features::Features,
     fold::{BoundVarReplacer, BoundVarReplacerDelegate, FnMutDelegate},
     generics::{Generics, generics},
+    persist,
     region::{BoundRegion, BoundRegionKind, EarlyParamRegion, Region},
-    util::sizedness_constraint_for_ty,
+    util::adt_sizedness_constraint,
 };
 
+/// A list of interned values, as an index into a [`table::Lists`] of its own: `$storage` holds the
+/// table, `$name<'db>` is the list, `$stored_name` the list as kept in a query result.
 macro_rules! interned_slice {
     ($storage:ident, $name:ident, $stored_name:ident, $default_types_field:ident, $ty_db:ty, $ty_static:ty $(,)?) => {
         const _: () = {
@@ -73,12 +80,33 @@ macro_rules! interned_slice {
             fn _ensure_correct_types<'db: 'static>(v: $ty_db) -> $ty_static { v }
         };
 
-        ::intern::impl_slice_internable!(gc; $storage, (), $ty_static);
+        // SAFETY: `$ty_static` is `$ty_db` with `'db` as `'static` (`_ensure_correct_types`
+        // above), which bounds no reference in it (`table::Erase`).
+        #[allow(unused_lifetimes)]
+        unsafe impl<'db> $crate::next_solver::interner::table::Erase for $ty_db {
+            type Static = $ty_static;
+        }
+
+        /// Where every interned [`$name`] is.
+        pub struct $storage;
+
+        impl $storage {
+            #[inline]
+            fn table() -> &'static $crate::next_solver::interner::table::Lists<$ty_static> {
+                static TABLE: $crate::next_solver::interner::table::Lists<$ty_static> =
+                    $crate::next_solver::interner::table::Lists::new(::std::stringify!($name));
+                &TABLE
+            }
+        }
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(transparent)]
         pub struct $name<'db> {
-            interned: ::intern::InternedSliceRef<'db, $storage>,
+            index: ::std::num::NonZeroU32,
+            _db: ::std::marker::PhantomData<&'db ()>,
         }
+
+        const _: () = ::std::assert!(::std::mem::size_of::<Option<$name<'static>>>() == 4);
 
         impl<'db> std::fmt::Debug for $name<'db> {
             fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,8 +134,7 @@ macro_rules! interned_slice {
             /// needs to intern the global slice as well.
             #[inline]
             pub(crate) fn new_from_slice_no_empty_check(slice: &[$ty_db]) -> Self {
-                let slice = unsafe { ::std::mem::transmute::<&[$ty_db], &[$ty_static]>(slice) };
-                Self { interned: ::intern::InternedSlice::from_header_and_slice((), slice) }
+                Self::at($storage::table().intern(slice))
             }
 
             #[inline]
@@ -123,8 +150,7 @@ macro_rules! interned_slice {
 
             #[inline]
             pub fn as_slice(self) -> &'db [$ty_db] {
-                let slice = &self.interned.get().slice;
-                unsafe { ::std::mem::transmute::<&[$ty_static], &[$ty_db]>(slice) }
+                $storage::table().get(self.index)
             }
 
             #[inline]
@@ -140,6 +166,34 @@ macro_rules! interned_slice {
             #[inline]
             pub fn is_empty(self) -> bool {
                 self.as_slice().is_empty()
+            }
+
+            /// The list's place in its table: dense from 1, the same for equal lists, for the
+            /// life of the process.
+            #[inline]
+            pub fn index(self) -> u32 {
+                self.index.get()
+            }
+
+            /// The list at `index`, which [`Self::index`] gave. Panics on any other number.
+            pub fn from_index(_interner: $crate::next_solver::DbInterner<'db>, index: u32) -> Self {
+                match ::std::num::NonZeroU32::new(index) {
+                    Some(index) if $storage::table().published(index) => Self::at(index),
+                    _ => ::std::panic!(
+                        "{index} is not the index of an interned {}",
+                        ::std::stringify!($name)
+                    ),
+                }
+            }
+
+            /// The list of a row of the table.
+            #[inline]
+            pub(crate) fn at(index: ::std::num::NonZeroU32) -> Self {
+                Self { index, _db: ::std::marker::PhantomData }
+            }
+
+            pub(crate) fn row(self) -> ::std::num::NonZeroU32 {
+                self.index
             }
         }
 
@@ -182,46 +236,43 @@ macro_rules! interned_slice {
             }
         }
 
-
-        impl<'db, V: $crate::next_solver::interner::WorldExposer>
+        // SAFETY: the handle holds one value, its row's slice, whose items this visits whenever
+        // the visitor asks to go into the row.
+        unsafe impl<'db, V: $crate::next_solver::interner::WorldExposer>
             rustc_type_ir::GenericTypeVisitable<V> for $name<'db>
         {
             #[inline]
             fn generic_visit_with(&self, visitor: &mut V) {
-                if visitor.on_interned_slice(self.interned).is_continue() {
+                if visitor.on_interned(::std::stringify!($name), self.index.get()).is_continue() {
                     self.as_slice().iter().for_each(|it| it.generic_visit_with(visitor));
                 }
             }
         }
 
-        $crate::next_solver::interner::impl_stored_interned_slice!($storage, $name, $stored_name);
+        $crate::next_solver::interner::impl_stored_interned_slice!($name, $stored_name);
     };
 }
 pub(crate) use interned_slice;
 
+/// `$stored_name`, the list `$name` as kept in a query result: its index, which stays valid in
+/// every revision, as an interned value is never freed.
 macro_rules! impl_stored_interned_slice {
-    ( $storage:ident, $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, PartialEq, Eq, Hash)]
+    ( $name:ident, $stored_name:ident $(,)? ) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $stored_name {
-            interned: ::intern::InternedSlice<$storage>,
+            index: ::std::num::NonZeroU32,
         }
 
         impl $stored_name {
             #[inline]
-            fn new(it: $name<'_>) -> Self {
-                Self { interned: it.interned.to_owned() }
-            }
-
-            // FIXME: This transmute is not safe as is!
-            #[inline]
-            pub fn as_ref<'a, 'db>(&'a self) -> $name<'db> {
-                let it = $name { interned: self.interned.as_ref() };
-                unsafe { std::mem::transmute::<$name<'a>, $name<'db>>(it) }
+            pub fn as_ref<'db>(&self) -> $name<'db> {
+                $name::at(self.index)
             }
         }
 
-        // SAFETY: It is safe to store this type in queries (but not `$name`).
-        unsafe impl salsa::SalsaValue for $stored_name {}
+        // SAFETY: `$stored_name` is a row number and borrows nothing, and the row it names is
+        // never freed, so it is valid in every revision (unlike `$name`, which carries `'db`).
+        unsafe impl blaze_query::db::Value for $stored_name {}
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -232,7 +283,7 @@ macro_rules! impl_stored_interned_slice {
         impl $name<'_> {
             #[inline]
             pub fn store(self) -> $stored_name {
-                $stored_name::new(self)
+                $stored_name { index: self.index }
             }
         }
     };
@@ -247,7 +298,7 @@ macro_rules! impl_foldable_for_interned_slice {
                 visitor: &mut V,
             ) -> V::Result {
                 use rustc_ast_ir::visit::VisitorResult;
-                rustc_ast_ir::walk_visitable_list!(visitor, (*self).iter());
+                rustc_ast_ir::walk_visitable_list!(visitor, (*self).as_slice());
                 V::Result::output()
             }
         }
@@ -299,23 +350,22 @@ macro_rules! impl_foldable_for_stored_type {
 }
 pub(crate) use impl_foldable_for_stored_type;
 
+/// `$stored_name`, the interned `$name` as kept in a query result: its index, which stays valid
+/// in every revision, as an interned value is never freed. `$name` has an `index: NonZeroU32`
+/// field and an `at(NonZeroU32)` constructor.
 macro_rules! impl_stored_interned {
-    ( $storage:ident, $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, PartialEq, Eq, Hash, ::salsa::SalsaValue)]
+    ( $name:ident, $stored_name:ident $(,)? ) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
         pub struct $stored_name {
-            interned: ::intern::Interned<$storage>,
+            index: ::std::num::NonZeroU32,
         }
+
+        const _: () = ::std::assert!(::std::mem::size_of::<Option<$stored_name>>() == 4);
 
         impl $stored_name {
             #[inline]
-            fn new(it: $name<'_>) -> Self {
-                Self { interned: it.interned.to_owned() }
-            }
-
-            #[inline]
-            pub fn as_ref<'a, 'db>(&'a self) -> $name<'db> {
-                let it = $name { interned: self.interned.as_ref() };
-                unsafe { std::mem::transmute::<$name<'a>, $name<'db>>(it) }
+            pub fn as_ref<'db>(&self) -> $name<'db> {
+                $name::at(self.index)
             }
         }
 
@@ -328,67 +378,50 @@ macro_rules! impl_stored_interned {
         impl $name<'_> {
             #[inline]
             pub fn store(self) -> $stored_name {
-                $stored_name::new(self)
+                $stored_name { index: self.index }
             }
         }
     };
 }
 pub(crate) use impl_stored_interned;
 
-/// This is a visitor trait that treats any interned thing specifically. Visitables are expected to call
-/// the trait's methods when encountering an interned. This is used to implement marking in GC.
+/// A visitor of the interned values a value holds. Visitables call [`Self::on_interned`] with
+/// the table and index of each interned value they reach, before its parts, and skip the parts
+/// on [`ControlFlow::Break`] (a value already seen): the walk a reachability pass over the
+/// tables makes.
 pub trait WorldExposer {
-    fn on_interned<T: intern::Internable>(
-        &mut self,
-        interned: InternedRef<'_, T>,
-    ) -> ControlFlow<()>;
-    fn on_interned_slice<T: intern::SliceInternable>(
-        &mut self,
-        interned: InternedSliceRef<'_, T>,
-    ) -> ControlFlow<()>;
+    fn on_interned(&mut self, table: &'static str, index: u32) -> ControlFlow<()>;
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct DbInterner<'db> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     krate: Option<Crate>,
     lang_items: Option<&'db LangItems>,
     /// The crate's `#![recursion_limit]`, or rustc's default. The solver asks for it with every
     /// goal, so it is read once.
     recursion_limit: u32,
-    /// Which of the thread's solver caches is this interner's, see [`tls_cache`].
+    /// Which solver cache is this interner's, see [`tls_cache`].
     solved: tls_cache::Solved,
     /// The solver answers with the region constraints proving a goal takes, as borrowck needs;
     /// otherwise regions are not looked at.
     regions: bool,
+    /// The crate's `#![feature(..)]`s, read once; `None` without a crate.
+    features: Option<Features<'db>>,
 }
 
-// FIXME: very wrong, see https://github.com/rust-lang/rust/pull/144808
-unsafe impl Send for DbInterner<'_> {}
-unsafe impl Sync for DbInterner<'_> {}
+// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<DbInterner<'static>>();
+};
 
 impl<'db> DbInterner<'db> {
-    // FIXME(next-solver): remove this method
-    #[doc(hidden)]
-    pub fn conjure() -> DbInterner<'db> {
-        // Here we can not reinit the cache since we do that when we attach the db.
-        crate::with_attached_db(|db| DbInterner {
-            db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
-            krate: None,
-            lang_items: None,
-            recursion_limit: 128,
-            solved: tls_cache::Solved::new(),
-            regions: false,
-        })
-    }
-
     /// Creates a new interner without an active crate. Good only for interning things, not for trait solving etc..
     /// As a rule of thumb, when you create an `InferCtxt`, you need to provide the crate (and the block).
     ///
     /// Elaboration is a special kind: it needs lang items (for `Sized`), therefore it needs `new_with()`.
-    pub fn new_no_crate(db: &'db dyn HirDatabase) -> Self {
-        // We do not reinit the cache here, since anything accessing the cache needs an InferCtxt,
-        // and we panic when trying to construct an InferCtxt for an Interner without a crate.
+    pub fn new_no_crate(db: &'db Db) -> Self {
         DbInterner {
             db,
             krate: None,
@@ -396,20 +429,21 @@ impl<'db> DbInterner<'db> {
             recursion_limit: 128,
             solved: tls_cache::Solved::new(),
             regions: false,
+            features: None,
         }
     }
 
-    pub fn new_with(db: &'db dyn HirDatabase, krate: Crate) -> DbInterner<'db> {
-        tls_cache::reinit_cache(db);
+    pub fn new_with(db: &'db Db, krate: Crate) -> DbInterner<'db> {
         DbInterner {
             db,
             krate: Some(krate),
             // As an approximation, when we call `new_with` we're trait solving, therefore we need the lang items.
             // This is also convenient since here we have a starting crate but not in `new_no_crate`.
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
-            recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
+            recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
             solved: tls_cache::Solved::new(),
             regions: false,
+            features: Some(Features::of(db, krate)),
         }
     }
 
@@ -424,8 +458,17 @@ impl<'db> DbInterner<'db> {
         self.regions
     }
 
+    /// Runs `f` on this interner's global-goal table (see `global_goals`).
     #[inline]
-    pub fn db(&self) -> &'db dyn HirDatabase {
+    pub(crate) fn with_global_goals<R>(
+        self,
+        f: impl FnOnce(&super::global_goals::Goals) -> R,
+    ) -> R {
+        tls_cache::global_goals(self.db, self.krate, self.regions, f)
+    }
+
+    #[inline]
+    pub fn db(&self) -> &'db Db {
         self.db
     }
 
@@ -448,6 +491,12 @@ impl<'db> DbInterner<'db> {
     pub(crate) fn expect_crate(&self) -> Crate {
         self.krate.expect("should have a crate")
     }
+
+    /// The crate this interner solves for, if any.
+    #[inline]
+    pub(crate) fn krate(&self) -> Option<Crate> {
+        self.krate
+    }
 }
 
 impl<'db> inherent::Span<DbInterner<'db>> for Span {
@@ -467,6 +516,95 @@ interned_slice!(
 
 pub type BoundVariableKind<'db> = rustc_type_ir::BoundVariableKind<DbInterner<'db>>;
 
+impl<'db> inherent::BoundVarKinds<DbInterner<'db>> for BoundVarKinds<'db> {
+    #[inline]
+    fn from_vars(
+        _cx: DbInterner<'db>,
+        iter: impl IntoIterator<Item = BoundVariableKind<'db>>,
+    ) -> Self {
+        BoundVarKinds::new_from_iter(iter)
+    }
+}
+
+/// rustc's `TypingEnv` as far as the shared IR reads it: the environment a type's layout is
+/// computed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TypingEnv<'db> {
+    pub param_env: ParamEnv<'db>,
+}
+
+impl<'db> inherent::TypingEnv<DbInterner<'db>> for TypingEnv<'db> {
+    #[inline]
+    fn fully_monomorphized() -> Self {
+        TypingEnv { param_env: ParamEnv::empty() }
+    }
+
+    /// As rustc's `layout_of(..).unwrap().size`: a type the IR asks the size of has a layout.
+    fn layout_size(self, interner: DbInterner<'db>, ty: Ty<'db>) -> Size {
+        let env =
+            crate::ParamEnvAndCrate { param_env: self.param_env, krate: interner.expect_crate() };
+        match interner.db.layout_of_ty(ty.store(), env.store()) {
+            Ok(layout) => layout.size,
+            Err(error) => panic!("the layout of `{ty:?}` is not known: {error:?}"),
+        }
+    }
+}
+
+pub type CanonicalInputData<'db> = rustc_type_ir::solve::CanonicalInputData<DbInterner<'db>>;
+
+/// Every interned [`CanonicalInput`], kept whole: it derefs to its data.
+static CANONICAL_INPUTS: table::Values<CanonicalInputData<'static>> =
+    table::Values::new("canonical inputs");
+table::erase!(CanonicalInputData);
+
+/// A canonical goal, the solver's cache key: its row in [`CANONICAL_INPUTS`], which is never
+/// freed, so the search graph hashes and compares a `u32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct CanonicalInput<'db> {
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
+}
+
+const _: () = assert!(size_of::<Option<CanonicalInput<'static>>>() == 4);
+
+impl<'db> CanonicalInput<'db> {
+    #[inline]
+    pub fn new(data: CanonicalInputData<'db>) -> Self {
+        CanonicalInput { index: CANONICAL_INPUTS.intern(data), _db: PhantomData }
+    }
+}
+
+impl<'db> std::ops::Deref for CanonicalInput<'db> {
+    type Target = CanonicalInputData<'db>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        CANONICAL_INPUTS.get(self.index)
+    }
+}
+
+impl fmt::Debug for CanonicalInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+type ParamEnvCache<'db> = CanonicalParamEnvCache<DbInterner<'db>>;
+table::erase!(ParamEnvCache);
+
+/// Past this many entries a thread's [`PARAM_ENV_CACHE`] starts over, as nothing is evicted.
+const PARAM_ENV_CACHE_ENTRIES: usize = 1 << 14;
+
+thread_local! {
+    /// rustc's `canonical_param_env_cache`, one per thread. An entry is a function of its key
+    /// alone: a param env with no type or const inference variables, whose free regions all
+    /// become placeholders of the root universe, of interned values that are never freed. So
+    /// it holds for every interner and database of the process.
+    static PARAM_ENV_CACHE: std::cell::Cell<Option<Box<ParamEnvCache<'static>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 interned_slice!(
     CanonicalVarsStorage,
     CanonicalVarKinds,
@@ -476,10 +614,14 @@ interned_slice!(
     CanonicalVarKind<'static>
 );
 
-pub struct DepNodeIndex;
-
+/// A solved goal's answer, with what solving it read from the database (`None` when it read
+/// something no other query may take on, see [`tls_cache`]): a query taking the answer takes
+/// the reads too, as rustc's `get_tracked` does.
 #[derive(Debug)]
-pub struct Tracked<T: fmt::Debug + Clone>(T);
+pub struct Tracked<T: fmt::Debug + Clone> {
+    value: T,
+    reads: Option<blaze_query::db::Reads>,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct AllocId;
@@ -495,6 +637,10 @@ bitflags::bitflags! {
         const IS_PHANTOM_DATA = 1 << 3;
         const IS_MANUALLY_DROP = 1 << 4;
         const IS_BOX = 1 << 5;
+        /// A field of some variant is `unsafe` (`#![feature(unsafe_fields)]`).
+        const HAS_UNSAFE_FIELDS = 1 << 6;
+        /// `core::field::FieldRepresentingType`, what `field_of!` names.
+        const IS_FIELD_REPRESENTING_TYPE = 1 << 7;
     }
 }
 
@@ -508,7 +654,7 @@ enum AdtDefInner {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdtDef(AdtDefInner);
 
-const _: () = assert!(size_of::<AdtDef>() == 12);
+const _: () = assert!(size_of::<AdtDef>() == 8);
 
 impl AdtDef {
     pub fn new<'db>(def_id: AdtId, interner: DbInterner<'db>) -> Self {
@@ -526,8 +672,14 @@ impl AdtDef {
                 if data.flags.contains(StructFlags::IS_MANUALLY_DROP) {
                     flags.insert(AdtFlags::IS_MANUALLY_DROP);
                 }
+                if data.flags.contains(StructFlags::IS_FIELD_REPRESENTING_TYPE) {
+                    flags.insert(AdtFlags::IS_FIELD_REPRESENTING_TYPE);
+                }
                 if data.flags.contains(StructFlags::IS_BOX) {
                     flags.insert(AdtFlags::IS_BOX);
+                }
+                if data.flags.contains(StructFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
                 }
                 if data.flags.contains(StructFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
@@ -543,6 +695,9 @@ impl AdtDef {
                 if data.flags.contains(StructFlags::FUNDAMENTAL) {
                     flags.insert(AdtFlags::IS_FUNDAMENTAL);
                 }
+                if data.flags.contains(StructFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
+                }
                 if data.flags.contains(StructFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
                     if data.repr(db, id).is_some_and(|repr| repr.packed()) {
@@ -556,6 +711,9 @@ impl AdtDef {
                 let mut flags = AdtFlags::empty();
                 if data.flags.contains(EnumFlags::FUNDAMENTAL) {
                     flags.insert(AdtFlags::IS_FUNDAMENTAL);
+                }
+                if data.flags.contains(EnumFlags::HAS_UNSAFE_FIELDS) {
+                    flags.insert(AdtFlags::HAS_UNSAFE_FIELDS);
                 }
                 if data.flags.contains(EnumFlags::HAS_REPR) {
                     flags.insert(AdtFlags::HAS_REPR);
@@ -587,6 +745,23 @@ impl AdtDef {
         }
     }
 
+    /// The bits of what `new` found of the ADT's definition, for an interned type's row.
+    #[inline]
+    pub(super) fn flag_bits(self) -> u8 {
+        self.flags().bits()
+    }
+
+    /// The ADT `new` gave with these flag bits, `None` for bits it never sets.
+    #[inline]
+    pub(super) fn from_parts(id: AdtId, bits: u8) -> Option<AdtDef> {
+        let flags = AdtFlags::from_bits(bits)?;
+        Some(AdtDef(match id {
+            AdtId::StructId(id) => AdtDefInner::Struct { id, flags },
+            AdtId::UnionId(id) => AdtDefInner::Union { id, flags },
+            AdtId::EnumId(id) => AdtDefInner::Enum { id, flags },
+        }))
+    }
+
     #[inline]
     pub fn is_struct(self) -> bool {
         matches!(self.0, AdtDefInner::Struct { .. })
@@ -607,8 +782,14 @@ impl AdtDef {
         matches!(self.0, AdtDefInner::Struct { flags, .. } if flags.contains(AdtFlags::IS_BOX))
     }
 
+    /// rustc's `AdtDef::has_unsafe_fields`.
     #[inline]
-    pub fn repr(self, db: &dyn HirDatabase) -> ReprOptions {
+    pub fn has_unsafe_fields(self) -> bool {
+        self.flags().contains(AdtFlags::HAS_UNSAFE_FIELDS)
+    }
+
+    #[inline]
+    pub fn repr(self, db: &Db) -> ReprOptions {
         if self.flags().contains(AdtFlags::HAS_REPR) {
             AttrFlags::repr_assume_has(db, self.def_id()).unwrap_or_default()
         } else {
@@ -673,7 +854,8 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
             ),
         };
 
-        EarlyBinder::bind(tys)
+        // The field types are read out of stored binders, which hold no rigid alias.
+        EarlyBinder::bind_unchecked(tys)
     }
 
     fn sizedness_constraint(
@@ -681,10 +863,7 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
         interner: DbInterner<'db>,
         sizedness: SizedTraitKind,
     ) -> Option<EarlyBinder<DbInterner<'db>, Ty<'db>>> {
-        let tail_ty = self.struct_tail_ty(interner)?;
-        tail_ty
-            .map_bound(|tail_ty| sizedness_constraint_for_ty(interner, sizedness, tail_ty))
-            .transpose()
+        adt_sizedness_constraint(interner, self, sizedness)
     }
 
     fn destructor(self, interner: DbInterner<'db>) -> Option<AdtDestructorKind> {
@@ -693,19 +872,83 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
         })
     }
 
+    /// rustc's rule (`field_projections`): `FieldRepresentingType<Base, VARIANT, FIELD>` names
+    /// field `FIELD` of variant `VARIANT` of `Base`. A base other than an ADT or a tuple, or an
+    /// index not yet a value, answers `None`: the solver's builtin field candidates take only
+    /// those two bases.
     fn field_representing_type_info(
         self,
-        _interner: DbInterner<'db>,
-        _args: GenericArgs<'db>,
+        interner: DbInterner<'db>,
+        args: GenericArgs<'db>,
     ) -> Option<rustc_type_ir::FieldInfo<DbInterner<'db>>> {
-        // FIXME
-        None
+        if !self.flags().contains(AdtFlags::IS_FIELD_REPRESENTING_TYPE) {
+            return None;
+        }
+        let index = |i: usize| match args.const_at(i).kind() {
+            ConstKind::Value(value) => Some(
+                value
+                    .try_to_leaf()
+                    .expect("a `FieldRepresentingType` index is a `u32` leaf")
+                    .to_u32() as usize,
+            ),
+            _ => None,
+        };
+        let base = args.type_at(0);
+        let (variant_idx, field_idx) = (index(1)?, index(2)?);
+        let db = interner.db;
+        let (ty, variant, name) = match base.kind() {
+            TyKind::Adt(base_def, base_args) => {
+                let (variant_id, variant_name): (VariantId, _) = match base_def.def_id() {
+                    AdtId::StructId(id) if variant_idx == 0 => (id.into(), None),
+                    AdtId::UnionId(id) if variant_idx == 0 => (id.into(), None),
+                    AdtId::EnumId(id) => {
+                        let (name, &(variant, _)) = id
+                            .enum_variants(db)
+                            .variants
+                            .get_index(variant_idx)
+                            .unwrap_or_else(|| panic!("{base:?} has no variant {variant_idx}"));
+                        (variant.into(), Some(Symbol(name.symbol().clone()))) // clone: `FieldInfo` owns its names
+                    }
+                    _ => panic!("{base:?} has no variant {variant_idx}"),
+                };
+                let (_, field) = hir_def::signatures::VariantFields::of(db, variant_id)
+                    .fields()
+                    .iter()
+                    .nth(field_idx)
+                    .unwrap_or_else(|| panic!("variant {variant_idx} of {base:?} has no field {field_idx}"));
+                let (_, field_ty) = db
+                    .field_types(variant_id)
+                    .iter()
+                    .nth(field_idx)
+                    .expect("every field of a variant has a type");
+                let ty = field_ty.ty().instantiate(interner, base_args).skip_norm_wip();
+                (ty, variant_name, Symbol(field.name.symbol().clone())) // clone: `FieldInfo` owns its names
+            }
+            TyKind::Tuple(tys) => {
+                assert_eq!(variant_idx, 0, "a tuple has one variant, not {variant_idx}");
+                let ty = *tys
+                    .as_slice()
+                    .get(field_idx)
+                    .unwrap_or_else(|| panic!("{base:?} has no field {field_idx}"));
+                let name = hir_expand::name::Name::new_tuple_field(field_idx);
+                (ty, None, Symbol(name.symbol().clone())) // clone: `FieldInfo` owns its names
+            }
+            _ => return None,
+        };
+        Some(rustc_type_ir::FieldInfo {
+            base,
+            ty,
+            variant,
+            variant_idx: rustc_abi::VariantIdx::from_usize(variant_idx),
+            name,
+            field_idx: rustc_abi::FieldIdx::from_usize(field_idx),
+        })
     }
 }
 
 impl fmt::Debug for AdtDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        crate::with_attached_db(|db| match self.0 {
+        fmt_with_attached_db(f, "AdtDef", |db, f| match self.0 {
             AdtDefInner::Struct { id, .. } => {
                 let data = StructSignature::of(db, id);
                 f.write_str(data.name.as_str())
@@ -722,34 +965,22 @@ impl fmt::Debug for AdtDef {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct Features;
+/// A name, as `rustc_span::Symbol`: an item's (see [`Interner::item_name`]) or a keyword.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct Symbol(pub intern::Symbol);
 
-impl<'db> inherent::Features<DbInterner<'db>> for Features {
-    fn generic_const_exprs(self) -> bool {
-        false
-    }
+const _: () = assert!(size_of::<Symbol>() == size_of::<intern::Symbol>());
 
-    fn coroutine_clone(self) -> bool {
-        false
-    }
-
-    fn generic_const_args(self) -> bool {
-        false
-    }
-
-    fn feature_bound_holds_in_crate(self, _symbol: Symbol) -> bool {
-        false
-    }
+// SAFETY: a symbol holds no interned type, so there is nothing to visit.
+unsafe impl<V> GenericTypeVisitable<V> for Symbol {
+    #[inline]
+    fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, GenericTypeVisitable)]
-pub struct Symbol;
-
 impl<'db> inherent::Symbol<DbInterner<'db>> for Symbol {
-    fn is_kw_underscore_lifetime(self) -> bool {
-        false
-    }
+    const KW_UNDERSCORE_LIFETIME: Self = Symbol(sym::tick_underscore);
+    const KW_STATIC_LIFETIME: Self = Symbol(sym::tick_static);
+    const SYM_ANON: Self = Symbol(sym::anon);
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -765,30 +996,59 @@ impl std::ops::Deref for UnsizingParams {
 
 pub type PatternKind<'db> = rustc_type_ir::PatternKind<DbInterner<'db>>;
 
+/// Every interned [`Pattern`].
+static PATTERNS: table::Rows<PatternKind<'static>> = table::Rows::new("patterns", table::LAST_ROW);
+table::erase!(PatternKind);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Pattern<'db> {
-    interned: InternedRef<'db, PatternInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-struct PatternInterned(PatternKind<'static>);
-
-impl_internable!(gc; PatternInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Pattern<'static>>();
-};
+const _: () = assert!(size_of::<Option<Pattern<'static>>>() == 4);
+// A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
+const _: () = assert!(size_of::<PatternKind<'static>>() <= 48);
 
 impl<'db> Pattern<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: PatternKind<'db>) -> Self {
-        let kind = unsafe { std::mem::transmute::<PatternKind<'db>, PatternKind<'static>>(kind) };
-        Self { interned: Interned::new_gc(PatternInterned(kind)) }
+        Self::intern(kind)
     }
 
-    pub fn inner(&self) -> &PatternKind<'db> {
-        let inner = &self.interned.0;
-        unsafe { std::mem::transmute::<&PatternKind<'static>, &PatternKind<'db>>(inner) }
+    #[inline]
+    pub(super) fn intern(kind: PatternKind<'db>) -> Self {
+        Self::at(PATTERNS.intern(kind, || {
+            let (flags, binder) = pattern_flags(kind);
+            table::RowInfo { tag: persist::tag(&kind), flags, binder }
+        }))
+    }
+
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Pattern { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
+    }
+}
+
+/// The flags and outer exclusive binder of a pattern: those of the constants in it.
+fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIndex) {
+    match kind {
+        PatternKind::Range { start, end } => (
+            start.flags() | end.flags(),
+            start.outer_exclusive_binder().max(end.outer_exclusive_binder()),
+        ),
+        PatternKind::Or(pats) => pats.iter().fold(
+            (TypeFlags::empty(), rustc_type_ir::INNERMOST),
+            |(flags, binder), pat| {
+                (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
+            },
+        ),
+        PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
     }
 }
 
@@ -799,44 +1059,22 @@ impl<'db> std::fmt::Debug for Pattern<'db> {
 }
 
 impl<'db> Flags for Pattern<'db> {
+    #[inline]
     fn flags(&self) -> TypeFlags {
-        match self.inner() {
-            PatternKind::Range { start, end } => {
-                FlagComputation::for_const_kind(&start.kind()).flags
-                    | FlagComputation::for_const_kind(&end.kind()).flags
-            }
-            PatternKind::Or(pats) => {
-                let mut flags = pats.as_slice()[0].flags();
-                for pat in pats.as_slice()[1..].iter() {
-                    flags |= pat.flags();
-                }
-                flags
-            }
-            PatternKind::NotNull => TypeFlags::empty(),
-        }
+        PATTERNS.flags(self.index)
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        match self.inner() {
-            PatternKind::Range { start, end } => {
-                start.outer_exclusive_binder().max(end.outer_exclusive_binder())
-            }
-            PatternKind::Or(pats) => {
-                let mut idx = pats.as_slice()[0].outer_exclusive_binder();
-                for pat in pats.as_slice()[1..].iter() {
-                    idx = idx.max(pat.outer_exclusive_binder());
-                }
-                idx
-            }
-            PatternKind::NotNull => rustc_type_ir::INNERMOST,
-        }
+        PATTERNS.binder(self.index)
     }
 }
 
 impl<'db> rustc_type_ir::inherent::IntoKind for Pattern<'db> {
     type Kind = rustc_type_ir::PatternKind<DbInterner<'db>>;
+    #[inline]
     fn kind(self) -> Self::Kind {
-        *self.inner()
+        PATTERNS.kind(self.index)
     }
 }
 
@@ -849,9 +1087,11 @@ impl<'db> rustc_type_ir::TypeVisitable<DbInterner<'db>> for Pattern<'db> {
     }
 }
 
-impl<'db, V: WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Pattern<'db> {
+// SAFETY: the handle holds one value, its row's kind, which this visits whenever the visitor
+// asks to go into the row.
+unsafe impl<'db, V: WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Pattern<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(PATTERNS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }
@@ -952,7 +1192,7 @@ impl<'db> Interner for DbInterner<'db> {
     type CoroutineId = CoroutineIdWrapper<'db>;
     type AdtId = AdtIdWrapper;
     type ImplId = AnyImplId;
-    type UnevaluatedConstId = GeneralConstIdWrapper<'db>;
+    type AnonConstId = AnonConstIdWrapper<'db>;
     type TraitAssocTyId = TraitAssocTyId;
     type TraitAssocConstId = TraitAssocConstId;
     type TraitAssocTermId = TraitAssocTermId;
@@ -976,6 +1216,7 @@ impl<'db> Interner for DbInterner<'db> {
     type Term = Term<'db>;
 
     type BoundVarKinds = BoundVarKinds<'db>;
+    type TypingEnv = TypingEnv<'db>;
 
     type PredefinedOpaques = PredefinedOpaques<'db>;
 
@@ -1004,7 +1245,7 @@ impl<'db> Interner for DbInterner<'db> {
         ExternalConstraints::new(self, data)
     }
 
-    type DepNodeIndex = DepNodeIndex;
+    type DepNodeIndex = Option<blaze_query::db::Reads>;
 
     type Tracked<T: fmt::Debug + Clone> = Tracked<T>;
 
@@ -1021,17 +1262,19 @@ impl<'db> Interner for DbInterner<'db> {
     type PatList = PatList<'db>;
     type Safety = Safety;
 
-    type Const = Const<'db>;
     type ParamConst = ParamConst;
     type ValueConst = ValueConst<'db>;
     type ValTree = ValTree<'db>;
     type Consts = Consts<'db>;
     type ScalarInt = ScalarInt;
+    type Scalar = Scalar;
     type ExprConst = ExprConst;
 
-    type Region = Region<'db>;
     type EarlyParamRegion = EarlyParamRegion;
-    type LateParamRegion = LateParamRegion<'db>;
+    type LateParamRegionKind = LateParamRegionKind<'db>;
+
+    type InternedRegionKind = InternedRegion<'db>;
+    type InternedConstKind = InternedConst<'db>;
 
     type RegionAssumptions = RegionAssumptions<'db>;
 
@@ -1046,7 +1289,7 @@ impl<'db> Interner for DbInterner<'db> {
 
     type AdtDef = AdtDef;
 
-    type Features = Features;
+    type Features = Features<'db>;
 
     fn mk_args(self, args: &[Self::GenericArg]) -> Self::GenericArgs {
         GenericArgs::new_from_slice(args)
@@ -1065,38 +1308,60 @@ impl<'db> Interner for DbInterner<'db> {
     fn mk_tracked<T: fmt::Debug + Clone>(
         self,
         data: T,
-        _dep_node: Self::DepNodeIndex,
+        reads: Self::DepNodeIndex,
     ) -> Self::Tracked<T> {
-        Tracked(data)
+        Tracked { value: data, reads }
     }
 
     fn get_tracked<T: fmt::Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T {
-        tracked.0.clone()
+        match tracked.reads {
+            // From the shared cache: the query taking it reruns when the reads change, and so
+            // does any goal it is solving in a capture of its own, which takes them too.
+            Some(reads) => blaze_query::db::replay_reads(self.db, reads),
+            // From this query's own cache: the query made the reads itself, but a goal being
+            // captured now did not, and so must not be shared either.
+            None => blaze_query::db::unshareable_reads(self.db),
+        }
+        tracked.value.clone() // clone: `get_tracked` hands out an owned value; the solver's are handles
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
         // Every goal the solver computes runs in here, a nested goal inside its parent's. A
         // goal can take minutes of solving that asks the database nothing, so a cancelled one
         // is noticed here rather than at the next query.
-        salsa::Database::unwind_if_revision_cancelled(self.db);
-        (super::ensure_sufficient_stack(task), DepNodeIndex)
+        blaze_query::db::unwind_if_cancelled(self.db);
+        blaze_query::db::capture_reads(self.db, || super::ensure_sufficient_stack(task))
+    }
+
+    fn cache_scope(self, reads: &Self::DepNodeIndex) -> rustc_type_ir::search_graph::CacheScope {
+        // A goal is shared only with its reads, which `capture_reads` gives only when any
+        // query may replay them.
+        match reads {
+            Some(_) => rustc_type_ir::search_graph::CacheScope::Shared,
+            None => rustc_type_ir::search_graph::CacheScope::Query,
+        }
     }
 
     fn with_global_cache<R>(
         self,
-        f: impl FnOnce(&mut rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
+        scope: rustc_type_ir::search_graph::CacheScope,
+        f: impl FnOnce(&rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
     ) -> R {
-        // We make sure to reinit the cache when constructing the Interner.
-        tls_cache::borrow_assume_valid(self.db, self.solved, f)
+        match scope {
+            rustc_type_ir::search_graph::CacheScope::Shared => {
+                tls_cache::shared(self.db, self.krate, self.regions, f)
+            }
+            rustc_type_ir::search_graph::CacheScope::Query => {
+                tls_cache::of_query(self.db, self.solved, f)
+            }
+        }
     }
 
-    fn canonical_param_env_cache_get_or_insert<R>(
+    fn with_canonical_param_env_cache<R>(
         self,
-        _param_env: Self::ParamEnv,
-        f: impl FnOnce() -> rustc_type_ir::CanonicalParamEnvCacheEntry<Self>,
-        from_entry: impl FnOnce(&rustc_type_ir::CanonicalParamEnvCacheEntry<Self>) -> R,
+        f: impl FnOnce(&mut CanonicalParamEnvCache<Self>) -> R,
     ) -> R {
-        from_entry(&f())
+        with_param_env_cache(f)
     }
 
     fn assert_evaluation_is_concurrent(&self) {
@@ -1105,7 +1370,10 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn expand_abstract_consts<T: rustc_type_ir::TypeFoldable<Self>>(self, _: T) -> T {
-        unreachable!("only used by the old trait solver in rustc");
+        panic!(
+            "`#![feature(generic_const_exprs)]` relates abstract consts, which blaze does not \
+             build (rustc's `thir_abstract_const`)"
+        );
     }
 
     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf {
@@ -1122,14 +1390,8 @@ impl<'db> Interner for DbInterner<'db> {
                 return crate::variance::ctor_variances(self.db, def_id.into());
             }
             SolverDefId::EnumVariantId(def_id) => def_id.loc(self.db).parent.into(),
-            SolverDefId::InternedOpaqueTyId(_def_id) => {
-                // FIXME(next-solver): track variances
-                //
-                // We compute them based on the only `Ty` level info in rustc,
-                // move `variances_of_opaque` into `rustc_next_trait_solver` for reuse.
-                return VariancesOf::new_from_iter(
-                    (0..self.generics_of(def_id).count()).map(|_| Variance::Invariant),
-                );
+            SolverDefId::InternedOpaqueTyId(def_id) => {
+                return super::opaque_variances::variances_of_opaque(self, def_id);
             }
             SolverDefId::AdtId(def_id) => def_id.into(),
             SolverDefId::FunctionId(def_id) => def_id.into(),
@@ -1153,10 +1415,16 @@ impl<'db> Interner for DbInterner<'db> {
         match def_id {
             SolverDefId::TypeAliasId(id) => self.db().ty(id.into()),
             SolverDefId::AdtId(id) => self.db().ty(id.into()),
-            // FIXME(next-solver): This uses the types of `query mir_borrowck` in rustc.
-            //
-            // We currently always use the type from HIR typeck which ignores regions. This
-            // should be fine.
+            // An inherent alias's self type is equated with its impl's.
+            SolverDefId::ImplId(id) => self.db.impl_self_ty(id),
+            SolverDefId::BuiltinDeriveImplId(id) => crate::builtin_derive::impl_trait(self, id)
+                .map_bound(|trait_ref| trait_ref.self_ty()),
+            // `AliasConst::type_of`: a const's type, and an anonymous const's.
+            SolverDefId::ConstId(id) => self.db.value_ty(id.into()).unwrap(),
+            SolverDefId::StaticId(id) => self.db.value_ty(id.into()).unwrap(),
+            SolverDefId::AnonConstId(id) => id.loc(self.db).ty.get(),
+            // rustc reads `mir_borrowck`'s hidden type; HIR typeck's differs from it only in its
+            // regions, which this solver proves no constraint over.
             SolverDefId::InternedOpaqueTyId(def_id) => {
                 self.type_of_opaque_hir_typeck(def_id.into())
             }
@@ -1176,35 +1444,37 @@ impl<'db> Interner for DbInterner<'db> {
         AdtDef::new(def_id.0, self)
     }
 
-    fn alias_term_kind_from_def_id(self, def_id: SolverDefId<'db>) -> AliasTermKind<'db> {
-        match def_id {
-            SolverDefId::InternedOpaqueTyId(def_id) => {
-                AliasTermKind::OpaqueTy { def_id: def_id.into() }
-            }
-            SolverDefId::TypeAliasId(type_alias) => match type_alias.loc(self.db).container {
-                ItemContainerId::ImplId(impl_)
-                    if ImplSignature::of(self.db, impl_).target_trait.is_none() =>
-                {
-                    AliasTermKind::InherentTy { def_id: type_alias.into() }
-                }
-                ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_) => {
-                    AliasTermKind::ProjectionTy { def_id: type_alias.into() }
-                }
-                _ => AliasTermKind::FreeTy { def_id: type_alias.into() },
-            },
-            // rustc creates an `AnonConst` for consts, and evaluates them with CTFE (normalizing projections
-            // via selection, similar to ours `find_matching_impl()`, and not with the trait solver), so mimic it.
-            SolverDefId::ConstId(def_id) => {
-                AliasTermKind::UnevaluatedConst { def_id: GeneralConstIdWrapper(def_id.into()) }
-            }
-            SolverDefId::StaticId(def_id) => {
-                AliasTermKind::UnevaluatedConst { def_id: GeneralConstIdWrapper(def_id.into()) }
-            }
-            SolverDefId::AnonConstId(def_id) => {
-                AliasTermKind::UnevaluatedConst { def_id: GeneralConstIdWrapper(def_id.into()) }
-            }
-            _ => unimplemented!("Unexpected alias: {:?}", def_id),
-        }
+    /// hir-ty's spans name expressions and types within a body, none an item.
+    fn def_span(self, _def_id: Self::DefId) -> Self::Span {
+        Span::Dummy
+    }
+
+    /// No item is a `type const` (`min_generic_const_args`): every alias const is evaluated.
+    fn is_direct_const(self, _alias: AliasConstKind<Self>) -> bool {
+        false
+    }
+
+    /// `None`, so the solver evaluates the const (`evaluate_const`), as rustc does for a const
+    /// item that is no `type const`.
+    fn const_of_item(
+        self,
+        _alias: AliasConstKind<Self>,
+    ) -> Option<EarlyBinder<Self, rustc_type_ir::Const<Self>>> {
+        None
+    }
+
+    fn mk_ct_from_kind(self, kind: ConstKind<Self>) -> rustc_type_ir::Const<Self> {
+        rustc_type_ir::Const(InternedConst::intern(kind))
+    }
+
+    /// rustc's `-Zassumptions-on-binders`, off.
+    fn assumptions_on_binders(self) -> bool {
+        false
+    }
+
+    /// rustc's check that a rigid alias stays rigid when normalized again, off.
+    fn renormalize_rigid_aliases(self) -> bool {
+        false
     }
 
     fn trait_ref_and_own_args_for_alias(
@@ -1217,17 +1487,36 @@ impl<'db> Interner for DbInterner<'db> {
         (trait_ref, &args.as_slice()[trait_ref.args.len()..])
     }
 
-    fn check_args_compatible(self, def_id: Self::DefId, args: Self::GenericArgs) -> bool {
-        let generics = self.generics_of(def_id);
-        generics.count() == args.len()
-            && std::iter::zip(generics.iter(), args).all(|((param, _), arg)| {
-                matches!(
-                    (param, arg.kind()),
-                    (GenericParamId::LifetimeParamId(_), GenericArgKind::Lifetime(_))
-                        | (GenericParamId::TypeParamId(_), GenericArgKind::Type(_))
-                        | (GenericParamId::ConstParamId(_), GenericArgKind::Const(_))
-                )
-            })
+    /// An inherent alias in "Self form" (`InherentTy`, `InherentConstSelf`) has the self type
+    /// and then the item's own parameters; any other has its item's every parameter.
+    fn check_alias_term_args_compatible(
+        self,
+        term_kind: AliasTermKind<'db>,
+        args: Self::GenericArgs,
+    ) -> bool {
+        let generics = self.generics_of(alias_term_def_id(term_kind));
+        match term_kind {
+            AliasTermKind::InherentTy { .. } | AliasTermKind::InherentConstSelf { .. } => {
+                match args.as_slice() {
+                    [self_ty, own @ ..] => {
+                        matches!(self_ty.kind(), GenericArgKind::Type(_))
+                            && args_fit_params(generics.iter_own(), own)
+                    }
+                    [] => false,
+                }
+            }
+            _ => args_fit_params(generics.iter().map(|(param, _)| param), args.as_slice()),
+        }
+    }
+
+    fn debug_assert_alias_term_args_compatible(
+        self,
+        term_kind: AliasTermKind<'db>,
+        args: Self::GenericArgs,
+    ) {
+        if cfg!(debug_assertions) && !self.check_alias_term_args_compatible(term_kind, args) {
+            panic!("args {args:?} do not fit the alias {term_kind:?}");
+        }
     }
 
     fn debug_assert_args_compatible(self, _def_id: Self::DefId, _args: Self::GenericArgs) {}
@@ -1293,19 +1582,18 @@ impl<'db> Interner for DbInterner<'db> {
         self.recursion_limit as usize
     }
 
-    fn is_type_const(self, _def_id: Self::DefId) -> bool {
-        false
-    }
-
-    fn features(self) -> Features {
-        Features
+    fn features(self) -> Features<'db> {
+        self.features.expect(
+            "the solver asked for the crate's features of an interner without a crate \
+             (`DbInterner::new_no_crate`); solving needs `DbInterner::new_with`",
+        )
     }
 
     fn fn_sig(
         self,
         def_id: Self::FunctionId,
     ) -> EarlyBinder<Self, rustc_type_ir::Binder<Self, rustc_type_ir::FnSig<Self>>> {
-        self.db().callable_item_signature(def_id.0)
+        crate::lower::solver_fn_sig(self.db(), def_id.0)
     }
 
     fn coroutine_movability(self, def_id: Self::CoroutineId) -> rustc_ast_ir::Movability {
@@ -1370,21 +1658,21 @@ impl<'db> Interner for DbInterner<'db> {
         ItemBounds::of_solver_def(self.db, def_id).non_self_bounds()
     }
 
-    fn predicates_of(
+    fn clauses_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>> {
-        predicates_of(self.db, def_id).all_predicates()
+        generic_predicates_of(self.db, def_id).all_predicates()
     }
 
-    fn own_predicates_of(
+    fn own_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>> {
-        predicates_of(self.db, def_id).own_explicit_predicates()
+        generic_predicates_of(self.db, def_id).own_explicit_predicates()
     }
 
-    fn explicit_super_predicates_of(
+    fn explicit_super_clauses_of(
         self,
         def_id: Self::TraitId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>> {
@@ -1395,23 +1683,22 @@ impl<'db> Interner for DbInterner<'db> {
             })
     }
 
-    fn explicit_implied_predicates_of(
+    fn explicit_implied_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>> {
         fn is_ty_assoc_of_self(ty: Ty<'_>) -> bool {
             // FIXME: Is this correct wrt. combined kind of assoc type bounds, i.e. `where Self::Assoc: Trait<Assoc2: Trait>`
             // wrt. `Assoc2`, which we should exclude?
-            if let TyKind::Alias(alias @ AliasTy { kind: AliasTyKind::Projection { .. }, .. }) =
-                ty.kind()
-            {
-                is_ty_assoc_of_self(alias.self_ty())
-            } else {
-                is_ty_self(ty)
+            match ty.kind() {
+                TyKind::Alias(_, alias) if alias.kind.try_to_projection().is_some() => {
+                    is_ty_assoc_of_self(alias.self_ty())
+                }
+                _ => is_ty_self(ty),
             }
         }
 
-        let predicates = predicates_of(self.db, def_id);
+        let predicates = generic_predicates_of(self.db, def_id);
         let non_assoc_types = predicates
             .explicit_non_assoc_types_predicates()
             .skip_binder()
@@ -1420,7 +1707,10 @@ impl<'db> Interner for DbInterner<'db> {
             .explicit_assoc_types_predicates()
             .skip_binder()
             .filter(|p| is_clause_at_ty(p, is_ty_assoc_of_self));
-        EarlyBinder::bind(non_assoc_types.chain(assoc_types).map(|it| (it, Span::dummy())))
+        // Both halves are read out of one stored binder, which holds no rigid alias.
+        EarlyBinder::bind_unchecked(
+            non_assoc_types.chain(assoc_types).map(|it| (it, Span::dummy())),
+        )
     }
 
     fn impl_super_outlives(
@@ -1447,12 +1737,12 @@ impl<'db> Interner for DbInterner<'db> {
     > {
         let db = self.db();
         let of = |def: GenericDefId| {
-            crate::effects::effect_trait_refs(
+            either::Either::Left(crate::effects::effect_trait_refs(
                 crate::lower::const_conditions(db, def).skip_binder().iter().copied(),
-            )
-            .collect()
+            ))
         };
-        EarlyBinder::bind(match def_id {
+        // Every arm reads a stored binder, which holds no rigid alias.
+        EarlyBinder::bind_unchecked(match def_id {
             SolverDefId::FunctionId(it) => of(it.into()),
             SolverDefId::ImplId(it) => of(it.into()),
             SolverDefId::TraitId(it) => of(it.into()),
@@ -1462,15 +1752,20 @@ impl<'db> Interner for DbInterner<'db> {
             {
                 of(closure.loc(db).owner.generic_def(db))
             }
-            SolverDefId::BuiltinDeriveImplId(it) => {
-                crate::effects::builtin_derive_const_conditions(db, it)
-            }
-            _ => Vec::new(),
+            SolverDefId::BuiltinDeriveImplId(it) => either::Either::Right(
+                crate::effects::builtin_derive_const_conditions(db, it).into_iter(),
+            ),
+            _ => either::Either::Right(Default::default()),
         })
     }
 
-    fn has_target_features(self, _def_id: Self::FunctionId) -> bool {
-        false
+    /// rustc's `!codegen_fn_attrs(def_id).target_features.is_empty()`: a safe
+    /// `#[target_feature]` function implements no `Fn*` trait.
+    fn has_target_features(self, def_id: Self::FunctionId) -> bool {
+        match def_id.0 {
+            CallableDefId::FunctionId(id) => !AttrFlags::target_features(self.db, id).is_empty(),
+            CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => false,
+        }
     }
 
     fn require_projection_lang_item(
@@ -1525,6 +1820,8 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::BikeshedGuaranteedNoDrop => lang_items.BikeshedGuaranteedNoDrop,
             SolverTraitLangItem::TrivialClone => lang_items.TrivialClone,
             SolverTraitLangItem::Field => lang_items.Field,
+            SolverTraitLangItem::Freeze => lang_items.Freeze,
+            SolverTraitLangItem::TryAsDyn => lang_items.TryAsDyn,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -1535,6 +1832,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverAdtLangItem::Option => lang_items.Option.map(Into::into),
             SolverAdtLangItem::Poll => lang_items.Poll.map(Into::into),
             SolverAdtLangItem::DynMetadata => lang_items.DynMetadata.map(Into::into),
+            SolverAdtLangItem::OwnedBox => lang_items.OwnedBox.map(Into::into),
         };
         AdtIdWrapper(lang_item.expect("Lang item required but not found."))
     }
@@ -1581,13 +1879,9 @@ impl<'db> Interner for DbInterner<'db> {
             BikeshedGuaranteedNoDrop,
             FusedIterator,
             Field,
+            Freeze,
+            TryAsDyn,
         )
-    }
-
-    fn is_adt_lang_item(self, def_id: Self::AdtId, lang_item: SolverAdtLangItem) -> bool {
-        // FIXME: derive PartialEq on SolverTraitLangItem
-        self.as_adt_lang_item(def_id)
-            .map_or(false, |l| std::mem::discriminant(&l) == std::mem::discriminant(&lang_item))
     }
 
     fn as_projection_lang_item(
@@ -1643,6 +1937,8 @@ impl<'db> Interner for DbInterner<'db> {
             BikeshedGuaranteedNoDrop,
             FusedIterator,
             Field,
+            Freeze,
+            TryAsDyn,
         )
     }
 
@@ -1653,6 +1949,7 @@ impl<'db> Interner for DbInterner<'db> {
             Option,
             Poll,
             DynMetadata,
+            OwnedBox,
         )
     }
 
@@ -1665,10 +1962,11 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn for_each_relevant_impl<R: VisitorResult>(
         self,
-        trait_def_id: Self::TraitId,
-        self_ty: Self::Ty,
+        trait_ref: TraitRef<Self>,
         mut f: impl FnMut(Self::ImplId) -> R,
     ) -> R {
+        let trait_def_id = trait_ref.def_id;
+        let self_ty = trait_ref.self_ty();
         let krate = self.krate.expect("trait solving requires setting `DbInterner::krate`");
         let trait_block = trait_def_id.0.loc(self.db).container.block(self.db);
         let mut consider_impls_for_simplified_type = |simp: SimplifiedType<'_>| {
@@ -1695,7 +1993,7 @@ impl<'db> Interner for DbInterner<'db> {
                 module.block(self.db)
             });
             let in_block = type_block.is_some() || trait_block.is_some();
-            let mut seen = Vec::new();
+            let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
             let in_crates = TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
                 self.db,
                 krate,
@@ -1817,15 +2115,35 @@ impl<'db> Interner for DbInterner<'db> {
             // into the witness.
             TyKind::CoroutineWitness(..) => (),
 
+            // This is only for diagnostics and normally ty vars should be handled by the callers.
+            TyKind::Infer(InferTy::TyVar(_)) => {
+                let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
+                TraitImpls::for_each_crate_and_block(self.db, krate, trait_block, &mut |impls| {
+                    impls.for_trait_non_blanket(trait_def_id.0, |run| match run {
+                        Either::Left(run) => seen.extend(run.iter().map(|&it| AnyImplId::from(it))),
+                        Either::Right(run) => {
+                            seen.extend(run.iter().map(|&it| AnyImplId::from(it)))
+                        }
+                    });
+                });
+                // The impls of a block are among those of its crate as well as its own.
+                let mut visited: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
+                for impl_ in seen {
+                    if visited.contains(&impl_) {
+                        continue;
+                    }
+                    visited.push(impl_);
+                    try_visit!(f(impl_));
+                }
+            }
+
+            // These are used in diagnostics or in the old solver.
+            TyKind::Param(_) | TyKind::Bound(_, _) => (),
+
             // These variants should not exist as a self type.
-            TyKind::Infer(
-                InferTy::TyVar(_)
-                | InferTy::FreshTy(_)
-                | InferTy::FreshIntTy(_)
-                | InferTy::FreshFloatTy(_),
-            )
-            | TyKind::Param(_)
-            | TyKind::Bound(_, _) => panic!("unexpected self type: {self_ty:?}"),
+            TyKind::Infer(InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_)) => {
+                panic!("unexpected self type: {self_ty:?}")
+            }
         }
 
         self.for_each_blanket_impl(trait_def_id, f)
@@ -1843,7 +2161,7 @@ impl<'db> Interner for DbInterner<'db> {
 
         // The impls of a block are among those of its crate as well as its own, and the solver
         // takes a second copy for an ambiguity.
-        let mut seen = Vec::new();
+        let mut seen: smallvec::SmallVec<[hir_def::ImplId; 8]> = smallvec::SmallVec::new();
         try_visit!(TraitImpls::for_each_block(self.db, block, &mut |impls| {
             for &impl_ in impls.blanket_impls(trait_def_id.0) {
                 seen.push(impl_);
@@ -1859,9 +2177,21 @@ impl<'db> Interner for DbInterner<'db> {
         R::output()
     }
 
-    fn has_item_definition(self, _def_id: Self::ImplOrTraitAssocTermId) -> bool {
-        // FIXME(next-solver): should check if the associated item has a value.
-        true
+    /// rustc's `defaultness(def_id).has_value()`: an impl's item always has one, a trait's when
+    /// it gives a default.
+    fn has_item_definition(self, def_id: Self::ImplOrTraitAssocTermId) -> bool {
+        use hir_def::signatures::{ConstSignature, TypeAliasSignature};
+        let db = self.db;
+        match def_id.0 {
+            TermId::TypeAliasId(id) => match id.loc(db).container {
+                ItemContainerId::TraitId(_) => TypeAliasSignature::of(db, id).ty.is_some(),
+                _ => true,
+            },
+            TermId::ConstId(id) => match id.loc(db).container {
+                ItemContainerId::TraitId(_) => ConstSignature::of(db, id).has_body(),
+                _ => true,
+            },
+        }
     }
 
     fn impl_is_default(self, impl_def_id: Self::ImplId) -> bool {
@@ -1911,6 +2241,21 @@ impl<'db> Interner for DbInterner<'db> {
         trait_data.flags.contains(TraitFlags::ALIAS)
     }
 
+    fn trait_is_marker(self, trait_: Self::TraitId) -> bool {
+        AttrFlags::has_word(self.db, trait_.0.into(), "marker")
+    }
+
+    fn supertrait_def_ids(self, trait_: Self::TraitId) -> impl Iterator<Item = Self::TraitId> {
+        crate::utils::all_super_traits(self.db, trait_.0).iter().map(|&it| TraitIdWrapper(it))
+    }
+
+    fn is_fully_generic_for_reflection(self, impl_id: Self::ImplId) -> bool {
+        fully_generic_for_reflection(
+            self.impl_trait_ref(impl_id).skip_binder().args,
+            self.own_clauses_of(impl_id.into()).skip_binder(),
+        )
+    }
+
     fn trait_is_dyn_compatible(self, trait_: Self::TraitId) -> bool {
         crate::dyn_compatibility::dyn_compatibility(self.db(), trait_.0).is_none()
     }
@@ -1920,12 +2265,11 @@ impl<'db> Interner for DbInterner<'db> {
         trait_data.flags.contains(TraitFlags::FUNDAMENTAL)
     }
 
-    fn is_impl_trait_in_trait(self, _def_id: Self::DefId) -> bool {
-        // FIXME(next-solver)
-        false
+    fn delay_bug(self, _msg: impl ToString) -> Self::ErrorGuaranteed {
+        ErrorGuaranteed
     }
 
-    fn delay_bug(self, _msg: impl ToString) -> Self::ErrorGuaranteed {
+    fn span_delayed_bug(self, _span: Self::Span, _msg: impl ToString) -> Self::ErrorGuaranteed {
         ErrorGuaranteed
     }
 
@@ -2012,7 +2356,7 @@ impl<'db> Interner for DbInterner<'db> {
             interner: DbInterner<'db>,
             map: &'a mut FxIndexMap<BoundVar, BoundVariableKind<'db>>,
         }
-        impl<'db> BoundVarReplacerDelegate<'db> for Anonymize<'_, 'db> {
+        impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for Anonymize<'_, 'db> {
             fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
                 let entry = self.map.entry(br.var);
                 let index = entry.index();
@@ -2051,6 +2395,7 @@ impl<'db> Interner for DbInterner<'db> {
         let Ok(def_id) = InferBodyId::try_from(def_id) else {
             return SolverDefIds::default();
         };
+        // alloc: once per body's typing mode; `opaques::opaque_types_defined_by` fills a `Vec`
         let mut result = Vec::new();
         crate::opaques::opaque_types_defined_by(self.db, def_id, &mut result);
         SolverDefIds::new_from_slice(&result)
@@ -2062,6 +2407,7 @@ impl<'db> Interner for DbInterner<'db> {
         let Ok(def_id) = InferBodyId::try_from(def_id) else {
             return SolverDefIds::default();
         };
+        // alloc: once per body's typing mode; `opaques::opaque_types_defined_by` fills a `Vec`
         let mut result = Vec::new();
 
         crate::opaques::opaque_types_defined_by(db, def_id, &mut result);
@@ -2075,7 +2421,7 @@ impl<'db> Interner for DbInterner<'db> {
         return SolverDefIds::new_from_slice(&result);
 
         struct CoroutinesVisitor<'a, 'db> {
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             owner: InferBodyId<'db>,
             store: &'db ExpressionStore,
             coroutines: &'a mut Vec<SolverDefId<'db>>,
@@ -2088,7 +2434,7 @@ impl<'db> Interner for DbInterner<'db> {
                         kind @ (hir_def::hir::ClosureKind::Coroutine { .. }
                         | hir_def::hir::ClosureKind::OldCoroutine(_)),
                     ..
-                } = self.store[expr]
+                } = self.store.expr(expr)
                 {
                     let coroutine = InternedCoroutineId::new(
                         self.db,
@@ -2107,9 +2453,22 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    fn alias_has_const_conditions(self, _def_id: Self::DefId) -> bool {
-        // FIXME(next-solver)
-        false
+    fn alias_has_const_conditions(self, def_id: Self::DefId) -> bool {
+        // rustc's `is_conditionally_const` on an alias: an associated type of a const trait or
+        // impl, and an RPIT of a const fn; a free alias, a TAIT and an inherent associated type
+        // never are.
+        match def_id {
+            SolverDefId::TypeAliasId(alias) => {
+                crate::effects::is_conditionally_const(self.db, alias.into())
+            }
+            SolverDefId::InternedOpaqueTyId(opaque) => match opaque.loc(self.db) {
+                crate::ImplTraitId::ReturnTypeImplTrait(func, _) => {
+                    crate::effects::fn_is_const(self.db, func)
+                }
+                crate::ImplTraitId::TypeAliasImplTrait(..) => false,
+            },
+            _ => false,
+        }
     }
 
     fn explicit_implied_const_bounds(
@@ -2119,15 +2478,27 @@ impl<'db> Interner for DbInterner<'db> {
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
-        // A trait's `[const]` supertraits. FIXME: an associated type's `[const]` item bounds.
-        let SolverDefId::TraitId(trait_) = def_id else { return EarlyBinder::bind(Vec::new()) };
-        let conditions = crate::lower::const_conditions(self.db(), trait_.into()).skip_binder();
-        EarlyBinder::bind(
-            crate::effects::effect_trait_refs(conditions.iter().copied())
-                .filter(|it| {
+        let (conditions, trait_) = match def_id {
+            SolverDefId::TraitId(trait_) => {
+                (crate::lower::const_conditions(self.db(), trait_.into()).skip_binder(), Some(trait_))
+            }
+            SolverDefId::TypeAliasId(alias) => {
+                (crate::lower::implied_const_bounds(self.db(), alias.into()).skip_binder(), None)
+            }
+            SolverDefId::InternedOpaqueTyId(opaque) => {
+                (crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(), None)
+            }
+            _ => (&[][..], None),
+        };
+        // A trait's `[const]` supertraits are its conditions on `Self`; an alias's bounds keep
+        // their own self type, the projection or opaque. Read out of a stored binder, which holds
+        // no rigid alias.
+        EarlyBinder::bind_unchecked(
+            crate::effects::effect_trait_refs(conditions.iter().copied()).filter(move |it| {
+                trait_.is_none_or(|trait_| {
                     it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
                 })
-                .collect(),
+            }),
         )
     }
 
@@ -2144,9 +2515,9 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn opt_alias_variances(
         self,
-        _kind: impl Into<AliasTermKind<'db>>,
+        kind: impl Into<AliasTermKind<'db>>,
     ) -> Option<Self::VariancesOf> {
-        None
+        super::opaque_variances::opt_alias_variances(self, kind.into())
     }
 
     fn opaque_of_impl(
@@ -2176,19 +2547,16 @@ impl<'db> Interner for DbInterner<'db> {
         };
         match hidden_type {
             Some(hidden_type) => hidden_type.get(),
-            None => EarlyBinder::bind(Ty::new_error(self, ErrorGuaranteed)),
+            None => EarlyBinder::bind(self, Ty::new_error(self, ErrorGuaranteed)),
         }
     }
 
     fn coroutine_hidden_types(
         self,
-        _def_id: Self::CoroutineId,
+        def_id: Self::CoroutineId,
     ) -> EarlyBinder<Self, Binder<'db, CoroutineWitnessTypes<Self>>> {
-        // FIXME: Actually implement this.
-        EarlyBinder::bind(Binder::dummy(CoroutineWitnessTypes {
-            types: Tys::default(),
-            assumptions: RegionAssumptions::default(),
-        }))
+        let witnesses = self.db.coroutine_witnesses(def_id.0);
+        EarlyBinder::bind(self, bind_witness_regions(self, witnesses.iter().map(StoredTy::as_ref)))
     }
 
     fn is_default_trait(self, def_id: Self::TraitId) -> bool {
@@ -2203,8 +2571,13 @@ impl<'db> Interner for DbInterner<'db> {
         TraitSignature::of(self.db(), trait_.0).flags.contains(TraitFlags::UNSAFE)
     }
 
-    fn impl_self_is_guaranteed_unsized(self, _def_id: Self::ImplId) -> bool {
-        false
+    fn impl_self_is_guaranteed_unsized(self, def_id: Self::ImplId) -> bool {
+        match def_id {
+            AnyImplId::ImplId(id) => impl_self_is_guaranteed_unsized(self.db, id),
+            AnyImplId::BuiltinDeriveImplId(_) => {
+                unreachable!("a builtin derive's trait has no associated item for it to miss")
+            }
+        }
     }
 
     fn impl_specializes(
@@ -2231,9 +2604,9 @@ impl<'db> Interner for DbInterner<'db> {
     }
     fn evaluate_root_goal_for_proof_tree_raw(
         self,
-        canonical_goal: rustc_type_ir::solve::CanonicalInput<Self>,
+        canonical_goal: Self::CanonicalInput,
         root_depth: usize,
-    ) -> (rustc_type_ir::solve::QueryResult<Self>, Self::Probe) {
+    ) -> (QueryResult<Self>, Self::Probe, RequiredDepth) {
         rustc_next_trait_solver::solve::evaluate_root_goal_for_proof_tree_raw_provider::<
             SolverContext<'db>,
             Self,
@@ -2247,48 +2620,175 @@ impl<'db> Interner for DbInterner<'db> {
         )
     }
 
-    fn const_of_item(self, def_id: Self::DefId) -> rustc_type_ir::EarlyBinder<Self, Self::Const> {
-        let id = match def_id {
-            SolverDefId::StaticId(id) => id.into(),
-            SolverDefId::ConstId(id) => id.into(),
-            _ => unreachable!(),
-        };
-        EarlyBinder::bind(Const::new_unevaluated(
-            self,
-            UnevaluatedConst { def: GeneralConstIdWrapper(id), args: GenericArgs::empty() },
-        ))
-    }
-
-    fn anon_const_kind(self, _def_id: Self::DefId) -> rustc_type_ir::AnonConstKind {
-        // FIXME
-        rustc_type_ir::AnonConstKind::GCE
-    }
-
-    fn alias_ty_kind_from_def_id(self, def_id: Self::DefId) -> AliasTyKind<'db> {
-        match def_id {
-            SolverDefId::TypeAliasId(type_alias) => match type_alias.loc(self.db).container {
-                ItemContainerId::ExternBlockId(_) | ItemContainerId::ModuleId(_) => {
-                    AliasTyKind::Free { def_id: type_alias.into() }
-                }
-                ItemContainerId::ImplId(_) => AliasTyKind::Inherent { def_id: type_alias.into() },
-                ItemContainerId::TraitId(_) => {
-                    AliasTyKind::Projection { def_id: type_alias.into() }
-                }
-            },
-            SolverDefId::InternedOpaqueTyId(def_id) => {
-                AliasTyKind::Opaque { def_id: def_id.into() }
-            }
-            _ => unreachable!(),
-        }
-    }
-
     fn closure_is_const(self, def_id: Self::ClosureId) -> bool {
         crate::effects::closure_is_const(self.db(), def_id.0)
     }
 
-    fn item_name(self, _item_index: Self::DefId) -> Self::Symbol {
-        Symbol
+    /// The item's name; `'_` for an item without one (an impl, closure, coroutine, opaque or
+    /// anonymous const), which `BoundRegionKind::get_name` reads as no name.
+    fn item_name(self, item: Self::DefId) -> Self::Symbol {
+        use hir_def::signatures::{
+            ConstSignature, FunctionSignature, StaticSignature, TypeAliasSignature,
+        };
+
+        let db = self.db;
+        let name = match item {
+            SolverDefId::AdtId(AdtId::StructId(id)) | SolverDefId::Ctor(Ctor::Struct(id)) => {
+                Some(*StructSignature::of(db, id).name.symbol())
+            }
+            SolverDefId::AdtId(AdtId::EnumId(id)) => Some(*EnumSignature::of(db, id).name.symbol()),
+            SolverDefId::AdtId(AdtId::UnionId(id)) => {
+                Some(*UnionSignature::of(db, id).name.symbol())
+            }
+            SolverDefId::ConstId(id) => {
+                ConstSignature::of(db, id).name.as_ref().map(|it| *it.symbol())
+            }
+            SolverDefId::FunctionId(id) => Some(*FunctionSignature::of(db, id).name.symbol()),
+            SolverDefId::StaticId(id) => Some(*StaticSignature::of(db, id).name.symbol()),
+            SolverDefId::TraitId(id) => Some(*TraitSignature::of(db, id).name.symbol()),
+            SolverDefId::TypeAliasId(id) => Some(*TypeAliasSignature::of(db, id).name.symbol()),
+            SolverDefId::EnumVariantId(id) | SolverDefId::Ctor(Ctor::Enum(id)) => {
+                id.loc(db).parent.enum_variants(db).variant_name_by_id(id).map(|it| *it.symbol())
+            }
+            SolverDefId::ImplId(_)
+            | SolverDefId::BuiltinDeriveImplId(_)
+            | SolverDefId::AnonConstId(_)
+            | SolverDefId::InternedClosureId(_)
+            | SolverDefId::InternedCoroutineId(_)
+            | SolverDefId::InternedCoroutineClosureId(_)
+            | SolverDefId::InternedOpaqueTyId(_) => None,
+        };
+        Symbol(name.unwrap_or(sym::tick_underscore))
     }
+
+    #[inline]
+    fn get_re_static_lifetime(self) -> rustc_type_ir::Region<Self> {
+        self.default_types().regions.statik
+    }
+
+    #[inline]
+    fn intern_re_var(self, vid: RegionVid) -> rustc_type_ir::Region<Self> {
+        self.intern_region(RegionKind::ReVar(vid))
+    }
+
+    #[inline]
+    fn intern_region(self, kind: RegionKind<Self>) -> rustc_type_ir::Region<Self> {
+        rustc_type_ir::Region(InternedRegion::intern(kind))
+    }
+
+    #[inline]
+    fn intern_bound_region(
+        self,
+        debruijn: DebruijnIndex,
+        bound_region: BoundRegion<'db>,
+    ) -> rustc_type_ir::Region<Self> {
+        self.intern_region(RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), bound_region))
+    }
+
+    #[inline]
+    fn intern_canonical_bound(self, var: BoundVar) -> rustc_type_ir::Region<Self> {
+        self.intern_region(RegionKind::ReBound(
+            BoundVarIndexKind::Canonical,
+            BoundRegion { var, kind: BoundRegionKind::Anon },
+        ))
+    }
+
+    #[inline]
+    fn intern_valtree(self, kind: ValTreeKind<Self>) -> Self::ValTree {
+        ValTree::new(kind)
+    }
+
+    type CanonicalInput = CanonicalInput<'db>;
+
+    #[inline]
+    fn mk_canonical_input(self, data: CanonicalInputData<'db>) -> Self::CanonicalInput {
+        CanonicalInput::new(data)
+    }
+
+    /// rustc's `ValTree::zst`: an aggregate of no fields.
+    #[inline]
+    fn const_zst(self) -> Self::ValTree {
+        ValTree::zst()
+    }
+}
+
+/// rustc's `coroutine_hidden_types` over `mir_coroutine_witnesses`: the witness types under one
+/// binder, each free region erased (rustc's `erase_regions`) and then replaced by an anonymous
+/// bound region of its own, numbered in the order they are met; regions bound inside a witness
+/// stay. `assumptions` stays empty: rustc fills it (`compute_assumptions`) only for the old
+/// trait solver under `-Zhigher-ranked-assumptions`, and neither the new solver nor blaze reads
+/// it.
+pub(super) fn bind_witness_regions<'db>(
+    interner: DbInterner<'db>,
+    witnesses: impl Iterator<Item = Ty<'db>>,
+) -> Binder<'db, CoroutineWitnessTypes<DbInterner<'db>>> {
+    let mut vars = 0usize;
+    let types = Tys::new_from_iter(witnesses.map(|ty| {
+        rustc_type_ir::fold_regions(interner, ty, |region, debruijn| {
+            assert!(
+                !matches!(
+                    region.kind(),
+                    RegionKind::ReBound(..) | RegionKind::ReVar(_) | RegionKind::RePlaceholder(_)
+                ),
+                "a coroutine witness holds the region {region:?}, which MIR never keeps"
+            );
+            let var = BoundVar::from_usize(vars);
+            vars += 1;
+            Region::new_anon_bound(interner, debruijn, var)
+        })
+    }));
+    let anon = BoundVariableKind::Region(BoundRegionKind::Anon);
+    Binder::bind_with_vars(
+        CoroutineWitnessTypes { types, assumptions: RegionAssumptions::default() },
+        BoundVarKinds::new_from_iter(std::iter::repeat_n(anon, vars)),
+    )
+}
+
+/// rustc's `impl_self_is_guaranteed_unsized` (rustc_ty_utils): the struct tail of the impl's
+/// self type, each alias structurally normalized on the way (`struct_tail_raw`), is `dyn`, a
+/// slice or `str`. Its own interner, as rustc's is a query of its own: the solve here shares no
+/// cache with the goal that asked.
+fn impl_self_is_guaranteed_unsized(db: &Db, impl_id: hir_def::ImplId) -> bool {
+    use crate::next_solver::{
+        infer::{DbInternerInferExt, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    let interner = DbInterner::new_with(db, impl_id.krate(db));
+    let infcx = interner.infer_ctxt().build(rustc_type_ir::TypingMode::non_body_analysis());
+    let mut ocx = ObligationCtxt::new(&infcx);
+    let cause = ObligationCause::dummy();
+    let param_env = crate::lower::trait_environment(db, GenericDefId::ImplId(impl_id));
+    let mut ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    let limit = interner.recursion_limit();
+    for iteration in 0.. {
+        // Past the limit rustc reports it and the tail is an error type.
+        if iteration > limit {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::Adt(adt, args) => {
+                let AdtId::StructId(id) = adt.def_id() else { break };
+                let Some(field) = db.field_types(id.into()).values().next_back() else { break };
+                ty = field.ty().instantiate(interner, args).skip_norm_wip();
+            }
+            TyKind::Tuple(tys) => match tys.as_slice().last() {
+                Some(&last) => ty = last,
+                None => break,
+            },
+            TyKind::Pat(inner, _) => ty = inner,
+            TyKind::Alias(..) => {
+                let normalized = ocx
+                    .structurally_normalize_ty(&cause, param_env, ty)
+                    .unwrap_or_else(|_| Ty::new_error(interner, ErrorGuaranteed));
+                if normalized == ty {
+                    break;
+                }
+                ty = normalized;
+            }
+            _ => break,
+        }
+    }
+    matches!(ty.kind(), TyKind::Dynamic(..) | TyKind::Slice(_) | TyKind::Str)
 }
 
 fn is_ty_self(ty: Ty<'_>) -> bool {
@@ -2307,6 +2807,75 @@ fn is_clause_at_ty(p: &Clause<'_>, filter: impl FnOnce(Ty<'_>) -> bool) -> bool 
         ClauseKind::HostEffect(it) => filter(it.self_ty()),
         _ => false,
     }
+}
+
+/// rustc's rule for `TypingMode::Reflection`, which ignores lifetimes: an impl whose header has
+/// `args` is generic over every lifetime the header names, each a parameter of its own, and
+/// its where clauses constrain none of them (name no free region, `'static` included).
+fn fully_generic_for_reflection<'db>(
+    args: GenericArgs<'db>,
+    clauses: impl IntoIterator<Item = Clause<'db>>,
+) -> bool {
+    let mut params: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
+    let header_generic = args.iter().all(|arg| {
+        arg.walk().all(|arg| match arg.kind() {
+            GenericArgKind::Lifetime(region) => match region.kind() {
+                RegionKind::ReEarlyParam(param) if !params.contains(&param.index) => {
+                    params.push(param.index);
+                    true
+                }
+                RegionKind::ReBound(..) => true,
+                _ => false,
+            },
+            GenericArgKind::Type(_) | GenericArgKind::Const(_) => true,
+        })
+    });
+    header_generic && clauses.into_iter().all(|clause| !clause.has_free_regions())
+}
+
+/// Runs `f` on this thread's [`PARAM_ENV_CACHE`], taken out while `f` runs, so a call within
+/// it gets a cache of its own.
+fn with_param_env_cache<'db, R>(f: impl FnOnce(&mut ParamEnvCache<'db>) -> R) -> R {
+    let mut cache = PARAM_ENV_CACHE.take().unwrap_or_default();
+    if cache.0.len() >= PARAM_ENV_CACHE_ENTRIES {
+        cache.0.clear();
+    }
+    let result = f(table::unerase_mut::<ParamEnvCache<'db>>(&mut cache));
+    PARAM_ENV_CACHE.set(Some(cache));
+    result
+}
+
+/// The item an alias names.
+fn alias_term_def_id(kind: AliasTermKind<'_>) -> SolverDefId<'_> {
+    match kind {
+        AliasTermKind::ProjectionTy { def_id } => def_id.into(),
+        AliasTermKind::InherentTy { def_id } => def_id.into(),
+        AliasTermKind::OpaqueTy { def_id } => def_id.into(),
+        AliasTermKind::FreeTy { def_id } => def_id.into(),
+        AliasTermKind::AnonConst { def_id } => def_id.into(),
+        AliasTermKind::ProjectionConst { def_id } => def_id.into(),
+        AliasTermKind::FreeConst { def_id } => def_id.into(),
+        AliasTermKind::InherentConstSelf { def_id }
+        | AliasTermKind::InherentConstImpl { def_id } => def_id.into(),
+    }
+}
+
+/// Whether `args` are one of each of `params`, in order and of its kind.
+fn args_fit_params(
+    params: impl IntoIterator<Item = GenericParamId>,
+    args: &[GenericArg<'_>],
+) -> bool {
+    let mut args = args.iter();
+    params.into_iter().all(|param| {
+        args.next().is_some_and(|arg| {
+            matches!(
+                (param, arg.kind()),
+                (GenericParamId::LifetimeParamId(_), GenericArgKind::Lifetime(_))
+                    | (GenericParamId::TypeParamId(_), GenericArgKind::Type(_))
+                    | (GenericParamId::ConstParamId(_), GenericArgKind::Const(_))
+            )
+        })
+    }) && args.next().is_none()
 }
 
 impl<'db> DbInterner<'db> {
@@ -2342,7 +2911,7 @@ impl<'db> DbInterner<'db> {
     pub fn replace_escaping_bound_vars_uncached<T: rustc_type_ir::TypeFoldable<DbInterner<'db>>>(
         self,
         value: T,
-        delegate: impl BoundVarReplacerDelegate<'db>,
+        delegate: impl BoundVarReplacerDelegate<DbInterner<'db>>,
     ) -> T {
         if !value.has_escaping_bound_vars() {
             value
@@ -2355,7 +2924,7 @@ impl<'db> DbInterner<'db> {
     pub fn replace_bound_vars_uncached<T: rustc_type_ir::TypeFoldable<DbInterner<'db>>>(
         self,
         value: Binder<'db, T>,
-        delegate: impl BoundVarReplacerDelegate<'db>,
+        delegate: impl BoundVarReplacerDelegate<DbInterner<'db>>,
     ) -> T {
         self.replace_escaping_bound_vars_uncached(value.skip_binder(), delegate)
     }
@@ -2376,7 +2945,10 @@ impl<'db> DbInterner<'db> {
             inputs_and_output: Tys::new_from_iter(
                 inputs.into_iter().chain(std::iter::once(output)),
             ),
-            fn_sig_kind: FnSigKind::new(abi, safety, c_variadic),
+            fn_sig_kind: FnSigKind::default()
+                .set_abi(abi)
+                .set_safety(safety)
+                .set_c_variadic(c_variadic),
         }
     }
 
@@ -2389,8 +2961,8 @@ impl<'db> DbInterner<'db> {
     }
 }
 
-fn predicates_of<'db>(
-    db: &'db dyn HirDatabase,
+fn generic_predicates_of<'db>(
+    db: &'db Db,
     def_id: SolverDefId<'db>,
 ) -> &'db GenericPredicates {
     match def_id {
@@ -2438,7 +3010,9 @@ macro_rules! TrivialTypeTraversalImpls {
                 }
             }
 
-            impl<V> rustc_type_ir::GenericTypeVisitable<V> for $ty {
+            // SAFETY: every type listed holds ids and plain data, no interned type, so there
+            // is nothing to visit.
+            unsafe impl<V> rustc_type_ir::GenericTypeVisitable<V> for $ty {
                 #[inline]
                 fn generic_visit_with(&self, _visitor: &mut V) {}
             }
@@ -2469,7 +3043,7 @@ TrivialTypeTraversalImpls! {
     InherentAssocTermId,
     OpaqueTyIdWrapper<'_>,
     AnyImplId,
-    GeneralConstIdWrapper<'_>,
+    AnonConstIdWrapper<'_>,
     Safety,
     Span,
     ParamConst,
@@ -2482,92 +3056,85 @@ TrivialTypeTraversalImpls! {
 mod tls_db {
     use std::{cell::Cell, ptr::NonNull};
 
-    use crate::db::HirDatabase;
+    use base_db::Db;
 
     struct Attached {
-        database: Cell<Option<NonNull<dyn HirDatabase>>>,
+        database: Cell<Option<NonNull<Db>>>,
     }
 
     impl Attached {
+        /// Attaches `db` for `op`, unless it is attached already. The slot is looked up again
+        /// on return, never kept: a job that waits inside `op` may resume on another thread,
+        /// with its database carried there ([`carry_attached`]).
         #[inline]
-        fn attach<R>(&self, db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
-            struct DbGuard<'s> {
-                state: Option<&'s Attached>,
+        fn attach<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+            struct DbGuard {
+                set: bool,
             }
 
-            impl<'s> DbGuard<'s> {
-                #[inline]
-                fn new(attached: &'s Attached, db: &dyn HirDatabase) -> Self {
-                    match attached.database.get() {
-                        Some(current_db) => {
-                            let new_db = NonNull::from(db);
-                            if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
-                                panic!(
-                                    "Cannot change attached database. This is likely a bug.\n\
-                                    If this is not a bug, you can use `attach_db_allow_change()`."
-                                );
-                            }
-                            Self { state: None }
-                        }
-                        None => {
-                            // Otherwise, set the database.
-                            attached.database.set(Some(NonNull::from(db)));
-                            Self { state: Some(attached) }
-                        }
-                    }
-                }
-            }
-
-            impl Drop for DbGuard<'_> {
+            impl Drop for DbGuard {
                 #[inline]
                 fn drop(&mut self) {
-                    // Reset database to null if we did anything in `DbGuard::new`.
-                    if let Some(attached) = self.state {
-                        attached.database.set(None);
+                    if self.set {
+                        replace_attached(None);
                     }
                 }
             }
 
-            let _guard = DbGuard::new(self, db);
-            super::tls_cache::reinit_cache(db);
+            let new_db = NonNull::from(db);
+            let set = match attached() {
+                Some(current_db) => {
+                    if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
+                        panic!(
+                            "Cannot change attached database. This is likely a bug.\n\
+                            If this is not a bug, you can use `attach_db_allow_change()`."
+                        );
+                    }
+                    false
+                }
+                None => {
+                    replace_attached(Some(new_db));
+                    true
+                }
+            };
+            let _guard = DbGuard { set };
             op()
         }
 
+        /// Attaches `db` for `op` in place of the one attached, as [`Attached::attach`] does.
         #[inline]
-        fn attach_allow_change<R>(&self, db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
-            struct DbGuard<'s> {
-                state: &'s Attached,
-                prev: Option<NonNull<dyn HirDatabase>>,
+        fn attach_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+            struct DbGuard {
+                prev: Option<NonNull<Db>>,
             }
 
-            impl<'s> DbGuard<'s> {
-                #[inline]
-                fn new(attached: &'s Attached, db: &dyn HirDatabase) -> Self {
-                    let prev = attached.database.replace(Some(NonNull::from(db)));
-                    Self { state: attached, prev }
-                }
-            }
-
-            impl Drop for DbGuard<'_> {
+            impl Drop for DbGuard {
                 #[inline]
                 fn drop(&mut self) {
-                    self.state.database.set(self.prev);
-                    if let Some(prev) = self.prev {
-                        super::tls_cache::reinit_cache(unsafe { prev.as_ref() });
-                    }
+                    replace_attached(self.prev);
                 }
             }
 
-            let _guard = DbGuard::new(self, db);
-            super::tls_cache::reinit_cache(db);
+            let _guard = DbGuard { prev: replace_attached(Some(NonNull::from(db))) };
             op()
         }
 
+        /// `op` with the attached database, or `None` with none attached.
         #[inline]
-        fn with<R>(&self, op: impl FnOnce(&dyn HirDatabase) -> R) -> R {
-            let db = self.database.get().expect("Tried to use attached db, but no db is attached");
+        fn try_with<R>(op: impl FnOnce(&Db) -> R) -> Option<R> {
+            let db = attached()?;
+            // SAFETY: as in `with`.
+            Some(op(unsafe { db.as_ref() }))
+        }
 
-            // SAFETY: The db is attached, so it must be valid.
+        #[inline]
+        fn with<R>(op: impl FnOnce(&Db) -> R) -> R {
+            let db = attached().expect("Tried to use attached db, but no db is attached");
+
+            // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
+            // which borrows the database for that long and puts back the pointer before it on
+            // drop, unwinding too; `op` runs within, and the reference it gets, of a lifetime
+            // of its own, cannot leave it.
             op(unsafe { db.as_ref() })
         }
     }
@@ -2576,243 +3143,1681 @@ mod tls_db {
         static GLOBAL_DB: Attached = const { Attached { database: Cell::new(None) } };
     }
 
+    // Every access to `GLOBAL_DB` is one of these two, never inlined: a job that waits between
+    // two of them may resume on another thread, and an inlined access may reuse the address of
+    // the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
+    /// The database attached on this thread.
+    #[inline(never)]
+    fn attached() -> Option<NonNull<Db>> {
+        GLOBAL_DB.try_with(|it| it.database.get()).ok().flatten()
+    }
+
+    /// Attaches `db` on this thread: the one attached before.
+    #[inline(never)]
+    fn replace_attached(db: Option<NonNull<Db>>) -> Option<NonNull<Db>> {
+        GLOBAL_DB.with(|it| it.database.replace(db))
+    }
+
+    /// Moves the switching job's attached database off this thread: a job that attached one
+    /// and waits on a query may resume on another thread, and reads it there.
+    fn take_attached() -> usize {
+        GLOBAL_DB
+            .try_with(|it| it.database.replace(None))
+            .ok()
+            .flatten()
+            .map_or(0, |db| db.as_ptr().expose_provenance())
+    }
+
+    /// Puts back what [`take_attached`] took, on a thread with no database attached.
+    fn put_attached(taken: usize) {
+        assert!(attached().is_none(), "a job's database put back on a thread with one attached");
+        replace_attached(NonNull::new(std::ptr::with_exposed_provenance_mut(taken)));
+    }
+
+    /// Carries the attached database with each job on a fiber ([`blaze_query::carry`]), from
+    /// the first attach on, before any job that attached one can wait.
     #[inline]
-    pub fn attach_db<R>(db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
-        GLOBAL_DB.with(|global_db| global_db.attach(db, op))
+    fn carry_attached() {
+        static CARRIED: std::sync::Once = std::sync::Once::new();
+        CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried { take: take_attached, put: put_attached }));
     }
 
     #[inline]
-    pub fn attach_db_allow_change<R>(db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
-        GLOBAL_DB.with(|global_db| global_db.attach_allow_change(db, op))
+    pub fn attach_db<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+        carry_attached();
+        Attached::attach(db, op)
     }
 
     #[inline]
-    pub fn with_attached_db<R>(op: impl FnOnce(&dyn HirDatabase) -> R) -> R {
-        GLOBAL_DB.with(
-            #[inline]
-            |a| a.with(op),
-        )
+    pub fn attach_db_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+        carry_attached();
+        Attached::attach_allow_change(db, op)
     }
-}
 
-mod tls_cache {
-    use crate::db::HirDatabase;
+    #[inline]
+    pub fn with_attached_db<R>(op: impl FnOnce(&Db) -> R) -> R {
+        Attached::with(op)
+    }
 
-    use super::DbInterner;
-    use base_db::Nonce;
-    use rustc_type_ir::search_graph::GlobalCache;
-    use salsa::Revision;
-    use std::{
-        cell::RefCell,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-
-    /// Names the cache of one interner. A solved goal is only good for where it was solved:
-    /// which impls there are to pick from depends on the crate, and what was read to solve it
-    /// was noted for the query that asked. Another query handed the answer would not be run
-    /// again when an impl changes. An interner does not leave the query that made it, so the
-    /// goals solved through it are kept for it alone.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) struct Solved(u64);
-
-    impl Solved {
-        pub(super) fn new() -> Solved {
-            // Not one count per thread: an interner can be sent to another.
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            Solved(NEXT.fetch_add(1, Ordering::Relaxed))
+    /// Formats `what` with the attached database, or as `what` alone when none is attached:
+    /// a `Debug` that panics inside a panic's message or a drop while unwinding aborts the
+    /// process (rule 15), so formatting never needs one.
+    pub fn fmt_with_attached_db(
+        f: &mut std::fmt::Formatter<'_>,
+        what: &str,
+        op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        let written = Attached::try_with(|db| op(db, &mut *f));
+        match written {
+            Some(written) => written,
+            None => write!(f, "<{what}: no database attached>"),
         }
     }
 
-    /// How many interners have their goals kept: the ones of the queries under way, as a
-    /// query that solves makes one and asks other queries that make theirs.
-    const KEPT: usize = 32;
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
 
-    struct Cache {
-        /// The last to be used is the last.
-        caches: Vec<(Solved, GlobalCache<DbInterner<'static>>)>,
-        revision: Revision,
-        db_nonce: Nonce,
-    }
+        use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
+        use hir_expand::fixture;
 
-    impl Cache {
-        fn default() -> Cache {
-            Cache { caches: Vec::new(), revision: Revision::max(), db_nonce: Nonce::invalid() }
+        fn attached_here() -> Option<usize> {
+            super::attached().map(|it| it.as_ptr().addr())
         }
 
-        fn of(&mut self, solved: Solved) -> &mut GlobalCache<DbInterner<'static>> {
-            match self.caches.iter().rposition(|it| it.0 == solved) {
-                Some(at) => {
-                    let found = self.caches.remove(at);
-                    self.caches.push(found);
-                }
-                None => {
-                    if self.caches.len() == KEPT {
-                        self.caches.remove(0);
+        /// A `Debug` of an ADT with no database attached says so and never panics: one in a
+        /// panic's message, or in a drop while unwinding, would abort the process.
+        #[test]
+        fn an_adt_formatted_with_no_database_attached_says_so() {
+            use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
+
+            let db = fixture::db("struct S;").into_db();
+            let adt = super::attach_db(&db, || {
+                let mut found = None;
+                for &krate in base_db::all_crates(&db).iter() {
+                    for (_, module) in crate_def_map(&db, krate).modules(&db) {
+                        for (name, per_ns) in module.scope(&db).entries() {
+                            if name.as_str() == "S"
+                                && let Some(ModuleDefId::AdtId(AdtId::StructId(it))) = per_ns.take_types()
+                            {
+                                found = Some(it);
+                            }
+                        }
                     }
-                    self.caches.push((solved, GlobalCache::default()));
+                }
+                let id = found.expect("struct `S`");
+                let adt = super::super::AdtDef::new(id.into(), super::super::DbInterner::new_no_crate(&db));
+                assert_eq!(format!("{adt:?}"), "S", "named with a database attached");
+                adt
+            });
+            assert_eq!(attached_here(), None);
+            assert_eq!(format!("{adt:?}"), "<AdtDef: no database attached>");
+        }
+
+        /// Two jobs on a pool of two workers each attach a database of their own (one with
+        /// `attach_db`, one with `attach_db_allow_change`) and wait for a key, parked where they
+        /// ran and resumed on whichever worker is free, so often on the one where the other
+        /// attached its own. After the wait each sees its own; once it detached it, the worker
+        /// it ended on has none, and so does every worker the jobs after them run on.
+        #[test]
+        fn jobs_with_databases_of_their_own_park_and_resume_on_each_others_workers() {
+            let dbs = [(), ()].map(|()| Arc::new(fixture::db("fn f() {}").into_db()));
+            let pool = Pool::new(&Topology::flat(2), false).unwrap();
+            let flights = Arc::new(Flights::<u32>::new());
+            for round in 0..50u32 {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&round.to_le_bytes());
+                let key = Key(bytes);
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
+                let waiting = Arc::new(AtomicUsize::new(0));
+                let held = flights.get_or_run(key, || {
+                    for (at, db) in dbs.iter().enumerate() {
+                        let (db, flights, waiting) = (db.clone(), flights.clone(), waiting.clone());
+                        let tx = tx.clone();
+                        pool.submit(
+                            None,
+                            move || {
+                                let mine = Arc::as_ptr(&db).addr();
+                                let wait = || {
+                                    assert_eq!(attached_here(), Some(mine));
+                                    waiting.fetch_add(1, Ordering::SeqCst);
+                                    assert_eq!(flights.get_or_run(key, || panic!("the test holds the key")), Ok(round));
+                                    assert_eq!(attached_here(), Some(mine), "a job resumed with another's database");
+                                };
+                                if at == 0 {
+                                    super::attach_db(&db, wait);
+                                } else {
+                                    super::attach_db_allow_change(&db, wait);
+                                }
+                                assert_eq!(attached_here(), None, "a worker kept a database its job detached");
+                            },
+                            move |it| _ = tx.send(it.map_err(|_| format!("job {at} of round {round} panicked"))),
+                        );
+                    }
+                    blaze_graph::spin::SpinWait::within("both jobs to wait", std::time::Duration::from_secs(60), || {
+                        waiting.load(Ordering::SeqCst) >= 2
+                    });
+                    blaze_graph::spin::busy(std::time::Duration::from_millis(2));
+                    Ok(round)
+                });
+                assert_eq!(held, Ok(round));
+                for _ in 0..2 {
+                    rx.recv().unwrap().unwrap();
+                }
+                for _ in 0..4 {
+                    let tx = tx.clone();
+                    pool.submit(
+                        None,
+                        || assert_eq!(attached_here(), None, "a job began with a database attached"),
+                        move |it| _ = tx.send(it.map_err(|_| format!("a later job of round {round} panicked"))),
+                    );
+                }
+                for _ in 0..4 {
+                    rx.recv().unwrap().unwrap();
                 }
             }
-            &mut self.caches.last_mut().expect("one was just put there").1
+        }
+
+        /// On a pool of one worker, whose own slot a job that ended left holding a database, two
+        /// jobs each attach a database of their own (one with `attach_db`, one with
+        /// `attach_db_allow_change`) and park, the first on one key and the second on another;
+        /// the keys end in the other order, so they resume on the one thread swapped. Each sees
+        /// its own after its wait, and the jobs after them none.
+        #[test]
+        fn jobs_with_databases_of_their_own_resume_on_one_thread_in_swapped_order() {
+            let dbs = [(), (), ()].map(|()| Arc::new(fixture::db("fn f() {}").into_db()));
+            let pool = Pool::new(&Topology::flat(1), false).unwrap();
+            let flights = Arc::new(Flights::<u32>::new());
+            let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
+                pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
+                rx.recv().unwrap().unwrap();
+            };
+            super::carry_attached();
+            {
+                let left = Arc::as_ptr(&dbs[2]).addr();
+                run("the job leaving its worker a database", Box::new(move || super::put_attached(left)));
+            }
+            for round in 0..20u32 {
+                let [first, second] = [2 * round, 2 * round + 1].map(|at| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..4].copy_from_slice(&at.to_le_bytes());
+                    bytes[4] = 1;
+                    Key(bytes)
+                });
+                let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
+                let waiting = Arc::new(AtomicUsize::new(0));
+                let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let parked = |count: usize| {
+                    while waiting.load(Ordering::SeqCst) < count {
+                        std::thread::yield_now();
+                    }
+                    run("the probe", Box::new(|| ()));
+                };
+                let job = |mine: u32, on: Key| {
+                    let (db, flights, waiting, order, tx) =
+                        (dbs[mine as usize].clone(), flights.clone(), waiting.clone(), order.clone(), tx.clone());
+                    pool.submit(
+                        None,
+                        move || {
+                            let own = Arc::as_ptr(&db).addr();
+                            let wait = || {
+                                assert_eq!(attached_here(), Some(own), "a job came on to another's database");
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                                assert_eq!(flights.get_or_run(on, || panic!("the test holds the key")), Ok(round));
+                                assert_eq!(attached_here(), Some(own), "a job resumed with another's database");
+                            };
+                            if mine == 0 {
+                                super::attach_db(&db, wait);
+                            } else {
+                                super::attach_db_allow_change(&db, wait);
+                            }
+                            assert_eq!(attached_here(), None, "a job kept a database it detached");
+                            order.lock().push(mine);
+                            mine
+                        },
+                        move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
+                    );
+                };
+                let held = flights.get_or_run(first, || {
+                    job(0, first);
+                    parked(1);
+                    let held = flights.get_or_run(second, || {
+                        job(1, second);
+                        parked(2);
+                        Ok(round)
+                    });
+                    assert_eq!(held, Ok(round));
+                    while order.lock().len() < 1 {
+                        std::thread::yield_now();
+                    }
+                    Ok(round)
+                });
+                assert_eq!(held, Ok(round));
+                let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+                ended.sort();
+                assert_eq!(ended, [Ok(0), Ok(1)]);
+                assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
+                run(
+                    "a later job",
+                    Box::new(|| assert_eq!(attached_here(), None, "a job came on to its worker's database")),
+                );
+            }
+        }
+
+        /// A job that attached the database and switched out (its carried thread-locals taken,
+        /// as the scheduler takes them when it parks the job) sees it again on the thread it
+        /// resumes on, which had none; the thread it left has none meanwhile.
+        #[test]
+        fn the_attached_database_moves_with_a_job_to_another_thread() {
+            let db = fixture::db("fn f() {}").into_db();
+            let here = std::ptr::from_ref(&db).addr();
+            super::attach_db(&db, || {
+                let taken = super::take_attached();
+                assert_eq!(taken, here);
+                assert!(super::attached().is_none(), "the thread it left has none");
+                let (seen, back) = std::thread::spawn(move || {
+                    super::put_attached(taken);
+                    let seen = super::with_attached_db(|it| std::ptr::from_ref(it).addr());
+                    (seen, super::take_attached())
+                })
+                .join()
+                .unwrap();
+                assert_eq!(seen, here, "the job sees its database on the thread it resumed on");
+                super::put_attached(back);
+                assert_eq!(super::with_attached_db(|it| std::ptr::from_ref(it).addr()), here);
+            });
+        }
+    }
+}
+
+mod tls_cache;
+
+/// The tables every interned kind is an index into (`docs/v2/plan/design/data.md`, "types"). A
+/// value is written once, at a row that never moves and is never freed, so its index names it
+/// for the life of the process, on every thread, in every revision. A value is found by its
+/// hash in an [`Index`]: no lock on a hit, the lock of one shard of the index to add a value.
+///
+/// - [`Rows`], for the kinds with a structure (types, regions, constants, predicates,
+///   patterns): the flags and outer exclusive binder in hot columns, a `u8` tag column, and the
+///   kind whole (its children `u32` indices, so it is 4 to 32 bytes) in a cold one.
+/// - [`Lists`], for the lists (generic arguments, types, clauses, ...): a start and a length
+///   column over one column of items (CSR), and for clauses the flags of the whole list.
+/// - [`Values`], for the kinds whose API hands out references (value trees, allocations, the
+///   solver's external constraints).
+///
+/// This module is the next solver's unsafe code (`docs/v2/plan/design/unsafe.md`), behind a
+/// safe API: no row number, however made, reads memory not written. A read checks its row was
+/// published (one acquire load of the row's tag, length or mark, which the table's own lookups
+/// skip, as the index names only published rows), and a kind goes in and out under its
+/// `'static` name through [`Erase`]. What unsafe buys here, against the safe version of each:
+///
+    /// - a column of `OnceLock<T>` segments: a state word per value (a type row's 4-byte flags
+    ///   and binder take 8 each) and a state check on every read of every column;
+/// - an index whose grown tables are reference counted rather than leaked: a shared counter
+///   written on every hit, which every core then contends on.
+///
+/// The safe reference version of each table is in the tests, which check both give the same
+/// rows and values.
+pub(crate) mod table {
+    use std::{
+        alloc::{self, Layout},
+        hash::{BuildHasher, Hash},
+        marker::PhantomData,
+        mem::ManuallyDrop,
+        num::NonZeroU32,
+        ptr,
+        sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    };
+
+    use blaze_hash::FixedState;
+    use parking_lot::{Mutex, MutexGuard};
+    use rustc_type_ir::{DebruijnIndex, TypeFlags};
+
+    /// A type a table holds under its `'static` name: a table is a `static`, and every value in
+    /// it lives as long.
+    ///
+    /// # Safety
+    ///
+    /// `Self::Static` is `Self` with each lifetime `'static`, so the two have one layout and the
+    /// same valid values; and `Self`'s lifetime bounds no reference in it (the next solver's
+    /// `'db` marks its handles, which are `PhantomData` and an index), so a value stays valid
+    /// however long the table keeps it.
+    pub(crate) unsafe trait Erase: Sized {
+        type Static: 'static;
+    }
+
+    /// [`Erase`] for each `$name<'db>`, a kind whose one lifetime is `'db`.
+    macro_rules! erase {
+        ($($name:ident),+ $(,)?) => {$(
+            // SAFETY: `$name<'static>` is `$name<'db>` with its one lifetime `'static`, which
+            // bounds no reference in it (`table::Erase`).
+            unsafe impl<'db> $crate::next_solver::interner::table::Erase for $name<'db> {
+                type Static = $name<'static>;
+            }
+        )+};
+    }
+    pub(crate) use erase;
+
+    /// What [`Erase`] promises of `V`, checked where the compiler can.
+    #[inline(always)]
+    fn same_layout<V: Erase>() {
+        const {
+            assert!(size_of::<V>() == size_of::<V::Static>());
+            assert!(align_of::<V>() == align_of::<V::Static>());
         }
     }
 
-    thread_local! {
-        static GLOBAL_CACHE: RefCell<Cache> = RefCell::new(Cache::default());
+    /// `value` under its `'static` name.
+    #[inline]
+    fn to_static<V: Erase>(value: V) -> V::Static {
+        same_layout::<V>();
+        let value = ManuallyDrop::new(value);
+        // SAFETY: `V::Static` is `V` but for lifetimes (`Erase`), and `value` is moved, not
+        // dropped.
+        unsafe { ptr::read(ptr::from_ref::<V>(&value).cast::<V::Static>()) }
     }
 
-    pub(super) fn reinit_cache(db: &dyn HirDatabase) {
-        GLOBAL_CACHE.with_borrow_mut(|handle| {
-            let (db_nonce, revision) = db.nonce_and_revision();
-            if handle.revision != revision || db_nonce != handle.db_nonce {
-                *handle = Cache { caches: Vec::new(), revision, db_nonce };
-            }
-        })
+    /// `value` under its name for the caller's lifetime.
+    #[inline]
+    fn unerase<V: Erase>(value: V::Static) -> V {
+        same_layout::<V>();
+        let value = ManuallyDrop::new(value);
+        // SAFETY: as in `to_static`.
+        unsafe { ptr::read(ptr::from_ref::<V::Static>(&value).cast::<V>()) }
     }
 
     #[inline]
-    pub(super) fn borrow_assume_valid<'db, T>(
-        db: &'db dyn HirDatabase,
-        solved: Solved,
-        f: impl FnOnce(&mut GlobalCache<DbInterner<'db>>) -> T,
-    ) -> T {
-        if cfg!(debug_assertions) {
-            let get_state =
-                || GLOBAL_CACHE.with_borrow(|handle| (handle.db_nonce, handle.revision));
-            let old_state = get_state();
-            reinit_cache(db);
-            let new_state = get_state();
-            assert_eq!(old_state, new_state, "you assumed the cache is valid!");
+    fn unerase_ref<V: Erase>(value: &V::Static) -> &V {
+        same_layout::<V>();
+        // SAFETY: as in `to_static`; the reference keeps its lifetime.
+        unsafe { &*ptr::from_ref(value).cast::<V>() }
+    }
+
+    /// `value` under its name for the caller's lifetime, to change in place: what is written
+    /// through it is a `V`, whose lifetimes bound no reference in it, so it stays valid kept
+    /// under the `'static` name.
+    #[inline]
+    pub(crate) fn unerase_mut<V: Erase>(value: &mut V::Static) -> &mut V {
+        same_layout::<V>();
+        // SAFETY: as in `to_static`; the reference keeps its lifetime, and a `V` written through it
+        // is a valid `V::Static` (`Erase`).
+        unsafe { &mut *ptr::from_mut(value).cast::<V>() }
+    }
+
+    #[inline]
+    fn erase_slice<V: Erase>(items: &[V]) -> &[V::Static] {
+        same_layout::<V>();
+        // SAFETY: as in `to_static`, for each item; the slice keeps its lifetime.
+        unsafe { std::slice::from_raw_parts(items.as_ptr().cast(), items.len()) }
+    }
+
+    #[inline]
+    fn unerase_slice<V: Erase>(items: &[V::Static]) -> &[V] {
+        same_layout::<V>();
+        // SAFETY: as in `erase_slice`.
+        unsafe { std::slice::from_raw_parts(items.as_ptr().cast(), items.len()) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn never_written(what: &str, row: NonZeroU32) -> ! {
+        panic!("row {row} of the {what} table was never written")
+    }
+
+    /// The last row of a table whose rows a [`GenericArg`](super::GenericArg) packs with a
+    /// 2-bit tag in a `u32`: types, regions and constants, and so every table, alike.
+    pub(crate) const LAST_ROW: u32 = (1 << 30) - 1;
+
+    /// The first segment of a column holds 2^10 values, each next one twice as many, so 23
+    /// segments hold all 2^32 positions.
+    const FIRST_BITS: u32 = 10;
+    const SEGMENTS: usize = 23;
+
+    const fn segment_start(segment: usize) -> u64 {
+        ((1 << segment) - 1) << FIRST_BITS
+    }
+
+    const fn segment_len(segment: usize) -> u64 {
+        1 << (FIRST_BITS as usize + segment)
+    }
+
+    /// The segment position `at` is in, and where in it.
+    #[inline]
+    fn locate(at: u64) -> (usize, usize) {
+        let segment = (63 - ((at >> FIRST_BITS) + 1).leading_zeros()) as usize;
+        (segment, (at - segment_start(segment)) as usize)
+    }
+
+    /// Values by position, appended and never moved or freed: segments allocated on first use,
+    /// so a reference into one lives as long as the column (a `static`). Each position is
+    /// written once, by the thread that claimed it, before anything naming it is published by
+    /// a release store that the reader's acquire load pairs with.
+    struct Column<T> {
+        segments: [AtomicPtr<T>; SEGMENTS],
+        /// Whether segments start zeroed: a column of atomics that are read before they are
+        /// written.
+        zeroed: bool,
+        of: PhantomData<T>,
+    }
+
+    impl<T> Column<T> {
+        const fn new() -> Column<T> {
+            Column::with(false)
         }
 
-        GLOBAL_CACHE.with_borrow_mut(|handle| {
-            // SAFETY: No idea
-            f(unsafe {
-                std::mem::transmute::<
-                    &mut GlobalCache<DbInterner<'static>>,
-                    &mut GlobalCache<DbInterner<'db>>,
-                >(handle.of(solved))
-            })
-        })
+        /// A column of atomics whose all-zero bits are a value: what a position not written yet
+        /// reads as.
+        const fn zeroed() -> Column<T> {
+            Column::with(true)
+        }
+
+        const fn with(zeroed: bool) -> Column<T> {
+            Column {
+                segments: [const { AtomicPtr::new(ptr::null_mut()) }; SEGMENTS],
+                zeroed,
+                of: PhantomData,
+            }
+        }
+
+        /// Where segment `segment` starts, allocated if this is its first use.
+        #[inline]
+        fn segment(&self, segment: usize) -> *mut T {
+            let base = self.segments[segment].load(Ordering::Acquire);
+            if base.is_null() { self.allocate(segment) } else { base }
+        }
+
+        #[cold]
+        fn allocate(&self, segment: usize) -> *mut T {
+            let layout = Layout::array::<T>(segment_len(segment) as usize)
+                .expect("a column segment fits in memory");
+            assert!(layout.size() > 0, "a column of zero-sized values");
+            let fresh = match self.zeroed {
+                // SAFETY: `layout` is not zero-sized (asserted above).
+                true => unsafe { alloc::alloc_zeroed(layout) },
+                // SAFETY: as above.
+                false => unsafe { alloc::alloc(layout) },
+            }
+            .cast::<T>();
+            if fresh.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            match self.segments[segment].compare_exchange(
+                ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(won) => {
+                    // SAFETY: `fresh` was allocated above with `layout` and lost the race to be
+                    // published, so no other thread has seen it.
+                    unsafe { alloc::dealloc(fresh.cast(), layout) };
+                    won
+                }
+            }
+        }
+
+        /// Writes `value` at `at`.
+        ///
+        /// # Safety
+        ///
+        /// `at` is below 2^32, claimed by the calling thread alone and not written yet.
+        #[inline]
+        unsafe fn write(&self, at: u64, value: T) {
+            let (segment, offset) = locate(at);
+            let slot = self.segment(segment).wrapping_add(offset);
+            // SAFETY: `slot` is in its segment (`locate`), allocated and never freed, and the
+            // caller alone writes it (the caller's precondition).
+            unsafe { slot.write(value) }
+        }
+
+        /// The value at `at`, of a zeroed column, its segment allocated if need be: a position
+        /// to store into.
+        ///
+        /// # Safety
+        ///
+        /// The column is [`Column::zeroed`] and `T` is an atomic, and `at` is below 2^32.
+        #[inline]
+        unsafe fn place(&self, at: u64) -> &T {
+            let (segment, offset) = locate(at);
+            let slot = self.segment(segment).wrapping_add(offset);
+            // SAFETY: `slot` is in its segment, allocated zeroed, which is a `T` (the caller's
+            // precondition), and never freed.
+            unsafe { &*slot }
+        }
+
+        /// The value at `at` of a zeroed column, `None` when its segment was never allocated
+        /// (so it was never written).
+        ///
+        /// # Safety
+        ///
+        /// As [`Column::place`].
+        #[inline]
+        unsafe fn peek(&self, at: u64) -> Option<&T> {
+            let (segment, offset) = locate(at);
+            let base = self.segments[segment].load(Ordering::Acquire);
+            // SAFETY: as in `place`; the acquire load pairs with `allocate`'s publication of
+            // the zeroed segment.
+            (!base.is_null()).then(|| unsafe { &*base.wrapping_add(offset) })
+        }
+
+        /// The value at `at`.
+        ///
+        /// # Safety
+        ///
+        /// `at` was written (or the column is zeroed and `T` an atomic), and that write happens
+        /// before this call. The write allocated the segment, so the relaxed load of its address
+        /// sees it.
+        #[inline]
+        unsafe fn get(&self, at: u64) -> &T {
+            let (segment, offset) = locate(at);
+            let slot = self.segments[segment].load(Ordering::Relaxed).wrapping_add(offset);
+            // SAFETY: the caller's precondition; segments are never freed.
+            unsafe { &*slot }
+        }
+
+        /// The `len` values from `start`.
+        ///
+        /// # Safety
+        ///
+        /// As [`Column::get`] for each of them, and they are in one segment, as [`Run::claim`]
+        /// gives them.
+        #[inline]
+        unsafe fn slice(&self, start: u64, len: usize) -> &[T] {
+            if len == 0 {
+                return &[];
+            }
+            let (segment, offset) = locate(start);
+            let first = self.segments[segment].load(Ordering::Relaxed).wrapping_add(offset);
+            // SAFETY: the caller's precondition.
+            unsafe { std::slice::from_raw_parts(first, len) }
+        }
     }
 
-    /// Clears the thread-local trait solver cache.
+    /// A column whose positions are claimed in runs that never cross a segment, so that a run
+    /// is one slice.
+    struct Run<T> {
+        column: Column<T>,
+        next: AtomicU64,
+    }
+
+    impl<T> Run<T> {
+        const fn new() -> Run<T> {
+            Run { column: Column::new(), next: AtomicU64::new(0) }
+        }
+
+        /// Claims `len` (not 0) positions in a row for the calling thread, returning the first.
+        /// Panics, naming `what`, past 2^32 positions.
+        fn claim(&self, len: u64, what: &str) -> u64 {
+            let mut next = self.next.load(Ordering::Relaxed);
+            loop {
+                let start = fit(next, len);
+                let end = start + len;
+                assert!(end <= 1 << 32, "the {what} table holds 2^32 words");
+                match self.next.compare_exchange_weak(
+                    next,
+                    end,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return start,
+                    Err(now) => next = now,
+                }
+            }
+        }
+    }
+
+    /// The first position from `from` where `len` positions in a row are in one segment, or
+    /// 2^32 when there is none.
+    fn fit(from: u64, len: u64) -> u64 {
+        let (mut segment, offset) = locate(from);
+        if offset as u64 + len <= segment_len(segment) {
+            return from;
+        }
+        loop {
+            segment += 1;
+            if segment >= SEGMENTS {
+                return 1 << 32;
+            }
+            if len <= segment_len(segment) {
+                return segment_start(segment);
+            }
+        }
+    }
+
+    /// The hash a value is found by: its hash, mixed (murmur's finalizer) so that its top
+    /// bits pick a shard and its low half a slot.
+    #[inline]
+    fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
+        let hash = FixedState.hash_one(value);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^ (hash >> 33)
+    }
+
+    const SHARD_BITS: u32 = 6;
+    const SHARDS: usize = 1 << SHARD_BITS;
+    const FIRST_SLOTS: usize = 16;
+
+    /// Finds a row by its value's hash: 64 shards, each an open-addressed table (linear
+    /// probing, at most half full) of `u64` slots, each the low half of a hash and a row (0 for
+    /// an empty slot, as rows start at 1). A hit is loads alone; an insert takes the shard's
+    /// lock, looks again and publishes the row with a release store. A table that grows is
+    /// copied and the old one leaked, as a reader may still be probing it.
     ///
-    /// Should be called before getting memory usage estimations, as the solver cache
-    /// is per-revision and usually should be excluded from estimations.
-    pub fn clear_tls_solver_cache() {
-        GLOBAL_CACHE.with_borrow_mut(|handle| *handle = Cache::default());
-    }
-}
-
-impl WorldExposer for intern::GarbageCollector {
-    fn on_interned<T: intern::Internable>(
-        &mut self,
-        interned: InternedRef<'_, T>,
-    ) -> ControlFlow<()> {
-        self.mark_interned_alive(interned)
+    /// A hit is three dependent loads: the shard's word, the slot, and the row's kind for the
+    /// equality check. The shard's word holds the table's address and the log2 of its length
+    /// together, so there is no header between the shard and the slot.
+    struct Index {
+        shards: [Shard; SHARDS],
     }
 
-    fn on_interned_slice<T: intern::SliceInternable>(
-        &mut self,
-        interned: InternedSliceRef<'_, T>,
-    ) -> ControlFlow<()> {
-        self.mark_interned_slice_alive(interned)
+    struct Shard {
+        /// Null until the first insert, then [`Slots::packed`]; replaced only by the holder of
+        /// `len`.
+        slots: AtomicPtr<AtomicU64>,
+        /// How many rows the shard holds.
+        len: Mutex<usize>,
     }
-}
 
-/// # Safety
-///
-/// This cannot be called if there are some not-yet-recorded type values. Generally, if you have a mutable
-/// reference to the database, and there are no other database - then you can call this safely, but you
-/// also need to make sure to maintain the mutable reference while this is running.
-pub unsafe fn collect_ty_garbage() {
-    let mut gc = intern::GarbageCollector::default();
+    /// A shard's table is aligned to this, so the low bits of its address hold the log2 of its
+    /// length (at most 34, as a table holds at most twice 2^32 rows).
+    const SLOTS_ALIGN: usize = 64;
+    const LOG_LEN_MASK: usize = SLOTS_ALIGN - 1;
 
-    gc.add_storage::<super::consts::ConstInterned>();
-    gc.add_storage::<super::consts::ValTreeInterned>();
-    gc.add_storage::<super::allocation::AllocationInterned>();
-    gc.add_storage::<PatternInterned>();
-    gc.add_storage::<super::opaques::ExternalConstraintsInterned>();
-    gc.add_storage::<super::predicate::PredicateInterned>();
-    gc.add_storage::<super::region::RegionInterned>();
-    gc.add_storage::<super::ty::TyInterned>();
+    /// A shard's table, as its word names it: `len` zeroed `AtomicU64`s in one allocation that
+    /// is never freed.
+    #[derive(Clone, Copy)]
+    struct Slots {
+        words: *mut AtomicU64,
+        mask: usize,
+    }
 
-    gc.add_slice_storage::<super::consts::ConstsStorage>();
-    gc.add_slice_storage::<super::predicate::ClausesStorage>();
-    gc.add_slice_storage::<super::generic_arg::GenericArgsStorage>();
-    gc.add_slice_storage::<BoundVarKindsStorage>();
-    gc.add_slice_storage::<VariancesOfStorage>();
-    gc.add_slice_storage::<CanonicalVarsStorage>();
-    gc.add_slice_storage::<PatListStorage>();
-    gc.add_slice_storage::<super::opaques::PredefinedOpaquesStorage>();
-    gc.add_slice_storage::<super::opaques::SolverDefIdsStorage>();
-    gc.add_slice_storage::<super::predicate::BoundExistentialPredicatesStorage>();
-    gc.add_slice_storage::<super::region::RegionAssumptionsStorage>();
-    gc.add_slice_storage::<super::ty::TysStorage>();
-    gc.add_slice_storage::<crate::mir::ProjectionStorage>();
-
-    // SAFETY:
-    //  - By our precondition, there are no unrecorded types.
-    //  - We implement `GcInternedVisit` and `GcInternedSliceVisit` correctly for all types.
-    //  - We added all storages (FIXME: it's too easy to forget to add a new storage here).
-    unsafe { gc.collect() };
-}
-
-macro_rules! impl_gc_visit {
-    ( $($ty:ty),* $(,)? ) => {
-        $(
-            impl ::intern::GcInternedVisit for $ty {
-                #[inline]
-                fn visit_with(&self, gc: &mut ::intern::GarbageCollector) {
-                    self.generic_visit_with(gc);
-                }
+    impl Slots {
+        /// A zeroed table of `len` slots, a power of two of at least [`FIRST_SLOTS`].
+        fn allocate(len: usize) -> Slots {
+            assert!(len.is_power_of_two() && len >= FIRST_SLOTS);
+            let layout = Layout::array::<AtomicU64>(len)
+                .and_then(|layout| layout.align_to(SLOTS_ALIGN))
+                .expect("a shard's slots fit in memory");
+            // SAFETY: `layout` is not zero-sized: `len` is at least `FIRST_SLOTS`.
+            let words = unsafe { alloc::alloc_zeroed(layout) }.cast::<AtomicU64>();
+            if words.is_null() {
+                alloc::handle_alloc_error(layout);
             }
-        )*
-    };
-}
+            Slots { words, mask: len - 1 }
+        }
 
-impl_gc_visit!(
-    super::consts::ConstInterned,
-    super::consts::ValTreeInterned,
-    super::allocation::AllocationInterned,
-    PatternInterned,
-    super::opaques::ExternalConstraintsInterned,
-    super::predicate::PredicateInterned,
-    super::region::RegionInterned,
-    super::ty::TyInterned,
-    super::predicate::ClausesCachedTypeInfo,
-);
+        /// The shard's pointer to this table: its address, whose low bits are 0 by
+        /// [`SLOTS_ALIGN`], with the log2 of its length in them (`map_addr` keeps the
+        /// allocation's provenance).
+        fn packed(self) -> *mut AtomicU64 {
+            let log_len = self.len().trailing_zeros() as usize;
+            self.words.map_addr(|addr| addr | log_len)
+        }
 
-macro_rules! impl_gc_visit_slice {
-    ( $($ty:ty),* $(,)? ) => {
-        $(
-            impl ::intern::GcInternedSliceVisit for $ty {
-                #[inline]
-                fn visit_header(header: &<Self as ::intern::SliceInternable>::Header, gc: &mut ::intern::GarbageCollector) {
-                    header.generic_visit_with(gc);
+        /// The table a shard's pointer names, `None` for null.
+        #[inline]
+        fn unpack(packed: *mut AtomicU64) -> Option<Slots> {
+            (!packed.is_null()).then(|| Slots {
+                words: packed.map_addr(|addr| addr & !LOG_LEN_MASK),
+                mask: (1 << (packed.addr() & LOG_LEN_MASK)) - 1,
+            })
+        }
+
+        fn len(self) -> usize {
+            self.mask + 1
+        }
+
+        #[inline]
+        fn word(self, at: usize) -> &'static AtomicU64 {
+            // SAFETY: `at & mask` is below the table's length, its allocation is never freed,
+            // and it was zeroed, which is a valid `AtomicU64`.
+            unsafe { &*self.words.add(at & self.mask) }
+        }
+
+        #[inline]
+        fn find(self, hash: u32, mut same: impl FnMut(NonZeroU32) -> bool) -> Option<NonZeroU32> {
+            let mut at = hash as usize;
+            loop {
+                let word = self.word(at).load(Ordering::Acquire);
+                let row = NonZeroU32::new(word as u32)?;
+                if (word >> 32) as u32 == hash && same(row) {
+                    return Some(row);
                 }
-
-                #[inline]
-                fn visit_slice(slice: &[<Self as ::intern::SliceInternable>::SliceType], gc: &mut ::intern::GarbageCollector) {
-                    slice.generic_visit_with(gc);
-                }
+                at += 1;
             }
-        )*
-    };
+        }
+
+        /// Puts `word` in the first empty slot from its hash's. Only the holder of the shard's
+        /// lock calls it, on a table with an empty slot.
+        fn put(self, word: u64) {
+            let mut at = (word >> 32) as usize;
+            while self.word(at).load(Ordering::Relaxed) != 0 {
+                at += 1;
+            }
+            self.word(at).store(word, Ordering::Release);
+        }
+    }
+
+    enum Entry<'a> {
+        Found(NonZeroU32),
+        Vacant(Vacant<'a>),
+    }
+
+    /// A hash not in the index, with its shard's lock held until a row is inserted for it.
+    struct Vacant<'a> {
+        shard: &'a Shard,
+        len: MutexGuard<'a, usize>,
+        hash: u32,
+    }
+
+    impl Index {
+        const fn new() -> Index {
+            Index {
+                shards: [const {
+                    Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) }
+                }; SHARDS],
+            }
+        }
+
+        #[inline]
+        fn shard(&self, hash: u64) -> &Shard {
+            &self.shards[(hash >> (64 - SHARD_BITS)) as usize]
+        }
+
+        /// The row of hash `hash` that `same` accepts.
+        #[inline]
+        fn find(
+            &self,
+            hash: u64,
+            same: impl FnMut(NonZeroU32) -> bool,
+        ) -> Option<NonZeroU32> {
+            // The acquire load pairs with `Vacant::insert`'s release store of a grown table, so
+            // its copied slots read as written.
+            Slots::unpack(self.shard(hash).slots.load(Ordering::Acquire))?.find(hash as u32, same)
+        }
+
+        /// The row of hash `hash` that `same` accepts, looked for again under its shard's lock,
+        /// or the lock to insert one.
+        fn lock(&self, hash: u64, same: impl FnMut(NonZeroU32) -> bool) -> Entry<'_> {
+            let shard = self.shard(hash);
+            let len = shard.len.lock();
+            match self.find(hash, same) {
+                Some(row) => Entry::Found(row),
+                None => Entry::Vacant(Vacant { shard, len, hash: hash as u32 }),
+            }
+        }
+    }
+
+    impl Vacant<'_> {
+        /// Publishes `row`, written in full, for the hash, and releases the shard's lock.
+        fn insert(mut self, row: NonZeroU32) {
+            let len = *self.len + 1;
+            let mut slots = Slots::unpack(self.shard.slots.load(Ordering::Relaxed));
+            let capacity = slots.map_or(0, Slots::len);
+            if len * 2 > capacity {
+                let grown = Slots::allocate((capacity * 2).max(FIRST_SLOTS));
+                if let Some(old) = slots {
+                    for at in 0..old.len() {
+                        let word = old.word(at).load(Ordering::Relaxed);
+                        if word != 0 {
+                            grown.put(word);
+                        }
+                    }
+                }
+                self.shard.slots.store(grown.packed(), Ordering::Release);
+                slots = Some(grown);
+            }
+            let slots = slots.expect("a shard has a table once it grew");
+            slots.put((u64::from(self.hash) << 32) | u64::from(row.get()));
+            *self.len = len;
+        }
+    }
+
+    /// What [`Rows::intern`] computes once, when it adds a value: its tag (its codec's first
+    /// word, in `persist.rs`), flags and outer exclusive binder.
+    #[derive(Clone, Copy)]
+    pub(crate) struct RowInfo {
+        pub(crate) tag: u8,
+        pub(crate) flags: TypeFlags,
+        pub(crate) binder: DebruijnIndex,
+    }
+
+    /// The rows of one kind with a structure, `K` its kind (`TyKind<'static>`, ...), kept whole
+    /// so that `kind()` is one indexed copy, as cheap as rustc's pointer dereference. Columns,
+    /// hot apart from cold:
+    ///
+    /// - `flags` and `binder`, what every `has_type_flags`/`has_escaping_bound_vars` reads;
+    /// - `tag`, the kind's tag plus one (0 for a row not written yet, so storing it publishes
+    ///   the row): a scan by kind reads one byte a row;
+    /// - `kinds`, the value, read by `kind()` and by the index's equality check.
+    ///
+    /// Lookup: one hash of the kind (no encoding), one probe of the index (a cache line), one
+    /// equality check of the row it names.
+    pub(crate) struct Rows<K> {
+        what: &'static str,
+        last: u32,
+        next: AtomicU64,
+        tag: Column<AtomicU8>,
+        flags: Column<u32>,
+        binder: Column<u32>,
+        kinds: Column<K>,
+        index: Index,
+    }
+
+    /// The bytes a row takes in its hot columns (`tag`, `flags`, `binder`), its kind aside.
+    pub(crate) const ROW_BYTES: usize =
+        size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>();
+    const _: () = assert!(ROW_BYTES == 9);
+
+    impl<K: Copy + Hash + Eq> Rows<K> {
+        /// A table of rows 1 to `last`, named `what` in what it panics with.
+        pub(crate) const fn new(what: &'static str, last: u32) -> Rows<K> {
+            Rows {
+                what,
+                last,
+                next: AtomicU64::new(1),
+                tag: Column::zeroed(),
+                flags: Column::new(),
+                binder: Column::new(),
+                kinds: Column::new(),
+                index: Index::new(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of `kind`, added with what `info` computes if it is not there. A hit writes
+        /// nothing and allocates nothing.
+        #[inline]
+        pub(crate) fn intern<V: Erase<Static = K>>(
+            &self,
+            kind: V,
+            info: impl FnOnce() -> RowInfo,
+        ) -> NonZeroU32 {
+            let kind = to_static(kind);
+            let hash = hash_of(&kind);
+            match self.index.find(hash, |row| self.indexed(row) == kind) {
+                Some(row) => row,
+                None => self.add(hash, kind, info),
+            }
+        }
+
+        /// The kind of a row the index names.
+        #[inline]
+        fn indexed(&self, row: NonZeroU32) -> K {
+            // SAFETY: the index names only rows written in full: its acquire load of a slot
+            // pairs with the release store `Vacant::insert` makes after `add`'s writes.
+            unsafe { *self.kinds.get(row.get().into()) }
+        }
+
+        #[cold]
+        fn add(&self, hash: u64, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
+            let info = info();
+            assert!(info.tag < u8::MAX, "a {} tag of {}", self.what, info.tag);
+            let vacant = match self.index.lock(hash, |row| self.indexed(row) == kind) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(self.last), "the {} table holds {} rows", self.what, self.last);
+            // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
+            unsafe { self.kinds.write(row, kind) };
+            // SAFETY: as above.
+            unsafe { self.flags.write(row, info.flags.bits()) };
+            // SAFETY: as above.
+            unsafe { self.binder.write(row, info.binder.as_u32()) };
+            // SAFETY: the tag column is zeroed and of atomics, and `row` is below 2^32.
+            let tag = unsafe { self.tag.place(row) };
+            // Publishes the row to `tag_of`'s acquire load.
+            tag.store(info.tag + 1, Ordering::Release);
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// Whether `row` is a row written in full: what a handle made from a bare index checks.
+        pub(crate) fn published(&self, row: NonZeroU32) -> bool {
+            // SAFETY: the tag column is zeroed and of atomics, and a row is below 2^32.
+            let tag = unsafe { self.tag.peek(row.get().into()) };
+            tag.is_some_and(|tag| tag.load(Ordering::Acquire) != 0)
+        }
+
+        /// The tag of `row` plus one. Panics unless the row was written in full; when it was,
+        /// the acquire load pairs with the release store that published it, so every column of
+        /// the row reads as written.
+        #[inline]
+        fn tag_of(&self, row: NonZeroU32) -> u8 {
+            // SAFETY: the tag column is zeroed and of atomics, and a row is below 2^32.
+            let tag = unsafe { self.tag.peek(row.get().into()) };
+            match tag.map_or(0, |tag| tag.load(Ordering::Acquire)) {
+                0 => never_written(self.what, row),
+                tag => tag,
+            }
+        }
+
+        /// The kind of `row`. Panics if it is not a row of this table.
+        #[inline]
+        pub(crate) fn kind<V: Erase<Static = K>>(&self, row: NonZeroU32) -> V {
+            self.tag_of(row);
+            // SAFETY: `tag_of` checked the row was written and published.
+            unerase(unsafe { *self.kinds.get(row.get().into()) })
+        }
+
+        /// The tag of `row`'s kind.
+        #[inline]
+        pub(crate) fn tag(&self, row: NonZeroU32) -> u8 {
+            self.tag_of(row) - 1
+        }
+
+        /// The flags of `row`.
+        #[inline]
+        pub(crate) fn flags(&self, row: NonZeroU32) -> TypeFlags {
+            self.tag_of(row);
+            // SAFETY: as in `kind`.
+            TypeFlags::from_bits_retain(unsafe { *self.flags.get(row.get().into()) })
+        }
+
+        /// The outer exclusive binder of `row`.
+        #[inline]
+        pub(crate) fn binder(&self, row: NonZeroU32) -> DebruijnIndex {
+            self.tag_of(row);
+            // SAFETY: as in `kind`.
+            DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
+        }
+    }
+
+    /// Interned lists of `T`: each row a start and a length over one column of items. A list's
+    /// items are one run, so a list is one slice. The length column holds the length plus one,
+    /// 0 for a row not written yet, and storing it publishes the row. For a kind whose lists
+    /// have flags (clauses), the flags and outer exclusive binder of the whole list are columns
+    /// too: one load tests a block of items.
+    pub(crate) struct Lists<T> {
+        what: &'static str,
+        /// Whether the lists have flags: [`Lists::with_flags`], all interned by
+        /// [`Lists::intern_with`].
+        flagged: bool,
+        next: AtomicU64,
+        start: Column<u32>,
+        len: Column<AtomicU32>,
+        flags: Column<u32>,
+        binder: Column<u32>,
+        items: Run<T>,
+        index: Index,
+    }
+
+    /// The bytes a list takes in its columns, its items aside (and the flag columns, for the
+    /// lists that have them).
+    pub(crate) const LIST_BYTES: usize = size_of::<u32>() + size_of::<AtomicU32>();
+    const _: () = assert!(LIST_BYTES == 8);
+
+    impl<T: Copy + Hash + Eq> Lists<T> {
+        /// A table of lists without flags, interned by [`Lists::intern`].
+        pub(crate) const fn new(what: &'static str) -> Lists<T> {
+            Lists::make(what, false)
+        }
+
+        /// A table of lists with flags, interned by [`Lists::intern_with`].
+        pub(crate) const fn with_flags(what: &'static str) -> Lists<T> {
+            Lists::make(what, true)
+        }
+
+        const fn make(what: &'static str, flagged: bool) -> Lists<T> {
+            Lists {
+                what,
+                flagged,
+                next: AtomicU64::new(1),
+                start: Column::new(),
+                len: Column::zeroed(),
+                flags: Column::new(),
+                binder: Column::new(),
+                items: Run::new(),
+                index: Index::new(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of the list `items`, added if it is not there. Panics on a table
+        /// [`Lists::with_flags`].
+        pub(crate) fn intern<V: Erase<Static = T>>(&self, items: &[V]) -> NonZeroU32 {
+            self.put(erase_slice(items), || None)
+        }
+
+        /// As [`Lists::intern`], for a table [`Lists::with_flags`]: `info` computes them.
+        pub(crate) fn intern_with<V: Erase<Static = T>>(
+            &self,
+            items: &[V],
+            info: impl FnOnce() -> (TypeFlags, DebruijnIndex),
+        ) -> NonZeroU32 {
+            self.put(erase_slice(items), || Some(info()))
+        }
+
+        #[inline]
+        fn put(
+            &self,
+            items: &[T],
+            info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
+        ) -> NonZeroU32 {
+            let hash = hash_of(items);
+            match self.index.find(hash, |row| self.items(row) == items) {
+                Some(row) => row,
+                None => self.add(hash, items, info),
+            }
+        }
+
+        #[cold]
+        fn add(
+            &self,
+            hash: u64,
+            items: &[T],
+            info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
+        ) -> NonZeroU32 {
+            let info = info();
+            assert_eq!(info.is_some(), self.flagged, "the flags of a list of {}", self.what);
+            let vacant = match self.index.lock(hash, |row| self.items(row) == items) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let len = u32::try_from(items.len() + 1)
+                .unwrap_or_else(|_| panic!("a list of {} items in {}", items.len(), self.what));
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
+            let start = match items.is_empty() {
+                true => 0,
+                false => self.items.claim(items.len() as u64, self.what),
+            };
+            for (i, &item) in items.iter().enumerate() {
+                // SAFETY: the positions `claim` gave are ours alone, below 2^32 and not written
+                // yet.
+                unsafe { self.items.column.write(start + i as u64, item) };
+            }
+            // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
+            unsafe { self.start.write(row, start as u32) };
+            if let Some((flags, binder)) = info {
+                // SAFETY: as above.
+                unsafe { self.flags.write(row, flags.bits()) };
+                // SAFETY: as above.
+                unsafe { self.binder.write(row, binder.as_u32()) };
+            }
+            // SAFETY: the length column is zeroed and of atomics, and `row` is below 2^32.
+            let slot = unsafe { self.len.place(row) };
+            // Publishes the row to `written`'s acquire load.
+            slot.store(len, Ordering::Release);
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// Whether `row` is a list written in full: what a handle made from a bare index checks.
+        pub(crate) fn published(&self, row: NonZeroU32) -> bool {
+            // SAFETY: the length column is zeroed and of atomics, and a row is below 2^32.
+            let len = unsafe { self.len.peek(row.get().into()) };
+            len.is_some_and(|len| len.load(Ordering::Acquire) != 0)
+        }
+
+        /// The length of `row`. Panics unless the row was written in full; when it was, the
+        /// acquire load pairs with the release store that published it, so every column of the
+        /// row, and its items, read as written.
+        #[inline]
+        fn written(&self, row: NonZeroU32) -> usize {
+            // SAFETY: the length column is zeroed and of atomics, and a row is below 2^32.
+            let len = unsafe { self.len.peek(row.get().into()) };
+            match len.map_or(0, |len| len.load(Ordering::Acquire)) {
+                0 => never_written(self.what, row),
+                len => len as usize - 1,
+            }
+        }
+
+        #[inline]
+        fn items(&self, row: NonZeroU32) -> &[T] {
+            let len = self.written(row);
+            // SAFETY: `written` checked the row was written and published.
+            let start = unsafe { *self.start.get(row.get().into()) };
+            // SAFETY: as above, for its items, which `Run::claim` put in one segment.
+            unsafe { self.items.column.slice(u64::from(start), len) }
+        }
+
+        /// The items of `row`. Panics if it is not a row of this table.
+        #[inline]
+        pub(crate) fn get<V: Erase<Static = T>>(&self, row: NonZeroU32) -> &[V] {
+            unerase_slice(self.items(row))
+        }
+
+        /// The flags of `row`. Panics if it is not a row of this table, or the table has no
+        /// flags.
+        #[inline]
+        pub(crate) fn flags(&self, row: NonZeroU32) -> TypeFlags {
+            self.flagged_row(row);
+            // SAFETY: the row was written and published (`written`), with its flags, as the
+            // table's every list has them (`add`'s assertion).
+            TypeFlags::from_bits_retain(unsafe { *self.flags.get(row.get().into()) })
+        }
+
+        /// The outer exclusive binder of `row`, as [`Lists::flags`].
+        #[inline]
+        pub(crate) fn binder(&self, row: NonZeroU32) -> DebruijnIndex {
+            self.flagged_row(row);
+            // SAFETY: as in `flags`.
+            DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
+        }
+
+        #[inline]
+        fn flagged_row(&self, row: NonZeroU32) {
+            assert!(self.flagged, "the lists of {} have no flags", self.what);
+            self.written(row);
+        }
+    }
+
+    /// Interned values kept whole, for the kinds whose API hands out a reference to the value.
+    /// The mark column is 1 for a row written in full, and storing it publishes the row.
+    pub(crate) struct Values<T> {
+        what: &'static str,
+        next: AtomicU64,
+        marks: Column<AtomicU8>,
+        values: Column<T>,
+        index: Index,
+    }
+
+    impl<T: Hash + Eq> Values<T> {
+        pub(crate) const fn new(what: &'static str) -> Values<T> {
+            Values {
+                what,
+                next: AtomicU64::new(1),
+                marks: Column::zeroed(),
+                values: Column::new(),
+                index: Index::new(),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn name(&self) -> &'static str {
+            self.what
+        }
+
+        /// The row of `value`, added if it is not there.
+        pub(crate) fn intern<V: Erase<Static = T>>(&self, value: V) -> NonZeroU32 {
+            let value = to_static(value);
+            let hash = hash_of(&value);
+            if let Some(row) = self.index.find(hash, |row| self.indexed(row) == &value) {
+                return row;
+            }
+            let vacant = match self.index.lock(hash, |row| self.indexed(row) == &value) {
+                Entry::Found(row) => return row,
+                Entry::Vacant(vacant) => vacant,
+            };
+            let row = self.next.fetch_add(1, Ordering::Relaxed);
+            assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
+            // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
+            unsafe { self.values.write(row, value) };
+            // SAFETY: the mark column is zeroed and of atomics, and `row` is below 2^32.
+            let mark = unsafe { self.marks.place(row) };
+            // Publishes the row to `get`'s acquire load.
+            mark.store(1, Ordering::Release);
+            let row = NonZeroU32::new(row as u32).expect("rows start at 1");
+            vacant.insert(row);
+            row
+        }
+
+        /// The value of a row the index names.
+        #[inline]
+        fn indexed(&self, row: NonZeroU32) -> &T {
+            // SAFETY: as in `Rows::indexed`.
+            unsafe { self.values.get(row.get().into()) }
+        }
+
+        /// The value of `row`. Panics if it is not a row of this table.
+        #[inline]
+        pub(crate) fn get<V: Erase<Static = T>>(&self, row: NonZeroU32) -> &V {
+            // SAFETY: the mark column is zeroed and of atomics, and a row is below 2^32.
+            let mark = unsafe { self.marks.peek(row.get().into()) };
+            if mark.is_none_or(|mark| mark.load(Ordering::Acquire) == 0) {
+                never_written(self.what, row);
+            }
+            // SAFETY: the row was written, and the acquire load of its mark pairs with the
+            // release store that published it.
+            unerase_ref(unsafe { self.values.get(row.get().into()) })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{
+            collections::{HashMap, HashSet},
+            hash::Hash,
+            num::NonZeroU32,
+            sync::Barrier,
+        };
+
+        use std::sync::atomic::Ordering;
+
+        use rustc_type_ir::{DebruijnIndex, INNERMOST, TypeFlags};
+
+        use super::{
+            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Values, fit,
+            locate, segment_len, segment_start,
+        };
+
+        macro_rules! erase_static {
+            ($($ty:ty),+) => {$(
+                // SAFETY: `$ty` has no lifetime: `Static` is `$ty` itself.
+                unsafe impl Erase for $ty {
+                    type Static = $ty;
+                }
+            )+};
+        }
+        erase_static!(u32, u64, (u32, u64), [u32; 3], String);
+
+        fn tagged(tag: u32) -> impl FnOnce() -> RowInfo {
+            move || RowInfo { tag: tag as u8, flags: TypeFlags::empty(), binder: INNERMOST }
+        }
+
+        /// The safe reference version of a table: a map from value to row under one lock, rows
+        /// dense from 1 in the order values are first seen, as the tables give them to one
+        /// thread.
+        struct Reference<K> {
+            rows: HashMap<K, NonZeroU32>,
+            values: Vec<K>,
+        }
+
+        impl<K: Clone + Hash + Eq> Reference<K> {
+            fn new() -> Reference<K> {
+                Reference { rows: HashMap::new(), values: Vec::new() }
+            }
+
+            fn intern(&mut self, value: K) -> NonZeroU32 {
+                let next = NonZeroU32::new(self.values.len() as u32 + 1).unwrap();
+                *self.rows.entry(value.clone()).or_insert_with(|| {
+                    self.values.push(value);
+                    next
+                })
+            }
+
+            fn get(&self, row: NonZeroU32) -> &K {
+                &self.values[row.get() as usize - 1]
+            }
+        }
+
+        #[test]
+        fn each_table_gives_the_rows_and_values_of_its_safe_reference() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("reference rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("reference lists");
+            static VALUES: Values<String> = Values::new("reference values");
+            let mut rows = Reference::new();
+            let mut lists = Reference::new();
+            let mut values = Reference::new();
+            let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+            for _ in 0..20_000 {
+                let n = rng.below(3000);
+                let kind = ((n % 7) as u32, n * 0x1_0000_0001);
+                let row = ROWS.intern(kind, tagged(kind.0));
+                assert_eq!(row, rows.intern(kind));
+                assert_eq!(ROWS.kind::<(u32, u64)>(row), *rows.get(row));
+                assert_eq!(u32::from(ROWS.tag(row)), kind.0);
+
+                // Lengths up to 2500 cross the first segments' ends.
+                let items: Vec<u32> = (0..(n * 13 % 2500) as u32).map(|i| i ^ n as u32).collect();
+                let row = LISTS.intern(&items[..]);
+                assert_eq!(row, lists.intern(items.clone()));
+                assert_eq!(LISTS.get::<u32>(row), &lists.get(row)[..]);
+
+                let value = format!("value {}", n % 500);
+                let row = VALUES.intern(value.clone());
+                assert_eq!(row, values.intern(value));
+                assert_eq!(VALUES.get::<String>(row), values.get(row));
+            }
+            for (row, kind) in rows.values.iter().enumerate() {
+                let row = NonZeroU32::new(row as u32 + 1).unwrap();
+                assert_eq!(ROWS.kind::<(u32, u64)>(row), *kind);
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "row 3 of the unwritten rows table was never written")]
+        fn reading_a_row_not_written_panics() {
+            static ROWS: Rows<u32> = Rows::new("unwritten rows", 10);
+            ROWS.intern(1u32, tagged(0));
+            ROWS.intern(2u32, tagged(0));
+            ROWS.flags(NonZeroU32::new(3).unwrap());
+        }
+
+        #[test]
+        #[should_panic(expected = "row 2 of the unwritten lists table was never written")]
+        fn reading_a_list_not_written_panics() {
+            static LISTS: Lists<u32> = Lists::new("unwritten lists");
+            LISTS.intern(&[1u32][..]);
+            LISTS.get::<u32>(NonZeroU32::new(2).unwrap());
+        }
+
+        #[test]
+        #[should_panic(expected = "row 1 of the unwritten values table was never written")]
+        fn reading_a_value_not_written_panics() {
+            static VALUES: Values<u64> = Values::new("unwritten values");
+            VALUES.get::<u64>(NonZeroU32::new(1).unwrap());
+        }
+
+        #[test]
+        #[should_panic(expected = "the lists of lists without flags have no flags")]
+        fn the_flags_of_a_table_without_them_panic() {
+            static LISTS: Lists<u32> = Lists::new("lists without flags");
+            let row = LISTS.intern(&[1u32][..]);
+            LISTS.flags(row);
+        }
+
+        #[test]
+        #[should_panic(expected = "the flags of a list of lists with flags")]
+        fn a_list_without_flags_in_a_table_with_them_panics() {
+            static LISTS: Lists<u32> = Lists::with_flags("lists with flags");
+            LISTS.intern(&[1u32][..]);
+        }
+
+        #[test]
+        fn a_list_keeps_its_flags() {
+            static LISTS: Lists<u32> = Lists::with_flags("flagged lists");
+            let row = LISTS.intern_with(&[4u32, 5][..], || {
+                (TypeFlags::HAS_TY_INFER, DebruijnIndex::from_u32(2))
+            });
+            assert_eq!(LISTS.flags(row), TypeFlags::HAS_TY_INFER);
+            assert_eq!(LISTS.binder(row), DebruijnIndex::from_u32(2));
+            assert_eq!(LISTS.get::<u32>(row), &[4, 5]);
+        }
+
+        #[test]
+        fn positions_are_in_the_segment_that_holds_them() {
+            for segment in 0..SEGMENTS {
+                let start = segment_start(segment);
+                let end = start + segment_len(segment) - 1;
+                assert_eq!(locate(start), (segment, 0));
+                assert_eq!(locate(end), (segment, (segment_len(segment) - 1) as usize));
+            }
+            assert!(segment_start(SEGMENTS - 1) + segment_len(SEGMENTS - 1) >= 1 << 32);
+            assert_eq!(segment_len(0), 1 << FIRST_BITS);
+        }
+
+        #[test]
+        fn a_run_never_crosses_a_segment() {
+            assert_eq!(fit(0, 10), 0);
+            assert_eq!(fit(1020, 4), 1020);
+            assert_eq!(fit(1021, 4), 1024);
+            assert_eq!(fit(1021, 3000), segment_start(2));
+            assert_eq!(fit(0, 1 << 33), 1 << 32);
+        }
+
+        #[test]
+        fn a_row_interned_twice_is_one_row() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("test rows", 1000);
+            let values = [(0, 0), (0, 7), (1, 7), (1, u64::MAX), (3, 1 << 40)];
+            let rows: Vec<_> = values.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
+            for (&kind, &row) in values.iter().zip(&rows) {
+                assert_eq!(ROWS.intern(kind, || panic!("computed the info of a value interned")), row);
+                assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
+                assert_eq!(u32::from(ROWS.tag(row)), kind.0);
+                assert!(ROWS.published(row));
+            }
+            let distinct: HashSet<_> = rows.iter().collect();
+            assert_eq!(distinct.len(), values.len());
+            assert!(!ROWS.published(NonZeroU32::new(999).unwrap()));
+        }
+
+        #[test]
+        fn a_row_keeps_its_flags() {
+            static ROWS: Rows<u32> = Rows::new("test rows with flags", 10);
+            let row = ROWS.intern(5u32, || RowInfo {
+                tag: 2,
+                flags: TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR,
+                binder: DebruijnIndex::from_u32(3),
+            });
+            assert_eq!(ROWS.flags(row), TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR);
+            assert_eq!(ROWS.binder(row), DebruijnIndex::from_u32(3));
+            assert_eq!(ROWS.tag(row), 2);
+        }
+
+        #[test]
+        #[should_panic(expected = "the tiny table holds 2 rows")]
+        fn a_full_table_says_so() {
+            static ROWS: Rows<u32> = Rows::new("tiny", 2);
+            for value in 0u32..3 {
+                ROWS.intern(value, tagged(0));
+            }
+        }
+
+        #[test]
+        fn a_shard_pointer_gives_back_its_table_and_length() {
+            for len in [FIRST_SLOTS, FIRST_SLOTS * 2, 1 << 20] {
+                let table = Slots::allocate(len);
+                let back = Slots::unpack(table.packed()).expect("a table's pointer is not null");
+                assert_eq!(back.words, table.words);
+                assert_eq!(back.len(), len);
+                assert!((0..len).all(|at| back.word(at).load(Ordering::Relaxed) == 0));
+            }
+            assert!(Slots::unpack(std::ptr::null_mut()).is_none());
+        }
+
+        #[test]
+        fn a_shard_that_grows_keeps_every_row() {
+            static ROWS: Rows<u32> = Rows::new("growing", 1 << 16);
+            let rows: Vec<_> = (0u32..5000).map(|value| ROWS.intern(value, tagged(0))).collect();
+            for (value, &row) in (0u32..5000).zip(&rows) {
+                assert_eq!(ROWS.intern(value, tagged(0)), row);
+                assert_eq!(ROWS.kind::<u32>(row), value);
+            }
+        }
+
+        #[test]
+        fn a_list_interned_twice_is_one_list() {
+            static LISTS: Lists<u64> = Lists::new("test lists");
+            let lists: [&[u64]; 4] = [&[], &[1], &[1, 2], &[2, 1]];
+            let rows: Vec<_> = lists.iter().map(|&items| LISTS.intern(items)).collect();
+            for (items, &row) in lists.iter().zip(&rows) {
+                assert_eq!(LISTS.intern(*items), row);
+                assert_eq!(LISTS.get::<u64>(row), *items);
+                assert!(LISTS.published(row));
+            }
+            assert_eq!(rows.iter().collect::<HashSet<_>>().len(), lists.len());
+            // A list longer than a first segment's free room starts in a later segment.
+            let long: Vec<u64> = (0..5000).collect();
+            let row = LISTS.intern(&long[..]);
+            assert_eq!(LISTS.get::<u64>(row), &long[..]);
+        }
+
+        #[test]
+        fn a_value_interned_twice_is_one_value() {
+            static VALUES: Values<String> = Values::new("test values");
+            let a = VALUES.intern("a".to_owned());
+            let b = VALUES.intern("b".to_owned());
+            assert_ne!(a, b);
+            assert_eq!(VALUES.intern("a".to_owned()), a);
+            assert_eq!(VALUES.get::<String>(a), "a");
+        }
+
+        #[test]
+        fn eight_threads_interning_at_once_get_one_row_per_value() {
+            static ROWS: Rows<[u32; 3]> = Rows::new("parallel rows", 1 << 20);
+            static LISTS: Lists<u32> = Lists::new("parallel lists");
+            const THREADS: u32 = 8;
+            const VALUES: u32 = 20_000;
+            let barrier = Barrier::new(THREADS as usize);
+            let seen: Vec<HashMap<u32, (NonZeroU32, NonZeroU32)>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|thread| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            // Each thread interns every value, in an order of its own.
+                            (0..VALUES)
+                                .map(|i| (i * 7919 + thread * 104_729) % VALUES)
+                                .map(|value| {
+                                    let words = [value % 100, value, value / 3];
+                                    let row = ROWS.intern(words, tagged(value % 100));
+                                    let list = LISTS.intern(&words[..1 + value as usize % 3]);
+                                    (value, (row, list))
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+            });
+            for value in 0..VALUES {
+                let first = seen[0][&value];
+                assert!(seen.iter().all(|thread| thread[&value] == first), "value {value}");
+            }
+            let rows: HashSet<_> = seen[0].values().map(|it| it.0).collect();
+            assert_eq!(rows.len(), VALUES as usize);
+            for (&value, &(row, list)) in &seen[0] {
+                let words = [value % 100, value, value / 3];
+                assert_eq!(ROWS.kind::<[u32; 3]>(row), words);
+                assert_eq!(LISTS.get::<u32>(list), &words[..1 + value as usize % 3]);
+            }
+        }
+    }
 }
 
-impl_gc_visit_slice!(
-    super::predicate::ClausesStorage,
-    super::generic_arg::GenericArgsStorage,
-    BoundVarKindsStorage,
-    VariancesOfStorage,
-    CanonicalVarsStorage,
-    PatListStorage,
-    super::opaques::PredefinedOpaquesStorage,
-    super::opaques::SolverDefIdsStorage,
-    super::predicate::BoundExistentialPredicatesStorage,
-    super::region::RegionAssumptionsStorage,
-    super::ty::TysStorage,
-    super::consts::ConstsStorage,
-    crate::mir::ProjectionStorage,
-);
+#[cfg(test)]
+mod tests {
+    use hir_def::{LifetimeParamId, TypeParamId};
+    use rustc_type_ir::{
+        CanonicalParamEnvCacheEntry, CanonicalQueryInput, OutlivesClause, TypingMode,
+        TypingModeEqWrapper, UniverseIndex, solve::QueryInput,
+    };
+
+    use super::*;
+    use crate::next_solver::{CanonicalVarKinds, Goal, PredicateKind, default_types};
+
+    fn function() -> GenericDefId {
+        GenericDefId::FunctionId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)))
+    }
+
+    fn early(index: u32) -> Region<'static> {
+        let id = LifetimeParamId {
+            parent: function(),
+            local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(index)),
+        };
+        rustc_type_ir::Region(InternedRegion::intern(RegionKind::ReEarlyParam(EarlyParamRegion {
+            id,
+            index,
+        })))
+    }
+
+    fn args(args: &[GenericArg<'static>]) -> GenericArgs<'static> {
+        GenericArgs::new_from_slice(args)
+    }
+
+    fn input(universe: u32) -> CanonicalInputData<'static> {
+        let predicate = Predicate::intern(Binder::dummy(PredicateKind::Ambiguous));
+        CanonicalQueryInput {
+            canonical: rustc_type_ir::Canonical {
+                value: QueryInput {
+                    goal: Goal { param_env: ParamEnv::empty(), predicate },
+                    predefined_opaques_in_body: PredefinedOpaques::empty(),
+                },
+                max_universe: UniverseIndex::from_u32(universe),
+                var_kinds: CanonicalVarKinds::empty(),
+            },
+            typing_mode: TypingModeEqWrapper(TypingMode::Coherence),
+        }
+    }
+
+    #[test]
+    fn a_canonical_input_is_one_row_and_reads_back() {
+        let input_0 = CanonicalInput::new(input(0));
+        assert_eq!(CanonicalInput::new(input(0)), input_0, "interned once");
+        assert_ne!(CanonicalInput::new(input(1)), input_0);
+        assert_eq!(*input_0, input(0));
+    }
+
+    #[test]
+    fn the_keyword_symbols_are_rustcs() {
+        type S = Symbol;
+        type I = DbInterner<'static>;
+        let kw = |symbol: S| symbol.0.as_str().to_owned();
+        assert_eq!(kw(<S as inherent::Symbol<I>>::KW_UNDERSCORE_LIFETIME), "'_");
+        assert_eq!(kw(<S as inherent::Symbol<I>>::KW_STATIC_LIFETIME), "'static");
+        assert_eq!(kw(<S as inherent::Symbol<I>>::SYM_ANON), "anon");
+    }
+
+    #[test]
+    fn args_fit_params_one_each_in_order() {
+        let lifetime = GenericParamId::LifetimeParamId(LifetimeParamId {
+            parent: function(),
+            local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0)),
+        });
+        let ty = GenericParamId::TypeParamId(TypeParamId::from_unchecked(
+            hir_def::TypeOrConstParamId {
+                parent: function(),
+                local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0)),
+            },
+        ));
+        let statik: GenericArg<'static> = default_types().regions.statik.into();
+        let u32_: GenericArg<'static> = default_types().types.u32.into();
+        assert!(args_fit_params([lifetime, ty], &[statik, u32_]));
+        assert!(!args_fit_params([lifetime, ty], &[u32_, statik]), "kinds out of order");
+        assert!(!args_fit_params([lifetime, ty], &[statik]), "one missing");
+        assert!(!args_fit_params([lifetime], &[statik, u32_]), "one too many");
+        assert!(args_fit_params([], &[]));
+    }
+
+    #[test]
+    fn reflection_takes_an_impl_generic_over_distinct_unconstrained_lifetimes() {
+        let (a, b) = (early(0), early(1));
+        let u32_ = default_types().types.u32;
+        let statik = default_types().regions.statik;
+        let outlives = |long: Region<'static>, short: Region<'static>| {
+            Clause(Predicate::intern(Binder::dummy(PredicateKind::Clause(
+                ClauseKind::RegionOutlives(OutlivesClause(long, short)),
+            ))))
+        };
+
+        assert!(fully_generic_for_reflection(args(&[a.into(), b.into(), u32_.into()]), []));
+        assert!(!fully_generic_for_reflection(args(&[a.into(), a.into()]), []), "a lifetime twice");
+        assert!(!fully_generic_for_reflection(args(&[statik.into()]), []), "`'static`");
+        assert!(
+            !fully_generic_for_reflection(args(&[a.into(), b.into()]), [outlives(a, b)]),
+            "a where clause on a lifetime"
+        );
+        assert!(
+            !fully_generic_for_reflection(args(&[a.into()]), [outlives(a, statik)]),
+            "a where clause naming `'static`"
+        );
+    }
+
+    #[test]
+    fn a_param_env_cache_call_within_another_gets_a_cache_of_its_own() {
+        let key = ParamEnv::empty();
+        let entry = CanonicalParamEnvCacheEntry {
+            param_env: key,
+            variables: Default::default(),
+            variable_lookup_table: Default::default(),
+            var_kinds: Vec::new(),
+        };
+        with_param_env_cache(|cache: &mut ParamEnvCache<'static>| {
+            cache.0.insert(key, entry);
+            with_param_env_cache(|inner: &mut ParamEnvCache<'static>| {
+                assert!(inner.0.is_empty(), "the outer call holds the thread's cache");
+            });
+        });
+        assert!(
+            with_param_env_cache(|cache: &mut ParamEnvCache<'static>| cache.0.contains_key(&key)),
+            "the outer call's entry is kept"
+        );
+    }
+
+    #[test]
+    fn a_fully_monomorphized_typing_env_has_no_clauses() {
+        let env =
+            <TypingEnv<'static> as inherent::TypingEnv<DbInterner<'static>>>::fully_monomorphized();
+        assert_eq!(env.param_env, ParamEnv::empty());
+    }
+}

@@ -460,7 +460,7 @@ impl Module for ObjectModule {
         info!("defining function {}: {}", func_id, ctx.func.display());
 
         let res = ctx.compile(self.isa(), ctrl_plane)?;
-        let alignment = res.buffer.alignment as u64;
+        let alignment = res.buffer.min_alignment as u64;
 
         let compiled = ctx.compiled_code().unwrap();
         #[cfg(feature = "unwind")]
@@ -476,7 +476,7 @@ impl Module for ObjectModule {
             .map(|reloc| {
                 self.process_reloc(&ModuleReloc::from_mach_reloc(&reloc, &ctx.func, func_id))
             })
-            .collect::<Vec<_>>();
+            .collect::<ModuleResult<Vec<_>>>()?;
         self.define_function_inner(func_id, alignment, buffer.data(), relocs)?;
         #[cfg(feature = "unwind")]
         if let (Some(builder), Some(info)) = (self.unwind.as_mut(), unwind_info) {
@@ -496,7 +496,7 @@ impl Module for ObjectModule {
         let relocs = relocs
             .iter()
             .map(|reloc| self.process_reloc(reloc))
-            .collect();
+            .collect::<ModuleResult<Vec<_>>>()?;
         self.define_function_inner(func_id, alignment, bytes, relocs)
     }
 
@@ -528,14 +528,18 @@ impl Module for ObjectModule {
         } = data;
 
         let pointer_reloc = match self.isa.triple().pointer_width().unwrap() {
-            PointerWidth::U16 => unimplemented!("16bit pointers"),
+            PointerWidth::U16 => {
+                return Err(ModuleError::Backend(anyhow!(
+                    "data with pointers on a target with 16-bit pointers"
+                )));
+            }
             PointerWidth::U32 => Reloc::Abs4,
             PointerWidth::U64 => Reloc::Abs8,
         };
         let relocs = data
             .all_relocs(pointer_reloc)
             .map(|record| self.process_reloc(&record))
-            .collect::<Vec<_>>();
+            .collect::<ModuleResult<Vec<_>>>()?;
 
         let section = if custom_section.is_none() {
             let section_kind = if let Init::Zeros { .. } = *init {
@@ -626,8 +630,14 @@ impl Module for ObjectModule {
                 .object
                 .add_symbol_data(symbol, section, &contents, align),
         };
-        // blaze: after the symbol is defined, for Mach-O to take its flags as those of a
-        // definition rather than of an undefined symbol.
+        if !relocs.is_empty() {
+            self.relocs.push(SymbolRelocs {
+                section,
+                offset,
+                relocs,
+            });
+        }
+
         if used {
             match self.object.format() {
                 object::BinaryFormat::Elf => match self.object.section_flags_mut(section) {
@@ -641,13 +651,6 @@ impl Module for ObjectModule {
                 },
                 _ => unreachable!(),
             }
-        }
-        if !relocs.is_empty() {
-            self.relocs.push(SymbolRelocs {
-                section,
-                offset,
-                relocs,
-            });
         }
         Ok(())
     }
@@ -888,7 +891,14 @@ impl ObjectModule {
         }
     }
 
-    fn process_reloc(&self, record: &ModuleReloc) -> ObjectRelocRecord {
+    // blaze: a relocation the object format has no form for is an error naming both.
+    fn process_reloc(&self, record: &ModuleReloc) -> ModuleResult<ObjectRelocRecord> {
+        let unsupported = |reloc: Reloc| {
+            ModuleError::Backend(anyhow!(
+                "the relocation {reloc:?} in a {:?} object",
+                self.object.format()
+            ))
+        };
         let flags = match record.kind {
             Reloc::Abs4 => RelocationFlags::Generic {
                 kind: RelocationKind::Absolute,
@@ -1028,7 +1038,7 @@ impl ObjectModule {
                     r_pcrel: true,
                     r_length: 2,
                 },
-                _ => unimplemented!("Aarch64AdrGotPage21 is not supported for this file format"),
+                _ => return Err(unsupported(record.kind)),
             },
             Reloc::Aarch64Ld64GotLo12Nc => match self.object.format() {
                 object::BinaryFormat::Elf => RelocationFlags::Elf {
@@ -1039,7 +1049,7 @@ impl ObjectModule {
                     r_pcrel: false,
                     r_length: 2,
                 },
-                _ => unimplemented!("Aarch64Ld64GotLo12Nc is not supported for this file format"),
+                _ => return Err(unsupported(record.kind)),
             },
             Reloc::Aarch64AdrPrelPgHi21 => match self.object.format() {
                 object::BinaryFormat::Elf => RelocationFlags::Elf {
@@ -1050,7 +1060,7 @@ impl ObjectModule {
                     r_pcrel: true,
                     r_length: 2,
                 },
-                _ => unimplemented!("Aarch64AdrPrelPgHi21 is not supported for this file format"),
+                _ => return Err(unsupported(record.kind)),
             },
             Reloc::Aarch64AddAbsLo12Nc => match self.object.format() {
                 object::BinaryFormat::Elf => RelocationFlags::Elf {
@@ -1061,7 +1071,7 @@ impl ObjectModule {
                     r_pcrel: false,
                     r_length: 2,
                 },
-                _ => unimplemented!("Aarch64AddAbsLo12Nc is not supported for this file format"),
+                _ => return Err(unsupported(record.kind)),
             },
             Reloc::S390xPCRel32Dbl => RelocationFlags::Generic {
                 kind: RelocationKind::Relative,
@@ -1143,16 +1153,15 @@ impl ObjectModule {
                     r_type: object::elf::R_RISCV_PCREL_HI20,
                 }
             }
-            // FIXME
-            reloc => unimplemented!("{:?}", reloc),
+            reloc => return Err(unsupported(reloc)),
         };
 
-        ObjectRelocRecord {
+        Ok(ObjectRelocRecord {
             offset: record.offset,
             name: record.name.clone(),
             flags,
             addend: record.addend,
-        }
+        })
     }
 }
 

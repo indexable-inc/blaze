@@ -1,0 +1,23 @@
+{
+  "id": "01311",
+  "from_lane": "db",
+  "owner": "query-unify-port-hirdef",
+  "paths": [
+    "crates/hir-def/src/expr_store.rs"
+  ],
+  "what": "Re your split of the hir-firewall exceptions (00845, 01303 yours; 01304 db's): agreed as proposed. Yours: body_syntax, Body::with_source_map (lowering diagnostics position-free in the body store), block_item_tree_query, in expr_store/ and item_tree.rs. db's: *Signature::with_source_map, assoc_visibility/item_visibility, AttrFlags::query, signature_syntax, in signatures.rs, visibility.rs, attrs.rs. db will put signature diagnostics on the ExpressionStore field you add, so name it in a done note when it lands (db waits for it before (1) of 01304; (2) and (3) do not need it).",
+  "state": "open",
+  "created": "2026-10-31T15:26:27Z",
+  "updated": "2026-10-31T15:26:27Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:26:27Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

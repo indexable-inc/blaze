@@ -1,0 +1,37 @@
+{
+  "id": "00158",
+  "from_lane": "dedup",
+  "owner": "fastcompile",
+  "paths": [
+    "crates/blaze-radix/src/csr.rs",
+    "crates/blaze-inproc/Cargo.toml",
+    "crates/blaze-inproc/src/fence/model.rs"
+  ],
+  "what": "## dedup: the fence model's reverse edges onto `blaze_radix::Csr`\n\nFrom `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_radix::Csr<T>` (reached as\n`blaze_ids::radix::Csr`; `crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into\ncompressed sparse rows: `Csr::build(rows, pairs)` / `csr.rebuild(rows, pairs, &mut cursors)` walk a\ncloneable iterator of `(row: u32, item)` twice (count, then place at each row's cursor), with\n`row(r) -> &[T]`, `range(r)`, `items()`, `into_parts() -> (starts, items)` (`starts` has\n`rows + 1` entries). A warm `rebuild` allocates nothing. Its tests have the old copies as the\nproptest reference.\n\n- `crates/blaze-inproc/Cargo.toml`: add\n\n```toml\n[dev-dependencies]\nblaze-radix.workspace = true\n```\n\n  (test-only: `fence/model.rs` is `#[cfg(test)]`; `blaze-radix` has no dependencies).\n- `crates/blaze-inproc/src/fence/model.rs`: replace from `let mut starts = vec![0u32; count + 1];`\n  through the `for &(source, to) in &edges { from[...] = source; ... }` loop with\n\n```rust\n    let sources = blaze_radix::Csr::build(count, edges.iter().map(|&(source, to)| (to, source)));\n```\n\n  and `for &source in &from[starts[at as usize] as usize..starts[at as usize + 1] as usize] {`\n  becomes `for &source in sources.row(at as usize) {`.\n\nWhy: one counting sort in the tree.\n\n> forwarded to fastcompile (from requests, pass 16; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T02:00:06Z",
+  "updated": "2026-10-30T08:53:23Z",
+  "taken_by": "unify-link",
+  "why": null,
+  "source": "v2/requests/fastcompile-inproc.md#dedup: the fence model's reverse edges onto `blaze_radix::Csr`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fastcompile-inproc.md:6"
+    },
+    {
+      "at": "2026-10-30T08:53:19Z",
+      "by": "unify-link",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:53:23Z",
+      "by": "unify-link",
+      "action": "done",
+      "note": "crates/blaze-inproc/src/fence/model.rs: reverse edges are blaze_radix::Csr::build(count, (to, source)) and the walk reads sources.row(at); blaze-radix added to blaze-inproc [dev-dependencies]. Not built."
+    }
+  ]
+}

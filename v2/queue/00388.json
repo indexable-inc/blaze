@@ -1,0 +1,21 @@
+{
+  "id": "00388",
+  "from_lane": "diagnostics-speed-bodies",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## 3. Parent (`diagnostics`): compute `body_owners` once per check\n\n**What.** `lints.rs` calls `bodies::before_abort(cx, codegen)` and then\n`bodies::after_abort(cx)`. Each computes `body_owners(cx)`: `every_body`, the file rank of each\nmodule, an `original_node_file_range_rooted` per body, and a radix sort. Compute it once and\npass it to both, or keep it in a `OnceCell` on `Cx`. `cx.rs` and `lints.rs` belong to\n`diagnostics-speed-lints` and the parent.\n\n**Why.** It costs one source range per body, 3,000 on the reference crate, spent twice. Done\nonce, `bodies::before_abort` and `after_abort` would take `owners: &[DefWithBodyId]`, a\none-line change in each that this lane can make when the call sites change.\n\n> forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T03:49:49Z",
+  "updated": "2026-10-30T03:49:49Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-speed-bodies.md#3. Parent (`diagnostics`): compute `body_owners` once per check",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-speed-bodies.md:73"
+    }
+  ]
+}

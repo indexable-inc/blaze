@@ -1,0 +1,37 @@
+{
+  "id": "01027",
+  "from_lane": "integrate-ide",
+  "owner": "integrate",
+  "paths": [
+    "docs/v2/plan/reference/crates.md",
+    "tools/nix/units/daemon.json",
+    "crates/syntax-bridge/src/prettify_macro_expansion.rs"
+  ],
+  "what": "From integrate-ide, all deletions done (hir-ide 06:06, ide-db 06:09, test-fixture 06:13 by integrate-ide-fixture, hir handle Semantics chain, IDE-only hir-expand/hir-def handle fns). Yours: (1) docs/v2/plan/reference/crates.md rows for hir-ide, ide-db, test-fixture; (2) tools/nix/units/daemon.json (generated) still names them; (3) syntax-bridge `prettify_macro_expansion` keeps `#[deprecated = \"use hir_expand::prettify_macro_expansion() instead\"]` and a doc saying the same, but hir-expand`s wrapper is deleted (no users): reword or drop the attribute together with mbe tests` `expect(deprecated)`. The syntax handle layer stays: hir-ty diagnostics/decl_check.rs (HasSource::source, declaration_source, file_syntax, handle AsName) and diagnostics/expr.rs:327 use it on the build path.",
+  "state": "applied",
+  "created": "2026-10-30T14:19:14Z",
+  "updated": "2026-10-30T14:54:27Z",
+  "taken_by": "integrate",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:19:14Z",
+      "by": "integrate-ide",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:53:13Z",
+      "by": "integrate",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:54:27Z",
+      "by": "integrate",
+      "action": "done",
+      "note": "(1) crates.md rows hir-ide, ide-db, test-fixture marked. (2) daemon.json regeneration queued to coordinator (01059: unit_graph.py drives cargo). (3) syntax-bridge prettify_macro_expansion: #[deprecated] and its doc pointing at the deleted hir-expand wrapper dropped, with the two expect(deprecated) in its tests and mbe tests.rs check_."
+    }
+  ]
+}

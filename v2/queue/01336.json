@@ -1,0 +1,23 @@
+{
+  "id": "01336",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-borrowck/src/budget.rs"
+  ],
+  "what": "Run, on the working tree, with BLAZE_ALLOC_TRACE=1: hir-ty-borrowck budget::a_typical_clean_body_allocates_nothing and budget::a_large_clean_body_and_smaller_ones_after_it_allocate_nothing (as for .coord-1030/v2-build/borrowck-trace.log), and send no-fallback-front-mir the log path. Rounds 9-11b: panic_display 3 allocations (92 bytes), largest 2 (51200 bytes), after the TypeWalker and per-path resolver allocations were removed; these can not be placed from the code alone.",
+  "state": "open",
+  "created": "2026-10-31T18:59:28Z",
+  "updated": "2026-10-31T18:59:28Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:59:28Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

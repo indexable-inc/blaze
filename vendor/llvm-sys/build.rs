@@ -2,36 +2,22 @@ extern crate anyhow;
 extern crate cc;
 #[macro_use]
 extern crate lazy_static;
-extern crate regex_lite;
-extern crate semver;
 
 use std::env;
 use std::ffi::OsStr;
-use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::Context as _;
-use regex_lite::Regex;
-use semver::Version;
+
+// blaze: the pinned LLVM, the one LLVM this script links.
+include!("pin.rs");
 
 // Environment variables that can guide compilation
 //
 // When adding new ones, they should also be added to main() to force a
 // rebuild if they are changed.
 lazy_static! {
-    /// A single path to search for LLVM in (containing bin/llvm-config)
-    static ref ENV_LLVM_PREFIX: String =
-        format!("LLVM_SYS_{}_PREFIX", env!("CARGO_PKG_VERSION_MAJOR"));
-
-    /// If exactly "YES", ignore the version blocklist
-    static ref ENV_IGNORE_BLOCKLIST: String =
-        format!("LLVM_SYS_{}_IGNORE_BLOCKLIST", env!("CARGO_PKG_VERSION_MAJOR"));
-
-    /// If set, enforce precise correspondence between crate and binary versions.
-    static ref ENV_STRICT_VERSIONING: String =
-        format!("LLVM_SYS_{}_STRICT_VERSIONING", env!("CARGO_PKG_VERSION_MAJOR"));
-
     /// If set, do not attempt to strip irrelevant options for llvm-config --cflags
     static ref ENV_NO_CLEAN_CFLAGS: String =
         format!("LLVM_SYS_{}_NO_CLEAN_CFLAGS", env!("CARGO_PKG_VERSION_MAJOR"));
@@ -43,19 +29,6 @@ lazy_static! {
     /// If set, always link against libffi
     static ref ENV_FORCE_FFI: String =
         format!("LLVM_SYS_{}_FFI_WORKAROUND", env!("CARGO_PKG_VERSION_MAJOR"));
-}
-
-lazy_static! {
-    /// LLVM version used by this version of the crate.
-    static ref CRATE_VERSION: Version = {
-        let crate_version = Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("Crate version is somehow not valid semver");
-        Version {
-            major: crate_version.major / 10,
-            minor: crate_version.major % 10,
-            .. crate_version
-        }
-    };
 }
 
 fn target_env_is(name: &str) -> bool {
@@ -76,155 +49,6 @@ fn target_abi_is(name: &str) -> bool {
     match env::var_os("CARGO_CFG_TARGET_ABI") {
         Some(s) => s == name,
         None => false,
-    }
-}
-
-/// Try to find a version of llvm-config that is compatible with this crate.
-///
-/// If $LLVM_SYS_<VERSION>_PREFIX is set, look for llvm-config ONLY in there. The assumption is
-/// that the user know best, and they want to link to a specific build or fork of LLVM.
-///
-/// If $LLVM_SYS_<VERSION>_PREFIX is NOT set, then look for llvm-config in $PATH.
-///
-/// Returns None on failure.
-fn locate_llvm_config() -> Option<PathBuf> {
-    let prefix = env::var_os(&*ENV_LLVM_PREFIX)
-        .map(|p| PathBuf::from(p).join("bin"))
-        .unwrap_or_default();
-
-    if let Some(x) = llvm_compatible_binary_name(&prefix) {
-        return Some(x);
-    }
-
-    // For users of Homebrew, LLVM is located in a non-standard location and
-    // typically not linked such that it appears in PATH. We try to handle that
-    // here, but only if we didn't already find a working llvm-config in PATH.
-    // This removes the need for fiddling around with LIBRARY_PATH or `brew
-    // link`.
-    if target_os_is("macos") {
-        if let Some(p) = homebrew_prefix(Some(&format!("llvm@{}", CRATE_VERSION.major)))
-            .or_else(|| homebrew_prefix(Some("llvm")))
-        {
-            return llvm_compatible_binary_name(&PathBuf::from(p).join("bin"));
-        }
-    }
-
-    None
-}
-
-fn llvm_compatible_binary_name(prefix: &Path) -> Option<PathBuf> {
-    for binary_name in llvm_config_binary_names() {
-        let binary_name = prefix.join(binary_name);
-        match llvm_version(&binary_name) {
-            Ok(version) => {
-                if is_compatible_llvm(&version) {
-                    // Compatible version found. Nice.
-                    return Some(binary_name);
-                }
-                // Version mismatch. Will try further searches, but warn that
-                // we're not using the system one.
-                println!(
-                    "found LLVM version {} on PATH, but need {}",
-                    version, *CRATE_VERSION
-                );
-            }
-            Err(e) => {
-                if e.downcast_ref::<io::Error>()
-                    .map_or(false, |e| e.kind() == ErrorKind::NotFound)
-                {
-                    // Looks like we failed to execute any llvm-config. Keep
-                    // searching.
-                } else {
-                    // Some other error, probably a weird failure. Give up.
-                    panic!("Failed to search PATH for llvm-config: {}", e)
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Return an iterator over possible names for the llvm-config binary.
-fn llvm_config_binary_names() -> impl Iterator<Item = String> {
-    let base_names = [
-        format!("llvm-config-{}", CRATE_VERSION.major),
-        format!("llvm-config{}", CRATE_VERSION.major),
-        format!("llvm{}-config", CRATE_VERSION.major),
-        format!(
-            "llvm-config-{}.{}",
-            CRATE_VERSION.major, CRATE_VERSION.minor
-        ),
-        format!("llvm-config{}{}", CRATE_VERSION.major, CRATE_VERSION.minor),
-        "llvm-config".into(),
-    ];
-
-    // On Windows, also search for llvm-config.exe
-    if target_os_is("windows") {
-        IntoIterator::into_iter(base_names)
-            .flat_map(|name| [format!("{}.exe", name), name])
-            .collect::<Vec<_>>()
-    } else {
-        base_names.to_vec()
-    }
-    .into_iter()
-}
-
-/// Check whether the given version of LLVM is blocklisted,
-/// returning `Some(reason)` if it is.
-fn is_blocklisted_llvm(llvm_version: &Version) -> Option<&'static str> {
-    static BLOCKLIST: &[(u64, u64, u64, &str)] = &[];
-
-    if let Some(x) = env::var_os(&*ENV_IGNORE_BLOCKLIST) {
-        if &x == "YES" {
-            println!(
-                "cargo:warning=ignoring blocklist entry for LLVM {}",
-                llvm_version
-            );
-            return None;
-        } else {
-            println!(
-                "cargo:warning={} is set but not exactly \"YES\"; blocklist is still honored",
-                *ENV_IGNORE_BLOCKLIST
-            );
-        }
-    }
-
-    for &(major, minor, patch, reason) in BLOCKLIST.iter() {
-        let bad_version = Version {
-            major,
-            minor,
-            patch,
-            pre: semver::Prerelease::EMPTY,
-            build: semver::BuildMetadata::EMPTY,
-        };
-
-        if &bad_version == llvm_version {
-            return Some(reason);
-        }
-    }
-    None
-}
-
-/// Check whether the given LLVM version is compatible with this version of
-/// the crate.
-fn is_compatible_llvm(llvm_version: &Version) -> bool {
-    if let Some(reason) = is_blocklisted_llvm(llvm_version) {
-        println!(
-            "found LLVM {}, which is blocklisted: {}",
-            llvm_version, reason
-        );
-        return false;
-    }
-
-    let strict =
-        env::var_os(&*ENV_STRICT_VERSIONING).is_some() || cfg!(feature = "strict-versioning");
-    if strict {
-        llvm_version.major == CRATE_VERSION.major && llvm_version.minor == CRATE_VERSION.minor
-    } else {
-        llvm_version.major >= CRATE_VERSION.major
-            || (llvm_version.major == CRATE_VERSION.major
-                && llvm_version.minor >= CRATE_VERSION.minor)
     }
 }
 
@@ -266,31 +90,6 @@ where
         }
     })()
     .with_context(|| format!("{cmd:?}"))
-}
-
-/// Get the LLVM version using llvm-config.
-fn llvm_version(binary: &Path) -> anyhow::Result<Version> {
-    let version_str = llvm_config_ex(binary, ["--version"])?;
-
-    // LLVM isn't really semver and uses version suffixes to build
-    // version strings like '3.8.0svn', so limit what we try to parse
-    // to only the numeric bits.
-    let re = Regex::new(r"^(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))??").unwrap();
-    let c = re.captures(&version_str).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not determine LLVM version from llvm-config. Version string: {version_str}"
-        )
-    })?;
-
-    // some systems don't have a patch number but Version wants it so we just append .0 if it isn't
-    // there
-    let major = c.name("major").unwrap().as_str().parse().context("major")?;
-    let minor = c.name("minor").unwrap().as_str().parse().context("minor")?;
-    let patch = match c.name("patch") {
-        None => 0,
-        Some(patch) => patch.as_str().parse().context("patch")?,
-    };
-    Ok(Version::new(major, minor, patch))
 }
 
 /// Get the names of the dylibs required by LLVM, including the C++ standard
@@ -706,20 +505,38 @@ fn get_llvm_cflags(llvm_config_path: &Path) -> String {
         .join(" ")
 }
 
+/// blaze: `llvm-config --cxxflags` for wrappers/passes.cpp, cleaned as [`get_llvm_cflags`]
+/// cleans the C flags.
+fn get_llvm_cxxflags(llvm_config_path: &Path) -> String {
+    let output = llvm_config(llvm_config_path, ["--cxxflags"]);
+    let no_clean = env::var_os(&*ENV_NO_CLEAN_CFLAGS).is_some();
+    if no_clean || target_env_is("msvc") {
+        return output;
+    }
+    output
+        .split(&[' ', '\n'][..])
+        .filter(|word| !word.starts_with("-W"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn is_llvm_debug(llvm_config_path: &Path) -> bool {
     // Has to be either Debug or Release
     llvm_config(llvm_config_path, ["--build-mode"]).contains("Debug")
 }
 
 fn main() {
+    // blaze: the pinned prefix or one error (pin.rs), before any step reads or runs LLVM. No
+    // search of PATH or Homebrew and no version range: a prefix that is not the pin stops here.
+    let Some(llvm_config_path) = pinned_llvm_config() else {
+        return;
+    };
+
     // Behavior can be significantly affected by these vars.
-    println!("cargo:rerun-if-env-changed={}", &*ENV_LLVM_PREFIX);
-    if let Ok(path) = env::var(&*ENV_LLVM_PREFIX) {
+    if let Ok(path) = env::var(PIN_PREFIX) {
         println!("cargo:rerun-if-changed={}", path);
     }
 
-    println!("cargo:rerun-if-env-changed={}", &*ENV_IGNORE_BLOCKLIST);
-    println!("cargo:rerun-if-env-changed={}", &*ENV_STRICT_VERSIONING);
     println!("cargo:rerun-if-env-changed={}", &*ENV_NO_CLEAN_CFLAGS);
     println!("cargo:rerun-if-env-changed={}", &*ENV_USE_DEBUG_MSVCRT);
     println!("cargo:rerun-if-env-changed={}", &*ENV_FORCE_FFI);
@@ -729,21 +546,24 @@ fn main() {
         return;
     }
 
-    let llvm_config_path = match locate_llvm_config() {
-        None => {
-            println!("cargo:rustc-cfg=LLVM_SYS_NOT_FOUND");
-            return;
-        }
-        Some(llvm_config_path) => llvm_config_path,
-    };
-
     // Build the extra wrapper functions.
+    println!("cargo:rerun-if-changed=wrappers/target.c");
     if !cfg!(feature = "disable-alltargets-init") {
         std::env::set_var("CFLAGS", get_llvm_cflags(&llvm_config_path));
         cc::Build::new()
             .file("wrappers/target.c")
             .compile("targetwrappers");
     }
+
+    // blaze: the pass builder kept per thread and target machine (wrappers/passes.cpp). LLVM's
+    // own system libraries name the C++ runtime, so cc names none.
+    println!("cargo:rerun-if-changed=wrappers/passes.cpp");
+    let mut passes = cc::Build::new();
+    passes.cpp(true).cpp_link_stdlib(None).file("wrappers/passes.cpp");
+    for flag in get_llvm_cxxflags(&llvm_config_path).split_whitespace() {
+        passes.flag(flag);
+    }
+    passes.compile("blazepasses");
 
     if cfg!(feature = "no-llvm-linking") {
         return;

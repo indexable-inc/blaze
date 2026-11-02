@@ -1,14 +1,14 @@
 //! The lints run over crates written out as rust-analyzer's fixtures write them, their
 //! diagnostics compared with what clippy writes of the same source.
 
-use ide_db::{RootDatabase, base_db::SourceDatabase as _};
-use rustc_hash::FxHashMap;
-use test_fixture::WithFixture as _;
+use base_db::{Db, FileId};
+use blaze_diagnostics::emit::{Sources, Style};
+use blaze_hash::HashMap;
+use hir_expand::fixture;
 
 use crate::{
     check::{Setup, check},
     conf::Conf,
-    emit::{self, Sources, Style},
     level::CommandLine,
 };
 
@@ -70,13 +70,34 @@ macro_rules! vec {
 /// The diagnostics clippy's lints have in the crate `main` of `fixture`, rustc's flags `flags`
 /// given, each as rustc writes it.
 pub(crate) fn lint(fixture: &str, flags: &str) -> String {
-    let db = RootDatabase::with_files(fixture);
+    lint_with(fixture, flags, Conf::default())
+}
+
+/// [`lint`] with the `clippy.toml` configuration `conf`. Each fixture is linted twice, on two
+/// databases, with the lints dispatched on the node's kind and as each cast the node for
+/// itself before ([`crate::lints::check_node_by_casts`]): the two write the same.
+pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
+    lint_given(fixture, flags, conf, |_| {})
+}
+
+/// [`lint_with`], `given` done to each database's fixture first (a proc-macro crate given its
+/// macros, [`fixture::Fixture::set_proc_macros`]).
+pub(crate) fn lint_given(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+    let by_kind = lint_once(fixture, flags, conf.clone(), given);
+    crate::lints::BY_CASTS.set(true);
+    let by_casts = lint_once(fixture, flags, conf, given);
+    crate::lints::BY_CASTS.set(false);
+    assert_eq!(by_kind, by_casts, "the dispatch on the kind finds what the casts found");
+    by_kind
+}
+
+fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+    let mut built = fixture::db(fixture);
+    given(&mut built);
+    let db = built.into_db();
     hir::attach_db(&db, || {
-        let krate = hir::Crate::all(&db)
-            .into_iter()
-            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
-            .expect("the fixture has a crate `main`");
-        let mut names: FxHashMap<ide_db::FileId, String> = FxHashMap::default();
+        let krate = main_crate(&db);
+        let mut names: HashMap<FileId, String> = HashMap::default();
         let mut texts = Vec::new();
         for krate in hir::Crate::all(&db) {
             for module in krate.modules(&db) {
@@ -92,18 +113,24 @@ pub(crate) fn lint(fixture: &str, flags: &str) -> String {
             }
         }
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
-        let setup = Setup {
-            command_line: CommandLine::parse(&flags).expect("the flags read"),
-            conf: Conf::default(),
-        };
-        let name_of = |file: ide_db::FileId| names.get(&file).cloned();
-        let found = check(&db, krate, &setup, &name_of);
+        let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
+        let name_of = |file: FileId| names.get(&file).cloned();
+        let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
         let mut sources = Sources::of(texts);
-        found
-            .iter()
-            .map(|it| emit::written(&it.diagnostic, &mut sources, Style::default()))
+        crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+            .expect("every file a lint points into is given")
+            .into_iter()
+            .map(|it| it.rendered)
             .collect()
     })
+}
+
+/// The crate `main` of a fixture's database.
+pub(crate) fn main_crate(db: &Db) -> hir::Crate {
+    hir::Crate::all(db)
+        .into_iter()
+        .find(|it| it.display_name(db).is_some_and(|it| it.to_string() == "main"))
+        .expect("the fixture has a crate `main`")
 }
 
 #[test]
@@ -173,7 +200,6 @@ fn f() {{
           |     ^^^^^^^^^^^^^^^^^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#bool_assert_comparison
-          = note: `#[warn(clippy::bool_assert_comparison)]` on by default
         help: replace it with `assert!(..)`
           |
         3 -     assert_ne!(1 > 0, false);
@@ -215,7 +241,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                           ^^^ help: remove the redundant `&`: `n`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:3:22
@@ -224,7 +249,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                      ^^ help: remove the redundant `&`: `n`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:3:26
@@ -233,7 +257,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                          ^^^^^^^ help: remove the redundant `&`: `5usize`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:4:18
@@ -242,7 +265,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                  ^^^^^^^ help: remove the redundant `&mut`: `*m`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:6:27
@@ -251,7 +273,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                           ^^^^ help: remove the redundant `&`: `(n)`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
     "#]].assert_eq(&lint(&fixture, ""));
 }
@@ -293,7 +314,6 @@ fn f(a: I<'_>, b: I<'_>, c: I<'_>) {{
            |             ^^^^^^^^^^^^^ help: consider calling the dedicated `copied` method: `b.copied()`
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#map_clone
-           = note: `#[warn(clippy::map_clone)]` on by default
 
         warning: you are using an explicit closure for copying elements
           --> src/lib.rs:11:13
@@ -302,7 +322,6 @@ fn f(a: I<'_>, b: I<'_>, c: I<'_>) {{
            |             ^^^^^^^^^^^^^^^^^^^^ help: consider calling the dedicated `copied` method: `c.copied()`
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#map_clone
-           = note: `#[warn(clippy::map_clone)]` on by default
 
         warning: using `clone` on type `u8` which implements the `Copy` trait
           --> src/lib.rs:11:23
@@ -365,7 +384,6 @@ fn f(x: Option<u8>) -> (bool, bool, bool) {{
           |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#match_like_matches_macro
-          = note: `#[warn(clippy::match_like_matches_macro)]` on by default
         help: use `matches!` directly
           |
         6 -     let b = if let Some(1) = x { false } else { true };
@@ -490,7 +508,6 @@ fn f(x: bool) -> u8 {{
           |         ^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#needless_return
-          = note: `#[warn(clippy::needless_return)]` on by default
         help: remove `return`
           |
         5 -         return 2;

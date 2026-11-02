@@ -1,9 +1,0 @@
-{
-  "row": "feature unification, resolver 3 (edition 2024)",
-  "package": "app",
-  "crates": [
-    "app",
-    "shared"
-  ],
-  "cargo": []
-}

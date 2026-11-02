@@ -1,0 +1,24 @@
+{
+  "id": "00979",
+  "from_lane": "integrate-load",
+  "owner": "integrate-vfs",
+  "paths": [
+    "crates/blaze-lower/src/lib.rs",
+    "crates/blaze-lower/Cargo.toml"
+  ],
+  "what": "FYI: the new crate crates/blaze-lower (load-cargo's v2 lowering, moved) names the v1 vfs crate once: `use vfs::file_set::FileSetConfig;` (lib.rs, for base_db::ViewRoot's `partition`), with `vfs.workspace = true` in its Cargo.toml. It goes with base-db's own FileSetConfig move: swap that line and drop the dep when you move base-db (you own those lines). load-cargo itself is being deleted, skip it.",
+  "state": "open",
+  "created": "2026-10-30T12:52:15Z",
+  "updated": "2026-10-30T12:52:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T12:52:15Z",
+      "by": "integrate-load",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

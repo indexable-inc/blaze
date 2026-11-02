@@ -1,255 +1,157 @@
 #!/usr/bin/env python3
-"""storeguards.py: whose the store is, and what of a checkout is in it.
+"""storeguards.py: v2's store is its user's alone. Linux and macOS.
 
-A daemon fills a store and ends. Then:
+    uv run --frozen python harness/storeguards.py '{"blaze": "target/release/blaze"}'
 
-  - the directory has to be the user's alone (0700) and every file in it too (0600);
-  - no file of the store, and no file of a remote the store was pushed to, may have the
-    path of the checkout in it: what one checkout kept is found by another, and read by
-    whoever reads the remote;
-  - a pack that other users can write to has to be removed, said so, and the program
-    built from the rest has to print what cargo's does;
-  - a store directory that other users can write to has to be refused by `blaze-engine cache`
-    with the reason, and a daemon on it has to say it is not used, build the right
-    program, and neither read nor write anything in it;
-  - `blaze-engine cache pull` from a remote whose lists nobody signed has to be refused, with
-    nothing fetched, unless BLAZE_REMOTE_UNSIGNED=1; `blaze-engine cache push` asks for nothing.
+`blaze` is the v2 command line. The input is one JSON object, inline, a file's path, or `-`.
 
-  - a crate cargo fetched from a registry is kept under `/cargo`, not under the cargo home
-    of whoever built it: a second user with another cargo home has to find what the first
-    kept, the program has to print what that user's cargo's prints (the place of the file
-    under their own cargo home), and neither home may be in the store.
+A daemon builds two states of the stress workspace into its store and stops. Then
+(docs/v2/plan/lanes/store.md, "Done when": a store others can write to refused):
 
-    python3 storeguards.py
+  - the store's directory is 0700 and every file in it (`head`, `index-N`, `pack-NNNNNN`,
+    `file-<content>`) 0600;
+  - a pack others can write to is not read: the next daemon refuses to start, or a build stops,
+    naming the pack and saying others can write to it; or the pack is left unread, said so
+    naming it, and the program built prints what blaze's build from nothing prints;
+  - a store directory others can write to (0770, then 0707) is refused: the daemon does not
+    start, says why naming the directory, and leaves every file of it as it was;
+  - with the modes put back, a daemon opens the store and builds right.
 """
-import os, re, shutil, stat, subprocess, sys
+import os, re, shutil, stat, sys, time
+from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import Checkout, Daemon, cache, files, run, scratch, verify
-from difftest import Fixture
-import packs
+from typed_input import fail, parse
+from storelib import Checkout, Daemon, Failed, blaze_of, files, listing, named, references, scratch, store_of
 
-SEALS = {"BLAZE_CACHE_SEAL_AT": "1", "BLAZE_CACHE_MAX": "off"}
-OTHERS_WRITE = "written to by other users"
+SCRIPT = "storeguards.py"
+# How blaze says that others than the user can write to a file or directory.
+OTHERS_WRITE = re.compile(r"can be written to by other users|belongs to another user", re.I)
 
 
-def fail(what):
-    raise SystemExit(f"FAIL: {what}")
+@dataclass(frozen=True)
+class Input:
+    blaze: str
+
+
+class Findings(Exception):
+    """What was wrong, said whole."""
+
+
+def bad(what):
+    raise Findings(f"FAIL: {what}")
 
 
 def mode(path):
     return stat.S_IMODE(os.stat(path).st_mode)
 
 
-def filled(checkout, store, name):
-    """Has a daemon build the program with `store`; returns what the daemon logged."""
-    daemon = Daemon(checkout, store, name=name, env=SEALS)
-    checkout.check(daemon, name)
-    daemon.kill()
-    return daemon.log()
+class Run:
+    def __init__(self, blaze, work):
+        self.blaze = blaze
+        self.home = os.path.join(work, "h")
+        self.store = store_of(self.home)
+        self.checkout = Checkout(work)
+        self.expected = references(blaze, work, [0, 1])
+
+    def right(self, daemon, built, what):
+        got, want = built.program(), self.expected[self.checkout.value]
+        if built.status != 0 or got != want:
+            bad(f"{what}: the build ended {built.status} and its program prints\n{got}\nand blaze's build from "
+                f"nothing\n{want}\nsaid: {built.said[-2000:]}\nlog: {daemon.log_path}")
+
+    def filled(self, name):
+        daemon = Daemon(self.blaze, self.home, name=name)
+        if not daemon.listening:
+            bad(f"{name}: the daemon did not start: {daemon.log_path}")
+        for value in (0, 1):
+            self.checkout.set(value)
+            self.right(daemon, daemon.build(self.checkout.ws), f"{name}, state {value}")
+        daemon.stop()
+
+    def the_users_alone(self):
+        if mode(self.store) != 0o700:
+            bad(f"the store {self.store} is {mode(self.store):o}, not 700")
+        kept = files(self.store, "head", "index", "pack", "file")
+        open_to = [(os.path.basename(path), f"{mode(path):o}") for path in kept if mode(path) != 0o600]
+        if not kept or open_to:
+            bad(f"files of the store are not 600: {open_to or 'there are none'}")
+        print(f"  modes: the store 700, its {len(kept)} files 600", flush=True)
+
+    def writable_pack(self):
+        pack = files(self.store, "pack")[0]
+        os.chmod(pack, 0o666)
+        daemon = Daemon(self.blaze, self.home, name="writable-pack", wait=False)
+        if not daemon.wait():
+            said = daemon.log()
+            if not named(said, pack) or not OTHERS_WRITE.search(said):
+                bad(f"a pack others can write to: the daemon refused to start without saying so of {pack}:\n{said[-2000:]}")
+            how = "the daemon refused to start"
+        else:
+            self.checkout.set(1)
+            built = daemon.build(self.checkout.ws)
+            said = built.said + daemon.log()
+            if not named(said, pack) or not OTHERS_WRITE.search(said):
+                daemon.kill()
+                bad(f"a pack others can write to: neither the build nor the daemon says it is not read, naming {pack}:\n"
+                    f"{built.said[-2000:]}\nlog: {daemon.log_path}")
+            if built.status == 0:
+                self.right(daemon, built, "a pack others can write to, left unread")
+                how = "left unread, the program right"
+            else:
+                how = "the build stopped"
+            daemon.stop()
+        os.chmod(pack, 0o600)
+        print(f"  a pack others can write to: {how}, naming it", flush=True)
+
+    def writable_store(self):
+        for open_to in (0o770, 0o707):
+            os.chmod(self.store, open_to)
+            before = listing(self.store)
+            daemon = Daemon(self.blaze, self.home, name=f"writable-{open_to:o}", wait=False)
+            if daemon.wait():
+                daemon.kill()
+                os.chmod(self.store, 0o700)
+                bad(f"a daemon started on a store others can write to ({open_to:o}): {daemon.log_path}")
+            said = daemon.log()
+            if not named(said, self.store) or not OTHERS_WRITE.search(said):
+                bad(f"a {open_to:o} store: the daemon's refusal does not say others can write to {self.store}:\n{said[-2000:]}")
+            if listing(self.store) != before:
+                bad(f"a {open_to:o} store: its files changed under a daemon that refused it")
+        os.chmod(self.store, 0o700)
+        print("  a store others can write to (770, 707): refused, naming it, nothing changed", flush=True)
+
+    def back(self):
+        daemon = Daemon(self.blaze, self.home, name="back")
+        if not daemon.listening:
+            bad(f"with its modes put back the store does not open: {daemon.log_path}")
+        self.checkout.set(0)
+        self.right(daemon, daemon.build(self.checkout.ws), "with the modes put back")
+        daemon.stop()
+        self.the_users_alone()
 
 
-def the_users_alone(store):
-    if mode(store) != 0o700:
-        fail(f"the store is {mode(store):o}")
-    open_to = [(name, mode(os.path.join(store, name))) for name in os.listdir(store)]
-    if not open_to or any(it != 0o600 for _, it in open_to):
-        fail(f"files of the store are not 0600: {open_to}")
-    print(f"  modes: the store 0700, its {len(open_to)} files 0600")
-
-
-def held_in(path):
-    """The bytes of a file as a store would hold them: a remote sends its packs through zstd,
-    a sealed pack keeps its values in zstd blocks, and a path that is looked for is not found
-    in what is compressed."""
-    data = open(path, "rb").read()
-    if path.endswith(".zst"):
-        unpacked = subprocess.run(["zstd", "-d", "-c", "-q"], input=data, capture_output=True)
-        if unpacked.returncode != 0:
-            fail(f"{path} is not zstd: {unpacked.stderr.decode()[-200:]}")
-        data = unpacked.stdout
-    if data.startswith(packs.MAGIC):
-        if packs.index(data) is None:
-            fail(f"{path} is not laid out as a sealed pack")
-        return b"".join(packs.blocks(data))
-    return data
-
-
-def names_no_checkout(checkout, directory, what):
-    """Nothing below `directory` has the checkout's place, or the home of the user, in it."""
-    places = [checkout.work.encode(), os.path.expanduser("~").encode()]
-    read = 0
-    for at, _, names in os.walk(directory):
-        for name in names:
-            data = held_in(os.path.join(at, name))
-            read += len(data)
-            for place in places:
-                if place in data:
-                    fail(f"{what}: {name} has {place.decode()} in it")
-    if read < 10_000:
-        fail(f"{what}: only {read} bytes to look through")
-    print(f"  paths: none of the checkout or the home in the {read} bytes of {what}")
-
-
-def writable_pack(checkout, store):
-    pack = files(store, ".pack")[0]
-    os.chmod(pack, 0o666)
-    whole, _, out = verify(store)
-    if whole or OTHERS_WRITE not in out:
-        fail(f"verify did not tell of the pack others can write to: {out}")
-    log = filled(checkout, store, "writable-pack")
-    if OTHERS_WRITE not in log or os.path.basename(pack) not in log:
-        fail(f"the daemon did not say it removed the pack: {log[-400:]}")
-    whole, _, out = verify(store)
-    if not whole or any(mode(it) != 0o600 for it in files(store, ".pack")):
-        fail(f"the store after the pack was removed: {out}")
-    print("  a pack others can write to: told of by verify, removed by the daemon, the program right")
-
-
-def writable_store(checkout, store):
-    before = sorted(os.listdir(store))
-    for open_to in (0o770, 0o707):
-        os.chmod(store, open_to)
-        for command in (["stats"], ["verify"], ["gc"]):
-            status, out = cache(store, *command)
-            if status == 0 or OTHERS_WRITE not in out:
-                fail(f"cache {command[0]} on a {open_to:o} store: {out}")
-        log = filled(checkout, store, f"writable-{open_to:o}")
-        if "store: not used" not in log or OTHERS_WRITE not in log:
-            fail(f"the daemon did not say the {open_to:o} store is not used: {log[-400:]}")
-        if sorted(os.listdir(store)) != before:
-            fail(f"the {open_to:o} store was changed: {sorted(os.listdir(store))}")
-    os.chmod(store, 0o700)
-    print("  a store others can write to: refused by cache stats, verify and gc; not used and "
-          "not changed by the daemon, the program right")
-
-
-def unsigned(checkout, store, work):
-    remote, second = os.path.join(work, "remote"), os.path.join(work, "second")
-    nothing_asked = {"BLAZE_REMOTE_UNSIGNED": ""}
-    status, out = cache(store, "push", remote, env=nothing_asked)
-    if status != 0:
-        fail(f"push: {out}")
-    names_no_checkout(checkout, remote, "the remote")
-    for value in ("", "0", "true"):
-        status, out = cache(second, "pull", remote, env={"BLAZE_REMOTE_UNSIGNED": value})
-        if status == 0 or "BLAZE_REMOTE_UNSIGNED=1" not in out or files(second, ".pack"):
-            fail(f"pull with BLAZE_REMOTE_UNSIGNED={value!r} was not refused: {out}")
-    status, out = cache(second, "pull", remote, env={"BLAZE_REMOTE_UNSIGNED": "1"})
-    whole, _, verified = verify(second)
-    if status != 0 or not whole or len(files(second, ".pack")) != len(files(store, ".pack")):
-        fail(f"pull with BLAZE_REMOTE_UNSIGNED=1: {out}\n{verified}")
-    the_users_alone(second)
-    print(f"  unsigned lists: push asks for nothing; pull refused unless BLAZE_REMOTE_UNSIGNED=1, "
-          f"then {len(files(second, '.pack'))} packs fetched")
-
-
-def write(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    open(path, "w").write(text)
-
-
-def fetched_workspace(top):
-    """A workspace whose program is built on a crate of a registry of this machine's own: a
-    local-registry the `local` registry's source is replaced with, as blaze reads no git index."""
-    registry, ws = os.path.join(top, "registry"), os.path.join(top, "ws")
-    write(f"{top}/stage/dep-0.1.0/Cargo.toml", '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
-    write(f"{top}/stage/dep-0.1.0/src/lib.rs",
-          'pub fn place() -> &\'static str {\n    file!()\n}\n\n'
-          'pub fn third(of: &[u32]) -> u32 {\n    of[2]\n}\n\n'
-          'pub fn first<T: Copy>(of: &[T]) -> T {\n    of[0]\n}\n')
-    os.makedirs(registry)
-    crate = f"{registry}/dep-0.1.0.crate"
-    subprocess.run(["tar", "-czf", crate, "-C", f"{top}/stage", "dep-0.1.0"], check=True)
-    import hashlib
-    cksum = hashlib.sha256(open(crate, "rb").read()).hexdigest()
-    write(f"{registry}/index/3/d/dep",
-          '{"name":"dep","vers":"0.1.0","deps":[],"cksum":"%s","features":{},"yanked":false}\n' % cksum)
-    index = f"file://{registry}/index"
-    write(f"{ws}/.cargo/config.toml",
-          f'[registries.local]\nindex = "{index}"\n\n[source.local-index]\nregistry = "{index}"\n'
-          f'replace-with = "local-files"\n\n[source.local-files]\nlocal-registry = "{registry}"\n')
-    write(f"{ws}/Cargo.toml", '[workspace]\nmembers = ["app"]\nresolver = "2"\n')
-    write(f"{ws}/app/Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n'
-          '[dependencies]\ndep = { version = "0.1", registry = "local" }\n')
-    write(f"{ws}/app/src/main.rs",
-          'fn main() {\n    println!("{} {}", dep::place(), dep::first(&[4u8]));\n'
-          '    let short = std::env::args().map(|it| it.len() as u32).collect::<Vec<_>>();\n'
-          '    let caught = std::panic::catch_unwind(|| dep::third(&short)).unwrap_err();\n'
-          '    println!("{}", caught.downcast_ref::<String>().map_or("?", |it| it));\n}\n')
-    return ws
-
-
-def built_with_home(ws, home, store):
-    """Builds the program with `home` as cargo's; returns what blaze said of the store."""
-    were = {name: os.environ.get(name) for name in ("CARGO_HOME", "BLAZE_CACHE", "PATH")}
-    cargo_bin = os.path.dirname(shutil.which("cargo"))
-    os.environ.update(CARGO_HOME=home, BLAZE_CACHE=store, PATH=cargo_bin + os.pathsep + os.environ["PATH"],
-                      **SEALS)
-    try:
-        fx = Fixture(ws, ["dep", "app"], ["-p", "app"])
-        fx.rustc_build()
-        fx.blaze_build()
-    finally:
-        for name, value in were.items():
-            os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
-    want, got = run(fx.reference), run(fx.binary)
-    if home not in want or got != want:
-        fail(f"with {home} as cargo's home the program prints\n{got}\nand cargo's\n{want}")
-    said = open(os.path.join(fx.work, "app.stderr")).read()
-    counted = re.search(r"entries: (\d+) found, (\d+) added", said)
-    if not counted:
-        fail(f"blaze said nothing of the entries of the crate of the registry:\n{said[-2000:]}")
-    return int(counted[1]), int(counted[2])
-
-
-def another_cargo_home(work):
-    top = os.path.join(work, "fetched")
-    ws, store = fetched_workspace(top), os.path.join(top, "store")
-    homes = [os.path.join(top, name, "cargo") for name in ("one", "another-user")]
-    found, added = built_with_home(ws, homes[0], store)
-    if found or not added:
-        fail(f"the first build found {found} entries and added {added}")
-    found_again, added_again = built_with_home(ws, homes[1], store)
-    if found_again != added or added_again:
-        fail(f"under another cargo home {found_again} of {added} entries were found and {added_again} added")
-    remote = os.path.join(top, "remote")
-    status, out = cache(store, "push", remote)
-    if status != 0:
-        fail(f"push: {out}")
-    stored = b""
-    for what, directory in (("the store", store), ("the remote", remote)):
-        held = b"".join(held_in(os.path.join(at, name))
-                        for at, _, names in os.walk(directory) for name in sorted(names))
-        for home in homes:
-            if home.encode() in held:
-                fail(f"{what} has the cargo home {home} in it")
-        if b"/cargo/registry/src/" not in held:
-            fail(f"{what} has no file of the registry in it by the name every machine has for it")
-        stored = stored or held
-    print(f"  cargo home: {added} entries, some of a crate of a registry, kept under one cargo home, all found "
-          f"under another; neither home in the {len(stored)} bytes of the store or in the remote it was pushed to; the program prints "
-          f"the place under the home it was built with")
-
-
-def main():
+def main(args):
     if os.name != "posix":
-        raise SystemExit("storeguards.py: the modes of files are checked on Unix only")
+        fail(SCRIPT, "the modes of files are checked on Unix only")
+    blaze = blaze_of(args.blaze)
+    start = time.time()
     work = scratch("blaze-storeguards-")
-    checkout = Checkout(work)
-    store = os.path.join(work, "store")
-    filled(checkout, store, "fill")
-    checkout.set(1)
-    filled(checkout, store, "fill")
-    the_users_alone(store)
-    names_no_checkout(checkout, store, "the store")
-    unsigned(checkout, store, work)
-    another_cargo_home(work)
-    writable_pack(checkout, store)
-    writable_store(checkout, store)
+    try:
+        run = Run(blaze, work)
+        run.filled("fill")
+        run.the_users_alone()
+        run.writable_pack()
+        run.writable_store()
+        run.back()
+    except (Failed, Findings) as failed:
+        sys.exit(f"{SCRIPT}: {failed}\n  kept: {work}")
     shutil.rmtree(work, ignore_errors=True)
-    print("storeguards: all right")
+    print(f"PASS: the store is its user's alone, in {time.time() - start:.0f}s")
+
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        sys.exit(f"usage: {SCRIPT} '<json>'\n\n{__doc__}")
+    main(parse(Input, sys.argv[1], SCRIPT))

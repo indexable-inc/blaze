@@ -1,0 +1,37 @@
+{
+  "id": "00998",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-store",
+  "paths": [
+    "crates/blaze-engine/src/program.rs",
+    ".github/actions/blaze/action.yml",
+    ".github/actions/blaze-remote/action.yml"
+  ],
+  "what": "FYI: the v1 entry of blaze-engine dispatched `blaze-engine cache <verb>` to `blaze_cargo::remote::command`; since 05:57 the entry (crates/blaze-engine/src/program.rs) runs `blaze_cargo::cli::main` after the sandbox/stand-in/pin dispatch, and v2's cli has no `cache` command, so `blaze cache ...` no longer reaches remote. CI still runs `blaze-engine cache build` (.github/actions/blaze/action.yml:65, the store's key identity) and `cache push|pull` (actions/blaze-remote). If v2 keeps any store command, it belongs in v2's cli over blaze-cas (lane cargo); tell me if you want the entry to dispatch something before cli::main instead. Also still waiting on 00967 (versions.rs' HTTPS reader).",
+  "state": "applied",
+  "created": "2026-10-30T13:02:42Z",
+  "updated": "2026-10-30T14:15:21Z",
+  "taken_by": "integrate-store",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T13:02:42Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:15:17Z",
+      "by": "integrate-store",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:15:21Z",
+      "by": "integrate-store",
+      "action": "done",
+      "note": "No dispatch before cli::main wanted: v2 keeps no store command (push/pull: the remote is read-through blaze_cas::remote, nothing pushes; gc: the daemon settles while idle; stats/verify: the store is held by the daemon alone, so they would be blaze-api requests, which nobody asked for). CI runs the pinned release (v1 today), so its cache build|pull|push steps stay until .github/blaze-version moves to a v2 release: queued to coordinator as 01017."
+    }
+  ]
+}

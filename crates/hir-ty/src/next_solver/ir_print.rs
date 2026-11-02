@@ -1,12 +1,47 @@
 //! Things related to IR printing in the next-trait-solver.
 
-use hir_def::signatures::{TraitSignature, TypeAliasSignature};
-use rustc_type_ir::{self as ty, ir_print::IrPrint};
+use base_db::Db;
+use hir_def::signatures::{ConstSignature, TraitSignature, TypeAliasSignature};
+use rustc_type_ir::{self as ty, AliasTermKind, ir_print::IrPrint};
 
-use crate::next_solver::TermId;
 
 use super::SolverDefId;
 use super::interner::DbInterner;
+
+fn alias_def_id<'db>(kind: AliasTermKind<DbInterner<'db>>) -> SolverDefId<'db> {
+    match kind {
+        AliasTermKind::ProjectionTy { def_id } => def_id.into(),
+        AliasTermKind::InherentTy { def_id } => def_id.into(),
+        AliasTermKind::OpaqueTy { def_id } => def_id.into(),
+        AliasTermKind::FreeTy { def_id } => def_id.into(),
+        AliasTermKind::AnonConst { def_id } => def_id.into(),
+        AliasTermKind::ProjectionConst { def_id } => def_id.into(),
+        AliasTermKind::FreeConst { def_id } => def_id.into(),
+        AliasTermKind::InherentConstSelf { def_id } => def_id.into(),
+        AliasTermKind::InherentConstImpl { def_id } => def_id.into(),
+    }
+}
+
+/// Writes `{what}({name}[{args:?}])`: a type alias or const by its name, anything else (an
+/// opaque type, an anonymous constant) by its id.
+fn print_alias<'db>(
+    db: &Db,
+    what: &str,
+    def_id: SolverDefId<'db>,
+    args: super::GenericArgs<'db>,
+    fmt: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match def_id {
+        SolverDefId::TypeAliasId(id) => {
+            write!(fmt, "{what}({:?}[{args:?}])", TypeAliasSignature::of(db, id).name.as_str())
+        }
+        SolverDefId::ConstId(id) => match &ConstSignature::of(db, id).name {
+            Some(name) => write!(fmt, "{what}({:?}[{args:?}])", name.as_str()),
+            None => write!(fmt, "{what}({id:?}[{args:?}])"),
+        },
+        id => write!(fmt, "{what}({id:?}[{args:?}])"),
+    }
+}
 
 impl<'db> IrPrint<ty::AliasTy<Self>> for DbInterner<'db> {
     fn print(t: &ty::AliasTy<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -14,16 +49,8 @@ impl<'db> IrPrint<ty::AliasTy<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::AliasTy<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| match t.kind.def_id() {
-            SolverDefId::TypeAliasId(id) => fmt.write_str(&format!(
-                "AliasTy({:?}[{:?}])",
-                TypeAliasSignature::of(db, id).name.as_str(),
-                t.args
-            )),
-            SolverDefId::InternedOpaqueTyId(id) => {
-                fmt.write_str(&format!("AliasTy({:?}[{:?}])", id, t.args))
-            }
-            _ => panic!("Expected TypeAlias or OpaqueTy."),
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "AliasTy", |db, fmt| {
+            print_alias(db, "AliasTy", alias_def_id(t.kind.into()), t.args, fmt)
         })
     }
 }
@@ -34,16 +61,8 @@ impl<'db> IrPrint<ty::AliasTerm<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::AliasTerm<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| match t.def_id() {
-            SolverDefId::TypeAliasId(id) => fmt.write_str(&format!(
-                "AliasTerm({:?}[{:?}])",
-                TypeAliasSignature::of(db, id).name.as_str(),
-                t.args
-            )),
-            SolverDefId::InternedOpaqueTyId(id) => {
-                fmt.write_str(&format!("AliasTerm({:?}[{:?}])", id, t.args))
-            }
-            _ => panic!("Expected TypeAlias or OpaqueTy."),
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "AliasTerm", |db, fmt| {
+            print_alias(db, "AliasTerm", alias_def_id(t.kind), t.args, fmt)
         })
     }
 }
@@ -53,52 +72,46 @@ impl<'db> IrPrint<ty::TraitRef<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::TraitRef<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "TraitRef", |db, fmt| {
             let trait_ = t.def_id.0;
             let self_ty = &t.args.as_slice()[0];
             let trait_args = &t.args.as_slice()[1..];
             if trait_args.is_empty() {
-                fmt.write_str(&format!(
-                    "{:?}: {}",
-                    self_ty,
-                    TraitSignature::of(db, trait_).name.as_str()
-                ))
+                write!(fmt, "{:?}: {}", self_ty, TraitSignature::of(db, trait_).name.as_str())
             } else {
-                fmt.write_str(&format!(
+                write!(
+                    fmt,
                     "{:?}: {}<{:?}>",
                     self_ty,
                     TraitSignature::of(db, trait_).name.as_str(),
                     trait_args
-                ))
+                )
             }
         })
     }
 }
-impl<'db> IrPrint<ty::TraitPredicate<Self>> for DbInterner<'db> {
-    fn print(t: &ty::TraitPredicate<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'db> IrPrint<ty::TraitClause<Self>> for DbInterner<'db> {
+    fn print(t: &ty::TraitClause<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Self::print_debug(t, fmt)
     }
 
-    fn print_debug(
-        t: &ty::TraitPredicate<Self>,
-        fmt: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn print_debug(t: &ty::TraitClause<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t.polarity {
-            ty::PredicatePolarity::Positive => write!(fmt, "{:?}", t.trait_ref),
-            ty::PredicatePolarity::Negative => write!(fmt, "!{:?}", t.trait_ref),
+            ty::ClausePolarity::Positive => write!(fmt, "{:?}", t.trait_ref),
+            ty::ClausePolarity::Negative => write!(fmt, "!{:?}", t.trait_ref),
         }
     }
 }
-impl<'db> IrPrint<rustc_type_ir::HostEffectPredicate<Self>> for DbInterner<'db> {
+impl<'db> IrPrint<ty::HostEffectClause<Self>> for DbInterner<'db> {
     fn print(
-        t: &rustc_type_ir::HostEffectPredicate<Self>,
+        t: &ty::HostEffectClause<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         Self::print_debug(t, fmt)
     }
 
     fn print_debug(
-        t: &rustc_type_ir::HostEffectPredicate<Self>,
+        t: &ty::HostEffectClause<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         let prefix = match t.constness {
@@ -120,13 +133,14 @@ impl<'db> IrPrint<ty::ExistentialTraitRef<Self>> for DbInterner<'db> {
         t: &ty::ExistentialTraitRef<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ExistentialTraitRef", |db, fmt| {
             let trait_ = t.def_id.0;
-            fmt.write_str(&format!(
+            write!(
+                fmt,
                 "ExistentialTraitRef({:?}[{:?}])",
                 TraitSignature::of(db, trait_).name.as_str(),
                 t.args
-            ))
+            )
         })
     }
 }
@@ -142,43 +156,30 @@ impl<'db> IrPrint<ty::ExistentialProjection<Self>> for DbInterner<'db> {
         t: &ty::ExistentialProjection<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
-            let id = match t.def_id.0 {
-                TermId::TypeAliasId(id) => id,
-                _ => panic!("Expected trait."),
-            };
-            fmt.write_str(&format!(
-                "ExistentialProjection(({:?}[{:?}]) -> {:?})",
-                TypeAliasSignature::of(db, id).name.as_str(),
-                t.args,
-                t.term
-            ))
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ExistentialProjection", |db, fmt| {
+            fmt.write_str("ExistentialProjection(")?;
+            print_alias(db, "", t.def_id.into(), t.args, fmt)?;
+            write!(fmt, " -> {:?})", t.term)
         })
     }
 }
-impl<'db> IrPrint<ty::ProjectionPredicate<Self>> for DbInterner<'db> {
+impl<'db> IrPrint<ty::ProjectionClause<Self>> for DbInterner<'db> {
     fn print(
-        t: &ty::ProjectionPredicate<Self>,
+        t: &ty::ProjectionClause<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         Self::print_debug(t, fmt)
     }
 
     fn print_debug(
-        t: &ty::ProjectionPredicate<Self>,
+        t: &ty::ProjectionClause<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
-            let id = match t.projection_term.def_id() {
-                SolverDefId::TypeAliasId(id) => id,
-                _ => panic!("Expected trait."),
-            };
-            fmt.write_str(&format!(
-                "ProjectionPredicate(({:?}[{:?}]) -> {:?})",
-                TypeAliasSignature::of(db, id).name.as_str(),
-                t.projection_term.args,
-                t.term
-            ))
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ProjectionClause", |db, fmt| {
+            fmt.write_str("ProjectionClause(")?;
+            let def_id = alias_def_id(t.projection_term.kind);
+            print_alias(db, "", def_id, t.projection_term.args, fmt)?;
+            write!(fmt, " -> {:?})", t.term)
         })
     }
 }

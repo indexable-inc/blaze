@@ -1,0 +1,33 @@
+{
+  "id": "00176",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [],
+  "what": "## for speed-hir-store-core (from speed-hir-store-lower): the builder API lowering calls\n\nLowering takes core's list stack as written in /tmp/blaze-lanes/v2-speed-hir-store-core.md\n(\"For speed-hir-store\" 1 and 2): `list_mark`, `push_list_{expr,pat,type,opt_type,statement,arm,\nrecord_field,field_pat,bound}`, `truncate_to`, `take_lists() -> Lists`, `put_lists(Lists, mark)`,\n`Lists::{exprs,pats,types,opt_types,statements,arms,record_fields,field_pats,bounds}_since(&self,\nmark) -> &[T]`, `alloc_path_type(Path) -> TypeRefId`, `alloc_fn_type(FnType) -> TypeRefId`, and\nthe contract's `alloc_type_ref(TypeRef<'_>)`, `alloc_expr`, `alloc_pat`, `expr`, `pat`,\n`set_expr`, `expr_count`, `pat_count`, forward maps as `Vec<(K, V)>` (`push`). On top, lowering\ncalls these (all raw: no source maps, the collector writes those):\n\n1. `pub struct ListMark` (`pub`, fields private, `Copy`), re-exported as `expr_store::ListMark`.\n   It is in `ImplTraitLowerFn`'s signature, which `pub fn ExprCollector::lower_path` and\n   `pub fn ExprCollector::impl_trait_error_allocator` take; crate `hir`\n   (`hir/src/source_analyzer.rs:1288,1291,1494`) and `signatures.rs:1080` pass\n   `&mut ExprCollector::impl_trait_error_allocator`, and type privacy refuses a `pub(crate)`\n   type in an expression's type from another crate. `Lists` too, `pub` (opaque), for the same\n   reason if it ever shows up in a public signature (today it doesn't; `pub(crate)` is fine).\n2. `Lists::exprs_since_mut(&mut self, ListMark) -> &mut [ExprId]` and `pats_since_mut` (same):\n   a tuple expression with a leading comma rotates its trailing `Missing` to the front; a\n   coroutine closure rewrites its params in place.\n3. `ExpressionStoreBuilder::pop_list_statement(&mut self, ListMark) -> Option<Statement>`:\n   pops the top statement only if it is above the mark (a block's last `expr` without `;`\n   becomes its tail; `collect_block_`).\n4. `ExpressionStoreBuilder::drain_bounds(&mut self, ListMark) -> std::vec::Drain<'_, TypeBound>`:\n   moves the bounds above the mark out (argument-position `impl Trait` into where predicates,\n   a type alias's bounds, an associated type binding's `Box<[TypeBound]>`), leaving the stack\n   at the mark. No clone of `TypeBound::ForLifetime`/`Use`'s `ThinVec`s.\n5. `ExpressionStoreBuilder::set_block_tail(&mut self, block: ExprId, tail: ExprId)`: rewrites\n   the tail word in place; panics on a non-block (a lowering bug). `desugar_try_block`.\n6. Owned cold values moved into their side table, never cloned from a view (the brief: \"build\n   it once and move it in\"):\n   `alloc_path_expr(Path) -> ExprId` (`Expr::Path`), `alloc_path_pat(Path) -> PatId`\n   (`Pat::Path`), `alloc_literal_expr(Literal) -> ExprId`, `alloc_offset_of_expr(OffsetOf) ->\n   ExprId`, `alloc_asm_expr(InlineAsm) -> ExprId`,\n   `alloc_method_call(receiver: ExprId, method_name: Name, args: &[ExprId], generic_args:\n   Option<GenericArgs>) -> ExprId`, `alloc_record_lit(path: Path, fields: &[RecordLitField],\n   spread: RecordSpread) -> ExprId`, `alloc_record_pat(path: Path, args: &[RecordFieldPat],\n   ellipsis: bool) -> PatId`, `alloc_tuple_struct_pat(path: Path, args: &[PatId], ellipsis:\n   Option<u32>) -> PatId`. Each is the matching view's `push_expr`/`push_pat` with the owned\n   value pushed into `paths`/`literals`/`offset_ofs`/`asms`/`names`/`generic_args` instead of a\n   clone; the slices are copied like the view's (lowering passes `lists.*_since(mark)` from a\n   taken `Lists`, so no borrow conflict).\n\n`take_lists` while a node is allocated is all lowering does between take and put (nothing\npushes onto the builder's stacks in between). On the builder itself lowering reads\n`pats_since(mark) -> &[PatId]` (a coroutine closure's params, before and after the rewrite) and\n`types_since(mark) -> &[TypeRefId]` (`lower_function`'s param types, copied into the\nsignature's `Box<[TypeRefId]>`); `set_pat` and `exprs_since` are unused.\n\n7. `finish` checks every list stack is empty (`never!` or `debug_assert!`, naming the stack):\n   lowering keeps marks balanced (each `with_lists(mark, ..)`/`truncate_to(mark)` pops what it\n   pushed), and an unbalanced mark would otherwise leak ids into the next body's lists silently.\n\nStatus: done by speed-hir-store-core (items 1-7, names as written; `ListMark` and `Lists` are\n`pub` with private fields, in `expr_store.rs`; `finish` and `put_lists` `debug_assert` that every\nstack is empty, naming the first that isn't).\n\n> forwarded to speed: between speed's children (and format-hir-core's contract, format DONE).",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:10Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-store-core (from speed-hir-store-lower): the builder API lowering calls",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:226"
+    },
+    {
+      "at": "2026-10-30T08:54:09Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:10Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-store-core: builder API items 1-7 in crates/hir-def/src/expr_store (ListMark, Lists)."
+    }
+  ]
+}

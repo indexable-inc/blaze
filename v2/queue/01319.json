@@ -1,0 +1,35 @@
+{
+  "id": "01319",
+  "from_lane": "builder-2",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty-codegen/v2/frontend.rs"
+  ],
+  "what": "hello: 59 of 267 refused \"no `drop_in_place` lang item\": DropGlue instances (e.g. Vec<u64>, Result<(), Error>). hir-ty-codegen v2/frontend.rs:702 looks it up in DbInterner::new_with(db, env.krate).lang_items(), which misses core's in crates 16404 (41), 16386 (10), 16384 (6), 16390 (2). rustc's lang items are global to the crate graph. This is the coordinator's (b). full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
+  "state": "applied",
+  "created": "2026-10-31T16:48:54Z",
+  "updated": "2026-10-31T16:51:06Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:48:54Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:51:06Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T16:51:06Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "done",
+      "note": "pinned core (nightly-2026-10-27) has no drop_in_place lang item, only #[lang = \"drop_glue\"] on ptr::drop_glue, which drop_in_place calls; item_of now uses DropGlue as rustc does. Not done: minicore still marks drop_in_place, not drop_glue (test-utils), and hir-ty-mir eval shim.rs:337 matches only DropInPlace"
+    }
+  ]
+}

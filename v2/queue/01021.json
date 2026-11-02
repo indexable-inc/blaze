@@ -1,0 +1,24 @@
+{
+  "id": "01021",
+  "from_lane": "fastcompile-queue",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-graph/src/history.rs",
+    "crates/blaze-graph/src/lib.rs"
+  ],
+  "what": "fastcompile-queue 2: once 01019 lands (the daemon on `blaze_history::section`), delete `crates/blaze-graph/src/history.rs` and its `mod` line: its `Estimates`-bytes `SCHEMA`, `write` and `restore` for `SectionId::PLANE_HISTORY` have no caller, and `blaze_history::section` owns that section now (items 00735/00738). Why: two schemas name one section ID.",
+  "state": "open",
+  "created": "2026-10-30T14:18:01Z",
+  "updated": "2026-10-30T14:18:01Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:18:01Z",
+      "by": "fastcompile-queue",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

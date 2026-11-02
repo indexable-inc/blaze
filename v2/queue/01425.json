@@ -1,0 +1,37 @@
+{
+  "id": "01425",
+  "from_lane": "observe-explore",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml",
+    "crates/blaze-cargo/src/cli.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "observe-explore: wire `blaze explore` (design docs/v2/plan/lanes/observe/explore.md, 'Where it runs'). Once crates/blaze-explore has landed: (1) blaze-cargo [dependencies] `blaze-explore.workspace = true`. (2) Daemon: on the first `explore` request (not at `blaze serve` start, so a daemon nobody explores binds no UDP port), call `blaze_explore::start(blaze_explore::Config { history: blaze_explore::History { duckdb: <the same DuckDB `blaze debug sql` resolves, 01420; None when it has none, which the explorer reports as a typed `sql` error per request>, dir: blaze_profile::history::dir_in(&state) }, world: None (see the ci request for blaze_web::Graphs), dev_origin: <the request's flag>, daemon: env!(\"CARGO_PKG_VERSION\") })` and keep the `Explorer` for the daemon's life (dropping it closes every session); a later request with a different dev_origin restarts it. A StartError fails that request with its message, no fallback. Answer the request with `explorer.link()` (it changes when the certificate rotates, every 12 days, so read it per request, never cache it in the client). (3) CLI: `blaze explore` asks the daemon, prints the link, and opens it (`open` on macOS, `xdg-open` on Linux; a failure to open prints why and leaves the printed link); `--dev` sets dev_origin (accepts http://localhost:5173, the ix page's vite server); `--print` prints without opening. The link carries the session token in its fragment: print it to the terminal only, never to the daemon's log or JSON event stream.",
+  "state": "applied",
+  "created": "2026-11-01T02:05:43Z",
+  "updated": "2026-11-01T03:42:36Z",
+  "taken_by": "explore-wire",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:05:43Z",
+      "by": "observe-explore",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:21:32Z",
+      "by": "explore-wire",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:42:36Z",
+      "by": "explore-wire",
+      "action": "done",
+      "note": "blaze explore [--dev] [--print] (cli/observe.rs) asks the daemon (Request::Explore, schema 20); serve/observe.rs starts blaze-explore at the first ask, restarts it when --dev changes, reads Explorer::link() on every ask and prints it to the terminal only. world: None until 01426."
+    }
+  ]
+}

@@ -1,0 +1,736 @@
+; Follows cranelift/filetests/filetests/runtests/extend.clif (and ireduce.clif), for the
+; stencil set: `uextend` and `sextend` from each of `i8` to `i32` to each wider type up to
+; `i64`, `ireduce` from each of `i16` to `i64` to each narrower one, and each after an
+; `iadd` that wraps (so the narrow value's bits above its width are checked to be ignored)
+; or before an extend back. Extends to and reductions from `i128` are
+; i128-arithmetic.clif's.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %uextend_i8_i16(i8) -> i16 {
+block0(v0: i8):
+    v1 = uextend.i16 v0
+    return v1
+}
+; run: %uextend_i8_i16(0) == 0
+; run: %uextend_i8_i16(1) == 1
+; run: %uextend_i8_i16(-1) == 255
+; run: %uextend_i8_i16(-128) == 128
+; run: %uextend_i8_i16(127) == 127
+; run: %uextend_i8_i16(-127) == 129
+; run: %uextend_i8_i16(100) == 100
+; run: %uextend_i8_i16(-77) == 179
+
+function %uextend_iadd_i8_i16(i8, i8) -> i16 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = uextend.i16 v2
+    return v3
+}
+; run: %uextend_iadd_i8_i16(127, 1) == 128
+; run: %uextend_iadd_i8_i16(-1, 1) == 0
+; run: %uextend_iadd_i8_i16(-1, -1) == 254
+; run: %uextend_iadd_i8_i16(-128, -1) == 127
+; run: %uextend_iadd_i8_i16(100, -77) == 23
+; run: %uextend_iadd_i8_i16(1, 2) == 3
+
+function %sextend_i8_i16(i8) -> i16 {
+block0(v0: i8):
+    v1 = sextend.i16 v0
+    return v1
+}
+; run: %sextend_i8_i16(0) == 0
+; run: %sextend_i8_i16(1) == 1
+; run: %sextend_i8_i16(-1) == -1
+; run: %sextend_i8_i16(-128) == -128
+; run: %sextend_i8_i16(127) == 127
+; run: %sextend_i8_i16(-127) == -127
+; run: %sextend_i8_i16(100) == 100
+; run: %sextend_i8_i16(-77) == -77
+
+function %sextend_iadd_i8_i16(i8, i8) -> i16 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = sextend.i16 v2
+    return v3
+}
+; run: %sextend_iadd_i8_i16(127, 1) == -128
+; run: %sextend_iadd_i8_i16(-1, 1) == 0
+; run: %sextend_iadd_i8_i16(-1, -1) == -2
+; run: %sextend_iadd_i8_i16(-128, -1) == 127
+; run: %sextend_iadd_i8_i16(100, -77) == 23
+; run: %sextend_iadd_i8_i16(1, 2) == 3
+
+function %uextend_i8_i32(i8) -> i32 {
+block0(v0: i8):
+    v1 = uextend.i32 v0
+    return v1
+}
+; run: %uextend_i8_i32(0) == 0
+; run: %uextend_i8_i32(1) == 1
+; run: %uextend_i8_i32(-1) == 255
+; run: %uextend_i8_i32(-128) == 128
+; run: %uextend_i8_i32(127) == 127
+; run: %uextend_i8_i32(-127) == 129
+; run: %uextend_i8_i32(100) == 100
+; run: %uextend_i8_i32(-77) == 179
+
+function %uextend_iadd_i8_i32(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = uextend.i32 v2
+    return v3
+}
+; run: %uextend_iadd_i8_i32(127, 1) == 128
+; run: %uextend_iadd_i8_i32(-1, 1) == 0
+; run: %uextend_iadd_i8_i32(-1, -1) == 254
+; run: %uextend_iadd_i8_i32(-128, -1) == 127
+; run: %uextend_iadd_i8_i32(100, -77) == 23
+; run: %uextend_iadd_i8_i32(1, 2) == 3
+
+function %sextend_i8_i32(i8) -> i32 {
+block0(v0: i8):
+    v1 = sextend.i32 v0
+    return v1
+}
+; run: %sextend_i8_i32(0) == 0
+; run: %sextend_i8_i32(1) == 1
+; run: %sextend_i8_i32(-1) == -1
+; run: %sextend_i8_i32(-128) == -128
+; run: %sextend_i8_i32(127) == 127
+; run: %sextend_i8_i32(-127) == -127
+; run: %sextend_i8_i32(100) == 100
+; run: %sextend_i8_i32(-77) == -77
+
+function %sextend_iadd_i8_i32(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = sextend.i32 v2
+    return v3
+}
+; run: %sextend_iadd_i8_i32(127, 1) == -128
+; run: %sextend_iadd_i8_i32(-1, 1) == 0
+; run: %sextend_iadd_i8_i32(-1, -1) == -2
+; run: %sextend_iadd_i8_i32(-128, -1) == 127
+; run: %sextend_iadd_i8_i32(100, -77) == 23
+; run: %sextend_iadd_i8_i32(1, 2) == 3
+
+function %uextend_i8_i64(i8) -> i64 {
+block0(v0: i8):
+    v1 = uextend.i64 v0
+    return v1
+}
+; run: %uextend_i8_i64(0) == 0
+; run: %uextend_i8_i64(1) == 1
+; run: %uextend_i8_i64(-1) == 255
+; run: %uextend_i8_i64(-128) == 128
+; run: %uextend_i8_i64(127) == 127
+; run: %uextend_i8_i64(-127) == 129
+; run: %uextend_i8_i64(100) == 100
+; run: %uextend_i8_i64(-77) == 179
+
+function %uextend_iadd_i8_i64(i8, i8) -> i64 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = uextend.i64 v2
+    return v3
+}
+; run: %uextend_iadd_i8_i64(127, 1) == 128
+; run: %uextend_iadd_i8_i64(-1, 1) == 0
+; run: %uextend_iadd_i8_i64(-1, -1) == 254
+; run: %uextend_iadd_i8_i64(-128, -1) == 127
+; run: %uextend_iadd_i8_i64(100, -77) == 23
+; run: %uextend_iadd_i8_i64(1, 2) == 3
+
+function %sextend_i8_i64(i8) -> i64 {
+block0(v0: i8):
+    v1 = sextend.i64 v0
+    return v1
+}
+; run: %sextend_i8_i64(0) == 0
+; run: %sextend_i8_i64(1) == 1
+; run: %sextend_i8_i64(-1) == -1
+; run: %sextend_i8_i64(-128) == -128
+; run: %sextend_i8_i64(127) == 127
+; run: %sextend_i8_i64(-127) == -127
+; run: %sextend_i8_i64(100) == 100
+; run: %sextend_i8_i64(-77) == -77
+
+function %sextend_iadd_i8_i64(i8, i8) -> i64 {
+block0(v0: i8, v1: i8):
+    v2 = iadd v0, v1
+    v3 = sextend.i64 v2
+    return v3
+}
+; run: %sextend_iadd_i8_i64(127, 1) == -128
+; run: %sextend_iadd_i8_i64(-1, 1) == 0
+; run: %sextend_iadd_i8_i64(-1, -1) == -2
+; run: %sextend_iadd_i8_i64(-128, -1) == 127
+; run: %sextend_iadd_i8_i64(100, -77) == 23
+; run: %sextend_iadd_i8_i64(1, 2) == 3
+
+function %uextend_i16_i32(i16) -> i32 {
+block0(v0: i16):
+    v1 = uextend.i32 v0
+    return v1
+}
+; run: %uextend_i16_i32(0) == 0
+; run: %uextend_i16_i32(1) == 1
+; run: %uextend_i16_i32(-1) == 0x0000ffff
+; run: %uextend_i16_i32(0x8000) == 0x00008000
+; run: %uextend_i16_i32(0x7fff) == 0x00007fff
+; run: %uextend_i16_i32(0x8001) == 0x00008001
+; run: %uextend_i16_i32(0x3039) == 0x00003039
+; run: %uextend_i16_i32(0xa460) == 0x0000a460
+
+function %uextend_iadd_i16_i32(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = iadd v0, v1
+    v3 = uextend.i32 v2
+    return v3
+}
+; run: %uextend_iadd_i16_i32(0x7fff, 1) == 0x00008000
+; run: %uextend_iadd_i16_i32(-1, 1) == 0
+; run: %uextend_iadd_i16_i32(-1, -1) == 0x0000fffe
+; run: %uextend_iadd_i16_i32(0x8000, -1) == 0x00007fff
+; run: %uextend_iadd_i16_i32(0x3039, 0xa460) == 0x0000d499
+; run: %uextend_iadd_i16_i32(1, 2) == 3
+
+function %sextend_i16_i32(i16) -> i32 {
+block0(v0: i16):
+    v1 = sextend.i32 v0
+    return v1
+}
+; run: %sextend_i16_i32(0) == 0
+; run: %sextend_i16_i32(1) == 1
+; run: %sextend_i16_i32(-1) == -1
+; run: %sextend_i16_i32(0x8000) == 0xffff8000
+; run: %sextend_i16_i32(0x7fff) == 0x00007fff
+; run: %sextend_i16_i32(0x8001) == 0xffff8001
+; run: %sextend_i16_i32(0x3039) == 0x00003039
+; run: %sextend_i16_i32(0xa460) == 0xffffa460
+
+function %sextend_iadd_i16_i32(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
+    v2 = iadd v0, v1
+    v3 = sextend.i32 v2
+    return v3
+}
+; run: %sextend_iadd_i16_i32(0x7fff, 1) == 0xffff8000
+; run: %sextend_iadd_i16_i32(-1, 1) == 0
+; run: %sextend_iadd_i16_i32(-1, -1) == -2
+; run: %sextend_iadd_i16_i32(0x8000, -1) == 0x00007fff
+; run: %sextend_iadd_i16_i32(0x3039, 0xa460) == 0xffffd499
+; run: %sextend_iadd_i16_i32(1, 2) == 3
+
+function %uextend_i16_i64(i16) -> i64 {
+block0(v0: i16):
+    v1 = uextend.i64 v0
+    return v1
+}
+; run: %uextend_i16_i64(0) == 0
+; run: %uextend_i16_i64(1) == 1
+; run: %uextend_i16_i64(-1) == 0x000000000000ffff
+; run: %uextend_i16_i64(0x8000) == 0x0000000000008000
+; run: %uextend_i16_i64(0x7fff) == 0x0000000000007fff
+; run: %uextend_i16_i64(0x8001) == 0x0000000000008001
+; run: %uextend_i16_i64(0x3039) == 0x0000000000003039
+; run: %uextend_i16_i64(0xa460) == 0x000000000000a460
+
+function %uextend_iadd_i16_i64(i16, i16) -> i64 {
+block0(v0: i16, v1: i16):
+    v2 = iadd v0, v1
+    v3 = uextend.i64 v2
+    return v3
+}
+; run: %uextend_iadd_i16_i64(0x7fff, 1) == 0x0000000000008000
+; run: %uextend_iadd_i16_i64(-1, 1) == 0
+; run: %uextend_iadd_i16_i64(-1, -1) == 0x000000000000fffe
+; run: %uextend_iadd_i16_i64(0x8000, -1) == 0x0000000000007fff
+; run: %uextend_iadd_i16_i64(0x3039, 0xa460) == 0x000000000000d499
+; run: %uextend_iadd_i16_i64(1, 2) == 3
+
+function %sextend_i16_i64(i16) -> i64 {
+block0(v0: i16):
+    v1 = sextend.i64 v0
+    return v1
+}
+; run: %sextend_i16_i64(0) == 0
+; run: %sextend_i16_i64(1) == 1
+; run: %sextend_i16_i64(-1) == -1
+; run: %sextend_i16_i64(0x8000) == 0xffffffffffff8000
+; run: %sextend_i16_i64(0x7fff) == 0x0000000000007fff
+; run: %sextend_i16_i64(0x8001) == 0xffffffffffff8001
+; run: %sextend_i16_i64(0x3039) == 0x0000000000003039
+; run: %sextend_i16_i64(0xa460) == 0xffffffffffffa460
+
+function %sextend_iadd_i16_i64(i16, i16) -> i64 {
+block0(v0: i16, v1: i16):
+    v2 = iadd v0, v1
+    v3 = sextend.i64 v2
+    return v3
+}
+; run: %sextend_iadd_i16_i64(0x7fff, 1) == 0xffffffffffff8000
+; run: %sextend_iadd_i16_i64(-1, 1) == 0
+; run: %sextend_iadd_i16_i64(-1, -1) == -2
+; run: %sextend_iadd_i16_i64(0x8000, -1) == 0x0000000000007fff
+; run: %sextend_iadd_i16_i64(0x3039, 0xa460) == 0xffffffffffffd499
+; run: %sextend_iadd_i16_i64(1, 2) == 3
+
+function %uextend_i32_i64(i32) -> i64 {
+block0(v0: i32):
+    v1 = uextend.i64 v0
+    return v1
+}
+; run: %uextend_i32_i64(0) == 0
+; run: %uextend_i32_i64(1) == 1
+; run: %uextend_i32_i64(-1) == 0x00000000ffffffff
+; run: %uextend_i32_i64(0x80000000) == 0x0000000080000000
+; run: %uextend_i32_i64(0x7fffffff) == 0x000000007fffffff
+; run: %uextend_i32_i64(0x80000001) == 0x0000000080000001
+; run: %uextend_i32_i64(0x075bcd15) == 0x00000000075bcd15
+; run: %uextend_i32_i64(0xc521974f) == 0x00000000c521974f
+
+function %uextend_iadd_i32_i64(i32, i32) -> i64 {
+block0(v0: i32, v1: i32):
+    v2 = iadd v0, v1
+    v3 = uextend.i64 v2
+    return v3
+}
+; run: %uextend_iadd_i32_i64(0x7fffffff, 1) == 0x0000000080000000
+; run: %uextend_iadd_i32_i64(-1, 1) == 0
+; run: %uextend_iadd_i32_i64(-1, -1) == 0x00000000fffffffe
+; run: %uextend_iadd_i32_i64(0x80000000, -1) == 0x000000007fffffff
+; run: %uextend_iadd_i32_i64(0x075bcd15, 0xc521974f) == 0x00000000cc7d6464
+; run: %uextend_iadd_i32_i64(1, 2) == 3
+
+function %sextend_i32_i64(i32) -> i64 {
+block0(v0: i32):
+    v1 = sextend.i64 v0
+    return v1
+}
+; run: %sextend_i32_i64(0) == 0
+; run: %sextend_i32_i64(1) == 1
+; run: %sextend_i32_i64(-1) == -1
+; run: %sextend_i32_i64(0x80000000) == 0xffffffff80000000
+; run: %sextend_i32_i64(0x7fffffff) == 0x000000007fffffff
+; run: %sextend_i32_i64(0x80000001) == 0xffffffff80000001
+; run: %sextend_i32_i64(0x075bcd15) == 0x00000000075bcd15
+; run: %sextend_i32_i64(0xc521974f) == 0xffffffffc521974f
+
+function %sextend_iadd_i32_i64(i32, i32) -> i64 {
+block0(v0: i32, v1: i32):
+    v2 = iadd v0, v1
+    v3 = sextend.i64 v2
+    return v3
+}
+; run: %sextend_iadd_i32_i64(0x7fffffff, 1) == 0xffffffff80000000
+; run: %sextend_iadd_i32_i64(-1, 1) == 0
+; run: %sextend_iadd_i32_i64(-1, -1) == -2
+; run: %sextend_iadd_i32_i64(0x80000000, -1) == 0x000000007fffffff
+; run: %sextend_iadd_i32_i64(0x075bcd15, 0xc521974f) == 0xffffffffcc7d6464
+; run: %sextend_iadd_i32_i64(1, 2) == 3
+
+function %ireduce_i16_i8(i16) -> i8 {
+block0(v0: i16):
+    v1 = ireduce.i8 v0
+    return v1
+}
+; run: %ireduce_i16_i8(0) == 0
+; run: %ireduce_i16_i8(1) == 1
+; run: %ireduce_i16_i8(-1) == -1
+; run: %ireduce_i16_i8(0x8000) == 0
+; run: %ireduce_i16_i8(0x7fff) == -1
+; run: %ireduce_i16_i8(0x3039) == 57
+; run: %ireduce_i16_i8(0xa460) == 96
+; run: %ireduce_i16_i8(256) == 0
+; run: %ireduce_i16_i8(255) == -1
+; run: %ireduce_i16_i8(384) == -128
+; run: %ireduce_i16_i8(128) == -128
+; run: %ireduce_i16_i8(0x8005) == 5
+
+function %ireduce_uextend_i16_i8(i16) -> i16 {
+block0(v0: i16):
+    v1 = ireduce.i8 v0
+    v2 = uextend.i16 v1
+    return v2
+}
+; run: %ireduce_uextend_i16_i8(0) == 0
+; run: %ireduce_uextend_i16_i8(1) == 1
+; run: %ireduce_uextend_i16_i8(-1) == 255
+; run: %ireduce_uextend_i16_i8(0x8000) == 0
+; run: %ireduce_uextend_i16_i8(0x7fff) == 255
+; run: %ireduce_uextend_i16_i8(0x3039) == 57
+; run: %ireduce_uextend_i16_i8(0xa460) == 96
+; run: %ireduce_uextend_i16_i8(256) == 0
+; run: %ireduce_uextend_i16_i8(255) == 255
+; run: %ireduce_uextend_i16_i8(384) == 128
+; run: %ireduce_uextend_i16_i8(128) == 128
+; run: %ireduce_uextend_i16_i8(0x8005) == 5
+
+function %ireduce_sextend_i16_i8(i16) -> i16 {
+block0(v0: i16):
+    v1 = ireduce.i8 v0
+    v2 = sextend.i16 v1
+    return v2
+}
+; run: %ireduce_sextend_i16_i8(0) == 0
+; run: %ireduce_sextend_i16_i8(1) == 1
+; run: %ireduce_sextend_i16_i8(-1) == -1
+; run: %ireduce_sextend_i16_i8(0x8000) == 0
+; run: %ireduce_sextend_i16_i8(0x7fff) == -1
+; run: %ireduce_sextend_i16_i8(0x3039) == 57
+; run: %ireduce_sextend_i16_i8(0xa460) == 96
+; run: %ireduce_sextend_i16_i8(256) == 0
+; run: %ireduce_sextend_i16_i8(255) == -1
+; run: %ireduce_sextend_i16_i8(384) == -128
+; run: %ireduce_sextend_i16_i8(128) == -128
+; run: %ireduce_sextend_i16_i8(0x8005) == 5
+
+function %iadd_ireduce_i16_i8(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
+    v2 = iadd v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}
+; run: %iadd_ireduce_i16_i8(0x7fff, 1) == 0
+; run: %iadd_ireduce_i16_i8(-1, 1) == 0
+; run: %iadd_ireduce_i16_i8(0x3039, 0xa460) == -103
+; run: %iadd_ireduce_i16_i8(255, 1) == 0
+
+function %ireduce_i32_i8(i32) -> i8 {
+block0(v0: i32):
+    v1 = ireduce.i8 v0
+    return v1
+}
+; run: %ireduce_i32_i8(0) == 0
+; run: %ireduce_i32_i8(1) == 1
+; run: %ireduce_i32_i8(-1) == -1
+; run: %ireduce_i32_i8(0x80000000) == 0
+; run: %ireduce_i32_i8(0x7fffffff) == -1
+; run: %ireduce_i32_i8(0x075bcd15) == 21
+; run: %ireduce_i32_i8(0xc521974f) == 79
+; run: %ireduce_i32_i8(256) == 0
+; run: %ireduce_i32_i8(255) == -1
+; run: %ireduce_i32_i8(384) == -128
+; run: %ireduce_i32_i8(128) == -128
+; run: %ireduce_i32_i8(0x80000005) == 5
+
+function %ireduce_uextend_i32_i8(i32) -> i32 {
+block0(v0: i32):
+    v1 = ireduce.i8 v0
+    v2 = uextend.i32 v1
+    return v2
+}
+; run: %ireduce_uextend_i32_i8(0) == 0
+; run: %ireduce_uextend_i32_i8(1) == 1
+; run: %ireduce_uextend_i32_i8(-1) == 255
+; run: %ireduce_uextend_i32_i8(0x80000000) == 0
+; run: %ireduce_uextend_i32_i8(0x7fffffff) == 255
+; run: %ireduce_uextend_i32_i8(0x075bcd15) == 21
+; run: %ireduce_uextend_i32_i8(0xc521974f) == 79
+; run: %ireduce_uextend_i32_i8(256) == 0
+; run: %ireduce_uextend_i32_i8(255) == 255
+; run: %ireduce_uextend_i32_i8(384) == 128
+; run: %ireduce_uextend_i32_i8(128) == 128
+; run: %ireduce_uextend_i32_i8(0x80000005) == 5
+
+function %ireduce_sextend_i32_i8(i32) -> i32 {
+block0(v0: i32):
+    v1 = ireduce.i8 v0
+    v2 = sextend.i32 v1
+    return v2
+}
+; run: %ireduce_sextend_i32_i8(0) == 0
+; run: %ireduce_sextend_i32_i8(1) == 1
+; run: %ireduce_sextend_i32_i8(-1) == -1
+; run: %ireduce_sextend_i32_i8(0x80000000) == 0
+; run: %ireduce_sextend_i32_i8(0x7fffffff) == -1
+; run: %ireduce_sextend_i32_i8(0x075bcd15) == 21
+; run: %ireduce_sextend_i32_i8(0xc521974f) == 79
+; run: %ireduce_sextend_i32_i8(256) == 0
+; run: %ireduce_sextend_i32_i8(255) == -1
+; run: %ireduce_sextend_i32_i8(384) == -128
+; run: %ireduce_sextend_i32_i8(128) == -128
+; run: %ireduce_sextend_i32_i8(0x80000005) == 5
+
+function %iadd_ireduce_i32_i8(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = iadd v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}
+; run: %iadd_ireduce_i32_i8(0x7fffffff, 1) == 0
+; run: %iadd_ireduce_i32_i8(-1, 1) == 0
+; run: %iadd_ireduce_i32_i8(0x075bcd15, 0xc521974f) == 100
+; run: %iadd_ireduce_i32_i8(255, 1) == 0
+
+function %ireduce_i32_i16(i32) -> i16 {
+block0(v0: i32):
+    v1 = ireduce.i16 v0
+    return v1
+}
+; run: %ireduce_i32_i16(0) == 0
+; run: %ireduce_i32_i16(1) == 1
+; run: %ireduce_i32_i16(-1) == -1
+; run: %ireduce_i32_i16(0x80000000) == 0
+; run: %ireduce_i32_i16(0x7fffffff) == -1
+; run: %ireduce_i32_i16(0x075bcd15) == 0xcd15
+; run: %ireduce_i32_i16(0xc521974f) == 0x974f
+; run: %ireduce_i32_i16(0x00010000) == 0
+; run: %ireduce_i32_i16(0x0000ffff) == -1
+; run: %ireduce_i32_i16(0x00018000) == 0x8000
+; run: %ireduce_i32_i16(0x00008000) == 0x8000
+; run: %ireduce_i32_i16(0x80000005) == 5
+
+function %ireduce_uextend_i32_i16(i32) -> i32 {
+block0(v0: i32):
+    v1 = ireduce.i16 v0
+    v2 = uextend.i32 v1
+    return v2
+}
+; run: %ireduce_uextend_i32_i16(0) == 0
+; run: %ireduce_uextend_i32_i16(1) == 1
+; run: %ireduce_uextend_i32_i16(-1) == 0x0000ffff
+; run: %ireduce_uextend_i32_i16(0x80000000) == 0
+; run: %ireduce_uextend_i32_i16(0x7fffffff) == 0x0000ffff
+; run: %ireduce_uextend_i32_i16(0x075bcd15) == 0x0000cd15
+; run: %ireduce_uextend_i32_i16(0xc521974f) == 0x0000974f
+; run: %ireduce_uextend_i32_i16(0x00010000) == 0
+; run: %ireduce_uextend_i32_i16(0x0000ffff) == 0x0000ffff
+; run: %ireduce_uextend_i32_i16(0x00018000) == 0x00008000
+; run: %ireduce_uextend_i32_i16(0x00008000) == 0x00008000
+; run: %ireduce_uextend_i32_i16(0x80000005) == 5
+
+function %ireduce_sextend_i32_i16(i32) -> i32 {
+block0(v0: i32):
+    v1 = ireduce.i16 v0
+    v2 = sextend.i32 v1
+    return v2
+}
+; run: %ireduce_sextend_i32_i16(0) == 0
+; run: %ireduce_sextend_i32_i16(1) == 1
+; run: %ireduce_sextend_i32_i16(-1) == -1
+; run: %ireduce_sextend_i32_i16(0x80000000) == 0
+; run: %ireduce_sextend_i32_i16(0x7fffffff) == -1
+; run: %ireduce_sextend_i32_i16(0x075bcd15) == 0xffffcd15
+; run: %ireduce_sextend_i32_i16(0xc521974f) == 0xffff974f
+; run: %ireduce_sextend_i32_i16(0x00010000) == 0
+; run: %ireduce_sextend_i32_i16(0x0000ffff) == -1
+; run: %ireduce_sextend_i32_i16(0x00018000) == 0xffff8000
+; run: %ireduce_sextend_i32_i16(0x00008000) == 0xffff8000
+; run: %ireduce_sextend_i32_i16(0x80000005) == 5
+
+function %iadd_ireduce_i32_i16(i32, i32) -> i16 {
+block0(v0: i32, v1: i32):
+    v2 = iadd v0, v1
+    v3 = ireduce.i16 v2
+    return v3
+}
+; run: %iadd_ireduce_i32_i16(0x7fffffff, 1) == 0
+; run: %iadd_ireduce_i32_i16(-1, 1) == 0
+; run: %iadd_ireduce_i32_i16(0x075bcd15, 0xc521974f) == 0x6464
+; run: %iadd_ireduce_i32_i16(0x0000ffff, 1) == 0
+
+function %ireduce_i64_i8(i64) -> i8 {
+block0(v0: i64):
+    v1 = ireduce.i8 v0
+    return v1
+}
+; run: %ireduce_i64_i8(0) == 0
+; run: %ireduce_i64_i8(1) == 1
+; run: %ireduce_i64_i8(-1) == -1
+; run: %ireduce_i64_i8(0x8000000000000000) == 0
+; run: %ireduce_i64_i8(0x7fffffffffffffff) == -1
+; run: %ireduce_i64_i8(0x123456789abcdef0) == -16
+; run: %ireduce_i64_i8(0xf0123456789abcdf) == -33
+; run: %ireduce_i64_i8(256) == 0
+; run: %ireduce_i64_i8(255) == -1
+; run: %ireduce_i64_i8(384) == -128
+; run: %ireduce_i64_i8(128) == -128
+; run: %ireduce_i64_i8(0x8000000000000005) == 5
+
+function %ireduce_uextend_i64_i8(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i8 v0
+    v2 = uextend.i64 v1
+    return v2
+}
+; run: %ireduce_uextend_i64_i8(0) == 0
+; run: %ireduce_uextend_i64_i8(1) == 1
+; run: %ireduce_uextend_i64_i8(-1) == 255
+; run: %ireduce_uextend_i64_i8(0x8000000000000000) == 0
+; run: %ireduce_uextend_i64_i8(0x7fffffffffffffff) == 255
+; run: %ireduce_uextend_i64_i8(0x123456789abcdef0) == 240
+; run: %ireduce_uextend_i64_i8(0xf0123456789abcdf) == 223
+; run: %ireduce_uextend_i64_i8(256) == 0
+; run: %ireduce_uextend_i64_i8(255) == 255
+; run: %ireduce_uextend_i64_i8(384) == 128
+; run: %ireduce_uextend_i64_i8(128) == 128
+; run: %ireduce_uextend_i64_i8(0x8000000000000005) == 5
+
+function %ireduce_sextend_i64_i8(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i8 v0
+    v2 = sextend.i64 v1
+    return v2
+}
+; run: %ireduce_sextend_i64_i8(0) == 0
+; run: %ireduce_sextend_i64_i8(1) == 1
+; run: %ireduce_sextend_i64_i8(-1) == -1
+; run: %ireduce_sextend_i64_i8(0x8000000000000000) == 0
+; run: %ireduce_sextend_i64_i8(0x7fffffffffffffff) == -1
+; run: %ireduce_sextend_i64_i8(0x123456789abcdef0) == -16
+; run: %ireduce_sextend_i64_i8(0xf0123456789abcdf) == -33
+; run: %ireduce_sextend_i64_i8(256) == 0
+; run: %ireduce_sextend_i64_i8(255) == -1
+; run: %ireduce_sextend_i64_i8(384) == -128
+; run: %ireduce_sextend_i64_i8(128) == -128
+; run: %ireduce_sextend_i64_i8(0x8000000000000005) == 5
+
+function %iadd_ireduce_i64_i8(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = iadd v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}
+; run: %iadd_ireduce_i64_i8(0x7fffffffffffffff, 1) == 0
+; run: %iadd_ireduce_i64_i8(-1, 1) == 0
+; run: %iadd_ireduce_i64_i8(0x123456789abcdef0, 0xf0123456789abcdf) == -49
+; run: %iadd_ireduce_i64_i8(255, 1) == 0
+
+function %ireduce_i64_i16(i64) -> i16 {
+block0(v0: i64):
+    v1 = ireduce.i16 v0
+    return v1
+}
+; run: %ireduce_i64_i16(0) == 0
+; run: %ireduce_i64_i16(1) == 1
+; run: %ireduce_i64_i16(-1) == -1
+; run: %ireduce_i64_i16(0x8000000000000000) == 0
+; run: %ireduce_i64_i16(0x7fffffffffffffff) == -1
+; run: %ireduce_i64_i16(0x123456789abcdef0) == 0xdef0
+; run: %ireduce_i64_i16(0xf0123456789abcdf) == 0xbcdf
+; run: %ireduce_i64_i16(0x0000000000010000) == 0
+; run: %ireduce_i64_i16(0x000000000000ffff) == -1
+; run: %ireduce_i64_i16(0x0000000000018000) == 0x8000
+; run: %ireduce_i64_i16(0x0000000000008000) == 0x8000
+; run: %ireduce_i64_i16(0x8000000000000005) == 5
+
+function %ireduce_uextend_i64_i16(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i16 v0
+    v2 = uextend.i64 v1
+    return v2
+}
+; run: %ireduce_uextend_i64_i16(0) == 0
+; run: %ireduce_uextend_i64_i16(1) == 1
+; run: %ireduce_uextend_i64_i16(-1) == 0x000000000000ffff
+; run: %ireduce_uextend_i64_i16(0x8000000000000000) == 0
+; run: %ireduce_uextend_i64_i16(0x7fffffffffffffff) == 0x000000000000ffff
+; run: %ireduce_uextend_i64_i16(0x123456789abcdef0) == 0x000000000000def0
+; run: %ireduce_uextend_i64_i16(0xf0123456789abcdf) == 0x000000000000bcdf
+; run: %ireduce_uextend_i64_i16(0x0000000000010000) == 0
+; run: %ireduce_uextend_i64_i16(0x000000000000ffff) == 0x000000000000ffff
+; run: %ireduce_uextend_i64_i16(0x0000000000018000) == 0x0000000000008000
+; run: %ireduce_uextend_i64_i16(0x0000000000008000) == 0x0000000000008000
+; run: %ireduce_uextend_i64_i16(0x8000000000000005) == 5
+
+function %ireduce_sextend_i64_i16(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i16 v0
+    v2 = sextend.i64 v1
+    return v2
+}
+; run: %ireduce_sextend_i64_i16(0) == 0
+; run: %ireduce_sextend_i64_i16(1) == 1
+; run: %ireduce_sextend_i64_i16(-1) == -1
+; run: %ireduce_sextend_i64_i16(0x8000000000000000) == 0
+; run: %ireduce_sextend_i64_i16(0x7fffffffffffffff) == -1
+; run: %ireduce_sextend_i64_i16(0x123456789abcdef0) == 0xffffffffffffdef0
+; run: %ireduce_sextend_i64_i16(0xf0123456789abcdf) == 0xffffffffffffbcdf
+; run: %ireduce_sextend_i64_i16(0x0000000000010000) == 0
+; run: %ireduce_sextend_i64_i16(0x000000000000ffff) == -1
+; run: %ireduce_sextend_i64_i16(0x0000000000018000) == 0xffffffffffff8000
+; run: %ireduce_sextend_i64_i16(0x0000000000008000) == 0xffffffffffff8000
+; run: %ireduce_sextend_i64_i16(0x8000000000000005) == 5
+
+function %iadd_ireduce_i64_i16(i64, i64) -> i16 {
+block0(v0: i64, v1: i64):
+    v2 = iadd v0, v1
+    v3 = ireduce.i16 v2
+    return v3
+}
+; run: %iadd_ireduce_i64_i16(0x7fffffffffffffff, 1) == 0
+; run: %iadd_ireduce_i64_i16(-1, 1) == 0
+; run: %iadd_ireduce_i64_i16(0x123456789abcdef0, 0xf0123456789abcdf) == 0x9bcf
+; run: %iadd_ireduce_i64_i16(0x000000000000ffff, 1) == 0
+
+function %ireduce_i64_i32(i64) -> i32 {
+block0(v0: i64):
+    v1 = ireduce.i32 v0
+    return v1
+}
+; run: %ireduce_i64_i32(0) == 0
+; run: %ireduce_i64_i32(1) == 1
+; run: %ireduce_i64_i32(-1) == -1
+; run: %ireduce_i64_i32(0x8000000000000000) == 0
+; run: %ireduce_i64_i32(0x7fffffffffffffff) == -1
+; run: %ireduce_i64_i32(0x123456789abcdef0) == 0x9abcdef0
+; run: %ireduce_i64_i32(0xf0123456789abcdf) == 0x789abcdf
+; run: %ireduce_i64_i32(0x0000000100000000) == 0
+; run: %ireduce_i64_i32(0x00000000ffffffff) == -1
+; run: %ireduce_i64_i32(0x0000000180000000) == 0x80000000
+; run: %ireduce_i64_i32(0x0000000080000000) == 0x80000000
+; run: %ireduce_i64_i32(0x8000000000000005) == 5
+
+function %ireduce_uextend_i64_i32(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i32 v0
+    v2 = uextend.i64 v1
+    return v2
+}
+; run: %ireduce_uextend_i64_i32(0) == 0
+; run: %ireduce_uextend_i64_i32(1) == 1
+; run: %ireduce_uextend_i64_i32(-1) == 0x00000000ffffffff
+; run: %ireduce_uextend_i64_i32(0x8000000000000000) == 0
+; run: %ireduce_uextend_i64_i32(0x7fffffffffffffff) == 0x00000000ffffffff
+; run: %ireduce_uextend_i64_i32(0x123456789abcdef0) == 0x000000009abcdef0
+; run: %ireduce_uextend_i64_i32(0xf0123456789abcdf) == 0x00000000789abcdf
+; run: %ireduce_uextend_i64_i32(0x0000000100000000) == 0
+; run: %ireduce_uextend_i64_i32(0x00000000ffffffff) == 0x00000000ffffffff
+; run: %ireduce_uextend_i64_i32(0x0000000180000000) == 0x0000000080000000
+; run: %ireduce_uextend_i64_i32(0x0000000080000000) == 0x0000000080000000
+; run: %ireduce_uextend_i64_i32(0x8000000000000005) == 5
+
+function %ireduce_sextend_i64_i32(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i32 v0
+    v2 = sextend.i64 v1
+    return v2
+}
+; run: %ireduce_sextend_i64_i32(0) == 0
+; run: %ireduce_sextend_i64_i32(1) == 1
+; run: %ireduce_sextend_i64_i32(-1) == -1
+; run: %ireduce_sextend_i64_i32(0x8000000000000000) == 0
+; run: %ireduce_sextend_i64_i32(0x7fffffffffffffff) == -1
+; run: %ireduce_sextend_i64_i32(0x123456789abcdef0) == 0xffffffff9abcdef0
+; run: %ireduce_sextend_i64_i32(0xf0123456789abcdf) == 0x00000000789abcdf
+; run: %ireduce_sextend_i64_i32(0x0000000100000000) == 0
+; run: %ireduce_sextend_i64_i32(0x00000000ffffffff) == -1
+; run: %ireduce_sextend_i64_i32(0x0000000180000000) == 0xffffffff80000000
+; run: %ireduce_sextend_i64_i32(0x0000000080000000) == 0xffffffff80000000
+; run: %ireduce_sextend_i64_i32(0x8000000000000005) == 5
+
+function %iadd_ireduce_i64_i32(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
+    v2 = iadd v0, v1
+    v3 = ireduce.i32 v2
+    return v3
+}
+; run: %iadd_ireduce_i64_i32(0x7fffffffffffffff, 1) == 0
+; run: %iadd_ireduce_i64_i32(-1, 1) == 0
+; run: %iadd_ireduce_i64_i32(0x123456789abcdef0, 0xf0123456789abcdf) == 0x13579bcf
+; run: %iadd_ireduce_i64_i32(0x00000000ffffffff, 1) == 0

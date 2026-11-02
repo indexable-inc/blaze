@@ -1,0 +1,22 @@
+# rustc's `rustc_lexer`, as it is at the toolchain in `harness/toolchain` (nightly-2026-10-27,
+# rustc 1.101.0-nightly 16d1ffac1 2026-10-26): `src` is `compiler/rustc_lexer/src` of
+# rust-lang/rust at commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977, unchanged, re-vendored by
+# harness/toolchain_bump.py. It is blaze's one lexer, the pinned nightly's, so source and a
+# macro's `TokenStream::from_str` lex as the toolchain's rustc and `proc_macro` do.
+[package]
+name = "rustc_lexer"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rustc_lexer"
+
+[dependencies]
+memchr.workspace = true
+unicode-properties = { workspace = true, features = ["emoji"] }
+unicode-ident.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true

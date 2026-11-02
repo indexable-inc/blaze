@@ -1,0 +1,315 @@
+; Shaped like what hir-ty-codegen makes for `core::arch` SSE/NEON float lane ops on
+; `__m128`/`float32x4_t`, each vector behind a pointer and the result through a
+; `StructReturn` pointer as the Rust ABI passes them: `_mm_add_ps` and `_mm_cmplt_ps` as
+; the builder's per-lane float ops (four scalar loads, operations and stores; a compare
+; widened to an all-ones lane), `_mm_min_ps`/`_mm_max_ps` as its `minps`/`maxps` (`fcmp lt`,
+; a little-endian bitcast of the mask, `bitselect`: the second operand wins on a NaN or
+; equal zeros), `vminq_f32`/`vmaxq_f32` as `fmin`/`fmax` (NaN wins, -0 < +0),
+; `vmulq_f32`, `vnegq_f32`, `vabsq_f32`, `_mm_sqrt_ps`, `_mm_cvtepi32_ps` (round to nearest
+; even), `_mm_shuffle_ps` (a byte `shuffle` between bitcasts) and `_mm_movemask_ps`
+; (`vhigh_bits`). The wrapper after each takes and returns vectors by value.
+test interpret
+test run
+target x86_64
+target aarch64
+
+function %_mm_add_ps(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32 notrap aligned v1
+    v4 = load.f32 notrap aligned v2
+    v5 = fadd v3, v4
+    store notrap aligned v5, v0
+    v6 = load.f32 notrap aligned v1+4
+    v7 = load.f32 notrap aligned v2+4
+    v8 = fadd v6, v7
+    store notrap aligned v8, v0+4
+    v9 = load.f32 notrap aligned v1+8
+    v10 = load.f32 notrap aligned v2+8
+    v11 = fadd v9, v10
+    store notrap aligned v11, v0+8
+    v12 = load.f32 notrap aligned v1+12
+    v13 = load.f32 notrap aligned v2+12
+    v14 = fadd v12, v13
+    store notrap aligned v14, v0+12
+    return
+}
+
+function %_mm_cmplt_ps(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32 notrap aligned v1
+    v4 = load.f32 notrap aligned v2
+    v5 = fcmp lt v3, v4
+    v6 = uextend.i32 v5
+    v7 = ineg v6
+    store notrap aligned v7, v0
+    v8 = load.f32 notrap aligned v1+4
+    v9 = load.f32 notrap aligned v2+4
+    v10 = fcmp lt v8, v9
+    v11 = uextend.i32 v10
+    v12 = ineg v11
+    store notrap aligned v12, v0+4
+    v13 = load.f32 notrap aligned v1+8
+    v14 = load.f32 notrap aligned v2+8
+    v15 = fcmp lt v13, v14
+    v16 = uextend.i32 v15
+    v17 = ineg v16
+    store notrap aligned v17, v0+8
+    v18 = load.f32 notrap aligned v1+12
+    v19 = load.f32 notrap aligned v2+12
+    v20 = fcmp lt v18, v19
+    v21 = uextend.i32 v20
+    v22 = ineg v21
+    store notrap aligned v22, v0+12
+    return
+}
+
+function %_mm_min_ps(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = fcmp lt v3, v4
+    v6 = bitcast.f32x4 little v5
+    v7 = bitselect v6, v3, v4
+    store notrap aligned v7, v0
+    return
+}
+
+function %_mm_max_ps(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = fcmp lt v4, v3
+    v6 = bitcast.f32x4 little v5
+    v7 = bitselect v6, v3, v4
+    store notrap aligned v7, v0
+    return
+}
+
+function %vminq_f32(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = fmin v3, v4
+    store notrap aligned v5, v0
+    return
+}
+
+function %vmaxq_f32(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = fmax v3, v4
+    store notrap aligned v5, v0
+    return
+}
+
+function %vmulq_f32(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = fmul v3, v4
+    store notrap aligned v5, v0
+    return
+}
+
+function %_mm_shuffle_ps_1b(i64 sret, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = load.f32x4 notrap aligned v1
+    v4 = load.f32x4 notrap aligned v2
+    v5 = bitcast.i8x16 little v3
+    v6 = bitcast.i8x16 little v4
+    v7 = shuffle v5, v6, [12 13 14 15 8 9 10 11 20 21 22 23 16 17 18 19]
+    v8 = bitcast.f32x4 little v7
+    store notrap aligned v8, v0
+    return
+}
+
+function %binop(f32x4, f32x4, i8) -> f32x4 {
+    ss0 = explicit_slot 48, align = 16
+    fn0 = %_mm_add_ps(i64 sret, i64, i64)
+    fn1 = %_mm_min_ps(i64 sret, i64, i64)
+    fn2 = %_mm_max_ps(i64 sret, i64, i64)
+    fn3 = %vminq_f32(i64 sret, i64, i64)
+    fn4 = %vmaxq_f32(i64 sret, i64, i64)
+    fn5 = %vmulq_f32(i64 sret, i64, i64)
+    fn6 = %_mm_shuffle_ps_1b(i64 sret, i64, i64)
+
+block0(v0: f32x4, v1: f32x4, v2: i8):
+    v3 = stack_addr.i64 ss0
+    v4 = stack_addr.i64 ss0+16
+    v5 = stack_addr.i64 ss0+32
+    store notrap aligned v0, v4
+    store notrap aligned v1, v5
+    v6 = uextend.i32 v2
+    br_table v6, block8, [block1, block2, block3, block4, block5, block6, block7]
+
+block1:
+    call fn0(v3, v4, v5)
+    jump block9
+
+block2:
+    call fn1(v3, v4, v5)
+    jump block9
+
+block3:
+    call fn2(v3, v4, v5)
+    jump block9
+
+block4:
+    call fn3(v3, v4, v5)
+    jump block9
+
+block5:
+    call fn4(v3, v4, v5)
+    jump block9
+
+block6:
+    call fn5(v3, v4, v5)
+    jump block9
+
+block7:
+    call fn6(v3, v4, v5)
+    jump block9
+
+block8 cold:
+    trap user2
+
+block9:
+    v7 = load.f32x4 notrap aligned v3
+    return v7
+}
+; run: %binop([0x1.0p0 0x1.8p1 +Inf -0x0.0], [0x1.0p0 -0x1.8p1 -Inf -0x0.0], 0) == [0x1.0p1 0x0.0 +NaN -0x0.0]
+; run: %binop([0x1.fffffep127 0x1.0p0 0x1.0p-24 0x0.000002p-126], [0x1.0p104 0x1.0p-24 0x1.0p-24 -0x0.000002p-126], 0) == [+Inf 0x1.0p0 0x1.0p-23 0x0.0]
+; run: %binop([0x1.0p0 +NaN 0x0.0 -0x0.0], [0x1.0p1 0x1.0p0 +NaN 0x0.0], 1) == [0x1.0p0 0x1.0p0 +NaN 0x0.0]
+; run: %binop([0x0.0 -Inf 0x1.0p0 -0x1.0p0], [-0x0.0 +Inf 0x1.0p0 -0x1.0p1], 1) == [-0x0.0 -Inf 0x1.0p0 -0x1.0p1]
+; run: %binop([0x1.0p0 +NaN 0x0.0 -0x0.0], [0x1.0p1 0x1.0p0 +NaN 0x0.0], 2) == [0x1.0p1 0x1.0p0 +NaN 0x0.0]
+; run: %binop([0x0.0 -Inf 0x1.0p0 -0x1.0p0], [-0x0.0 +Inf 0x1.0p0 -0x1.0p1], 2) == [-0x0.0 +Inf 0x1.0p0 -0x1.0p0]
+; run: %binop([0x1.0p0 +NaN 0x0.0 -0x0.0], [0x1.0p1 0x1.0p0 +NaN 0x0.0], 3) == [0x1.0p0 +NaN +NaN -0x0.0]
+; run: %binop([0x1.0p0 +NaN 0x0.0 -0x0.0], [0x1.0p1 0x1.0p0 +NaN 0x0.0], 4) == [0x1.0p1 +NaN +NaN 0x0.0]
+; run: %binop([0x1.0p0 -0x1.0p1 +Inf 0x0.0], [0x1.8p1 0x1.8p1 0x0.0 -0x1.0p0], 5) == [0x1.8p1 -0x1.8p2 +NaN -0x0.0]
+; run: %binop([0x1.0p0 0x1.0p1 0x1.8p1 0x1.0p2], [0x1.4p2 0x1.8p2 0x1.cp2 0x1.0p3], 6) == [0x1.0p2 0x1.8p1 0x1.8p2 0x1.4p2]
+
+function %cmplt(f32x4, f32x4) -> i32x4 {
+    ss0 = explicit_slot 48, align = 16
+    fn0 = %_mm_cmplt_ps(i64 sret, i64, i64)
+
+block0(v0: f32x4, v1: f32x4):
+    v2 = stack_addr.i64 ss0
+    v3 = stack_addr.i64 ss0+16
+    v4 = stack_addr.i64 ss0+32
+    store notrap aligned v0, v3
+    store notrap aligned v1, v4
+    call fn0(v2, v3, v4)
+    v5 = load.i32x4 notrap aligned v2
+    return v5
+}
+; run: %cmplt([0x1.0p0 +NaN 0x0.0 -0x0.0], [0x1.0p1 0x1.0p0 +NaN 0x0.0]) == [-1 0 0 0]
+; run: %cmplt([-Inf 0x1.0p0 -0x1.0p0 0x0.000002p-126], [+Inf 0x1.0p0 0x0.0 0x0.000004p-126]) == [-1 0 -1 -1]
+
+function %vnegq_f32(i64 sret, i64) {
+block0(v0: i64, v1: i64):
+    v2 = load.f32x4 notrap aligned v1
+    v3 = fneg v2
+    store notrap aligned v3, v0
+    return
+}
+
+function %vabsq_f32(i64 sret, i64) {
+block0(v0: i64, v1: i64):
+    v2 = load.f32x4 notrap aligned v1
+    v3 = fabs v2
+    store notrap aligned v3, v0
+    return
+}
+
+function %_mm_sqrt_ps(i64 sret, i64) {
+block0(v0: i64, v1: i64):
+    v2 = load.f32x4 notrap aligned v1
+    v3 = sqrt v2
+    store notrap aligned v3, v0
+    return
+}
+
+function %unop(f32x4, i8) -> f32x4 {
+    ss0 = explicit_slot 32, align = 16
+    fn0 = %vnegq_f32(i64 sret, i64)
+    fn1 = %vabsq_f32(i64 sret, i64)
+    fn2 = %_mm_sqrt_ps(i64 sret, i64)
+
+block0(v0: f32x4, v1: i8):
+    v2 = stack_addr.i64 ss0
+    v3 = stack_addr.i64 ss0+16
+    store notrap aligned v0, v3
+    v4 = uextend.i32 v1
+    br_table v4, block4, [block1, block2, block3]
+
+block1:
+    call fn0(v2, v3)
+    jump block5
+
+block2:
+    call fn1(v2, v3)
+    jump block5
+
+block3:
+    call fn2(v2, v3)
+    jump block5
+
+block4 cold:
+    trap user2
+
+block5:
+    v5 = load.f32x4 notrap aligned v2
+    return v5
+}
+; run: %unop([0x1.0p0 -0x0.0 +NaN -Inf], 0) == [-0x1.0p0 0x0.0 -NaN +Inf]
+; run: %unop([-0x1.0p0 -0x0.0 -NaN -Inf], 1) == [0x1.0p0 0x0.0 +NaN +Inf]
+; run: %unop([0x1.0p2 0x1.0p0 0x0.0 -0x0.0], 2) == [0x1.0p1 0x1.0p0 0x0.0 -0x0.0]
+; run: %unop([-0x1.0p0 +Inf 0x1.0p-2 0x1.2p3], 2) == [+NaN +Inf 0x1.0p-1 0x1.8p1]
+
+function %_mm_cvtepi32_ps(i64 sret, i64) {
+block0(v0: i64, v1: i64):
+    v2 = load.i32x4 notrap aligned v1
+    v3 = fcvt_from_sint.f32x4 v2
+    store notrap aligned v3, v0
+    return
+}
+
+function %cvtepi32(i32x4) -> f32x4 {
+    ss0 = explicit_slot 32, align = 16
+    fn0 = %_mm_cvtepi32_ps(i64 sret, i64)
+
+block0(v0: i32x4):
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss0+16
+    store notrap aligned v0, v2
+    call fn0(v1, v2)
+    v3 = load.f32x4 notrap aligned v1
+    return v3
+}
+; run: %cvtepi32([1 -1 0x7fffffff 0x80000000]) == [0x1.0p0 -0x1.0p0 0x1.0p31 -0x1.0p31]
+; run: %cvtepi32([16777217 16777219 -16777217 3]) == [0x1.0p24 0x1.000004p24 -0x1.0p24 0x1.8p1]
+; run: %cvtepi32([0 16777216 16777215 -16777219]) == [0x0.0 0x1.0p24 0x1.fffffep23 -0x1.000004p24]
+
+function %_mm_movemask_ps(i64) -> i32 {
+block0(v0: i64):
+    v1 = load.f32x4 notrap aligned v0
+    v2 = bitcast.i32x4 little v1
+    v3 = vhigh_bits.i32 v2
+    return v3
+}
+
+function %movemask(f32x4) -> i32 {
+    ss0 = explicit_slot 16, align = 16
+    fn0 = %_mm_movemask_ps(i64) -> i32
+
+block0(v0: f32x4):
+    v1 = stack_addr.i64 ss0
+    store notrap aligned v0, v1
+    v2 = call fn0(v1)
+    return v2
+}
+; run: %movemask([-0x1.0p0 0x1.0p0 -0x0.0 +NaN]) == 5
+; run: %movemask([0x0.0 0x0.0 0x0.0 -NaN]) == 8
+; run: %movemask([-Inf -Inf -Inf -Inf]) == 15
+; run: %movemask([0x0.0 +Inf 0x1.0p0 +NaN]) == 0

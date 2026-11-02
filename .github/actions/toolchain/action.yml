@@ -24,13 +24,9 @@ runs:
       shell: bash
       run: |
         tc=$(cat harness/toolchain)
-        # rust-src is for the rustc side of the harnesses, not for blaze: blaze compiles the
-        # standard library only from its own library/ (docs/toolchain.md) and reads no
-        # toolchain's rust-src. A program plain rustc builds names a file of std it inlines
-        # (a panic's location) where rust-src installed it, and only when rust-src is there
-        # is that a file; blaze names its library's file the same way, and the harnesses
-        # compare the two (harness/breakers/cases/src/library_panic_location.rs).
-        components="-c rust-src"
+        # No rust-src: blaze compiles the standard library only from its own library/
+        # (docs/toolchain.md) and reads no toolchain's rust-src.
+        components=""
         for c in ${{ inputs.components }}; do components="$components -c $c"; done
         rustup toolchain install "$tc" --profile minimal $components
         rustup default "$tc"
@@ -63,8 +59,8 @@ runs:
       shell: bash
       run: rm -f /usr/bin/link.exe
     # The build of the pinned LLVM the flake fetches, for Windows: the libraries, the headers and
-    # `llvm-config`, which is all the build reads, and `llvm-pdbutil`, which debuginfo.py reads a
-    # PDB with. blaze links it statically: running it needs none of this.
+    # `llvm-config`, which is all the build reads. blaze links it statically: running it needs
+    # none of this.
     - if: runner.os == 'Windows' && inputs.llvm != 'none'
       id: llvm-windows
       uses: actions/cache@v6

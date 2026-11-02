@@ -2,8 +2,8 @@
 """headerpad.py: a program whose unwind table is larger than the room its header was given
 is spliced all the same (macOS on AArch64, issue #13).
 
-usage: headerpad.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc
-                        are found next to it)
+usage: headerpad.py    (BLAZE_BIN names the blaze built; blaze is found next
+                        to it)
 
 A splice moves the program's `__unwind_info` into the room Apple's linker leaves after the
 load commands, which is as much as `-headerpad` says. A program of a few hundred crates has

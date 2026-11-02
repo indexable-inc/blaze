@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::Config;
+use blaze_manifest::files::Disk;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
 use cargo_platform::Cfg;
 
@@ -29,7 +30,7 @@ impl Tree {
         Tree { root: dunce::canonicalize(root).unwrap() }
     }
 
-    fn config(&self, env: &[(&str, &str)]) -> Config {
+    fn config(&self, env: &[(&str, &str)]) -> Config<Disk> {
         let mut vars =
             vec![("CARGO_HOME".to_owned(), self.root.join("home").display().to_string())];
         vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
@@ -65,7 +66,7 @@ rustflags = ["--cfg", "from_macos"]
 rustflags = ["--cfg", "from_windows"]
 "#;
 
-fn flags(config: &Config, requested: &[CompileKind], kind: &CompileKind) -> Vec<String> {
+fn flags(config: &Config<Disk>, requested: &[CompileKind], kind: &CompileKind) -> Vec<String> {
     config.extra_args(requested, HOST, Some(&macos()), kind, Flags::Rust).unwrap()
 }
 
@@ -255,7 +256,7 @@ fn source_replacement_follows_replace_with() {
     );
     let config = tree.config(&[]);
     let sources = config.source_configs().unwrap();
-    assert_eq!(sources["vendored"].id.url.to_file_path().unwrap(), tree.root.join("vendor"));
+    assert_eq!(sources["vendored"].id.url().to_file_path().unwrap(), tree.root.join("vendor"));
     assert_eq!(config.replacement("crates-io").unwrap(), Replacement::Source("vendored".into()));
     assert_eq!(config.replacement("vendored").unwrap(), Replacement::None);
     assert_eq!(config.replacement("alt").unwrap(), Replacement::Registry("my-registry".into()));
@@ -263,25 +264,27 @@ fn source_replacement_follows_replace_with() {
 
 #[test]
 fn source_tables_refuse_what_cargo_refuses() {
-    let def = |tree: &Tree| tree.root.join(".cargo").join("config.toml").display().to_string();
-    let cases: &[(&str, &str, &dyn Fn(&Tree) -> String)] = &[
+    fn def(tree: &Tree) -> String {
+        tree.root.join(".cargo").join("config.toml").display().to_string()
+    }
+    let cases: &[(&str, &str, fn(&Tree) -> String)] = &[
         (
             "source-branch",
             "[source.a]\nregistry = \"https://example.com\"\nbranch = \"main\"\n",
-            &|t| {
+            |t| {
                 format!(
                     "source definition `source.a` specifies `branch`, but that requires a `git` key to be specified (in {})",
                     def(t)
                 )
             },
         ),
-        ("source-none", "[source.a]\nreplace-with = \"b\"\n", &|_| {
+        ("source-none", "[source.a]\nreplace-with = \"b\"\n", |_| {
             "no source location specified for `source.a`, need `registry`, `local-registry`, `directory`, or `git` defined".into()
         }),
-        ("source-two", "[source.a]\ndirectory = \"v\"\ngit = \"https://example.com/r\"\n", &|_| {
+        ("source-two", "[source.a]\ndirectory = \"v\"\ngit = \"https://example.com/r\"\n", |_| {
             "more than one source location specified for `source.a`".into()
         }),
-        ("source-url", "[source.a]\nregistry = \"not a url\"\n", &|t| {
+        ("source-url", "[source.a]\nregistry = \"not a url\"\n", |t| {
             format!(
                 "configuration key `source.a.registry` specified an invalid URL (in {})",
                 def(t)

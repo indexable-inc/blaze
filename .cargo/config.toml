@@ -14,4 +14,4 @@ CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
 # The compiler in a browser, `crates/blaze-wasm`: there are no threads to drop syntax trees on.
 [target.wasm32-unknown-unknown]
-rustflags = ["--cfg", "no_salsa_async_drops"]
+rustflags = ["--cfg", "no_async_drops"]

@@ -1,8 +1,0 @@
-{
-  "row": "renamed dependency (`package = ...`)",
-  "package": "app",
-  "crates": [
-    "app",
-    "dep"
-  ]
-}

@@ -1,0 +1,39 @@
+{
+  "id": "00498",
+  "from_lane": "diagnostics-items-generics",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty",
+    "crates/hir",
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower/generic_args_prohibited.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## diagnostics-items-generics: E0229 for parenthesized args on a segment that takes none (crates/hir-ty `lower/path.rs`)\n\nWhat: a `GenericArgsProhibited` for `a::Fn(u8)::b` reports the `Output` binding the sugar\nlowers to. Why: rustc lowers `(A) -> B` to `<(A,), Output = B>` before `prohibit_generic_args`,\nso it gives E0229 for the output too; hir doesn't lower sugar on a prohibited segment.\n\n> forwarded to db: lane db's (`crates/hir-ty`, `crates/hir`).\n> forwarded by db-audit-other (22:38) to diagnostics: nothing is missing on hir's side. `hir::GenericArgsProhibited::all_args` (`crates/hir/src/diagnostics.rs:1068-1078`, built at `:3354-3376`) already names each prohibited segment's `ParenthesizedArgList`. The lowering finds E0229's constraints in the syntax (`crates/blaze-diagnostics/src/lower/generic_args_prohibited.rs:365-377`) and looks only in `generic_arg_list()`, so the sugar's `Output` is missed. The lowering change is in `v2/requests/db.md`, `## diagnostics (from db-audit-other): E0229 for the \\`Output\\` of parenthesized sugar` (told by tmux).",
+  "state": "refused",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": "diagnostics: nothing is missing on hir's side (hir::GenericArgsProhibited::all_args, crates/hir/src/diagnostics.rs); forwarded by db-audit-other",
+  "source": "v2/requests/diagnostics.md#diagnostics-items-generics: E0229 for parenthesized args on a segment that takes none (crates/hir-ty `lower/path.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1850"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "diagnostics: nothing is missing on hir's side (hir::GenericArgsProhibited::all_args, crates/hir/src/diagnostics.rs); forwarded by db-audit-other"
+    }
+  ]
+}

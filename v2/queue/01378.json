@@ -1,0 +1,36 @@
+{
+  "id": "01378",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/infer/coerce.rs",
+    "crates/hir-ty/src/infer/pat.rs"
+  ],
+  "what": "E0308 mismatched types on the coercion `let trait_obj: &dyn SomeTrait = &S;` (minicore: coerce_unsized, edition 2015, S: SomeTrait with `fn foo(&self)`), in a body that also has `let &invalid = trait_obj;` (E0033). rustc reports only the E0033. Test: tests::bodies::patterns::a_reference_pattern_of_a_trait_object_cannot_dereference_it (tests/ui/error-codes/E0033.rs). Possibly the pattern check of `&invalid` against `&dyn SomeTrait` feeding back into the coercion.",
+  "state": "applied",
+  "created": "2026-11-01T00:12:21Z",
+  "updated": "2026-11-01T03:59:25Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:12:21Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T01:27:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:59:25Z",
+      "by": "db",
+      "action": "done",
+      "note": "the fixture lacked dispatch_from_dyn (SomeTrait not dyn-compatible without it); fixture fixed in patterns.rs; round 19: a_reference_pattern_of_a_trait_object_cannot_dereference_it ok"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01447",
+  "from_lane": "sched",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/pump.rs"
+  ],
+  "what": "For 01445 (fiber-boundary lint): pump.rs names `sched::fiber` (the `use crate::sched::{JobId, Wait, fiber}` and its `fiber::wait/claim/key_done/current_job` calls). sched now re-exports that free API from `crate::sched` (`sched::{wait, claim, key_done, miss, current_job, carry, Carried, NoWait}`): switch pump.rs to those, no behavior change. After one-pool lands its pump.rs deadlock fix; then sched makes `fiber` pub(crate).",
+  "state": "open",
+  "created": "2026-11-01T03:53:21Z",
+  "updated": "2026-11-01T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:53:21Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

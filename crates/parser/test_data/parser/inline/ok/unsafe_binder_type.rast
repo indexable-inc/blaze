@@ -1,0 +1,86 @@
+SOURCE_FILE
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "A"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    UNSAFE_BINDER_TYPE
+      UNSAFE_KW "unsafe"
+      GENERIC_PARAM_LIST
+        L_ANGLE "<"
+        LIFETIME_PARAM
+          LIFETIME
+            LIFETIME_IDENT "'a"
+        R_ANGLE ">"
+      WHITESPACE " "
+      REF_TYPE
+        AMP "&"
+        LIFETIME
+          LIFETIME_IDENT "'a"
+        WHITESPACE " "
+        TUPLE_TYPE
+          L_PAREN "("
+          R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "B"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    UNSAFE_BINDER_TYPE
+      UNSAFE_KW "unsafe"
+      GENERIC_PARAM_LIST
+        L_ANGLE "<"
+        LIFETIME_PARAM
+          LIFETIME
+            LIFETIME_IDENT "'a"
+        COMMA ","
+        WHITESPACE " "
+        LIFETIME_PARAM
+          LIFETIME
+            LIFETIME_IDENT "'b"
+        R_ANGLE ">"
+      WHITESPACE " "
+      REF_TYPE
+        AMP "&"
+        LIFETIME
+          LIFETIME_IDENT "'a"
+        WHITESPACE " "
+        REF_TYPE
+          AMP "&"
+          LIFETIME
+            LIFETIME_IDENT "'b"
+          WHITESPACE " "
+          TUPLE_TYPE
+            L_PAREN "("
+            R_PAREN ")"
+    SEMICOLON ";"
+  WHITESPACE "\n"
+  TYPE_ALIAS
+    TYPE_KW "type"
+    WHITESPACE " "
+    NAME
+      IDENT "C"
+    WHITESPACE " "
+    EQ "="
+    WHITESPACE " "
+    UNSAFE_BINDER_TYPE
+      UNSAFE_KW "unsafe"
+      GENERIC_PARAM_LIST
+        L_ANGLE "<"
+        R_ANGLE ">"
+      WHITESPACE " "
+      PATH_TYPE
+        PATH
+          PATH_SEGMENT
+            NAME_REF
+              IDENT "u8"
+    SEMICOLON ";"
+  WHITESPACE "\n"

@@ -1,0 +1,42 @@
+{
+  "id": "00015",
+  "from_lane": "format",
+  "owner": "db",
+  "paths": [
+    "crates/intern",
+    "docs/v2/plan/lanes/format.md",
+    "docs/v2/plan/lanes/db.md",
+    "Cargo.toml",
+    "crates/hir-ty/src/next_solver/interner.rs",
+    "crates/hir-ty",
+    "crates/hir/src/lib.rs",
+    "crates/hir-ty/src/next_solver/generic_arg.rs"
+  ],
+  "what": "## format-span-intern\n\n`crates/intern/` is now sharded and append-only (docs/v2/plan/lanes/format.md section 5, \"IDs, two kinds\";\ndocs/v2/plan/lanes/db.md: memory is bounded by the db's reachability GC rebuilding arenas, not by\nrefcounts). `Interned`, `InternedRef`, `InternedSlice`, `InternedSliceRef` and `Symbol` are\n`Copy` pointers with no reference count; nothing is ever freed. So the GC (`intern::GarbageCollector`,\n`GcInternedVisit`, `GcInternedSliceVisit`), `InternedRef::decrement_refcount`,\n`InternedSliceRef::decrement_refcount` and the `prevent-gc` feature are gone. These callers\nbreak without the edits below (lane: whoever owns hir-ty / hir; no crate enabled `prevent-gc`,\nso no Cargo.toml edit is needed).\n\n1. **Remove the interner GC from the solver** — `crates/hir-ty/src/next_solver/interner.rs`,\n   lines 2707 to the end of the file (2818). Old text: everything from\n   ```rust\n   impl WorldExposer for intern::GarbageCollector {\n   ```\n   through the end of the file, i.e. that impl, `pub unsafe fn collect_ty_garbage() { ... }`,\n   `macro_rules! impl_gc_visit { ... }` with its `impl_gc_visit!( ... );` call, and\n   `macro_rules! impl_gc_visit_slice { ... }` with its `impl_gc_visit_slice!( ... );` call.\n   New text: nothing (the file ends after `mod tls_cache`'s closing `}` at line 2705).\n   Why: the types and the collection no longer exist; values are never freed, so there is\n   nothing to mark or sweep. `WorldExposer` itself can stay (every `GenericTypeVisitable`\n   impl names it); it now has no implementor, so whoever owns hir-ty may remove it and those\n   impls later, but that is not needed to build.\n\n> forwarded to db: `crates/hir-ty/src/next_solver/interner.rs` is db's (db-ty); the GC impl is still at line 2600.\n> checked by db-audit-other (22:40): in the tree. `crates/hir-ty/` has no `GarbageCollector`, `impl_gc_visit`, `collect_ty_garbage` or `decrement_refcount`, and `interner.rs` has no `impl WorldExposer for`.\n2. **Drop the re-export** — `crates/hir/src/lib.rs:215`. Old text:\n   ```rust\n           next_solver::{clear_tls_solver_cache, collect_ty_garbage},\n   ```\n   New text:\n   ```rust\n           next_solver::clear_tls_solver_cache,\n   ```\n   Why: `collect_ty_garbage` is removed by request 1 (nothing calls it: `rg collect_ty_garbage`).\n\n> forwarded to db: `crates/hir/src/lib.rs:220` still re-exports it.\n> checked by db-audit-other (22:40): in the tree at `crates/hir/src/lib.rs:241` (`next_solver::clear_tls_solver_cache,` alone).\n3. **`StoredGenericArg` holds no reference count** — `crates/hir-ty/src/next_solver/generic_arg.rs:147-184`.\n   Old text:\n   ```rust\n   #[derive(PartialEq, Eq, Hash)]\n   pub struct StoredGenericArg {\n       ptr: GenericArgImpl<'static>,\n   }\n\n   impl Clone for StoredGenericArg {\n       #[inline]\n       fn clone(&self) -> Self {\n           match self.ptr.kind() {\n               GenericArgKind::Lifetime(it) => std::mem::forget(it.interned.to_owned()),\n               GenericArgKind::Type(it) => std::mem::forget(it.interned.to_owned()),\n               GenericArgKind::Const(it) => std::mem::forget(it.interned.to_owned()),\n           }\n           Self { ptr: self.ptr }\n       }\n   }\n\n   impl Drop for StoredGenericArg {\n       #[inline]\n       fn drop(&mut self) {\n           unsafe {\n               match self.ptr.kind() {\n                   GenericArgKind::Lifetime(it) => it.interned.decrement_refcount(),\n                   GenericArgKind::Type(it) => it.interned.decrement_refcount(),\n                   GenericArgKind::Const(it) => it.interned.decrement_refcount(),\n               }\n           }\n       }\n   }\n\n   impl StoredGenericArg {\n       #[inline]\n       fn new(value: GenericArg<'_>) -> Self {\n           let result = Self { ptr: GenericArgImpl { ptr: value.ptr.ptr, _marker: PhantomData } };\n           // Increase refcount.\n           std::mem::forget(result.clone());\n           result\n       }\n   ```\n   New text:\n   ```rust\n   #[derive(Clone, PartialEq, Eq, Hash)]\n   pub struct StoredGenericArg {\n       ptr: GenericArgImpl<'static>,\n   }\n\n   impl StoredGenericArg {\n       #[inline]\n       fn new(value: GenericArg<'_>) -> Self {\n           Self { ptr: GenericArgImpl { ptr: value.ptr.ptr, _marker: PhantomData } }\n       }\n   ```\n   Why: `decrement_refcount` is gone (interned values are never freed, so a no-op in its place\n   would be a silent path), and the `forget(to_owned())` dance only bumped the count.\n   `GenericArgImpl`'s tag bits still work: every interned value sits at its type's alignment\n   in the arena, at least 8 for `TyInterned`/`ConstInterned`/`RegionInterned`.\n\n> forwarded to db: `generic_arg.rs` still calls `decrement_refcount` (line 169).\n> checked by db-audit-other (22:40): in the tree at `crates/hir-ty/src/next_solver/generic_arg.rs:111-120`. `StoredGenericArg` derives `Clone, Copy` with no `Drop`, and `new` only packs the pointer: the field is now `packed`, not `ptr`.\n\nOptional, not needed to build: `impl_internable!(gc; X)` and `impl_slice_internable!(gc; X, H, S)`\nare still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*.rs`); the\n`gc;` can be dropped from those calls whenever someone touches them.",
+  "state": "applied",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-30T09:56:49Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/format.md#format-span-intern",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:175"
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:49Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-other (22:40): in the tree at `crates/hir-ty/src/next_solver/generic_arg.rs:111-120`. `StoredGenericArg` derives `Clone, Copy` with no `Drop`, and `new` only packs the pointer: the field is now `packed`, not `ptr`."
+    }
+  ]
+}

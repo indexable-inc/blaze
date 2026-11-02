@@ -1,0 +1,29 @@
+{
+  "id": "01042",
+  "from_lane": "integrate",
+  "owner": "integrate-engine",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "Delete hir-ty-codegen's v1 whole-object build outright (brief item 5: the crate-at-a-time codegen tail goes; Andrew 05:37 \"delete v1 stuff\"). integrate-store found it is blaze-store's last real user: cached::Entries/Writer/KeptTypes/StoredCode/LlvmEntry, IncrementalCache, later::Keeper::keep, v1's patch base (patch.rs), units.rs, debuginfo.rs, fncache/asm store use. v2 calls only hir_ty_codegen::v2 and host*; check with rg that nothing outside hir-ty-codegen reaches the rest, move anything v2 still needs into v2/, and delete the v1 modules and their now-dead tests (port any test whose property v2 keeps into v2/'s tests). This also resolves 00996 (codegen has no live window): v2/toolchain.rs id() off blaze_store::build_name (pinned nightly + versioned codegen producer). Tell integrate-store (owner of the blaze-store deletion) when hir-ty-codegen no longer names blaze_store. You may split this among children (your cap).",
+  "state": "taken",
+  "created": "2026-10-30T14:31:52Z",
+  "updated": "2026-10-30T14:32:29Z",
+  "taken_by": "integrate-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:31:52Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T14:32:29Z",
+      "by": "integrate-engine",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

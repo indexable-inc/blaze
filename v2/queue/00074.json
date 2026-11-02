@@ -1,0 +1,36 @@
+{
+  "id": "00074",
+  "from_lane": "db-ty-db",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/allocation.rs",
+    "crates/hir-ty/src/consteval.rs"
+  ],
+  "what": "## 3. db-ty-types: `crates/hir-ty/src/next_solver/allocation.rs`\n\nWhat: hash `memory_map` in `impl Hash for AllocationData` (it is `let Self { ty, memory,\nmemory_map: _ }` today): `memory_map.hash(state);`.\nWhy: `MemoryMap` now implements `Hash` over everything its `PartialEq` compares (pieces by\naddress, alignments, statics, vtable types, `TypeId` types). Allocations equal but for what\nthey point to hash the same today, so they collide in the interner's table.\nAlso, for `crates/hir-ty/src/consteval.rs`: `write_allocation`/`read_allocation` use\n`TyTableWriter::ty` and `TyTableReader::ty` of `next_solver::persist` (shared rule 2) and\n`Allocation::new(AllocationData { ty, memory, memory_map })` with `Deref` to\n`AllocationData`'s three public fields, as today.\n\n> forwarded to db: `next_solver/allocation.rs` is inside lane db (db-ty-types); `impl Hash for AllocationData` still skips `memory_map`.\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/allocation.rs:78` (`memory_map.hash(state)`); `TyTableWriter::ty`/`TyTableReader::ty` at `next_solver/persist.rs:1800,1955`.",
+  "state": "applied",
+  "created": "2026-10-30T00:40:52Z",
+  "updated": "2026-10-30T09:56:50Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db-ty-db.md#3. db-ty-types: `crates/hir-ty/src/next_solver/allocation.rs`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-db.md:28"
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:50Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/allocation.rs:78` (`memory_map.hash(state)`); `TyTableWriter::ty`/`TyTableReader::ty` at `next_solver/persist.rs:1800,1955`."
+    }
+  ]
+}

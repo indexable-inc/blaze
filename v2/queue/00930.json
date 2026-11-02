@@ -1,0 +1,25 @@
+{
+  "id": "00930",
+  "from_lane": "speed-sol2-link-pewasm",
+  "owner": "speed-sol2-link",
+  "paths": [
+    "crates/blaze-link/src/output.rs",
+    "crates/blaze-link/src/model.rs",
+    "crates/blaze-link/src/native.rs"
+  ],
+  "what": "P18: lock-free long import members. Writer::read of an archive member does not know its archive, so pe.rs keeps every archive descriptor (__IMPORT_DESCRIPTOR_<lib> -> DLL) in Pe::descriptors: Mutex, locked once per long import member (thousands for windows.lib, serialising the parallel member reads). Add NativeKind::Member { archive } (or an Option<&Archive> argument to Writer::read) and Archive::descriptors: Vec<(Name, Name)> filled by the writer when it reads the archive, so the PE writer looks the DLL up without a lock. Spec: /tmp/blaze-lanes/v2-link-requests.md ### P18. I change pe.rs/pe/coff.rs once the model has it.",
+  "state": "open",
+  "created": "2026-10-30T09:55:44Z",
+  "updated": "2026-10-30T09:55:44Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:55:44Z",
+      "by": "speed-sol2-link-pewasm",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

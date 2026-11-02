@@ -58,8 +58,9 @@ impl SyntaxText {
     }
 
     pub fn slice<R: private::SyntaxTextRange>(&self, range: R) -> SyntaxText {
-        let start = range.start().unwrap_or_default();
-        let end = range.end().unwrap_or(self.len());
+        let asked = range.bounds();
+        let start = asked.0.unwrap_or_default();
+        let end = asked.1.unwrap_or(self.len());
         assert!(start <= end);
         let len = end - start;
         let start = self.range.start() + start;
@@ -68,7 +69,7 @@ impl SyntaxText {
             start <= end,
             "invalid slice, range: {:?}, slice: {:?}",
             self.range,
-            (range.start(), range.end()),
+            asked,
         );
         let range = TextRange::new(start, end);
         assert!(
@@ -77,6 +78,7 @@ impl SyntaxText {
             self.range,
             range,
         );
+        // clone: the slice holds its node, a count bump
         SyntaxText { node: self.node.clone(), range }
     }
 
@@ -124,6 +126,7 @@ fn found<T>(res: Result<(), T>) -> Option<T> {
 
 impl fmt::Debug for SyntaxText {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // alloc: debug output only
         fmt::Debug::fmt(&self.to_string(), f)
     }
 }
@@ -136,7 +139,9 @@ impl fmt::Display for SyntaxText {
 
 impl From<SyntaxText> for String {
     fn from(text: SyntaxText) -> String {
-        text.to_string()
+        let mut out = String::with_capacity(usize::from(text.len()));
+        text.for_each_chunk(|chunk| out.push_str(chunk));
+        out
     }
 }
 
@@ -214,70 +219,56 @@ mod private {
     use crate::{TextRange, TextSize};
 
     pub trait SyntaxTextRange {
-        fn start(&self) -> Option<TextSize>;
-        fn end(&self) -> Option<TextSize>;
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>);
     }
 
     impl SyntaxTextRange for TextRange {
-        fn start(&self) -> Option<TextSize> {
-            Some(TextRange::start(*self))
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(TextRange::end(*self))
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start()), Some(self.end()))
         }
     }
 
     impl SyntaxTextRange for ops::Range<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            Some(self.start)
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(self.end)
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start), Some(self.end))
         }
     }
 
     impl SyntaxTextRange for ops::RangeFrom<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            Some(self.start)
-        }
-        fn end(&self) -> Option<TextSize> {
-            None
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (Some(self.start), None)
         }
     }
 
     impl SyntaxTextRange for ops::RangeTo<TextSize> {
-        fn start(&self) -> Option<TextSize> {
-            None
-        }
-        fn end(&self) -> Option<TextSize> {
-            Some(self.end)
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (None, Some(self.end))
         }
     }
 
     impl SyntaxTextRange for ops::RangeFull {
-        fn start(&self) -> Option<TextSize> {
-            None
-        }
-        fn end(&self) -> Option<TextSize> {
-            None
+        fn bounds(self) -> (Option<TextSize>, Option<TextSize>) {
+            (None, None)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{green::SyntaxKind, GreenNodeBuilder};
+    use std::sync::Arc;
+
+    use crate::{FlatTreeBuilder, SyntaxKind};
 
     use super::*;
 
     fn build_tree(chunks: &[&str]) -> SyntaxNode {
-        let mut builder = GreenNodeBuilder::new();
+        let mut builder = FlatTreeBuilder::new();
         builder.start_node(SyntaxKind(62));
         for &chunk in chunks.iter() {
-            builder.token(SyntaxKind(92), chunk.into())
+            builder.token(SyntaxKind(92), chunk)
         }
         builder.finish_node();
-        SyntaxNode::new_root(builder.finish())
+        SyntaxNode::new_flat_root(Arc::new(builder.finish()))
     }
 
     #[test]

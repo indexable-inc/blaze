@@ -1,0 +1,29 @@
+{
+  "id": "01417",
+  "from_lane": "observe",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-profile/src/lib.rs"
+  ],
+  "what": "observe, follow-up to 01412 (same change or right after it): with the Arrow deps in blaze-profile's Cargo.toml, also add to crates/blaze-profile/src/lib.rs, after `pub mod arrow;`: `pub mod batches;` and after `pub mod flight;`: `pub mod live;`. Both files are in the tree, unlinked: batches.rs (a flight::Read as Arrow RecordBatches of the schema's spans, counters and open tables; arrow-array, arrow-schema) and live.rs (the live feed's frames as Arrow IPC with zstd, and the top-like view; arrow-array, arrow-ipc, arrow-schema). APIs checked against arrow-rs 60.0.0's source. Check: blaze test -p blaze-profile (batches::tests, live::tests).",
+  "state": "refused",
+  "created": "2026-11-01T01:45:20Z",
+  "updated": "2026-11-01T02:08:11Z",
+  "taken_by": null,
+  "why": "superseded by my newer dedup request linking all six blaze-profile modules (batches, history, live, sql, views with arrow)",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:45:20Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "refuse",
+      "note": "superseded by my newer dedup request linking all six blaze-profile modules (batches, history, live, sql, views with arrow)"
+    }
+  ]
+}

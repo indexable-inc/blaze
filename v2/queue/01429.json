@@ -1,0 +1,35 @@
+{
+  "id": "01429",
+  "from_lane": "observe",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-profile/src/lib.rs"
+  ],
+  "what": "observe, follow-up to 01412, replacing my 01417 (same change as 01412 or right after it): with the Arrow and Parquet deps in blaze-profile's Cargo.toml, link the six blaze-profile modules that are in the tree and unlinked, in crates/blaze-profile/src/lib.rs's `pub mod` list, alphabetical: `pub mod arrow;` (01412 already), `pub mod batches;`, `pub mod history;`, `pub mod live;`, `pub mod sql;`, `pub mod views;`. They use arrow-array, arrow-ipc (zstd), arrow-schema and parquet (arrow, zstd): no dependency beyond 01412. APIs checked against arrow-rs 60.0.0's source. Check: blaze test -p blaze-profile (batches::tests, live::tests, history::tests, views::tests, sql::tests; sql's DuckDB test is #[ignore] and needs BLAZE_DUCKDB).",
+  "state": "applied",
+  "created": "2026-11-01T02:08:11Z",
+  "updated": "2026-11-01T02:31:03Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:08:11Z",
+      "by": "observe",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:26:21Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T02:31:03Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "linked batches, history, live, sql, views (rustfmt order: mod symbols before pub mod views). Fixed two E0106 in your files: io_error in history.rs:157 and sql.rs:106 now name the lifetime (<'a>, &'a Path, + 'a). check-live 19:29:53 exit 0; tests not run."
+    }
+  ]
+}

@@ -1,29 +1,23 @@
-//! A nice interface for working with the infcx. The basic idea is to
-//! do `infcx.at(cause, param_env)`, which sets the "cause" of the
-//! operation as well as the surrounding parameter environment. Then
-//! you can do something like `.sub(a, b)` or `.eq(a, b)` to create a
-//! subtype or equality relationship respectively. The first argument
-//! is always the "expected" output from the POV of diagnostics.
+//! A nice interface for working with the infcx. Subtyping goes through
+//! `infcx.sub_raw(cause, param_env, a, b)` and `infcx.sup_raw(..)`; equality,
+//! `relate` and `lub` also through `infcx.at(cause, param_env)`, which sets
+//! the "cause" of the operation as well as the surrounding parameter
+//! environment. The first value is always the "expected" output from the POV
+//! of diagnostics.
 //!
 //! Examples:
 //! ```ignore (fragment)
-//!     infcx.at(cause, param_env).sub(a, b)
+//!     infcx.sub_raw(cause, param_env, a, b)
 //!     // requires that `a <: b`, with `a` considered the "expected" type
 //!
-//!     infcx.at(cause, param_env).sup(a, b)
+//!     infcx.sup_raw(cause, param_env, a, b)
 //!     // requires that `b <: a`, with `a` considered the "expected" type
 //!
 //!     infcx.at(cause, param_env).eq(a, b)
 //!     // requires that `a == b`, with `a` considered the "expected" type
 //! ```
-//! For finer-grained control, you can also do use `trace`:
-//! ```ignore (fragment)
-//!     infcx.at(...).trace(a, b).sub(&c, &d)
-//! ```
-//! This will set `a` and `b` as the "root" values for
-//! error-reporting, but actually operate on `c` and `d`. This is
-//! sometimes useful when the types of `c` and `d` are not traceable
-//! things. (That system should probably be refactored.)
+
+use std::cell::{Cell, RefCell};
 
 use rustc_type_ir::{
     FnSig, GenericArgKind, TypeFoldable, TypingMode, Variance,
@@ -37,10 +31,11 @@ use crate::next_solver::{
     TraitRef, Ty,
     fulfill::NextSolverError,
     infer::relate::lattice::{LatticeOp, LatticeOpKind},
+    recycle,
 };
 
 use super::{
-    InferCtxt, InferOk, InferResult, TypeTrace, ValuePairs,
+    InferCtxt, InferOk, InferResult, InferTables, TypeTrace, ValuePairs,
     traits::{Obligation, ObligationCause},
 };
 
@@ -61,14 +56,32 @@ impl<'db> InferCtxt<'db> {
     /// variables in the same state. This can be used to "branch off" many tests from the same
     /// common state.
     pub fn fork(&self) -> Self {
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self.fork_tables();
         Self {
             interner: self.interner,
             typing_mode: self.typing_mode,
-            inner: self.inner.clone(),
-            tainted_by_errors: self.tainted_by_errors.clone(),
-            universe: self.universe.clone(),
-            obligation_inspector: self.obligation_inspector.clone(),
+            inner: RefCell::new(inner),
+            tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
+            universe: Cell::new(self.universe.get()),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
+            enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
+            obligation_inspector: Cell::new(self.obligation_inspector.get()),
+            canonicalizer_state: RefCell::new(canonicalizer),
         }
+    }
+
+    /// The worker's warm tables (`recycle::infer_tables`) holding a copy of this context's.
+    fn fork_tables(&self) -> InferTables<'db> {
+        let mut tables = recycle::infer_tables();
+        // clone: a fork is a copy of the variable tables, into the worker's warm ones.
+        tables.inner.clone_from(&self.inner.borrow());
+        // clone: the fork sees the same universes, so it needs their assumptions.
+        tables.placeholder_assumptions.clone_from(&self.placeholder_assumptions.borrow());
+        // clone: empty unless a root goal overflowed, and then a handful.
+        tables.next_solver_overflows.clone_from(&self.next_solver_overflows.borrow());
+        tables
     }
 
     /// Forks the inference context, creating a new inference context with the same inference
@@ -78,13 +91,114 @@ impl<'db> InferCtxt<'db> {
         // Unlike `fork`, this invalidates all cache entries as they may depend on the
         // typing mode.
 
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self.fork_tables();
         Self {
             interner: self.interner,
             typing_mode,
-            inner: self.inner.clone(),
-            tainted_by_errors: self.tainted_by_errors.clone(),
-            universe: self.universe.clone(),
-            obligation_inspector: self.obligation_inspector.clone(),
+            inner: RefCell::new(inner),
+            tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
+            universe: Cell::new(self.universe.get()),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
+            enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
+            obligation_inspector: Cell::new(self.obligation_inspector.get()),
+            canonicalizer_state: RefCell::new(canonicalizer),
+        }
+    }
+
+    /// Makes `actual <: expected`. For example, if type-checking a
+    /// call like `foo(x)`, where `foo: fn(i32)`, you might have
+    /// `sup_raw(cause, param_env, i32, x)`, since the "expected" type is the
+    /// type that appears in the signature.
+    pub fn sup_raw<T>(
+        &self,
+        cause: &ObligationCause,
+        param_env: ParamEnv<'db>,
+        expected: T,
+        actual: T,
+    ) -> InferResult<'db, ()>
+    where
+        T: ToTrace<'db>,
+    {
+        RelateExt::relate(self, param_env, expected, Variance::Contravariant, actual, cause.span())
+            .map(|goals| self.goals_to_obligations(cause, goals))
+    }
+
+    /// Makes `expected <: actual`.
+    pub fn sub_raw<T>(
+        &self,
+        cause: &ObligationCause,
+        param_env: ParamEnv<'db>,
+        expected: T,
+        actual: T,
+    ) -> InferResult<'db, ()>
+    where
+        T: ToTrace<'db>,
+    {
+        RelateExt::relate(self, param_env, expected, Variance::Covariant, actual, cause.span())
+            .map(|goals| self.goals_to_obligations(cause, goals))
+    }
+
+    /// Makes `expected == actual`.
+    pub fn eq_raw<T>(
+        &self,
+        cause: &ObligationCause,
+        param_env: ParamEnv<'db>,
+        expected: T,
+        actual: T,
+    ) -> InferResult<'db, ()>
+    where
+        T: Relate<DbInterner<'db>>,
+    {
+        RelateExt::relate(self, param_env, expected, Variance::Invariant, actual, cause.span())
+            .map(|goals| self.goals_to_obligations(cause, goals))
+    }
+
+    pub fn relate_raw<T>(
+        &self,
+        cause: &ObligationCause,
+        param_env: ParamEnv<'db>,
+        expected: T,
+        variance: Variance,
+        actual: T,
+    ) -> InferResult<'db, ()>
+    where
+        T: ToTrace<'db>,
+    {
+        self.at(cause, param_env).relate(expected, variance, actual)
+    }
+
+    /// Computes the least-upper-bound, or mutual supertype, of two
+    /// values. The order of the arguments doesn't matter, but since
+    /// this can result in an error (e.g., if asked to compute LUB of
+    /// u32 and i32), it is meaningful to call one of them the
+    /// "expected type".
+    pub fn lub_raw<T>(
+        &self,
+        cause: &ObligationCause,
+        param_env: ParamEnv<'db>,
+        expected: T,
+        actual: T,
+    ) -> InferResult<'db, T>
+    where
+        T: ToTrace<'db>,
+    {
+        self.at(cause, param_env).lub(expected, actual)
+    }
+
+    pub fn goals_to_obligations(
+        &self,
+        cause: &ObligationCause,
+        goals: Vec<Goal<'db, Predicate<'db>>>,
+    ) -> InferOk<'db, ()> {
+        InferOk {
+            value: (),
+            obligations: goals
+                .into_iter()
+                .map(|goal| Obligation::new(self.interner, *cause, goal.param_env, goal.predicate))
+                // alloc: none when the relation made no goals; otherwise the caller owns them.
+                .collect(),
         }
     }
 }
@@ -102,15 +216,7 @@ impl<'a, 'db> At<'a, 'db> {
     where
         T: ToTrace<'db>,
     {
-        RelateExt::relate(
-            self.infcx,
-            self.param_env,
-            expected,
-            Variance::Contravariant,
-            actual,
-            self.cause.span(),
-        )
-        .map(|goals| self.goals_to_obligations(goals))
+        self.infcx.sup_raw(self.cause, self.param_env, expected, actual)
     }
 
     /// Makes `expected <: actual`.
@@ -118,15 +224,7 @@ impl<'a, 'db> At<'a, 'db> {
     where
         T: ToTrace<'db>,
     {
-        RelateExt::relate(
-            self.infcx,
-            self.param_env,
-            expected,
-            Variance::Covariant,
-            actual,
-            self.cause.span(),
-        )
-        .map(|goals| self.goals_to_obligations(goals))
+        self.infcx.sub_raw(self.cause, self.param_env, expected, actual)
     }
 
     /// Makes `expected == actual`.
@@ -134,15 +232,7 @@ impl<'a, 'db> At<'a, 'db> {
     where
         T: Relate<DbInterner<'db>>,
     {
-        RelateExt::relate(
-            self.infcx,
-            self.param_env,
-            expected,
-            Variance::Invariant,
-            actual,
-            self.cause.span(),
-        )
-        .map(|goals| self.goals_to_obligations(goals))
+        self.infcx.eq_raw(self.cause, self.param_env, expected, actual)
     }
 
     pub fn relate<T>(self, expected: T, variance: Variance, actual: T) -> InferResult<'db, ()>
@@ -150,9 +240,13 @@ impl<'a, 'db> At<'a, 'db> {
         T: ToTrace<'db>,
     {
         match variance {
-            Variance::Covariant => self.sub(expected, actual),
+            Variance::Covariant => {
+                self.infcx.sub_raw(self.cause, self.param_env, expected, actual)
+            }
             Variance::Invariant => self.eq(expected, actual),
-            Variance::Contravariant => self.sup(expected, actual),
+            Variance::Contravariant => {
+                self.infcx.sup_raw(self.cause, self.param_env, expected, actual)
+            }
 
             // We could make this make sense but it's not readily
             // exposed and I don't feel like dealing with it. Note
@@ -189,23 +283,6 @@ impl<'a, 'db> At<'a, 'db> {
         );
         let value = op.relate(expected, actual)?;
         Ok(InferOk { value, obligations: op.into_obligations() })
-    }
-
-    fn goals_to_obligations(&self, goals: Vec<Goal<'db, Predicate<'db>>>) -> InferOk<'db, ()> {
-        InferOk {
-            value: (),
-            obligations: goals
-                .into_iter()
-                .map(|goal| {
-                    Obligation::new(
-                        self.infcx.interner,
-                        *self.cause,
-                        goal.param_env,
-                        goal.predicate,
-                    )
-                })
-                .collect(),
-        }
     }
 }
 

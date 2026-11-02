@@ -1,0 +1,24 @@
+{
+  "id": "01503",
+  "from_lane": "one-pool",
+  "owner": "usercode",
+  "paths": [
+    "crates/blaze-usercode/src/test/queue.rs",
+    "crates/blaze-usercode/src/test/fork_server.rs"
+  ],
+  "what": "## From one-pool (2026-11-01, step 3 of brief-locks): the fork server retries its connect every 25 ms\n\n`crates/blaze-usercode/src/test/fork_server.rs` `connect` (text written into each test harness) retries `UnixStream::connect` up to 400 times, sleeping 25 ms, on NotFound/ConnectionRefused: \"blaze listens as it starts the binary; the listen may be made a moment after.\"\n\nCause: `crates/blaze-usercode/src/test/queue.rs` `spawn_server` pushes `Effect::Listen` and `Effect::Spawn` in one batch, so the driver may start the binary before the socket is bound.\n\nWhat: push the spawn from `listened` once its listen succeeded (a failed listen ends the server with its error, no spawn), then make `connect` connect once and fail naming the socket. That removes a wait no event ends (rules every-wait-says-what, no-fallback: a server that can't connect today waits 10 s and then fails). Test on the queue: no `Effect::Spawn` before the listen's completion, and a refused listen spawns nothing.",
+  "state": "open",
+  "created": "2026-11-01T13:43:36Z",
+  "updated": "2026-11-01T13:43:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T13:43:36Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

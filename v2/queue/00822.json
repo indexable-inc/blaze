@@ -1,0 +1,24 @@
+{
+  "id": "00822",
+  "from_lane": "graph",
+  "owner": "frontend-image",
+  "paths": [
+    "vendor/salsa/src/function.rs",
+    "vendor/salsa/src/image.rs"
+  ],
+  "what": "Function memo restore onto the frozen query graph: when the daemon image is mapped, restored function memos take their node from graph::frozen::FrozenGraph (section 0x0501, SALSA_GRAPH once it exists) and their edges from it through graph::frozen::Overlay, with no decode into the live edge array. A section whose layout hash or content hash does not match is an error (FrozenError), never a rebuild. Design: docs/v2/plan/lanes/db/graph.md section 3.",
+  "state": "open",
+  "created": "2026-10-30T08:30:13Z",
+  "updated": "2026-10-30T08:30:13Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:30:13Z",
+      "by": "graph",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

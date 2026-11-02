@@ -1,0 +1,38 @@
+{
+  "id": "00336",
+  "from_lane": "mem-db-infer-eval",
+  "owner": "db",
+  "paths": [
+    "crates/rustc_abi",
+    "crates/rustc_abi/src/layout.rs",
+    "crates/rustc_abi/src/layout/coroutine.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## R-abi: a request to the coordinator (`crates/rustc_abi`)\n\nThe layout calculator takes the variants as owned nested `IndexVec`s, which forces one global\nallocation per variant on every ADT and coroutine layout. Borrowed slices carry the same data:\n\n1. `crates/rustc_abi/src/layout.rs`: `layout_of_struct_or_enum`, `layout_of_union` and the\n   private `layout_of_struct` and `layout_of_enum` take\n   `variants: &IndexSlice<VariantIdx, V>` with `V: Deref<Target = IndexSlice<FieldIdx, F>>`\n   instead of `&IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>`. Every use (lines 359-360, 423,\n   549, 555, 610-643, 769, 815, 823 and 936 as of today) indexes, iterates or calls `len` on a\n   variant, which `Deref` reaches unchanged.\n2. `crates/rustc_abi/src/layout/coroutine.rs`: `layout_of_coroutine`, `coroutine::layout` and\n   `coroutine_saved_local_eligibility` take `variant_fields: &IndexSlice<VariantIdx, K>` with\n   `K: Deref<Target = IndexSlice<FieldIdx, LocalIdx>>`; line 58's `for local in fields` becomes\n   `for local in fields.iter()`.\n\n`IndexVec` meets both bounds, so every existing caller compiles unchanged; the layouts are the\nsame values. Its test: `layout/adt.rs`' `one_flat_buffer_matches_a_buffer_per_variant` (A2) runs\nboth shapes through the calculator and compares.\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> not applied by db-mem-infer-b-eval (21:42): `crates/rustc_abi` is the coordinator's; filed in `v2/requests/db.md` under \"mem-db-infer-eval, for the coordinator: `crates/rustc_abi` takes borrowed variants\".",
+  "state": "refused",
+  "created": "2026-10-30T03:32:40Z",
+  "updated": "2026-10-30T09:56:58Z",
+  "taken_by": "db-next5",
+  "why": "coordinator: crates/rustc_abi is the coordinator's (coord-apply-front 00642 already applied the borrowed-variants change)",
+  "source": "v2/requests/mem-db-infer-eval.md#R-abi: a request to the coordinator (`crates/rustc_abi`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-eval.md:84"
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:58Z",
+      "by": "db-next5",
+      "action": "refuse",
+      "note": "coordinator: crates/rustc_abi is the coordinator's (coord-apply-front 00642 already applied the borrowed-variants change)"
+    }
+  ]
+}

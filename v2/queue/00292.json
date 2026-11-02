@@ -1,0 +1,38 @@
+{
+  "id": "00292",
+  "from_lane": "dedup",
+  "owner": "frontend-tree",
+  "paths": [
+    "v2/requests",
+    "crates/syntax/src/view.rs",
+    "crates/syntax/src/view/expr_ext.rs",
+    "crates/syntax"
+  ],
+  "what": "## dedup: `syntax::view::written_range` and `Expr::peel_parens` (from dedup-sim-diag, 2026-10-29)\n\nFrom `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). Two\nsyntax-only helpers are written over and over above `syntax`; one copy of each belongs here.\nThe callers' edits are in `v2/requests/{diagnostics,db,codegen,coordinator}.md` under\n`## dedup: callers of syntax::view::written_range and Expr::peel_parens`.\n\n### 1. `crates/syntax/src/view.rs`: where rustc's span of an item starts\n\nFour copies of \"from the first child that is not an attribute, a doc comment or trivia\":\n`blaze-diagnostics/src/cx.rs` `item_range`, `blaze-lints/src/check.rs` `item_range`,\n`hir-expand/src/builtin/fn_macro.rs` `written_range`, `hir-ty-mir/src/mir/location.rs`\n`written_range`; two walk handles, two views. (`DOC_COMMENT` is a node kind, so the copies\nthat test it on nodes only and those that test it on every child agree.) The rule over the\nchildren's kinds and ranges serves both trees; the view form is the one new code calls.\n\nAdd `TextRange` to `use crate::{..}` and, after `pub fn ptr`:\n\n```rust\n/// rustc's span of an item or a macro call, which leaves out the attributes, doc comments and\n/// comments on top of it: from the first of `children` (a node's children, in order, as their\n/// kinds and ranges) that is none of those, to the end of `range`, the node's own.\npub fn written_range_of(range: TextRange, children: impl IntoIterator<Item = (SyntaxKind, TextRange)>) -> TextRange {\n    let start = children\n        .into_iter()\n        .find(|&(kind, _)| !matches!(kind, SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT) && !kind.is_trivia())\n        .map_or(range.start(), |(_, it)| it.start());\n    TextRange::new(start, range.end())\n}\n\n/// [`written_range_of`] of `node`.\n#[inline]\npub fn written_range(node: Node<'_>) -> TextRange {\n    written_range_of(node.text_range(), node.children_with_tokens().map(|it| (it.kind(), it.text_range())))\n}\n```\n\nTests (`view/tests.rs`): `/// d\\n#[a]\\n// c\\npub fn f() {}` gives the range from `pub`; a node of\nattributes only gives its own range; and for every node of `ast/tests`'s sample files,\n`written_range(view)` equals `written_range_of` over the handle's `children_with_tokens()`.\n\n### 2. `crates/syntax/src/view/expr_ext.rs`: `peel_parens`\n\nSix copies in `blaze-lints` (`needless_borrow.rs` and `byte_char_slices.rs` and\n`useless_borrows_in_formatting.rs` `strip_parens`, `needless_borrows_for_generic_args.rs`,\n`collapsible_if.rs` and `multiple_unsafe_ops_per_block.rs` `peel_parens`), all on views, and two\nin `blaze-diagnostics` on handles (`lints/syntax/delims.rs` `peel_parens`,\n`lints/names/dead/mark.rs` `unparen`). In `impl<'t> ast::Expr<'t>`, after `is_block_like`:\n\n```rust\n    /// The expression inside every pair of parentheses around `self` (rustc's `peel_parens`:\n    /// HIR has no parentheses); `self` when it is not parenthesized, or a `()` holds nothing.\n    pub fn peel_parens(self) -> ast::Expr<'t> {\n        let mut expr = self;\n        while let ast::Expr::ParenExpr(paren) = expr\n            && let Some(inner) = paren.expr()\n        {\n            expr = inner;\n        }\n        expr\n    }\n```\n\nTest: `((a))` peels to `a`, `(a).b` stays a field expression, `()` stays a tuple.\n\nWhen frontend-tree's moves reach `blaze-diagnostics/src/lints/syntax/delims.rs` and\n`lints/names/dead/mark.rs` (frontend-tree-move-diag-lints-delims, -names), their handle copies\ngo and the callers write `expr.peel_parens()`.\n\n> forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 29).\n> frontend-tree (2026-10-29): both applied as written: `syntax::view::{written_range_of,\n> written_range}` (`view.rs`, after `ptr`) and `view::Expr::peel_parens` (`view/expr_ext.rs`).\n> Tests in `view/tests.rs`: `an_items_written_range_leaves_out_its_attributes_and_comments`\n> (the three cases asked, the last over every node of the source fixture) and\n> `peel_parens_leaves_the_expression_inside_every_pair`.",
+  "state": "applied",
+  "created": "2026-10-30T02:59:37Z",
+  "updated": "2026-10-30T07:50:00Z",
+  "taken_by": "frontend-tree",
+  "why": null,
+  "source": "v2/requests/frontend-tree.md#dedup: `syntax::view::written_range` and `Expr::peel_parens` (from dedup-sim-diag, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-tree.md:377"
+    },
+    {
+      "at": "2026-10-30T07:49:59Z",
+      "by": "frontend-tree",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T07:50:00Z",
+      "by": "frontend-tree",
+      "action": "done",
+      "note": "view::written_range_of / written_range in crates/syntax/src/view.rs:210-225, Expr::peel_parens in view/expr_ext.rs:30, tests in view/tests.rs"
+    }
+  ]
+}

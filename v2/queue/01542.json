@@ -1,0 +1,29 @@
+{
+  "id": "01542",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "docs/cargo.md"
+  ],
+  "what": "cargo, follow-up to 01541 part 2 (docs/cargo.md ~line 415). The example table, copied as written, is refused at load: its `${LLVM_SYS_231_PREFIX}/lib` entry has no `build-script-env` listing the variable. It also uses LLVM, the one case that must not use this feature (the pinned LLVM is already in a SYSTEM dir; see docs/contributing.md). Replace the table's link-dirs line with these two lines:\nbuild-script-link-dirs = [\"/opt/vendor/lib\", \"${OPENSSL_DIR}/lib\"]   # rustc-link-search may name\nbuild-script-env = [\"OPENSSL_DIR\"]                                   # a ${NAME} above must be listed here",
+  "state": "applied",
+  "created": "2026-11-02T00:54:51Z",
+  "updated": "2026-11-02T01:28:00Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T00:54:51Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T01:28:00Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "docs/cargo.md sandbox example uses ${OPENSSL_DIR}/lib with build-script-env = [\"OPENSSL_DIR\"], as given"
+    }
+  ]
+}

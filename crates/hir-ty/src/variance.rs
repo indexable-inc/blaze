@@ -8,18 +8,20 @@
 //! need to be resolved. rust-analyzer does not want a crate-wide analysis though as that would hurt
 //! incrementality too much and as such our query is based on a per item basis.
 //!
-//! This does unfortunately run into the issue that we can run into query cycles which salsa
-//! currently does not allow to be resolved via a fixpoint computation. This will likely be resolved
-//! by the next salsa version. If not, we will likely have to adapt and go with the rustc approach
-//! while installing firewall per item queries to prevent invalidation issues.
+//! Per item, the queries can form cycles; the query engine resolves them by fixpoint iteration
+//! (`variances_of`'s `cycle_initial` and `cycle_fn`).
+
+mod unused;
+
+use base_db::Db;
+pub use unused::adt_unused_params;
 
 use hir_def::{
     AdtId, GenericDefId, GenericParamId, VariantId,
     signatures::{StructFlags, StructSignature},
 };
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::{Variance, inherent::IntoKind};
-use stdx::never;
+use rustc_type_ir::{TypeFlags, TypeVisitableExt as _, Variance, inherent::IntoKind};
 
 use crate::{
     CallableDefId,
@@ -31,16 +33,17 @@ use crate::{
     },
 };
 
-pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> VariancesOf<'_> {
+pub(crate) fn variances_of(db: &Db, def: GenericDefId) -> VariancesOf<'_> {
     variances_of_query(db, def).as_ref()
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_fn = crate::variance::variances_of_cycle_fn,
     cycle_initial = crate::variance::variances_of_cycle_initial,
+    mem_tag = Infer,
 )]
-fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariancesOf {
+fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
     tracing::debug!("variances_of(def={:?})", def);
     match def {
         GenericDefId::FunctionId(_) => (),
@@ -65,11 +68,10 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
     if count == 0 {
         return VariancesOf::empty().store();
     }
-    let variances =
-        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db }
-            .solve();
-
-    VariancesOf::new_from_slice(&variances).store()
+    blaze_mem::frame::current(|frame| {
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        VariancesOf::new_from_slice(Context { generics, variances, db }.solve()).store()
+    })
 }
 
 /// The variances of a tuple struct's or tuple variant's constructor function item, as rustc's
@@ -77,12 +79,12 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
 /// `fn(fields..) -> Adt<..>`, not from the ADT's. A parameter its fields use appears both as an
 /// argument and in the result, so it is invariant (`SomeStruct::<&'static u32>` can't be called
 /// with a shorter borrow); one only another variant uses keeps the ADT's variance.
-pub fn ctor_variances(db: &dyn HirDatabase, ctor: VariantId) -> VariancesOf<'_> {
+pub fn ctor_variances(db: &Db, ctor: VariantId) -> VariancesOf<'_> {
     ctor_variances_query(db, ctor).as_ref()
 }
 
-#[salsa::tracked(returns(ref))]
-fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariancesOf {
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     let adt: GenericDefId = match ctor {
         VariantId::StructId(s) => AdtId::StructId(s).into(),
         VariantId::EnumVariantId(v) => AdtId::EnumId(v.loc(db).parent).into(),
@@ -93,27 +95,29 @@ fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariance
     if count == 0 {
         return VariancesOf::empty().store();
     }
-    let mut cx =
-        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db };
-    let callable = match ctor {
-        VariantId::StructId(s) => CallableDefId::StructId(s),
-        VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
-        VariantId::UnionId(_) => unreachable!(),
-    };
-    let sig = db.callable_item_signature(callable).instantiate_identity().skip_binder();
-    cx.add_constraints_from_sig(sig.inputs_and_output.iter(), Variance::Covariant);
-    let mut variances = cx.variances;
-    for (idx, param) in cx.generics.iter_id(false).enumerate() {
-        if let GenericParamId::ConstParamId(_) = param {
-            variances[idx] = Variance::Invariant;
+    blaze_mem::frame::current(|frame| {
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        let mut cx = Context { generics, variances, db };
+        let callable = match ctor {
+            VariantId::StructId(s) => CallableDefId::StructId(s),
+            VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
+            VariantId::UnionId(_) => unreachable!(),
+        };
+        let sig = db.callable_item_signature(callable).instantiate_identity().skip_binder();
+        cx.add_constraints_from_sig(sig.inputs_and_output.iter(), Variance::Covariant);
+        let variances = cx.variances;
+        for (idx, param) in cx.generics.iter_id(false).enumerate() {
+            if let GenericParamId::ConstParamId(_) = param {
+                variances[idx] = Variance::Invariant;
+            }
         }
-    }
-    VariancesOf::new_from_slice(&variances).store()
+        VariancesOf::new_from_slice(variances).store()
+    })
 }
 
 pub(crate) fn variances_of_cycle_fn(
-    _db: &dyn HirDatabase,
-    _: &salsa::Cycle<'_>,
+    _db: &Db,
+    _: &blaze_query::db::Cycle<'_>,
     _last_provisional_value: &StoredVariancesOf,
     value: StoredVariancesOf,
     _def: GenericDefId,
@@ -142,8 +146,8 @@ fn glb(v1: Variance, v2: Variance) -> Variance {
 }
 
 pub(crate) fn variances_of_cycle_initial(
-    db: &dyn HirDatabase,
-    _: salsa::Id,
+    db: &Db,
+    _: blaze_query::db::Id,
     def: GenericDefId,
 ) -> StoredVariancesOf {
     let generics = generics(db, def);
@@ -152,14 +156,15 @@ pub(crate) fn variances_of_cycle_initial(
     VariancesOf::new_from_iter(std::iter::repeat_n(Variance::Bivariant, count)).store()
 }
 
-struct Context<'db> {
-    db: &'db dyn HirDatabase,
+struct Context<'db, 'f> {
+    db: &'db Db,
     generics: Generics<'db>,
-    variances: Box<[Variance]>,
+    /// The variances while they are worked out, one byte a parameter, in the run's frame.
+    variances: &'f mut [Variance],
 }
 
-impl<'db> Context<'db> {
-    fn solve(mut self) -> Box<[Variance]> {
+impl<'db, 'f> Context<'db, 'f> {
+    fn solve(mut self) -> &'f mut [Variance] {
         tracing::debug!("solve(generics={:?})", self.generics);
         match self.generics.def() {
             GenericDefId::AdtId(adt) => {
@@ -189,7 +194,7 @@ impl<'db> Context<'db> {
             }
             _ => {}
         }
-        let mut variances = self.variances;
+        let variances = self.variances;
 
         // Const parameters are always invariant.
         // Make all const parameters invariant.
@@ -214,6 +219,12 @@ impl<'db> Context<'db> {
     /// in a context with the generics defined in `generics` and
     /// ambient variance `variance`
     fn add_constraints_from_ty(&mut self, ty: Ty<'db>, variance: Variance) {
+        // Only a type parameter and an early-bound lifetime are constrained: a type with
+        // neither in it (`u8`, `Vec<String>`) adds nothing, and its ADTs' variances need not
+        // be read.
+        if !ty.has_type_flags(TypeFlags::HAS_TY_PARAM.union(TypeFlags::HAS_RE_PARAM)) {
+            return;
+        }
         tracing::debug!("add_constraints_from_ty(ty={:?}, variance={:?})", ty, variance);
         match ty.kind() {
             TyKind::Int(_)
@@ -230,7 +241,7 @@ impl<'db> Context<'db> {
             | TyKind::Coroutine(..)
             | TyKind::CoroutineClosure(..)
             | TyKind::Closure(..) => {
-                never!("Unexpected unnameable type in variance computation: {:?}", ty);
+                unreachable!("Unexpected unnameable type in variance computation: {:?}", ty);
             }
             TyKind::Ref(lifetime, ty, mutbl) => {
                 self.add_constraints_from_region(lifetime, variance);
@@ -254,7 +265,7 @@ impl<'db> Context<'db> {
             TyKind::Adt(def, args) => {
                 self.add_constraints_from_args(def.def_id().into(), args, variance);
             }
-            TyKind::Alias(alias) => {
+            TyKind::Alias(_, alias) => {
                 // FIXME: Probably not correct wrt. opaques.
                 self.add_constraints_from_invariant_args(alias.args);
             }
@@ -299,7 +310,7 @@ impl<'db> Context<'db> {
             | TyKind::Placeholder(..)
             | TyKind::Infer(..)
             | TyKind::UnsafeBinder(..) => {
-                never!("unexpected type encountered in variance inference: {:?}", ty)
+                unreachable!("unexpected type encountered in variance inference: {:?}", ty)
             }
         }
     }
@@ -359,7 +370,7 @@ impl<'db> Context<'db> {
     /// in a context with ambient variance `variance`
     fn add_constraints_from_const(&mut self, c: Const<'db>) {
         match c.kind() {
-            ConstKind::Unevaluated(c) => self.add_constraints_from_invariant_args(c.args),
+            ConstKind::Alias(_, c) => self.add_constraints_from_invariant_args(c.args),
             _ => {}
         }
     }
@@ -373,7 +384,7 @@ impl<'db> Context<'db> {
     ) {
         let contra = variance.xform(Variance::Contravariant);
         let Some(output) = sig_tys.next_back() else {
-            return never!("function signature has no return type");
+            unreachable!("function signature has no return type");
         };
         self.add_constraints_from_ty(output, variance);
         for input in sig_tys {
@@ -405,7 +416,7 @@ impl<'db> Context<'db> {
             | RegionKind::ReErased => {
                 // We don't expect to see anything but 'static or bound
                 // regions when visiting member types or method types.
-                never!(
+                unreachable!(
                     "unexpected region encountered in variance \
                       inference: {:?}",
                     region

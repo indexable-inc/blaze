@@ -1,0 +1,24 @@
+{
+  "id": "00892",
+  "from_lane": "fix-back",
+  "owner": "coordinator",
+  "paths": [
+    "fuzz/targets",
+    "/tmp/v2-errors/split.sh"
+  ],
+  "what": "/tmp/v2-errors/split.sh only matches crates/ and vendor/, so the 29 errors in fuzz/targets/*.rs in /tmp/v2-check22.txt (api_envelope 12, cas_cold 1, cas_entry 1, cas_remote 3, link_elf_object 1, link_macho_object 1, proc_macro_frames 1, usercode_script_elide 3, usercode_wire 6) go to no group file. fuzz/ is the safety lane (docs/v2/plan/reference/crates.md:83), which has no live window. These targets lag back-group APIs (blaze-api, blaze-cas, blaze-link, proc-macro-api, blaze-usercode); fix-back will fix them if you reassign fuzz/targets to fix-back, and the split should send fuzz/ lines somewhere (back fits).",
+  "state": "open",
+  "created": "2026-10-30T09:31:17Z",
+  "updated": "2026-10-30T09:31:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:31:17Z",
+      "by": "fix-back",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

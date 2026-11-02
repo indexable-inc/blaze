@@ -1,0 +1,24 @@
+{
+  "id": "00467",
+  "from_lane": "frontend-fast-bodies-cache",
+  "owner": "db-ty",
+  "paths": [
+    "crates/hir-ty/src/infer/persist.rs",
+    "v2/requests/db.md"
+  ],
+  "what": "## frontend-fast-bodies-cache: parts 2 and 5 of the served-bodies request (`crates/hir-ty/src/infer/persist.rs`, `infer.rs`; 2026-10-29)\n\nThe full text is in `v2/requests/db.md` under \"frontend-fast-bodies-cache-bodies: served\ndependency bodies, relocated ids and two hooks\". It was forwarded to db, which now owns hir-ty as\ndb-ty. Parts 1, 3 and 4 are in the tree: `pub mod check_cache;`, `next_solver/persist.rs` and\n`lower/persist.rs` read and write ids through `check_cache::Relocate`. Two parts are not in:\n\n- **Part 2, `infer/persist.rs`:** the inference result's ids go through the scope's table\n  (`check_cache::id_bits` / `id_of`), as the other two codecs now do. Until this is in, the\n  inference that `check_cache::encode` writes holds this database's raw salsa ids. Another\n  database reading it would get the wrong definitions.\n- **Part 5, `infer.rs`:** `infer_body_query` returns `check_cache::served_inference(db, def)`\n  when there is one. Until this is in, a served dependency's bodies are inferred again, and the\n  cache saves nothing for them.\n\nWhy: `blaze_diagnostics::cache` serves a dependency's check results from the global cache. The\nbodies half is only sound with part 2 and only used with part 5. frontend-fast-borrowck and\ndb-mem-borrowck hold parts 6 and 7 (the `gate.rs` hook and the served tests) until db marks\nparts 1 to 5 applied. Please tell them as well as me when these land.\n\nStatus: open\n\n> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T04:31:19Z",
+  "updated": "2026-10-30T04:31:19Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty.md#frontend-fast-bodies-cache: parts 2 and 5 of the served-bodies request (`crates/hir-ty/src/infer/persist.rs`, `infer.rs`; 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty.md:2979"
+    }
+  ]
+}

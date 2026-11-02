@@ -1,0 +1,255 @@
+[package]
+name = "blaze-fuzzer"
+description = "Coverage-guided fuzzing of every parser of untrusted bytes in blaze: the engine, and one target binary per parser"
+publish = false
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# One binary per target; `targets/{cas_shared,hir_shared,hir_expr_shared,syntax_shared}.rs`
+# are modules of their targets.
+[[bin]]
+name = "api_cbor"
+path = "targets/api_cbor.rs"
+
+[[bin]]
+name = "api_cbor_encode"
+path = "targets/api_cbor_encode.rs"
+
+[[bin]]
+name = "api_envelope"
+path = "targets/api_envelope.rs"
+
+[[bin]]
+name = "api_frame"
+path = "targets/api_frame.rs"
+
+[[bin]]
+name = "api_frames"
+path = "targets/api_frames.rs"
+
+[[bin]]
+name = "api_http_request"
+path = "targets/api_http_request.rs"
+
+[[bin]]
+name = "api_http_response"
+path = "targets/api_http_response.rs"
+
+[[bin]]
+name = "cas_cold"
+path = "targets/cas_cold.rs"
+
+[[bin]]
+name = "cas_entry"
+path = "targets/cas_entry.rs"
+
+[[bin]]
+name = "cas_head"
+path = "targets/cas_head.rs"
+
+[[bin]]
+name = "cas_index"
+path = "targets/cas_index.rs"
+
+[[bin]]
+name = "cas_pack"
+path = "targets/cas_pack.rs"
+
+[[bin]]
+name = "cas_remote"
+path = "targets/cas_remote.rs"
+
+[[bin]]
+name = "codegen_blob"
+path = "targets/codegen_blob.rs"
+
+[[bin]]
+name = "hir_body"
+path = "targets/hir_body.rs"
+
+[[bin]]
+name = "hir_body_source_map"
+path = "targets/hir_body_source_map.rs"
+
+[[bin]]
+name = "hir_expr_store"
+path = "targets/hir_expr_store.rs"
+
+[[bin]]
+name = "hir_item_tree"
+path = "targets/hir_item_tree.rs"
+
+[[bin]]
+name = "hir_store_source_map"
+path = "targets/hir_store_source_map.rs"
+
+[[bin]]
+name = "intern_table"
+path = "targets/intern_table.rs"
+
+[[bin]]
+name = "link_coff_archive"
+path = "targets/link_coff_archive.rs"
+
+[[bin]]
+name = "link_coff_import"
+path = "targets/link_coff_import.rs"
+
+[[bin]]
+name = "link_coff_object"
+path = "targets/link_coff_object.rs"
+
+[[bin]]
+name = "link_elf_archive"
+path = "targets/link_elf_archive.rs"
+
+[[bin]]
+name = "link_elf_object"
+path = "targets/link_elf_object.rs"
+
+[[bin]]
+name = "link_elf_shared"
+path = "targets/link_elf_shared.rs"
+
+[[bin]]
+name = "link_macho_archive"
+path = "targets/link_macho_archive.rs"
+
+[[bin]]
+name = "link_macho_dylib"
+path = "targets/link_macho_dylib.rs"
+
+[[bin]]
+name = "link_macho_object"
+path = "targets/link_macho_object.rs"
+
+[[bin]]
+name = "link_macho_tbd"
+path = "targets/link_macho_tbd.rs"
+
+[[bin]]
+name = "link_macho_trie"
+path = "targets/link_macho_trie.rs"
+
+[[bin]]
+name = "link_wasm_archive"
+path = "targets/link_wasm_archive.rs"
+
+[[bin]]
+name = "link_wasm_object"
+path = "targets/link_wasm_object.rs"
+
+[[bin]]
+name = "live_message"
+path = "targets/live_message.rs"
+
+[[bin]]
+name = "proc_macro_tt_wire"
+path = "targets/proc_macro_tt_wire.rs"
+
+[[bin]]
+name = "syntax_parse"
+path = "targets/syntax_parse.rs"
+
+[[bin]]
+name = "syntax_reparse"
+path = "targets/syntax_reparse.rs"
+
+[[bin]]
+name = "usercode_index_shape"
+path = "targets/usercode_index_shape.rs"
+
+[[bin]]
+name = "usercode_run_value"
+path = "targets/usercode_run_value.rs"
+
+[[bin]]
+name = "usercode_script_elide"
+path = "targets/usercode_script_elide.rs"
+
+[[bin]]
+name = "usercode_script_output"
+path = "targets/usercode_script_output.rs"
+
+[[bin]]
+name = "usercode_script_verify"
+path = "targets/usercode_script_verify.rs"
+
+[[bin]]
+name = "usercode_trace_record"
+path = "targets/usercode_trace_record.rs"
+
+[[bin]]
+name = "usercode_trace_report"
+path = "targets/usercode_trace_report.rs"
+
+[[bin]]
+name = "usercode_wire"
+path = "targets/usercode_wire.rs"
+
+[[bin]]
+name = "vfs_image"
+path = "targets/vfs_image.rs"
+
+[[bin]]
+name = "vfs_journal_bytes"
+path = "targets/vfs_journal_bytes.rs"
+
+[[bin]]
+name = "vfs_journal_model"
+path = "targets/vfs_journal_model.rs"
+
+[[bin]]
+name = "vfs_journal_records"
+path = "targets/vfs_journal_records.rs"
+
+[dependencies]
+base-db.workspace = true
+# The global allocator of every target, whose counts `blaze_fuzz::largest_allocation` reads.
+blaze-alloc-count.workspace = true
+blaze-api.workspace = true
+blaze-build-script.workspace = true
+blaze-cas.workspace = true
+blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-fuzz.workspace = true
+blaze-ids.workspace = true
+# `Builder`, which `Vfs::write_image` writes into, and `Image`, which `vfs_image` reopens.
+blaze-image.workspace = true
+# `fuzz_read` and the reference readers the link targets call.
+blaze-link = { workspace = true, features = ["fuzz"] }
+blaze-live.workspace = true
+blaze-mem.workspace = true
+# `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.
+blaze-protocol = { workspace = true, features = ["reference"] }
+blaze-query.workspace = true
+blaze-usercode.workspace = true
+blaze-vfs.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+# `intern::fuzz`, a table section restored into a fresh table and the writer of one, which `intern_table` runs.
+intern = { workspace = true, features = ["fuzz"] }
+# The object-file targets build their seeds with `object::write`.
+object = { workspace = true, features = ["write"] }
+# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone.
+parser = { workspace = true, features = ["fuzz"] }
+serde = { workspace = true, features = ["derive"] }
+span.workspace = true
+syntax.workspace = true
+tt.workspace = true
+
+[lints]
+workspace = true

@@ -1,7 +1,6 @@
 # bun (oven-sh/bun 1.4.3, its Rust port: 1.25M lines in 103 crates) built through blaze on each
-# platform's dedicated benchmark machine, nightly: the edits of harness/bench.py and the runtime
-# of harness/runbench.py, stored as docs/benchmarks/bun-<platform>.json and
-# runtime-bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
+# platform's dedicated benchmark machine, nightly: the edits of harness/bench.py, stored as
+# docs/benchmarks/bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
 # in the tables and charts of docs/benchmarks.md, which benchreport.py writes again from every stored result
 # (docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
 # (harness/benchplatforms.py, BENCH_RUNNERS); one whose runner is not registered is skipped and
@@ -89,12 +88,6 @@ jobs:
           nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py bun \
             --runs 3 --work "$work" --reference "$BENCH_HOME/reference-bun" --out "$RUNNER_TEMP/results/bench-bun.json" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
-      - name: Runtime bench
-        continue-on-error: true
-        run: |
-          export BLAZE_BIN="$BENCH_HOME/target-llvm/release/blaze-engine" APPS_DIR="$BENCH_HOME/apps"
-          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py --runtime bun \
-            --runs 5 --out "$RUNNER_TEMP/results/runtime-bun.json"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -125,7 +118,7 @@ jobs:
           path: ${{ runner.temp }}/results
       - name: README
         run: |
-          for result in "$RUNNER_TEMP"/results/bench-bun-*/bench-bun.json "$RUNNER_TEMP"/results/bench-bun-*/runtime-bun.json; do
+          for result in "$RUNNER_TEMP"/results/bench-bun-*/bench-bun.json; do
             [ -f "$result" ] || continue
             python3 harness/benchreport.py "$result" --name bun ${{ inputs.force && '--force' || '' }} \
               || echo "::warning::$result was not published"

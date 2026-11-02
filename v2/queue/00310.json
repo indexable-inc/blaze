@@ -1,0 +1,40 @@
+{
+  "id": "00310",
+  "from_lane": "dedup",
+  "owner": "frontend-db",
+  "paths": [
+    "crates/blaze-format/src/cursor.rs",
+    "docs/v2/plan/lanes/dedup/cursor.md",
+    "crates/base-db/Cargo.toml",
+    "crates/base-db/src/content.rs",
+    "crates/base-db/src/files.rs",
+    "crates/base-db"
+  ],
+  "what": "## dedup: byte cursor onto blaze_format::cursor\n\nFrom `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is\n`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). Two copies of\n`Put::put_bytes_u64` (a `u64` length, then the bytes) in base-db's hash inputs. Same bytes\nwritten, so every content ID stays what it is.\n\n- `crates/base-db/Cargo.toml` `[dependencies]`, under `# local deps` beside `blaze-ids`:\n  `blaze-format.workspace = true`. No cycle: `blaze-format` depends on `blaze-ids`, `serde`,\n  `zstd` only, and is already in every build of base-db's dependents through `hir-def`.\n- `crates/base-db/src/content.rs`: add `use blaze_format::cursor::Put;`; delete `fn frame`; its\n  three calls in `cfg_options_content` become `bytes.put_bytes_u64(name.as_str().as_bytes());`,\n  `bytes.put_bytes_u64(key.as_str().as_bytes());`, `bytes.put_bytes_u64(value.as_str().as_bytes());`,\n  and the one in `opt_bytes` becomes `out.put_bytes_u64(part.as_bytes());`.\n- `crates/base-db/src/files.rs`, `fn bucket_bytes`: add `use blaze_format::cursor::Put;`; the body\n  becomes\n  ```rust\n          let files = &self.buckets[bucket];\n          out.put_u64(files.len() as u64);\n          for (key, content) in files {\n              out.put_bytes_u64(key);\n              out.put_bytes(&content.0);\n          }\n  ```\n\nNot cursors, left: `named.rs`, `input.rs`, `lib.rs` feed a `Hasher` directly; `reparse.rs`'s\n`lane` reads a fixed 8-byte lane of a block.\n\n> applied by frontend-db-basereq (10-29) as written: `blaze-format.workspace = true` in\n> base-db's `[dependencies]`; `content.rs` has no `fn frame`, its four calls are `put_bytes_u64`;\n> `files.rs` `bucket_bytes` writes through `Put`. Same bytes (`put_bytes_u64` is the `u64` LE\n> length, then the bytes). Note for mem-db-def's B1: it makes `content::frame` and `opt_bytes`\n> generic over `A: Allocator`; `frame` is gone now, and `Put` is implemented for `Vec<u8>` only,\n> so B1's `opt_bytes<A>` needs `Put for Vec<u8, A>` from lane format, or it keeps\n> `extend_from_slice` there.\n> forwarded to frontend-db (parent of frontend-db-base, which holds `crates/base-db/`; its window is gone) (requests, pass 18; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:20:40Z",
+  "updated": "2026-10-30T08:55:30Z",
+  "taken_by": "unify-front-def",
+  "why": null,
+  "source": "v2/requests/frontend-db-base.md#dedup: byte cursor onto blaze_format::cursor",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-db-base.md:673"
+    },
+    {
+      "at": "2026-10-30T08:55:30Z",
+      "by": "unify-front-def",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:55:30Z",
+      "by": "unify-front-def",
+      "action": "done",
+      "note": "already applied by frontend-db-basereq: base-db/Cargo.toml:30 blaze-format; content.rs:9,44-49,94 put_bytes_u64; files.rs:21,1220-1233 Put. Checked by unify-front-def."
+    }
+  ]
+}

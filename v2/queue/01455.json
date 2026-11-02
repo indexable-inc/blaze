@@ -1,0 +1,36 @@
+{
+  "id": "01455",
+  "from_lane": "coordinator",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/stdlib",
+    "crates/blaze-cargo/src/serve"
+  ],
+  "what": "Repro #6 (/tmp/blaze-lanes/v2-repro.md): a second workspace on one live daemon rebuilds std from scratch (133 s). std artifacts must key on toolchain + target + profile + std features only (and the std sources and flags those imply), never on the workspace, so they are shared across workspaces and across BLAZE_HOMEs on one machine. Test, named for the property: a second workspace on the same daemon compiles no std crate. Keep every key input that changes the output (a cache key that misses an input is a bug); drop only the workspace-specific ones. Blocks the self-build loop speed.",
+  "state": "applied",
+  "created": "2026-11-01T04:10:11Z",
+  "updated": "2026-11-01T05:51:49Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T04:10:11Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T04:10:19Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T05:51:49Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "green in round 24 (9661f55b99): blaze_cargo 384/0, blaze_units 148/0, blaze_lower all passing"
+    }
+  ]
+}

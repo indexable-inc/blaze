@@ -1,0 +1,49 @@
+[package]
+name = "hir-firewall"
+description = "A body edit touches only its own function: edits one function body at a time and checks that the queries executed again and the code compiled again are that function's"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-query.workspace = true
+
+base-db.workspace = true
+blaze-codegen.workspace = true
+blaze-ids.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+hir-ty-codegen.workspace = true
+hir-ty-share.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-macro-eval.workspace = true
+blaze-query.workspace = true
+blaze-units.workspace = true
+blaze-vfs.workspace = true
+hegeltest.workspace = true
+blaze-lower.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+# One fixture crate of many bodies, one body edited at a time: the time to check the crate
+# again against the bound (docs/v2/plan/lanes/firewall/speed-of-light.md); prints a verdict.
+[[bench]]
+name = "edit"
+harness = false
+
+[lints]
+workspace = true

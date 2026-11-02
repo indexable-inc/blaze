@@ -1,0 +1,633 @@
+FileId(EditionedFileId(Id(#0))) 0..46 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 47..117 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 119..621 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 135..178 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 161..164 resolve_type: Some(Type { owner: GenericDefId(AdtId(StructId(StructId(#0)))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 161..164 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 161..164 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 161..164 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 173..176 resolve_type: Some(Type { owner: GenericDefId(AdtId(StructId(StructId(#0)))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 173..176 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 173..176 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 173..176 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 183..217 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 203..206 resolve_type: Some(Type { owner: GenericDefId(AdtId(StructId(StructId(#1)))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 203..206 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 203..206 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 203..206 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 212..215 resolve_type: Some(Type { owner: GenericDefId(AdtId(StructId(StructId(#1)))), ty: EarlyBinder { value: i64, .. } })
+FileId(EditionedFileId(Id(#0))) 212..215 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Int(I64) })))
+FileId(EditionedFileId(Id(#0))) 212..215 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Int(I64) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 212..215 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Int(I64) })))
+FileId(EditionedFileId(Id(#0))) 222..295 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 243..248 resolve_type: Some(Type { owner: GenericDefId(AdtId(EnumId(EnumId(#0)))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 243..248 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 243..248 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 243..248 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 264..269 resolve_type: Some(Type { owner: GenericDefId(AdtId(EnumId(EnumId(#0)))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 264..269 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 264..269 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 264..269 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 275..280 resolve_type: Some(Type { owner: GenericDefId(AdtId(EnumId(EnumId(#0)))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 275..280 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 275..280 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 275..280 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 292..293 type_of_expr: Some((Type { owner: GenericDefId(AdtId(EnumId(EnumId(#0)))), ty: EarlyBinder { value: isize, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 292..293 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 300..341 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 324..327 resolve_type: Some(Type { owner: GenericDefId(AdtId(UnionId(UnionId(#0)))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 324..327 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 324..327 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 324..327 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 336..339 resolve_type: Some(Type { owner: GenericDefId(AdtId(UnionId(UnionId(#0)))), ty: EarlyBinder { value: f32, .. } })
+FileId(EditionedFileId(Id(#0))) 336..339 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Float(F32) })))
+FileId(EditionedFileId(Id(#0))) 336..339 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Float(F32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 336..339 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Float(F32) })))
+FileId(EditionedFileId(Id(#0))) 346..415 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 363..380 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 376..379 resolve_type: Some(Type { owner: GenericDefId(ConstId(ConstId(#0))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 376..379 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 376..379 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 376..379 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 381..390 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 391..413 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 409..412 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#0))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 409..412 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 409..412 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 409..412 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 420..551 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 425..429 resolve_type: Some(Type { owner: GenericDefId(ImplId(ImplId(#0))), ty: EarlyBinder { value: dyn [Binder { value: Trait(ExistentialTraitRef("Area"[[]])), bound_vars: [] }] + 'static, .. } })
+FileId(EditionedFileId(Id(#0))) 425..429 resolve_path: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 425..429 resolve_path_per_ns: Some((Some(Def(Trait(Trait { id: TraitId(#0) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 425..429 speculative_resolve_view: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 434..439 resolve_type: Some(Type { owner: GenericDefId(ImplId(ImplId(#0))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 434..439 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 434..439 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 434..439 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 450..471 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 463..466 resolve_type: Some(Type { owner: GenericDefId(ConstId(ConstId(#1))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 463..466 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 463..466 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 463..466 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 469..470 type_of_expr: Some((Type { owner: GenericDefId(ConstId(ConstId(#1))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 469..470 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 480..495 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 491..494 resolve_type: Some(Type { owner: GenericDefId(TypeAliasId(TypeAliasId(#0))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 491..494 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 491..494 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 491..494 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 504..545 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 522..525 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 522..525 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 522..525 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 522..525 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 526..545 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 526..545 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 528..543 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 528..543 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 528..534 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 528..534 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 528..534 resolve_field: Some(Left(Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(0) }))
+FileId(EditionedFileId(Id(#0))) 528..532 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: &'{region error} Point, .. } }, Some(Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: Point, .. } })))
+FileId(EditionedFileId(Id(#0))) 528..532 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 528..532 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#1))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#1))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 528..532 resolve_path_per_ns: Some((Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } }))), Some(Local(Local { parent: Body(FunctionId(FunctionId(#1))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#1))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 528..532 speculative_resolve_view: Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } })))
+FileId(EditionedFileId(Id(#0))) 537..543 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 537..543 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 537..543 resolve_field: Some(Left(Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(1) }))
+FileId(EditionedFileId(Id(#0))) 537..541 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: &'{region error} Point, .. } }, Some(Type { owner: GenericDefId(FunctionId(FunctionId(#1))), ty: EarlyBinder { value: Point, .. } })))
+FileId(EditionedFileId(Id(#0))) 537..541 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 537..541 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#1))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#1))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 537..541 resolve_path_per_ns: Some((Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } }))), Some(Local(Local { parent: Body(FunctionId(FunctionId(#1))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#1))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 537..541 speculative_resolve_view: Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } })))
+FileId(EditionedFileId(Id(#0))) 556..619 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 561..566 resolve_type: Some(Type { owner: GenericDefId(ImplId(ImplId(#1))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 561..566 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 561..566 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 561..566 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 569..617 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 580..581 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 580..581 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 580..581 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 583..586 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 583..586 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 583..586 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 583..586 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 591..595 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 591..595 resolve_path: Some(SelfType(Impl { id: ImplId(ImplId(#1)) }))
+FileId(EditionedFileId(Id(#0))) 591..595 resolve_path_per_ns: Some((Some(SelfType(Impl { id: ImplId(ImplId(#1)) })), Some(SelfType(Impl { id: ImplId(ImplId(#1)) })), None))
+FileId(EditionedFileId(Id(#0))) 591..595 speculative_resolve_view: Some(SelfType(Impl { id: ImplId(ImplId(#1)) }))
+FileId(EditionedFileId(Id(#0))) 596..617 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 596..617 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 598..615 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 598..615 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 598..615 resolve_variant: Some(Struct(Struct { id: StructId(#0) }))
+FileId(EditionedFileId(Id(#0))) 598..603 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 598..603 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 598..603 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 606..607 resolve_record_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(0) }, Some(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) }), Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 606..607 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 606..607 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 606..607 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 606..607 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 606..607 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 609..613 resolve_record_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(1) }, None, Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 612..613 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#2))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 612..613 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 612..613 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 612..613 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 612..613 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#2))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#2))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 623..661 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 627..632 resolve_path: Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } })))
+FileId(EditionedFileId(Id(#0))) 627..632 resolve_path_per_ns: Some((Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } }))), None, None))
+FileId(EditionedFileId(Id(#0))) 627..632 speculative_resolve_view: Some(Def(Module(Module { id: ModuleIdLt { [id]: Id(#1) } })))
+FileId(EditionedFileId(Id(#0))) 635..639 resolve_path: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 635..639 resolve_path_per_ns: Some((Some(Def(Trait(Trait { id: TraitId(#0) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 635..639 speculative_resolve_view: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 641..645 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 641..645 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), None))
+FileId(EditionedFileId(Id(#0))) 641..645 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 647..652 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 647..652 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 647..652 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 654..659 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 654..659 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 654..659 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 663..686 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 676..681 resolve_type: Some(Type { owner: GenericDefId(ConstId(ConstId(#2))), ty: EarlyBinder { value: usize, .. } })
+FileId(EditionedFileId(Id(#0))) 676..681 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 676..681 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 676..681 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 684..685 type_of_expr: Some((Type { owner: GenericDefId(ConstId(ConstId(#2))), ty: EarlyBinder { value: usize, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 684..685 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 687..711 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 700..704 resolve_type: Some(Type { owner: GenericDefId(StaticId(StaticId(#0))), ty: EarlyBinder { value: &'static str, .. } })
+FileId(EditionedFileId(Id(#0))) 701..704 resolve_type: Some(Type { owner: GenericDefId(StaticId(StaticId(#0))), ty: EarlyBinder { value: str, .. } })
+FileId(EditionedFileId(Id(#0))) 701..704 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Str })))
+FileId(EditionedFileId(Id(#0))) 701..704 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Str }))), None, None))
+FileId(EditionedFileId(Id(#0))) 701..704 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Str })))
+FileId(EditionedFileId(Id(#0))) 707..710 type_of_expr: Some((Type { owner: GenericDefId(StaticId(StaticId(#0))), ty: EarlyBinder { value: &'static str, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 707..710 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 712..759 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 723..725 resolve_lifetime_param: Some(LifetimeParam { id: LifetimeParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<LifetimeParamData>(0) } })
+FileId(EditionedFileId(Id(#0))) 723..725 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 739..744 resolve_type: Some(Type { owner: GenericDefId(TypeAliasId(TypeAliasId(#1))), ty: EarlyBinder { value: usize, .. } })
+FileId(EditionedFileId(Id(#0))) 739..744 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 739..744 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 739..744 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 748..758 resolve_type: Some(Type { owner: GenericDefId(TypeAliasId(TypeAliasId(#1))), ty: EarlyBinder { value: &#0 [#1; #2], .. } })
+FileId(EditionedFileId(Id(#0))) 749..751 resolve_lifetime_param: Some(LifetimeParam { id: LifetimeParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<LifetimeParamData>(0) } })
+FileId(EditionedFileId(Id(#0))) 749..751 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 752..758 resolve_type: Some(Type { owner: GenericDefId(TypeAliasId(TypeAliasId(#1))), ty: EarlyBinder { value: [#1; #2], .. } })
+FileId(EditionedFileId(Id(#0))) 753..754 resolve_type: Some(Type { owner: GenericDefId(TypeAliasId(TypeAliasId(#1))), ty: EarlyBinder { value: #1, .. } })
+FileId(EditionedFileId(Id(#0))) 753..754 resolve_path: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 753..754 resolve_path_per_ns: Some((Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(0) }) })), None, None))
+FileId(EditionedFileId(Id(#0))) 753..754 speculative_resolve_view: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 756..757 type_of_expr: None
+FileId(EditionedFileId(Id(#0))) 756..757 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 756..757 resolve_path: Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(1) }) }))
+FileId(EditionedFileId(Id(#0))) 756..757 resolve_path_per_ns: Some((None, Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(1) }) })), None))
+FileId(EditionedFileId(Id(#0))) 756..757 speculative_resolve_view: Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: TypeAliasId(TypeAliasId(#1)), local_id: Idx::<TypeOrConstParamData>(1) }) }))
+FileId(EditionedFileId(Id(#0))) 761..776 resolve_macro_call: Some(Macro { id: MacroRulesId(MacroRulesId(#0)) })
+FileId(EditionedFileId(Id(#0))) 761..776 resolve_macro_call_arm: Some(0)
+FileId(EditionedFileId(Id(#0))) 761..776 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 761..768 resolve_path: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#0)) })))
+FileId(EditionedFileId(Id(#0))) 761..768 resolve_path_per_ns: Some((None, None, Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#0)) })))))
+FileId(EditionedFileId(Id(#0))) 761..768 speculative_resolve_view: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#0)) })))
+FileId(EditionedFileId(Id(#0))) 778..865 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 789..791 resolve_lifetime_param: Some(LifetimeParam { id: LifetimeParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<LifetimeParamData>(0) } })
+FileId(EditionedFileId(Id(#0))) 789..791 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 796..800 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: {type error}, .. } })
+FileId(EditionedFileId(Id(#0))) 796..800 resolve_path: None
+FileId(EditionedFileId(Id(#0))) 796..800 resolve_path_per_ns: Some((None, None, None))
+FileId(EditionedFileId(Id(#0))) 796..800 speculative_resolve_view: None
+FileId(EditionedFileId(Id(#0))) 811..816 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: usize, .. } })
+FileId(EditionedFileId(Id(#0))) 811..816 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 811..816 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 811..816 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 818..820 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: &ReLateParam(FunctionId("generic"), 0.Named(FunctionId("generic"))) [#0; #1], .. } }, None))
+FileId(EditionedFileId(Id(#0))) 818..820 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: &ReLateParam(FunctionId("generic"), 0.Named(FunctionId("generic"))) [#0; #1], .. } })
+FileId(EditionedFileId(Id(#0))) 818..820 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 822..832 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: &ReLateParam(FunctionId("generic"), 0.Named(FunctionId("generic"))) [#0; #1], .. } })
+FileId(EditionedFileId(Id(#0))) 823..825 resolve_lifetime_param: Some(LifetimeParam { id: LifetimeParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<LifetimeParamData>(0) } })
+FileId(EditionedFileId(Id(#0))) 823..825 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 826..832 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: [#0; #1], .. } })
+FileId(EditionedFileId(Id(#0))) 827..828 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: #0, .. } })
+FileId(EditionedFileId(Id(#0))) 827..828 resolve_path: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 827..828 resolve_path_per_ns: Some((Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) })), None, None))
+FileId(EditionedFileId(Id(#0))) 827..828 speculative_resolve_view: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 830..831 type_of_expr: None
+FileId(EditionedFileId(Id(#0))) 830..831 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 830..831 resolve_path: Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(1) }) }))
+FileId(EditionedFileId(Id(#0))) 830..831 resolve_path_per_ns: Some((None, Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(1) }) })), None))
+FileId(EditionedFileId(Id(#0))) 830..831 speculative_resolve_view: Some(ConstParam(ConstParam { id: ConstParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(1) }) }))
+FileId(EditionedFileId(Id(#0))) 837..850 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: {type error}, .. } })
+FileId(EditionedFileId(Id(#0))) 837..850 resolve_path: None
+FileId(EditionedFileId(Id(#0))) 837..850 resolve_path_per_ns: Some((None, None, None))
+FileId(EditionedFileId(Id(#0))) 837..850 speculative_resolve_view: None
+FileId(EditionedFileId(Id(#0))) 844..849 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: &ReLateParam(FunctionId("generic"), 0.Named(FunctionId("generic"))) #0, .. } })
+FileId(EditionedFileId(Id(#0))) 845..847 resolve_lifetime_param: Some(LifetimeParam { id: LifetimeParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<LifetimeParamData>(0) } })
+FileId(EditionedFileId(Id(#0))) 845..847 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 848..849 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: #0, .. } })
+FileId(EditionedFileId(Id(#0))) 848..849 resolve_path: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 848..849 resolve_path_per_ns: Some((Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) })), None, None))
+FileId(EditionedFileId(Id(#0))) 848..849 speculative_resolve_view: Some(TypeParam(TypeParam { id: TypeParamId(TypeOrConstParamId { parent: FunctionId(FunctionId(#3)), local_id: Idx::<TypeOrConstParamData>(0) }) }))
+FileId(EditionedFileId(Id(#0))) 851..865 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 851..865 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 853..863 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 853..863 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 853..863 resolve_method_call: None
+FileId(EditionedFileId(Id(#0))) 853..863 resolve_method_call_as_callable: None
+FileId(EditionedFileId(Id(#0))) 853..855 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#3))), ty: EarlyBinder { value: &ReLateParam(FunctionId("generic"), 0.Named(FunctionId("generic"))) [#0; #1], .. } }, None))
+FileId(EditionedFileId(Id(#0))) 853..855 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 853..855 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#3))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#3))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 853..855 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#3))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#3))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 853..855 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#3))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#3))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 867..905 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 882..887 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 882..887 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 882..887 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 882..887 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 888..905 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 888..905 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 890..903 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 890..903 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 890..900 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: FnDef(FunctionId(FunctionId(#2)), Binder { value: [], bound_vars: [] }), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 890..900 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 890..900 resolve_path: Some(Def(Function(FunctionId(FunctionId(#2)))))
+FileId(EditionedFileId(Id(#0))) 890..900 resolve_path_per_ns: Some((None, None, None))
+FileId(EditionedFileId(Id(#0))) 890..900 speculative_resolve_view: None
+FileId(EditionedFileId(Id(#0))) 890..895 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 890..895 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 890..895 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 901..902 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#4))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 901..902 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 907..1537 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 917..1537 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: (), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 917..1537 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 923..948 type_of_expr: None
+FileId(EditionedFileId(Id(#0))) 923..948 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 923..948 resolve_macro_call: Some(Macro { id: MacroRulesId(MacroRulesId(#1)) })
+FileId(EditionedFileId(Id(#0))) 923..948 resolve_macro_call_arm: Some(0)
+FileId(EditionedFileId(Id(#0))) 923..948 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 923..925 resolve_path: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))
+FileId(EditionedFileId(Id(#0))) 923..925 resolve_path_per_ns: Some((None, None, Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))))
+FileId(EditionedFileId(Id(#0))) 923..925 speculative_resolve_view: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))
+FileId(EditionedFileId(Id(#0))) 957..958 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 957..958 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 957..958 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 961..981 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 961..981 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 961..981 resolve_variant: Some(Struct(Struct { id: StructId(#0) }))
+FileId(EditionedFileId(Id(#0))) 961..966 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 961..966 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 961..966 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 969..973 resolve_record_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(0) }, None, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 972..973 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 972..973 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 975..979 resolve_record_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(1) }, None, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 978..979 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 978..979 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 991..1010 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 991..996 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 991..996 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 991..996 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 999..1000 resolve_record_pat_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(0) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 999..1000 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 999..1000 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 999..1000 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1002..1008 resolve_record_pat_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(1) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 1005..1008 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1005..1008 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1005..1008 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1013..1014 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1013..1014 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1013..1014 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1013..1014 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) })), None))
+FileId(EditionedFileId(Id(#0))) 1013..1014 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1024..1028 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1024..1028 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } })
+FileId(EditionedFileId(Id(#0))) 1024..1028 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1031..1041 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1031..1041 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1031..1035 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: FnDef(StructId(StructId(#1)), Binder { value: [], bound_vars: [] }), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1031..1035 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } })
+FileId(EditionedFileId(Id(#0))) 1031..1035 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 1031..1035 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), None))
+FileId(EditionedFileId(Id(#0))) 1031..1035 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 1036..1037 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1036..1037 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1039..1040 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: i64, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1039..1040 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1051..1065 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1051..1065 resolve_tuple_struct_pat_fields: Some([(Field { parent: Struct(Struct { id: StructId(#1) }), id: Idx::<FieldData>(0) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }), (Field { parent: Struct(Struct { id: StructId(#1) }), id: Idx::<FieldData>(1) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: i64, .. } })])
+FileId(EditionedFileId(Id(#0))) 1051..1055 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 1051..1055 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), Some(Def(Adt(Struct(Struct { id: StructId(#1) })))), None))
+FileId(EditionedFileId(Id(#0))) 1051..1055 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#1) }))))
+FileId(EditionedFileId(Id(#0))) 1056..1061 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1056..1061 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1056..1061 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1063..1064 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: i64, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1068..1072 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1068..1072 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1068..1072 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) }))
+FileId(EditionedFileId(Id(#0))) 1068..1072 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) })), None))
+FileId(EditionedFileId(Id(#0))) 1068..1072 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) }))
+FileId(EditionedFileId(Id(#0))) 1082..1086 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1082..1086 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1082..1086 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1089..1140 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1140 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1131 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1131 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1115 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1115 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1107 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1107 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1101 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1101 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1097 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1089..1097 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1097 resolve_method_call: Some(FunctionId(FunctionId(#1)))
+FileId(EditionedFileId(Id(#0))) 1089..1097 resolve_method_call_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1089..1090 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: &'{region error} Point, .. } })))
+FileId(EditionedFileId(Id(#0))) 1089..1090 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1089..1090 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 1089..1090 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 1089..1090 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 1100..1101 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1100..1101 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1100..1101 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(2) }))
+FileId(EditionedFileId(Id(#0))) 1100..1101 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(2) })), None))
+FileId(EditionedFileId(Id(#0))) 1100..1101 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(2) }))
+FileId(EditionedFileId(Id(#0))) 1104..1107 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1104..1107 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1104..1107 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(3) }))
+FileId(EditionedFileId(Id(#0))) 1104..1107 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(3) })), None))
+FileId(EditionedFileId(Id(#0))) 1104..1107 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(3) }))
+FileId(EditionedFileId(Id(#0))) 1110..1115 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1110..1115 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1110..1115 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(5) }))
+FileId(EditionedFileId(Id(#0))) 1110..1115 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(5) })), None))
+FileId(EditionedFileId(Id(#0))) 1110..1115 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(5) }))
+FileId(EditionedFileId(Id(#0))) 1118..1131 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1118..1131 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1118..1124 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1118..1124 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1118..1124 resolve_field: Some(Left(Field { parent: Struct(Struct { id: StructId(#1) }), id: Idx::<FieldData>(0) }))
+FileId(EditionedFileId(Id(#0))) 1118..1122 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Pair, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1118..1122 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1118..1122 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) }))
+FileId(EditionedFileId(Id(#0))) 1118..1122 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) })), None))
+FileId(EditionedFileId(Id(#0))) 1118..1122 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(4) }))
+FileId(EditionedFileId(Id(#0))) 1128..1131 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1128..1131 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1128..1131 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1128..1131 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1134..1140 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1134..1140 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1134..1138 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: FnDef(FunctionId(FunctionId(#6)), Binder { value: [], bound_vars: [] }), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1134..1138 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1134..1138 resolve_path: Some(Def(Function(FunctionId(FunctionId(#6)))))
+FileId(EditionedFileId(Id(#0))) 1134..1138 resolve_path_per_ns: Some((None, Some(Def(Function(FunctionId(FunctionId(#6))))), None))
+FileId(EditionedFileId(Id(#0))) 1134..1138 speculative_resolve_view: Some(Def(Function(FunctionId(FunctionId(#6)))))
+FileId(EditionedFileId(Id(#0))) 1150..1152 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1150..1152 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } })
+FileId(EditionedFileId(Id(#0))) 1150..1152 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1155..1168 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1155..1168 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1155..1165 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: FnDef(EnumVariantId(EnumVariantId(#0)), Binder { value: [], bound_vars: [] }), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1155..1165 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } })
+FileId(EditionedFileId(Id(#0))) 1155..1165 resolve_path: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1155..1165 resolve_path_per_ns: Some((Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) }))), Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) }))), None))
+FileId(EditionedFileId(Id(#0))) 1155..1165 speculative_resolve_view: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1155..1160 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1155..1160 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1155..1160 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1166..1167 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1166..1167 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1166..1167 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 1166..1167 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) })), None))
+FileId(EditionedFileId(Id(#0))) 1166..1167 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(0) }))
+FileId(EditionedFileId(Id(#0))) 1178..1180 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1178..1180 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } })
+FileId(EditionedFileId(Id(#0))) 1178..1180 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1183..1213 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1183..1213 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1183..1213 resolve_variant: Some(EnumVariant(EnumVariant { id: EnumVariantId(#1) }))
+FileId(EditionedFileId(Id(#0))) 1183..1194 resolve_path: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) })))
+FileId(EditionedFileId(Id(#0))) 1183..1194 resolve_path_per_ns: Some((Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1183..1194 speculative_resolve_view: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) })))
+FileId(EditionedFileId(Id(#0))) 1183..1188 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1183..1188 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1183..1188 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1197..1204 resolve_record_field: Some((Field { parent: EnumVariant(EnumVariant { id: EnumVariantId(#1) }), id: Idx::<FieldData>(0) }, None, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }))
+FileId(EditionedFileId(Id(#0))) 1203..1204 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1203..1204 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1203..1204 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1203..1204 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) })), None))
+FileId(EditionedFileId(Id(#0))) 1203..1204 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1206..1211 resolve_record_field: Some((Field { parent: EnumVariant(EnumVariant { id: EnumVariantId(#1) }), id: Idx::<FieldData>(1) }, None, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }))
+FileId(EditionedFileId(Id(#0))) 1210..1211 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1210..1211 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1210..1211 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1210..1211 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) })), None))
+FileId(EditionedFileId(Id(#0))) 1210..1211 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(1) }))
+FileId(EditionedFileId(Id(#0))) 1223..1226 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: [u8; 4_usize], .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1223..1226 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: [u8; 4_usize], .. } })
+FileId(EditionedFileId(Id(#0))) 1223..1226 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1229..1241 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: [u8; 4_usize], .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1229..1241 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1230..1233 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u8, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1230..1233 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1235..1240 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: usize, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1235..1240 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1235..1240 resolve_path: Some(Def(Const(Const { id: ConstId(#2) })))
+FileId(EditionedFileId(Id(#0))) 1235..1240 resolve_path_per_ns: Some((None, Some(Def(Const(Const { id: ConstId(#2) }))), None))
+FileId(EditionedFileId(Id(#0))) 1235..1240 speculative_resolve_view: Some(Def(Const(Const { id: ConstId(#2) })))
+FileId(EditionedFileId(Id(#0))) 1251..1253 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1251..1253 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } })
+FileId(EditionedFileId(Id(#0))) 1251..1253 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1256..1269 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1256..1269 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1256..1263 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: FnDef(FunctionId(FunctionId(#3)), Binder { value: [u8, 4_usize], bound_vars: [] }), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1256..1263 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } })
+FileId(EditionedFileId(Id(#0))) 1256..1263 resolve_path: Some(Def(Function(FunctionId(FunctionId(#3)))))
+FileId(EditionedFileId(Id(#0))) 1256..1263 resolve_path_per_ns: Some((None, Some(Def(Function(FunctionId(FunctionId(#3))))), None))
+FileId(EditionedFileId(Id(#0))) 1256..1263 speculative_resolve_view: Some(Def(Function(FunctionId(FunctionId(#3)))))
+FileId(EditionedFileId(Id(#0))) 1264..1268 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: &'{region error} [u8; 4_usize], .. } }, Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: &'{region error} [u8; 4_usize], .. } })))
+FileId(EditionedFileId(Id(#0))) 1264..1268 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1265..1268 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: [u8; 4_usize], .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1265..1268 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1265..1268 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(9) }))
+FileId(EditionedFileId(Id(#0))) 1265..1268 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(9) })), None))
+FileId(EditionedFileId(Id(#0))) 1265..1268 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(9) }))
+FileId(EditionedFileId(Id(#0))) 1279..1282 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Closure(InternedClosureId(InternedClosureId(Id(#2))), [i8, Binder { value: extern "RustCall" fn((u32, u32)) -> u32, bound_vars: [] }, ()]), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1279..1282 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Closure(InternedClosureId(InternedClosureId(Id(#2))), [i8, Binder { value: extern "RustCall" fn((u32, u32)) -> u32, bound_vars: [] }, ()]), .. } })
+FileId(EditionedFileId(Id(#0))) 1279..1282 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1285..1307 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Closure(InternedClosureId(InternedClosureId(Id(#2))), [i8, Binder { value: extern "RustCall" fn((u32, u32)) -> u32, bound_vars: [] }, ()]), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1285..1307 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1286..1287 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1286..1287 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1286..1287 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1289..1292 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1289..1292 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1289..1292 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1289..1292 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1294..1295 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1294..1295 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1294..1295 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1297..1300 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1297..1300 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1297..1300 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1297..1300 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+FileId(EditionedFileId(Id(#0))) 1302..1307 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1302..1307 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1302..1303 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1302..1303 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1302..1303 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(12) }))
+FileId(EditionedFileId(Id(#0))) 1302..1303 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(12) })), None))
+FileId(EditionedFileId(Id(#0))) 1302..1303 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(12) }))
+FileId(EditionedFileId(Id(#0))) 1306..1307 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1306..1307 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1306..1307 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(13) }))
+FileId(EditionedFileId(Id(#0))) 1306..1307 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(13) })), None))
+FileId(EditionedFileId(Id(#0))) 1306..1307 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(13) }))
+FileId(EditionedFileId(Id(#0))) 1317..1319 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1317..1319 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1317..1319 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1322..1367 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1322..1367 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1322..1328 resolve_lifetime_param: None
+FileId(EditionedFileId(Id(#0))) 1322..1328 resolve_label: None
+FileId(EditionedFileId(Id(#0))) 1335..1367 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: !, .. } }, Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: (), .. } })))
+FileId(EditionedFileId(Id(#0))) 1335..1367 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1337..1364 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: !, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1337..1364 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1343..1349 resolve_lifetime_param: None
+FileId(EditionedFileId(Id(#0))) 1343..1349 resolve_label: Some(Label { parent: Body(FunctionId(FunctionId(#5))), label_id: Idx::<Label>(0) })
+FileId(EditionedFileId(Id(#0))) 1350..1364 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1350..1364 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1350..1353 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Closure(InternedClosureId(InternedClosureId(Id(#2))), [i8, Binder { value: extern "RustCall" fn((u32, u32)) -> u32, bound_vars: [] }, ()]), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1350..1353 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1350..1353 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(11) }))
+FileId(EditionedFileId(Id(#0))) 1350..1353 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(11) })), None))
+FileId(EditionedFileId(Id(#0))) 1350..1353 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(11) }))
+FileId(EditionedFileId(Id(#0))) 1354..1360 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1354..1360 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1354..1360 resolve_macro_call: Some(Macro { id: MacroRulesId(MacroRulesId(#1)) })
+FileId(EditionedFileId(Id(#0))) 1354..1360 resolve_macro_call_arm: Some(0)
+FileId(EditionedFileId(Id(#0))) 1354..1360 resolve_attr_macro_call: None
+FileId(EditionedFileId(Id(#0))) 1354..1356 resolve_path: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))
+FileId(EditionedFileId(Id(#0))) 1354..1356 resolve_path_per_ns: Some((None, None, Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))))
+FileId(EditionedFileId(Id(#0))) 1354..1356 speculative_resolve_view: Some(Def(Macro(Macro { id: MacroRulesId(MacroRulesId(#1)) })))
+FileId(EditionedFileId(Id(#0))) 1362..1363 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1362..1363 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1377..1379 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1377..1379 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } })
+FileId(EditionedFileId(Id(#0))) 1377..1379 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1382..1426 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1382..1426 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1382..1392 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: {type error}, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1382..1392 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1382..1392 resolve_method_call: None
+FileId(EditionedFileId(Id(#0))) 1382..1392 resolve_method_call_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1382..1386 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: &'static str, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1382..1386 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1382..1386 resolve_path: Some(Def(Static(Static { id: StaticId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1382..1386 resolve_path_per_ns: Some((None, Some(Def(Static(Static { id: StaticId(#0) }))), None))
+FileId(EditionedFileId(Id(#0))) 1382..1386 speculative_resolve_view: Some(Def(Static(Static { id: StaticId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1395..1426 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: usize, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1395..1426 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1395..1417 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1395..1417 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1395..1417 resolve_path: Some(Def(Const(Const { id: ConstId(#1) })))
+FileId(EditionedFileId(Id(#0))) 1395..1417 resolve_path_per_ns: Some((None, None, None))
+FileId(EditionedFileId(Id(#0))) 1395..1417 speculative_resolve_view: None
+FileId(EditionedFileId(Id(#0))) 1395..1410 resolve_path: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1395..1410 resolve_path_per_ns: Some((Some(Def(Trait(Trait { id: TraitId(#0) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1395..1410 speculative_resolve_view: None
+FileId(EditionedFileId(Id(#0))) 1396..1401 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } })
+FileId(EditionedFileId(Id(#0))) 1396..1401 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1396..1401 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1396..1401 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1405..1409 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: dyn [Binder { value: Trait(ExistentialTraitRef("Area"[[]])), bound_vars: [] }] + 'static, .. } })
+FileId(EditionedFileId(Id(#0))) 1405..1409 resolve_path: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1405..1409 resolve_path_per_ns: Some((Some(Def(Trait(Trait { id: TraitId(#0) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1405..1409 speculative_resolve_view: Some(Def(Trait(Trait { id: TraitId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1421..1426 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: usize, .. } })
+FileId(EditionedFileId(Id(#0))) 1421..1426 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 1421..1426 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1421..1426 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(Usize) })))
+FileId(EditionedFileId(Id(#0))) 1432..1535 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: (), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1432..1535 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1438..1440 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1438..1440 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1438..1440 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(7) }))
+FileId(EditionedFileId(Id(#0))) 1438..1440 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(7) })), None))
+FileId(EditionedFileId(Id(#0))) 1438..1440 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(7) }))
+FileId(EditionedFileId(Id(#0))) 1443..1474 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1443..1474 resolve_tuple_struct_pat_fields: Some([(Field { parent: EnumVariant(EnumVariant { id: EnumVariantId(#0) }), id: Idx::<FieldData>(0) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } })])
+FileId(EditionedFileId(Id(#0))) 1443..1453 resolve_path: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1443..1453 resolve_path_per_ns: Some((Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) }))), Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) }))), None))
+FileId(EditionedFileId(Id(#0))) 1443..1453 speculative_resolve_view: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#0) })))
+FileId(EditionedFileId(Id(#0))) 1443..1448 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1443..1448 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1443..1448 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1454..1473 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1454..1459 resolve_path: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1454..1459 resolve_path_per_ns: Some((Some(Def(Adt(Struct(Struct { id: StructId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1454..1459 speculative_resolve_view: Some(Def(Adt(Struct(Struct { id: StructId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1462..1467 resolve_record_pat_field: Some((Field { parent: Struct(Struct { id: StructId(#0) }), id: Idx::<FieldData>(0) }, Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }))
+FileId(EditionedFileId(Id(#0))) 1465..1467 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1465..1467 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } })
+FileId(EditionedFileId(Id(#0))) 1465..1467 resolve_bind_pat_to_const: None
+FileId(EditionedFileId(Id(#0))) 1469..1471 type_of_pat: None
+FileId(EditionedFileId(Id(#0))) 1478..1493 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: (), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1478..1493 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1484..1485 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1488..1490 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1488..1490 resolve_expr_as_callable: None
+FileId(EditionedFileId(Id(#0))) 1488..1490 resolve_path: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(16) }))
+FileId(EditionedFileId(Id(#0))) 1488..1490 resolve_path_per_ns: Some((None, Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(16) })), None))
+FileId(EditionedFileId(Id(#0))) 1488..1490 speculative_resolve_view: Some(Local(Local { parent: Body(FunctionId(FunctionId(#5))), parent_infer: DefWithBodyId(FunctionId(FunctionId(#5))), binding_id: Idx::<Binding>(16) }))
+FileId(EditionedFileId(Id(#0))) 1494..1527 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1494..1512 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1494..1505 resolve_path: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) })))
+FileId(EditionedFileId(Id(#0))) 1494..1505 resolve_path_per_ns: Some((Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) }))), None, None))
+FileId(EditionedFileId(Id(#0))) 1494..1505 speculative_resolve_view: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#1) })))
+FileId(EditionedFileId(Id(#0))) 1494..1499 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1494..1499 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1494..1499 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1508..1510 type_of_pat: None
+FileId(EditionedFileId(Id(#0))) 1515..1527 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Shape, .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1515..1527 resolve_path: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#2) })))
+FileId(EditionedFileId(Id(#0))) 1515..1527 resolve_path_per_ns: Some((Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#2) }))), Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#2) }))), None))
+FileId(EditionedFileId(Id(#0))) 1515..1527 speculative_resolve_view: Some(Def(EnumVariant(EnumVariant { id: EnumVariantId(#2) })))
+FileId(EditionedFileId(Id(#0))) 1515..1520 resolve_path: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1515..1520 resolve_path_per_ns: Some((Some(Def(Adt(Enum(Enum { id: EnumId(#0) })))), None, None))
+FileId(EditionedFileId(Id(#0))) 1515..1520 speculative_resolve_view: Some(Def(Adt(Enum(Enum { id: EnumId(#0) }))))
+FileId(EditionedFileId(Id(#0))) 1531..1533 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: (), .. } }, None))
+FileId(EditionedFileId(Id(#0))) 1531..1533 resolve_expr_as_callable: None
+MacroFile(MacroCallId(Id(#3))) 0..16 resolve_attr_macro_call: None
+MacroFile(MacroCallId(Id(#3))) 10..13 resolve_type: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#6))), ty: EarlyBinder { value: u32, .. } })
+MacroFile(MacroCallId(Id(#3))) 10..13 resolve_path: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+MacroFile(MacroCallId(Id(#3))) 10..13 resolve_path_per_ns: Some((Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) }))), None, None))
+MacroFile(MacroCallId(Id(#3))) 10..13 speculative_resolve_view: Some(Def(BuiltinType(BuiltinType { inner: Uint(U32) })))
+MacroFile(MacroCallId(Id(#3))) 13..16 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#6))), ty: EarlyBinder { value: u32, .. } }, None))
+MacroFile(MacroCallId(Id(#3))) 13..16 resolve_expr_as_callable: None
+MacroFile(MacroCallId(Id(#3))) 14..15 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#6))), ty: EarlyBinder { value: u32, .. } }, None))
+MacroFile(MacroCallId(Id(#3))) 14..15 resolve_expr_as_callable: None
+MacroFile(MacroCallId(Id(#4))) 3..4 type_of_pat: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+MacroFile(MacroCallId(Id(#4))) 3..4 type_of_binding_in_pat: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } })
+MacroFile(MacroCallId(Id(#4))) 3..4 resolve_bind_pat_to_const: None
+MacroFile(MacroCallId(Id(#4))) 5..13 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } }, None))
+MacroFile(MacroCallId(Id(#4))) 5..13 resolve_expr_as_callable: None
+MacroFile(MacroCallId(Id(#4))) 5..11 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: FnDef(FunctionId(FunctionId(#4)), Binder { value: [], bound_vars: [] }), .. } }, None))
+MacroFile(MacroCallId(Id(#4))) 5..11 resolve_expr_as_callable: Some(Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: Point, .. } })
+MacroFile(MacroCallId(Id(#4))) 5..11 resolve_path: Some(Def(Function(FunctionId(FunctionId(#4)))))
+MacroFile(MacroCallId(Id(#4))) 5..11 resolve_path_per_ns: Some((None, Some(Def(Function(FunctionId(FunctionId(#4))))), None))
+MacroFile(MacroCallId(Id(#4))) 5..11 speculative_resolve_view: Some(Def(Function(FunctionId(FunctionId(#4)))))
+MacroFile(MacroCallId(Id(#5))) 0..1 type_of_expr: Some((Type { owner: GenericDefId(FunctionId(FunctionId(#5))), ty: EarlyBinder { value: u32, .. } }, None))
+MacroFile(MacroCallId(Id(#5))) 0..1 resolve_expr_as_callable: None

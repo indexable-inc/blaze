@@ -1,0 +1,36 @@
+{
+  "id": "01038",
+  "from_lane": "fastcompile-wire",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/driver.rs",
+    "crates/blaze-codegen/src/driver/later.rs"
+  ],
+  "what": "## fastcompile-wire 1 (answers 00744): an owned lazy build, `Later<I, S>`, compiled per call against a front end the caller passes\n\nThe blaze-lazy side is written: `crates/blaze-lazy/src/compile.rs`, `Source` (cargo implements it over this) and `Lazily<S>: runner::Compiler`. Design, now in `docs/v2/plan/lanes/fastcompile/lazy.md` (\"The compiler of a run\"):\n\n- **No snapshot.** `Db` has no fork (`docs/v2/plan/lanes/frontend/db.md`, \"Readers that outlive a borrow\"), so 00744 item 3 is the reader per call, taken by cargo for one compile and let go before placement; a write stops it (`Cancelled::PendingWrite`) and the compile runs again on the next reader.\n- **Exact by key, not by revision.** A lazy slot only ever runs code of the key the image was linked with (blaze-link never puts a patch's code in a lazy slot, `crates/blaze-link/src/lazy.rs`), and a key names its code as the store's templates do across builds. So a compile at a later revision is exact while the front end still describes the instance under the image's key, and is refused when it doesn't. No revision equality, no swap of `Later` at a patch.\n\nAsked, in `driver/later.rs`:\n\n1. **`Build::into_later(self) -> Later<FrontInstance<B>, FrontStatic<B>>`**, after `run_later`: owns `nodes` and `shapes` (what `compile_kept`, `memo_hit` and `fresh` read of a node: `unit`, `spec`, `instance`, `refs`, `built_in`, `stored()`, `described.origin`). Generic over the front end's instance and static types (`HirInstance`, `HirStatic`), **not over `B`**: `B = Backends<'db>` and `B::Frontend = HirFrontend<'db>` carry the database's lifetime, which a run's `'static` threads can't name. That means `FnNode` (or a lazy copy of what it needs) is parameterized by `<I, S>` rather than `B`. `Later: Send + Sync`.\n2. **`Later::memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<(CompiledFunction, Vec<Put>), CodegenError>>`**: today's `Build::memo_hit` body (`recorded_hit`), no front end, no store read, no IR. It runs on the thread that reads a run's asks, so no lock but the memo's (00357 makes that lock-free).\n3. **`Later::compile_kept<B: Prepare, L: Lookup + ?Sized>(&self, backend: &B, frontend: &B::Frontend, memo: &Memo, key: InstanceKey, store: &L) -> Result<(CompiledFunction, Vec<Put>), CodegenError> where B::Frontend: Frontend<Instance = I, Static = S>`**: today's `Build::compile_kept` (`stored_one`, then `fresh`), **plus the key check before `prepare`**: `frontend.describe(&node.instance, &node.described.origin)` and refuse unless `described.code == node.unit.instance.code && described.args == node.unit.instance.args`. The store and recorded-shape branches need no check (content-keyed, recorded at the image's revision); only IR built at the reader's revision does. The refusal is a `CodegenError` naming the instance, the item and both code hashes, e.g. \"changed before its first call: the front end now describes it as code {new:?}; its old body can't be compiled into the running image (the edit's patch gives the run its new code)\". The IR is built against `node.refs` (the image's slots), never the new description's.\n4. **`Later::tier_up<B, L>(&self, backend: &B, frontend: &B::Frontend, memo: &Memo, key: InstanceKey, to: blaze_stencil::tier::Tier, store: &L) -> Result<(CompiledFunction, Vec<Put>), CodegenError>`**: `key`'s node compiled at `to.backend()`, counting in cells when `to.counts()` (as `Spec::counted`), alone (`imports: None`, also for `Tier::Llvm`), under the same key check as 3. Its function's key is the tier's instance; blaze-lazy places it in `key`'s slot (`Placer::replace`). This is fastcompile-stencil-tier 2's `Compiler::tier_up`, not `Build::tier_up`.\n5. **Let salsa's cancellation unwind.** `describe`/`prepare` unwinding with `Cancelled::PendingWrite` must pass through `Later` uncaught (nothing in `driver/` catches today; keep it so). Cargo turns it into `compile::Refusal::Stopped`.\n6. `Build::compile_one`/`compile_kept`/`memo_hit` stay as thin wrappers over the same functions (the tests in `driver/tests/later.rs` keep passing), with tests for `Later`: the key check refuses a re-described instance and accepts an unchanged one at a later revision; `memo_hit` equals `compile_kept`'s memo branch; `tier_up` at each tier.\n\nCargo's half (the `Source` over `Later`, the reader, the launcher) is the next request from fastcompile-wire.",
+  "state": "applied",
+  "created": "2026-10-30T14:25:41Z",
+  "updated": "2026-10-31T21:04:29Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:25:41Z",
+      "by": "fastcompile-wire",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:29Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:29Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-codegen/src/driver/later.rs: Later<I, S> with compile_kept (store, recorded shape, then the key check via describe(instance, requester) before prepare, under a single-flight claim), tier_up(backend, frontend, memo, key, to: Backend, counted: bool, store) taking Tier::backend() and Tier::counts() because blaze-stencil depends on blaze-codegen; nothing catches unwinding; tests in driver/tests/later.rs"
+    }
+  ]
+}

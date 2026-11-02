@@ -1,0 +1,35 @@
+{
+  "id": "01019",
+  "from_lane": "fastcompile-queue",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/image.rs"
+  ],
+  "what": "fastcompile-queue 1: the daemon reads and writes the plane history section through `blaze_history::section` (items 00735/00738).\n\n`crates/blaze-history/src/section.rs` now owns the section: `SCHEMA` (the same string as `serve/image.rs` `HISTORY`, so existing images still read), `write(&History, &mut Builder)`, `restore(&Image<S>, Config) -> Result<History, HistoryError>`, and `HistoryError::starts_fresh()` (true for `Refused` and `Decode(DecodeError::Version)`, false for `Corrupt` and other decode errors).\n\nIn `crates/blaze-cargo/src/serve/image.rs`:\n- Delete `pub const HISTORY` and use `blaze_history::section::SCHEMA` in its tests (`with_history(HISTORY, ..)`).\n- `history` becomes:\n```rust\npub fn history<S: Stable>(image: &Image<S>, config: blaze_history::Config) -> Result<History, String> {\n    match blaze_history::section::restore(image, config) {\n        Ok(history) => Ok(history),\n        Err(error) if error.starts_fresh() => {\n            eprintln!(\"blaze serve: {error}; the plane's history starts empty\");\n            Ok(History::new(config))\n        }\n        Err(error) => Err(error.to_string()),\n    }\n}\n```\n- Line 146 `builder.add(SectionId::PLANE_HISTORY, HISTORY, &parts.predict.encode());` becomes `blaze_history::section::write(parts.predict, builder);` (with the builder in scope as there).\n- Drop the now-unused `DecodeError` and `SchemaHash` imports if nothing else uses them.\n\nWhy: one owner per section layout; today `blaze_graph::history` and the daemon each name a schema for one section ID. Once this lands, `crates/blaze-graph/src/history.rs` (the `Estimates` form, unused) can be deleted by its owner.",
+  "state": "applied",
+  "created": "2026-10-30T14:17:49Z",
+  "updated": "2026-10-31T20:35:14Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:17:49Z",
+      "by": "fastcompile-queue",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:35:14Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:35:14Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "serve/image.rs: HISTORY and the local HistoryError are gone; history() is blaze_history::section::restore, Refused and Decode(Version) giving an empty history with the typed Unlearned (no eprintln: daemon.rs Started records it), any other error stopping the start; make() writes through section::write. daemon.rs imports blaze_history::section::HistoryError. Tests use section::SCHEMA. ra: 0 errors."
+    }
+  ]
+}

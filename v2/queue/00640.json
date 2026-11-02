@@ -1,0 +1,36 @@
+{
+  "id": "00640",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/design/frontend.md",
+    "docs/v2/plan/design"
+  ],
+  "what": "## 14. Coordinator: reword `docs/v2/plan/design/frontend.md` item 9 (db, 21:15)\n\nAndrew's decision (21:10): cancellation keeps the unwind, but only to carry a stop from a query\ncall up to the task it runs in. Item 9's last sentence, before:\n\n```text\n   be unwind-safe, and cancelling costs an unwind through deep stacks. v2 cancels\n   cooperatively: the plane stops scheduling a cancelled request's tasks, and a running task\n   sees the flag at its next query call and returns.\n```\n\nAfter:\n\n```text\n   be unwind-safe, and cancelling costs an unwind through deep stacks. v2 cancels\n   cooperatively: the plane stops scheduling a cancelled request's tasks, and a running task\n   sees the flag at its next query call and unwinds to its own task boundary, where it is\n   caught once (`base_db::Db::run_all`, `base_db::Shared`). Nothing is caught per query, and\n   a query never returns a `Result` for it: a cancel comes once per edit made during a build,\n   and a hit pays no branch for it.\n```\n\nStatus: open\n\n> forwarded to the coordinator (`docs/v2/plan/design/`), on the requests report's list (requests, pass 21).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T08:31:13Z",
+  "taken_by": "coord-apply-docs",
+  "why": null,
+  "source": "v2/requests/db.md#14. Coordinator: reword `docs/v2/plan/design/frontend.md` item 9 (db, 21:15)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:7818"
+    },
+    {
+      "at": "2026-10-30T08:31:13Z",
+      "by": "coord-apply-docs",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:31:13Z",
+      "by": "coord-apply-docs",
+      "action": "done",
+      "note": "docs/v2/plan/design/frontend.md item 9: last sentence replaced word for word (Andrew 21:10: unwind to the task boundary, caught once in base_db::Db::run_all / Shared, no per-query catch or Result)."
+    }
+  ]
+}

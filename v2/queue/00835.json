@@ -1,0 +1,36 @@
+{
+  "id": "00835",
+  "from_lane": "tree-store",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/image.rs",
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "daemon wiring for stored library trees (needs coordinator request for SectionId::SYNTAX_TREES + Image section Bytes helper first): at daemon start, open the image section SYNTAX_TREES with schema `base_db::trees::SCHEMA`, `base_db::trees::Trees::open(bytes)`; on Ok call `base_db::trees::install(Arc::new(trees))` before any Db is made (Db::new picks it up); on Err report the error (it names the section and versions) and start with no trees, never silently. In serve/image.rs Images::make add the section: `base_db::trees::write_section(&db, &mut out)` (out starting empty, 8-aligned). Report `db.trees().and_then(|t| t.failed())` when set: that image entry was refused and is not carried on. Also call `db.admit_parses()` once per revision (after applying file changes, before queries) so parse memos stay under the Parse tag budget of blaze-mem; it replaces the old `lru = 128`.",
+  "state": "applied",
+  "created": "2026-10-30T08:40:42Z",
+  "updated": "2026-10-31T20:50:21Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:40:42Z",
+      "by": "tree-store",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:21Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:50:21Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Wired. Start (serve/daemon.rs, after the history, before any front end's Db is made): serve/image.rs `trees(image)` opens SectionId::SYNTAX_TREES with base_db::trees::SCHEMA via whole_bytes and Trees::open; Ok -> base_db::trees::install(Arc::new(trees)); Missing -> none; a schema refusal, Corrupt or TreeError -> Started.trees = Some(why) (in Started's Display and whole(), reported with the start; library files then parse), never ignored. Image (serve/image.rs make): Parts gains `front: Option<&base_db::Db>` (Jobs::front_db: the first root's kept front end, via a new work.rs trait KeptDb that Steps::KeptFront implements; the fakes' is None), and with one the section is base_db::trees::write_section(front, ..) added under SYNTAX_TREES; db.trees().failed() is logged (tracing::warn) when set. With no front kept at image time (all checked out by running jobs) the image has no trees section and the next start parses them: one Db's trees only, as write_section takes one Db; several checkouts keep the first root's. admit_parses: blaze-lower Lowered::refresh calls db.admit_parses() once per revision before its batch of file writes."
+    }
+  ]
+}

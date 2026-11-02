@@ -1,0 +1,37 @@
+{
+  "id": "00485",
+  "from_lane": "diagnostics-lints-bodies",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-mir",
+    "crates/hir-ty/src/mir.rs",
+    "v2/requests/codegen-rq-mir.md"
+  ],
+  "what": "## diagnostics-lints-bodies: `become` in hir-ty's MIR (codegen, `crates/hir-ty-mir`; db for the variant in `crates/hir-ty/src/mir.rs`)\n\n`unconditional_recursion` (`lints/bodies/recursion.rs`, rustc's\n`compiler/rustc_mir_transform/src/check_call_recursion.rs`) reads the built MIR, and hir-ty-mir\nrefuses a body with `become` (`Expr::Become { .. } => not_supported!(\"tail-calls\")` in\n`mir/lower.rs`). With no MIR for such a body, the lint is missing where rustc gives it:\n`tests/ui/lint/lint-unconditional-recursion-tail-calls.rs` (`fn f(x: bool) { if x { become\nf(!x) } else { f(!x) } }` lints, with only the `f(!x)` call as a \"recursive call site\";\n`fn g` that recurses only through `become` does not). What: rustc's\n`TerminatorKind::TailCall { func, args, fn_span }`, no successors, for `become`. Nothing else\nis needed on my side: `recursion.rs` already treats a terminator with no successors that is\nneither a return nor a call of the function itself as rustc treats `TailCall`.\n\n> forwarded to codegen (`crates/hir-ty-mir`) and db (the variant), both still running.\n> not applied, by codegen-rq-mir (2026-10-29): waits on db. `crates/hir-ty/src/mir.rs` has no\n> `TerminatorKind::TailCall` yet, and `lower.rs:1580` still refuses `Expr::Become`. Asked of db\n> in `v2/requests/codegen-rq-mir.md` R3: the variant, the hir-ty arms, and the list of every\n> other exhaustive match to update. The lowering follows (operands as for `Expr::Call`, the\n> body's drops in scope order, then `TailCall`), with the evaluator's frame swap and the\n> inliner refusing it.\n> codegen-rq-mir (2026-10-30): db's variant is in, and so are hir-ty-mir's arms (the inliner\n> refuses a callee with a tail call, as rustc does). What's left is lowering `Expr::Become`\n> (`lower.rs:1580`), which belongs to frontend-fast-mir-next2, the holder of `lower.rs` (told\n> by tmux). The evaluator's arm follows it.",
+  "state": "applied",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-31T20:36:08Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies: `become` in hir-ty's MIR (codegen, `crates/hir-ty-mir`; db for the variant in `crates/hir-ty/src/mir.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1430"
+    },
+    {
+      "at": "2026-10-31T20:36:08Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:36:08Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "become lowers: lower.rs Expr::Become -> lower_become emits TerminatorKind::TailCall; the evaluator runs it (eval.rs Ran::TailCalled)."
+    }
+  ]
+}

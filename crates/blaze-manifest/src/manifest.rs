@@ -4,9 +4,11 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
+use blaze_hash::HashMap;
 use cargo_platform::Platform;
 use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
 use cargo_util_schemas::manifest::{
@@ -14,7 +16,6 @@ use cargo_util_schemas::manifest::{
     StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints,
     TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
 };
-use rustc_hash::FxHashMap;
 use url::Url;
 
 use crate::config::Config;
@@ -23,22 +24,28 @@ use crate::dependency::{DepKind, Dependency, FeatureMap, build_summary_features}
 use crate::diagnostic::ManifestDiagnostic;
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
+use crate::files::Files;
 use crate::paths::normalize_path;
 use crate::profiles::validate_profiles;
-use crate::source::{CRATES_IO_INDEX, CRATES_IO_REGISTRY, SourceId, into_url};
+use crate::source::{self, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
 use crate::targets::{self, Target};
 use crate::workspace::find_workspace_root;
 
 /// What reading manifests shares: the configuration, and the workspace roots read so far, which
 /// cargo consults before walking up the file system (its `GlobalContext::ws_roots`).
-pub struct Context {
-    pub config: Config,
-    pub(crate) ws_roots: RefCell<FxHashMap<PathBuf, WorkspaceRootConfig>>,
+/// Every file is read through the configuration's [`Files`].
+pub struct Context<F: Files> {
+    pub config: Config<F>,
+    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig>>,
 }
 
-impl Context {
-    pub fn new(config: Config) -> Context {
-        Context { config, ws_roots: RefCell::new(FxHashMap::default()) }
+impl<F: Files> Context<F> {
+    pub fn new(config: Config<F>) -> Context<F> {
+        Context { config, ws_roots: RefCell::new(HashMap::default()) }
+    }
+
+    pub fn files(&self) -> &F {
+        self.config.files()
     }
 }
 
@@ -50,13 +57,24 @@ pub struct PackageId {
     pub source_id: SourceId,
 }
 
+/// cargo's `PackageId` display: `name vX`, with the source unless it is crates.io.
+impl fmt::Display for PackageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} v{}", self.name, self.version)?;
+        if !self.source_id.is_crates_io() {
+            write!(f, " ({})", self.source_id)?;
+        }
+        Ok(())
+    }
+}
+
 impl PackageId {
     /// The spec `cargo metadata` names the package by, e.g. `path+file:///w/a#0.1.0`.
     pub fn to_spec(&self) -> PackageIdSpec {
         PackageIdSpec::new(self.name.clone())
             .with_version(PartialVersion::from(self.version.clone()))
-            .with_url(self.source_id.url.clone())
-            .with_kind(self.source_id.kind.clone())
+            .with_url(self.source_id.url().clone())
+            .with_kind(source::spec_kind(self.source_id.kind()))
     }
 }
 
@@ -133,21 +151,22 @@ impl WorkspaceRootConfig {
     }
 
     /// The directories `globs` name, each with the glob it came from when it was a pattern.
-    pub(crate) fn members_paths<'g>(
+    pub(crate) fn members_paths<'g, F: Files>(
         &self,
+        files: &F,
         globs: &'g [String],
     ) -> anyhow::Result<Vec<(PathBuf, Option<&'g str>)>> {
         let mut expanded_list = Vec::new();
         for glob in globs {
             let pathbuf = self.root_dir.join(glob);
-            let expanded_paths = expand_member_path(&pathbuf)?;
+            let expanded_paths = expand_member_path(files, &pathbuf)?;
             if expanded_paths.is_empty() {
                 expanded_list.push((pathbuf, None));
             } else {
                 let used_glob_pattern = expanded_paths.len() > 1 || expanded_paths[0] != pathbuf;
                 let glob = used_glob_pattern.then_some(glob.as_str());
                 for expanded_path in expanded_paths {
-                    if expanded_path.is_dir() {
+                    if files.is_dir(&expanded_path) {
                         expanded_list.push((expanded_path, glob));
                     }
                 }
@@ -157,12 +176,15 @@ impl WorkspaceRootConfig {
     }
 }
 
-fn expand_member_path(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn expand_member_path<F: Files>(files: &F, path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let Some(path) = path.to_str() else {
         return Ok(Vec::new());
     };
-    let res = glob::glob(path).with_context(|| format!("could not parse pattern `{path}`"))?;
-    res.map(|p| p.with_context(|| format!("unable to match path to pattern `{path}`"))).collect()
+    let res = crate::files::glob(files, path)
+        .with_context(|| format!("could not parse pattern `{path}`"))?;
+    res.into_iter()
+        .map(|p| p.with_context(|| format!("unable to match path to pattern `{path}`")))
+        .collect()
 }
 
 /// What `[workspace]` offers its members to inherit.
@@ -237,8 +259,9 @@ impl InheritableFields {
         resolve_relative_path("license-file", &self.ws_root, package_root, license_file)
     }
 
-    fn readme(&self, package_root: &Path) -> anyhow::Result<StringOrBool> {
+    fn readme<F: Files>(&self, files: &F, package_root: &Path) -> anyhow::Result<StringOrBool> {
         let Some(readme) = normalize_package_readme(
+            files,
             &self.ws_root,
             self.package.as_ref().and_then(|p| p.readme.as_ref()),
         ) else {
@@ -302,7 +325,7 @@ pub struct Manifest {
     pub custom_metadata: Option<toml::Value>,
     pub publish: Option<Vec<String>>,
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: FxHashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub edition: Edition,
@@ -318,7 +341,7 @@ pub struct Manifest {
 #[derive(Debug)]
 pub struct VirtualManifest {
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: FxHashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub resolve_behavior: Option<ResolveBehavior>,
@@ -342,21 +365,24 @@ impl EitherManifest {
 }
 
 /// Reads the manifest at `path`, a package or a virtual workspace.
-pub fn read_manifest(
+/// `bytes`, the manifest at `path`, parsed: not UTF-8, or TOML that is no manifest, is cargo's
+/// error naming `path` (with the TOML error's snippet).
+pub fn parse_manifest(path: &Path, bytes: &[u8]) -> anyhow::Result<TomlManifest> {
+    let contents = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow!("path at `{}` was not valid utf-8", path.display()))?;
+    toml::from_str(contents).map_err(|e| ManifestDiagnostic::from_toml(e, contents, path))
+}
+
+pub fn read_manifest<F: Files>(
     path: &Path,
     source_id: SourceId,
-    ctx: &Context,
+    ctx: &Context<F>,
 ) -> anyhow::Result<EitherManifest> {
     let ext = path.extension();
     if ext.is_none() || ext == Some(std::ffi::OsStr::new("rs")) {
         bail!("parsing `{}` requires `-Zscript`", path.display());
     }
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
-    let contents = String::from_utf8(bytes)
-        .map_err(|_| anyhow!("path at `{}` was not valid utf-8", path.display()))?;
-    let original_toml: TomlManifest =
-        toml::from_str(&contents).map_err(|e| ManifestDiagnostic::from_toml(e, &contents, path))?;
+    let original_toml = ctx.files().manifest(path)?;
 
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
@@ -441,39 +467,48 @@ fn to_workspace_config(
     }
 }
 
-type Inherit<'a> = dyn Fn() -> anyhow::Result<&'a InheritableFields> + 'a;
+/// What `[workspace]` gives a member: read from its workspace root the first time a field
+/// inherits, so a manifest that inherits nothing never reads the root.
+struct Inherit<'a, F: Files> {
+    fields: OnceCell<InheritableFields>,
+    ctx: &'a Context<F>,
+    manifest_file: &'a Path,
+    workspace_config: &'a WorkspaceConfig,
+}
 
-fn normalize_toml(
+impl<F: Files> Inherit<'_, F> {
+    fn fields(&self) -> anyhow::Result<&InheritableFields> {
+        if let Some(fields) = self.fields.get() {
+            return Ok(fields);
+        }
+        let fields = load_inheritable_fields(self.ctx, self.manifest_file, self.workspace_config)?;
+        Ok(self.fields.get_or_init(|| fields))
+    }
+
+    fn ws_root(&self) -> anyhow::Result<&Path> {
+        self.fields().map(InheritableFields::ws_root)
+    }
+}
+
+fn normalize_toml<F: Files>(
     original_toml: &TomlManifest,
     features: &Features,
     workspace_config: &WorkspaceConfig,
     manifest_file: &Path,
-    ctx: &Context,
+    ctx: &Context<F>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) -> anyhow::Result<TomlManifest> {
     let package_root = manifest_file.parent().unwrap();
+    let files = ctx.files();
 
-    let inherit_cell: OnceCell<InheritableFields> = OnceCell::new();
-    let inherit = || -> anyhow::Result<&InheritableFields> {
-        if let Some(fields) = inherit_cell.get() {
-            return Ok(fields);
-        }
-        let fields = load_inheritable_fields(ctx, manifest_file, workspace_config)?;
-        Ok(inherit_cell.get_or_init(|| fields))
-    };
-    let workspace_root = || inherit().map(|fields| fields.ws_root());
+    let inherit = Inherit { fields: OnceCell::new(), ctx, manifest_file, workspace_config };
 
     let mut normalized_toml = TomlManifest {
         cargo_features: original_toml.cargo_features.clone(),
         workspace: original_toml.workspace.clone(),
         profile: original_toml.profile.clone(),
-        patch: normalize_patch(
-            &ctx.config,
-            original_toml.patch.as_ref(),
-            &workspace_root,
-            features,
-        )?,
+        patch: normalize_patch(&ctx.config, original_toml.patch.as_ref(), &inherit, features)?,
         replace: original_toml.replace.clone(),
         ..Default::default()
     };
@@ -491,6 +526,7 @@ fn normalize_toml(
         normalized_toml.features = original_toml.features.clone();
 
         normalized_toml.lib = targets::normalize_lib(
+            files,
             original_toml.lib.as_ref(),
             package_root,
             &package_name,
@@ -499,6 +535,7 @@ fn normalize_toml(
             warnings,
         )?;
         normalized_toml.bin = Some(targets::normalize_bins(
+            files,
             original_toml.bin.as_ref(),
             package_root,
             &package_name,
@@ -509,6 +546,7 @@ fn normalize_toml(
             normalized_toml.lib.is_some(),
         )?);
         normalized_toml.example = Some(targets::normalize_examples(
+            files,
             original_toml.example.as_ref(),
             package_root,
             edition,
@@ -517,6 +555,7 @@ fn normalize_toml(
             errors,
         )?);
         normalized_toml.test = Some(targets::normalize_tests(
+            files,
             original_toml.test.as_ref(),
             package_root,
             edition,
@@ -525,6 +564,7 @@ fn normalize_toml(
             errors,
         )?);
         normalized_toml.bench = Some(targets::normalize_benches(
+            files,
             original_toml.bench.as_ref(),
             package_root,
             edition,
@@ -647,7 +687,7 @@ fn normalize_toml(
         let normalized_lints = original_toml
             .lints
             .clone()
-            .map(|value| lints_inherit_with(value, || inherit()?.lints()))
+            .map(|value| lints_inherit_with(value, || inherit.fields()?.lints()))
             .transpose()?;
         normalized_toml.lints =
             normalized_lints.map(|lints| manifest::InheritableLints { workspace: false, lints });
@@ -667,10 +707,10 @@ fn normalize_toml(
     Ok(normalized_toml)
 }
 
-fn normalize_patch<'a>(
-    config: &Config,
+fn normalize_patch<F: Files>(
+    config: &Config<F>,
     original_patch: Option<&BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>,
-    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
+    inherit: &Inherit<'_, F>,
     features: &Features,
 ) -> anyhow::Result<Option<BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>> {
     let Some(patch) = original_patch else {
@@ -682,7 +722,7 @@ fn normalize_patch<'a>(
         for (pkg, dep) in packages {
             let dep = if let TomlDependency::Detailed(dep) = dep {
                 let mut dep = dep.clone();
-                normalize_path_dependency(config, &mut dep, workspace_root, features)
+                normalize_path_dependency(config, &mut dep, inherit, features)
                     .with_context(|| {
                         format!("resolving path for patch of ({pkg}) for source ({name})")
                     })?;
@@ -712,19 +752,20 @@ fn field_inherit_with<T>(
     }
 }
 
-fn normalize_package_toml(
+fn normalize_package_toml<F: Files>(
     original_package: &TomlPackage,
     manifest_file: &Path,
-    inherit: &Inherit<'_>,
+    inherit: &Inherit<'_, F>,
     features: &Features,
 ) -> anyhow::Result<Box<TomlPackage>> {
     let package_root = manifest_file.parent().unwrap();
+    let files = inherit.ctx.files();
     macro_rules! inherit_field {
         ($field:ident, $label:literal) => {
             original_package
                 .$field
                 .clone()
-                .map(|value| field_inherit_with(value, $label, || inherit()?.$field()))
+                .map(|value| field_inherit_with(value, $label, || inherit.fields()?.$field()))
                 .transpose()?
                 .map(InheritableField::Value)
         };
@@ -743,7 +784,7 @@ fn normalize_package_toml(
     if let Some(TomlPackageBuild::MultipleScript(_)) = original_package.build {
         features.require(Feature::multiple_build_scripts)?;
     }
-    let build = targets::normalize_build(original_package.build.as_ref(), package_root)?;
+    let build = targets::normalize_build(files, original_package.build.as_ref(), package_root)?;
     let exclude = inherit_field!(exclude, "exclude");
     let include = inherit_field!(include, "include");
     let publish = inherit_field!(publish, "publish");
@@ -751,11 +792,14 @@ fn normalize_package_toml(
     let homepage = inherit_field!(homepage, "homepage");
     let documentation = inherit_field!(documentation, "documentation");
     let readme = normalize_package_readme(
+        files,
         package_root,
         original_package
             .readme
             .clone()
-            .map(|value| field_inherit_with(value, "readme", || inherit()?.readme(package_root)))
+            .map(|value| {
+                field_inherit_with(value, "readme", || inherit.fields()?.readme(files, package_root))
+            })
             .transpose()?
             .as_ref(),
     )
@@ -768,7 +812,9 @@ fn normalize_package_toml(
         .license_file
         .clone()
         .map(|value| {
-            field_inherit_with(value, "license-file", || inherit()?.license_file(package_root))
+            field_inherit_with(value, "license-file", || {
+                inherit.fields()?.license_file(package_root)
+            })
         })
         .transpose()?
         .map(InheritableField::Value);
@@ -813,11 +859,15 @@ fn normalize_package_toml(
 
 const DEFAULT_README_FILES: [&str; 3] = ["README.md", "README.txt", "README"];
 
-fn normalize_package_readme(package_root: &Path, readme: Option<&StringOrBool>) -> Option<String> {
+fn normalize_package_readme<F: Files>(
+    files: &F,
+    package_root: &Path,
+    readme: Option<&StringOrBool>,
+) -> Option<String> {
     match readme {
         None => DEFAULT_README_FILES
             .iter()
-            .find(|f| package_root.join(f).is_file())
+            .find(|f| files.is_file(&package_root.join(f)))
             .map(|f| (*f).to_owned()),
         Some(StringOrBool::Bool(false)) => None,
         Some(StringOrBool::Bool(true)) => Some("README.md".to_owned()),
@@ -825,13 +875,13 @@ fn normalize_package_readme(package_root: &Path, readme: Option<&StringOrBool>) 
     }
 }
 
-fn normalize_dependencies<'a>(
+fn normalize_dependencies<F: Files>(
     edition: Edition,
     features: &Features,
-    config: &Config,
+    config: &Config<F>,
     orig_deps: Option<&BTreeMap<PackageName, manifest::InheritableDependency>>,
     kind: DepKind,
-    inherit: &Inherit<'a>,
+    inherit: &Inherit<'_, F>,
     package_root: &Path,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<Option<BTreeMap<PackageName, manifest::InheritableDependency>>> {
@@ -878,8 +928,7 @@ fn normalize_dependencies<'a>(
                     }
                 }
             }
-            let workspace_root = || inherit().map(|fields| fields.ws_root());
-            normalize_path_dependency(config, d, &workspace_root, features)
+            normalize_path_dependency(config, d, inherit, features)
                 .with_context(|| format!("resolving path dependency {name_in_toml}"))?;
         }
         deps.insert(name_in_toml.clone(), manifest::InheritableDependency::Value(resolved));
@@ -889,15 +938,15 @@ fn normalize_dependencies<'a>(
 
 /// A path dependency's `base` (the unstable `path-bases`) joined to its `path`, as nightly
 /// cargo's `normalize_path_dependency` does.
-fn normalize_path_dependency<'a>(
-    config: &Config,
+fn normalize_path_dependency<F: Files>(
+    config: &Config<F>,
     detailed_dep: &mut TomlDetailedDependency,
-    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
+    inherit: &Inherit<'_, F>,
     features: &Features,
 ) -> anyhow::Result<()> {
     if let Some(base) = detailed_dep.base.take() {
         if let Some(path) = detailed_dep.path.as_mut() {
-            let new_path = lookup_path_base(&base, config, workspace_root, features)?.join(&path);
+            let new_path = lookup_path_base(&base, config, inherit, features)?.join(&path);
             *path = new_path.to_str().unwrap().to_owned();
         } else {
             bail!("`base` can only be used with path dependencies");
@@ -908,10 +957,10 @@ fn normalize_path_dependency<'a>(
 
 /// Where the path base `base` points: the configuration's `[path-bases]` entry, else the
 /// built-in `workspace`, cargo's `lookup_path_base`.
-fn lookup_path_base<'a>(
+fn lookup_path_base<F: Files>(
     base: &PathBaseName,
-    config: &Config,
-    workspace_root: &dyn Fn() -> anyhow::Result<&'a Path>,
+    config: &Config<F>,
+    inherit: &Inherit<'_, F>,
     features: &Features,
 ) -> anyhow::Result<PathBuf> {
     features.require(Feature::path_bases)?;
@@ -921,7 +970,7 @@ fn lookup_path_base<'a>(
         return Ok(path.resolve_path(config.cwd()));
     }
     match base.as_str() {
-        "workspace" => Ok(workspace_root()?.to_path_buf()),
+        "workspace" => Ok(inherit.ws_root()?.to_path_buf()),
         _ => bail!(
             "path base `{base}` is undefined. \
              You must add an entry for `{base}` in the Cargo configuration [path-bases] table."
@@ -929,8 +978,8 @@ fn lookup_path_base<'a>(
     }
 }
 
-fn load_inheritable_fields(
-    ctx: &Context,
+fn load_inheritable_fields<F: Files>(
+    ctx: &Context<F>,
     normalized_path: &Path,
     workspace_config: &WorkspaceConfig,
 ) -> anyhow::Result<InheritableFields> {
@@ -949,15 +998,15 @@ fn load_inheritable_fields(
     }
 }
 
-fn inheritable_from_path(
-    ctx: &Context,
+fn inheritable_from_path<F: Files>(
+    ctx: &Context<F>,
     workspace_path: PathBuf,
 ) -> anyhow::Result<InheritableFields> {
     let workspace_path_root = workspace_path.parent().unwrap();
     if let Some(ws_root) = ctx.ws_roots.borrow().get(workspace_path_root) {
         return Ok(ws_root.inheritable.clone());
     }
-    let source_id = SourceId::for_manifest_path(&workspace_path)?;
+    let source_id = source::for_manifest_path(&workspace_path)?;
     let man = read_manifest(&workspace_path, source_id, ctx)?;
     match man.workspace_config() {
         WorkspaceConfig::Root(root) => {
@@ -985,15 +1034,15 @@ fn lints_inherit_with(
     }
 }
 
-fn inner_dependency_inherit_with(
+fn inner_dependency_inherit_with<F: Files>(
     pkg_dep: TomlInheritedDependency,
     name: &str,
-    inherit: &Inherit<'_>,
+    inherit: &Inherit<'_, F>,
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<TomlDependency> {
-    let ws_dep = inherit()?.get_dependency(name, package_root)?;
+    let ws_dep = inherit.fields()?.get_dependency(name, package_root)?;
     let mut merged_dep = match ws_dep {
         TomlDependency::Simple(ws_version) => {
             TomlDetailedDependency { version: Some(ws_version), ..Default::default() }
@@ -1071,18 +1120,18 @@ pub(crate) fn deprecated_underscore<T>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn to_real_manifest(
+fn to_real_manifest<F: Files>(
     original_toml: TomlManifest,
     normalized_toml: TomlManifest,
     features: Features,
     workspace_config: WorkspaceConfig,
     source_id: SourceId,
     manifest_file: &Path,
-    ctx: &Context,
+    ctx: &Context<F>,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<Manifest> {
     let package_root = manifest_file.parent().unwrap();
-    if !package_root.is_dir() {
+    if !ctx.files().is_dir(package_root) {
         bail!("package root '{}' is not a directory", package_root.display());
     }
 
@@ -1214,7 +1263,7 @@ fn to_real_manifest(
     let mut deps = Vec::new();
     let mut manifest_ctx = ManifestContext {
         deps: &mut deps,
-        source_id: source_id.clone(),
+        source_id,
         config: &ctx.config,
         warnings,
         platform: None,
@@ -1249,7 +1298,7 @@ fn to_real_manifest(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = BTreeMap::new();
+        let mut names_sources = HashMap::default();
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
@@ -1305,7 +1354,7 @@ fn to_real_manifest(
     };
 
     if let Some(profiles) = &normalized_toml.profile {
-        validate_profiles(profiles, &features, warnings)?;
+        validate_profiles(profiles, &features, ctx.config.unstable(), warnings)?;
     }
 
     let version = normalized_package.normalized_version().expect("previously normalized");
@@ -1324,6 +1373,7 @@ fn to_real_manifest(
         version: version.cloned().unwrap_or_else(|| semver::Version::new(0, 0, 0)),
         source_id,
     };
+    // BTreeMap: `closest_msg` in `build_summary_features` breaks ties in its key order.
     let declared_features: BTreeMap<String, Vec<String>> = normalized_toml
         .features
         .iter()
@@ -1394,13 +1444,13 @@ note: only a feature named `default` will be enabled by default"
     })
 }
 
-fn to_virtual_manifest(
+fn to_virtual_manifest<F: Files>(
     normalized_toml: TomlManifest,
     features: Features,
     workspace_config: WorkspaceConfig,
     source_id: SourceId,
     manifest_file: &Path,
-    ctx: &Context,
+    ctx: &Context<F>,
 ) -> anyhow::Result<VirtualManifest> {
     let mut deps = Vec::new();
     let mut warnings = Vec::new();
@@ -1416,7 +1466,7 @@ fn to_virtual_manifest(
         (replace(&normalized_toml, &mut manifest_ctx)?, patch(&normalized_toml, &mut manifest_ctx)?)
     };
     if let Some(profiles) = &normalized_toml.profile {
-        validate_profiles(profiles, &features, &mut warnings)?;
+        validate_profiles(profiles, &features, ctx.config.unstable(), &mut warnings)?;
     }
     let resolve_behavior = normalized_toml
         .workspace
@@ -1438,17 +1488,17 @@ fn to_virtual_manifest(
     })
 }
 
-struct ManifestContext<'a, 'b> {
+struct ManifestContext<'a, 'b, F: Files> {
     deps: &'a mut Vec<Dependency>,
     source_id: SourceId,
-    config: &'b Config,
+    config: &'b Config<F>,
     warnings: &'a mut Vec<String>,
     platform: Option<Platform>,
     file: &'a Path,
 }
 
-fn gather_dependencies(
-    manifest_ctx: &mut ManifestContext<'_, '_>,
+fn gather_dependencies<F: Files>(
+    manifest_ctx: &mut ManifestContext<'_, '_, F>,
     normalized_deps: Option<&BTreeMap<PackageName, manifest::InheritableDependency>>,
     kind: Option<DepKind>,
 ) -> anyhow::Result<()> {
@@ -1463,9 +1513,9 @@ fn gather_dependencies(
     Ok(())
 }
 
-fn replace(
+fn replace<F: Files>(
     me: &TomlManifest,
-    manifest_ctx: &mut ManifestContext<'_, '_>,
+    manifest_ctx: &mut ManifestContext<'_, '_, F>,
 ) -> anyhow::Result<Vec<(PackageIdSpec, Dependency)>> {
     if me.patch.is_some() && me.replace.is_some() {
         bail!("cannot specify both [replace] and [patch]");
@@ -1505,11 +1555,11 @@ fn replace(
     Ok(replace)
 }
 
-fn patch(
+fn patch<F: Files>(
     me: &TomlManifest,
-    manifest_ctx: &mut ManifestContext<'_, '_>,
-) -> anyhow::Result<FxHashMap<Url, Vec<Dependency>>> {
-    let mut patch = FxHashMap::default();
+    manifest_ctx: &mut ManifestContext<'_, '_, F>,
+) -> anyhow::Result<HashMap<Url, Vec<Dependency>>> {
+    let mut patch = HashMap::default();
     for (toml_url, deps) in me.patch.iter().flatten() {
         let url = match &toml_url[..] {
             CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),
@@ -1537,10 +1587,10 @@ fn patch(
     Ok(patch)
 }
 
-fn dep_to_dependency(
+fn dep_to_dependency<F: Files>(
     orig: &TomlDependency,
     name_in_toml: &str,
-    manifest_ctx: &mut ManifestContext<'_, '_>,
+    manifest_ctx: &mut ManifestContext<'_, '_, F>,
     kind: Option<DepKind>,
 ) -> anyhow::Result<Dependency> {
     let simple;
@@ -1615,10 +1665,10 @@ fn dep_to_dependency(
     dep.optional = orig.optional.unwrap_or(false);
     dep.platform = manifest_ctx.platform.clone();
     if let Some(registry) = &orig.registry {
-        dep.registry_id = Some(SourceId::alt_registry(manifest_ctx.config, registry)?);
+        dep.registry_id = Some(source::alt_registry(manifest_ctx.config, registry)?);
     }
     if let Some(registry_index) = &orig.registry_index {
-        dep.registry_id = Some(SourceId::for_registry(&into_url(registry_index)?));
+        dep.registry_id = Some(SourceId::for_registry(&into_url(registry_index)?)?);
     }
     if let Some(kind) = kind {
         dep.kind = kind;
@@ -1628,21 +1678,35 @@ fn dep_to_dependency(
         dep.public = p;
     }
 
-    if orig.artifact.is_some() {
+    if orig.artifact.is_some() && !manifest_ctx.config.bindeps() {
         bail!("`artifact = …` requires `-Z bindeps` ({name_in_toml})");
-    } else if orig.lib.is_some() || orig.target.is_some() {
-        let specifier = if orig.lib.is_some() { "lib" } else { "target" };
-        bail!(
-            "'{specifier}' specifier cannot be used without an 'artifact = …' value ({name_in_toml})"
-        )
+    }
+    match (&orig.artifact, orig.lib, orig.target.as_deref()) {
+        (Some(artifact), lib, target) => {
+            let artifact =
+                crate::dependency::Artifact::parse(&artifact.0, lib.unwrap_or(false), target)?;
+            if dep.kind != DepKind::Build && artifact.target.as_deref() == Some("target") {
+                bail!(
+                    r#"`target = "target"` in normal- or dev-dependencies has no effect ({name_in_toml})"#
+                );
+            }
+            dep.artifact = Some(artifact);
+        }
+        (None, Some(_), _) => {
+            bail!("'lib' specifier cannot be used without an 'artifact = …' value ({name_in_toml})")
+        }
+        (None, None, Some(_)) => bail!(
+            "'target' specifier cannot be used without an 'artifact = …' value ({name_in_toml})"
+        ),
+        (None, None, None) => {}
     }
     Ok(dep)
 }
 
-fn to_dependency_source_id(
+fn to_dependency_source_id<F: Files>(
     orig: &TomlDetailedDependency,
     name_in_toml: &str,
-    manifest_ctx: &mut ManifestContext<'_, '_>,
+    manifest_ctx: &mut ManifestContext<'_, '_, F>,
 ) -> anyhow::Result<SourceId> {
     match (
         orig.git.as_ref(),
@@ -1667,7 +1731,6 @@ fn to_dependency_source_id(
                      Only one of `branch`, `tag` or `rev` is allowed.",
                 );
             }
-            use cargo_util_schemas::core::GitReference;
             let reference = orig
                 .branch
                 .clone()
@@ -1683,21 +1746,21 @@ fn to_dependency_source_id(
                      use `rev = \"{fragment}\"` in the dependency declaration.",
                 ));
             }
-            Ok(SourceId::for_git(&loc, reference))
+            SourceId::for_git(&loc, reference)
         }
         (None, Some(path), _, _) => {
             if manifest_ctx.source_id.is_path() {
                 let path = manifest_ctx.file.parent().unwrap().join(path);
                 SourceId::for_path(&normalize_path(&path))
             } else {
-                Ok(manifest_ctx.source_id.clone())
+                Ok(manifest_ctx.source_id)
             }
         }
-        (None, None, Some(registry), None) => SourceId::alt_registry(manifest_ctx.config, registry),
+        (None, None, Some(registry), None) => source::alt_registry(manifest_ctx.config, registry),
         (None, None, None, Some(registry_index)) => {
-            Ok(SourceId::for_registry(&into_url(registry_index)?))
+            SourceId::for_registry(&into_url(registry_index)?)
         }
-        (None, None, None, None) => SourceId::crates_io(manifest_ctx.config),
+        (None, None, None, None) => source::crates_io(manifest_ctx.config),
     }
 }
 

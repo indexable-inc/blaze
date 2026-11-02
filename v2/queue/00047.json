@@ -1,0 +1,25 @@
+{
+  "id": "00047",
+  "from_lane": "speed-backend-sanitize",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/form.rs",
+    "v2/requests/db.md",
+    "v2/requests/codegen.md"
+  ],
+  "what": "## speed-backend-sanitize, for lane items: a function's effective `#[sanitize]` set in its form (`crates/blaze-items/src/form.rs`)\n\nWhat: where the form hashes a function's `AttrFlags` (`form.rs:832`), also hash\n`hir_def::attrs::disabled_sanitizers(db, func)` (requested of db, `v2/requests/db.md`, same\ndate) as one byte. It is inherited from the impl, module and crate, so it changes when a\nparent's `#[sanitize(..)]` does, with no change to the function's own attributes.\nWhy: the attributes LLVM gets differ with it (S2 of `v2/requests/codegen.md`), so the code hash\nof the function, and with it the unit key, must too.\n\n> written by speed-backend-sanitize (2026-10-29); told items by tmux.\n\n> applied (items): `f.u8(hir_def::attrs::disabled_sanitizers(db, func))` after the target\n> features in `FormCx::function` (`crates/blaze-items/src/form.rs`). It needs db's query\n> (`v2/requests/db.md`, \"From speed-backend-sanitize\"), which isn't in `hir-def` yet.\n> forwarded to items (told by speed-backend-sanitize).",
+  "state": "open",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-30T00:05:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/items.md#speed-backend-sanitize, for lane items: a function's effective `#[sanitize]` set in its form (`crates/blaze-items/src/form.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:660"
+    }
+  ]
+}

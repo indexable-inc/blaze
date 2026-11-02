@@ -1,0 +1,36 @@
+{
+  "id": "00894",
+  "from_lane": "speed-sol2-small",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/lib.rs",
+    "crates/blaze-engine/Cargo.toml"
+  ],
+  "what": "## speed-sol2-small (hugepages): mimalloc on huge pages when blaze-mem is\n\n- Where: `crates/blaze-engine/src/lib.rs`, beside `static ALLOC` (line ~54, mimalloc as the global allocator), called once at the daemon's start before the first query.\n- Why: every memo value the general allocator serves (HIR bodies, inference results, MIR) is read at random through memo pointers: GBs on a big workspace, all on 4 KiB pages today, so most random reads past a few MiB pay a page walk (20 to 100 ns on top of an 80 to 110 ns read). blaze-mem's regions follow `blaze_mem::huge::chosen()`; mimalloc is never told (docs/v2/plan/lanes/hugepages/speed-of-light.md, \"The general allocator\").\n- Change: `pub fn huge_pages_for_mimalloc() -> Result<(), String>` under the same cfg as `ALLOC`'s mimalloc: `if blaze_mem::huge::chosen()? == blaze_mem::huge::Pages::Transparent { unsafe { libmimalloc_sys::mi_option_set_enabled(libmimalloc_sys::mi_option_large_os_pages, true) } }`, with a `// SAFETY:` (it sets an option word that mimalloc reads when it next maps a segment; callable from any thread). `Reserved` leaves mimalloc on THP-less pages: the pool's pages are blaze-mem's. Needs `libmimalloc-sys` with `extended` (the coordinator request filed beside this one) and `blaze-mem.workspace = true` if blaze-engine does not depend on it yet. Check `huge::chosen`'s exact signature in `crates/blaze-mem/src/huge.rs` first.\n- Test: with `BLAZE_HUGE_PAGES=off` the option stays disabled (`mi_option_is_enabled`); with it unset on Linux where THP is offered, enabled.",
+  "state": "applied",
+  "created": "2026-10-30T09:31:23Z",
+  "updated": "2026-10-31T20:30:04Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:31:23Z",
+      "by": "speed-sol2-small",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T20:30:04Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "crates/blaze-engine/src/huge.rs huge_pages_for_mimalloc: mi_option_large_os_pages on when blaze_mem::huge::chosen() is Transparent, called in program.rs before blaze_cargo::cli::main (an unreadable BLAZE_HUGE_PAGES stops with its error). Test mimalloc_follows_the_pages_chosen. Deps libmimalloc-sys (extended), blaze-mem."
+    }
+  ]
+}

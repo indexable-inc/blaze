@@ -1,0 +1,45 @@
+{
+  "id": "00347",
+  "from_lane": "mem-db-infer-method",
+  "owner": "db",
+  "paths": [
+    "Cargo.toml",
+    "crates/hir-ty/Cargo.toml",
+    "crates/hir/Cargo.toml",
+    "crates/hir",
+    "crates/blaze-items",
+    "crates/blaze-mem",
+    "v2/requests/mem-db-infer-expr.md",
+    "crates/hir-ty/src/lib.rs",
+    "crates/hir-ty/src/db.rs",
+    "crates/hir-ty/src/infer.rs",
+    "vendor/salsa/src/function/execute.rs"
+  ],
+  "what": "## Prerequisites (other parts)\n\n- **mem-db-infer** (`lib.rs`, `Cargo.toml`, `db.rs`): `#![feature(allocator_api)]`;\n  `blaze-mem.workspace = true` and `hashbrown.workspace = true` in `crates/hir-ty/Cargo.toml`\n  (hashbrown's `nightly` feature, filed by mem-db, is what makes `hashbrown::HashMap<K, V, S,\n  &Frame>` take `core::alloc::Allocator`); `pub(crate) const INFER_TAG: blaze_mem::Tag =\n  blaze_mem::Tag::Infer;` in `db.rs`. `crates/hir/Cargo.toml` needs `blaze-mem.workspace = true`\n  (entry H1, H2; `crates/hir` is lane db's). `crates/blaze-items` already has it.\n- **lane mem** (`crates/blaze-mem`): `pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R` in\n  `frame.rs`, beside `task` (line 447). Everything below programs against that signature.\n- **mem-db-infer-ctx** (`infer.rs`): `pub(crate) frame: &'f Frame` on `InferenceContext<'db,\n  'f>` (R2), and expr's X1 (`write_expr_adj(&mut self, ExprId, &[Adjustment])`) and X2\n  (`adjust_steps_as_infer_ok(&mut self, frame: &'f Frame) -> InferOk<'db, Vec<Adjustment, &'f\n  Frame>>`), written out in `v2/requests/mem-db-infer-expr.md`. Every `impl<'db>\n  InferenceContext<'db>` header in my files becomes `impl<'db, 'f> InferenceContext<'db, 'f>`.\n- **mem-db-infer-lower** (`lower.rs`): `TyLoweringContext::new` takes the frame as its last\n  parameter (R2); used by T1.\n- **mem-db-solver** (`next_solver/`): `PredicateObligations`, `QueryResponse`,\n  `OriginalQueryValues`, `elaborate`, `supertrait_def_ids`, `ObligationCtxt` allocate in the\n  solver; see \"Left as is\".\n\n> forwarded to db (from requests, pass 17; told by tmux).\n> checked by db-audit-mem (22:46): in the tree: `crates/hir-ty/src/lib.rs:5` (`allocator_api`), `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `FrameMap`/`FrameSet` in `crates/hir-ty/src/lib.rs`, `crates/hir-ty/src/infer.rs:2049` (the context's frame), salsa's `mem_tag` (`vendor/salsa/src/function/execute.rs`).",
+  "state": "applied",
+  "created": "2026-10-30T03:35:03Z",
+  "updated": "2026-10-30T09:56:53Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/mem-db-infer-method.md#Prerequisites (other parts)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-db-infer-method.md:56"
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:53Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-audit-mem (22:46): in the tree: `crates/hir-ty/src/lib.rs:5` (`allocator_api`), `crates/hir-ty/src/db.rs:46` (`INFER_TAG`), `FrameMap`/`FrameSet` in `crates/hir-ty/src/lib.rs`, `crates/hir-ty/src/infer.rs:2049` (the context's frame), salsa's `mem_tag` (`vendor/salsa/src/function/execute.rs`)."
+    }
+  ]
+}

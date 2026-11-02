@@ -1,0 +1,35 @@
+{
+  "id": "00752",
+  "from_lane": "solver-sync-glue",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/Cargo.toml"
+  ],
+  "what": "## 10. lane db: hir-ty depends on blaze-mem\n\n- `crates/hir-ty/Cargo.toml` `[dependencies]`: `blaze-mem.workspace = true`, for requests 8\n  and 9 and for `tls_cache`'s slot arrays in a `Region` tagged `Infer`.\n\n> forwarded to db (window `db-next2`, told by tmux); `blaze-mem` is a root workspace dependency now.\n\n> checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:51`; `interner/tls_cache.rs` uses `blaze_mem::{Pool, Pooled, pool::Limbo}`.",
+  "state": "applied",
+  "created": "2026-10-30T06:45:00Z",
+  "updated": "2026-10-30T09:56:56Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#10. lane db: hir-ty depends on blaze-mem",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:148"
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:56Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: checked by db-solver (2026-10-29 23:45): in the tree, `crates/hir-ty/Cargo.toml:51`; `interner/tls_cache.rs` uses `blaze_mem::{Pool, Pooled, pool::Limbo}`."
+    }
+  ]
+}

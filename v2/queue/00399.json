@@ -1,0 +1,37 @@
+{
+  "id": "00399",
+  "from_lane": "speed-link-edge-hot-proof",
+  "owner": "dedup-codec-rng",
+  "paths": [
+    "crates/blaze-v2-proof/src/lib.rs",
+    "python/typed-input/src",
+    "crates/blaze-v2-proof/src"
+  ],
+  "what": "## From speed-link-edge-hot-proof: `crates/blaze-v2-proof/src/lib.rs` hot_lint findings (20)\n\nYou hold `lib.rs` (the `Rng` move); every other file in `blaze-v2-proof` is done. Please apply\nthese with your `Rng` change, or tell me (window `speed-link-edge-hot-proof-next1`) once you are\nDONE and I will. `PYTHONPATH=python/typed-input/src python3 /tmp/sle_lint.py crates/blaze-v2-proof/src`\nshould then print 0. Behavior and bytes are unchanged.\n\n1. `TraceBuilder::finish`, the range `.clone()`s (lines 120-121 and 154-156): index by two\n   `usize`s instead of cloning a `Range`.\n\n   ```rust\n       let (from, to) = (row.from as usize, (row.from + row.len) as usize);\n       for (id, edge) in read_ids[from..to].iter_mut().zip(&self.edges[from..to]) {\n   ```\n\n   and\n\n   ```rust\n                   let (from, to) = (row.from as usize, (row.from + row.len) as usize);\n                   trace.reads.extend(read_ids[from..to].iter().map(|&read| rank[read as usize]));\n                   trace.saw.extend(self.edges[from..to].iter().map(|e| e.saw));\n   ```\n\n2. `TraceBuilder::finish`, each buffer is sized once a trace. Put these on the line above:\n   - `let mut read_ids = vec![NONE; ...]`: `// alloc: once a trace, sized to its edges: the key ID each edge read.`\n   - `let mut order: Vec<u32> = ...collect()`: `// alloc: once a trace, the sort's permutation of the distinct keys.`\n   - `let mut rank = vec![0u32; ...]`: `// alloc: once a trace, each key ID's sorted index.`\n   - `keys: order.iter()...collect(),`: `// alloc: the trace's key column, once a trace.`\n   - `fingerprints: vec![Fingerprint(0); n],`: `// alloc: the trace's fingerprint column, once a trace.`\n\n3. `KeyTable::with_capacity` (line 179), above the `KeyTable { ... }` line:\n   `// alloc: once a trace, the table's slots, sized for its keys.`\n\n4. `Trace::edges` (line 260-261), called per key in every join: no range clone.\n\n   ```rust\n       let (from, to) = (self.edges_from[i as usize] as usize, self.edges_from[i as usize + 1] as usize);\n       self.reads[from..to].iter().copied().zip(self.saw[from..to].iter().copied())\n   ```\n\n5. The answers, unallocated while empty:\n   - `under`, `let mut stale = Vec::new();`: `// alloc: the answer; unallocated while nothing is stale.`\n   - `over`, `let mut needless = Vec::new();`: `// alloc: the answer; unallocated while nothing reran for nothing.`\n   - `apart`, `let mut out = Vec::new();`: `// alloc: the answer; unallocated while the maps agree.`\n   - above each of the three `out.push(Apart::...)` lines: `// clone: the answer owns the keys and values where the maps differ, and only those.`\n\n6. Derives on big types (speed-link-edge-hot-shared.md part 1), the line above:\n   - `Trace`'s `#[derive(Clone, ...)]`: `// clone: tests only (join.rs's tests mutate a copy of a trace); nothing in the library clones one.`\n   - `Stale`'s derive: `// clone: no heap, keys and fingerprints only; nameres's `Finding::Stale` carries one.`\n\n7. `sample` (yours to rewrite with `Rng`; whatever `Rng` becomes, keep this shape): drop the\n   second `to_vec` and the `into_iter`.\n\n   ```rust\n   pub fn sample<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {\n       if n >= items.len() {\n           // alloc: the answer, once a sample: every item when there are no more.\n           return items.to_vec();\n       }\n       let mut rng = Rng::new(seed);\n       // alloc: once a sample, the partial shuffle's indices.\n       let mut at: Vec<usize> = (0..items.len()).collect();\n       for i in 0..n {\n           let j = i + rng.below((items.len() - i) as u64) as usize;\n           at.swap(i, j);\n       }\n       at.truncate(n);\n       radix::sort(&mut at);\n       // clone: the answer, the chosen items, once a sample.\n       at.iter().map(|&i| items[i].clone()).collect()\n   }\n   ```\n\nStatus: handed back. dedup-codec-rng is DONE with `lib.rs` (the `Rng` move is in: `pub use blaze_ids::rng::SplitMix64 as Rng;`, 20:59), so speed-link-edge-hot-proof-next1 applies all 7 items, including the `sample` shape (it works with the re-exported `Rng` as written).\n\nStatus: done by speed-link-edge-hot-proof (21:10), after dedup-bits-next1 released `lib.rs` too; the `Rng` re-export kept. Lint 0.\n\n> forwarded to dedup-codec-rng (holds `blaze-v2-proof/src/lib.rs`; speed-link-edge-hot-proof-next1 applies them once it is DONE) (requests, pass 19; told by tmux).",
+  "state": "applied",
+  "created": "2026-10-30T03:52:25Z",
+  "updated": "2026-10-31T18:43:22Z",
+  "taken_by": "dedup",
+  "why": null,
+  "source": "v2/requests/dedup-codec-rng.md#From speed-link-edge-hot-proof: `crates/blaze-v2-proof/src/lib.rs` hot_lint findings (20)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/dedup-codec-rng.md:3"
+    },
+    {
+      "at": "2026-10-31T18:43:22Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:43:22Z",
+      "by": "dedup",
+      "action": "done",
+      "note": "Already applied: hot_lint on blaze-v2-proof reports 0 findings (2026-10-31); the Rng move it waited on is long done (owner dedup-codec-rng retired)."
+    }
+  ]
+}

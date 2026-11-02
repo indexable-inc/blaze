@@ -1,0 +1,36 @@
+{
+  "id": "00152",
+  "from_lane": "fix-names-features",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/asm.rs",
+    "v2/refs.rs"
+  ],
+  "what": "## 3. (for fix-intrinsics / codegen) `asm::extensions` by feature, not by name\n- What: `crates/hir-ty-codegen/asm.rs`'s `extensions(arch, impl IntoIterator<Item = &str>)`\n  maps each name by `aarch64_version` / `aarch64_extension` string matches. It could take a\n  `hir_ty::TargetFeatureSet`, with a `const` table `[Option<&str>; TargetFeature::COUNT]`\n  (and one of versions) built by `TargetFeature::named`. Its callers (`mod.rs` inline `asm!`,\n  `v2/refs.rs` inline `asm!`, and the NEON lowering through `neon::Lowered::features`) would\n  pass `TargetFeatures::from_fn_no_implications(..).known()` or a set.\n- Why: per `asm!` block and per NEON intrinsic, cold next to the assembly text it builds, so I\n  left it: `asm.rs` is fix-intrinsics' file right now.\n\n> forwarded to codegen (and fix-intrinsics).",
+  "state": "refused",
+  "created": "2026-10-30T01:51:54Z",
+  "updated": "2026-10-31T21:06:59Z",
+  "taken_by": "codegen",
+  "why": "asm.rs extensions is cold (once per asm block or NEON intrinsic) and all four callers (mod.rs 6488 and 12053, v2/refs.rs 1567, v2/refs/intrinsics.rs 1446) hold feature names already, so a TargetFeatureSet table only converts them and back; no correctness or speed gain",
+  "source": "v2/requests/fix-names-features.md#3. (for fix-intrinsics / codegen) `asm::extensions` by feature, not by name",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/fix-names-features.md:29"
+    },
+    {
+      "at": "2026-10-31T21:06:59Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:06:59Z",
+      "by": "codegen",
+      "action": "refuse",
+      "note": "asm.rs extensions is cold (once per asm block or NEON intrinsic) and all four callers (mod.rs 6488 and 12053, v2/refs.rs 1567, v2/refs/intrinsics.rs 1446) hold feature names already, so a TargetFeatureSet table only converts them and back; no correctness or speed gain"
+    }
+  ]
+}

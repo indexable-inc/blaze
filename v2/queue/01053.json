@@ -1,0 +1,39 @@
+{
+  "id": "01053",
+  "from_lane": "integrate-store-harness",
+  "owner": "coordinator",
+  "paths": [
+    "harness/deps.py",
+    "harness/freshwarm.py",
+    "harness/bscache.py",
+    "harness/allblaze.py",
+    ".github/workflows/blaze-platform.yaml"
+  ],
+  "what": "Wholly-v1 remote/cache harnesses, not cut line by line because the remote or BLAZE_CACHE is their subject: harness/deps.py (all of it is the v1 remote), harness/freshwarm.py (push/pull to a remote), harness/bscache.py (RUSTC_WRAPPER=blaze-rustc with BLAZE_CACHE; dropping BLAZE_CACHE would make it use the user default store), harness/allblaze.py (drives the v1 engine with BLAZE_CACHE stores). Decide delete or port to the v2 daemon; their ci.py rows go with them. Also .github/workflows/blaze-platform.yaml:280 starts MinIO for the deleted harness/remote.py (with 01017).",
+  "state": "applied",
+  "created": "2026-10-30T14:50:23Z",
+  "updated": "2026-10-30T15:39:14Z",
+  "taken_by": "integrate-tooling",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:50:23Z",
+      "by": "integrate-store-harness",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:39:14Z",
+      "by": "integrate-tooling",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:39:14Z",
+      "by": "integrate-tooling",
+      "action": "done",
+      "note": "deps.py, freshwarm.py, bscache.py, allblaze.py (and allblaze_wasm.py) deleted with their ci.py rows; the MinIO step of blaze-platform.yaml removed"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01264",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify-bench",
+  "paths": [
+    "crates/blaze-bench/benches/query_hit.rs"
+  ],
+  "what": "(re-filed from blaze-v2-qu queue 01250, which collided with main's ids) blaze-v2-qu crates/blaze-bench/benches/query_hit.rs:266: `Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db)` must pass `&mut db` since R18 (singleton inputs take &mut; line 580 already does). Every other singleton caller in blaze-v2-qu is on &mut as of checkpoint 9. [query-unify-engine on re-filing: line 266 is the salsa Graph (`#[salsa::input(singleton)]` at :221), whose `new` takes `&`; the blaze_query one at :580 already passes `&mut db`. Likely nothing to do; the bench ran ok at cfe216f2de.]",
+  "state": "open",
+  "created": "2026-10-31T13:18:37Z",
+  "updated": "2026-10-31T13:18:37Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:18:37Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

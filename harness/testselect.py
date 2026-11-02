@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """testselect.py: `blaze test` with `BLAZE_TESTS=affected` runs the tests that have not
 passed as they are now, and no others: a pass is kept in the store under what the test is a
-function of, and travels with it through a remote.
+function of.
 
 usage: testselect.py    (BLAZE_BIN names the blaze built; blaze is found next to it)
 
@@ -32,9 +32,8 @@ package changes nothing of it outside its run, a test that writes outside fails 
 says what the sandbox denied it and how to take it out, a test its package takes out of the
 sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
 `BLAZE_SANDBOX=off` the hermetic tests are still skipped and the one that reads a file runs every
-time, `BLAZE_TESTS=verify` runs the tests kept as passed and says they passed again, a store
-pushed to a remote and pulled into an empty one skips every test that passed, and so does the
-store under a fresh target and daemon, as on a CI runner. A package that has not opted in keeps
+time, `BLAZE_TESTS=verify` runs the tests kept as passed and says they passed again, and the
+store under a fresh target and daemon skips every test that passed, as on a CI runner. A package that has not opted in keeps
 the passes of its hermetic tests all the same, and runs its bench every time.
 
 Python 3, stdlib only.
@@ -259,7 +258,6 @@ if SANDBOXED:
          "affected", None, True),
         ("nothing edited after it ran outside", [], "affected -v", {OUTSIDE_TEST}, True),
         ("every pass kept verified", [], "verify", None, True),
-        ("passes pulled from a remote", [], "remote", {OUTSIDE_TEST}, True),
         ("a fresh target and daemon with the store", [], "fresh", {OUTSIDE_TEST}, True),
     ]
 # What a step's output has to say, beside the tests it runs.
@@ -301,10 +299,6 @@ if SANDBOXED:
             rf'`unsandboxed-tests = \["{OUTSIDE_TEST}"\]` under `\[package\.metadata\.blaze\.sandbox\]`',
         ],
         "every pass kept verified": [r"Verified the passes kept: (\d+) of \1 tests passed again$"],
-        "passes pulled from a remote": [
-            rf"Cached \d+ tests from {KEPT_FROM}",
-            r"; 1 test run every time \(`blaze test --why` says why\);",
-        ],
         "a fresh target and daemon with the store": [
             rf"Cached \d+ tests from {KEPT_FROM}",
         ],
@@ -440,18 +434,7 @@ def beside(root, env):
 
 def test(ws, env, mode):
     """`mode` is BLAZE_TESTS's value, then `blaze test`'s arguments and NAME=VALUE for the
-    environment. `remote` pushes the store to a directory, pulls that into an empty store and
-    runs `affected` with it."""
-    if mode == "remote":
-        remote, pulled = os.path.join(ws, "..", "remote"), os.path.join(ws, "..", "pulled-store")
-        for verb, store in (("push", env["BLAZE_CACHE"]), ("pull", pulled)):
-            moved = subprocess.run([os.environ["BLAZE_BIN"], "cache", verb, remote, "tsel"], cwd=ws,
-                                   env=dict(env, BLAZE_CACHE=store, BLAZE_REMOTE_UNSIGNED="1"),
-                                   capture_output=True, text=True,
-                                   timeout=TIMEOUT)
-            if moved.returncode != 0:
-                return moved.returncode, f"cache {verb} failed:\n{moved.stdout}{moved.stderr}"
-        return test(ws, dict(env, BLAZE_CACHE=pulled), "affected")
+    environment."""
     if mode == "fresh":
         subprocess.run(["blaze", "stop"], cwd=ws, env=env, capture_output=True, timeout=TIMEOUT)
         shutil.rmtree(os.path.join(ws, "target"))
@@ -480,9 +463,10 @@ def main():
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    # A store of its own: the passes it keeps are what the steps are about.
+    # A home of its own, so a store of its own (`<home>/v2/store`): the passes it keeps are what
+    # the steps are about.
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               RUST_BACKTRACE="0", BLAZE_CACHE=os.path.join(root, "store"))
+               RUST_BACKTRACE="0")
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "BLAZE_TESTS"):
         env.pop(name, None)
     wrong = 0

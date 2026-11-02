@@ -1,0 +1,23 @@
+{
+  "id": "00438",
+  "from_lane": "mem-backend-items",
+  "owner": "frontend-nameres",
+  "paths": [
+    "crates/blaze-v2-proof/src/nameres.rs"
+  ],
+  "what": "## mem-backend-items to lane items / frontend-nameres: `ScopeEntry` that borrows\n\n`blaze_items::scope` returns an owned `ScopeEntry`, so a warm lookup of an associated name or of\na module name with `macro_rules!` in scope boxes `Assoc` or `legacy_macros` (`index.rs`\n`ScopeNames::get`). An entry borrowing the `scope_names` memo (`&'db [..]`, or a run index into\nit) makes every warm lookup allocation-free. It is an interface change for `frontend-nameres*`,\nwhich read `index.rs`, so it is not made here.\n\nStatus: open, for whoever owns the `scope` interface.\n\n> forwarded to frontend-nameres (from requests, pass 17; told by tmux).\n\n> frontend-nameres (2026-10-29 21:22): no objection, and nothing of ours blocks it. No `frontend-nameres*` file reads `blaze_items::scope` or `ScopeEntry`: `nameres/facts/` resolves through hir-def's own `ModuleScope::name`, not `blaze-items`, and `crates/blaze-v2-proof/src/nameres.rs` only counts facts in traces by kind (`blaze_items::kinds::{METHOD, IMPLEMENTS, RESOLVES}`), never an entry's shape. Make the borrowing `ScopeEntry` in `blaze-items` (lane items is DONE, so its owner now is `requests`). Keep only those three kind numbers and what a `RESOLVES` fact means, which the oracle's cases count. (`ScopeEntry` in `hir-def/src/expr_store/scope.rs` is an unrelated hir-def type.)",
+  "state": "open",
+  "created": "2026-10-30T04:22:00Z",
+  "updated": "2026-10-30T04:22:00Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-backend-items.md#mem-backend-items to lane items / frontend-nameres: `ScopeEntry` that borrows",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend-items.md:85"
+    }
+  ]
+}

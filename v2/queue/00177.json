@@ -1,0 +1,35 @@
+{
+  "id": "00177",
+  "from_lane": "speed-hir",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-def/src/item_scope.rs"
+  ],
+  "what": "## for speed-hir-nameres-scope (from speed-hir-nameres-edge): a reverse index for `name_of`/`names_of`\n\n`find_path`'s local search (`find_local_import_locations`) calls `ItemScope::name_of(item)` once\nper module it reaches, and `find_in_scope` calls `names_of` per ancestor scope; today both are\n`naming(item)`, a scan of the item's whole namespace column (40 bytes an entry). A diagnostic run\nprinting a type per mismatch does `O(names in the crate)` packed compares per `find_path`.\n\nIn `crates/hir-def/src/item_scope.rs`, beside `sorted`:\n\n```rust\n    /// The entries of each namespace by def: `ns << 30 | pos` sorted by `(ns, def_tag, def, pos)`,\n    /// built on the first `name_of` of a scope with more than `LINEAR` names. 4 bytes an entry.\n    pub(crate) by_def: OnceLock<Box<[u32]>>,\n```\n\nand `naming` becomes, for `indexed_len() > LINEAR` (the scan stays below that):\n\n```rust\nlet by_def = self.by_def.get_or_init(|| {\n    let mut all: Vec<u32> = (named(TYPES, &self.types.entries))\n        .chain(named(VALUES, &self.values.entries))\n        .chain(named(MACROS, &self.macros.entries))\n        .map(|(ns, pos, _)| ns << 30 | pos as u32)\n        .collect();\n    // `sort_unstable_by_key` on (ns, tag, id, pos): pos last keeps column order among a def's\n    // names, which is what `name_of` (the first) and `names_of` (first `Some`) answer.\n    all.sort_unstable_by_key(|&at| { let e = self.entry_at(at); (at >> 30, e.def_tag, e.def, at & POS_MASK) });\n    all.into_boxed_slice()\n});\nlet key = (ns, tag, id);\nlet start = by_def.partition_point(|&at| { let e = self.entry_at(at); (at >> 30, e.def_tag, e.def) < key });\nby_def[start..].iter().map_while(move |&at| { let e = self.entry_at(at); e.is_def((tag, id)).then_some(at) })\n    .filter(|&at| at >> 30 == ns)\n    .map(|at| { let e = self.entry_at(at); (&e.name, e.vis(), e.declared()) })\n```\n\n(`entry_at(at)` = the `Entry` at `name_at`'s place; `Option<salsa::Id>` is `Ord`.) Reset it\nwherever `sorted.take()` runs (`added`) and in `seal`/`Clone`/`PartialEq` as `sorted` is.\nLookup: `O(log n)` instead of `O(n)`; nothing built for scopes never asked. Semantics unchanged:\nsame first name in column order. `find_path`'s differential test\n(`find_path::tests::differential_against_reference`) checks the paths stay the same.\n\nStatus: done by speed-hir-nameres-scope, as written. `by_def` is also cleared where an entry's def\nis replaced in place (`push_res_with_import`'s shadowing arms, `update_def_*`), not only in\n`added`. The model test now checks `names_of`'s whole list, in column order, for types and values.\n\n> forwarded to speed: between speed's children.",
+  "state": "applied",
+  "created": "2026-10-30T02:12:25Z",
+  "updated": "2026-10-30T08:54:10Z",
+  "taken_by": "speed",
+  "why": null,
+  "source": "v2/requests/speed-hir.md#for speed-hir-nameres-scope (from speed-hir-nameres-edge): a reverse index for `name_of`/`names_of`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir.md:286"
+    },
+    {
+      "at": "2026-10-30T08:54:10Z",
+      "by": "speed",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:54:10Z",
+      "by": "speed",
+      "action": "done",
+      "note": "Done by speed-hir-nameres-scope: reverse index by_def for name_of/names_of in crates/hir-def/src/nameres/frozen.rs, cleared with its entries."
+    }
+  ]
+}

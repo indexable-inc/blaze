@@ -17,8 +17,7 @@ Prints each step's time and exits non-zero when one is wrong.
 import json, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-from difftest import BLAZE
+BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(os.path.dirname(HERE), "target/release/blaze-engine" + (".exe" if os.name == "nt" else ""))
 
 
 def main():
@@ -29,13 +28,11 @@ def main():
     ws = tempfile.mkdtemp(prefix="blaze-constmacros-")
     shutil.copytree(os.path.join(HERE, "constmacros"), ws, dirs_exist_ok=True)
     home = os.path.join(ws, ".blaze-home")
-    env = {**os.environ, "BLAZE_HOME": home, "BLAZE_CACHE": os.path.join(home, "store")}
+    env = {**os.environ, "BLAZE_HOME": home}
 
     def blaze(*args):
-        # The engine takes `blaze build` as `cargo build`; `stop` as itself.
-        argv = [BLAZE, *args] if args[0] == "stop" else [BLAZE, "cargo", *args]
         start = time.monotonic()
-        ran = subprocess.run(argv, cwd=ws, env=env, capture_output=True, text=True)
+        ran = subprocess.run([BLAZE, *args], cwd=ws, env=env, capture_output=True, text=True)
         return ran, time.monotonic() - start
 
     def edit(path, old, new):

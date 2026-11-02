@@ -112,30 +112,7 @@ pub(super) fn atom_expr(
         T![continue] => continue_expr(p),
         T![break] => break_expr(p, r),
 
-        LIFETIME_IDENT if la == T![:] => {
-            let m = p.start();
-            label(p);
-            match p.current() {
-                T![loop] => loop_expr(p, Some(m)),
-                T![for] => for_expr(p, Some(m)),
-                T![while] => while_expr(p, Some(m)),
-                // test labeled_block
-                // fn f() { 'label: {}; }
-                T!['{'] => {
-                    stmt_list(p);
-                    m.complete(p, BLOCK_EXPR)
-                }
-                _ => {
-                    // test_err misplaced_label_err
-                    // fn main() {
-                    //     'loop: impl
-                    // }
-                    p.error("expected a loop or block");
-                    m.complete(p, ERROR);
-                    return None;
-                }
-            }
-        }
+        LIFETIME_IDENT if la == T![:] => labeled_expr(p)?,
         // test effect_blocks
         // fn f() { unsafe { } }
         // fn f() { const { } }
@@ -270,7 +247,8 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // fn foo() {
         //     builtin#offset_of(Foo, (bar.baz.0));
         // }
-        while !p.at(EOF) && !p.at(T![')']) {
+        // A name refuses a `}` without bumping it: the `}` closes a block around the macro.
+        while !p.at(EOF) && !p.at(T![')']) && !p.at(T!['}']) {
             // `0.1` is lexed as a float; whoever reads the name splits it.
             if p.at(FLOAT_NUMBER) {
                 let m = p.start();
@@ -331,6 +309,21 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // test include_bytes
         // fn foo() { builtin # include_bytes }
         Some(m.complete(p, INCLUDE_BYTES_EXPR))
+    } else if p.eat_contextual_kw(T![wrap_binder]) || p.eat_contextual_kw(T![unwrap_binder]) {
+        // As rustc's `parse_expr_unsafe_binder_cast`: an expression, then a type after a comma
+        // or nothing; no trailing comma.
+        // test unsafe_binder_cast
+        // fn foo() {
+        //     builtin # wrap_binder(x);
+        //     builtin # unwrap_binder(x, &u32);
+        // }
+        p.expect(T!['(']);
+        expr(p);
+        if p.eat(T![,]) {
+            type_(p);
+        }
+        p.expect(T![')']);
+        Some(m.complete(p, UNSAFE_BINDER_CAST_EXPR))
     } else if p.eat_contextual_kw(T![cfg]) {
         p.expect(T!['(']);
         attributes::cfg_predicate(p);
@@ -356,14 +349,15 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 // }
 pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedMarker> {
     p.expect(T!['(']);
-    if expr(p).is_none() {
+    if expr(p).is_none() && !p.at(T!['}']) {
         p.err_and_bump("expected asm template");
     }
     let mut allow_templates = true;
-    while !p.at(EOF) && !p.at(T![')']) {
+    // A `}` here closes a block around the `asm!`: every `{` inside it is an operand's.
+    while !p.at(EOF) && !p.at(T![')']) && !p.at(T!['}']) {
         p.expect(T![,]);
         // accept trailing commas
-        if p.at(T![')']) {
+        if p.at(T![')']) || p.at(T!['}']) {
             break;
         }
 
@@ -455,7 +449,7 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
             // The attributes of a template are the template expression's.
             let r =
                 Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
-            if expr_bp(p, Some(op_n), r, 1).is_none() {
+            if expr_bp(p, Some(op_n), r, 1).is_none() && !p.at(T!['}']) {
                 p.err_and_bump("expected asm template");
             }
             continue;
@@ -474,6 +468,8 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
                 //     );
                 // }
                 expr(p);
+            } else if p.at(T!['}']) {
+                p.error("expected asm operand");
             } else {
                 p.err_and_bump("expected asm operand");
             }
@@ -492,7 +488,7 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
 fn parse_options(p: &mut Parser<'_>) {
     p.expect(T!['(']);
 
-    while !p.eat(T![')']) && !p.at(EOF) {
+    while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
         const OPTIONS: &[SyntaxKind] = &[
             T![pure],
             T![nomem],
@@ -523,7 +519,7 @@ fn parse_options(p: &mut Parser<'_>) {
 fn parse_clobber_abi(p: &mut Parser<'_>) {
     p.expect(T!['(']);
 
-    while !p.eat(T![')']) && !p.at(EOF) {
+    while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
         if !p.expect(T![string]) {
             break;
         }
@@ -546,6 +542,8 @@ fn parse_reg(p: &mut Parser<'_>) {
         let m = p.start();
         p.bump_any();
         m.complete(p, ASM_REG_SPEC);
+    } else if p.at(T!['}']) {
+        p.error("expected register name");
     } else {
         p.err_and_bump("expected register name");
     }
@@ -689,6 +687,33 @@ fn label(p: &mut Parser<'_>) {
     lifetime(p);
     p.bump_any();
     m.complete(p, LABEL);
+}
+
+/// A loop or block after a label (rustc's `parse_expr_labeled`); `None` after the error when
+/// neither follows.
+fn labeled_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    let m = p.start();
+    label(p);
+    Some(match p.current() {
+        T![loop] => loop_expr(p, Some(m)),
+        T![for] => for_expr(p, Some(m)),
+        T![while] => while_expr(p, Some(m)),
+        // test labeled_block
+        // fn f() { 'label: {}; }
+        T!['{'] => {
+            stmt_list(p);
+            m.complete(p, BLOCK_EXPR)
+        }
+        _ => {
+            // test_err misplaced_label_err
+            // fn main() {
+            //     'loop: impl
+            // }
+            p.error("expected a loop or block");
+            m.complete(p, ERROR);
+            return None;
+        }
+    })
 }
 
 // test loop_expr
@@ -1007,6 +1032,16 @@ fn break_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
     assert!(p.at(T![break]));
     let m = p.start();
     p.bump(T![break]);
+    // rustc's `parse_expr_break`: `break 'a: loop {}` breaks with the labeled loop as its value,
+    // and the error ends where the value does.
+    if p.at(LIFETIME_IDENT) && p.nth(1) == T![:] && !p.nth_at(1, T![::]) {
+        if labeled_expr(p).is_some() {
+            p.error(
+                "parentheses are required around this expression to avoid confusion with a labeled break expression",
+            );
+        }
+        return m.complete(p, BREAK_EXPR);
+    }
     if p.at(LIFETIME_IDENT) {
         lifetime(p);
     }

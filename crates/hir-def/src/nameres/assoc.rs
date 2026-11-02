@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use cfg::CfgOptions;
 use hir_expand::{
     AstId, AttrMacroAttrIds, ExpandTo, HirFileId, InFile, Intern, Lookup, MacroCallKind,
@@ -11,11 +11,10 @@ use hir_expand::{
     name::{AsName, Name},
     span_map::SpanMap,
 };
-use intern::Interned;
 use span::AstIdMap;
 use syntax::{
-    AstNode,
-    ast::{self, HasModuleItem, HasName},
+    ast,
+    view::{self, AstNode, HasModuleItem, HasName},
 };
 use thin_vec::ThinVec;
 
@@ -38,25 +37,25 @@ pub struct TraitItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl TraitItems {
     #[inline]
-    pub(crate) fn query(db: &dyn SourceDatabase, tr: TraitId) -> &TraitItems {
+    pub(crate) fn query(db: &Db, tr: TraitId) -> &TraitItems {
         &Self::query_with_diagnostics(db, tr).0
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn query_with_diagnostics(
-        db: &dyn SourceDatabase,
+        db: &Db,
         tr: TraitId,
     ) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
-        let ast_id_map = ast_id.file_id.ast_id_map(db);
-        let source = ast_id.with_value(ast_id_map.get(ast_id.value)).to_node(db);
+        let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
             // FIXME(trait-alias) probably needs special handling here
             return (
                 TraitItems { macro_calls: ThinVec::new(), items: Box::default() },
+                // alloc: empty; allocates nothing
                 DefDiagnostics::new(vec![]),
             );
         }
@@ -110,16 +109,16 @@ pub struct ImplItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ImplItems {
-    #[salsa::tracked(returns(ref))]
-    pub fn of(db: &dyn SourceDatabase, id: ImplId) -> (ImplItems, DefDiagnostics) {
+    #[blaze_query::tracked(returns(ref))]
+    pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
 
         let collector =
             AssocItemCollector::new(db, module_id, ItemContainerId::ImplId(id), ast_id.file_id);
-        let source = ast_id.with_value(collector.ast_id_map.get(ast_id.value)).to_node(db);
+        let source = collector.ast_id_map.get(ast_id.value).to_view(ast_id.file_id.root(db));
         let (items, macro_calls, diagnostics) = collector.collect(source.assoc_item_list());
 
         (ImplItems { items, macro_calls }, DefDiagnostics::new(diagnostics))
@@ -133,7 +132,7 @@ impl ImplItems {
 }
 
 struct AssocItemCollector<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     module_id: ModuleId,
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
@@ -151,7 +150,7 @@ struct AssocItemCollector<'db> {
 
 impl<'db> AssocItemCollector<'db> {
     fn new(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         module_id: ModuleId,
         container: ItemContainerId,
         file_id: HirFileId,
@@ -167,17 +166,19 @@ impl<'db> AssocItemCollector<'db> {
             cfg_options: module_id.krate(db).cfg_options(db),
             file_id,
             container,
+            // alloc: the query's result, once per trait or impl
             items: Vec::new(),
 
             macro_depth: file_id.macro_expansion_depth(db),
             macro_calls: ThinVec::new(),
+            // alloc: the query's result, once per trait or impl
             diagnostics: Vec::new(),
         }
     }
 
     fn collect(
         mut self,
-        item_list: Option<ast::AssocItemList>,
+        item_list: Option<view::AssocItemList<'db>>,
     ) -> (Box<[(Name, AssocItemId)]>, ThinVec<(AstId<ast::Item>, MacroCallId)>, Vec<DefDiagnostic>)
     {
         if let Some(item_list) = item_list {
@@ -189,16 +190,15 @@ impl<'db> AssocItemCollector<'db> {
         (self.items.into_boxed_slice(), self.macro_calls, self.diagnostics)
     }
 
-    fn collect_item(&mut self, item: ast::AssocItem) {
-        let ast_id = self.ast_id_map.ast_id(&item);
-        let attrs = match AttrsOrCfg::lower(self.db, &item, &|| self.cfg_options, self.span_map) {
+    fn collect_item(&mut self, item: view::AssocItem<'db>) {
+        let ast_id = self.ast_id_map.ast_id_of_view::<ast::AssocItem>(item);
+        let attrs = match AttrsOrCfg::lower(self.db, item, &|| self.cfg_options, self.span_map) {
             AttrsOrCfg::Enabled { attrs } => attrs,
             AttrsOrCfg::CfgDisabled(cfg) => {
                 self.diagnostics.push(DefDiagnostic::unconfigured_code(
                     self.module_id,
                     InFile::new(self.file_id, ast_id.erase()),
                     cfg.0,
-                    self.cfg_options.clone(),
                 ));
                 return;
             }
@@ -206,7 +206,7 @@ impl<'db> AssocItemCollector<'db> {
         let ast_id = InFile::new(self.file_id, ast_id.upcast());
 
         'attrs: for (attr_id, attr) in attrs.as_ref().iter() {
-            let ast_id_with_path = AstIdWithPath { path: attr.path.clone(), ast_id };
+            let ast_id_with_path = AstIdWithPath { path: ModPath::clone(&attr.path), ast_id };
 
             match self.def_map.resolve_attr_macro(
                 self.local_def_map,
@@ -225,11 +225,11 @@ impl<'db> AssocItemCollector<'db> {
                         // crate failed), skip expansion like we would if it was
                         // disabled. This is analogous to the handling in
                         // `DefCollector::collect_macros`.
-                        if let Some(err) = exp.as_expand_error(self.module_id.krate(self.db)) {
+                        if let Some(err) = exp.as_expand_error(self.db, loc.def.krate) {
                             self.diagnostics.push(DefDiagnostic::macro_error(
                                 self.module_id,
                                 ast_id,
-                                (*attr.path).clone(),
+                                ModPath::clone(&attr.path),
                                 err,
                             ));
                             continue 'attrs;
@@ -249,7 +249,7 @@ impl<'db> AssocItemCollector<'db> {
                             attr_args: None,
                             censored_attr_ids: AttrMacroAttrIds::from_one(attr_id),
                         },
-                        (*attr.path).clone(),
+                        ModPath::clone(&attr.path),
                     ));
                 }
             }
@@ -258,11 +258,11 @@ impl<'db> AssocItemCollector<'db> {
         self.record_item(item);
     }
 
-    fn record_item(&mut self, item: ast::AssocItem) {
+    fn record_item(&mut self, item: view::AssocItem<'db>) {
         match item {
-            ast::AssocItem::Fn(function) => {
+            view::AssocItem::Fn(function) => {
                 let Some(name) = function.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&function);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::Fn>(function);
                 let def = FunctionLoc {
                     container: self.container,
                     id: InFile::new(self.file_id, ast_id),
@@ -270,9 +270,9 @@ impl<'db> AssocItemCollector<'db> {
                 .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::TypeAlias(type_alias) => {
+            view::AssocItem::TypeAlias(type_alias) => {
                 let Some(name) = type_alias.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&type_alias);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::TypeAlias>(type_alias);
                 let def = TypeAliasLoc {
                     container: self.container,
                     id: InFile::new(self.file_id, ast_id),
@@ -280,25 +280,24 @@ impl<'db> AssocItemCollector<'db> {
                 .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::Const(konst) => {
+            view::AssocItem::Const(konst) => {
                 let Some(name) = konst.name() else { return };
-                let ast_id = self.ast_id_map.ast_id(&konst);
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::Const>(konst);
                 let def =
                     ConstLoc { container: self.container, id: InFile::new(self.file_id, ast_id) }
                         .intern(self.db);
                 self.items.push((name.as_name(), def.into()));
             }
-            ast::AssocItem::MacroCall(call) => {
-                let ast_id = self.ast_id_map.ast_id(&call);
+            view::AssocItem::MacroCall(call) => {
+                let ast_id = self.ast_id_map.ast_id_of_view::<ast::MacroCall>(call);
                 let ast_id = InFile::new(self.file_id, ast_id);
                 let Some(path) = call.path() else { return };
                 let range = path.syntax().text_range();
-                let Some(path) = ModPath::from_src(self.db, path, &mut |range| {
+                let Some(path) = ModPath::from_src_view(self.db, path, &mut |range| {
                     self.span_map.span_for_range(range).ctx
                 }) else {
                     return;
                 };
-                let path = Interned::new(path);
                 let ctxt = self.span_map.span_for_range(range).ctx;
 
                 let resolver = |path: &ModPath| {
@@ -322,7 +321,9 @@ impl<'db> AssocItemCollector<'db> {
                         .take_macros()
                         .map(|it| it.definition(self.db))
                 };
-                match macro_call_as_call_id(
+                // alloc: none unless the call is eager and its input holds macro calls
+                let mut eager_calls = Vec::new();
+                let call_id = macro_call_as_call_id(
                     self.db,
                     ast_id,
                     &path,
@@ -332,10 +333,14 @@ impl<'db> AssocItemCollector<'db> {
                     self.macro_depth + 1,
                     self.def_map.recursion_limit(),
                     resolver,
-                    &mut |ptr, call_id| {
-                        self.macro_calls.push((ptr.map(|(_, it)| it.upcast()), call_id))
-                    },
-                ) {
+                    &mut eager_calls,
+                );
+                self.macro_calls.extend(
+                    eager_calls
+                        .into_iter()
+                        .map(|(ptr, call_id)| (ptr.map(|(_, it)| it.upcast()), call_id)),
+                );
+                match call_id {
                     // FIXME: Expansion error?
                     Ok(call_id) => match call_id.value {
                         Some(call_id) => {
@@ -352,7 +357,7 @@ impl<'db> AssocItemCollector<'db> {
                                 expand_to: ExpandTo::Items,
                                 eager: None,
                             },
-                            (*path).clone(),
+                            path,
                         ));
                     }
                 }
@@ -362,7 +367,8 @@ impl<'db> AssocItemCollector<'db> {
 
     fn collect_macro_items(&mut self, macro_call_id: MacroCallId) {
         if self.macro_depth > self.def_map.recursion_limit() {
-            tracing::warn!("macro expansion is too deep");
+            let diag = DefDiagnostic::recursion_overflow(self.db, self.module_id, macro_call_id);
+            self.diagnostics.push(diag);
             return;
         }
 
@@ -372,13 +378,13 @@ impl<'db> AssocItemCollector<'db> {
         let old_span_map = mem::replace(&mut self.span_map, SpanMap::ExpansionSpanMap(span_map));
         self.macro_depth += 1;
 
-        let items = ast::MacroItems::cast(syntax.syntax_node()).expect("not `MacroItems`");
+        let items = view::MacroItems::cast(syntax.root()).expect("not `MacroItems`");
         for item in items.items() {
             let item = match item {
-                ast::Item::Fn(it) => ast::AssocItem::from(it),
-                ast::Item::Const(it) => it.into(),
-                ast::Item::TypeAlias(it) => it.into(),
-                ast::Item::MacroCall(it) => it.into(),
+                view::Item::Fn(it) => view::AssocItem::from(it),
+                view::Item::Const(it) => it.into(),
+                view::Item::TypeAlias(it) => it.into(),
+                view::Item::MacroCall(it) => it.into(),
                 // FIXME: Should error on disallowed item kinds.
                 _ => continue,
             };

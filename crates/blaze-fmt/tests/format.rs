@@ -83,6 +83,21 @@ fn max_width() {
 }
 
 #[test]
+fn chains_in_both_indent_styles() {
+    let src = "fn main() { let x = aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbb().ccccccccccccccccccccccccc().ddddddddddddddddddddddd(); }\n";
+    formats_as(
+        src,
+        &[],
+        "fn main() {\n    let x = aaaaaaaaaaaaaaaaaaaa\n        .bbbbbbbbbbbbbbbbbbbbbbbbb()\n        .ccccccccccccccccccccccccc()\n        .ddddddddddddddddddddddd();\n}\n",
+    );
+    formats_as(
+        src,
+        &["indent_style=Visual"],
+        "fn main() {\n    let x = aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbb()\n                                .ccccccccccccccccccccccccc()\n                                .ddddddddddddddddddddddd();\n}\n",
+    );
+}
+
+#[test]
 fn a_syntax_error_is_refused() {
     let (_, refused) = format("fn main() { let = ; }\n", &[]);
     assert!(refused);

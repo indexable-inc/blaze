@@ -1,0 +1,24 @@
+{
+  "id": "00941",
+  "from_lane": "item-hash",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-items/src/facts.rs",
+    "crates/blaze-items/src/goals.rs"
+  ],
+  "what": "Please also reassign 00881, 00919 and 00828 (owner items, no live window) to item-hash: item-hash-identity makes them as targeted edits in crates/blaze-items/src/{facts.rs,goals.rs,table.rs} now (fact values by signature_hash, which removes a salsa cycle infer -> fact value -> interface_hash -> infer; one tracked fact_value query). Same reason as 00869.",
+  "state": "open",
+  "created": "2026-10-30T10:25:43Z",
+  "updated": "2026-10-30T10:25:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T10:25:43Z",
+      "by": "item-hash",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

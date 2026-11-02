@@ -1,24 +1,28 @@
 //! MIR definitions and implementation
 
-use std::{fmt::Display, iter};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    hash::{Hash, Hasher},
+    iter,
+};
 
-use base_db::target::TargetLoadError;
+use base_db::{Db, target::TargetLoadError};
 use either::Either;
 use hir_def::{
     ExpressionStoreOwnerId, FieldId, FunctionId, GenericParamId, LocalFieldId, StaticId, TraitId,
     UnionId, VariantId,
-    expr_store::{ExpressionStore, path::Path},
+    expr_store::ExpressionStore,
     hir::{BindingId, ClosureKind, CoroutineSource, Expr, ExprId, Ordering, PatId},
 };
-use hir_expand::name::Name;
+use hir_expand::{mod_path::ModPath, name::Name};
+use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     CoroutineArgs, GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use smallvec::{SmallVec, smallvec};
 use stdx::impl_from;
 
@@ -27,6 +31,7 @@ use crate::{
     consteval::ConstEvalError,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     infer::PointerCast,
+    intrinsic::Intrinsic,
     layout::LayoutError,
     next_solver::{
         Allocation, AllocationData, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv,
@@ -38,6 +43,7 @@ use crate::{
 };
 
 mod held;
+pub(crate) mod persist;
 pub mod target;
 
 pub use held::{HeldLocals, YieldPoint};
@@ -72,14 +78,14 @@ pub struct Local {
 /// **Needs clarification:** Is loading a place that has its variant index set well-formed? Miri
 /// currently implements it, but it seems like this may be something to check against in the
 /// validator.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Operand {
     pub kind: OperandKind,
     // FIXME : This should actually just be of type `MirSpan`.
     pub span: Option<MirSpan>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum OperandKind {
     /// Creates a value by loading the given place.
     ///
@@ -128,7 +134,7 @@ impl<'db> Operand {
     }
 
     pub fn from_fn(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         func_id: hir_def::FunctionId,
         generic_args: GenericArgs<'db>,
     ) -> Operand {
@@ -141,11 +147,31 @@ impl<'db> Operand {
     pub fn span(&self) -> Option<MirSpan> {
         self.span
     }
+
+    /// The function item, constructor or not, this operand is a value of, with its generic
+    /// arguments: a call's callee when it is named, not a pointer.
+    pub fn fn_def(&self) -> Option<(CallableDefId, GenericArgs<'db>)> {
+        let ty: Ty<'db> = match &self.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return None,
+        };
+        let TyKind::FnDef(callable, args) = ty.kind() else { return None };
+        Some((callable.0, args.skip_binder()))
+    }
+
+    /// [`Operand::fn_def`] when it is a function, not a constructor.
+    pub fn fn_item(&self) -> Option<(FunctionId, GenericArgs<'db>)> {
+        match self.fn_def()? {
+            (CallableDefId::FunctionId(func), args) => Some((func, args)),
+            _ => None,
+        }
+    }
 }
 
 /// The index of a field (whether of a struct/enum variant, tuple, or closure).
 /// For a struct/enum it converts from and to the LocalFieldId, for a tuple or closure it's simply the index.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, salsa::SalsaValue, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, blaze_query::Value, PartialOrd, Ord, Debug)]
 pub struct FieldIndex(pub u32);
 
 impl FieldIndex {
@@ -218,7 +244,9 @@ impl<V: PartialEq> ProjectionElem<V> {
 
 pub type PlaceElem = ProjectionElem<LocalId>;
 
-impl<W: crate::next_solver::WorldExposer> GenericTypeVisitable<W> for PlaceElem {
+// SAFETY: visits every field: no variant holds a type (fields, locals, offsets and variants
+// only).
+unsafe impl<W: crate::next_solver::WorldExposer> GenericTypeVisitable<W> for PlaceElem {
     fn generic_visit_with(&self, _: &mut W) {}
 }
 
@@ -287,7 +315,7 @@ impl<'db> From<LocalId> for Place<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AggregateKind {
     /// The type is of the element
     Array(StoredTy),
@@ -299,7 +327,7 @@ pub enum AggregateKind {
     //Coroutine(LocalDefId, SubstsRef, Movability),
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)] // clone: inside `MirBody`
 pub struct SwitchTargets {
     /// Possible values. The locations to branch to in each case
     /// are found in the corresponding indices from the `targets` vector.
@@ -329,14 +357,21 @@ impl SwitchTargets {
         targets: impl Iterator<Item = (u128, BasicBlockId)>,
         otherwise: BasicBlockId,
     ) -> Self {
-        let (values, mut targets): (SmallVec<_>, SmallVec<_>) = targets.unzip();
-        targets.push(otherwise);
-        Self { values, targets }
+        let count = targets.size_hint().0;
+        let mut values = SmallVec::with_capacity(count);
+        let mut blocks = SmallVec::with_capacity(count + 1);
+        for (value, target) in targets {
+            values.push(value);
+            blocks.push(target);
+        }
+        blocks.push(otherwise);
+        Self { values, targets: blocks }
     }
 
     /// Builds a switch targets definition that jumps to `then` if the tested value equals `value`,
     /// and to `else_` if not.
     pub fn static_if(value: u128, then: BasicBlockId, else_: BasicBlockId) -> Self {
+        // alloc: none, both lists fit inline
         Self { values: smallvec![value], targets: smallvec![then, else_] }
     }
 
@@ -368,20 +403,28 @@ impl SwitchTargets {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Terminator {
     pub span: MirSpan,
     pub kind: TerminatorKind,
 }
 
 /// What a failed [`TerminatorKind::Assert`] panics with: rustc's `AssertKind`.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AssertKind {
     BoundsCheck { len: Operand, index: Operand },
     Overflow(BinOp, Operand, Operand),
     OverflowNeg(Operand),
     DivisionByZero(Operand),
     RemainderByZero(Operand),
+    /// rustc's `CheckAlignment`: `found` is the address, `required` its type's alignment.
+    MisalignedPointerDereference { required: Operand, found: Operand },
+    /// rustc's `CheckNull` on a dereference.
+    NullPointerDereference,
+    /// rustc's `CheckNull` on a reference made from a raw pointer.
+    NullReferenceConstructed,
+    /// rustc's `CheckEnums`: the operand is the invalid discriminant or value, as a `u128`.
+    InvalidEnumConstruction(Operand),
 }
 
 impl AssertKind {
@@ -408,9 +451,15 @@ impl AssertKind {
                 f(a);
                 f(b);
             }
+            AssertKind::MisalignedPointerDereference { required, found } => {
+                f(required);
+                f(found);
+            }
             AssertKind::OverflowNeg(a)
             | AssertKind::DivisionByZero(a)
-            | AssertKind::RemainderByZero(a) => f(a),
+            | AssertKind::RemainderByZero(a)
+            | AssertKind::InvalidEnumConstruction(a) => f(a),
+            AssertKind::NullPointerDereference | AssertKind::NullReferenceConstructed => {}
         }
     }
 
@@ -424,14 +473,54 @@ impl AssertKind {
                 f(a);
                 f(b);
             }
+            AssertKind::MisalignedPointerDereference { required, found } => {
+                f(required);
+                f(found);
+            }
             AssertKind::OverflowNeg(a)
             | AssertKind::DivisionByZero(a)
-            | AssertKind::RemainderByZero(a) => f(a),
+            | AssertKind::RemainderByZero(a)
+            | AssertKind::InvalidEnumConstruction(a) => f(a),
+            AssertKind::NullPointerDereference | AssertKind::NullReferenceConstructed => {}
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+/// The blocks control goes to from a terminator, borrowed from it: what
+/// [`TerminatorKind::successors`] gives, in the same order.
+#[derive(Debug, Clone)]
+pub struct Successors<'a> {
+    /// The targets of a terminator with at most two, `None` where it has fewer.
+    pair: [Option<BasicBlockId>; 2],
+    at: usize,
+    /// A switch's targets.
+    switch: std::slice::Iter<'a, BasicBlockId>,
+}
+
+impl Iterator for Successors<'_> {
+    type Item = BasicBlockId;
+
+    #[inline]
+    fn next(&mut self) -> Option<BasicBlockId> {
+        while self.at < 2 {
+            let it = self.pair[self.at];
+            self.at += 1;
+            if it.is_some() {
+                return it;
+            }
+        }
+        self.switch.next().copied()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.pair[self.at.min(2)..].iter().flatten().count() + self.switch.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Successors<'_> {}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum TerminatorKind {
     /// Block has one successor; we continue execution there.
     Goto { target: BasicBlockId },
@@ -565,10 +654,18 @@ pub enum TerminatorKind {
         /// `true` if this is from a call in HIR rather than from an overloaded
         /// operator. True for overloaded function call.
         from_hir_call: bool,
+        /// The intrinsic `func` is, recognized once when the call is lowered; `None` for a
+        /// call of anything else, a function pointer's included.
+        intrinsic: Option<Intrinsic>,
         // This `Span` is the span of the function, without the dot and receiver
         // (e.g. `foo(a, b)` in `x.foo(a, b)`
         //fn_span: Span,
     },
+
+    /// `become func(args)`: the frame is gone before `func` runs, and what `func` returns, the
+    /// caller of this body gets. No successors, no unwind edge (rustc: a tail call unwinds as the
+    /// callee does, from the caller's caller).
+    TailCall { func: Operand, args: Box<[Operand]>, fn_span: MirSpan },
 
     /// Evaluates the operand, which must have type `bool`. If it is not equal to `expected`,
     /// initiates a panic. Initiating a panic corresponds to a `Call` terminator with some
@@ -654,7 +751,7 @@ pub enum TerminatorKind {
 }
 
 // Order of variants in this enum matter: they are used to compare borrow kinds.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
     Shared,
@@ -685,7 +782,7 @@ pub enum BorrowKind {
 }
 
 // Order of variants in this enum matter: they are used to compare borrow kinds.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub enum MutBorrowKind {
     /// Data must be immutable but not aliasable. This kind of borrow cannot currently
     /// be expressed by the user and is used only in implicit closure bindings.
@@ -732,7 +829,7 @@ pub enum UnOp {
     Neg,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum BinOp {
     /// The `+` operator (addition)
     Add,
@@ -876,7 +973,7 @@ impl From<Operand> for Rvalue {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum CastKind {
     /// An exposing pointer to address cast. A cast between a pointer and an integer type, or
     /// between a function pointer and an integer type.
@@ -897,9 +994,11 @@ pub enum CastKind {
     FloatToFloat,
     IntToFloat,
     FnPtrToPtr,
+    /// rustc's `Transmute`: a reinterpretation of the bits between types of the same size.
+    Transmute,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum Rvalue {
     /// Yields the operand unchanged
     Use(Operand),
@@ -1034,7 +1133,7 @@ pub enum Rvalue {
     CopyForDeref(StoredPlace),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum StatementKind {
     Assign(StoredPlace, Rvalue),
     FakeRead(StoredPlace),
@@ -1053,7 +1152,7 @@ pub enum StatementKind {
 }
 
 /// An `asm!` block. One that does not return is followed by `Unreachable`.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub struct InlineAsm {
     /// The pieces name `operands` by index.
     pub template: Box<[hir_def::hir::AsmPiece]>,
@@ -1068,7 +1167,7 @@ pub struct InlineAsm {
     pub clobber_abi: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AsmOperand {
     /// A register that holds `input` when the block starts, and whose value when the block
     /// ends goes to `output`. With neither it is one the block overwrites.
@@ -1091,13 +1190,13 @@ impl StatementKind {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Statement {
     pub kind: StatementKind,
     pub span: MirSpan,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)] // clone: inside `MirBody`
 pub struct BasicBlock {
     /// List of statements in this block.
     pub statements: Vec<Statement>,
@@ -1238,7 +1337,7 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand_mut(f);
             }
-            TerminatorKind::Call { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter_mut().for_each(f);
             }
@@ -1263,7 +1362,7 @@ impl TerminatorKind {
                 f(cond);
                 msg.for_each_operand(f);
             }
-            TerminatorKind::Call { func, args, .. } => {
+            TerminatorKind::Call { func, args, .. } | TerminatorKind::TailCall { func, args, .. } => {
                 f(func);
                 args.iter().for_each(f);
             }
@@ -1281,25 +1380,25 @@ impl TerminatorKind {
 
     /// The blocks control goes to from here when nothing unwinds, and the coroutine is not
     /// dropped where it yields.
-    pub fn successors(&self) -> SmallVec<[BasicBlockId; 2]> {
-        match self {
+    pub fn successors(&self) -> Successors<'_> {
+        let (pair, switch): ([Option<BasicBlockId>; 2], &[BasicBlockId]) = match self {
             TerminatorKind::Goto { target }
             | TerminatorKind::Drop { target, .. }
             | TerminatorKind::DropAndReplace { target, .. }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::FalseEdge { real_target: target, .. }
-            | TerminatorKind::FalseUnwind { real_target: target, .. } => smallvec![*target],
-            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().into(),
-            TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
-            TerminatorKind::Yield { resume, drop, .. } => {
-                std::iter::once(*resume).chain(*drop).collect()
-            }
+            | TerminatorKind::FalseUnwind { real_target: target, .. } => ([Some(*target), None], &[]),
+            TerminatorKind::SwitchInt { targets, .. } => ([None, None], targets.all_targets()),
+            TerminatorKind::Call { target, .. } => ([*target, None], &[]),
+            TerminatorKind::Yield { resume, drop, .. } => ([Some(*resume), *drop], &[]),
             TerminatorKind::UnwindResume
             | TerminatorKind::Abort
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
-            | TerminatorKind::CoroutineDrop => smallvec![],
-        }
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::CoroutineDrop => ([None, None], &[]),
+        };
+        Successors { pair, at: 0, switch: switch.iter() }
     }
 
     /// The cleanup block this terminator unwinds to, if it names one.
@@ -1315,6 +1414,34 @@ impl TerminatorKind {
         }
     }
 
+    /// Every block this terminator may go to: its successors, the imaginary edge of a
+    /// `FalseEdge`, and the block it unwinds to, last. Read in place.
+    pub fn all_successors(&self) -> impl DoubleEndedIterator<Item = BasicBlockId> + '_ {
+        use std::slice::from_ref;
+        let (first, then, last): (&[BasicBlockId], _, _) = match self {
+            TerminatorKind::Goto { target } => (from_ref(target), None, None),
+            TerminatorKind::SwitchInt { targets, .. } => (targets.all_targets(), None, None),
+            TerminatorKind::Drop { target, unwind, .. }
+            | TerminatorKind::DropAndReplace { target, unwind, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
+                (from_ref(target), *unwind, None)
+            }
+            TerminatorKind::Call { target, cleanup, .. } => (&[], *target, *cleanup),
+            TerminatorKind::Assert { target, cleanup, .. } => (from_ref(target), *cleanup, None),
+            TerminatorKind::Yield { resume, drop, .. } => (from_ref(resume), *drop, None),
+            TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+                (from_ref(real_target), Some(*imaginary_target), None)
+            }
+            TerminatorKind::UnwindResume
+            | TerminatorKind::Abort
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::CoroutineDrop => (&[], None, None),
+        };
+        first.iter().copied().chain(then).chain(last)
+    }
+
     pub fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
         match self {
             TerminatorKind::Drop { unwind, .. }
@@ -1328,14 +1455,108 @@ impl TerminatorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+/// What `LintAndRemoveUninhabited` lints: a call of a type uninhabited from the body's module
+/// that is not `!`, in a function whose return type is inhabited, and the first statement of
+/// user code its target block would have had (`find_unreachable_code_from`: skipping the `()`
+/// and return-place assignments, `StorageLive`/`StorageDead`, and a `Goto`/`Drop` into a block
+/// only it leads to).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnreachableAfterCall {
+    /// The call (`orig`).
+    pub call: MirSpan,
+    /// What would have come next (`target_loc.span`).
+    pub next: MirSpan,
+    /// "definition" for a `FakeRead` (a `let`), else "expression".
+    pub descr: &'static str,
+    pub ty: StoredTy,
+}
+
+/// A body whose code an optimized body has in it: rustc's `Instance` of an inlined callee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum InlinedBody<'db> {
+    Fn(FunctionId),
+    Closure(InternedClosureId<'db>),
+}
+
+/// One instance an optimized body inlined, listed once however often it was.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct InlinedCallee<'db> {
+    pub body: InlinedBody<'db>,
+    /// With regions erased, in the caller's generic parameters (instantiated by
+    /// monomorphization like the rest of the body).
+    pub args: StoredGenericArgs,
+    /// The callee's arithmetic is checked: its crate checks overflow, or it is
+    /// `#[rustc_inherit_overflow_checks]` and the caller's crate does.
+    pub written_checked: bool,
+}
+
+/// rustc's inlined `SourceScope`: the code of `callees[callee]`, inlined at `call_site` (a span
+/// of the body, itself `Inlined` when the call was in an inlined body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct InlinedScope {
+    pub callee: u32,
+    pub call_site: MirSpan,
+}
+
+/// What `MirSpan::Inlined(n)` is, `n` indexing [`Inlined::spans`]: `span` of the body of the
+/// callee of `scopes[scope]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct InlinedSpan {
+    pub scope: u32,
+    pub span: MirSpan,
+}
+
+/// The local an inlined callee's binding is in (its debug info).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct InlinedBinding {
+    pub scope: u32,
+    pub binding: BindingId,
+    pub local: LocalId,
+}
+
+/// `promoted_locals` of an inlined callee: `expr` is of the expression store of
+/// `callees[callee]`, evaluated with its `args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct InlinedPromoted {
+    pub local: LocalId,
+    pub callee: u32,
+    pub expr: ExprId,
+}
+
+/// What an optimized body inlined. Empty in every body as it is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)] // clone: inside `MirBody`
+pub struct Inlined<'db> {
+    pub callees: Vec<InlinedCallee<'db>>,
+    pub scopes: Vec<InlinedScope>,
+    pub spans: Vec<InlinedSpan>,
+    pub bindings: Vec<InlinedBinding>,
+    pub promoted: Vec<InlinedPromoted>,
+}
+
+impl Inlined<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.callees.is_empty()
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let Inlined { callees, scopes, spans, bindings, promoted } = self;
+        callees.shrink_to_fit();
+        scopes.shrink_to_fit();
+        spans.shrink_to_fit();
+        bindings.shrink_to_fit();
+        promoted.shrink_to_fit();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)] // clone: monomorphizing and optimizing copy the body they start from, once per query answer
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
     pub locals: Arena<Local>,
     pub start_block: BasicBlockId,
     pub owner: InferBodyId<'db>,
     pub binding_locals: ArenaMap<BindingId, LocalId>,
-    pub upvar_locals: FxHashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
+    pub upvar_locals:
+        blaze_hash::HashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
     pub param_locals: Vec<LocalId>,
     /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
     /// value has to outlive the call.
@@ -1372,12 +1593,102 @@ pub struct MirBody<'db> {
     /// temporary a constant and the temporary goes, so it is never kept across a yield; the
     /// code generator gives it read-only or static memory.
     pub promoted_constants: Vec<LocalId>,
+    /// In a built body, in the order of the calls' blocks: the calls of an uninhabited type
+    /// lowering gave no target, for the `unreachable_code` lint.
+    pub unreachable_after_calls: Vec<UnreachableAfterCall>,
+    /// The locals that hold a guard's shared reference to a by-value binding of a guarded match
+    /// arm, with that binding (rustc's `BindingForm::RefForGuard`). A read of the local in the
+    /// guard is a read of the binding.
+    pub guard_refs: Vec<(LocalId, BindingId)>,
+    /// The locals a closure or coroutine copies a capture into at its start
+    /// (`cap = move (*_1).f`, at `MirSpan::Unknown`), with the capture's field. rustc has no such
+    /// copy: it is neither a use nor an assignment. Each local's first `Assign` in `start_block`
+    /// is the copy. A capture used in place (a borrowed closure's owned capture) isn't listed.
+    pub capture_copies: Vec<(LocalId, FieldIndex)>,
+    /// What the optimizer inlined into this body; `MirSpan::Inlined` indexes its spans.
+    pub inlined: Inlined<'db>,
+}
+
+impl Hash for MirBody<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let MirBody {
+            basic_blocks,
+            locals,
+            start_block,
+            owner,
+            binding_locals,
+            upvar_locals,
+            param_locals,
+            promoted_locals,
+            closures,
+            coroutine,
+            unreached,
+            scope_ends,
+            inherits_overflow_checks,
+            phase,
+            upvars_in_place,
+            panic_unwinds,
+            promoted_constants,
+            unreachable_after_calls,
+            guard_refs,
+            capture_copies,
+            inlined,
+        } = self;
+        basic_blocks.hash(state);
+        locals.hash(state);
+        start_block.hash(state);
+        owner.hash(state);
+        binding_locals.hash(state);
+        hash_by_key(
+            upvar_locals,
+            |binding| binding.into_raw().into_u32(),
+            |raw| BindingId::from_raw(RawIdx::from_u32(raw)),
+            state,
+        );
+        param_locals.hash(state);
+        promoted_locals.hash(state);
+        closures.hash(state);
+        coroutine.hash(state);
+        unreached.hash(state);
+        scope_ends.hash(state);
+        inherits_overflow_checks.hash(state);
+        phase.hash(state);
+        upvars_in_place.hash(state);
+        panic_unwinds.hash(state);
+        promoted_constants.hash(state);
+        unreachable_after_calls.hash(state);
+        guard_refs.hash(state);
+        capture_copies.hash(state);
+        inlined.hash(state);
+    }
+}
+
+/// Hashes the entries of `map` in the order of their keys, so that maps that are `==` hash the
+/// same whatever order they iterate in. The keys sort as `u32`s in the worker's scratch buffer,
+/// `raw` keeping their order, and each value is found again by its key; straight into `state`,
+/// with no hasher per entry.
+fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
+    map: &blaze_hash::HashMap<K, V>,
+    raw: impl Fn(K) -> u32,
+    from_raw: impl Fn(u32) -> K,
+    state: &mut H,
+) {
+    blaze_mem::scratch::with_u32s(|keys| {
+        keys.extend(map.keys().map(|&key| raw(key)));
+        keys.sort_unstable();
+        state.write_usize(keys.len());
+        for &key in keys.iter() {
+            let key = from_raw(key);
+            key.hash(state);
+            map[&key].hash(state);
+        }
+    })
 }
 
 /// What a body means, which depends on the passes it has been through. The IDE only ever
 /// asks for [`MirPhase::Built`]; the interpreter and the code generator run
 /// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum MirPhase {
     /// As lowering builds it, as rustc's MIR building does. A `Drop` drops what the place holds
     /// if it holds anything, which the code that runs it has to keep track of. Calls and drops
@@ -1397,7 +1708,7 @@ pub enum MirPhase {
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
 /// reference to the future and the `&mut Context` of the current `poll`, and the return slot
 /// has the type of the block's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
@@ -1519,6 +1830,10 @@ macro_rules! places_walker {
                             args.$iter().for_each(|x| for_operand(x, &mut f));
                             f(destination);
                         }
+                        TerminatorKind::TailCall { func, args, .. } => {
+                            for_operand(func, &mut f);
+                            args.$iter().for_each(|x| for_operand(x, &mut f));
+                        }
                         TerminatorKind::Assert { cond, msg, .. } => {
                             for_operand(cond, &mut f);
                             msg.$each(&mut |it| for_operand(it, &mut f));
@@ -1568,9 +1883,10 @@ impl MirBody<'_> {
                 self.param_locals.push(local);
                 Operand { kind: OperandKind::Move(Place::from(local).store()), span: None }
             })
-            .collect();
+            .collect(); // alloc: the owned shim body's aggregate, once per `rust-call` shim
         let span = MirSpan::Unknown;
         self.start_block = self.basic_blocks.alloc(BasicBlock {
+            // alloc: the owned shim body's one statement
             statements: vec![Statement {
                 kind: StatementKind::Assign(
                     Place::from(tuple).store(),
@@ -1588,7 +1904,12 @@ impl MirBody<'_> {
     }
 
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
-        self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
+        // alloc: the caller's map, one block over the body's locals
+        let mut map = ArenaMap::with_capacity(self.locals.len());
+        for (binding, &local) in self.binding_locals.iter() {
+            map.insert(local, binding);
+        }
+        map
     }
 
     places_walker!(
@@ -1617,7 +1938,7 @@ impl<'db> MirBody<'db> {
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
-        copy: &mut FxHashMap<Ty<'db>, bool>,
+        copy: &mut blaze_hash::HashMap<Ty<'db>, bool>,
     ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {
@@ -1626,6 +1947,7 @@ impl<'db> MirBody<'db> {
             let is_copy =
                 *copy.entry(ty).or_insert_with(|| infcx.type_is_copy_modulo_regions(env, ty));
             if !is_copy {
+                // clone: a `StoredPlace` is a local and an interned projection handle
                 operand.kind = OperandKind::Move(place.clone());
             }
         };
@@ -1661,8 +1983,16 @@ impl MirBody<'_> {
             upvars_in_place,
             panic_unwinds,
             promoted_constants,
+            unreachable_after_calls,
+            guard_refs,
+            capture_copies,
+            inlined,
         } = self;
+        inlined.shrink_to_fit();
+        guard_refs.shrink_to_fit();
+        capture_copies.shrink_to_fit();
         promoted_constants.shrink_to_fit();
+        unreachable_after_calls.shrink_to_fit();
         upvars_in_place.shrink_to_fit();
         panic_unwinds.shrink_to_fit();
         unreached.shrink_to_fit();
@@ -1681,7 +2011,7 @@ impl MirBody<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, blaze_query::Value)]
 pub enum MirSpan {
     ExprId(ExprId),
     /// Where the expression ends: what leaving a scope does is taken to be written there.
@@ -1690,6 +2020,8 @@ pub enum MirSpan {
     BindingId(BindingId),
     SelfParam,
     Unknown,
+    /// A span of a body inlined into this one: [`Inlined::spans`]`[n]`.
+    Inlined(u32),
 }
 impl_from!(ExprId, PatId for MirSpan);
 
@@ -1803,10 +2135,12 @@ impl<'db> PlaceTy<'db> {
             elem,
             |ty| {
                 if matches!(ty.kind(), TyKind::Alias(..)) {
+                    // rustc's `normalize_erasing_regions` panics on a type that does not
+                    // normalize: the body type-checked, so its place types do.
                     let mut ocx = ObligationCtxt::new(infcx);
                     match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
                         Ok(it) => it,
-                        Err(_) => Ty::new_error(infcx.interner, ErrorGuaranteed),
+                        Err(e) => panic!("the place type {ty:?} does not normalize: {e:?}"),
                     }
                 } else {
                     ty
@@ -1837,18 +2171,22 @@ impl<'db> PlaceTy<'db> {
             panic!("cannot use non field projection on downcasted place")
         }
         match *elem {
+            // rustc's `PlaceTy::projection_ty` has `bug!` for both: MIR building derefs only
+            // builtin pointers (a deref pattern on a smart pointer calls `Deref::deref` first,
+            // `lower/deref_pattern.rs`) and indexes only arrays and slices.
             ProjectionElem::Deref => {
-                // Lowering a deref pattern on a smart pointer gets here, for one.
-                let ty = structurally_normalize(self.ty)
-                    .builtin_deref(true)
-                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed));
-                PlaceTy::from_ty(ty)
+                let ty = structurally_normalize(self.ty);
+                PlaceTy::from_ty(
+                    ty.builtin_deref(true)
+                        .unwrap_or_else(|| panic!("deref projection of non-dereferenceable {ty:?}")),
+                )
             }
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => PlaceTy::from_ty(
-                structurally_normalize(self.ty)
-                    .builtin_index()
-                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed)),
-            ),
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let ty = structurally_normalize(self.ty);
+                PlaceTy::from_ty(
+                    ty.builtin_index().unwrap_or_else(|| panic!("index projection of non-indexable {ty:?}")),
+                )
+            }
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
                 PlaceTy::from_ty(match structurally_normalize(self.ty).kind() {
                     TyKind::Slice(..) => self.ty,
@@ -1870,23 +2208,37 @@ impl<'db> PlaceTy<'db> {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)] // clone: inside a constant's `ComplexMemoryMap`
 pub struct VTableMap<'db> {
-    ty_to_id: FxHashMap<Ty<'db>, usize>,
+    /// Hashed by `blaze_hash::FixedHasher` through `BuildHasherDefault`, the hasher
+    /// `rustc_type_ir` can visit.
+    ty_to_id: HashMap<Ty<'db>, usize, std::hash::BuildHasherDefault<blaze_hash::FixedHasher>>,
     id_to_ty: Vec<Ty<'db>>,
 }
 
 impl<'db> VTableMap<'db> {
     const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
 
+    /// The id of the first type: the `n`th of [`VTableMap::tys`] has id `FIRST_ID + n`.
+    pub const FIRST_ID: usize = VTableMap::OFFSET;
+
+    /// One hash of `ty` per call, a hit or a new id alike.
     pub fn id(&mut self, ty: Ty<'db>) -> usize {
-        if let Some(it) = self.ty_to_id.get(&ty) {
-            return *it;
+        match self.ty_to_id.entry(ty) {
+            std::collections::hash_map::Entry::Occupied(it) => *it.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let id = self.id_to_ty.len() + VTableMap::OFFSET;
+                self.id_to_ty.push(ty);
+                slot.insert(id);
+                id
+            }
         }
-        let id = self.id_to_ty.len() + VTableMap::OFFSET;
-        self.id_to_ty.push(ty);
-        self.ty_to_id.insert(ty, id);
-        id
+    }
+
+    /// The types, in the order of their ids, which run on from [`VTableMap::FIRST_ID`]
+    /// without a gap.
+    pub fn tys(&self) -> impl ExactSizeIterator<Item = Ty<'db>> + '_ {
+        self.id_to_ty.iter().copied()
     }
 
     pub fn ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
@@ -1905,7 +2257,7 @@ impl<'db> VTableMap<'db> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -1914,6 +2266,10 @@ pub enum MirEvalError<'db> {
     /// then use this type of error.
     UndefinedBehavior(String),
     Panic(String),
+    /// The program aborted, as rustc's `panic_cannot_unwind`/`panic_in_cleanup` abort it: a
+    /// panic in a cleanup block, while unwinding, or out of a frame that cannot unwind. Holds
+    /// the message std's abort prints; nothing catches it.
+    Aborted(String),
     // FIXME: This should be folded into ConstEvalError?
     MirLowerError(FunctionId, MirLowerError<'db>),
     MirLowerErrorForClosure(InternedClosureId<'db>, MirLowerError<'db>),
@@ -1930,6 +2286,11 @@ pub enum MirEvalError<'db> {
         spent: Budget,
         at: Option<(InferBodyId<'db>, MirSpan)>,
     },
+    /// rustc's `long_running_const_eval` at an error level: a constant's or static's evaluation
+    /// ran 2,000,000 blocks (rustc's `LINT_TERMINATOR_LIMIT`), at `at`.
+    LongRunning {
+        at: Option<(InferBodyId<'db>, MirSpan)>,
+    },
     /// The value of the constant points to memory allocated while evaluating it: by the
     /// program's allocator (a `Box`, `Vec` or `String`), which it would free at run time, or
     /// by `const_allocate` without `const_make_global`.
@@ -1937,6 +2298,9 @@ pub enum MirEvalError<'db> {
         of_const_allocate: bool,
     },
     StackOverflow,
+    /// The evaluator's `Machine` (a checker of undefined behavior, `hir-ty-ub`) stopped the
+    /// run; what it found the machine holds. Const eval never gives it: its machine never stops.
+    MachineStop,
     /// FIXME: Fold this into InternalError
     InvalidVTableId(usize),
     /// ?
@@ -1958,11 +2322,13 @@ impl std::fmt::Debug for MirEvalError<'_> {
                 f.debug_tuple("UndefinedBehavior").field(arg0).finish()
             }
             Self::Panic(msg) => write!(f, "Panic with message:\n{msg:?}"),
+            Self::Aborted(msg) => write!(f, "the program aborted: {msg}"),
             Self::TargetDataLayoutNotAvailable(arg0) => {
                 f.debug_tuple("TargetDataLayoutNotAvailable").field(arg0).finish()
             }
             Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
             Self::OverBudget { spent, at: _ } => write!(f, "{spent}"),
+            Self::LongRunning { at: _ } => f.write_str("constant evaluation is taking a long time"),
             Self::HeapInValue { of_const_allocate: true } => f.write_str(
                 "encountered `const_allocate` pointer in final value that was not made global",
             ),
@@ -1971,6 +2337,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
                  `String` or the like), which the program would free",
             ),
             Self::StackOverflow => write!(f, "stack overflow"),
+            Self::MachineStop => f.write_str("MachineStop"),
             Self::MirLowerError(arg0, arg1) => {
                 f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
             }
@@ -1992,7 +2359,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
 }
 
 /// What an evaluation ran out of: its budget of steps or of bytes, of this size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum Budget {
     Steps(u64),
     Memory(u64),
@@ -2012,8 +2379,8 @@ impl Budget {
     pub fn setting(&self) -> String {
         let key = base_db::ConstEvalBudget::KEY;
         match self {
-            Budget::Steps(_) => format!("`{key}.steps`"),
-            Budget::Memory(_) => format!("`{key}.memory`"),
+            Budget::Steps(_) => format!("`{key}.steps`"), // alloc: error path
+            Budget::Memory(_) => format!("`{key}.memory`"), // alloc: error path
         }
     }
 }
@@ -2038,7 +2405,7 @@ pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
 }
 
 // FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
 pub enum MirLowerError<'db> {
     ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError),
@@ -2048,7 +2415,8 @@ pub enum MirLowerError<'db> {
     TraitFunctionDefinition(TraitId, Name),
     UnresolvedName {
         owner: ExpressionStoreOwnerId,
-        path: Path,
+        /// `None` for a lang item path.
+        path: Option<ModPath>,
     },
     RecordLiteralWithoutPath,
     UnresolvedMethod(String),
@@ -2068,6 +2436,8 @@ pub enum MirLowerError<'db> {
     UnresolvedLabel,
     UnresolvedUpvar(StoredPlace),
     InaccessibleLocal,
+    /// A call of a `#[rustc_intrinsic]` function whose name is none of rustc's intrinsics.
+    UnknownIntrinsic(Symbol),
 
     // monomorphization errors:
     GenericArgNotProvided(GenericParamId, StoredGenericArgs),
@@ -2082,7 +2452,7 @@ impl From<LayoutError> for MirLowerError<'_> {
 /// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
 /// what its `async` closure captured.
 pub fn is_by_move_coroutine<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     args: CoroutineArgs<DbInterner<'db>>,
 ) -> bool {
@@ -2091,7 +2461,7 @@ pub fn is_by_move_coroutine<'db>(
     let Expr::Closure {
         closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
         ..
-    } = &store[expr]
+    } = store.expr(expr)
     else {
         return false;
     };
@@ -2107,7 +2477,7 @@ pub fn is_by_move_coroutine<'db>(
 }
 
 /// How much of rustc's optimization pipeline runs: rustc's `-Zmir-opt-level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
 pub enum MirOptLevel {
     /// None: the body is the runtime body.
     Off,
@@ -2133,5 +2503,288 @@ impl MirOptLevel {
             MirOptLevel::Debug => 1,
             MirOptLevel::Release => 2,
         }
+    }
+}
+
+/// What a MIR body is optimized for: the level, whether rustc's UB checks are inserted
+/// (`sess.ub_checks()` of the crate the body is of), and whether the code generator emits
+/// lifetime markers (rustc removes storage markers only when it doesn't).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+pub struct MirOptions {
+    pub level: MirOptLevel,
+    pub ub_checks: bool,
+    pub lifetime_markers: bool,
+    /// rustc's `Inline::is_enabled`, which the level alone does not give: rustc inlines at
+    /// mir-opt-level 2 only at `-Copt-level` 2 or 3, and not in an incremental build.
+    pub inline: bool,
+}
+
+impl MirOptions {
+    /// The interpreter's: no UB checks, markers as rustc keeps them without a code generator,
+    /// nothing inlined (rustc's CTFE MIR is not, and the interpreter reads no [`Inlined`]).
+    pub fn at(level: MirOptLevel) -> MirOptions {
+        MirOptions {
+            level,
+            ub_checks: false,
+            lifetime_markers: level >= MirOptLevel::Release,
+            inline: false,
+        }
+    }
+
+    /// Whether these ask for nothing beyond the runtime body: no passes and no checks.
+    pub fn is_runtime(self) -> bool {
+        self.level == MirOptLevel::Off && !self.ub_checks
+    }
+}
+
+/// Whose MIR body: a function's or constant's, a closure's, or an `async` block's, as the
+/// `Future::poll` of the block's type or (by move) as that of the future an `async` closure
+/// gives when called by value though it could be called again, which owns what the closure
+/// captured where the block itself borrows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirOwner<'db> {
+    Body(InferBodyId<'db>),
+    Closure(InternedClosureId<'db>),
+    Coroutine(InternedCoroutineId<'db>),
+    CoroutineByMove(InternedCoroutineId<'db>),
+}
+
+impl<'db> MirOwner<'db> {
+    /// The body of the future of type `args` that the `async` block `coroutine` gives.
+    pub fn coroutine(
+        db: &'db Db,
+        coroutine: InternedCoroutineId<'db>,
+        args: CoroutineArgs<DbInterner<'db>>,
+    ) -> MirOwner<'db> {
+        match is_by_move_coroutine(db, coroutine, args) {
+            true => MirOwner::CoroutineByMove(coroutine),
+            false => MirOwner::Coroutine(coroutine),
+        }
+    }
+
+    /// The body this one is written in: itself for a function or constant, else the body the
+    /// closure or block is an expression of.
+    pub fn written_in(self, db: &'db Db) -> InferBodyId<'db> {
+        match self {
+            MirOwner::Body(def) => def,
+            MirOwner::Closure(closure) => closure.loc(db).owner,
+            MirOwner::Coroutine(coroutine) | MirOwner::CoroutineByMove(coroutine) => {
+                coroutine.loc(db).owner
+            }
+        }
+    }
+
+    /// The body inlining sees as the caller when this owner's MIR is optimized: a function or a
+    /// closure. A const, static or anon const body is evaluated by the interpreter, which does
+    /// not read `Inlined`, and a coroutine body inlines nothing (rustc's
+    /// `check_caller_mir_body`).
+    pub fn caller(self) -> Option<InlinedBody<'db>> {
+        match self {
+            MirOwner::Body(def) => def.as_function().map(InlinedBody::Fn),
+            MirOwner::Closure(closure) => Some(InlinedBody::Closure(closure)),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => None,
+        }
+    }
+}
+
+/// How far a body has gone: built from its HIR, through the runtime passes, or optimized and
+/// checked with the options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirStage {
+    Built,
+    Runtime,
+    Optimized(MirOptions),
+}
+
+impl MirStage {
+    /// The stage the code generator compiles `owner` at under `options`: the runtime body when
+    /// they ask for nothing beyond it, else the body optimized with them. Of the passes only
+    /// the UB checks run on a coroutine, so without them its runtime body serves every level.
+    pub fn compiled(owner: MirOwner<'_>, options: MirOptions) -> MirStage {
+        let runtime = match owner {
+            MirOwner::Body(_) | MirOwner::Closure(_) => options.is_runtime(),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => !options.ub_checks,
+        };
+        match runtime {
+            true => MirStage::Runtime,
+            false => MirStage::Optimized(options),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use la_arena::{Idx, RawIdx};
+
+    use super::{
+        AssertKind, LocalId, MirOptLevel, MirOptions, Operand, OperandKind, Place, hash_by_key,
+    };
+
+    fn copy_of(local: u32) -> Operand {
+        let local: LocalId = Idx::from_raw(RawIdx::from(local));
+        Operand { kind: OperandKind::Copy(Place::from(local).store()), span: None }
+    }
+
+    fn locals_visited(kind: &mut AssertKind) -> (Vec<u32>, Vec<u32>) {
+        let local_of = |operand: &Operand| match &operand.kind {
+            OperandKind::Copy(place) => place.local.into_raw().into_u32(),
+            _ => unreachable!("the tests build only copies"),
+        };
+        let mut read = Vec::new();
+        kind.for_each_operand(&mut |operand| read.push(local_of(operand)));
+        let mut written = Vec::new();
+        kind.for_each_operand_mut(&mut |operand| written.push(local_of(&*operand)));
+        (read, written)
+    }
+
+    #[test]
+    fn the_ub_check_asserts_visit_their_operands_in_order() {
+        let mut misaligned =
+            AssertKind::MisalignedPointerDereference { required: copy_of(1), found: copy_of(2) };
+        assert_eq!(locals_visited(&mut misaligned), (vec![1, 2], vec![1, 2]));
+        let mut invalid_enum = AssertKind::InvalidEnumConstruction(copy_of(3));
+        assert_eq!(locals_visited(&mut invalid_enum), (vec![3], vec![3]));
+        for mut null in [AssertKind::NullPointerDereference, AssertKind::NullReferenceConstructed]
+        {
+            assert_eq!(locals_visited(&mut null), (vec![], vec![]));
+        }
+    }
+
+    #[test]
+    fn all_successors_are_the_successors_then_the_imaginary_edge_then_the_unwind() {
+        use super::{BasicBlockId, SwitchTargets, TerminatorKind};
+
+        let block = |n: u32| -> BasicBlockId { Idx::from_raw(RawIdx::from(n)) };
+        let all = |kind: &TerminatorKind| {
+            kind.all_successors().map(|it| it.into_raw().into_u32()).collect::<Vec<_>>()
+        };
+        let switch = TerminatorKind::SwitchInt {
+            discr: copy_of(0),
+            targets: SwitchTargets::new([(0, block(1)), (1, block(2))].into_iter(), block(3)),
+        };
+        assert_eq!(all(&switch), [1, 2, 3]);
+        let edge = TerminatorKind::FalseEdge { real_target: block(4), imaginary_target: block(5) };
+        assert_eq!(all(&edge), [4, 5]);
+        let unwind = TerminatorKind::FalseUnwind { real_target: block(6), unwind: Some(block(7)) };
+        assert_eq!(all(&unwind), [6, 7]);
+        assert_eq!(unwind.all_successors().rev().next(), Some(block(7)), "the unwind is last");
+        assert!(all(&TerminatorKind::Return).is_empty());
+    }
+
+    #[test]
+    fn a_tail_call_goes_nowhere_in_this_body_and_reads_its_operands() {
+        use super::{MirSpan, TerminatorKind};
+
+        let call = TerminatorKind::TailCall {
+            func: copy_of(0),
+            args: Box::new([copy_of(1), copy_of(2)]),
+            fn_span: MirSpan::Unknown,
+        };
+        assert_eq!(call.successors().count(), 0);
+        assert_eq!(call.all_successors().count(), 0);
+        assert_eq!(call.unwind(), None);
+        let mut read = Vec::new();
+        call.for_each_operand(&mut |op| read.push(op.clone()));
+        assert_eq!(read, [copy_of(0), copy_of(1), copy_of(2)]);
+    }
+
+    #[test]
+    fn the_interpreter_keeps_lifetime_markers_only_at_release() {
+        for (level, lifetime_markers) in
+            [(MirOptLevel::Off, false), (MirOptLevel::Debug, false), (MirOptLevel::Release, true)]
+        {
+            assert_eq!(
+                MirOptions::at(level),
+                MirOptions { level, ub_checks: false, lifetime_markers, inline: false }
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_body_inlined_is_part_of_its_hash() {
+        use hir_def::hir::ExprId;
+
+        use super::{Inlined, InlinedPromoted, InlinedScope, InlinedSpan, MirSpan};
+
+        let expr = |n: u32| MirSpan::ExprId(ExprId::from_raw(RawIdx::from(n)));
+        let hash =
+            |inlined: &Inlined<'_>| blaze_ids::Hasher::new("hir-ty test").std(inlined).finish();
+        let empty = Inlined::default();
+        assert!(empty.is_empty());
+        let mut scoped = Inlined::default();
+        scoped.scopes.push(InlinedScope { callee: 0, call_site: expr(1) });
+        scoped.spans.push(InlinedSpan { scope: 0, span: expr(2) });
+        let mut nested = Inlined::default();
+        nested.scopes.push(InlinedScope { callee: 0, call_site: MirSpan::Inlined(0) });
+        nested.spans.push(InlinedSpan { scope: 0, span: expr(2) });
+        let mut promoted = scoped.clone();
+        promoted.promoted.push(InlinedPromoted {
+            local: Idx::from_raw(RawIdx::from(3)),
+            callee: 0,
+            expr: ExprId::from_raw(RawIdx::from(4)),
+        });
+        let hashes = [hash(&empty), hash(&scoped), hash(&nested), hash(&promoted)];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(hash(&scoped), hash(&scoped.clone()));
+    }
+
+    fn digest(map: &blaze_hash::HashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {
+        let mut hasher = blaze_ids::Hasher::new("hir-ty test");
+        hash_by_key(map, |key| key, |raw| raw, &mut blaze_hash::Blake3Hasher(&mut hasher));
+        hasher.finish()
+    }
+
+    #[test]
+    fn a_small_map_hashes_by_key() {
+        let forward = map((0..3).map(|key| (key, vec![key])), 0);
+        let backward = map((0..3).rev().map(|key| (key, vec![key])), 64);
+        assert_eq!(digest(&forward), digest(&backward));
+        assert_ne!(digest(&forward), digest(&map([(0, vec![0])], 0)));
+        let empty = map(std::iter::empty::<(u32, Vec<u32>)>(), 0);
+        assert_ne!(digest(&empty), digest(&map([(0, vec![])], 0)));
+    }
+
+    fn map(
+        entries: impl IntoIterator<Item = (u32, Vec<u32>)>,
+        capacity: usize,
+    ) -> blaze_hash::HashMap<u32, Vec<u32>> {
+        let mut map = blaze_hash::HashMap::with_capacity_and_hasher(capacity, Default::default());
+        map.extend(entries);
+        map
+    }
+
+    fn entries() -> Vec<(u32, Vec<u32>)> {
+        (0..40).map(|key| (key, vec![key, key * 3])).collect()
+    }
+
+    #[test]
+    fn unordered_hash_ignores_insertion_order() {
+        let forward = map(entries(), 0);
+        let backward = map(entries().into_iter().rev(), 256);
+        assert_eq!(forward, backward);
+        assert_eq!(digest(&forward), digest(&backward));
+    }
+
+    #[test]
+    fn unordered_hash_sees_every_entry() {
+        let base = map(entries(), 0);
+
+        let mut changed = base.clone();
+        changed.get_mut(&17).unwrap()[1] += 1;
+        assert_ne!(base, changed);
+        assert_ne!(digest(&base), digest(&changed));
+
+        let mut rekeyed = base.clone();
+        let value = rekeyed.remove(&17).unwrap();
+        rekeyed.insert(1000, value);
+        assert_ne!(digest(&base), digest(&rekeyed));
+
+        let mut fewer = base.clone();
+        fewer.remove(&17);
+        assert_ne!(digest(&base), digest(&fewer));
     }
 }

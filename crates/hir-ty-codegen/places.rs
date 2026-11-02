@@ -9,9 +9,13 @@
 //! Only where the anchor begins ([`anchor_location`]) is found from the whole file, once per
 //! body, and added when the place is asked for.
 
+#![forbid(unsafe_code)]
+
+use base_db::Db;
 use hir_def::expr_store::body::{BodySyntax, body_syntax};
 use hir_expand::{MacroCallId, MacroCallKind, map_node_range_up_rooted_span};
 use span::Span;
+use syntax::view;
 
 use super::*;
 
@@ -27,7 +31,7 @@ pub(crate) enum Place {
 
 /// File, line and column of a place in a body, as rustc reports them.
 pub(crate) fn source_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -40,7 +44,7 @@ pub(crate) fn source_location(
 
 /// File, line and column of a place in a body for a debugger: [`row_location_in_file`].
 pub(crate) fn row_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
@@ -73,7 +77,7 @@ fn compare<T: PartialEq + fmt::Debug>(
 }
 
 fn resolve(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     place: Place,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -87,9 +91,9 @@ fn resolve(
 }
 
 /// File, line and column of where the anchor of the body begins.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn anchor_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = body_syntax(db, owner).as_ref()?.file_id.file_id()?;
@@ -97,28 +101,23 @@ fn anchor_location(
     line_and_column(db, FileRange { file_id, range: TextRange::empty(start) })
 }
 
-/// Where each row of the anchor of the body begins.
-#[salsa::tracked(returns(ref))]
-fn anchor_rows(db: &dyn HirDatabase, owner: DefWithBodyId) -> Option<Box<[u32]>> {
-    let text = body_syntax(db, owner).as_ref()?.text();
-    let ends = text.bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
-    Some(std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect())
+/// Where the rows of the anchor of the body are.
+#[blaze_query::tracked(returns(ref))]
+fn anchor_rows(db: &Db, owner: DefWithBodyId) -> Option<span::LineIndex> {
+    Some(span::LineIndex::new(body_syntax(db, owner).as_ref()?.text()))
 }
 
 /// The place of `offset` in the anchor of the body.
-fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
-    let starts = anchor_rows(db, owner).as_ref()?;
+fn anchored(db: &Db, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
+    let (row, start) = anchor_rows(db, owner).as_ref()?.row(offset)?;
     let text = body_syntax(db, owner).as_ref()?.text();
-    let at = u32::from(offset);
-    let row = starts.partition_point(|&start| start <= at).checked_sub(1)?;
-    let written = text.get(starts[row] as usize..at as usize)?;
-    let column = written.chars().map(column_width).sum::<usize>() as u32;
-    Some(Place::Anchored { row: row as u32, column })
+    let written = text.get(usize::from(start)..usize::from(offset))?;
+    Some(Place::Anchored { row, column: span::display_width(written) })
 }
 
 /// The place of a span: in the anchor of the body when it is relative to that anchor.
 fn place_of_span(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     span: Span,
@@ -130,27 +129,30 @@ fn place_of_span(
     Some(Place::At(file, line, column))
 }
 
-/// The node of a macro call: in the anchor of the body, or in another file.
-enum CallNode {
-    Anchored(SyntaxNode),
-    Other(InFile<SyntaxNode>),
+/// The node of a macro call: in the anchor of the body, of which the range it is written at is
+/// kept (the anchor's tree is a count this thread holds, which no view outlives), or in
+/// another file.
+enum CallNode<'db> {
+    Anchored(TextRange),
+    Other(InFile<view::Node<'db>>),
 }
 
-fn call_node(db: &dyn HirDatabase, syntax: &BodySyntax, call: MacroCallId) -> CallNode {
+fn call_node<'db>(db: &'db Db, syntax: &BodySyntax, call: MacroCallId) -> CallNode<'db> {
     let loc = call.loc(db);
     if let MacroCallKind::FnLike { ast_id, .. } = loc.kind
         && ast_id.file_id == syntax.file_id
         && let Some(ptr) = syntax.ast_id_map.try_get_erased(ast_id.value.erase())
     {
-        return CallNode::Anchored(ptr.to_node(&syntax.root(db)));
+        let tree = syntax.tree(db);
+        return CallNode::Anchored(written_range(view::to_node(ptr, view::Node::root(&tree))));
     }
-    CallNode::Other(loc.to_node(db))
+    CallNode::Other(loc.to_node_view(db))
 }
 
 /// The file a place in a body is written in, and where in it rustc has the place begin: in
-/// the tree of [`BodySyntax::root`] when that file is the body's own.
+/// the tree of [`BodySyntax::tree`] when that file is the body's own.
 fn source_range(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     span: MirSpan,
@@ -161,16 +163,20 @@ fn source_range(
         // The block an `async fn` is taken to wrap its body in is not written anywhere, and
         // ends where the body does.
         MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+            match (source_map.expr_syntax(expr), Body::of(db, owner).expr(expr)) {
                 (Ok(written), _) => written,
                 (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
+                    source_map.expr_syntax(tail).ok()?
                 }
                 (Err(_), _) => return None,
             }
         }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
+        // Code inlined into the body is written in another's, which `fragment::Source`
+        // resolves the span to before asking where it is.
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => {
+            return None;
+        }
     };
     if let MirSpan::ExprEnd(_) = span {
         // The brace that closes a block, which is where rustc has a scope left.
@@ -180,12 +186,18 @@ fn source_range(
     }
     let range = match span {
         MirSpan::ExprId(expr) => {
-            let root = match source.file_id == syntax.file_id {
-                true => syntax.root(db),
-                false => source.file_id.parse_or_expand(db),
-            };
-            let node = source.value.syntax_node_ptr().to_node(&root);
-            reported_range(db, owner, expr, source.file_id, &node)?
+            let ptr = source.value.syntax_node_ptr();
+            match source.file_id == syntax.file_id {
+                true => {
+                    let tree = syntax.tree(db);
+                    let node = view::to_node(ptr, view::Node::root(&tree));
+                    reported_range(db, owner, expr, source.file_id, node)?
+                }
+                false => {
+                    let node = view::to_node(ptr, source.file_id.root(db));
+                    reported_range(db, owner, expr, source.file_id, node)?
+                }
+            }
         }
         _ => source.value.syntax_node_ptr().text_range(),
     };
@@ -193,10 +205,10 @@ fn source_range(
 }
 
 /// The [`Place`] of [`source_location_in_file`].
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(revisions = usize::MAX)]
-fn source_place(db: &dyn HirDatabase, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked]
+fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
         let (file, line, column) = (*source_location_in_file(db, owner, span))?;
         return Some(Place::At(file, line, column));
@@ -206,11 +218,11 @@ fn source_place(db: &dyn HirDatabase, owner: DefWithBodyId, span: MirSpan) -> Op
 }
 
 /// The [`Place`] of [`row_location_in_file`].
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(revisions = usize::MAX)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked]
 fn row_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
@@ -240,7 +252,7 @@ fn row_place(
 
 /// [`super::written_place`], of a macro file, in the anchor of the body where it can be.
 fn written_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,
@@ -253,11 +265,11 @@ fn written_place(
         let Some(call) = at.ctx.outer_expn(db) else { break };
         let call = MacroCallId::from(call);
         at = match call_node(db, syntax, call) {
-            CallNode::Anchored(node) => {
-                syntax.span_map.span_for_range(TextRange::empty(written_range(&node).start()))
+            CallNode::Anchored(range) => {
+                syntax.span_map.span_for_range(TextRange::empty(range.start()))
             }
             CallNode::Other(node) => {
-                let range = TextRange::empty(written_range(&node.value).start());
+                let range = TextRange::empty(written_range(node.value).start());
                 node.file_id.span_map(db).span_for_range(range)
             }
         };
@@ -271,7 +283,11 @@ fn written_place(
 }
 
 /// [`super::written_call`], in the anchor of the body where it is written there.
-fn written_call(db: &dyn HirDatabase, syntax: &BodySyntax, file_id: HirFileId) -> Option<CallNode> {
+fn written_call<'db>(
+    db: &'db Db,
+    syntax: &BodySyntax,
+    file_id: HirFileId,
+) -> Option<CallNode<'db>> {
     let mut call = call_node(db, syntax, file_id.macro_file()?);
     while let CallNode::Other(node) = &call
         && let Some(outer) = node.file_id.macro_file()
@@ -286,9 +302,9 @@ fn written_call(db: &dyn HirDatabase, syntax: &BodySyntax, file_id: HirFileId) -
 }
 
 /// [`super::location_of`], in the anchor of the body where it can be: `range` is in the tree
-/// of [`BodySyntax::root`] when `file_id` is the body's file.
+/// of [`BodySyntax::tree`] when `file_id` is the body's file.
 fn place_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,
@@ -300,9 +316,9 @@ fn place_of(
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     if own_tokens && let Some(call) = written_call(db, syntax, file_id) {
         return match call {
-            CallNode::Anchored(node) => anchored(db, owner, written_range(&node).start()),
+            CallNode::Anchored(range) => anchored(db, owner, range.start()),
             CallNode::Other(node) => {
-                place_up(db, owner, syntax, node.file_id, written_range(&node.value))
+                place_up(db, owner, syntax, node.file_id, written_range(node.value))
             }
         };
     }
@@ -314,7 +330,7 @@ fn place_of(
 
 /// The place of a range of a macro file, or of a file that is not the body's.
 fn place_up(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,

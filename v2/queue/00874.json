@@ -1,0 +1,29 @@
+{
+  "id": "00874",
+  "from_lane": "speed-sol-core",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/lib.rs",
+    "crates/blaze-core/src/uring.rs",
+    "crates/blaze-core/src/uring/files.rs",
+    "crates/blaze-core/src/threads.rs",
+    "crates/blaze-core/src/kqueue.rs",
+    "crates/blaze-core/src/iocp.rs",
+    "crates/blaze-core/src/sim.rs"
+  ],
+  "what": "Speed of light (docs/v2/plan/lanes/core/speed-of-light.md, io_uring driver section, 'Reaching 90% needs one effect for many reads'): a batched whole-file read effect, as Stamp is for stamps.\n\nWhy: the cold workspace load reads 50,000 files of 20 KiB. Each is one `Effect::Read` today, so the io_uring driver's thread spends about 0.8 us a file on the effect, its request and its Done: about 40 ms for 50,000, against the warm-cache bound of 11.6 ms on 16 cores (3.3x). With 64 names an effect, the driver's per-file work drops to the SQEs alone and the reads reach about 12.5 ms (within 10%).\n\nShape (crates/blaze-core/src/lib.rs): `Effect::Load { files: Names, tag }` and `Done::Loaded(Vec<Result<Vec<u8>, IoError>>)`, answers in the order of `files`, each exactly what `Effect::Read` of the whole file gives (the file at its name now, opened read-only, nothing kept). Every driver implements it: uring (Kind::Load per name, the loads_most cap and IOSQE_ASYNC spread already there), threads and kqueue (threads.rs: one job per chunk of names, as fs::stamps sweeps), IOCP (files::read_whole per name on its threads), sim (each name as its Read). Tests: differential against per-file Read on every driver over random trees (missing files, empty files, a file renamed over between asks), and an allocation budget of the payloads alone. No fallback: a driver that cannot do it is an error, not a loop of Reads.\n\nThen blaze-vfs (lane vfs) asks it for a cold load's reads; that caller change is vfs's, to file once this lands. Not done in the speed-of-light pass because it changes all five drivers and could not be built or tested there.",
+  "state": "open",
+  "created": "2026-10-30T09:18:12Z",
+  "updated": "2026-10-30T09:18:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T09:18:12Z",
+      "by": "speed-sol-core",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "id": "01338",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "crates/hir-def/src/visibility.rs",
+    "crates/hir-def/src/attrs.rs"
+  ],
+  "what": "hir-firewall exceptions an_edit_of_each_function_reaches_only_it: its last 70 leaks (/tmp/blaze-lanes/hir-firewall-exceptions2.log, coord-dup-78 12:44) are five queries of one item, Id(30786): signature_syntax, placed_body_syntax, AttrFlags::query (asked by the check of `helper`), AssocItemId::assoc_visibility and block_disabled_sanitizers(the block, Id(57344)) (asked by the code hash of `helper`), re-executed on every edit and undo of each of the 7 other fns. The item is `nested`, the fn written in `helper`'s body (`fn nested(m: u32) -> u32 { m + 1 }`, exceptions.rs:65): only it leaks, and the sanitizer query is keyed by a block. Cause, in hir-def signatures.rs: the FileOutline leaves out items written in a body, and for those item_syntax (:534-538), written_visibility (:567-569) and outline_item fall back to the file's live parse (`id.file_id.root(db)`, `ast_id_map(db)`), so each of their queries re-executes on any edit of the file. hir's checks read only these position-free queries (collect_blocks -> the block module's item checks -> `$Sig::relative`, Body::of, AttrFlags), as for module items, which do not leak. Ask: lower an item written in a body off that body's own syntax (the per-body `file_body_syntax` of 00845, which an edit of another body leaves equal), so its signature syntax, visibility, attributes and body syntax re-execute only on an edit of the body it is in. This is the item half of 01303 part 3 (block_item_tree_query), which db-next5 has; item-hash-facts sent you assoc_visibility's switch to the outline, which leaves this case. Acceptance: that test goes clean.",
+  "state": "open",
+  "created": "2026-10-31T19:45:18Z",
+  "updated": "2026-10-31T19:45:18Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T19:45:18Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -14,14 +14,16 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-jobserver = "0.1.35"
-rustc-hash.workspace = true
+blaze-core.workspace = true
+blaze-hash.workspace = true
+blaze-mem.workspace = true
+memchr.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
-serde_json.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
 
 [lints]
 workspace = true

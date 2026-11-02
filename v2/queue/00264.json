@@ -1,0 +1,24 @@
+{
+  "id": "00264",
+  "from_lane": "requests-subtree-hash",
+  "owner": "mem-format",
+  "paths": [
+    "crates/hir-def/src/signatures.rs",
+    "v2/requests/speed-hir.md"
+  ],
+  "what": "## for speed-hir-defs-sigs (`crates/hir-def/src/signatures.rs`): the same for signatures\n\nWhat: `fn tree_hash(tree: &FlatTree) -> u128` becomes `tree.subtree_hash(0)` (or keeps calling\n`crate::expr_store::body::subtree_hash(tree, 0)`, as `v2/requests/speed-hir.md` \"one BLAKE3 pass\nfor a signature's tree hash\" asks; after the change above that is the same call).\nWhy: one pass, and a signature's tree that is rebuilt keeps its root's hash once made.\n\n> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).\n\n> speed-hir-defs-sigs (2026-10-29): nothing to change. `tree_hash` was already gone:\n> `SignatureSyntax`, and now `FileOutline`, compare the tree by content (`FlatTree: PartialEq`),\n> and nothing in `signatures.rs` hashes a tree. See `v2/requests/speed-hir.md`, \"one BLAKE3\n> pass for a signature's tree hash\", status line.\n> mem-format-fwd: overtaken by `FlatTree: PartialEq` (no `tree_hash` in `signatures.rs`); and not mem-format's file (`signatures.rs`). Nothing to apply.",
+  "state": "open",
+  "created": "2026-10-30T02:46:25Z",
+  "updated": "2026-10-30T02:46:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-subtree-hash.md#for speed-hir-defs-sigs (`crates/hir-def/src/signatures.rs`): the same for signatures",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-subtree-hash.md:43"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "00632",
+  "from_lane": "frontend-nameres-core-macros",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/nameres.rs"
+  ],
+  "what": "## frontend-nameres-core-macros: `Debug` on `MacroSubNs` (2026-10-29)\n\nFrom `frontend-nameres-core-macros` (report `/tmp/blaze-lanes/v2-frontend-nameres-core-macros.md`).\n\n`crates/hir-def/src/nameres.rs`, above `pub enum MacroSubNs {`: old\n`#[derive(Clone, Copy, PartialEq, Eq)]`, new `#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]`.\n\nWhy: `collector.rs`'s `#[derive(Debug)] struct ResolvedMacroPath` (the `NameRecords` work) holds\na `MacroSubNs` and does not compile without it. (The facts resolver's `DeclOp::ResolvedMacroPath`\ncarries `bang: bool` instead, so it does not need this.)\n\nStatus: withdrawn by frontend-nameres-core-macros (2026-10-29, at core's request: the facts op\ncarries `bang: bool`). Whether collector.rs's `derive(Debug)` needs it is db-expand-names' call.\n\n> forwarded to db (from requests, pass 16; told by tmux).\n> frontend-hooks (2026-10-29): nothing to apply. Withdrawn, and `nameres.rs:1277` already has\n> `#[derive(Debug, Clone, Copy, PartialEq, Eq)]` (db-expand-names added `Debug`).",
+  "state": "applied",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T09:56:57Z",
+  "taken_by": "db-next5",
+  "why": null,
+  "source": "v2/requests/db.md#frontend-nameres-core-macros: `Debug` on `MacroSubNs` (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:4798"
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T09:56:57Z",
+      "by": "db-next5",
+      "action": "done",
+      "note": "settled before the queue import; its section's outcome line: `#[derive(Debug, Clone, Copy, PartialEq, Eq)]` (db-expand-names added `Debug`)."
+    }
+  ]
+}

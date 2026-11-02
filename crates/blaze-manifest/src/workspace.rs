@@ -2,36 +2,36 @@
 //! walking up from the current manifest; its members, from `members` globs and path
 //! dependencies, less `exclude`; its default members; and cargo's checks that they agree.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, bail};
+use blaze_hash::{HashMap, HashSet};
 use cargo_util_schemas::manifest::TomlProfiles;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::features::{Edition, Features, ResolveBehavior};
+use crate::files::Files;
 use crate::manifest::{
     Context, EitherManifest, Manifest, WorkspaceConfig, WorkspaceRootConfig, read_manifest,
 };
 use crate::paths::{ancestors, normalize_path};
-use crate::source::SourceId;
+use crate::source;
 
 /// The manifest of the workspace root above `manifest_path`, if one claims it.
-pub(crate) fn find_workspace_root(
+pub(crate) fn find_workspace_root<F: Files>(
     manifest_path: &Path,
-    ctx: &Context,
+    ctx: &Context<F>,
 ) -> anyhow::Result<Option<PathBuf>> {
     find_workspace_root_with_loader(manifest_path, ctx, |self_path| {
-        let source_id = SourceId::for_manifest_path(self_path)?;
+        let source_id = source::for_manifest_path(self_path)?;
         let manifest = read_manifest(self_path, source_id, ctx)?;
         Ok(manifest.workspace_config().get_ws_root(self_path, manifest_path))
     })
 }
 
-fn find_workspace_root_with_loader(
+fn find_workspace_root_with_loader<F: Files>(
     manifest_path: &Path,
-    ctx: &Context,
+    ctx: &Context<F>,
     mut loader: impl FnMut(&Path) -> anyhow::Result<Option<PathBuf>>,
 ) -> anyhow::Result<Option<PathBuf>> {
     {
@@ -67,9 +67,9 @@ fn find_workspace_root_with_loader(
 
 /// The `Cargo.toml` files above `manifest_path`, nearest first, stopping at `target/package`
 /// and after `CARGO_HOME`.
-fn find_root_iter<'a>(
+fn find_root_iter<'a, F: Files>(
     manifest_path: &'a Path,
-    ctx: &'a Context,
+    ctx: &'a Context<F>,
 ) -> impl Iterator<Item = PathBuf> + 'a {
     let home = ctx.config.home();
     let mut last: Option<&Path> = None;
@@ -83,36 +83,36 @@ fn find_root_iter<'a>(
         .take_while(|(curr, _)| !curr.ends_with("target/package"))
         .take_while(move |(_, last)| last.is_none_or(|last| last != home))
         .map(|(curr, _)| curr.join("Cargo.toml"))
-        .filter(|path| path.exists())
+        .filter(move |path| ctx.files().exists(path))
 }
 
-pub struct Workspace<'c> {
-    ctx: &'c Context,
+pub struct Workspace<'c, F: Files> {
+    ctx: &'c Context<F>,
     current_manifest: PathBuf,
-    packages: FxHashMap<PathBuf, EitherManifest>,
+    packages: HashMap<PathBuf, EitherManifest>,
     root_manifest: Option<PathBuf>,
     target_dir: Option<PathBuf>,
     build_dir: Option<PathBuf>,
     /// In the order cargo finds them, which is the order `cargo metadata` prints them.
     members: Vec<PathBuf>,
-    member_set: FxHashSet<PathBuf>,
+    member_set: HashSet<PathBuf>,
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
     custom_metadata: Option<toml::Value>,
     warnings: Vec<String>,
 }
 
-impl<'c> Workspace<'c> {
-    pub fn new(manifest_path: &Path, ctx: &'c Context) -> anyhow::Result<Workspace<'c>> {
+impl<'c, F: Files> Workspace<'c, F> {
+    pub fn new(manifest_path: &Path, ctx: &'c Context<F>) -> anyhow::Result<Workspace<'c, F>> {
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
-            packages: FxHashMap::default(),
+            packages: HashMap::default(),
             root_manifest: None,
             target_dir: None,
             build_dir: None,
             members: Vec::new(),
-            member_set: FxHashSet::default(),
+            member_set: HashSet::default(),
             default_members: Vec::new(),
             resolve_behavior: ResolveBehavior::V1,
             custom_metadata: None,
@@ -135,7 +135,7 @@ impl<'c> Workspace<'c> {
 
     fn load(&mut self, manifest_path: &Path) -> anyhow::Result<&EitherManifest> {
         if !self.packages.contains_key(manifest_path) {
-            let source_id = SourceId::for_manifest_path(manifest_path)?;
+            let source_id = source::for_manifest_path(manifest_path)?;
             let manifest = read_manifest(manifest_path, source_id, self.ctx)?;
             self.packages.insert(manifest_path.to_owned(), manifest);
         }
@@ -284,11 +284,13 @@ impl<'c> Workspace<'c> {
         };
         let root_manifest_path = self.root_manifest.clone().unwrap();
 
-        let members_paths = workspace_config
-            .members_paths(workspace_config.members.as_deref().unwrap_or_default())?;
+        let members_paths = workspace_config.members_paths(
+            self.ctx.files(),
+            workspace_config.members.as_deref().unwrap_or_default(),
+        )?;
         let default_members_paths = if root_manifest_path == self.current_manifest {
             match &workspace_config.default_members {
-                Some(default) => Some(workspace_config.members_paths(default)?),
+                Some(default) => Some(workspace_config.members_paths(self.ctx.files(), default)?),
                 None => None,
             }
         } else {
@@ -402,7 +404,7 @@ impl<'c> Workspace<'c> {
     }
 
     fn validate_unique_names(&self) -> anyhow::Result<()> {
-        let mut names = BTreeMap::new();
+        let mut names = HashMap::default();
         for member in &self.members {
             let name = match self.get(member) {
                 EitherManifest::Real(m) => &m.package_id.name,

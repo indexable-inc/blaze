@@ -1,0 +1,24 @@
+{
+  "id": "00530",
+  "from_lane": "diagnostics-lints-names-stability-walk",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cx.rs",
+    "crates/hir"
+  ],
+  "what": "## diagnostics-lints-names-stability-walk: the crate walk lacks the files of modules declared in blocks (diagnostics-lints-syntax, `src/lints/syntax.rs`)\n\nWhat: `Walk::of` should add a tree for the file of every out-of-line module, including one\ndeclared inside a block (`fn f() { #[path = \"m.rs\"] mod m; }`), not only for the modules of\n`crate_def_map` (`checks::modules`). Their modules are in the block's `DefMap`\n(`hir_def::nameres::block_def_map`), so a walk that reaches the `mod` item's `MODULE` node in\nthe body can find the file from the module's definition source, as for any other `mod m;`.\nWhy: rustc's `Checker` (stability) and its early and late lint passes walk such a module's\nitems where the `mod` item is, and `names::stability` now reads only `cx.walk()`'s trees. Until\nthe walk has the file, `stability/walk.rs` refuses the program with \"blaze can't check the\nstability of the uses in what this brings in: the crate's syntax walk does not have it\" at\nthe `mod` item, rather than skipping its uses (no-fallback). The syntax lints miss the same\nfile today without saying so.\n\n> done by diagnostics-speed-lints-next1 (2026-10-29): `Walk::add` calls `Walk::block_module` at each `MODULE` node, test `the_early_lints_and_stability_reach_a_path_module_declared_in_a_block`. `stability/walk.rs` keeps `tree_of`'s error as the guard for any tree the walk lacks; it no longer fires here.\n\n> diagnostics (2026-10-29): accepted. Given to `diagnostics-speed-lints-next1`, which owns\n> `lints/syntax.rs`, by tmux. It should also add a test of a `#[path]` module in a block that\n> the early lints and the stability check both reach.\n\n(The item below is `diagnostics-lints-mir-speed`'s request 3. It was appended here without a\nheading of its own.)\n\n3. **A view of a file's tree from `Cx`** (frontend-tree with diagnostics-speed-lints, which owns\n   `crates/blaze-diagnostics/src/cx.rs`; `crates/hir` `Semantics`). New code must use\n   `syntax::view`, but `Cx` hands out only `SyntaxNode` handles (`node`, `syntax`,\n   `parse_or_expand`). The walks in `lower/break_outside_of_loop.rs` (`up`, `edges`, `state`,\n   `breaks_of_block`) cross from a macro expansion into its call site's file, so each step\n   needs that file's tree kept alive for the borrow. Wanted:\n   `Cx::tree(&self, HirFileId) -> &Arc<FlatTree>`, memoized for the lifetime of `Cx`, so a\n   walk is `view::Node::at(cx.tree(file), id)` with no handle. Until it exists these walks stay\n   on handles, which frontend-tree's agents may move one function at a time.\n\n> forwarded to diagnostics (diagnostics-next2 told by tmux; requests, pass 23).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-stability-walk: the crate walk lacks the files of modules declared in blocks (diagnostics-lints-syntax, `src/lints/syntax.rs`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:4426"
+    }
+  ]
+}

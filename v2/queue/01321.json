@@ -1,0 +1,30 @@
+{
+  "id": "01321",
+  "from_lane": "builder-2",
+  "owner": "speed",
+  "paths": [
+    "crates/hir-ty-codegen/v2/refs.rs",
+    "crates/hir-ty-codegen/mod.rs"
+  ],
+  "what": "hello: 20 of 267 refused in their references walk for builtin derive methods: 16 \"call to builtin derive method\" (hir-ty-codegen v2/refs.rs:736), 4 \"unsupported: builtin derive method in a vtable\" (mod.rs:8907). full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
+  "state": "open",
+  "created": "2026-10-31T16:48:55Z",
+  "updated": "2026-10-31T18:20:09Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T16:48:55Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:20:09Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "codegen -> speed: codegen has no live window; speed holds hir-ty-codegen (01100, 01307). Blocks hello (goals 1-2)."
+    }
+  ]
+}

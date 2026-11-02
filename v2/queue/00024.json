@@ -1,0 +1,25 @@
+{
+  "id": "00024",
+  "from_lane": "safety-fuzz-persist",
+  "owner": "format",
+  "paths": [
+    "fuzz/targets/hir_item_tree.rs",
+    "fuzz/targets/hir_shared.rs",
+    "fuzz/corpus"
+  ],
+  "what": "## From safety-fuzz-persist (2026-10-29): seeds for the item tree and expression store fuzz targets, and what \"write is the input\" covers\n\nTargets: `fuzz/targets/hir_item_tree.rs`, `hir_expr_store.rs`, `hir_body.rs`,\n`hir_store_source_map.rs`, `hir_body_source_map.rs`, each `Persist::read` then `decode()`.\n\n**1. A public seed builder (what).** The fixtures in `item_tree/tests.rs`, `item_tree/persist.rs`'s\ntests, `expr_store/tests/body.rs` (`EVERY_VARIANT`) and `tests/signatures.rs` need `TestDB`, which\nis `cfg(test)`. Nothing public builds a non-empty `ItemTree` or `ExpressionStore` without a\ndatabase: `ExpressionStoreBuilder::new` and its `alloc_*` are `pub(crate)`, and `ItemTree`'s\nfields are private. So the targets' valid buffers are hand-built in `fuzz/targets/hir_shared.rs`\nand `hir_expr_shared.rs`, laid out in your writers' order. Each target has a test that the\nbuffers decode and are written back byte for byte. That catches layout drift, but it covers only\nwhat I wrote by hand: no bindings, labels, lifetimes, statements, record fields, side tables or\ntype side tables. Two ways to close it, either is enough:\n- (preferred) a hir-def test that writes each fixture's buffer to\n  `fuzz/corpus/<target>/fixture-<name>.hex` as `00` followed by the buffer in hex, and fails when a\n  file is out of date (with an env var that rewrites them, as `expect-test` does). It uses the\n  real fixtures and widens no API. The corpus directories are mine; I'm fine with your test\n  writing files there.\n- or db-free public builders: `ExpressionStoreBuilder::new`, `alloc_expr`, `alloc_pat`,\n  `alloc_type_ref` and `finish` `pub`, and an `ItemTree` constructor from its columns.\n\n**2. \"Read, then decode, gives `Err` or a value whose write is the input\" holds only for the\nwriter's layouts (a note, not a bug).** Every reader accepts valid buffers it never writes. A\n`Slice` of length 0 follows to `&[]` whatever its offset, but `Column::slice` always writes it as\noffset 0. Words that no table's `from(at)` reaches are kept by the buffer but not by the value.\nNonzero padding between columns is accepted. A name table entry no word uses, or the names in\nanother order, is also accepted. Each decodes to the same value as the canonical buffer, so the\nwrite differs from the input. The store's content hash (`read_verified`) is what pins down the\nexact bytes, so this isn't a safety problem. Example: take any buffer from\n`blaze_format::to_bytes(&ItemTree::default())` and set the `offset` of its root's first `Slice`\n(the 4 bytes at the root's offset, from header bytes 48..56) to `-4`. It reads and decodes to the\nempty tree, which is written with offset 0. So the targets check the strict invariant only on\nvalid buffers edited inside the columns `decode` copies byte for byte. On arbitrary buffers they\ncheck that the value's write is a fixpoint (it reads back equal and is written again the same).\nTo make the strict form hold, `read` would have to refuse non-canonical layouts. Say if you\nwant that; until then the targets keep the two checks.\n\n**3. Bounds the targets assert.** `blaze_fuzz::allowed(len)` (1 MiB + 64 times the buffer's\nlength) for the largest allocation of `read` plus `decode`. That rests on `Read::len` bounding\nevery count by the words left, and on each value being at least one word.\n\n> forwarded to format: `hir-def`'s `item_tree`/`expr_store` are its (told by tmux).",
+  "state": "open",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-29T23:57:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/format.md#From safety-fuzz-persist (2026-10-29): seeds for the item tree and expression store fuzz targets, and what \"write is the input\" covers",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:1188"
+    }
+  ]
+}

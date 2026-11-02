@@ -1,0 +1,9 @@
+[package]
+name = "corpus-panics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+corpus-macros = { path = "../macros" }
+tokio-macros = "=2.6.1"

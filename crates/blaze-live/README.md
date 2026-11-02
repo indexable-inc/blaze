@@ -20,10 +20,9 @@ loop {
 }
 ```
 
-While the program runs, the daemon also samples where its threads spend their time and
-compiles the functions they are found in again with LLVM, swapping them in as patches like any
-edit. `blaze_live::tiers()` says which functions are hot and at which level, for the program to
-show. `BLAZE_TIER=off` in the program's environment turns it off.
+Every function a patch can replace is called through a slot of a jump table the linker laid
+out; a patch is taken in one atomic store of the table, with no thread stopped and no code a
+thread can be in written over.
 
-macOS on Apple silicon and Linux x86-64; elsewhere `Live::start` says so and you still get
-blaze's fast builds. MIT or Apache-2.0.
+Linux on x86-64 and AArch64, macOS on Apple silicon and Windows x86-64; elsewhere
+`Live::start` says so and you still get blaze's fast builds. MIT or Apache-2.0.

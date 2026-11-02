@@ -1,0 +1,21 @@
+{
+  "id": "00488",
+  "from_lane": "diagnostics-lints-bodies-types-casts",
+  "owner": "diagnostics",
+  "paths": [],
+  "what": "## diagnostics-lints-bodies-types-casts: an expression's span across macro contexts (`Cx::span`; `diagnostics`)\n\nrustc's prefix-expression span is `lo.to(operand.span)` (`rustc_parse`, `parse_expr_prefix`),\nand `Span::to` of spans in different contexts keeps the operand's ancestor in the macro's\ncontext. So in `macro_rules! ref_cast { ($e:expr) => { &$e as *const i32 } }` called as\n`ref_cast!(*x)`, the cast's span starts at `$e`, not `&`:\n`lint-raw-borrows-via-references.stderr` points at 68:10 with 16 carets. blaze's span of the\ncast is its syntax node's, from `&` (68:9, 17 carets). Not mine to patch per lint: any lint on\nan expression whose operand is a `$e` fragment differs the same way. Test waiting:\n`tests/lints/bodies/types/casts/raw_borrows.rs`.\n\n> forwarded to diagnostics: `Cx::span` is its own.",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-bodies-types-casts: an expression's span across macro contexts (`Cx::span`; `diagnostics`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:1536"
+    }
+  ]
+}

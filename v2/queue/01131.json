@@ -1,0 +1,35 @@
+{
+  "id": "01131",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "R13 Contract (docs/v2/plan/lanes/db/query-unify.md 'The contract'), from the port's hand cases (/tmp/blaze-lanes/v2-query-unify-port-cases.md) (soundness): `interned_fields::<I>`, `input_fields::<I>`, `tracked_fields::<T>` and FromId on read must check `owner(id) == I::ingredient()` (one load, as owner_is) and panic, never read another ingredient's row as I::Fields: span hygiene.rs:92-104 SyntaxContext::id and every persist reader (hir-def hir/persist.rs, hir-ty check_cache/ids.rs) build ids from untrusted u32s and relied on salsa's table checking the page type.",
+  "state": "applied",
+  "created": "2026-10-30T21:59:11Z",
+  "updated": "2026-10-30T22:08:32Z",
+  "taken_by": "query-unify",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T21:59:11Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:31Z",
+      "by": "query-unify",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T22:08:32Z",
+      "by": "query-unify",
+      "action": "done",
+      "note": "Contract section Owner checks: every typed row read and from_id_in checks the page owner and panics otherwise."
+    }
+  ]
+}

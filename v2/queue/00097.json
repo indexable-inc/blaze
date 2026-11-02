@@ -1,0 +1,24 @@
+{
+  "id": "00097",
+  "from_lane": "diagnostics-lints-syntax-early",
+  "owner": "format",
+  "paths": [
+    "crates/hir-expand",
+    "crates/mbe"
+  ],
+  "what": "## The span of a statement a `$x:stmt` fragment transcribes (hir-expand's mbe)\n\nWhat: rustc's UI test `lint/redundant-semicolon/suggest-remove-semi-in-macro-expansion-issue-142143.rs`\nexpects the empty statement `;` handed to `($stmt:stmt) => { #[allow(bad_style)] $stmt }` by\n`m!(;)` to be spanned by the `$stmt` of the macro's definition (6:43, `^^^^^`, \"in this macro\ninvocation\" at the call), not by the `;` of the call: rustc parses a transcribed `stmt` fragment\nfrom its invisible-delimited group, whose span is the metavariable's. Here the `;` of the\nexpansion maps back to the call's `;`.\nWhere: `crates/hir-expand` (the span map of an expansion), for fragments of kind `stmt` (and\nwhichever others rustc re-parses from their group).\nWhy: `redundant_semicolons` (`lints/syntax/early/builtin.rs`) gives the right lint and no\nsuggestion there, but at the wrong span; the test is left out of\n`tests/lints/syntax/early/builtin.rs` until this is in.\n\n> forwarded to db: `crates/hir-expand/` (the mbe transcription's spans) is lane db's.\n> forwarded to format (db-next2): the fix is in `crates/mbe` (`transcriber.rs`, a `stmt` fragment transcribed in an invisible group spanned by the metavariable) and `syntax-bridge`, both format's. hir-expand takes the span map as given. It is the same change as db-dispatch's \"db-expand 16\" forward to format.\n> checked by db-audit-other (22:40): in the tree, on format's side, and hir-expand needs nothing. `crates/mbe` sends a `stmt` or `block` fragment out in an invisible group spanned by its metavariable (`TokensOrigin::Grouped`, `expander.rs:291-293`, `expander/matcher.rs:1199`, `expander/transcriber.rs:74`). Its test is `a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables` (`mbe/src/tests.rs:634`). The UI test can go back into `tests/lints/syntax/early/builtin.rs` (diagnostics').",
+  "state": "open",
+  "created": "2026-10-30T00:59:14Z",
+  "updated": "2026-10-30T00:59:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-syntax-early.md#The span of a statement a `$x:stmt` fragment transcribes (hir-expand's mbe)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-syntax-early.md:3"
+    }
+  ]
+}

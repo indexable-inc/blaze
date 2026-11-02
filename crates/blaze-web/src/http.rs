@@ -3,6 +3,8 @@
 //! names the token, comes to the address the page is at, and, for the websocket, from the
 //! page itself (docs/web.md, "The wire").
 
+#![forbid(unsafe_code)]
+
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
@@ -11,6 +13,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use blaze_protocol::write_both;
 use sha1::{Digest, Sha1};
 
 use crate::{Graphs, Next};
@@ -103,10 +106,12 @@ impl Site {
     }
 
     pub(crate) fn route(&self, request: &Request) -> Result<Route, Refused> {
+        // alloc: the edge, once per request
         let hosts = [format!("127.0.0.1:{}", self.port), format!("localhost:{}", self.port)];
         if !request.host.as_ref().is_some_and(|it| hosts.contains(it)) {
             return Err(Refused::Forbidden);
         }
+        // alloc: the edge, once per request
         let origins = hosts.map(|it| format!("http://{it}"));
         if request.origin.as_ref().is_some_and(|it| !origins.contains(it)) {
             return Err(Refused::Forbidden);
@@ -122,6 +127,7 @@ impl Site {
             return Err(Refused::MethodNotAllowed);
         }
         if let Some(path) = file.strip_prefix("flecs/") {
+            // alloc: the edge, once per REST request
             return Ok(Route::Flecs { path: format!("/{path}") });
         }
         let file = file.split_once('?').map_or(file, |it| it.0);
@@ -174,6 +180,7 @@ impl Site {
     /// Sends the page what the world says, until it closes or goes away.
     fn follow(&self, stream: TcpStream, accept: &str) -> io::Result<()> {
         let mut writer = stream.try_clone()?;
+        // alloc: the edge, once per page
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -186,15 +193,24 @@ impl Site {
         let closed = std::thread::Builder::new()
             .name("blaze-web-socket".into())
             .spawn(move || read_until_closed(reader))?;
+        let mut frames = Frames::default();
         let sent = (|| {
             while !closed.is_finished() {
                 match following.next(PATIENCE / 10) {
-                    Next::Message(message) => write_frame(&mut writer, 0x2, &message)?,
+                    // Every message there already goes in the same writes.
+                    Next::Message(message) => {
+                        frames.push(&mut writer, 0x2, &message)?;
+                        while let Some(message) = following.ready() {
+                            frames.push(&mut writer, 0x2, &message)?;
+                        }
+                        frames.flush(&mut writer)?;
+                    }
                     Next::Nothing => {}
                     Next::Gone => break,
                 }
             }
-            write_frame(&mut writer, 0x8, &[])
+            frames.push(&mut writer, 0x8, &[])?;
+            frames.flush(&mut writer)
         })();
         let _ = writer.shutdown(Shutdown::Both);
         sent
@@ -259,12 +275,14 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, Refused> {
     if version != "HTTP/1.1" {
         return Err(Refused::Malformed("a version other than HTTP/1.1"));
     }
-    let mut request =
-        Request { method: method.to_owned(), path: path.to_owned(), ..Request::default() };
+    // alloc: the edge, once per request
+    let (method, path) = (method.to_owned(), path.to_owned());
+    let mut request = Request { method, path, ..Request::default() };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(Refused::Malformed("a header without a colon"));
         };
+        // alloc: the edge, once per header of a request
         let value = value.trim().to_owned();
         let field = match name.to_ascii_lowercase().as_str() {
             "host" => &mut request.host,
@@ -282,6 +300,7 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, Refused> {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io::Result<()> {
+    // alloc: the edge, once per request
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
          Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
@@ -297,23 +316,68 @@ fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io:
     stream.write_all(&response)
 }
 
-/// Writes one unmasked frame of `opcode`, as a server does.
-pub(crate) fn write_frame(to: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut head = Vec::with_capacity(10);
-    head.push(0x80 | opcode);
-    match payload.len() {
-        len @ 0..=125 => head.push(len as u8),
-        len @ 126..=0xffff => {
-            head.push(126);
-            head.extend((len as u16).to_be_bytes());
+/// A payload this long is written from where it is, beside what is buffered, not copied.
+const IN_PLACE: usize = 64 << 10;
+/// What is buffered is written once it is this long.
+const BUFFERED: usize = 256 << 10;
+
+/// Unmasked frames, as a server sends them, in as few writes as they fit: heads and short
+/// payloads are copied into one buffer, written with the next long payload or at a flush.
+#[derive(Default)]
+pub(crate) struct Frames {
+    out: Vec<u8>,
+}
+
+impl Frames {
+    pub(crate) fn push(
+        &mut self,
+        to: &mut impl Write,
+        opcode: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        head(&mut self.out, opcode, payload.len());
+        if payload.len() >= IN_PLACE {
+            write_both(to, &self.out, payload)?;
+            self.out.clear();
+            return Ok(());
         }
-        len => {
-            head.push(127);
-            head.extend((len as u64).to_be_bytes());
+        self.out.extend_from_slice(payload);
+        if self.out.len() >= BUFFERED {
+            self.flush(to)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self, to: &mut impl Write) -> io::Result<()> {
+        if !self.out.is_empty() {
+            to.write_all(&self.out)?;
+            self.out.clear();
+        }
+        Ok(())
+    }
+}
+
+fn head(out: &mut Vec<u8>, opcode: u8, len: usize) {
+    out.push(0x80 | opcode);
+    match len {
+        0..=125 => out.push(len as u8),
+        126..=0xffff => {
+            out.push(126);
+            out.extend((len as u16).to_be_bytes());
+        }
+        _ => {
+            out.push(127);
+            out.extend((len as u64).to_be_bytes());
         }
     }
-    to.write_all(&head)?;
-    to.write_all(payload)
+}
+
+/// Writes one unmasked frame of `opcode`, as a server does.
+#[cfg(test)]
+pub(crate) fn write_frame(to: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    let mut frames = Frames::default();
+    frames.push(to, opcode, payload)?;
+    frames.flush(to)
 }
 
 /// What a frame from the page is.
@@ -328,6 +392,7 @@ pub(crate) enum Frame {
 /// The next frame of the page, which a browser masks; an unmasked one or one longer than
 /// [`LONGEST_MESSAGE`] is no browser's page's.
 pub(crate) fn read_frame(from: &mut impl Read) -> io::Result<Frame> {
+    // alloc: an error path
     let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
     let mut head = [0u8; 2];
     from.read_exact(&mut head)?;

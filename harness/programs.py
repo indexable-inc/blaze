@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """programs.py: two programs of one workspace built by one daemon.
 
-The stress workspace gets a second binary. The daemon is started for the first; each step edits
-files and then asks for one program or both by `blaze sync SOCKET --crate ...`. Every program
-asked for is run and compared with what `cargo build` of the same source prints.
+The stress workspace gets a second binary. Each step edits files and then asks the daemon for
+one program or both by `blaze build -p NAME`. Every program asked for is run and held to what a
+fresh build of the same source does (rebuild.py).
 """
-import os, shlex, shutil, subprocess, sys, tempfile, time
+import os, shutil, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import linkline
-from difftest import Fixture, BLAZE, sysroot_rlibs, RUNNER, TARGET_ARGS, built
+from rebuild import WRONG, Project, copy, edit, scratch
 
 TOOL_TOML = """[package]
 name = "stool"
@@ -38,7 +37,8 @@ fn main() {
 """
 MID, TOOL, APP = "mid/src/lib.rs", "tool/src/main.rs", "app/src/main.rs"
 AREA = "sbase::square!(self.side)"
-# (what the step is, [(file, old, new)], programs asked for in order, whether cargo rejects it)
+
+# (what the step is, [(file, old, new)], programs asked for in order, whether it is not Rust)
 STEPS = [
     ("nothing edited, the second program asked for first time", [], ["stool"], False),
     ("nothing edited, both again", [], ["sapp", "stool", "stool"], False),
@@ -50,9 +50,9 @@ STEPS = [
     ("the second catches up", [(TOOL, "n * 5", "n * 7")], ["stool", "sapp"], False),
     ("broken code both use", [(MID, AREA + " + 3", AREA + ' + "x"')], ["sapp", "stool", "sapp"], True),
     ("mended", [(MID, AREA + ' + "x"', AREA + " + 4")], ["stool", "sapp"], False),
-    # rustc parses a parenthesized macro call with no `;` after it as an expression, so the outer
-    # call's expansion, two calls with nothing between, does not parse (#154).
-    ("a macro of several statements in the parentheses of another's call, which rustc rejects",
+    # A parenthesized macro call with no `;` after it is an expression, so the outer call's
+    # expansion, two calls with nothing between, does not parse (#154).
+    ("a macro of several statements in the parentheses of another's call, which does not parse",
      [(MID, "        " + AREA + " + 4\n",
        "        macro_rules! twice {\n            ($($body:tt)*) => { $($body)* $($body)* };\n        }\n"
        "        let mut n = 0;\n        twice!(twice!(n += 1;));\n        " + AREA + " + 4 + n\n")],
@@ -62,84 +62,34 @@ STEPS = [
 ]
 
 
-def splice(program):
-    """Edits are added to the linked binary where that can be done; BLAZE_SPLICE=0 links each in full."""
-    return ["--binary", program["bin"]]
-
-
 def main():
-    ws = tempfile.mkdtemp(prefix="blaze-programs-")
-    shutil.copytree(os.path.join(HERE, "stress"), ws, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
-    os.makedirs(os.path.join(ws, "tool/src"))
-    open(os.path.join(ws, "tool/Cargo.toml"), "w").write(TOOL_TOML)
-    open(os.path.join(ws, TOOL), "w").write(TOOL_MAIN)
-    manifest = os.path.join(ws, "Cargo.toml")
-    members = open(manifest).read().replace('"app"]', '"app", "tool"]')
-    open(manifest, "w").write(members)
-    work = tempfile.mkdtemp(prefix="blaze-programs-out-")
-    socket, log_path = os.path.join(work, "blaze.sock"), os.path.join(work, "daemon.log")
-    reference = os.path.join(work, "reference")
-    crates = ["sapp", "sbase", "smid", "stool"]
-    programs = {}
-    for name in ("sapp", "stool"):
-        fx = Fixture(ws, crates, ["-p", name])
-        fx.rustc_build()
-        obj, patch, binary = (os.path.join(work, f"{name}.{n}") for n in ("o", "patch.o", "bin"))
-        link = list(fx.link_args)
-        link = linkline.with_output(linkline.ahead(link, [patch, obj], BLAZE), binary)
-        symbols = [x for rlib in fx.rlibs + sysroot_rlibs() for x in ("--symbols", rlib)]
-        programs[name] = {"obj": obj, "patch": patch, "bin": binary, "link": linkline.join(link), "symbols": symbols}
-    first = programs["sapp"]
-    out = open(log_path, "a")
-    daemon = subprocess.Popen(
-        [BLAZE, ws, *TARGET_ARGS, *[x for c in crates for x in ("--crate", c)], "--out", first["obj"], "--socket", socket,
-         "--patch", first["patch"], "--link-cmd", first["link"], *splice(first), *first["symbols"]], stderr=out, stdout=out)
-    while "watching" not in open(log_path).read():
-        if daemon.poll() is not None:
-            raise SystemExit(f"the daemon did not start: {log_path}")
-        time.sleep(0.05)
-
-    def run(path):
-        try:
-            ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30)
-        except Exception as error:
-            return f"did not run: {error}"
-        return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
-
+    work = scratch("blaze-programs-")
+    ws = copy(os.path.join(HERE, "stress"), os.path.join(work, "ws"))
+    edit(ws, "tool/Cargo.toml", None, TOOL_TOML)
+    edit(ws, TOOL, None, TOOL_MAIN)
+    edit(ws, "Cargo.toml", '"app"]', '"app", "tool"]')
+    project = Project(ws, work)
     wrong = asked = 0
-    for what, edits, order, broken in STEPS:
-        for path, old, new in edits:
-            text = open(os.path.join(ws, path)).read()
-            assert old in text, (what, old)
-            open(os.path.join(ws, path), "w").write(text.replace(old, new, 1))
-        time.sleep(0.02)
-        print(what, flush=True)
-        for name in order:
-            program = programs[name]
-            began = time.time()
-            reply = subprocess.run(
-                [BLAZE, "sync", socket, "--crate", name, "--out", program["obj"], "--patch", program["patch"],
-                 "--link-cmd", program["link"], *splice(program), *program["symbols"]], capture_output=True, text=True, timeout=120)
-            took = (time.time() - began) * 1000
-            reply = (reply.stdout + reply.stderr).strip()
-            cargo = subprocess.run(["cargo", "build", "-q", "-p", name, *TARGET_ARGS], cwd=ws, capture_output=True, text=True,
-                                   env={**os.environ, "CARGO_TARGET_DIR": reference})
-            assert (cargo.returncode != 0) == broken, cargo.stderr[-2000:]
-            if daemon.poll() is not None:
-                verdict = "DAEMON DIED"
-            elif broken:
-                verdict = "refused" if not reply.startswith("ok") else "ANSWERED OK"
-            elif not reply.startswith("ok"):
-                verdict = "REFUSED"
-            else:
-                verdict = "same" if run(program["bin"]) == run(built(reference, name)) else "DIFFERENT OUTPUT"
-            asked += 1
-            wrong += verdict.isupper()
-            print(f"    {name:6} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
-            if daemon.poll() is not None:
-                raise SystemExit(f"the daemon died: {log_path}")
-    daemon.kill()
-    print(f"{asked - wrong} of {asked} right; log {log_path}")
+    try:
+        for what, edits, order, broken in STEPS:
+            for path, old, new in edits:
+                edit(ws, path, old, new)
+            print(what, flush=True)
+            for name in order:
+                began = time.time()
+                built = project.build(name, "-p", name)
+                took = (time.time() - began) * 1000
+                verdict, said = project.held(built, name, "-p", name, broken=broken)
+                asked += 1
+                wrong += verdict in WRONG
+                print(f"    {name:6} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}", flush=True)
+                if verdict == "DAEMON DIED":
+                    raise SystemExit(f"the daemon died: its log is in {project.home}")
+    finally:
+        project.stop()
+    print(f"{asked - wrong} of {asked} right")
+    if not wrong:
+        shutil.rmtree(work, ignore_errors=True)
     sys.exit(1 if wrong else 0)
 
 

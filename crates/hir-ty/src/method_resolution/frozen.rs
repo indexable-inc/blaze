@@ -7,15 +7,17 @@
 
 use std::sync::Arc as StdArc;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Crate, Db};
+use blaze_format::cursor::{Put, Reader};
+use blaze_hash::HashMap;
+use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
-    nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference},
+    nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
 };
-use rustc_hash::FxHashMap;
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
 
-use super::{InherentImpls, OneTraitImpls, TraitImpls};
+use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
 use crate::{
     db::HirDatabase,
     next_solver::{SimplifiedType, SolverDefId},
@@ -24,15 +26,15 @@ use crate::{
 type R<T = ()> = Result<T, String>;
 
 /// The crates whose impls are frozen, set by whoever has the bytes.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct FrozenImpls {
     #[returns(ref)]
-    pub maps: StdArc<FxHashMap<Crate, Frozen>>,
+    pub maps: StdArc<HashMap<Crate, Frozen>>,
 }
 
 /// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
-    use salsa::{Durability, Setter};
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen>) {
+    use blaze_query::db::{Durability, Setter};
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {
         Some(it) => {
@@ -44,25 +46,24 @@ pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
     }
 }
 
-fn frozen(db: &dyn HirDatabase, krate: Crate) -> Option<Frozen> {
-    FrozenImpls::try_get(db)?.maps(db).get(&krate).cloned()
+fn frozen(db: &Db, krate: Crate) -> Option<&Frozen> {
+    FrozenImpls::try_get(db)?.maps(db).get(&krate)
 }
 
 /// Whether the impls of `krate` are read from frozen bytes rather than found.
-pub fn served(db: &dyn HirDatabase, krate: Crate) -> bool {
+pub fn served(db: &Db, krate: Crate) -> bool {
     frozen(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
 
 /// Part `which` of frozen bytes: the first is after its length.
 fn part(bytes: &[u8], which: usize) -> R<&[u8]> {
-    let len: [u8; 4] = bytes.get(..4).and_then(|it| it.try_into().ok()).ok_or("no length")?;
-    let first = 4 + u32::from_le_bytes(len) as usize;
-    let part = if which == 0 { bytes.get(4..first) } else { bytes.get(first..) };
-    part.ok_or_else(|| "a part past the end".to_owned())
+    let mut at = Reader::new(bytes);
+    let first = at.bytes_u32()?;
+    Ok(if which == 0 { first } else { at.take_rest() })
 }
 
 fn read<'db, T>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     which: usize,
     f: impl FnOnce(&mut Dec<'_>) -> R<T>,
@@ -77,53 +78,60 @@ fn read<'db, T>(
     Some(read().unwrap_or_else(|why| panic!("frozen impls do not read: {why}")))
 }
 
-pub(super) fn trait_impls<'db>(db: &'db dyn HirDatabase, krate: Crate) -> Option<TraitImpls<'db>> {
+pub(super) fn trait_impls<'db>(
+    db: &'db Db,
+    frame: &Frame,
+    krate: Crate,
+) -> Option<TraitImpls<'db>> {
     read(db, krate, 0, |dec| {
         let n = dec.len()?;
-        let mut map = FxHashMap::default();
-        map.reserve(n);
+        let mut builder = TraitImplsBuilder::new(frame);
         for _ in 0..n {
             let ModuleDefId::TraitId(trait_) = dec.def()? else {
+                // alloc: the error on corrupt bytes.
                 return Err("impls of no trait".to_owned());
             };
-            let non_blanket_impls = dec.many(|dec| {
-                let self_ty = read_simplified(dec)?;
-                let impls = dec.many(|dec| dec.impl_id())?.into_boxed_slice();
-                let derived = dec.many(|dec| dec.builtin_derive_impl())?.into_boxed_slice();
-                Ok((self_ty, (impls, derived)))
+            let t = builder.trait_(trait_);
+            // `many` of `()` allocates nothing: each id goes straight into the builder.
+            dec.many(|dec| {
+                let row = builder.row(t, read_simplified(dec)?);
+                dec.many(|dec| Ok(builder.push_impl(row, dec.impl_id()?)))?;
+                dec.many(|dec| Ok(builder.push_derive(row, dec.builtin_derive_impl()?)))?;
+                Ok(())
             })?;
-            let blanket_impls = dec.many(|dec| dec.impl_id())?.into_boxed_slice();
-            let non_blanket_impls = non_blanket_impls.into_iter().collect();
-            map.insert(trait_, OneTraitImpls { non_blanket_impls, blanket_impls });
+            dec.many(|dec| Ok(builder.push_blanket(t, dec.impl_id()?)))?;
         }
-        Ok(TraitImpls { map })
+        Ok(builder.finish())
     })
 }
 
 pub(super) fn inherent_impls<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
+    frame: &Frame,
     krate: Crate,
 ) -> Option<InherentImpls<'db>> {
     read(db, krate, 1, |dec| {
-        let map = dec.many(|dec| {
-            let self_ty = read_simplified(dec)?;
-            Ok((self_ty, dec.many(|dec| dec.impl_id())?.into_boxed_slice()))
+        let mut builder = InherentImplsBuilder::new(frame);
+        dec.many(|dec| {
+            let group = builder.group(read_simplified(dec)?);
+            dec.many(|dec| Ok(builder.push(group, dec.impl_id()?)))?;
+            Ok(())
         })?;
-        Ok(InherentImpls { map: map.into_iter().collect() })
+        Ok(builder.finish())
     })
 }
 
 /// The bytes of the impls of `krate` as they are now: found, or read in [`Mode::Serve`] and
 /// [`Mode::Verify`].
-pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
+pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
-    let TraitImpls { map } = &**TraitImpls::for_crate(db, krate);
-    let map = enc.sorted(map.iter(), |enc, it| enc.def(ModuleDefId::TraitId(**it)))?;
-    enc.usize(map.len())?;
-    for (&trait_, one) in map {
+    let trait_impls = &**TraitImpls::for_crate(db, krate);
+    let traits =
+        enc.sorted(trait_impls.trait_indices(), |enc, it| enc.def(ModuleDefId::TraitId(*it)))?;
+    enc.usize(traits.len())?;
+    for (trait_, t) in traits {
         enc.def(ModuleDefId::TraitId(trait_))?;
-        let OneTraitImpls { non_blanket_impls, blanket_impls } = one;
-        let entries = enc.sorted(non_blanket_impls.iter(), |enc, it| write_simplified(enc, it))?;
+        let entries = enc.sorted(trait_impls.rows_at(t), |enc, it| write_simplified(enc, it))?;
         enc.usize(entries.len())?;
         for (self_ty, (impls, derived)) in entries {
             write_simplified(&mut enc, self_ty)?;
@@ -136,16 +144,17 @@ pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
                 enc.builtin_derive_impl(it)?;
             }
         }
+        let blanket_impls = trait_impls.blanket_impls(trait_);
         enc.usize(blanket_impls.len())?;
-        for &it in blanket_impls.iter() {
+        for &it in blanket_impls {
             enc.impl_id(it)?;
         }
     }
     let traits = enc.finish()?;
 
     let mut enc = Enc::new(db, krate);
-    let InherentImpls { map } = InherentImpls::for_crate(db, krate);
-    let map = enc.sorted(map.iter(), |enc, it| write_simplified(enc, it))?;
+    let inherent_impls = InherentImpls::for_crate(db, krate);
+    let map = enc.sorted(inherent_impls.iter(), |enc, it| write_simplified(enc, it))?;
     enc.usize(map.len())?;
     for (self_ty, impls) in map {
         write_simplified(&mut enc, self_ty)?;
@@ -157,29 +166,18 @@ pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
     let inherent = enc.finish()?;
 
     let len = u32::try_from(traits.len()).map_err(|_| "impls over 4 GiB")?;
-    let mut out = len.to_le_bytes().to_vec();
-    out.extend_from_slice(&traits);
-    out.extend_from_slice(&inherent);
+    let mut out = Vec::with_capacity(4 + traits.len() + inherent.len());
+    out.put_u32(len);
+    out.put_bytes(&traits);
+    out.put_bytes(&inherent);
     Ok(out)
 }
 
 /// Records a difference between the frozen impls of `krate` and the live ones in
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
-pub fn check(db: &dyn HirDatabase, krate: Crate) {
+pub fn check(db: &Db, krate: Crate) {
     let Some(frozen) = frozen(db, krate) else { return };
-    let what = match frozen.mode {
-        Mode::Serve => return,
-        Mode::Check => "the live ones",
-        Mode::Verify => "what was read of them",
-    };
-    match encode(db, krate) {
-        Ok(written) if *written == *frozen.bytes => {}
-        Ok(written) => record_difference(db, krate, "impls", what, &written, &frozen.bytes),
-        Err(why) => {
-            let what = format!("{what}, which cannot be written ({why})");
-            record_difference(db, krate, "impls", &what, &[], &[])
-        }
-    }
+    check_frozen(db, krate, "impls", frozen, || encode(db, krate));
 }
 
 const INTS: [IntTy; 6] = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
@@ -201,6 +199,7 @@ fn write_def(enc: &mut Enc<'_>, it: &SolverDefId<'_>) -> R {
             enc.u8(2);
             enc.def(it.into())
         }
+        // alloc: the error of impls that cannot be written, which keeps them unfrozen
         _ => Err("a type named by neither an ADT, a trait nor a type alias".to_owned()),
     }
 }
@@ -211,6 +210,7 @@ fn read_def<'db>(dec: &mut Dec<'_>) -> R<SolverDefId<'db>> {
         _ => match dec.def()? {
             ModuleDefId::TraitId(it) => SolverDefId::TraitId(it),
             ModuleDefId::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+            // alloc: the error on corrupt bytes.
             _ => return Err("a type named by an item that names none".to_owned()),
         },
     })
@@ -283,6 +283,7 @@ fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
         S::Placeholder => enc.u8(18),
         S::Error => enc.u8(19),
         S::Closure(_) | S::Coroutine(_) | S::CoroutineWitness(_) => {
+            // alloc: the error of impls that cannot be written, which keeps them unfrozen
             return Err("an impl for a closure or a coroutine".to_owned());
         }
     }
@@ -311,6 +312,6 @@ fn read_simplified<'db>(dec: &mut Dec<'_>) -> R<SimplifiedType<'db>> {
         17 => S::UnsafeBinder,
         18 => S::Placeholder,
         19 => S::Error,
-        it => return Err(format!("simplified type {it}")),
+        it => return Err(format!("simplified type {it}")), // alloc: the error on corrupt bytes.
     })
 }

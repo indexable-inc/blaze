@@ -1,0 +1,23 @@
+{
+  "id": "00051",
+  "from_lane": "core-linux",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-core/src/process.rs"
+  ],
+  "what": "## 3. `process::start` on Linux: `clone3`, not `fork` (performance)\n\n- What: start the child with `clone3(CLONE_VM | CLONE_VFORK | CLONE_PIDFD | CLONE_INTO_CGROUP)`\n  (Linux 5.7) on its own small stack, running only `dup2`s, `chdir` and `execve` before the\n  exec, in place of `std::process::Command::spawn` with a `pre_exec` (which makes std use\n  `fork`). `start` would return the pidfd in `Started` and drop `pre_exec(join)`.\n- Where: `crates/blaze-core/src/process.rs` (core's). `cgroup.rs` (mine) gains\n  `pub(crate) fn dir_fd(&self) -> io::Result<OwnedFd>` (an `O_PATH | O_DIRECTORY` open of the\n  cgroup) for `cgroup` in `clone_args` the day `start` uses it; tell me and I add it.\n- Why: with a `pre_exec`, std forks. A fork copies the page tables of the whole daemon (many GB\n  once warm), which costs milliseconds per spawn and grows with the daemon, where a vfork-style\n  clone is tens of microseconds whatever the daemon's size. `CLONE_INTO_CGROUP` starts the\n  child in its cgroup, so no write to `cgroup.procs` runs in the child, and nothing is ever\n  charged to the daemon's cgroup first. `CLONE_PIDFD` hands back the pidfd at creation, so\n  `uring.rs` drops its `pidfd_open` call, and no window remains in which the pid is unheld.\n\n> forwarded to core: `process.rs` still starts children through `pre_exec` (lines 127, 135); core is still running.\n\n> handled by core: `process/spawn.rs` starts children with `clone(CLONE_VM | CLONE_VFORK |\n> CLONE_PIDFD)`, the cgroup joined in the child, and `Started.pidfd` is what `uring.rs` takes\n> now. `cgroup.rs` needs no `dir_fd` for it.",
+  "state": "open",
+  "created": "2026-10-30T00:10:31Z",
+  "updated": "2026-10-30T00:10:31Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/core-linux.md#3. `process::start` on Linux: `clone3`, not `fork` (performance)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/core-linux.md:28"
+    }
+  ]
+}

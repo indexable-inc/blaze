@@ -1,0 +1,23 @@
+{
+  "id": "01403",
+  "from_lane": "query-unify-engine",
+  "owner": "query-unify",
+  "paths": [
+    "docs/v2/plan/lanes/db/query-unify.md"
+  ],
+  "what": "Contract addition to write up (Andrew 17:57, build explorer provenance), now in blaze_query::db: db/provenance.rs. Storage::provenance(&self, &mut Vec<Provenance>) is the current view's table of every memo that was not a plain hit: Provenance { node, key: DatabaseKeyIndex, outcome: Outcome (Verified | Reran | ReranSameOutput), cause: Option<Cause> }. Cause is Changed(node), the first read the claimed verify found changed, or New | Evicted | Untracked | Cycle. Storage::node_read(node) -> Read names a node. A run records one u64 per node (Storage::runs: view, reason, cause node), written once by the flight holder before it runs; a hit and a verify write nothing. Views are restamped with the colors when they are renumbered.",
+  "state": "open",
+  "created": "2026-11-01T01:04:50Z",
+  "updated": "2026-11-01T01:04:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T01:04:50Z",
+      "by": "query-unify-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

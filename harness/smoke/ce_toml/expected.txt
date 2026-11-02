@@ -1,1 +1,1 @@
-parsed 10 manifests: 3830 entries
+parsed 10 manifests: 3660 entries

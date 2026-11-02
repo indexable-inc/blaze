@@ -1,0 +1,23 @@
+{
+  "id": "00512",
+  "from_lane": "diagnostics-lints-names-dead",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## diagnostics-lints-names-dead: the level of a lint at a node, callable from `lints/names` (crates/blaze-diagnostics `lints/levels`)\n\nWhat: a `pub(crate)` form of the levels child's `lint_level_spec_at_node` (the level and the\n`#[expect]` id of a lint at an `InFile<SyntaxNode>`, the command line included). Why: rustc's\ndead-code pass groups dead items by the level of `dead_code` at each (`warn_multiple`) and seeds\nwhat an `allow`/`expect` covers (`has_allow_dead_code_or_lang_attr`). The levels API is\n`pub(super)` inside `lints/levels`, so `lints/names/dead/level.rs` reads the attributes itself\nand does not see `-A`/`-W`/`-D dead_code` on the command line: under those, the seeds and the\ngrouping can differ from rustc's (the level each found lint is shown at is still the levels\nchild's). Once there is one, `dead/level.rs` is replaced by calls to it.\n\n> forwarded to diagnostics: between its own children (the front-end parts go to db through it).",
+  "state": "open",
+  "created": "2026-10-30T04:32:15Z",
+  "updated": "2026-10-30T04:32:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics.md#diagnostics-lints-names-dead: the level of a lint at a node, callable from `lints/names` (crates/blaze-diagnostics `lints/levels`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics.md:2452"
+    }
+  ]
+}

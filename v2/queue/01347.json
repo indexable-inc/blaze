@@ -1,0 +1,25 @@
+{
+  "id": "01347",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-codegen/src/plan.rs",
+    "crates/blaze-cargo/src/serve",
+    "crates/blaze-link/src/tests/lazy.rs"
+  ],
+  "what": "codegen, for 00746 (dev backend axis): it adds a field codegen_backend: Option<DevBackend> to blaze_codegen::plan::Profile and Override. Profile and Policy are built as full struct literals outside codegen (blaze-link src/tests/lazy.rs:170; blaze-cargo serve/tests.rs:170, serve/unit/run/tests.rs:28, serve/unit/tests.rs:39, serve/unit/codegen.rs:404 and 417, serve/unit/codegen/tests.rs:21), so the field alone would break those crates. Ask: a coordinated round where codegen adds the field and cargo and link add codegen_backend: None to those literals at once, or permission for codegen to add that one line in each. Then cargo can map codegen-backend = cranelift or stencil onto it in serve/unit/codegen.rs codegen_backend instead of refusing it.",
+  "state": "open",
+  "created": "2026-10-31T20:47:40Z",
+  "updated": "2026-10-31T20:47:40Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T20:47:40Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

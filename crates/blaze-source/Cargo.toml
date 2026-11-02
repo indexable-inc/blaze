@@ -15,12 +15,16 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-rustc-hash.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
 # The hasher cargo names a source's directories with.
-rustc-stable-hash = "0.1.2"
+rustc-stable-hash.workspace = true
 semver.workspace = true
 serde.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
 
 [lints]
 workspace = true

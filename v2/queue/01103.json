@@ -1,0 +1,25 @@
+{
+  "id": "01103",
+  "from_lane": "integrate",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/blaze-wasm-pack"
+  ],
+  "what": "01083 part (1) done by integrate, with one change: blaze-wasm-pack moved from crates/blaze-wasm/pack to crates/blaze-wasm-pack, a root member (crates/*), so its tests (src/tests.rs) run with the workspace's; as a path dependency under the excluded crates/blaze-wasm they would never have run. Its manifest now uses workspace = true dependencies and [lints] workspace = true. Root [workspace.dependencies] gained blaze-wasm-pack = { path = \"crates/blaze-wasm-pack\" }; Cargo.lock gained its [[package]] block and the line in blaze-cargo's list; blaze-cargo uses blaze-wasm-pack.workspace = true; crates/blaze-wasm/Cargo.toml points at ../blaze-wasm-pack (01069's build of blaze-wasm: the pack tests are now in the root workspace, not --manifest-path crates/blaze-wasm/pack). Workspace lints may add warnings in it. 01083 part (2), the check, is still yours; errors go to integrate-load (its successor window has closed, so send them to integrate). docs/cargo.md and crates.md updated.",
+  "state": "open",
+  "created": "2026-10-30T17:18:48Z",
+  "updated": "2026-10-30T17:18:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T17:18:48Z",
+      "by": "integrate",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

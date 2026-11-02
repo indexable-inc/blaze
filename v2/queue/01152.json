@@ -1,0 +1,35 @@
+{
+  "id": "01152",
+  "from_lane": "tests-misc-front2",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/lower.rs"
+  ],
+  "what": "hir-ty-matchck test match_arm_statics (ported from rustc ui/pattern/usefulness/match-arm-statics) expects E0004 at `(Foo { .. })`, the parenthesized scrutinee, as rustc reports: rustc_ast_lowering lower_expr_mut for ExprKind::Paren widens the inner HIR expr span to the parens (`if e.span.contains(ex.span) { ex.span = e.span }`). crates/hir-def/src/expr_store/lower.rs:1802 maps a ParenExpr to its inner expression id, so the back map (expr_syntax) gives the inner node and the diagnostic span lacks the parens. Ask: a span for diagnostics that is the outermost paren around an expression (e.g. record the ParenExpr ptr as the back-map entry of the inner id, or a separate diagnostic-span lookup), so blaze matches rustc spans for paren scrutinees.",
+  "state": "applied",
+  "created": "2026-10-30T22:47:57Z",
+  "updated": "2026-10-31T13:49:03Z",
+  "taken_by": "tests-misc-front2",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:47:57Z",
+      "by": "tests-misc-front2",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:44:21Z",
+      "by": "tests-misc-front2",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T13:49:03Z",
+      "by": "tests-misc-front2",
+      "action": "done",
+      "note": "crates/hir-def/src/expr_store/lower.rs ParenExpr arm (~1807-1820): the inner expr's expr_map_back entry is replaced by the paren syntax when same file and the parens' range contains it (rustc lower_expr_mut ExprKind::Paren, e.span.contains(ex.span)); nested parens give the outermost"
+    }
+  ]
+}

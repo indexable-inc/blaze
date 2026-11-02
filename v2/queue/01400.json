@@ -1,0 +1,36 @@
+{
+  "id": "01400",
+  "from_lane": "no-fallback-front-mir",
+  "owner": "no-fallback-front-mir",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/eval.rs",
+    "crates/hir-ty-mir/src/tests/consteval/const_traits.rs"
+  ],
+  "what": "From 01286 (4): const_trait_derive_const still meets a recorded builtin derive impl in the evaluator although its harness sets set_expand_builtin_derives(true). eval.rs get_mir_or_dyn_index now names the derive, method and self type; needs one run of tests::consteval::const_traits::const_trait_derive_const to say which impl stays unexpanded, then the fix in name resolution or the harness.",
+  "state": "applied",
+  "created": "2026-11-01T00:53:47Z",
+  "updated": "2026-11-01T03:48:02Z",
+  "taken_by": "no-fallback-front-mir",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T00:53:47Z",
+      "by": "no-fallback-front-mir",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:48:02Z",
+      "by": "no-fallback-front-mir",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T03:48:02Z",
+      "by": "no-fallback-front-mir",
+      "action": "done",
+      "note": "round 19 (71269b1fd5): const_trait_derive_const passes, alone with --nocapture prints nothing (/tmp/blaze-lanes/round19-const_trait_derive_const.txt); no change needed. location::placed already errors on a file!() it cannot place (01398 closed)."
+    }
+  ]
+}

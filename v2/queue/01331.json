@@ -1,0 +1,36 @@
+{
+  "id": "01331",
+  "from_lane": "query-unify",
+  "owner": "tests-misc-front1",
+  "paths": [
+    "crates/blaze-item-hash/src/reads.rs",
+    "crates/blaze-item-hash/src/tests/classify.rs"
+  ],
+  "what": "Round 10 (844fdd3314): 01295 worked, the (Infer|Mir, Crate) and (Mir, CrateResolution::module) refusals are gone, but blaze-item-hash is still 48/3 because the walk now reaches reads the first refusal hid: every_read_of_the_steps... refuses (Infer, ScopeInput::legacy_macro), (Infer, ScopeInput::name), (Mir, ScopeInput::legacy_macro) (tracked methods on hir-def nameres/delta/publish.rs ScopeInput, nameres.rs:590) and (Borrowck, match_check) (hir-ty-matchck lib.rs:288; round 9 listed Body::has_lowering_errors there instead). several_argument_reads_are_facts_of_their_first (classify.rs:642) and own_earlier_steps_are_step_facts (classify.rs:664) still fail too. They need RULES or REFUSALS entries; nothing in blaze-query. Log: .coord-1030/v2-build/round10-test.log:11516-11570.",
+  "state": "applied",
+  "created": "2026-10-31T18:20:19Z",
+  "updated": "2026-10-31T18:23:05Z",
+  "taken_by": "tests-misc-front1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T18:20:19Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:21:38Z",
+      "by": "tests-misc-front1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T18:23:05Z",
+      "by": "tests-misc-front1",
+      "action": "done",
+      "note": "fixed by item-hash-facts, uncommitted: ScopeInput::{name,legacy_macro,traits} Names rules (in 7c81a55a8d) and match_check of the own body as the MatchCheck fact 0x1805 (reads.rs Rule::OwnMatchCheck, values.rs, dep hir-ty-matchck, reads.md row). Round 11 shows whether the other two classify tests follow."
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 //! Builds the page's files into the crate: every file under `assets/` but the tools that make
 //! them (`dev/`, `build/`) and their notes (`*.md`), by its path under `assets/`.
+#![forbid(unsafe_code)]
 
 use std::{
     fs,

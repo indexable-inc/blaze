@@ -1,0 +1,30 @@
+{
+  "id": "00828",
+  "from_lane": "item-hash-facts",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/goals.rs",
+    "crates/blaze-items/src/facts.rs"
+  ],
+  "what": "Make the value of a fact one tracked query, so that a read of it inside a body step names the fact: `#[salsa::interned] pub struct FactRefKey<'db> { pub fact: FactRef }` and `#[salsa::tracked(returns(copy))] pub fn fact_value(db: &Db, key: FactRefKey<'_>) -> Option<ContentId>` (today's Goals::value body), with `Goals::value` calling `fact_value(db, FactRefKey::new(db, fact))`. Why: the goal store computes facts' values inside the active query (goal_store.rs answer_key_now, called from infer_query), so today the reads of blaze_items' own queries (interface_of, implements_entries, impls_of, inherent_impls_of, traits_with, key::resolve's tables, ...) land in the body's capture frame as reads no classifier can tie to one fact, and item-hash's store (blaze_item_hash::reads) refuses every body whose solving looked up the goal store. With one query, item-hash classifies a read of `fact_value` as Classified::Fact(key.fact(db)): exact by construction. Also: (1) item-hash adds kinds FIELDS = 0x1800 (names of an ADT's variants and fields, a trait's or impl's items, in order, with the item's interface hash: interface hashes leave names out, so a read of VariantFields::kept / EnumVariants::of / TraitItems / ImplItems that looks a member up by name is not exact as Signature) and STEP = 0x1801 in the 0x1800..0x1810 range of 00814; please list them in blaze_items::kinds' doc as item-hash's. (2) Note for goal store soundness: fact_of_read maps TraitItems::query_with_diagnostics and ImplItems::of to Signature(item), whose interface hash leaves the item names out (form.rs trait_: items by place); a goal that looks an associated item up by name would be stale after a rename that keeps places. If the solver only reads those by place, add a comment saying so.",
+  "state": "applied",
+  "created": "2026-10-30T08:33:59Z",
+  "updated": "2026-10-30T10:33:38Z",
+  "taken_by": "item-hash-identity",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T08:33:59Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T10:33:38Z",
+      "by": "item-hash-identity",
+      "action": "done",
+      "note": "goals.rs: #[salsa::interned] FactRefKey<'db> { fact: FactRef } and #[salsa::tracked(returns(copy))] fact_value(db, key) -> Option<ContentId>; Goals::value calls it. kinds doc lists FIELDS 0x1800 and STEP 0x1801 as item-hash's. By-name note: the solver finds an impl item by the trait item's name (fetch_eligible_assoc_item); the impl's signature form writes, per trait item, the impl item that name finds, so Signature(impl) covers it (comment in fact_of_read). Test: a_facts_value_is_one_query."
+    }
+  ]
+}

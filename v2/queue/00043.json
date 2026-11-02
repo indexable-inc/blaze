@@ -1,0 +1,35 @@
+{
+  "id": "00043",
+  "from_lane": "items",
+  "owner": "codegen",
+  "paths": [
+    "docs/v2/plan/lanes/items.md"
+  ],
+  "what": "## items: an instance of a name-observing fn is keyed on its arguments' names; a const's data on its value (for `codegen`)\n\nThis settles items-form's \"who observes a type's name through a generic wrapper\" above. A\nbody hashes a direct call of `type_name`/`type_id` with the key and path of the nominal types\nin its arguments (`form`), so only the instance that calls the intrinsic embeds a name: with\ncallees named by identity (the request above), `std::any::type_name::<A>`'s caller calls that\ninstance and holds no name itself. What codegen must do:\n\n- An instance of a fn for which `blaze_items::observes_names(db, func)` holds, or whose body\n  calls one with its own generic parameters in the arguments, is keyed on the\n  `Fact::Name` of every nominal type in its instance arguments as well as its code hash. An\n  instance that inlines one (release, deep hash) carries the same.\n- A const's or static's data is keyed on its `Fact::ConstValue` (the evaluated bytes), never\n  on its code hash: `const C: &str = f::<A>()` keeps its code hash when `A` is renamed while\n  its bytes change.\n\nWhy: otherwise a rename keeps a stale `type_name` string or `TypeId` (docs/v2/plan/lanes/items.md 6.1:\nnames are in a hash only where the program observes them, and here it does, one instance away).\n\n> forwarded to codegen",
+  "state": "applied",
+  "created": "2026-10-30T00:05:22Z",
+  "updated": "2026-10-31T21:04:54Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": "v2/requests/items.md#items: an instance of a name-observing fn is keyed on its arguments' names; a const's data on its value (for `codegen`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/items.md:98"
+    },
+    {
+      "at": "2026-10-31T21:04:54Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T21:04:54Z",
+      "by": "codegen",
+      "action": "done",
+      "note": "Already holds, now pinned by tests in crates/hir-ty-codegen/v2/hashes/tests.rs (renaming_or_moving_a_type_changes_its_identity, a_constant_s_code_is_its_value): instance args are spelled by Hashes::ty = hir_ty_share::identity, which holds each ADT item key (crate, parent and name, so a function of the path type_name prints); a generic calling type_name/type_id with its params has a share key taking their full identity (walk.rs Class::Identity, transitively through instance_callee), as does an inlining instance through its built-in keys; a non-generic const code hash is its evaluated value (blaze-items form.rs const_value) and a static data key its evaluated bytes (v2/statics.rs value_id)."
+    }
+  ]
+}

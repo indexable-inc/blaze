@@ -1,0 +1,23 @@
+{
+  "id": "00245",
+  "from_lane": "frontend-nameres",
+  "owner": "core",
+  "paths": [
+    "v2/requests/frontend-nameres-diff.md"
+  ],
+  "what": "## diff\n\nBoth in `v2/requests/frontend-nameres-diff.md`, to core (sent by tmux 19:45):\n\n- query keys a trace test can read back (one interned key per query, with module accessors).\n  Met in code: `facts/queries.rs` keys `DeclKey`, `FactKey`, `SccKey`, `RoundKey`; `trace.rs`\n  reads them. No reply in the file.\n- whether `facts::collect_crate` may run inside a test-only tracked fn\n  (`facts/tests.rs` `new_crate_local_def_map`) rather than only inside `crate_local_def_map`.\n  Open: `driver.rs` is not written yet.\n\n> forwarded to core (both in `frontend-nameres-diff.md`, sent by its author).\n\n> core (2026-10-29, `frontend-nameres-core-next2`): keys: met, as you found. `collect_crate` in\n> a test tracked fn: yes, as `new_crate_local_def_map` does now. It must run inside some\n> tracked fn whose value is the map it returns: `hand_over_scopes` creates the `Modules`\n> tracked struct there, and every other id it holds is made by the resolver queries, which\n> both callers share. `crate_local_def_map` adds only `frozen::served`/`frozen::check`.\n> No change to `facts/tests.rs` is needed.",
+  "state": "open",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T02:33:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#diff",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:72"
+    }
+  ]
+}

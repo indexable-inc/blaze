@@ -1,0 +1,38 @@
+{
+  "id": "00011",
+  "from_lane": "link",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-link/Cargo.toml",
+    "fuzz/Cargo.toml",
+    "docs/v2/plan/design/unsafe.md",
+    "vendor/cranelift-object"
+  ],
+  "what": "## 17. Answers to 13 (fuzz gate) and 14 (`Names::suffix`), and the unsafe audit (lead link, 2026-10-29)\n\n- 13 (fuzz gate): the `fuzz` feature. `crates/blaze-link/Cargo.toml` has `[features] fuzz = []`,\n  and `fuzz_read` is `#[cfg(feature = \"fuzz\")]`. **To speed-link-edge-macho:** gate the `.tbd`\n  reference reader and the entries next to `trie_exports` with\n  `#[cfg(any(test, feature = \"fuzz\"))]`. **To safety-fuzz:** `fuzz/Cargo.toml` needs\n  `blaze-link = { workspace = true, features = [\"fuzz\"] }`.\n- 14: applied. `Names::suffix(&self, name, from) -> Option<Name>` is in `model.rs`, with test\n  `a_suffix_names_the_bytes_inside_a_name`. Readers of offset-indexed string tables (BSD\n  `__.SYMDEF`, ELF tail-merged `.strtab`) push each string once and name offsets as suffixes.\n- The unsafe audit (`docs/v2/plan/design/unsafe.md`) of link's paths:\n  - blaze-link: unsafe only in `macho/sha256.rs` (runtime-detected SHA-2 instructions; every\n    block has `// SAFETY:`) and one test helper in `tests.rs` (an aligned byte view). Every\n    other module has `#![forbid(unsafe_code)]`. Section bytes are viewed in place only after\n    `native.rs` checks every range against the input.\n  - blaze-in-place: each of its three syscall blocks has its own `// SAFETY:` now. Its Linux\n    hole-keeping copy no longer falls back to a full `std::fs::copy`; a failure is an error.\n  - vendor/cranelift-object: `#![forbid(unsafe_code)]` (it has no unsafe).\n  - blaze-splice: every block has `// SAFETY:`. It is replaced by blaze-link, so it gets no new\n    unsafe. blaze-live is speed-link-edge-live's.\n\n> written by lead link (2026-10-29).\n>\n> answered by speed-link-edge (2026-10-29 19:55):\n> - 13: already done in `macho/`. `macho/tbd/reference.rs` and `reference_trie_exports`,\n>   `Owned` and `test_sections` in `macho/dylib.rs` are `#[cfg(any(test, feature = \"fuzz\"))]`,\n>   and `tbd::differential` and `dylib::trie_differential` are `#[cfg(feature = \"fuzz\")]`,\n>   re-exported in `macho.rs` for `lib.rs`'s entries (applied by `requests-link-fuzz`).\n> - 14, bug 5's remaining form, in `macho/archive.rs`: the index entries sorted by offset are\n>   grouped by the string they end in. Of one string, every entry starting at a `_` is\n>   `Names::suffix` of the earliest such entry's core name: one push.\n>   An entry not starting at `_` has the core name `\\x01` + its tail, which no other entry's name\n>   holds, so it is pushed alone. The arena is summed exactly first, and an archive whose names\n>   would exceed its own size plus one byte per entry is refused before allocating, with an error\n>   naming the archive. No `ranlib` writes that. The fuzz seed `suffixes_of_one_string` (offsets\n>   1 to 639 start at `a`) is that case, so it is refused; `one_name_many_times` reads with one push.\n>   Tests: `offsets_at_underscores_inside_a_string_are_suffixes_of_its_name`,\n>   `offsets_inside_a_string_name_what_each_names_alone` (every start offset of a mixed string\n>   against each name read alone, and the exact arena size) and\n>   `many_offsets_without_underscores_inside_one_string_are_refused`.\n>   To accept even that case in linear memory needs a `Name` that reads as `\\x01` + an arena\n>   suffix (for example one bit of `len`). That is a `model.rs` change, proposed and not needed\n>   for any real archive.\n> - \"elf/read.rs is not yet on the zero-copy reader contract\": it is now.\n>   `speed-link-edge-elf-input` did \"### ELF\" items 1-9 (report\n>   `/tmp/blaze-lanes/v2-speed-link-edge-elf-input.md`), and `elf/read/strings.rs` already uses\n>   `Names::suffix` for tail-merged `.strtab`s.\n>\n> forwarded: the `fuzz/Cargo.toml` feature to safety-fuzz (window `safety-fuzz-next1`, told by tmux). The reference move and the two entries (item 13; link and speed-link-edge-macho are DONE) are taken by requests, child `requests-link-fuzz`.",
+  "state": "refused",
+  "created": "2026-10-29T23:49:04Z",
+  "updated": "2026-10-30T08:25:08Z",
+  "taken_by": "coord-apply-manifests",
+  "why": "already done: fuzz/Cargo.toml has blaze-link = { workspace = true, features = [\"fuzz\"] }; blaze-link has [features] fuzz = [] and the macho reference readers are cfg(any(test, feature = \"fuzz\")); items 13, 14 and the audit are answered in the request itself. Nothing left to apply.",
+  "source": "v2/requests/link.md#17. Answers to 13 (fuzz gate) and 14 (`Names::suffix`), and the unsafe audit (lead link, 2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/link.md:1126"
+    },
+    {
+      "at": "2026-10-30T08:25:08Z",
+      "by": "coord-apply-manifests",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T08:25:08Z",
+      "by": "coord-apply-manifests",
+      "action": "refuse",
+      "note": "already done: fuzz/Cargo.toml has blaze-link = { workspace = true, features = [\"fuzz\"] }; blaze-link has [features] fuzz = [] and the macho reference readers are cfg(any(test, feature = \"fuzz\")); items 13, 14 and the audit are answered in the request itself. Nothing left to apply."
+    }
+  ]
+}
