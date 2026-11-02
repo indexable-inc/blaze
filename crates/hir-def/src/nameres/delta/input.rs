@@ -48,7 +48,9 @@ pub(super) struct Delta {
 /// `cold`: the state is new, every group is a seed. `deps_changed`: a crate maintained before
 /// this one changed a binding or a module in this write, so the root's log is read again: it
 /// alone reads other crates at round 0 (the injected std prelude, `#[macro_use] extern crate`),
-/// and `root_decl` holds only their roots.
+/// and `root_decl` holds only their roots. The root's log is read again too when the crate was
+/// given proc macros (`written.proc_macros`): it lists their expanders, as `#[proc_macro]`
+/// functions are only at the root.
 pub(super) fn read(
     db: &Db,
     krate: Crate,
@@ -58,6 +60,7 @@ pub(super) fn read(
     deps_changed: bool,
 ) -> Delta {
     let mut delta = Delta::default();
+    let deps_changed = deps_changed || written.proc_macros.binary_search(&krate).is_ok();
     let root_key = queries::root_decl(db, krate);
     let full = cold
         || !written.added.is_empty()

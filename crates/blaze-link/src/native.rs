@@ -1882,6 +1882,12 @@ impl<'a> Stage<'a> {
         inputs.sort_by_key(|it| (it.order, it.id));
         let mut names: HashSet<&str> = HashSet::with_capacity_and_hasher(inputs.len(), Default::default());
         names.extend(inputs.iter().map(|it| &*it.name));
+        // A Mach-O library is on the line by its install name too, which is where an SDK's
+        // `.tbd` stands for the `/usr/lib` dylib another library re-exports.
+        names.extend(inputs.iter().filter_map(|it| match &*it.file {
+            NativeFile::Shared(shared) if shared.name.starts_with('/') => Some(&*shared.name),
+            _ => None,
+        }));
         for input in inputs.iter() {
             let NativeFile::Shared(shared) = &*input.file else { continue };
             for wanted in &shared.inputs {

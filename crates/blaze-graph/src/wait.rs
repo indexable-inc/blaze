@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::pump::Waiting;
 
@@ -22,10 +22,14 @@ pub enum WaitOn<'a> {
     Io(&'a str),
     /// A child process, by its pid.
     Child(u32),
+    /// The jobs of a scope its caller waits for, by the scope's counter. The profiler's span of
+    /// the wait adds what the scope is for: the span its caller waits in, which opened it.
+    Scope(u32),
 }
 
 impl WaitOn<'_> {
-    /// Its `awaits`: `lock <name>`, `channel <name>`, `io <what>`, `child <pid>`, or the key.
+    /// Its `awaits`: `lock <name>`, `channel <name>`, `io <what>`, `child <pid>`, `scope <counter>`,
+    /// or the key.
     fn write(self, out: &mut String) {
         // Writing to a `String` does not fail.
         _ = match self {
@@ -34,14 +38,60 @@ impl WaitOn<'_> {
             WaitOn::Channel(name) => write!(out, "channel {name}"),
             WaitOn::Io(what) => write!(out, "io {what}"),
             WaitOn::Child(pid) => write!(out, "child {pid}"),
+            WaitOn::Scope(counter) => write!(out, "scope {counter}"),
         };
+    }
+
+    /// Which kind of wait it is, without what it names.
+    pub fn kind(self) -> WaitKind {
+        match self {
+            WaitOn::Key(_) => WaitKind::Key,
+            WaitOn::Lock(_) => WaitKind::Lock,
+            WaitOn::Channel(_) => WaitKind::Channel,
+            WaitOn::Io(_) => WaitKind::Io,
+            WaitOn::Child(_) => WaitKind::Child,
+            WaitOn::Scope(_) => WaitKind::Scope,
+        }
+    }
+}
+
+/// The variant of a [`WaitOn`], what a profiler groups the time of waits by (blaze-profile's
+/// latency sketch of each).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WaitKind {
+    Key,
+    Lock,
+    Channel,
+    Io,
+    Child,
+    Scope,
+}
+
+impl WaitKind {
+    /// Every kind, each at its [`WaitKind::index`].
+    pub const ALL: [WaitKind; 6] =
+        [WaitKind::Key, WaitKind::Lock, WaitKind::Channel, WaitKind::Io, WaitKind::Child, WaitKind::Scope];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            WaitKind::Key => "key",
+            WaitKind::Lock => "lock",
+            WaitKind::Channel => "channel",
+            WaitKind::Io => "io",
+            WaitKind::Child => "child",
+            WaitKind::Scope => "scope",
+        }
     }
 }
 
 /// Runs `block`, which blocks on `on`, inside a span `wait` saying so; `owner` is the job or
 /// thread that will end the wait, when known.
 pub fn wait<R>(on: WaitOn<'_>, owner: Option<u64>, block: impl FnOnce() -> R) -> R {
-    let waiting = Waiting::begin(&mut |it| on.write(it), owner);
+    let waiting = Waiting::begin(on.kind(), &mut |it| on.write(it), owner);
     let result = block();
     drop(waiting);
     result
@@ -53,6 +103,22 @@ pub fn lock<'a, T>(lock: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> 
     match lock.try_lock() {
         Some(held) => held,
         None => wait(WaitOn::Lock(name), None, || lock.lock()),
+    }
+}
+
+/// `lock.read()`, said as a wait on `name` only when a writer holds it or waits for it.
+pub fn read<'a, T>(lock: &'a RwLock<T>, name: &'static str) -> RwLockReadGuard<'a, T> {
+    match lock.try_read() {
+        Some(held) => held,
+        None => wait(WaitOn::Lock(name), None, || lock.read()),
+    }
+}
+
+/// `lock.write()`, said as a wait on `name` only when another holds it.
+pub fn write<'a, T>(lock: &'a RwLock<T>, name: &'static str) -> RwLockWriteGuard<'a, T> {
+    match lock.try_write() {
+        Some(held) => held,
+        None => wait(WaitOn::Lock(name), None, || lock.write()),
     }
 }
 
@@ -89,6 +155,7 @@ mod tests {
         assert_eq!(named(WaitOn::Channel("readers gone")), "channel readers gone");
         assert_eq!(named(WaitOn::Io("store pack")), "io store pack");
         assert_eq!(named(WaitOn::Child(42)), "child 42");
+        assert_eq!(named(WaitOn::Scope(9)), "scope 9");
         assert_eq!(named(WaitOn::Key("infer_query(Id(7))")), "infer_query(Id(7))");
     }
 
@@ -102,5 +169,22 @@ mod tests {
         crate::spin::busy(std::time::Duration::from_millis(20));
         drop(held);
         assert_eq!(waiter.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn readers_share_an_rwlock_and_a_writer_waits_for_them() {
+        let guarded = std::sync::Arc::new(RwLock::new(0));
+        *write(&guarded, "a test's") += 1;
+        let first = read(&guarded, "a test's");
+        assert_eq!(*read(&guarded, "a test's"), 1, "a second reader takes it beside the first");
+        let other = std::sync::Arc::clone(&guarded);
+        let writer = std::thread::spawn(move || {
+            *write(&other, "a test's") += 1;
+            *read(&other, "a test's")
+        });
+        crate::spin::busy(std::time::Duration::from_millis(20));
+        assert_eq!(*first, 1, "the writer waits while a reader holds it");
+        drop(first);
+        assert_eq!(writer.join().unwrap(), 2);
     }
 }

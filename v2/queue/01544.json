@@ -1,0 +1,24 @@
+{
+  "id": "01544",
+  "from_lane": "codegen",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/",
+    "crates/blaze-units/src/load.rs"
+  ],
+  "what": "self-build 16:17 (tree a674d33407dd2143): stdx (tempfile.rs:43, :67) and rustc_abi (layout/coroutine.rs:107, :137, :191) fail with \"blaze cannot evaluate static META: NotSupported(file!() evaluated with no source names ... (name_sources))\" (tracing callsite statics). Nothing in the v2 build calls hir_ty_codegen::name_sources (= hir_ty_mir::mir::location::name_sources) any more: v1 blaze-engine lib.rs called it after loading each workspace and was dropped in 5d69a67f48 (the 10-30 reboot checkpoint). The v2 daemon has to call it on its database once the files are loaded and before codegen (blaze-cargo serve, where serve/unit/codegen.rs:492 builds HirFrontend), with the old rule: key = the loaded checkout roots joined by NUL, innermost first; name = the library file path as is for toolchain library files, else the path relative to the innermost checkout root containing it, else the absolute path. Same key again is a no-op, so calling it every load is cheap. The test in hir-ty-mir tests/mir/source_names.rs pins the evaluator side; please add one that a crate with a tracing-style static holding file!() builds. Context: git show 5d69a67f48 -- crates/blaze-engine/src/lib.rs | rg -n name_sources -A20.",
+  "state": "open",
+  "created": "2026-11-02T01:16:26Z",
+  "updated": "2026-11-02T01:16:26Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:16:26Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

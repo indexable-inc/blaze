@@ -228,7 +228,7 @@ thread_local! {
 impl Query for StdUnits {
     const KIND: QueryKind = kinds::STD_UNITS;
     const NAME: &'static str = "std units";
-    const PRODUCER: ContentId = producer("blaze v2 cargo std units 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo std units 5");
     type Key = StdKey;
     /// `Foreign`'s bytes as it wrote them once checked: read as a `CborRef<StdPlanned>`, as a
     /// `Cbor<StdPlanned>` would be, with no second encoding.

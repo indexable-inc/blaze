@@ -8,10 +8,10 @@
     "crates/hir-ty-borrowck/src/lib.rs"
   ],
   "what": "Four hir-ty causes of blaze-diagnostics failures (coord-1030 run, /tmp/blaze-lanes/test-globvis-base.log), none queued before:\n1. tests::lints::bodies::unstable_names::inference_unstable: a method call whose probe passes over an unstable trait method (aux IpuIterator::ipu_flatten, #[unstable] in a staged crate, the crate without the feature) for a stable one of another trait (IpuItertools) records no unstable_candidates for the call, so unstable_name_collisions is missing at lines 16, 19, 22, 25. The same for a type-relative path (char::C, infer/path.rs write_unstable_candidates) works, and blaze-diagnostics reads both alike, so the method probe (probe.rs consider_candidates / lookup_probe, rustc's pick_all_method with unstable_candidates) is where they are lost.\n2. tests::lints::names::dead::lint_dead_code_3: `let a: &dyn inner::Trait = &1_isize;` (line 91, `impl Trait for isize {}`, minicore coerce_unsized, whose `CoerceUnsized<&'a U> for &'b T` is there) gets E0308 expected `&dyn Trait`, found `&isize`: the unsizing coercion to a trait object is not found.\n3. tests::lints::names::items::ungated_async_fn_track_caller_of_methods_and_with_the_feature: `blaze cannot borrow-check Tr::required: coroutine: TraitFunctionDefinition` for a bodiless `async fn required();` in a trait: 01139 skips a bodiless trait fn, but not its coroutine.\n4. tests::lints::names::items::runtime_symbols: E0282 type annotations needed at the C-variadic parameter `_: ...` of `pub unsafe extern \"C\" fn bcmp(.., _: ...) -> c_int` (line 44): rustc types it VaList and gives no error.\nAlready queued, same run: 01183 (borrowck after missing fields, a_variant_left_short...), 01379 (SizedReturnType of a bodiless trait fn, unused_adt_impls_pub_trait).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T08:12:41Z",
-  "updated": "2026-11-01T08:12:41Z",
-  "taken_by": null,
+  "updated": "2026-11-01T22:11:56Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,18 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T22:10:01Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T22:11:56Z",
+      "by": "db",
+      "action": "done",
+      "note": "(3) fixed: hir-ty-borrowck check_def asks written_with_body first, so a bodiless async fn (an async block around nothing) has nothing to check; test missing_body_tests::an_async_fn_without_a_body_has_nothing_to_check. (2) and (4) are fixture gaps, queued 01539 for diagnostics: lint_dead_code_3 has no dispatch_from_dyn in its core, so `&self` is not a dispatchable receiver and the trait is not dyn compatible (rustc the same); runtime_symbols FFI_STD has no va_list lang item. (1) the method probe (probe.rs consider_candidates / pick_core) records unstable candidates as rustc does, and the pick cache keeps them; pinned by the new hir test tests::infer::a_method_call_keeps_the_unstable_method_its_probe_passed_over (method call and path, outside a macro). If it passes, the loss is in blaze-diagnostics lints/bodies/unstable_names.rs method_name, which looks up the MethodCallExpr name_ref of a call inside assert_eq!; the path case uses span_of instead."
     }
   ]
 }

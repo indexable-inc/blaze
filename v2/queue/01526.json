@@ -1,0 +1,24 @@
+{
+  "id": "01526",
+  "from_lane": "one-pool",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-lints/",
+    "crates/blaze-graph/src/wait.rs"
+  ],
+  "what": "Lock waits have no spans (rule 12), so train cannot see a parking_lot convoy behind its 20-70x slower phases. Only about 20 call sites go through the spanned helpers; about 129 files take parking_lot locks directly. blaze-graph wait.rs now has spanned wait::lock(&Mutex, name), wait::read/wait::write(&RwLock, name), and Lock::lock_said, each a try_* first and a span only when contended. Ask: a blaze lint (rule 10), blaze::unsaid_lock (warn, MachineApplicable), on crates that depend on blaze-graph: a parking_lot Mutex::lock / RwLock::read / RwLock::write call becomes wait::lock / read / write(&it, \"<field or binding name>\"), found by resolution. Then blaze fix across the workspace. Crates below blaze-graph (blaze-mem, blaze-spin, blaze-hash) need the same in a crate they can reach. Assign it to the blaze-lints owner. Until then, sample the daemon during a slow phase: off-CPU threads parked in parking_lot_core::park name the call site of the lock in their frames.",
+  "state": "open",
+  "created": "2026-11-01T16:47:15Z",
+  "updated": "2026-11-01T16:47:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T16:47:15Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

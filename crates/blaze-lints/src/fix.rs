@@ -1,4 +1,4 @@
-//! `blaze fix`: every machine-applicable suggestion of a crate's findings made in its files. Each
+//! Every machine-applicable suggestion of a crate's findings made in its files. Each
 //! pass splices the fixes into the front end's trees (reparsing only what they touched), sets the
 //! texts and their trees in the database, and lints again, which recomputes only the bodies the
 //! fixes changed. It ends when no finding has a fix left, or fails naming what it could not do;

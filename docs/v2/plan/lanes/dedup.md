@@ -167,6 +167,8 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 | `syn` 2 beside 3 | both majors are in use upstream (syn 2: `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`, `wasm-bindgen-macro-support`, `ra-ap-rustc_index_macros`, `synstructure` 0.13 under `yoke-derive`/`zerofrom-derive`; syn 3: `serde_derive`, `rkyv_derive`, `ref-cast-impl`, `defmt-macros`). The workspace's own `syn` stays 2 for now: moving `blaze-query-macros` and `macros` to 3 removes no copy and adds `synstructure` 0.14 beside 0.13 |
 | `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |
 | `wit-bindgen` 0.57 (no dependencies of its own) | `wasip2` 1.0.3, under `getrandom` 0.3.4 (`ahash`, in `sonic-rs`) |
+| `wasmparser` 0.261 beside 0.263 | `wasmtime` =50.0.1 (blaze-macro-eval's wasm host), the release whose Cranelift is the workspace's 0.137.1 |
+| `serde_derive` (no second copy; it stays after blaze-serde-derive replaces the workspace's derives) | `wasmtime` and `wasmtime-environ` 50.0.1, which depend on it unconditionally, and cranelift's `enable-serde` (hir-ty-codegen) |
 
 Gone from the lock as of f92a85458d (2026-10-31): the second `sha2`/`digest` family, `miniz_oxide` 0.8, `rustc-literal-escaper` 0.0.7, `hashbrown` 0.15, `foldhash` 0.1, `wasmparser`/`wasm-encoder` 0.244 with `wasm-metadata`, `wit-component`, `wit-parser` and `wit-bindgen` 0.51, `wasip3`, and tango-bench's `rand` 0.8, `thiserror` 1, `nix` 0.23, `memoffset` 0.6, `windows` 0.34 and `colored` 2.
 

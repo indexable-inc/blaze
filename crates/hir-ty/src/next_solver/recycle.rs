@@ -1,7 +1,8 @@
 //! What the solver's inference contexts, fulfillment contexts and search graphs allocate, kept
 //! per worker between them (docs/v2/plan/lanes/mem/db-solver.md): each is emptied, its capacity
 //! kept, when its context ends, and the next one built on the worker takes it, so a warm worker
-//! builds contexts without allocating.
+//! builds contexts without allocating. Obligation lists are kept the same way between their
+//! registering and the next list a coercion makes.
 
 use std::{cell::RefCell, mem};
 
@@ -12,7 +13,14 @@ use blaze_mem::{
 };
 use rustc_next_trait_solver::solve::SearchStorage;
 
-use crate::next_solver::{DbInterner, fulfill::Pending, infer::InferTables};
+use crate::next_solver::{
+    DbInterner,
+    fulfill::Pending,
+    infer::{
+        InferTables,
+        traits::{PredicateObligation, PredicateObligations},
+    },
+};
 
 /// Kept up to the deepest nesting of canonical goals (each nested goal's context is alive
 /// while it solves), and of bodies inferred inside another's goals.
@@ -22,6 +30,9 @@ const PENDING_DEPTH: usize = 32;
 /// A search graph lives for one root goal; root goals nest only through a nested
 /// `InferCtxt`'s own solving.
 const SEARCH_DEPTH: usize = 8;
+/// Obligation lists are registered as soon as they are made: one is alive per coercion or
+/// relation in progress.
+const OBLIGATIONS_DEPTH: usize = 8;
 
 /// Storage bigger than this is freed, not kept: a huge body's root context would pin its high
 /// water on every worker. Such a body pays its tables' few allocations per run, against at
@@ -63,6 +74,16 @@ impl Recycled for SearchStorage<DbInterner<'static>> {
 
     fn held(&self) -> usize {
         SearchStorage::held(self) + self.scratch().held()
+    }
+}
+
+impl Recycled for PredicateObligations<'static> {
+    fn empty(&mut self) {
+        self.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.capacity() * size_of::<PredicateObligation<'static>>()
     }
 }
 
@@ -125,6 +146,7 @@ macro_rules! shelf {
 shelf!(INFER: InferTables<'static>, INFER_DEPTH);
 shelf!(PENDING: Pending<'static>, PENDING_DEPTH);
 shelf!(SEARCH: SearchStorage<DbInterner<'static>>, SEARCH_DEPTH);
+shelf!(OBLIGATIONS: PredicateObligations<'static>, OBLIGATIONS_DEPTH);
 
 fn take<T: Recycled>() -> Option<T>
 where
@@ -216,10 +238,38 @@ pub(crate) fn give_search_storage(storage: SearchStorage<DbInterner<'_>>) {
     give::<SearchStorage<DbInterner<'static>>>(unsafe { erase_empty(storage) });
 }
 
+/// An empty obligation list with room for `capacity`: the worker's, or a new one.
+pub(crate) fn obligations<'db>(capacity: usize) -> PredicateObligations<'db> {
+    match take::<PredicateObligations<'static>>() {
+        Some(list) => {
+            // SAFETY: shelved lists were cleared (`give`), and `PredicateObligations<'db>` is
+            // `PredicateObligations<'static>` with only the lifetime changed.
+            let mut list: PredicateObligations<'db> = unsafe { erase_empty(list) };
+            // alloc: only when the worker's list is shorter than `capacity`
+            list.reserve(capacity);
+            list
+        }
+        // alloc: a worker's first list, kept from then on
+        None => PredicateObligations::with_capacity(capacity),
+    }
+}
+
+/// Puts a registered obligation list on the worker's shelf, cleared; one that never had room
+/// is dropped.
+pub(crate) fn give_obligations(mut list: PredicateObligations<'_>) {
+    if list.capacity() == 0 {
+        return;
+    }
+    list.clear();
+    // SAFETY: `clear` dropped every obligation, so the list holds no `'db` data, and
+    // `PredicateObligations<'static>` is the same type up to the lifetime.
+    give::<PredicateObligations<'static>>(unsafe { erase_empty(list) });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KEEP_AT_MOST, PENDING_DEPTH, give_pending, pending};
-    use crate::next_solver::fulfill::Pending;
+    use super::{KEEP_AT_MOST, PENDING_DEPTH, give_obligations, give_pending, obligations, pending};
+    use crate::next_solver::{fulfill::Pending, infer::traits::PredicateObligations};
 
     fn reserved(rows: usize) -> Pending<'static> {
         let mut pending = Pending::default();
@@ -234,6 +284,17 @@ mod tests {
         give_pending(reserved(64));
         assert_eq!(pending().held(), held);
         assert_eq!(pending().held(), 0, "the shelf held one");
+    }
+
+    #[test]
+    fn a_registered_obligation_list_comes_back_with_its_capacity() {
+        give_obligations(PredicateObligations::<'static>::new());
+        give_obligations(PredicateObligations::<'static>::with_capacity(4));
+        let list: PredicateObligations<'static> =
+            blaze_alloc_count::assert_at_most(0, "a kept obligation list", || obligations(2));
+        assert!(list.capacity() >= 4);
+        let next: PredicateObligations<'static> = obligations(0);
+        assert_eq!(next.capacity(), 0, "a list without room is not kept");
     }
 
     #[test]

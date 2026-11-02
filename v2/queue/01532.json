@@ -1,0 +1,29 @@
+{
+  "id": "01532",
+  "from_lane": "tests-diag",
+  "owner": "coordinator",
+  "paths": [
+    "crates/test-utils/src/minicore.rs"
+  ],
+  "what": "minicore.rs region:drop (line ~712): put #[rustc_default_body_unstable(feature = \"pin_ergonomics\", issue = \"130494\")] on `fn drop(&mut self)` in `pub trait Drop`, as library/core/src/ops/drop.rs:242 has it. With tests-diag edit 84 (hir collect_impl reads it through hir_def::attrs::stability::default_body_stability), an impl of Drop in another crate that leaves drop to the default body is E0046 `missing: drop` unless that crate enables pin_ergonomics, as in rustc. Fixes blaze-diagnostics items::impls::a_missing_drop_method. No fixture writes an empty Drop impl except that test and E0117's (an orphan impl, whose E0046 the lowering already drops). Filed by hand: tools/v2/queue.py fails with ModuleNotFoundError: typed_input.",
+  "state": "refused",
+  "created": "2026-11-01T20:19:33Z",
+  "updated": "2026-11-01T20:26:00Z",
+  "taken_by": null,
+  "why": "duplicate of 01384 (same minicore attribute on Drop::drop), filed before tests-diag saw it",
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T20:19:33Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:26:00Z",
+      "by": "tests-diag",
+      "action": "refuse",
+      "note": "duplicate of 01384"
+    }
+  ]
+}

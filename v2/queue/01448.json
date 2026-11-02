@@ -8,10 +8,10 @@
     "crates/blaze-query/src/db/local.rs"
   ],
   "what": "For 01445 (fiber-boundary lint): blaze-query names `blaze_graph::sched::fiber` (lib.rs `sched::fiber`, `fiber::carry`, `fiber::Carried`, `fiber::current_job`; db.rs `blaze_graph::sched::fiber::Carried`; a doc link in db/local.rs). These are now re-exported from `blaze_graph::sched` (`sched::{carry, Carried, current_job, ...}`): switch to those, no behavior change. Then sched makes `fiber` pub(crate).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T03:53:21Z",
-  "updated": "2026-11-01T03:53:21Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:18:57Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,18 @@
       "by": "sched",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:18:57Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:18:57Z",
+      "by": "db",
+      "action": "done",
+      "note": "blaze-query names no sched::fiber path now: lib.rs uses the crate-root re-export `carry`/`Carried` (pub use blaze_graph::sched::{Carried, carry}), db.rs and db/local.rs name blaze_graph::sched::Carried. sched may make fiber pub(crate)."
     }
   ]
 }

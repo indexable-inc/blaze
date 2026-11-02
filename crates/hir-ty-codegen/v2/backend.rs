@@ -268,7 +268,7 @@ impl Backends<'_> {
             let function = built_function(db, homes, hashes, unit, spec, (instance, inlined), refs, frame)?;
             let shape = shape::of(unit, &function, frame)
                 // alloc: an error
-                .map_err(|what| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {what}"))))?;
+                .map_err(|what| failed(unit, format!("{}: {what}", super::Named(db, instance))))?;
             let prepared = match unit.backend {
                 // alloc: the prepared function, kept by the driver until its emit
                 Backend::Cranelift { .. } => Prepared::Cranelift(Box::new(function)),
@@ -280,6 +280,18 @@ impl Backends<'_> {
             Ok((shape, prepared))
         })
     }
+}
+
+/// A request the walk did not list, `what`, with the settings the unit built its IR under and
+/// the walks its references came from: a unit whose settings neither walk has is where the
+/// two disagree.
+fn unwalked(what: String, build: Build, inlined: bool) -> String {
+    let walks = match inlined {
+        true => [Build::WALK, Build::WALK_INLINED].as_slice(),
+        false => [Build::WALK].as_slice(),
+    };
+    // alloc: an error
+    format!("{what}; the unit is built as {build:?}, its references walked as {walks:?}")
 }
 
 /// `instance`'s IR as `spec` builds it, against `refs`, with what each of its requests is in
@@ -297,7 +309,7 @@ pub(super) fn built_function(
     frame: &Frame,
 ) -> Result<Function, CodegenError> {
     // alloc: an error
-    let fail = |what: String| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {what}")));
+    let fail = |what: String| failed(unit, format!("{}: {what}", super::Named(db, instance)));
     let build = Build::of(spec);
     if build.inlines && !inlined {
         // alloc: an error
@@ -325,12 +337,12 @@ pub(super) fn built_function(
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
             let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                .map_err(fail)?;
+                .map_err(|what| fail(unwalked(what, build, inlined)))?;
             (places, pending.source.take(), pending.variables.take())
         }
         Built::Assembled(_, requests) => {
             let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                .map_err(fail)?;
+                .map_err(|what| fail(unwalked(what, build, inlined)))?;
             (places, None, None)
         }
     };
@@ -395,7 +407,7 @@ pub(super) fn compiled_in(db: &Db, instance: &HirInstance) -> Option<Crate> {
         Kind::Code(_, env) => Some(env.as_ref(db).krate),
         Kind::Start(main) => Some(main.krate(db)),
         Kind::Allocator(forward) => Some(forward.krate),
-        Kind::Asm(_) => None,
+        Kind::Asm(..) => None,
     }
 }
 
@@ -444,7 +456,7 @@ fn features(db: &Db, spec: &Spec, instance: &HirInstance) -> Result<(crate::Feat
             ItemId::Function(func) => Some(func),
             _ => None,
         },
-        Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(_) => None,
+        Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => None,
     };
     let Some(func) = func else { return Ok((unit, false)) };
     let enabled = hir_ty::TargetFeatures::from_fn(db, func).known();
@@ -506,7 +518,7 @@ fn unsanitized(
                 ));
             }
         },
-        Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(_) => 0,
+        Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => 0,
     };
     let mut unsanitized = Sanitizers(off & sanitize.sanitizers.0);
     let callback = || {
@@ -529,7 +541,7 @@ fn foldable(db: &Db, instance: &HirInstance) -> bool {
             !FunctionSignature::of(db, *func).is_varargs()
         }
         Kind::Code(..) => true,
-        Kind::Asm(_) | Kind::Start(_) | Kind::Allocator(_) => false,
+        Kind::Asm(..) | Kind::Start(_) | Kind::Allocator(_) => false,
     }
 }
 
@@ -544,7 +556,7 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
             compile_as(db, env, None, false, checked, true, |fx| fx.start_shim(*main))
         }
-        Kind::Asm(text) => {
+        Kind::Asm(text, _) => {
             // An `asm!` block's code is its text, the same under every unit's settings.
             _ = super::build::building();
             return assembled(text);

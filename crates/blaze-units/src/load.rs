@@ -115,6 +115,8 @@ pub(crate) struct Spec {
     pub filter: Filter,
     /// `cargo run`: one executable among the roots.
     pub run: bool,
+    /// `check`: the workspace's crates are linted by rustc's, clippy's and blaze's lints.
+    pub lints: bool,
     pub release: bool,
     pub profile: Option<String>,
     pub host: String,
@@ -207,6 +209,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         intent,
         filter,
         run: asked.command() == Command::Run,
+        lints: asked.command() == Command::Check,
         release: asked.release,
         profile: asked.profile.clone(),
         host: asked.host.clone(),
@@ -253,6 +256,7 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
             benches: crate::Rule::none(),
         },
         run: false,
+        lints: false,
         release: false,
         profile: None,
         host: ask.host.clone(),
@@ -290,7 +294,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 5");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -389,7 +393,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 5");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 

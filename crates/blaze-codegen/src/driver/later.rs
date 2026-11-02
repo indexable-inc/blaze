@@ -34,7 +34,7 @@ use blaze_mem::{Tag, frame};
 use super::{
     Build, Built, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
     StaticNode, Whence, callee, error, placed, stopped, stored, stored_function, unfit,
-    unkept_inline,
+    unkept_inline, unkept_message,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -220,8 +220,7 @@ fn compiled<B: Prepare>(
         return Err(error(key, item, format!("compiled as {:?}", emitted.function.key)));
     }
     if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
-        // alloc: an error
-        return Err(error(key, item, format!("built in {it:?}, which its key does not hold")));
+        return Err(error(key, item, unkept_message(nodes, node, it)));
     }
     // alloc: the store's values of a compile: its template and its side table
     let mut puts = Vec::with_capacity(2);

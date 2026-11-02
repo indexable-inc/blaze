@@ -6,7 +6,7 @@ use either::Either;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
-pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
+pub use tls_db::{attach_db, attach_db_allow_change, fmt_with_attached_db, with_attached_db};
 
 use base_db::{Crate, Db};
 use hir_def::{
@@ -948,7 +948,7 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
 
 impl fmt::Debug for AdtDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        crate::with_attached_db(|db| match self.0 {
+        fmt_with_attached_db(f, "AdtDef", |db, f| match self.0 {
             AdtDefInner::Struct { id, .. } => {
                 let data = StructSignature::of(db, id);
                 f.write_str(data.name.as_str())
@@ -3119,6 +3119,14 @@ mod tls_db {
             op()
         }
 
+        /// `op` with the attached database, or `None` with none attached.
+        #[inline]
+        fn try_with<R>(op: impl FnOnce(&Db) -> R) -> Option<R> {
+            let db = attached()?;
+            // SAFETY: as in `with`.
+            Some(op(unsafe { db.as_ref() }))
+        }
+
         #[inline]
         fn with<R>(op: impl FnOnce(&Db) -> R) -> R {
             let db = attached().expect("Tried to use attached db, but no db is attached");
@@ -3142,7 +3150,7 @@ mod tls_db {
     /// The database attached on this thread.
     #[inline(never)]
     fn attached() -> Option<NonNull<Db>> {
-        GLOBAL_DB.with(|it| it.database.get())
+        GLOBAL_DB.try_with(|it| it.database.get()).ok().flatten()
     }
 
     /// Attaches `db` on this thread: the one attached before.
@@ -3192,6 +3200,21 @@ mod tls_db {
         Attached::with(op)
     }
 
+    /// Formats `what` with the attached database, or as `what` alone when none is attached:
+    /// a `Debug` that panics inside a panic's message or a drop while unwinding aborts the
+    /// process (rule 15), so formatting never needs one.
+    pub fn fmt_with_attached_db(
+        f: &mut std::fmt::Formatter<'_>,
+        what: &str,
+        op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        let written = Attached::try_with(|db| op(db, &mut *f));
+        match written {
+            Some(written) => written,
+            None => write!(f, "<{what}: no database attached>"),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::sync::{
@@ -3204,6 +3227,35 @@ mod tls_db {
 
         fn attached_here() -> Option<usize> {
             super::attached().map(|it| it.as_ptr().addr())
+        }
+
+        /// A `Debug` of an ADT with no database attached says so and never panics: one in a
+        /// panic's message, or in a drop while unwinding, would abort the process.
+        #[test]
+        fn an_adt_formatted_with_no_database_attached_says_so() {
+            use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
+
+            let db = fixture::db("struct S;").into_db();
+            let adt = super::attach_db(&db, || {
+                let mut found = None;
+                for &krate in base_db::all_crates(&db).iter() {
+                    for (_, module) in crate_def_map(&db, krate).modules(&db) {
+                        for (name, per_ns) in module.scope(&db).entries() {
+                            if name.as_str() == "S"
+                                && let Some(ModuleDefId::AdtId(AdtId::StructId(it))) = per_ns.take_types()
+                            {
+                                found = Some(it);
+                            }
+                        }
+                    }
+                }
+                let id = found.expect("struct `S`");
+                let adt = super::super::AdtDef::new(id.into(), super::super::DbInterner::new_no_crate(&db));
+                assert_eq!(format!("{adt:?}"), "S", "named with a database attached");
+                adt
+            });
+            assert_eq!(attached_here(), None);
+            assert_eq!(format!("{adt:?}"), "<AdtDef: no database attached>");
         }
 
         /// Two jobs on a pool of two workers each attach a database of their own (one with

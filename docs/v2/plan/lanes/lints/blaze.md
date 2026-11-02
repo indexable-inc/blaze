@@ -161,7 +161,7 @@ resolved; the expression form still finds what such a type makes.
 The moves of AGENTS.md rule 9 (std's locks to `parking_lot`'s, `std::sync::mpsc` to
 `crossbeam_channel`, `rustc_hash` to `blaze_hash`) are `disallowed-*` entries of `clippy.toml`
 with a `replacement`, not lints of blaze's own: clippy's `disallowed_types`, `disallowed_methods`
-and `disallowed_macros` find them by resolution and `blaze fix` makes the fixes
+and `disallowed_macros` find them by resolution and `blaze check --fix` makes the fixes
 ([lints.md](../lints.md#clippytoml-bans-disallowed_types-disallowed_methods-disallowed_macros)).
 
 ## `error_debug`
@@ -334,23 +334,32 @@ and re-exports count; `blaze_graph` itself, where the API is written, is not lin
 
 ## `shared_collection_lock`
 
-Warn. AGENTS.md rule 9: a shared map is `papaya::HashMap`, and the results of parallel items
-come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`. A finding is:
+Warn. AGENTS.md rule 9: a shared map is `papaya::HashMap` (a shared set `papaya::HashSet`), and
+the results of parallel items come back from `blaze_graph::par` in order, never pushed into a
+`Mutex<Vec>`. A finding is:
 
-- a field (of a struct, a tuple struct or a variant) whose type is a `Mutex` or `RwLock`, std's
-  or `lock_api`'s (`parking_lot`'s are its types), around a map: std's `HashMap` with any hasher
-  or `BTreeMap`, hashbrown's `HashMap`, indexmap's `IndexMap`; itself or inside `Arc`s. The
-  types are resolved, so a renamed lock, an alias (`FxHashMap`, `parking_lot::Mutex`) and a
-  macro-written field count. For a hash map written out with its arguments the fix replaces the
-  lock's type with `papaya::HashMap<..>` of the same arguments, `MaybeIncorrect`: the field's
-  uses change with it (`.lock().insert(k, v)` becomes `.pin().insert(k, v)`). An ordered map
-  has no fix;
-- a `push` or `extend` of `Vec`, through a lock guard (std's or `lock_api`'s), inside a closure
-  passed to a function of `blaze_graph::par`, found by resolution as above. The message names
-  the `par` function and the function it is in; the note points at `par::map`, `filter_map` and
-  `par::extend`.
+- a field (of a struct, a tuple struct or a variant) or a static whose type is a `Mutex` or
+  `RwLock`, std's or `lock_api`'s (`parking_lot`'s are its types), around a map (std's
+  `HashMap` with any hasher or `BTreeMap`, hashbrown's and blaze-hash's `HashMap`, indexmap's
+  `IndexMap`) or a set (std's `HashSet` or `BTreeSet`, hashbrown's and blaze-hash's `HashSet`,
+  indexmap's `IndexSet`); the lock itself or inside `Arc`s and lazy or once cells (std's
+  `LazyLock` and `OnceLock`, once_cell's `Lazy` and `OnceCell`). The types are resolved, so a
+  renamed lock, an alias (`FxHashMap`, `parking_lot::Mutex`) and a macro-written field count.
+  For a hashed collection written out with its arguments the fix replaces the lock's type with
+  `papaya::HashMap<..>` or `papaya::HashSet<..>` of the same arguments, `MaybeIncorrect`: the
+  uses change with it (`.lock().insert(..)` becomes `.pin().insert(..)`). A static gets the fix
+  only inside a cell (papaya's types have no `const` constructor; the note says to put it in a
+  `LazyLock`). An ordered collection has no fix;
+- a local bound to a lock around such a collection inside at least one `Arc`, where the `Arc`
+  is made: an initializer that is a path or a `clone` hands on one made elsewhere and is not a
+  finding. No fix (the local's type is inferred); the note names `Arc<papaya::HashMap<..>>`;
+- a `push` or `extend` of `Vec`, through a lock guard (std's or `lock_api`'s `Mutex` guard or
+  `RwLock` write guard), inside a closure passed to a function of `blaze_graph::par`, found by
+  resolution as above. The message names the `par` function and the function it is in; the
+  note points at `par::map`, `filter_map` and `par::extend`.
 
-A lock around anything else, a map alone, `papaya`'s own map and a local are not findings.
+A lock around anything else, a collection alone, `papaya`'s own types and a lock in a local
+with no `Arc` are not findings.
 
 ## `open_wait_loop`
 

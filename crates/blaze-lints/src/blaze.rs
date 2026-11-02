@@ -262,8 +262,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(f) = ast::Fn::cast(node) {
         untyped_error::check(cx, f);
     }
-    if matches!(node.kind(), syntax::SyntaxKind::RECORD_FIELD | syntax::SyntaxKind::TUPLE_FIELD) {
-        shared_collection_lock::check_field(cx, node);
+    if matches!(node.kind(), syntax::SyntaxKind::RECORD_FIELD | syntax::SyntaxKind::TUPLE_FIELD | syntax::SyntaxKind::STATIC) {
+        shared_collection_lock::check_declaration(cx, node);
     }
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);

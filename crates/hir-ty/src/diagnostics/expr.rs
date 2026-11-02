@@ -173,17 +173,16 @@ impl<'db> ExprValidator<'db> {
         }
     }
 
+    /// `unused_must_use` is rustc's lint, warned by default: it runs whatever
+    /// `validate_lints` (rust-analyzer's own style lints) says.
     fn validate_block(&mut self, statements: Statements<'_>) {
-        if !self.validate_lints {
-            return;
-        }
+        let mut diags = std::mem::take(&mut self.diagnostics);
         for stmt in statements {
             if let Statement::Expr { expr: stmt_expr, has_semi: true } = stmt {
-                let mut diags = Vec::new();
                 self.check_unused_must_use(stmt_expr, &mut diags);
-                self.diagnostics.extend(diags);
             }
         }
+        self.diagnostics = diags;
     }
 
     fn check_unused_must_use(

@@ -10,9 +10,9 @@ use crate::lifetimes::{self, Both};
 use crate::options::{Options, Site};
 use crate::query::{Arg, Query};
 
-pub(crate) fn expand(args: TokenStream, item: ItemFn) -> syn::Result<TokenStream> {
+pub(crate) fn expand(args: TokenStream, item: &ItemFn) -> syn::Result<TokenStream> {
     let options = Options::parse(Site::TrackedFn, args)?;
-    let hygiene = Hygiene::of(&item);
+    let hygiene = Hygiene::of(item);
     let sig = &item.sig;
     refuse_modifiers(sig)?;
 

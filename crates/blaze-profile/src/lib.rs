@@ -52,10 +52,12 @@ pub mod facts;
 pub mod flight;
 pub mod gate;
 pub mod history;
+pub mod hot;
 pub mod identity;
 pub mod live;
 pub mod sampler;
 pub mod schema;
+pub mod span;
 pub mod sql;
 mod symbols;
 pub mod views;
@@ -268,57 +270,69 @@ pub fn install() {
 }
 
 /// Moves each fiber job's open spans and build with it when it resumes on another thread
-/// (`blaze_graph::sched::fiber::carry`), records its switches, and spans each wait for a key
-/// another task runs (`blaze_graph::pump::span_waits`). Once a process, before any driver
+/// (`blaze_graph::sched::fiber::carry`), records its switches, spans each wait for a key
+/// another task runs (`blaze_graph::pump::span_waits`) and each job a pool runs
+/// (`blaze_graph::pool::span_jobs`). Once a process, before any driver
 /// runs: [`install`] calls it.
 fn carry_with_fiber_jobs() {
-    use blaze_graph::{pump, sched::fiber};
+    use blaze_graph::{pool, pump, sched::fiber};
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
         fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
         _ = fiber::observe(observed);
         _ = fiber::observe_idle(idled);
         _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended, held: hold_began });
+        _ = pool::span_jobs(pool::JobSpans { began: job_began, ended: job_ended });
     });
 }
 
-/// Opens and enters the span `wait`, its `awaits` (and `function`) what it waits for and its
-/// `owner` the task running that: its id, 0 when no subscriber records it. The span outlives
-/// this call, closed by [`wait_ended`].
-fn wait_began(awaited: &str, owner: Option<u64>) -> u64 {
-    let span = tracing::info_span!(target: "blaze", "wait", function = awaited, awaits = awaited, owner);
-    let Some(id) = span.id() else { return 0 };
-    tracing::dispatcher::get_default(|it| {
-        // The handle `span` drops is given back: the wait keeps the span open.
-        _ = it.clone_span(&id);
-        it.enter(&id);
-    });
-    id.into_u64()
+/// Opens and enters the span of a job of `kind` beginning on this thread ([`span::Job`]): the
+/// span of the job it runs inside, for [`job_ended`].
+fn job_began(kind: &'static str) -> u64 {
+    flight::job_began(span::open_raw(span::Job { kind: span::Name::kept(kind) }))
 }
 
-/// Opens and enters the span `hold`, its `function` what is held and its `owner` the task
-/// holding it (the number a waiter's `owner` names); closed by [`wait_ended`] as a wait's is.
+/// Closes the span of the job that ended on this thread, its last segment if it parked, and
+/// goes back to `outer`, the span of the job it ran inside.
+fn job_ended(outer: u64) {
+    let id = flight::job_ended(outer);
+    if id != 0 {
+        span::close_raw(id);
+    }
+}
+
+/// Opens and enters the span `wait` ([`span::Wait`]), its `awaits` (and `function`) what it
+/// waits for and its `owner` the task running that: its id. The span outlives this call,
+/// closed by [`wait_ended`]. A scope's wait names what the scope is for, the span its caller
+/// opened it in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
+fn wait_began(kind: blaze_graph::wait::WaitKind, awaited: &str, owner: Option<u64>) -> u64 {
+    // alloc: once a scope's wait, which suspends
+    let mut named = String::new();
+    let awaited = if kind == blaze_graph::wait::WaitKind::Scope {
+        named.push_str(awaited);
+        named.push_str(" of ");
+        if !flight::write_working_on(&mut named) {
+            named.push_str("no span");
+        }
+        named.as_str()
+    } else {
+        awaited
+    };
+    let awaited = span::Name::of(awaited);
+    span::open_raw(span::Wait { awaits: awaited, function: awaited, owner, on: kind })
+}
+
+/// Opens and enters the span `hold` ([`span::Hold`]), its `function` what is held and its
+/// `owner` the task holding it (the number a waiter's `owner` names); closed by [`wait_ended`]
+/// as a wait's is.
 fn hold_began(what: &str, holder: u64) -> u64 {
-    let span = tracing::info_span!(target: "blaze", "hold", function = what, owner = holder);
-    let Some(id) = span.id() else { return 0 };
-    tracing::dispatcher::get_default(|it| {
-        // The handle `span` drops is given back: the hold keeps the span open.
-        _ = it.clone_span(&id);
-        it.enter(&id);
-    });
-    id.into_u64()
+    span::open_raw(span::Hold { what: span::Name::of(what), holder })
 }
 
 /// Leaves and closes the span [`wait_began`] opened, on the thread the wait ended on (where its
 /// job's open spans moved, for a job on a fiber).
 fn wait_ended(span: u64) {
-    let Some(span) = std::num::NonZero::new(span) else { return };
-    let id = tracing::span::Id::from_non_zero_u64(span);
-    tracing::dispatcher::get_default(|it| {
-        it.exit(&id);
-        // clone: an id is a number; `get_default` may call this more than once
-        _ = it.try_close(id.clone());
-    });
+    span::close_raw(span);
 }
 
 /// A worker of `blaze_graph`'s fiber driver going idle or waking, as a switch row of no job.
@@ -388,6 +402,7 @@ pub fn built(built: Built) {
     plot(Plot::MemoMisses, built.misses);
     plot(Plot::Joined, built.joined);
     flight::mark(built.serial);
+    hot::read::mark();
 }
 
 /// Spans shorter than this are left out of the timeline; their time still counts in the
@@ -476,17 +491,23 @@ fn recorded<T>(work: impl FnOnce(&mut Recorded) -> T) -> Option<T> {
     RECORDED.try_with(|it| work(&mut lock(it))).ok()
 }
 
-/// The CPU time this thread has had, in nanoseconds.
+/// The CPU time this thread has had, in nanoseconds; 0 when it can't be read.
 fn thread_cpu_ns() -> u64 {
+    thread_cpu().unwrap_or(0)
+}
+
+/// The CPU time the calling thread has had, in nanoseconds: `None` where the system can't say.
+/// What a driver gives [`flight::count_cpu`].
+pub fn thread_cpu() -> Option<u64> {
     #[cfg(unix)]
     {
         let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: `at` is a timespec to write.
         if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) } == 0 {
-            return at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64;
+            return Some(at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64);
         }
     }
-    0
+    None
 }
 
 /// The subscriber: a span id is the flight recorder's (the ring and slot holding its open
@@ -522,8 +543,17 @@ fn opened(span: &tracing::span::Attributes<'_>) -> u64 {
     id
 }
 
+/// While profiling, what the span `id` of a kind ([`span`]) began with, as [`opened`] keeps
+/// of a `blaze` span.
+pub(crate) fn profile_began(id: u64) {
+    if id != flight::UNRECORDED && on() {
+        let open = Open { id, cpu_ns: thread_cpu_ns(), under_ns: 0, subject: None };
+        _ = OPEN.try_with(|it| it.borrow_mut().push(open));
+    }
+}
+
 /// Whether the span `id` closed: its last handle was dropped.
-fn closed(id: u64) -> bool {
+pub(crate) fn closed(id: u64) -> bool {
     // The site is read before the close frees the span's slot, and only while profiling.
     let site = if on() { flight::site_of(id) } else { None };
     let Some(ticks) = flight::closed(id) else { return false };
@@ -1225,6 +1255,42 @@ fn chrome(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_scopes_wait_names_the_span_its_caller_opened_it_in() {
+        use blaze_graph::wait::{WaitOn, wait};
+        install();
+        let tid = std::thread::spawn(|| {
+            let unit = tracing::info_span!(
+                target: "blaze",
+                "unit codegen",
+                krate = "build-script-build",
+                unit = "serde v1.0.219 (build script)"
+            )
+            .entered();
+            let par = tracing::info_span!(target: "blaze", "par").entered();
+            wait(WaitOn::Scope(13), None, || {});
+            drop(par);
+            drop(unit);
+            wait(WaitOn::Scope(14), None, || {});
+            sampler::os_tid() as u32
+        })
+        .join()
+        .unwrap();
+        let mut read = flight::Read::default();
+        flight::window(Duration::from_secs(60), &mut read);
+        let awaits: Vec<_> = read
+            .spans
+            .iter()
+            .filter(|it| it.thread == tid && flight::meta(it.site).map(|it| it.name()) == Some("wait"))
+            .map(|it| it.get::<span::col::Awaits>().and_then(span::Name::text))
+            .collect();
+        assert_eq!(
+            awaits.iter().map(|it| it.as_deref()).collect::<Vec<_>>(),
+            [Some("scope 13 of unit codegen serde v1.0.219 (build script)"), Some("scope 14 of no span")],
+            "the innermost span that names what it is of, past one that names nothing"
+        );
+    }
+
     fn at(name: &str, level: u8, start_us: u64, dur_us: u64) -> Span {
         Span {
             name: name.to_owned(),
@@ -1354,5 +1420,49 @@ mod tests {
         }
         let plot_ns = started.elapsed().as_nanos() / u128::from(N);
         println!("a span: {span_ns} ns, a plot: {plot_ns} ns");
+    }
+
+    /// What a span with two name fields costs as a kind ([`span`]) and as an ad hoc span whose
+    /// fields the visitor matches by name, each opened, entered and closed on one thread; and a
+    /// kind whose names were interned once, which is what a site that keeps its `Name`s pays.
+    #[test]
+    #[ignore = "a measurement, not a check: run it in release with --ignored --nocapture"]
+    fn what_a_typed_span_costs_beside_a_visited_one() {
+        const N: u32 = 1_000_000;
+        install();
+        assert!(!on(), "measures the recorder without BLAZE_PROFILE");
+        let per = |started: Instant| started.elapsed().as_nanos() / u128::from(N);
+        let started = Instant::now();
+        for _ in 0..N {
+            let _span =
+                tracing::info_span!(target: "blaze", "unit bodies", krate = "serde", unit = "serde v1.0.219 (lib)")
+                    .entered();
+        }
+        let visited_ns = per(started);
+        let started = Instant::now();
+        for _ in 0..N {
+            let krate = span::Name::of("serde");
+            let _span = span::UnitBodies { krate, unit: span::Name::of("serde v1.0.219 (lib)") }.open();
+        }
+        let typed_ns = per(started);
+        let (krate, unit) = (span::Name::of("serde"), span::Name::of("serde v1.0.219 (lib)"));
+        let started = Instant::now();
+        for _ in 0..N {
+            let _span = span::UnitBodies { krate, unit }.open();
+        }
+        let named_ns = per(started);
+        let started = Instant::now();
+        for it in 0..N {
+            let path = span::Name::of("serde_derive::Serialize");
+            span::MacroExpand { path, krate }.open().ended(span::MacroExpanded {
+                steps: Some(u64::from(it)),
+                peak_bytes: Some(4096),
+                outcome: span::Outcome::Ok,
+            });
+        }
+        let ended_ns = per(started);
+        println!(
+            "a span of two fields, visited: {visited_ns} ns; typed: {typed_ns} ns; typed, names kept: {named_ns} ns; a `macro expand` with its end: {ended_ns} ns"
+        );
     }
 }

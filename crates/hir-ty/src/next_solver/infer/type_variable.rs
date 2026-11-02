@@ -340,6 +340,8 @@ impl UnifyValue for TypeVariableSubValue {
 
 impl<'db> UnifyValue for TypeVariableValue<'db> {
     type Error = NoError;
+    /// rustc's `order_roots` of `TyVidEqKey`; the sub-unification table keeps `ena`'s rule.
+    const OLDER_ROOT: bool = true;
 
     fn unify_values(value1: &Self, value2: &Self) -> Result<Self, NoError> {
         match (value1, value2) {

@@ -23,7 +23,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use blaze_api::{ApiError, BuildScriptRan, Diagnostic, Level, Response, UnitOf};
@@ -32,7 +32,7 @@ use blaze_build_script::{
     unit as bs,
 };
 use blaze_cas::Store;
-use blaze_core::{Command, Completion, Done, Effect, FileName, Sandbox, Tag};
+use blaze_core::{Command, Completion, Done, Effect, FileName, Names, Sandbox, Stamp, Tag};
 use blaze_units::{
     query::{UnitPlan, Units},
     schema::{DebugInfo, Mode, Unit},
@@ -602,7 +602,8 @@ pub(crate) struct ScriptRun {
 
 enum State {
     Ready(Box<Start>),
-    Running { start: Box<Start>, run: Option<Run>, began: SystemTime, cancelled: bool },
+    /// `quiet` is a sandboxed run's bound; `stuck` says why it was killed past it.
+    Running { start: Box<Start>, run: Option<Run>, began: SystemTime, cancelled: bool, quiet: Option<Quiet>, stuck: Option<String> },
     Writing(Box<Writing>),
     Done,
 }
@@ -626,6 +627,104 @@ struct Writing {
 const CUT: u64 = 1;
 const BYTES: u64 = 4;
 const TIMED: u64 = 7;
+
+/// The tags of [`Quiet`]'s effects, after [`Writing`]'s: the timer before a look, and the look.
+const TICK: u64 = 8;
+const LOOK: u64 = 9;
+
+/// How often a sandboxed run's live record is looked at, on the driver's clock.
+const LOOK_EVERY: Duration = Duration::from_secs(15);
+/// How long a sandboxed run's live record may stay as it is before the run is one that makes
+/// no progress: past any one compile a script waits on, which reads as it starts.
+const QUIET_MOST: Duration = Duration::from_secs(600);
+
+/// The live record of a sandboxed run, beside its `OUT_DIR`, where cargo's files of it are.
+const LIVE_FILE: &str = "blaze-live";
+
+/// A sandboxed run's bound. Its sandbox appends to its live record for each file, listing and
+/// variable that it or any program it started reads, so a record that stays as it is for
+/// [`QUIET_MOST`] is a run making no progress (cc's executor sleeping for a job token that
+/// never comes): it is killed, and fails saying so. Time is the driver's: each look is a timer
+/// of [`LOOK_EVERY`], then a stamp of the record.
+struct Quiet {
+    live: Arc<Names>,
+    last: Stamp,
+    /// How long the record has stayed as `last`, and how long the run has run, in looks.
+    quiet: Duration,
+    ran: Duration,
+}
+
+/// What [`Quiet::step`] found: the record has not moved for `quiet`, of a run of `ran`.
+#[derive(PartialEq, Eq, Debug)]
+struct Stuck {
+    quiet: Duration,
+    ran: Duration,
+}
+
+impl Quiet {
+    /// The bound of the run `tag` whose live record is `live`: its first timer asked.
+    fn begin(live: &FileName, tag: Tag, effects: &mut Vec<Effect>) -> Quiet {
+        // alloc: once per sandboxed run, the one name its looks stamp
+        let mut names = Names::with_capacity(1, live.as_str().len() + 1);
+        names.push(live);
+        effects.push(Effect::Timer { after: LOOK_EVERY, tag: Tag(tag.0 + TICK) });
+        // alloc: as above.
+        Quiet { live: Arc::new(names), last: Stamp::GONE, quiet: Duration::ZERO, ran: Duration::ZERO }
+    }
+
+    /// Whether `completion` of the run `tag` is a look's.
+    fn owns(tag: Tag, completion: Tag) -> bool {
+        matches!(completion.0.wrapping_sub(tag.0), TICK | LOOK)
+    }
+
+    /// A look's `completion`: the next asked while the record moves, [`Stuck`] once it has not
+    /// for [`QUIET_MOST`]. A look that fails is an error: the bound can't be kept.
+    fn step(&mut self, tag: Tag, completion: Completion, effects: &mut Vec<Effect>) -> Result<Option<Stuck>, String> {
+        match (completion.tag.0.wrapping_sub(tag.0), completion.done) {
+            (TICK, Done::Fired) => {
+                self.ran += LOOK_EVERY;
+                effects.push(Effect::Stamp { files: Arc::clone(&self.live), tag: Tag(tag.0 + LOOK) });
+                Ok(None)
+            }
+            (LOOK, Done::Stamped(stamps)) => {
+                let Some(&now) = stamps.first() else {
+                    return Err("a look at its live record was told of no file".to_owned()); // alloc: error path
+                };
+                match now == self.last {
+                    true => self.quiet += LOOK_EVERY,
+                    false => (self.last, self.quiet) = (now, Duration::ZERO),
+                }
+                if self.quiet >= QUIET_MOST {
+                    return Ok(Some(Stuck { quiet: self.quiet, ran: self.ran }));
+                }
+                effects.push(Effect::Timer { after: LOOK_EVERY, tag: Tag(tag.0 + TICK) });
+                Ok(None)
+            }
+            (_, Done::Failed(error)) => Err(format!("a look at its live record failed: {error}")), // alloc: error path
+            (own, other) => Err(format!("a look at its live record (tag +{own}) ended as {other:?}")), // alloc: error path
+        }
+    }
+}
+
+/// `spec`, of a sandboxed run of `unit`, with its live record named ([`blaze_usercode::confine::LIVE`])
+/// at [`LIVE_FILE`] beside its `OUT_DIR`, so its bound can look at it ([`Quiet`]); an earlier
+/// run's record there removed. With the record's name.
+fn live_record(unit: &bs::Unit, spec: &blaze_usercode::run::Spec) -> Result<(blaze_usercode::run::Spec, FileName), String> {
+    let Some(dir) = unit.out_dir.parent() else {
+        return Err(format!("{}: its OUT_DIR is in no directory", unit.package.descr())); // alloc: error path
+    };
+    let path = dir.join(LIVE_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: an earlier run's live record: {error}", path.display())), // alloc: error path
+    }
+    let name = file_name(&path)?;
+    // clone: once per sandboxed run, the spec the run owns
+    let mut spec = spec.clone();
+    spec.command.env.push((OsString::from(blaze_usercode::confine::LIVE), path.into_os_string()));
+    Ok((spec, name))
+}
 
 /// `path` as the driver names it, under its root `/`.
 fn file_name(path: &Path) -> Result<FileName, String> {
@@ -660,6 +759,33 @@ impl ScriptRun {
         self.job.unit_of(self.unit).ok()
     }
 
+    /// A look of the running run's bound ([`Quiet`]): past it, or when it can't be kept, the
+    /// run is killed and ends through its spawn's completion with the error. One that comes
+    /// after the run ended, or once it is being killed, is dropped.
+    fn looked(&mut self, completion: Completion, effects: &mut Vec<Effect>) {
+        let State::Running { start, quiet: Some(quiet), cancelled: false, stuck: stuck @ None, .. } = &mut self.state else {
+            return;
+        };
+        let what = match quiet.step(self.tag, completion, effects) {
+            Ok(None) => return,
+            // alloc: error path
+            Ok(Some(Stuck { quiet, ran })) => format!(
+                "the build script of `{}` ({}) made no progress: its sandbox's record of what it and \
+                 the programs it started read stayed as it was for {} s, of a run of {} s, so it \
+                 was killed (blaze bounds a run that waits on nothing at {} s of no reads)",
+                start.unit.package.descr(),
+                start.unit.script.display(),
+                quiet.as_secs(),
+                ran.as_secs(),
+                QUIET_MOST.as_secs()
+            ),
+            // alloc: error path
+            Err(why) => format!("the build script of `{}`: its bound can't be kept: {why}", start.unit.package.descr()),
+        };
+        *stuck = Some(what);
+        effects.push(Effect::Kill { tag: self.tag });
+    }
+
     fn error(&mut self, what: String, out: &mut Vec<Response>) -> Option<bool> {
         out.push(Response::Diagnostic(say::refused(what, self.of(), self.job.input.color)));
         self.state = State::Done;
@@ -684,8 +810,16 @@ impl ScriptRun {
         {
             return self.error(format!("the build script of `{}`: {}", start.unit.package.descr(), error.0), out);
         }
-        let link_dirs: Vec<PathBuf> = job.units().link_dirs.iter().map(PathBuf::from).collect();
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
+        let link_dirs: Vec<PathBuf> = match start.how {
+            How::Outside(_) => Vec::new(),
+            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
+                Ok(it) => it,
+                Err(why) => {
+                    return self.error(format!("the build script of `{}`: {why}", start.unit.package.descr()), out);
+                }
+            },
+        };
         let checked = match start.how {
             How::Outside(_) => None,
             _ => Some(link_dirs.as_slice()),
@@ -837,15 +971,20 @@ impl Runs<Real> for ScriptRun {
             }
             How::Outside(command) => {
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
-                self.state = State::Running { start, run: None, began, cancelled: false };
+                self.state = State::Running { start, run: None, began, cancelled: false, quiet: None, stuck: None };
                 None
             }
             How::Sandboxed(prepared) => {
-                let begun = Run::begin(prepared.spec.clone(), store, &mut start.disk, self.tag, effects);
+                let (spec, live) = match live_record(&start.unit, &prepared.spec) {
+                    Ok(it) => it,
+                    Err(what) => return self.error(what, out),
+                };
+                let begun = Run::begin(spec, store, &mut start.disk, self.tag, effects);
                 match begun {
                     Ok(Begun::Reused(value)) => self.finish(start, value, began, writer, effects, out),
                     Ok(Begun::Running(run)) => {
-                        self.state = State::Running { start, run: Some(run), began, cancelled: false };
+                        let quiet = Some(Quiet::begin(&live, self.tag, effects));
+                        self.state = State::Running { start, run: Some(run), began, cancelled: false, quiet, stuck: None };
                         None
                     }
                     Err(error) => {
@@ -869,8 +1008,12 @@ impl Runs<Real> for ScriptRun {
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
-        let (mut start, run, began, cancelled) = match std::mem::replace(&mut self.state, State::Done) {
-            State::Running { start, run, began, cancelled } => (start, run, began, cancelled),
+        if Quiet::owns(self.tag, completion.tag) {
+            self.looked(completion, effects);
+            return None;
+        }
+        let (mut start, run, began, cancelled, stuck) = match std::mem::replace(&mut self.state, State::Done) {
+            State::Running { start, run, began, cancelled, stuck, .. } => (start, run, began, cancelled, stuck),
             State::Writing(writing) => return self.written(writing, completion, effects, out),
             other => {
                 self.state = other;
@@ -880,6 +1023,9 @@ impl Runs<Real> for ScriptRun {
         if cancelled {
             // A run killed is no result: nothing of it is kept or applied.
             return Some(false);
+        }
+        if let Some(what) = stuck {
+            return self.error(what, out);
         }
         let (job, run_unit) = (self.job.clone(), self.unit);
         let Start { unit, env, disk, how, .. } = &mut *start;

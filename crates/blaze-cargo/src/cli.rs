@@ -1,4 +1,4 @@
-//! `blaze build|run|test|check|bench` and `cargo blaze <the same>`, `blaze stop`, `blaze
+//! `blaze build|run|test|check|bench|doc` and `cargo blaze <the same>`, `blaze stop`, `blaze
 //! status`: a client of the agent API with cargo's flags, output and exit codes
 //! (docs/v2/plan/lanes/cargo/notes.md section 7). It reads no manifest and commits nothing (the
 //! daemon's watcher has the edits): it finds the checkout, sends one request with the whole
@@ -13,11 +13,14 @@
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
 //!   and `pack`, the in-browser compiler's pack of a program.
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
-//! - [`fix`]: `fix --replace`, a path moved through the front end's name resolution.
+//! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
+//! - [`baselines`]: `check --baselines`, a run's lint counts held to the checked-in ones.
+//! - [`fix`]: `check --fix`, the check's machine-applicable suggestions made and checked.
 
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod baselines;
 pub mod daemon;
 pub mod doc;
 pub mod fix;
@@ -26,6 +29,7 @@ pub mod json;
 pub mod observe;
 pub mod place;
 pub mod print;
+pub mod replace;
 pub mod run;
 pub mod say;
 pub mod test;
@@ -60,7 +64,10 @@ Usage: blaze <COMMAND> [OPTIONS]
 
 Commands:
     build, b    Compile the current package
-    check, c    Analyze the current package and report errors, but don't build object files
+    check, c    Analyze the current package with every lint (rustc's, clippy's, blaze's) and report
+                errors, but don't build object files; `--fix [--lint NAME]...` makes the
+                machine-applicable suggestions, `--replace FROM=TO` retargets every reference to
+                the item FROM to TO by name resolution, `--baselines DIR` holds lint counts to DIR's
     run, r      Run a binary or example of the local package
     test, t     Run the tests
     bench       Run the benchmarks
@@ -79,7 +86,6 @@ Commands:
     debug live                     The daemon's threads as they run
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
-    fix --replace FROM=TO          Every reference to the item FROM retargeted to TO, by name resolution
 
 Options:
     -V, --version  Print version info and exit
@@ -98,6 +104,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         let it = blaze_mem::tag::copied_on_thread();
         blaze_profile::flight::FrameCopied { copies: it.copies, bytes: it.bytes }
     });
+    _ = blaze_profile::flight::count_cpu(blaze_profile::thread_cpu);
     let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
         return crate::serve::main(words.into_iter().skip(1));
@@ -155,8 +162,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
-                 explain and fix"
+                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug \
+                 and explain"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -178,7 +185,6 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Explore(words) => observe::explore(words, auto_color()),
         Asked::Debug(words) => observe::debug(words, auto_color()),
         Asked::Explain(words) => observe::explain(words, auto_color()),
-        Asked::Fix(words) => fix::main(words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }
@@ -229,7 +235,10 @@ fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), Str
     let env = place::env(std::env::vars_os())?;
     let place = place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
     let home = blaze_registry::cargo_home();
-    let files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
+    let mut files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
+    if asked.command() == Command::Check {
+        files.extend(place::clippy_files(&place)?);
+    }
     let width = place::width(|name| std::env::var(name).ok(), io::stderr().is_terminal(), place::stderr_columns)?;
     let cargo = place::cargo(asked, &place, env, files, color, width)?;
     Ok((place, cargo))
@@ -268,7 +277,7 @@ fn cargo(asked: &Invocation) -> i32 {
     if let Some(what) = args::refused(asked) {
         return refused(&what, color);
     }
-    let (place, request) = match prepared(asked, color) {
+    let (place, mut request) = match prepared(asked, color) {
         Ok(prepared) => prepared,
         Err(what) => return refused(&what, color),
     };
@@ -276,6 +285,16 @@ fn cargo(asked: &Invocation) -> i32 {
     if let Err(what) = crate::toolchain::ensure() {
         return refused(&what, color);
     }
+    if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
+        return replaced(&place, &asked.flags.replace, color);
+    }
+    let pinned = match asked.command() == Command::Check && asked.flags.fix {
+        true => match fix::pin(&mut request) {
+            Ok(pinned) => Some(pinned),
+            Err(what) => return refused(&what, color),
+        },
+        false => None,
+    };
     let mut client = match daemon::connect(Start::IfMissing) {
         Ok(Some(client)) => client,
         Ok(None) => return refused("no daemon answers, and none could be started", color),
@@ -297,8 +316,49 @@ fn cargo(asked: &Invocation) -> i32 {
             drop(out);
             run::exec(&exec, &mut err, run::Told { color, quiet: shown.quiet, verbose: shown.verbose })
         }
+        Ok(Then::Fix(found)) => {
+            let Some(pinned) = &pinned else { return refused("`--fix` was not asked for", color) };
+            match fix::run(found, pinned, &place.root) {
+                Ok(fixed) => {
+                    let files = match fixed.files.is_empty() {
+                        true => String::new(),
+                        false => format!(": {}", fixed.files.join(", ")),
+                    };
+                    let rest = format!("{} suggestion(s) in {} file(s){files}", fixed.made, fixed.files.len());
+                    let _ = err.write_all(say::status("Fixed", &rest, color).as_bytes());
+                    if fixed.left > 0 {
+                        let left = format!("{} suggestion(s) are not machine-applicable, or are outside the checkout", fixed.left);
+                        let _ = err.write_all(say::status("Left", &left, color).as_bytes());
+                    }
+                    if fixed.errors == 0 { 0 } else { FAILED }
+                }
+                Err(what) => {
+                    let _ = err.write_all(say::error(&what, color).as_bytes());
+                    FAILED
+                }
+            }
+        }
         // stdout or stderr closed under it: nothing more can be said.
         Err(_) => FAILED,
+    }
+}
+
+/// `check --replace`'s edits made in the checkout: its exit code.
+fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
+    let done = replace::edits(pairs).and_then(|edits| replace::replace(&place.root, edits));
+    match done {
+        Ok(edited) => {
+            let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
+            files.sort_unstable();
+            files.dedup();
+            let rest = format!("{} item(s) in {} file(s): {}", edited.items.len(), files.len(), files.join(", "));
+            eprint!("{}", say::status("Replaced", &rest, color));
+            0
+        }
+        Err(what) => {
+            eprint!("{}", say::error(&what, color));
+            FAILED
+        }
     }
 }
 
@@ -308,6 +368,8 @@ pub enum Then {
     Exit(i32),
     /// `run`'s program, to become.
     Exec(run::Exec),
+    /// `check --fix`: what the check said, for its suggestions to be made.
+    Fix(fix::Found),
 }
 
 /// The request sent and its responses printed, then what `run` or `test` runs after it.
@@ -328,7 +390,17 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;
     let mut docs = doc::Docs::default();
+    let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
+    let mut found = (asked.command() == Command::Check && asked.flags.fix).then(|| fix::Found::new(&asked.flags.lints));
     let called = api.call(request, |response, more| {
+        if let ResponseRef::Diagnostic(diagnostic) = &response {
+            if let Some(counted) = &mut counted {
+                counted.add(diagnostic);
+            }
+            if let Some(found) = &mut found {
+                found.add(diagnostic);
+            }
+        }
         let printed = match response {
             ResponseRef::Documented(documented) => {
                 let printed = documented.crates.iter().try_for_each(|it| printer.status("Documenting", &it.package));
@@ -387,6 +459,13 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         _ => None,
     };
     printer.finish(ok, started.elapsed())?;
+    // A check that failed on its findings still has its suggestions made: a deny lint's
+    // finding is an error, and its fix takes it away.
+    if let Some(found) = found
+        && !printer.refused()
+    {
+        return Ok(Then::Fix(found));
+    }
     if !ok {
         return Ok(Then::Exit(FAILED));
     }
@@ -395,7 +474,22 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     let artifacts = printer.take_artifacts();
     let members = printer.members();
     match asked.command() {
-        Command::Build | Command::Check => Ok(Then::Exit(0)),
+        Command::Build => Ok(Then::Exit(0)),
+        Command::Check => {
+            let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else { return Ok(Then::Exit(0)) };
+            match counted.finish(&place.root, dir, asked.flags.bless_baselines, &asked.flags.new_baselines) {
+                Ok(said) => {
+                    for line in said {
+                        printer.err().write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
+                    }
+                    Ok(Then::Exit(0))
+                }
+                Err(what) => {
+                    printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+                    Ok(Then::Exit(FAILED))
+                }
+            }
+        }
         Command::Doc => {
             if let Some(documented) = &documented {
                 doc::done(documented, asked.flags.open, shown.quiet, shown.color, printer.err())?;

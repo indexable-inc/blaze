@@ -1354,3 +1354,34 @@ fn f() {
         .collect();
     assert_eq!(too_large.len(), 2, "the literal past u128 and the pattern: {too_large:?}");
 }
+
+#[test]
+fn an_anonymous_parameter_is_a_wildcard() {
+    let db = fixture::db(
+        r#"
+//- /main.rs edition:2015
+trait T {
+    fn with_default(String, i32) {}
+}
+"#,
+    )
+    .into_db();
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let module = def_map.modules(&db).next().expect("the crate root").1;
+    let func = module
+        .scope(&db)
+        .declarations()
+        .find_map(|decl| match decl {
+            ModuleDefId::TraitId(it) => {
+                let name = Name::new_symbol_root(intern::Symbol::intern("with_default"));
+                crate::nameres::assoc::TraitItems::query(&db, it).method_by_name(&name)
+            }
+            _ => None,
+        })
+        .expect("`T::with_default`");
+    let body = Body::of(&db, func.into());
+    assert_eq!(body.params.len(), 2);
+    for param in body.params.iter() {
+        assert!(matches!(body.pat(param.formal), Pat::Wild), "{:?}", body.pat(param.formal));
+    }
+}

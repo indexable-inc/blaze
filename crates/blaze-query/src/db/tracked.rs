@@ -58,6 +58,7 @@ impl Vtable {
             fields: T::TRACKED_FIELD_NAMES,
             row_size: 0,
             ids_of: None,
+            made: None,
             memory: memory::<T>,
             verify: None,
             reset: None,

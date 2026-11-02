@@ -11,7 +11,7 @@ fn ui(name: &str, source: &str) -> String {
 /// [`ui`] with core's indexing, unsizing and negation, which rustc's type check reaches only
 /// through their lang items, as the UI test has them from std.
 fn ui_core(name: &str, source: &str) -> String {
-    const FLAGS: &str = "sized, copy, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls";
+    const FLAGS: &str = "sized, copy, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls, int_bounds";
     crate::tests::items::ui_core(name, "2015", FLAGS, source)
 }
 
@@ -145,7 +145,6 @@ fn main() {
     let _n = [64][u32::MAX as usize - 1];
     //~^ ERROR this operation will panic at runtime [unconditional_panic]
 }
-mod u32 { pub const MAX: u32 = 4294967295; }
 "##;
     assert_reports(
         &ui_core("index-bounds.rs", source),
@@ -203,7 +202,6 @@ impl<T: Foo> Foo for Vec<T> {
     const OOB_REV: i32 = T::OOB + [1][1];
     //~^ ERROR operation will panic
 }
-mod i32 { pub const MIN: i32 = -2147483648; pub const MAX: i32 = 2147483647; }
 pub struct Vec<T>(T);
 fn main() {}
 "##;

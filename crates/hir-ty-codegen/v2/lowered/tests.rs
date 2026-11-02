@@ -221,7 +221,7 @@ fn what_the_tier_does_not_compile_is_refused_by_name() {
 fn assembly_and_the_allocator_shim_are_named() {
     let (db, frontend) = frontend();
     let tier = spec();
-    let text = HirInstance(Kind::Asm("nop".to_owned()));
+    let text = HirInstance(Kind::Asm("nop".to_owned(), false));
     let Ok(Lowering::Asm(got)) = lowered(&frontend, &unit(&tier), &tier, &text, &[]) else { panic!("asm") };
     assert_eq!(got, "nop");
     let forward = crate::v2::allocator::Forward {

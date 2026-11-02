@@ -6,8 +6,8 @@ use hir_def::{
     hir::generics::{GenericParams, TypeParamProvenance},
 };
 use rustc_type_ir::{
-    InferConst, InferTy, TypeFoldable as _, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
-    inherent::{IntoKind, Ty as _}, solve::TyOrConstInferVar,
+    InferConst, InferTy, TypeFlags, TypeFoldable as _, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt, inherent::{IntoKind, Ty as _}, solve::TyOrConstInferVar,
 };
 
 use crate::{
@@ -150,7 +150,8 @@ impl<'db> TypeFolder<DbInterner<'db>> for Unnamer<'db> {
     }
 
     fn fold_ty(&mut self, t: Ty<'db>) -> Ty<'db> {
-        if !t.has_infer() {
+        // A fresh variable is no inference variable: `has_infer` does not see it.
+        if !t.has_type_flags(TypeFlags::HAS_TY_FRESH | TypeFlags::HAS_CT_FRESH) {
             return t;
         }
         match t.kind() {
@@ -166,7 +167,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for Unnamer<'db> {
     }
 
     fn fold_const(&mut self, c: Const<'db>) -> Const<'db> {
-        if !c.has_infer() {
+        if !c.has_type_flags(TypeFlags::HAS_TY_FRESH | TypeFlags::HAS_CT_FRESH) {
             return c;
         }
         match c.kind() {

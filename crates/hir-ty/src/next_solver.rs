@@ -27,7 +27,7 @@ mod opaque_variances;
 mod opaques;
 pub mod persist;
 pub mod predicate;
-mod recycle;
+pub(crate) mod recycle;
 mod region;
 mod solver;
 mod structural_normalize;

@@ -101,11 +101,11 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 3");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 5");
 }
 
 impl Versioned for Asked {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 3");
 }
 
 /// Reads `Cx::config`: the [`BuildConfig`] narrowed.
@@ -114,7 +114,7 @@ pub(crate) struct Invocation;
 impl Query for Invocation {
     const KIND: QueryKind = QueryKind(0x6010);
     const NAME: &'static str = "cargo invocation";
-    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 4");
     type Key = ();
     type Value = Cbor<Configured>;
 
@@ -134,7 +134,7 @@ pub(crate) struct Asking;
 impl Query for Asking {
     const KIND: QueryKind = QueryKind(0x6011);
     const NAME: &'static str = "cargo asked";
-    const PRODUCER: ContentId = producer("blaze v2 cargo asked 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo asked 2");
     type Key = ();
     type Value = Cbor<Result<Asked, LoadError>>;
 
@@ -148,7 +148,7 @@ impl Query for Asking {
 }
 
 impl Versioned for Result<Asked, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 2");
 }
 
 fn configure(bytes: &[u8]) -> Configured {
@@ -197,12 +197,14 @@ fn configure(bytes: &[u8]) -> Configured {
     Configured { asked, mounts }
 }
 
-/// The variables cargo reads by name (cargo-notes section 1): no other one is kept.
+/// The variables cargo reads by name (cargo-notes section 1), and clippy's driver's
+/// `CLIPPY_CONF_DIR`: no other one is kept.
 fn read_by_cargo(name: &str) -> bool {
     name.starts_with("CARGO_")
         || matches!(
             name,
             "RUSTFLAGS"
+                | "CLIPPY_CONF_DIR"
                 | "RUSTDOCFLAGS"
                 | "RUSTC_WORKSPACE_WRAPPER"
                 | "HOME"
@@ -331,7 +333,8 @@ fn short(letter: char) -> Option<&'static str> {
     })
 }
 
-/// The arguments after the subcommand and before `--`, as clap reads cargo's.
+/// The arguments after the subcommand and before `--`, as clap reads cargo's; `clippy`'s after
+/// `--` are its driver's.
 fn parse(command: Command, args: &[String], mut asked: Asked) -> Result<Asked, String> {
     let mut args = args.iter();
     let mut positional = 0;
@@ -461,6 +464,16 @@ mod tests {
         assert_eq!(asked(Command::Check, &["--no-deps"]).unwrap_err(), "unexpected argument '--no-deps' found");
         assert_eq!(Command::named("d"), Some(Command::Doc));
         assert_eq!(Command::Doc.profile(), "dev");
+    }
+
+    /// `check` lints, so there is no `clippy` command, and no driver flags after `--`.
+    #[test]
+    fn clippy_is_no_command_and_check_takes_no_drivers_flags() {
+        assert_eq!(Command::named("clippy"), None);
+        assert_eq!(Command::named("fix"), None);
+        assert_eq!(asked(Command::Check, &["--", "-D"]).unwrap_err(), "unexpected argument '--' found");
+        assert_eq!(asked(Command::Check, &["--no-deps"]).unwrap_err(), "unexpected argument '--no-deps' found");
+        assert_eq!(asked(Command::Check, &["-p", "a", "--all-targets"]).unwrap().packages, ["a"]);
     }
 
     #[test]

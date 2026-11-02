@@ -485,7 +485,7 @@ fn main() {
 }
 "##;
     assert_reports(
-        &ui_core("gap_between_ranges.rs", "2015", "option", source),
+        &ui_core("gap_between_ranges.rs", "2015", "option, int_bounds", source),
         &[
             error(15, &[]),
             error(20, &[]),

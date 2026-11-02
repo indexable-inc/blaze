@@ -1204,7 +1204,7 @@ fn test() {
 fn call_argument_expectations_from_expected_output() {
     check_types(
         r"
-//- minicore: fn
+//- minicore: fn, coerce_unsized
 struct Wrap<T>(T);
 fn wrap<T>(t: T) -> Wrap<T> { Wrap(t) }
 fn test() {

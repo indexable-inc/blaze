@@ -1,0 +1,37 @@
+{
+  "id": "01521",
+  "from_lane": "no-fallback-front",
+  "owner": "tests-misc-lints",
+  "paths": [
+    "crates/blaze-cargo/src/cli",
+    "crates/blaze-lints/src/serve.rs",
+    "crates/blaze-lints/src/baseline.rs"
+  ],
+  "what": "No command runs blaze-lints today: no crate depends on it, so serve.rs and baseline.rs have no caller, and the 07:11 lint-baseline self-build found nothing. Add `blaze clippy` (blaze-cargo CLI, a client of the daemon API): for each workspace member load the crate into the front end and run blaze_lints over it at the levels of [workspace.metadata.blaze.lints] (blaze::) and [workspace.lints.clippy] plus each package [lints] (clippy::), writing findings as clippy-driver does, exit nonzero on deny. With `--baseline` (or a typed JSON input) compare per-file counts against crates/blaze-lints/baselines/<tool>.<lint>.txt through baseline::check, fail on any count above its line, and `--bless` write shrunk files through baseline::bless. That is the command the coordinator runs for 01501 (error_debug count), 01502 (first baselines) and 01507. Shares the crate loading with 01499 (blaze fix).",
+  "state": "applied",
+  "created": "2026-11-01T15:39:16Z",
+  "updated": "2026-11-01T23:28:17Z",
+  "taken_by": "tests-misc-lints",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:39:16Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T23:28:16Z",
+      "by": "tests-misc-lints",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T23:28:17Z",
+      "by": "tests-misc-lints",
+      "action": "done",
+      "note": "blaze clippy (blaze-units Command::Clippy, --no-deps, args after --; blaze-cargo args/place/cli, cli/baselines.rs with --baselines/--bless-baselines/--new-baseline; compile.rs runs blaze_lints::check per unit). Verified by coord-1030 10:40 (lint-defs 20/0, lints 203/0, blaze-cargo serve::unit 82/0). --fix added 15:22 (cli/clippy_fix.rs)."
+    }
+  ]
+}

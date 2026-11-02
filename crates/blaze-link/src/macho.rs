@@ -34,6 +34,33 @@ mod tests;
 mod unwind;
 
 pub(crate) use input::{Autolink, asked_libraries, autolink};
+
+/// The libraries the Mach-O dynamic library or `.tbd` stub `bytes` (`name` on the link line)
+/// re-exports from outside itself ([`crate::model::Shared::inputs`]), by install name: a
+/// dylib's `LC_REEXPORT_DYLIB`s, a stub's re-exports that are no document of it. ld64 loads
+/// each with the library, so the link line has them too ([`crate::target`]). A universal file
+/// is read for `arch`'s slice.
+pub(crate) fn reexported(name: &str, bytes: &[u8], arch: Arch, platform: u32) -> Result<Vec<String>, String> {
+    let cpu = match arch {
+        Arch::Aarch64 => macho::CPU_TYPE_ARM64,
+        Arch::X86_64 => macho::CPU_TYPE_X86_64,
+        // alloc: error path
+        Arch::Wasm32 => return Err(format!("{name}: a Mach-O library in a wasm32 link")),
+    };
+    let bytes = input::slice(name, bytes, cpu)?;
+    let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
+    let shared = match magic == Some(macho::MH_MAGIC_64) {
+        true => dylib::read(name, bytes, arch)?,
+        false => {
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                // alloc: error path
+                format!("{name} is neither a Mach-O dynamic library nor a `.tbd` stub")
+            })?;
+            tbd::read(name, text, arch, platform)?
+        }
+    };
+    Ok(shared.inputs)
+}
 #[cfg(test)]
 pub(crate) use input::tests::linking as linking_object;
 #[cfg(feature = "fuzz")]

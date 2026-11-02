@@ -107,6 +107,16 @@ fn paths(fixture: &str) -> Vec<String> {
 /// The workspace crates of `fixture` checked with `options`, each file named as the fixture
 /// names it, with `prefix` before it.
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
+    checked_as(fixture, prefix, options, false)
+}
+
+/// [`checked_with`] with builtin derives expanded, as a build that generates code expands them
+/// (`hir_def::nameres::set_expand_builtin_derives`), so what they write is checked.
+pub(crate) fn checked_expanding_derives(fixture: &str, options: &Options) -> Checked {
+    checked_as(fixture, "", options, true)
+}
+
+fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bool) -> Checked {
     // compiletest's `should_emit_metadata`: a `check-pass` or `check-fail` UI test is given
     // `--emit=metadata`.
     let checks_only = fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
@@ -117,7 +127,10 @@ pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Ch
     let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
     let sysroot = fx.sysroot_files().to_vec();
-    let db = fx.into_db();
+    let mut db = fx.into_db();
+    if expand_derives {
+        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    }
     let mut names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))

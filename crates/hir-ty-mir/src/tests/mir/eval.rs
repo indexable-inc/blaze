@@ -172,6 +172,49 @@ fn innermost<'a, 'db>(e: &'a MirEvalError<'db>) -> &'a MirEvalError<'db> {
 }
 
 #[test]
+fn an_unresolved_weak_extern_static_is_null_when_run() {
+    check_pass(
+        r#"
+//- minicore: sized
+extern "C" {
+    #[linkage = "extern_weak"]
+    static __dso_handle: *mut u8;
+}
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn main() {
+    if unsafe { __dso_handle } as usize != 0 {
+        should_not_reach();
+    }
+}
+        "#,
+    );
+}
+
+#[test]
+fn reading_a_strong_extern_static_when_run_is_refused_naming_it() {
+    check_error_with(
+        r#"
+//- minicore: sized
+extern "C" {
+    static environ: *const *const u8;
+}
+
+fn main() {
+    let _env = unsafe { environ };
+}
+        "#,
+        |e| {
+            matches!(innermost(&e), MirEvalError::NotSupported(it)
+                if it.contains("extern static `environ`"))
+        },
+    );
+}
+
+#[test]
 fn function_with_extern_c_abi() {
     check_pass(
         r#"
@@ -3151,4 +3194,144 @@ fn main() {}
         assert!(panics(run(Some(true))), "a crate built with overflow checks panics");
         assert!(panics(run(None)), "unset, as in a constant, it checks");
     })
+}
+
+#[test]
+fn a_box_of_dyn_fn_unsizes_to_dyn_fn_keeping_its_vtable() {
+    check_pass(
+        r#"
+//- minicore: fn, unsize, coerce_unsized, dispatch_from_dyn, phantom_data, send, sync
+use core::marker::{PhantomData, Send, Sync, Unsize};
+use core::ops::CoerceUnsized;
+
+pub struct Global;
+
+pub struct NonNull<T: ?Sized> {
+    pointer: *const T,
+}
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<NonNull<U>> for NonNull<T> {}
+
+pub struct Unique<T: ?Sized> {
+    pointer: NonNull<T>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Unique<U>> for Unique<T> {}
+
+unsafe impl<T: ?Sized + Send> Send for Unique<T> {}
+unsafe impl<T: ?Sized + Sync> Sync for Unique<T> {}
+
+pub struct Box<T: ?Sized, A = Global>(Unique<T>, A);
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized, A> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+
+fn new_box<T>(x: &T) -> Box<T> {
+    Box(Unique { pointer: NonNull { pointer: x as *const T }, _marker: PhantomData }, Global)
+}
+
+fn get<T: ?Sized>(b: &Box<T>) -> &T {
+    unsafe { &*b.0.pointer.pointer }
+}
+
+pub struct Info(i32);
+
+enum Hook {
+    Custom(Box<dyn Fn(&Info) -> i32 + Sync + Send>),
+}
+
+impl Hook {
+    fn into_box(self) -> Box<dyn Fn(&Info) -> i32 + Sync + Send> {
+        match self {
+            Hook::Custom(hook) => hook,
+        }
+    }
+}
+
+// As std's: the value `into_box` returns is cast to the very type it has.
+fn take_hook(hook: Hook) -> Box<dyn Fn(&Info) -> i32 + 'static + Sync + Send> {
+    hook.into_box()
+}
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn default_hook(info: &Info) -> i32 {
+    info.0 + 2
+}
+
+fn main() {
+    let f = default_hook;
+    let boxed = new_box(&f);
+    let hook: Box<dyn Fn(&Info) -> i32 + Sync + Send> = boxed;
+    let prev = take_hook(Hook::Custom(hook));
+    if get(&prev)(&Info(5)) != 7 {
+        should_not_reach();
+    }
+    // As `maybe_install_panic_hook`'s: a closure holding the hook taken and a flag.
+    let force_show = true;
+    let wrapper = move |info: &Info| if force_show { get(&prev)(info) } else { 0 };
+    let boxed = new_box(&wrapper);
+    let installed: Box<dyn Fn(&Info) -> i32 + Sync + Send> = boxed;
+    let fewer: Box<dyn Fn(&Info) -> i32> = take_hook(Hook::Custom(installed));
+    if get(&fewer)(&Info(1)) != 3 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn the_c_heap_std_system_allocator_uses_allocates_grows_and_frees() {
+    check_pass(
+        r#"
+//- minicore: sized, copy, slice, index, coerce_unsized
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn calloc(count: usize, size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+    fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32;
+    fn free(ptr: *mut u8);
+}
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn main() {
+    unsafe {
+        let a = malloc(4);
+        let small = a as *mut [u8; 4];
+        (*small)[0] = 7;
+        (*small)[3] = 9;
+        let b = realloc(a, 64);
+        let grown = b as *mut [u8; 64];
+        if (*grown)[0] != 7 || (*grown)[3] != 9 {
+            should_not_reach();
+        }
+        let c = calloc(8, 2) as *mut [u8; 16];
+        if (*c)[0] != 0 || (*c)[15] != 0 {
+            should_not_reach();
+        }
+        let mut aligned: *mut u8 = 0 as *mut u8;
+        if posix_memalign(&mut aligned, 64, 10) != 0 || (aligned as usize) % 64 != 0 {
+            should_not_reach();
+        }
+        let mut refused: *mut u8 = 0 as *mut u8;
+        if posix_memalign(&mut refused, 3, 8) != 22 {
+            should_not_reach();
+        }
+        if calloc(!0usize, 2) as usize != 0 {
+            should_not_reach();
+        }
+        free(b);
+        free(c as *mut u8);
+        free(aligned);
+        free(0 as *mut u8);
+    }
+}
+"#,
+    );
 }

@@ -6,10 +6,10 @@
     "crates/hir-ty/src/infer.rs"
   ],
   "what": "## An item written without a body reports a type-annotations-needed error for that body (E0284 TypeMustBeKnown at its root `ExprId(0)`)\n\n`const A: u8;`, `static A: u8;`, `static mut C: u8;` and a free `fn f1();` inside `main` each get the user-facing error (\"free constant/static item / free function without body\"). They also get `InferenceDiagnostic::TypeMustBeKnown { at_point: ExprId(0), top_term: None, kind: E0284, .. }` for the body's root, which is `Expr::Missing`. It has no syntax, so blaze-diagnostics prints `blaze: type checking's TypeMustBeKnown { .. } .. which blaze cannot place`. In rustc a missing body is an error body: typeck is tainted and reports nothing more. Fix in hir-ty inference: a body whose root is `Expr::Missing` (or an `Expr::Missing` anywhere: its type is the error type, not a fresh variable) yields no ambiguity diagnostic. Related to 01379 (Sized of a trait method with no body), same family. Tests: blaze-diagnostics tests::items::ast_validation::{free_consts_without_bodies, free_statics_without_bodies, which_functions_need_a_body} (round15-test.log).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:18:38Z",
-  "updated": "2026-11-01T00:18:38Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:24:28Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "fix-diag-lints",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "done",
+      "note": "fixed by 01371 (hir-ty infer/expr.rs: Expr::Missing keeps the error type, no fresh var): free_consts_without_bodies, free_statics_without_bodies, which_functions_need_a_body pass in test-diag-1028.log."
     }
   ]
 }

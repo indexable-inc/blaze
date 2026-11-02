@@ -6,12 +6,8 @@ use std::sync::Arc;
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::Setter as _;
 use cfg::CfgAtom;
-use hir_expand::proc_macro::{
-    CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
-    ProcMacros,
-};
+use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros};
 use intern::sym;
 use parking_lot::Mutex;
 
@@ -113,7 +109,7 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
 
     let expansions = Arc::new(Mutex::new(Expansions::default()));
     let loaded = ProcMacros::get(reading).by_crate(reading).clone();
-    let recording: HashMap<_, _> = loaded
+    let recording: Vec<_> = loaded
         .iter()
         .map(|(&krate, macros)| {
             let macros = macros.macros().map(|macros| {
@@ -130,12 +126,10 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
                     })
                     .collect()
             });
-            let macros = macros.ok_or(base_db::ProcMacroLoadingError::NotYetBuilt);
-            (krate, triomphe::Arc::new(CrateProcMacros::new(macros)))
+            (krate, macros.ok_or(base_db::ProcMacroLoadingError::NotYetBuilt))
         })
-        .collect();
-    let macros = ProcMacros::get(db);
-    macros.set_by_crate(db).to(recording);
+        .collect(); // alloc: once per pack, each loaded crate's recording expanders
+    ProcMacros::give(db, recording);
     let db = &*db;
     expand(db, &crates);
 

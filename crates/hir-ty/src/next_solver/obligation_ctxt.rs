@@ -140,6 +140,15 @@ impl<'a, 'db> ObligationCtxt<'a, 'db> {
         self.engine.evaluate_obligations_error_on_ambiguity(self.infcx)
     }
 
+    /// [`Self::evaluate_obligations_error_on_ambiguity`] handing each error to `on_error`, for
+    /// a caller that needs only a verdict or keeps the errors elsewhere.
+    pub fn evaluate_obligations_error_on_ambiguity_with(
+        &mut self,
+        on_error: &mut impl FnMut(NextSolverError<'db>),
+    ) {
+        self.engine.evaluate_obligations_error_on_ambiguity_with(self.infcx, on_error)
+    }
+
     /// Returns the not-yet-processed and stalled obligations from the
     /// `ObligationCtxt`.
     ///

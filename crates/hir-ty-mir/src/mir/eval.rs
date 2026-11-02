@@ -15,7 +15,7 @@ use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
     VariantId,
-    expr_store::{Body, HygieneId},
+    expr_store::HygieneId,
     item_tree::FieldsShape,
     lang_item::LangItems,
     layout::{TagEncoding, Variants},
@@ -39,7 +39,7 @@ use smallvec::{SmallVec, smallvec};
 use triomphe::Arc;
 
 use crate::{
-    CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
+    CallableDefId, ComplexMemoryMap, InferBodyId, MemoryMap, ParamEnvAndCrate,
     PointerAt,
     consteval::{self, ConstEvalError, try_const_usize},
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
@@ -266,6 +266,9 @@ enum Origin {
     Machine,
     /// An anonymous `mmap`, freed only by `munmap`.
     Mmap,
+    /// C's heap (`malloc`, `calloc`, `posix_memalign`, `realloc`), freed by `free`: what std's
+    /// `System` allocator asks for.
+    C,
 }
 
 impl Origin {
@@ -276,6 +279,7 @@ impl Origin {
             Origin::ConstHeap { .. } => MemKind::ConstHeap,
             Origin::Machine => MemKind::Machine,
             Origin::Mmap => MemKind::Mmap,
+            Origin::C => MemKind::C,
         }
     }
 }
@@ -423,6 +427,12 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     unevaluated_statics: Vec<(usize, usize, StaticId)>,
     /// The unevaluated static whose memory was read, which fails the evaluation.
     missing_static: Cell<Option<StaticId>>,
+    /// Evaluating at compile time (the body of a constant or static, or a const macro) rather
+    /// than running a function: no extern static has a value then.
+    compile_time: bool,
+    /// Heap memory standing in for the extern statics named at compile time, as start and
+    /// size: their address is known, their value is not.
+    extern_statics: Vec<(usize, usize, StaticId)>,
     /// Running a static's initializer, where the memory of every static is read-only, as in
     /// rustc.
     in_static: bool,
@@ -456,6 +466,8 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     budget: ConstEvalBudget,
     /// The steps of [`Self::budget`] not spent yet.
     steps_left: u64,
+    /// The most bytes of stack and heap together the evaluation has held.
+    memory_peak: u64,
     /// [`Self::steps_left`] once [`LINT_TERMINATOR_LIMIT`] steps are spent, when the evaluation
     /// is of a constant's or static's initializer; `u64::MAX`, which it never is, otherwise.
     lint_mark: u64,
@@ -975,6 +987,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             read_statics: None,
             unevaluated_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             missing_static: Cell::new(None),
+            compile_time: !matches!(
+                owner,
+                InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_))
+            ),
+            extern_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
             random_state: blaze_rng::SplitMix64::new(0),
@@ -990,6 +1007,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             limits_frames,
             budget,
             steps_left: budget.steps,
+            memory_peak: 0,
             lint_mark: lint_mark(limits_frames, budget.steps),
             inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
@@ -1224,8 +1242,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             OperandKind::Constant { konst: _, ty } => ty.as_ref(),
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
             &OperandKind::Static(s) => {
-                let ty = InferenceResult::of(self.db, DefWithBodyId::from(s))
-                    .expr_ty(Body::of(self.db, s.into()).root_expr());
+                let ty = self.db.type_for_static(s).instantiate_identity().skip_norm_wip();
                 Ty::new_ref(
                     self.interner(),
                     Region::new_static(self.interner()),
@@ -2894,8 +2911,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if let AdtId::StructId(id) = current_adt.def_id()
                     && target_adt.def_id() == current_adt.def_id() =>
             {
-                let mut changed = None;
-                for (_, field) in self.db.field_types(id.into()).iter() {
+                // The field with bytes, changed or not: a cast from `Box<dyn A>` to `Box<dyn A>`
+                // changes none.
+                let fields = id.fields(self.db).fields();
+                let mut pointer = None;
+                for (field_id, field) in self.db.field_types(id.into()).iter() {
                     let from =
                         field.ty().instantiate(self.interner(), current_subst).skip_norm_wip();
                     let to = field.ty().instantiate(self.interner(), target_subst).skip_norm_wip();
@@ -2904,17 +2924,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     if self.layout(from)?.size.bytes_usize() == 0 {
                         continue;
                     }
-                    if from == to {
+                    let name = fields[field_id].name.as_str();
+                    if let Some((first, first_from, first_to)) = pointer.replace((name, from, to)) {
                         // The cast widens the value's bytes as one pointer.
-                        not_supported!("unsizing a struct with bytes beside its pointer");
-                    }
-                    if changed.replace((from, to)).is_some() {
-                        not_supported!("unsizing a struct whose cast changes two fields");
+                        not_supported!(
+                            "unsizing `{current:?}` to `{target:?}`: two of its fields have bytes, \
+                             `{first}` (`{first_from:?}` to `{first_to:?}`) and `{name}` \
+                             (`{from:?}` to `{to:?}`), and the cast widens one pointer"
+                        );
                     }
                 }
-                match changed {
-                    Some((from, to)) => self.coerce_unsized_pointees(from, to),
-                    None => Err(MirEvalError::CoerceUnsizedError(current.store())),
+                match pointer {
+                    Some((_, from, to)) => self.coerce_unsized_pointees(from, to),
+                    None => not_supported!(
+                        "unsizing `{current:?}` to `{target:?}`: none of its fields has bytes"
+                    ),
                 }
             }
             _ => Err(MirEvalError::CoerceUnsizedError(current.store())),
@@ -2953,6 +2977,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("slice unsizing from non array type {t:?}")
                 }
             },
+            // From `dyn A` (to itself, or upcast) the pointer keeps its vtable, as rustc's
+            // `unsized_info` keeps it for one principal: a vtable here names the concrete type,
+            // which answers every trait of it.
+            TyKind::Dynamic(..) if matches!(current_ty.kind(), TyKind::Dynamic(..)) => {
+                IntervalOrOwned::Borrowed(addr)
+            }
             TyKind::Dynamic(..) => {
                 let vtable = self.vtable_map.id(current_ty);
                 self.with_metadata(addr, &word_bytes(vtable))?
@@ -3730,9 +3760,20 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .unevaluated_statics
             .iter()
             .find(|&&(start, len, _)| pos < start + len && start < pos + size);
+        if let Some(&(.., id)) = read {
+            self.missing_static.set(Some(id));
+            not_supported!("reading a static that was left unevaluated");
+        }
+        let read = self
+            .extern_statics
+            .iter()
+            .find(|&&(start, len, _)| pos < start + len && start < pos + size);
         let Some(&(.., id)) = read else { return Ok(()) };
-        self.missing_static.set(Some(id));
-        not_supported!("reading a static that was left unevaluated")
+        // alloc: error path
+        Err(MirEvalError::NotSupported(format!(
+            "cannot access extern static `{}` at compile time",
+            StaticSignature::of(self.db, id).name.as_str()
+        )))
     }
 
     /// Fails a write to the memory of a static from a static's initializer.
@@ -4098,16 +4139,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         map.note_align(addr, align);
     }
 
-    /// Whether `more` bytes of stack or heap fit the evaluation's budget.
-    fn check_memory(&self, more: usize) -> Result<'db, ()> {
+    /// Whether `more` bytes of stack or heap fit the evaluation's budget; when they do, the
+    /// total they make counts toward [`Self::memory_peak`].
+    fn check_memory(&mut self, more: usize) -> Result<'db, ()> {
         let used = self.stack.len() as u64 + self.heap.len() as u64;
-        if (more as u64).checked_add(used).is_none_or(|it| it > self.budget.memory) {
-            return Err(MirEvalError::OverBudget {
-                spent: Budget::Memory(self.budget.memory),
-                at: None,
-            });
+        match (more as u64).checked_add(used) {
+            Some(total) if total <= self.budget.memory => {
+                self.memory_peak = self.memory_peak.max(total);
+                Ok(())
+            }
+            _ => Err(MirEvalError::OverBudget { spent: Budget::Memory(self.budget.memory), at: None }),
         }
-        Ok(())
     }
 
     /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
@@ -4201,19 +4243,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(())
     }
 
-    /// `__rust_realloc`: the block grows or shrinks in place while it fits its size class,
-    /// else its bytes move to a new block and it is freed.
-    fn reallocate(&mut self, addr: Address, new_size: usize) -> Result<'db, Address> {
+    /// `__rust_realloc`, or C's `realloc` for [`Origin::C`] (`what`): the block grows or
+    /// shrinks in place while it fits its size class, else its bytes move to a new block and
+    /// it is freed.
+    fn reallocate(
+        &mut self,
+        addr: Address,
+        new_size: usize,
+        origin: Origin,
+        what: &str,
+    ) -> Result<'db, Address> {
         let block = match addr.at() {
             Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
             _ => None,
         };
-        let Some((pos, block)) = block.filter(|(_, it)| it.origin == Origin::Allocator) else {
-            return Err(MirEvalError::UndefinedBehavior(
-                "`__rust_realloc` of a pointer that is not the start of memory allocated by it"
-                    // alloc: error path
-                    .to_owned(),
-            ));
+        let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            // alloc: error path
+            return Err(MirEvalError::UndefinedBehavior(format!(
+                "`{what}` of a pointer that is not the start of memory allocated by it"
+            )));
         };
         // The machine sees a reallocation as rustc's evaluation does: a new block, the bytes
         // that fit copied to it, the old one freed.
@@ -4224,11 +4272,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.heap_blocks.insert(pos, HeapBlock { size: new_size, ..block });
             return Ok(addr);
         }
-        let new = self.allocate(new_size, block.align, Origin::Allocator, false)?;
+        let new = self.allocate(new_size, block.align, origin, false)?;
         let kept = block.size.min(new_size);
         Interval { addr: new, size: kept }
             .write_from_interval(self, Interval { addr, size: kept })?;
-        self.deallocate(addr, Origin::Allocator, "__rust_realloc")?;
+        self.deallocate(addr, origin, what)?;
         Ok(new)
     }
 
@@ -5410,16 +5458,34 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.record_static(result.addr, size, st)?;
             return Ok(location);
         } else {
-            let ty = InferenceResult::of(self.db, DefWithBodyId::from(st))
-                .expr_ty(Body::of(self.db, st.into()).root_expr());
+            let ty = self.db.type_for_static(st).instantiate_identity().skip_norm_wip();
             let Some((size, align)) = self.size_align_of(ty, locals)? else {
                 not_supported!("unsized extern static");
             };
-            // Zeroed: an `extern_weak` one is unresolved, so std's `Option<fn>` for
-            // `__cxa_thread_atexit_impl` is `None` and it registers thread-local destructors
-            // through a pthread key, which the thread shims run.
+            let weak = hir_def::attrs::AttrFlags::linkage(self.db, st.into())
+                .is_some_and(|it| it.as_str() == "extern_weak");
+            if !self.compile_time && !weak {
+                // alloc: error path
+                return Err(MirEvalError::NotSupported(format!(
+                    "extern static `{}`, which only the linked program has",
+                    static_data.name.as_str()
+                )));
+            }
             let addr = self.heap_allocate(size, align)?;
-            Interval::new(addr, size)
+            let result = Interval::new(addr, size);
+            if self.compile_time {
+                // Its address is a value at compile time; reading it is not (rustc's
+                // `ExternStatic`), which `check_static_is_evaluated` refuses.
+                if let Heap(start) = addr.at() {
+                    self.extern_statics.push((start, size, st));
+                }
+            } else {
+                // Null: an `extern_weak` one is unresolved, so std's `Option<fn>` for
+                // `__cxa_thread_atexit_impl` is `None` and it registers thread-local destructors
+                // through a pthread key, which the thread shims run.
+                self.initialized(result);
+            }
+            result
         };
         self.record_static(result.addr, result.size, st)?;
         self.locate_static(st, result.addr)
@@ -5942,9 +6008,8 @@ impl IntValue {
             (16, false) => Self::U128(u128::from_le_bytes(bytes.try_into().unwrap())),
             (16, true) => Self::I128(i128::from_le_bytes(bytes.try_into().unwrap())),
             (len, is_signed) => {
-                // alloc: error path
                 return Err(MirEvalError::InternalError(
-                    format!("an integer operand of {len} bytes, signed: {is_signed}").into(),
+                    format!("an integer operand of {len} bytes, signed: {is_signed}").into(), // alloc: error path
                 ));
             }
         })

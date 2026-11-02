@@ -392,6 +392,22 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
         &[TextEdit::Remove { at: 0 }],
         false,
     );
+    // 2026-11-01: `#[path = "models"]` renamed to `#[S = "models"]`, then that line removed:
+    // positions after the walk found `bar`'s parent group through `group_of`, as of the last
+    // run, and panicked ("a round-0 module its parent does not declare").
+    fixture_script(
+        fixture_named("tests/mod_resolution.rs::module_resolution_decl_inside_inline_module_with_path_attribute#0"),
+        &[TextEdit::Rename { at: 0, to: 0 }, TextEdit::Remove { at: 0 }],
+        false,
+    );
+    // 2026-11-01: renaming the variant `Minus` that `panels` imports by path
+    // (`use MinusPlusIndex::Minus as Left`) woke nothing: a path through an enum noted no read
+    // of its variants, so the maintained map kept `Left`.
+    fixture_script(
+        fixture_named("tests/globs.rs::variant_alias_reexported#0"),
+        &[TextEdit::Rename { at: 23552, to: 0 }],
+        false,
+    );
     // 2026-11-01: removing `fn f();` from a trait the same module globs touched the root and ran
     // nothing: its own read of the trait's items was not kept, so the maintained map kept `f`.
     fixture_script(
@@ -720,6 +736,10 @@ const PINNED_GENERATED: &[(u64, bool, &[ModelEdit])] = &[
     // 2026-11-01: `m0` and `m1` reached `crate::a` through two globs, both `pub(crate)`: each map
     // credited the glob that arrived first.
     (0x33a6fd1240da37, false, &[ModelEdit::AddItem { module: 1, at: 0, seed: 1 }]),
+    // 2026-11-01: a macro-written `pub use $crate::b::*` gave `U` an item another glob bound:
+    // each map recorded the ambiguity at the visibility of the glob's delivery that came last,
+    // `pub` in one and `pub(crate)` in the other.
+    (0x1598f, false, &[ModelEdit::AddItem { module: 143, at: 0, seed: 1 }]),
 ];
 
 #[test]

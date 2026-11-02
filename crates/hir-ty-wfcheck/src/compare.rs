@@ -13,7 +13,6 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use rustc_type_ir::{
-    TypeVisitableExt as _,
     error::{ExpectedFound, TypeError},
     inherent::{GenericArgs as _, IntoKind as _},
 };
@@ -22,7 +21,7 @@ use hir_ty::{
     db::HirDatabase as _,
     next_solver::{
         Clauses, DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
-        RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode,
+        RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode, references_non_lt_error,
         infer::{BoundRegionConversionTime, DbInternerInferExt as _, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -126,10 +125,13 @@ pub fn compare_impl_method_signature<'db>(
     db: &'db Db,
     impl_method: FunctionId,
 ) -> Option<SignatureMismatch<'db>> {
+    // A method of an inherent impl, or one its trait lacks (E0407), has nothing to compare.
     let (impl_, _, trait_method) = trait_method_of(db, impl_method)?;
     let interner = DbInterner::new_with(db, impl_method.module(db).krate(db));
     let trait_ref = db.impl_trait(impl_)?.instantiate_identity().skip_norm_wip();
-    if trait_ref.references_error() {
+    // rustc's `compare_impl_item` stops at `trait_ref.error_reported()`, a type error already
+    // reported. An error region is none: lowering leaves some lifetimes as error regions.
+    if references_non_lt_error(&trait_ref) {
         return None;
     }
 
@@ -145,6 +147,8 @@ pub fn compare_impl_method_signature<'db>(
         GenericArgKind::Type(_) => 1,
         GenericArgKind::Const(_) => 2,
     };
+    // `compare_number_of_generics` and `compare_generic_param_kinds` (E0049, E0053 of a
+    // const parameter's kind): each is its own error, and rustc compares no types after it.
     if !own(trait_method, SolverDefId::TraitId(trait_ref.def_id.0))
         .map(|it| kind(it.kind()))
         .eq(own(impl_method, SolverDefId::ImplId(impl_)).map(|it| kind(it.kind())))
@@ -184,9 +188,11 @@ pub fn compare_impl_method_signature<'db>(
         .instantiate(interner, trait_to_impl_args)
         .skip_norm_wip();
     let trait_sig = interner.liberate_late_bound_regions(impl_method.into(), trait_sig);
+    // `compare_number_of_method_arguments` (E0050), and a signature with a type error already
+    // reported (rustc's `references_error` check before relating). An error region is none.
     if impl_poly_sig.skip_binder().inputs().len() != trait_sig.inputs().len()
-        || impl_poly_sig.references_error()
-        || trait_sig.references_error()
+        || references_non_lt_error(&impl_poly_sig)
+        || references_non_lt_error(&trait_sig)
     {
         return None;
     }
@@ -253,23 +259,21 @@ pub struct ProcMacroSignatureMismatch<'db> {
 /// signature of `function`, a `#[proc_macro]` or `#[proc_macro_derive]` function (`inputs` 1)
 /// or a `#[proc_macro_attribute]` one (`inputs` 2), its generic parameters fresh inference
 /// variables and normalized, equated with safe Rust `fn(TokenStream, ..) -> TokenStream`.
-/// `None` when they agree, when `function`'s crate sees no diagnostic item `TokenStream` or
-/// it has generic parameters, and when proving the signature well-formed fails, as rustc's.
+/// `None` when they agree, when `function`'s crate sees no diagnostic item `TokenStream`, and
+/// when proving the signature well-formed fails, as rustc's.
 pub fn compare_proc_macro_signature<'db>(
     db: &'db Db,
     function: FunctionId,
     inputs: usize,
 ) -> Option<ProcMacroSignatureMismatch<'db>> {
     let krate = function.module(db).krate(db);
+    // rustc's `check_proc_macro` returns where no `TokenStream` diagnostic item is in scope.
     let token_stream = match hir_def::diagnostic_item::diagnostic_items(db, krate)
         .get(&intern::Symbol::intern("TokenStream"))?
     {
         hir_def::AttrDefId::AdtId(adt) => adt,
         _ => return None,
     };
-    if !GenericParams::of(db, token_stream.into()).is_empty() {
-        return None;
-    }
     let token_stream = db.ty(token_stream.into()).instantiate_identity().skip_norm_wip();
 
     let interner = DbInterner::new_with(db, krate);
@@ -283,9 +287,12 @@ pub fn compare_proc_macro_signature<'db>(
         function.into(),
         poly_sig.instantiate(interner, fresh_args).skip_norm_wip(),
     );
-    if sig.references_error() {
+    // A type error already reported, as rustc's `references_error` check; an error region is
+    // none.
+    if references_non_lt_error(&sig) {
         return None;
     }
+    // rustc's: a signature that does not normalize or is not well-formed is an error of its own.
     let sig = ocx.deeply_normalize(&cause, param_env, sig).ok()?;
     if !ocx.try_evaluate_obligations().is_empty() {
         return None;

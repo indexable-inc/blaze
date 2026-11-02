@@ -1,0 +1,29 @@
+{
+  "id": "01523",
+  "from_lane": "no-fallback-link-native",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen"
+  ],
+  "what": "Round 33 hang (coord-1030, run log /tmp/blaze-lanes/self-run-1101-081613PST.log, stacks /tmp/blaze-lanes/sandbox-hang/*.sample): blaze-compiled build scripts of ring and zstd-sys (cc 1.4.3) sit in cc::parallel::async_executor::block_on -> thread::sleep forever with no clang child. In cc 1.4.3 src/parallel/command_runner.rs block_on polls spawn_future first, whose first step is job_token inprocess_jobserver::JobServer::acquire: `AtomicU32::new(NUM_JOBS=18).fetch_update(AcqRel, Acquire, |t| t.checked_sub(1))`, retried after `YieldOnce::default().await`. A spawn error would end the future Err and an empty cmd list would let block_on return, so the only way to sleep with no child is that acquire never succeeds: suspect blaze codegen of fetch_update/compare_exchange_weak on AtomicU32, checked_sub's Option<u32>, `\"18\".parse::<u32>()` (cargo_env_var_os NUM_JOBS), or the async state machine not keeping YieldOnce(bool)'s flag across polls (every poll Pending). Under rustc the same loop spawns clang at once. Suggested repro tests: those four in a blaze-built binary. Not the sandbox: the hang is before any spawn.",
+  "state": "taken",
+  "created": "2026-11-01T16:36:01Z",
+  "updated": "2026-11-01T16:38:27Z",
+  "taken_by": "codegen",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T16:36:01Z",
+      "by": "no-fallback-link-native",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T16:38:27Z",
+      "by": "codegen",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "01525",
+  "from_lane": "no-fallback-link-native",
+  "owner": "no-fallback-link-native",
+  "paths": [
+    "crates/blaze-usercode/src/confine.rs",
+    "crates/blaze-cargo/src/sandbox/v2.rs"
+  ],
+  "what": "Security: spawn/<pid>/spec.json under BLAZE_HOME (written by blaze-usercode confine.rs SPEC_FILE, read by blaze-cargo sandbox/v2.rs) carries the whole parent environment, AWS keys and tokens included, persisted on disk (seen by coord-1030 in round 33, e.g. b2-home-rel/v2/spawn/91226-20/spec.json). Secrets must not be written to the store or disk: pass only the environment the run is given (cargo's build-script set plus the declared env), or hand the env over a pipe/fd rather than the spec file, and remove the file after the launcher reads it; existing spawn dirs with secrets should be cleaned. Code review rule: secrets written to artifacts or the store.",
+  "state": "applied",
+  "created": "2026-11-01T16:36:01Z",
+  "updated": "2026-11-01T17:32:54Z",
+  "taken_by": "no-fallback-link-native",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T16:36:01Z",
+      "by": "no-fallback-link-native",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T17:32:00Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "usercode has no live window; link-native diagnosed the round 33 hang and has the context"
+    },
+    {
+      "at": "2026-11-01T17:26:58Z",
+      "by": "no-fallback-link-native",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T17:32:54Z",
+      "by": "no-fallback-link-native",
+      "action": "done",
+      "note": "blaze-usercode confine.rs: spec.json written create_new with mode 0600 (write_private); blaze-cargo sandbox/v2.rs read_spec removes it as soon as it is read, before anything runs, and a spec that cannot be removed is an error (nothing runs). The driver (blaze-core process.rs) already removes the scratch dir when the process exits, so the env is on disk only from confine to the launcher start. The Windows warm launcher gets the spec over its stdin pipe, never on disk. Env itself still passed whole: cargo gives build scripts the whole parent env, so the program must see it. Tests: confine.rs the_launcher_is_given_its_spec... asserts mode 0600; v2.rs a_spec_with_a_field... asserts removed once read and a second read fails. Scrub: only /Volumes/Projects/.coord-1030/b2-home-rel/v2/spawn has a spec.json left (1, from the hung run); remove it once that run is killed."
+    }
+  ]
+}

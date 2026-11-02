@@ -7,7 +7,9 @@ use crate::{
     emit::Style,
     lints::{CommandLine, Level, LintOptions},
     model,
-    tests::{Mode, checked, checked_with, compiletest, normalized, ui_with},
+    tests::{
+        Mode, checked, checked_expanding_derives, checked_with, compiletest, normalized, ui_with,
+    },
 };
 
 /// The options of a test's own `//@ compile-flags`, its lint flags `flags`.
@@ -864,13 +866,59 @@ fn main() { from_dep(); from_here(); }
     assert_eq!(unused[0].span.primary[0].file, "main.rs", "{:?}", checked.messages());
 }
 
-/// `blaze` is a tool every crate has, with the one lint `blaze::const_impure`: naming it is
-/// quiet, and any other `blaze::` name is an unknown lint of a known tool.
+/// What a builtin derive writes is another crate's macro's: derive(Debug)'s `&mut Formatter`
+/// and the bodies of the other derives give no lint, while the same elided path written by
+/// hand does (blaze-hash's `FixedState` warned twice in the self-build).
+#[test]
+fn the_lints_of_what_a_builtin_derive_writes_are_not_reported() {
+    let fixture = r#"//- minicore: clone, copy, default, eq, fmt, derive
+//- /lib.rs crate:other
+#![warn(elided_lifetimes_in_paths)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct FixedState;
+pub fn by_hand(_: &mut core::fmt::Formatter) {}
+"#;
+    let checked = checked_expanding_derives(fixture, &Options::default());
+    let lib = fixture.split("//- /lib.rs crate:other\n").nth(1).unwrap();
+    let line = lib.find("pub fn by_hand").unwrap() as u32..lib.len() as u32;
+    let lints: Vec<_> = checked
+        .diags
+        .iter()
+        .filter_map(|it| Some((it.lint_name()?, it.span.primary[0].lo)))
+        .collect();
+    assert!(
+        matches!(lints[..], [("elided_lifetimes_in_paths", lo)] if line.contains(&lo)),
+        "{lints:?}: {:?}",
+        checked.messages()
+    );
+}
+
+/// As blaze-rng's `SplitMix64` under `blaze check`'s lints: derives expanded, the lint warned on the
+/// command line. Each expansion names the derive it is of, so what it writes is external.
+#[test]
+fn the_lints_of_what_a_derive_of_a_documented_item_writes_are_not_reported() {
+    // `ord` has the integers' `PartialEq`, `dispatch_from_dyn` makes `Debug` dyn-compatible:
+    // what derive(PartialEq) and derive(Debug) of a field need, as with the real core.
+    let fixture = r#"//- minicore: clone, copy, eq, ord, fmt, derive, dispatch_from_dyn
+//- /lib.rs crate:other edition:2024
+/// One stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitMix64(u64);
+"#;
+    let checked = checked_expanding_derives(fixture, &flags(&["-W", "elided-lifetimes-in-paths"]));
+    let lints: Vec<_> = checked.diags.iter().filter_map(|it| it.lint_name()).collect();
+    assert!(lints.is_empty(), "{lints:?}: {:?}", checked.messages());
+    assert!(!checked.diags.iter().any(|it| it.is_error()), "{}", checked.stderr());
+}
+
+/// `blaze` is a tool every crate has, with the front end's `blaze::const_impure` and
+/// blaze-lints' lints and group: naming them is quiet, an `#[expect]` of blaze-lints' is left
+/// to it, and any other `blaze::` name is an unknown lint of a known tool.
 #[test]
 fn blaze_tool_lints() {
-    let fixture = "//- /main.rs crate:other:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\nfn main() {}\n";
+    let fixture = "//- /main.rs crate:other:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\n#![warn(blaze::hot)]\n#![expect(blaze::wall_clock)]\nfn main() {}\n";
     let messages = checked(fixture).messages();
-    let unknown: Vec<_> = messages.iter().filter(|it| it.contains("unknown lint")).collect();
+    let unknown: Vec<_> = messages.iter().filter(|it| it.contains("unknown lint") || it.contains("unfulfilled")).collect();
     assert_eq!(unknown, ["unknown_lints: unknown lint: `blaze::const_purity`"], "{messages:?}");
 }
 

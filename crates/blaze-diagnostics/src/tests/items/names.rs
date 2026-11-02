@@ -107,6 +107,33 @@ pub fn f<#[cfg(feature = "big")] T: big::Tr>(#[cfg(feature = "big")] _: big::Big
 }
 
 #[test]
+fn a_field_a_cfg_removes_after_its_doc_comment_is_not_resolved() {
+    // Our own: blaze-core's threads.rs, a field documented before its `#[cfg]` beside a twin of
+    // the same name the other cfg keeps. A doc comment is the owner's first child, before the
+    // `#[cfg]`.
+    let fixture = r#"//- minicore: sized
+//- /lib.rs crate:other:threads edition:2024
+#[cfg(feature = "linux")]
+mod linux {
+    pub struct Control;
+}
+pub struct S {
+    /// Stopped watches kept for the next.
+    #[cfg(feature = "linux")]
+    spare: linux::Control,
+    #[cfg(not(feature = "linux"))]
+    spare: u8,
+    /// Documented, with no cfg.
+    kept: kept::Kept,
+}
+"#;
+    let messages = checked(fixture).messages();
+    let unresolved: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0433")).collect();
+    assert_eq!(unresolved.len(), 1, "only `kept`, which no cfg removes, is unresolved: {messages:?}");
+    assert!(unresolved[0].contains("`kept`"), "{messages:?}");
+}
+
+#[test]
 fn an_impl_of_a_struct_is_not_a_trait() {
     // tests/ui/error-codes/E0404.rs
     let source = "struct Foo;\nstruct Bar;\n\nimpl Foo for Bar {} //~ ERROR E0404\n\nfn main() {}\n\nfn baz<T: Foo>(_: T) {} //~ ERROR E0404\n";

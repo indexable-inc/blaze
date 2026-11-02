@@ -396,6 +396,12 @@ fn need<T: Copy + Tr>(_: T) where T: Clone {}
 
 /// rustc's `ty_infer_name_resolver`: an undecided `[T; N]` keeps both variables as their
 /// parameters, in printing order ("consider giving `_x` an explicit type: `[T; N]`").
+///
+/// The one error is the const's: `ConstArgHasType(?N, usize)` sorts before `?T: Sized`, which
+/// the taint then drops, so it blames `N` alone (E0284, as the pinned nightly's ui tests
+/// `const-generics/infer/issue-77092.stderr` and, for a `let`,
+/// `repeat-expr/copy-check-const-element-uninferred-count.stderr`). The binding's type is
+/// what names both, as rustc's `FindInferSourceVisitor` prints the `let`'s type.
 #[test]
 fn an_undecided_term_names_each_variable_by_its_parameter() {
     let db = fixture::db(
@@ -407,29 +413,50 @@ fn undecided() { let _x = make(); }
     )
     .into_db();
     crate::attach_db(&db, || {
-        let (_, result) = infer(&db, "undecided");
-        let named = result
+        let (body, result) = infer(&db, "undecided");
+        let names = |named: &hir_ty::solver_errors::NamedTerm| -> Vec<String> {
+            named
+                .params
+                .iter()
+                .map(|&(_, param)| {
+                    let param: hir_def::TypeOrConstParamId = match param {
+                        GenericParamId::TypeParamId(it) => it.into(),
+                        GenericParamId::ConstParamId(it) => it.into(),
+                        GenericParamId::LifetimeParamId(_) => {
+                            panic!("a lifetime is never undecided")
+                        }
+                    };
+                    let params = GenericParams::of(&db, param.parent);
+                    params[param.local_id].name().expect("a named parameter").as_str().to_owned()
+                })
+                .collect()
+        };
+        let errors: Vec<_> = result
             .diagnostics()
             .iter()
-            .find_map(|it| match it {
-                InferenceDiagnostic::TypeMustBeKnown { named: Some(named), .. } => Some(named),
+            .filter_map(|it| match it {
+                InferenceDiagnostic::TypeMustBeKnown { kind, named, .. } => Some((*kind, named)),
                 _ => None,
             })
-            .expect("an undecided term");
-        let names: Vec<_> = named
-            .params
-            .iter()
-            .map(|&(_, param)| {
-                let param: hir_def::TypeOrConstParamId = match param {
-                    GenericParamId::TypeParamId(it) => it.into(),
-                    GenericParamId::ConstParamId(it) => it.into(),
-                    GenericParamId::LifetimeParamId(_) => panic!("a lifetime is never undecided"),
-                };
-                let params = GenericParams::of(&db, param.parent);
-                params[param.local_id].name().expect("a named parameter").as_str().to_owned()
-            })
             .collect();
-        assert_eq!(names, ["T", "N"], "both variables of `[T; N]`, the element first");
+        let [(kind, Some(blamed))] = &errors[..] else {
+            panic!("one undecided term, the const's: {errors:?}");
+        };
+        assert_eq!((*kind, names(blamed)), (TypeAnnotationNeeded::E0284, vec!["N".to_owned()]));
+
+        let binding = body
+            .pats()
+            .find_map(|(id, pat)| match pat {
+                hir_def::hir::Pat::Bind { id: binding, .. }
+                    if body[binding].name.as_str() == "_x" =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("the binding `_x`");
+        let named = result.named_pat_type(binding).expect("`_x` is undecided");
+        assert_eq!(names(named), ["T", "N"], "both variables of `[T; N]`, the element first");
         let interner = hir_ty::next_solver::DbInterner::new_no_crate(&db);
         let named_all = named.named(interner, |_, _| true);
         assert!(!named_all.has_infer() && !named_all.references_error(), "{named_all:?}");
@@ -596,6 +623,51 @@ fn sized_two(x: [u8], s: &str) { let t = *s; }
         assert_eq!(unmet_causes(&db, "sized_closure_param"), [C::SizedArgumentType]);
         // rustc's order: the parameter, then the local.
         assert_eq!(unmet_causes(&db, "sized_two"), [C::SizedArgumentType, C::LetType]);
+    });
+}
+
+/// A fn with no body asks nothing `Sized`: rustc's parameter check is typeck's `check_fn` and
+/// its return check wfcheck's "if the function has a body" (stdx's `TupleExt::head(self)` on
+/// a `?Sized` trait, which blaze once refused).
+#[test]
+fn a_fn_without_a_body_needs_no_sized_parameters_or_return_type() {
+    let db = fixture::db(
+        r#"
+//- minicore: sized
+trait Head {
+    fn head(self) -> Self;
+    fn slice(x: [u8]) -> str;
+}
+extern "C" {
+    fn foreign(x: [u8]) -> str;
+}
+"#,
+    )
+    .into_db();
+    crate::attach_db(&db, || {
+        let mut methods = Vec::new();
+        for &krate in base_db::all_crates(&db).iter() {
+            let def_map = hir_def::nameres::crate_def_map(&db, krate);
+            for (_, module) in def_map.modules(&db) {
+                for def in module.scope(&db).declarations() {
+                    if let hir_def::ModuleDefId::TraitId(it) = def
+                        && TraitSignature::of(&db, it).name.as_str() == "Head"
+                    {
+                        for &(_, item) in it.trait_items(&db).items.iter() {
+                            if let hir_def::AssocItemId::FunctionId(f) = item {
+                                methods.push(DefWithBodyId::FunctionId(f));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(methods.len(), 2, "`head` and `slice`");
+        methods.push(function(&db, "foreign"));
+        for def in methods {
+            let result = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
+            assert!(result.diagnostics().is_empty(), "{def:?}: {:?}", result.diagnostics());
+        }
     });
 }
 
@@ -1512,5 +1584,58 @@ fn a_path_that_names_nothing_reports_its_first_failing_segment() {
                 .iter()
                 .any(|it| matches!(it, InferenceDiagnostic::UnresolvedIdent { .. }))
         );
+    });
+}
+
+const UNSTABLE_METHOD: &str = r#"
+//- minicore: sized
+//- /iterator.rs crate:iterator edition:2015 library
+#![feature(staged_api)]
+#![stable(feature = "ipu_iterator", since = "1.0.0")]
+#[stable(feature = "ipu_iterator", since = "1.0.0")]
+pub trait IpuIterator {
+    #[unstable(feature = "ipu_flatten", issue = "99999")]
+    fn ipu_flatten(&self) -> u32 { 0 }
+    #[unstable(feature = "assoc_const_ipu_iter", issue = "99999")]
+    const C: i32;
+}
+#[stable(feature = "ipu_iterator", since = "1.0.0")]
+impl IpuIterator for char {
+    const C: i32 = 42;
+}
+//- /itertools.rs crate:itertools edition:2015 library
+pub trait IpuItertools {
+    fn ipu_flatten(&self) -> u32 { 1 }
+    const C: i32;
+}
+impl IpuItertools for char {
+    const C: i32 = 1;
+}
+//- /main.rs crate:main edition:2015 deps:iterator,itertools
+use iterator::IpuIterator;
+use itertools::IpuItertools;
+fn call() -> u32 {
+    'x'.ipu_flatten()
+}
+fn path() -> i32 {
+    char::C
+}
+"#;
+
+/// The unstable items a probe passed over for a stable one of another trait: one for a method
+/// call as for a type-relative path, rustc's `Pick::unstable_candidates` for both.
+#[test]
+fn a_method_call_keeps_the_unstable_method_its_probe_passed_over() {
+    let db = fixture::db(UNSTABLE_METHOD).into_db();
+    crate::attach_db(&db, || {
+        for name in ["call", "path"] {
+            let (_, result) = infer(&db, name);
+            let found: Vec<_> = result // alloc: a test's list
+                .unstable_candidate_nodes()
+                .flat_map(|(_, candidates)| candidates.iter().map(|(_, feature)| feature.as_str()))
+                .collect();
+            let want = if name == "call" { "ipu_flatten" } else { "assoc_const_ipu_iter" };
+            assert_eq!(found, [want], "`{name}`");
+        }
     });
 }

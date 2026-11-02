@@ -12,7 +12,7 @@ use std::{
 use blaze_api::{Cargo, Targets};
 use blaze_manifest::paths::normalize_path;
 
-use super::args::Invocation;
+use super::args::{Command, Invocation};
 
 /// Where a command runs.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -131,6 +131,23 @@ pub fn config_files(place: &Place, configs: &[String], cargo_home: Option<&Path>
     Ok(files)
 }
 
+/// The files clippy's configuration search reads above the checkout, which the view does not
+/// have: `.clippy.toml` and `clippy.toml` of each directory above the root.
+pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut files = Vec::new();
+    for dir in place.root.ancestors().skip(1) {
+        for name in [".clippy.toml", "clippy.toml"] {
+            let path = dir.join(name);
+            match std::fs::read(&path) {
+                Ok(bytes) => files.push((utf8(&path)?, bytes)),
+                Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory) => {}
+                Err(error) => return Err(format!("reading {}: {error}", path.display())),
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// A path as the API carries it.
 pub fn utf8(path: &Path) -> Result<String, String> {
     path.to_str()
@@ -235,9 +252,14 @@ pub fn cargo(
     color: bool,
     width: Option<u32>,
 ) -> Result<Cargo, String> {
+    let mut args = asked.args.clone();
+    // `check --fix` makes the suggestions of every target when none is named, as `cargo fix`.
+    if asked.command() == Command::Check && asked.flags.fix && !asked.flags.targeted {
+        args.push("--all-targets".to_owned());
+    }
     Ok(Cargo {
         command: asked.command().name().to_owned(),
-        args: asked.args.clone(),
+        args,
         root: utf8(&place.root)?,
         cwd: utf8(&place.cwd)?,
         env,

@@ -21,8 +21,8 @@ use crate::{
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 29;
-const RESPONSES: usize = 34;
+const REQUESTS: usize = 30;
+const RESPONSES: usize = 35;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -293,6 +293,10 @@ impl Gen {
             25 => Request::Profile { seconds: self.u32() },
             26 => Request::Live,
             27 => Request::Sql { sql: self.text(), last_s: self.u32() },
+            28 => Request::Hot {
+                top: self.u32(),
+                since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
+            },
             _ => Request::Stop,
         }
     }
@@ -641,6 +645,38 @@ impl Gen {
                 counters: self.bytes(),
             }),
             32 => Response::Queried { ipc: self.bytes(), rows: self.wide() },
+            33 => Response::Hot(crate::Hot {
+                keys: self.many(depth, |g| crate::HotKey {
+                    span: g.text(),
+                    function: match g.below(3) {
+                        0 => crate::HotFunction::None,
+                        1 => crate::HotFunction::Named(g.text()),
+                        _ => crate::HotFunction::Forgotten(g.u32()),
+                    },
+                    lower_ns: g.wide(),
+                    upper_ns: g.wide(),
+                }),
+                torn: self.wide(),
+                since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
+                spans: self.wide(),
+                waits: self.many(depth, |g| crate::HotWait {
+                    kind: match g.below(6) {
+                        0 => crate::HotWaitKind::Key,
+                        1 => crate::HotWaitKind::Lock,
+                        2 => crate::HotWaitKind::Channel,
+                        3 => crate::HotWaitKind::Io,
+                        4 => crate::HotWaitKind::Child,
+                        _ => crate::HotWaitKind::Scope,
+                    },
+                    count: g.wide(),
+                    max_ns: g.wide(),
+                    p50_ns: g.wide(),
+                    p90_ns: g.wide(),
+                    p99_ns: g.wide(),
+                }),
+                error_ns: self.wide(),
+                total_ns: self.wide(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -705,7 +741,8 @@ fn request_index(request: &Request) -> usize {
         Request::Profile { .. } => 25,
         Request::Live => 26,
         Request::Sql { .. } => 27,
-        Request::Stop => 28,
+        Request::Hot { .. } => 28,
+        Request::Stop => 29,
     }
 }
 
@@ -745,7 +782,8 @@ fn response_index(response: &Response) -> usize {
         Response::Profiled { .. } => 30,
         Response::Live(_) => 31,
         Response::Queried { .. } => 32,
-        Response::Of { .. } => 33,
+        Response::Hot(_) => 33,
+        Response::Of { .. } => 34,
     }
 }
 

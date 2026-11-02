@@ -50,8 +50,10 @@ pub struct Written<'a> {
     pub removed: &'a [FileId],
     /// Source roots whose file sets changed (a `mod` probe may now hit).
     pub roots: &'a [SourceRootId],
-    /// The crate graph, cfg, env or proc macros changed.
+    /// The crate graph, cfg or env changed, or proc macros set by [`Db::note_crates_changed`].
     pub crates: bool,
+    /// Crates given proc macros in place of those they had ([`Db::note_proc_macros`]).
+    pub proc_macros: &'a [Crate],
     /// Files `include_bytes!` or `include_str!` read whose bytes changed.
     pub included: &'a [IncludedFile],
 }
@@ -63,6 +65,7 @@ impl Written<'_> {
             && self.removed.is_empty()
             && self.roots.is_empty()
             && !self.crates
+            && self.proc_macros.is_empty()
             && self.included.is_empty()
     }
 }
@@ -265,6 +268,7 @@ struct Pending {
     removed: Vec<FileId>,
     roots: Vec<SourceRootId>,
     crates: bool,
+    proc_macros: Vec<Crate>,
     included: Vec<IncludedFile>,
 }
 
@@ -280,6 +284,7 @@ impl Default for Pending {
             removed: Vec::with_capacity(PENDING_ROOM),
             roots: Vec::with_capacity(PENDING_ROOM),
             crates: false,
+            proc_macros: Vec::new(), // alloc: grows to the proc-macro crates, kept from one pass to the next
             included: Vec::with_capacity(PENDING_ROOM),
         }
     }
@@ -295,6 +300,7 @@ impl Pending {
             removed: Vec::new(), // alloc: see above
             roots: Vec::new(), // alloc: see above
             crates: false,
+            proc_macros: Vec::new(), // alloc: see above
             included: Vec::new(), // alloc: see above
         }
     }
@@ -310,6 +316,7 @@ impl Pending {
             removed: &self.removed,
             roots: &self.roots,
             crates: self.crates,
+            proc_macros: &self.proc_macros,
             included: &self.included,
         }
     }
@@ -322,6 +329,8 @@ impl Pending {
         }
         self.roots.sort_unstable();
         self.roots.dedup();
+        self.proc_macros.sort_unstable();
+        self.proc_macros.dedup();
         let (added, removed) = (&self.added, &self.removed);
         self.set.retain(|file| {
             added.binary_search(file).is_err() && removed.binary_search(file).is_err()
@@ -334,6 +343,7 @@ impl Pending {
         self.removed.clear();
         self.roots.clear();
         self.crates = false;
+        self.proc_macros.clear();
         self.included.clear();
     }
 }
@@ -344,6 +354,7 @@ pub(crate) enum Note<'a> {
     View { set: &'a [FileId], added: &'a [FileId], removed: &'a [FileId], roots: &'a [SourceRootId] },
     Root(SourceRootId),
     Crates,
+    ProcMacros(Crate),
     Included(IncludedFile),
 }
 
@@ -407,6 +418,14 @@ impl Db {
         self.batch(|db| db.note(Note::Crates));
     }
 
+    /// Notes that `krate` was given proc macros in place of those it had, as a write: outside a
+    /// [`Db::batch`] the maintainers run now. Unlike [`Db::note_crates_changed`] it leaves the
+    /// other crates' maintained state warm: a crate's list reaches only its own def map, and
+    /// the crates depending on it through that.
+    pub fn note_proc_macros(&mut self, krate: Crate) {
+        self.batch(|db| db.note(Note::ProcMacros(krate)));
+    }
+
     /// Records what `maintainer` did for `krate` in this pass, while [`Db::keep_maintained`] is
     /// on; a maintainer reports each crate it went over once per pass, zeros included.
     pub fn report_work(&mut self, maintainer: &'static str, krate: Crate, work: Work) {
@@ -451,6 +470,7 @@ impl Db {
             }
             Note::Root(root) => pending.roots.push(root),
             Note::Crates => pending.crates = true,
+            Note::ProcMacros(krate) => pending.proc_macros.push(krate),
             Note::Included(file) => {
                 if !pending.included.contains(&file) {
                     pending.included.push(file);

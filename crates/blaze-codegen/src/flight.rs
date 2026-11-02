@@ -383,32 +383,57 @@ mod tests {
         assert_eq!(flights.wait(&[key(3)], || true), None);
     }
 
-    /// On a pool of one worker, a build waits for a function another build's round claimed,
-    /// having posted that build's landing as a job of its own: the landing can run only on the
+    /// On a pool of one worker, a build waits for a function another build's round claimed
+    /// while that build, a job parked before it lands, is woken: the landing can run only on the
     /// worker the wait is on, so the wait ends only if it parks its job rather than its thread
-    /// (with the thread held, as by a lock's condition, it never ends).
+    /// (with the thread held, as by a lock's condition, it never ends). Each build claims,
+    /// lands and lets go in its own job, as a build's compile does.
     #[test]
     fn a_build_waiting_for_another_rounds_function_leaves_its_thread_to_that_round() {
-        let flights = &Flights::new();
+        const LONG: Duration = Duration::from_secs(60);
+        let flights = std::sync::Arc::new(Flights::new());
         let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
-        let owner = Mutex::new(flights.claims("the owner"));
-        assert_eq!(owner.lock().claim(&[key(1)]), [Asked::Ours]);
-        let (owner, pool) = (&owner, &pool);
-        let waited = pool.install(move || {
-            pool.scope(|scope| {
-                let land = move || {
-                    let mut owner = owner.lock();
+        let go = blaze_graph::sched::Event::new();
+        let on = go.waiter();
+        let (claimed_tx, claimed) = crossbeam_channel::unbounded::<()>();
+        let (owned_tx, owned) = crossbeam_channel::unbounded::<Result<(), String>>();
+        {
+            let flights = std::sync::Arc::clone(&flights);
+            pool.submit(
+                None,
+                move || {
+                    let mut owner = flights.claims("the owner");
+                    assert_eq!(owner.claim(&[key(1)]), [Asked::Ours]);
+                    claimed_tx.send(()).unwrap();
+                    on.wait().expect("an event's wait closes no cycle");
                     owner.land(&[(key(1), shape(1))]);
                     owner.release();
-                };
-                scope.submit(None, land, |it| it.unwrap());
-                let mut theirs = flights.claims("the waiter");
-                assert_eq!(theirs.claim(&[key(1)]), [Asked::Theirs]);
-                theirs.release();
-                flights.wait(&[key(1)], || false)
-            })
-        });
-        assert_eq!(waited, Some(vec![Some(shape(1))]));
+                },
+                move |it| _ = owned_tx.send(it.map_err(|_| "the owner's build panicked".to_owned())),
+            );
+        }
+        claimed.recv_timeout(LONG).expect("the owner claims its function");
+        let (asking_tx, asking) = crossbeam_channel::unbounded::<()>();
+        let (waited_tx, waited) = crossbeam_channel::unbounded();
+        {
+            let flights = std::sync::Arc::clone(&flights);
+            pool.submit(
+                None,
+                move || {
+                    let mut theirs = flights.claims("the waiter");
+                    assert_eq!(theirs.claim(&[key(1)]), [Asked::Theirs]);
+                    theirs.release();
+                    asking_tx.send(()).unwrap();
+                    flights.wait(&[key(1)], || false)
+                },
+                move |it| _ = waited_tx.send(it.map_err(|_| "the waiting build panicked".to_owned())),
+            );
+        }
+        asking.recv_timeout(LONG).expect("the waiter runs once the owner parks");
+        go.fire();
+        let waited = waited.recv_timeout(LONG).expect("the waiter parks its job, so the owner lands on the one worker");
+        assert_eq!(waited, Ok(Some(vec![Some(shape(1))])));
+        assert_eq!(owned.recv_timeout(LONG).expect("the owner's build ends"), Ok(()));
     }
 
     /// Builds that each hold a claim the other waits for: each lets go of or lands its own

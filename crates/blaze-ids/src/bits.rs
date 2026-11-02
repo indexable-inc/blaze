@@ -1073,15 +1073,15 @@ impl fmt::Debug for DebugOnes<'_> {
 /// Per word of `words`, how many bits are set in the words before it; `None` past `u32::MAX`
 /// of them.
 pub fn ranks_of(words: &[u64]) -> Option<Box<[u32]>> {
+    // An `Option` collect knows no length, so it would grow a buffer and shrink it to fit.
+    // alloc: a ranked set's counts, made once with it at their length
+    let mut ranks = Vec::with_capacity(words.len());
     let mut before = 0u32;
-    words
-        .iter()
-        .map(|word| {
-            let rank = before;
-            before = before.checked_add(word.count_ones())?;
-            Some(rank)
-        })
-        .collect() // alloc: a ranked set's counts, made once with it
+    for word in words {
+        ranks.push(before);
+        before = before.checked_add(word.count_ones())?;
+    }
+    Some(ranks.into_boxed_slice())
 }
 
 /// How many bits of `words` are set below bit `at`, `ranks` being [`ranks_of`] `words`: one

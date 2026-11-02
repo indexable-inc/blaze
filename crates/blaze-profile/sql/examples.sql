@@ -345,7 +345,7 @@ FROM switched
 ORDER BY thread, start_ns
 
 -- name: uncovered_per_worker
--- says: per pool worker, the share of a build's wall time it was in no state the pool said (before its first switch) and inside no span: the gate holds it under 1%
+-- says: per pool worker, the share of a build's wall time it ran a job (from the job's start or resume to its next switch) or was in no state the pool said (before its first switch) and was inside no span: every job opens a span of its own, so the gate holds it under 1%
 WITH bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -354,11 +354,17 @@ WITH bounds AS (
     SELECT DISTINCT process, thread, any_value(thread_name) OVER (PARTITION BY process, thread) AS thread_name
     FROM switches, bounds
     WHERE t_ns BETWEEN t0 AND t1
-), covered AS (
-    SELECT switches.process, switches.thread, min(t_ns) AS start_ns, (SELECT t1 FROM bounds) AS end_ns
+), switched AS (
+    SELECT switches.process, switches.thread, t_ns, event,
+        lead(t_ns, 1, (SELECT t1 FROM bounds)) OVER (PARTITION BY switches.process, switches.thread ORDER BY t_ns) AS next_ns
     FROM switches, bounds
     WHERE t_ns BETWEEN t0 AND t1
-    GROUP BY switches.process, switches.thread
+), covered AS (
+    -- What the pool said the worker did besides running a job: idle, or between a job's park
+    -- or end and the next job's start or resume.
+    SELECT process, thread, t_ns AS start_ns, next_ns AS end_ns
+    FROM switched
+    WHERE event NOT IN ('started', 'resumed')
     UNION ALL
     SELECT spans.process, spans.thread, greatest(start_ns, t0), least(start_ns + dur_ns, t1)
     FROM spans, bounds

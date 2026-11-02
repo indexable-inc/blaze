@@ -311,6 +311,34 @@ fn two_closures_of_one_signature_keep_their_own_bodies() {
     assert_eq!(case.ok(&["run"]), "Ok(\"a\")\n[\"x\"] (\"y\",)\n");
 }
 
+/// cc 1.4.3's in-process jobserver, which a build script without cargo's jobserver takes a token
+/// of before it runs the C compiler: `fetch_update(AcqRel, Acquire, |t| t.checked_sub(1))` on
+/// an `AtomicU32` of `NUM_JOBS`, retried after a `YieldOnce` on a no-op waker, and given back
+/// when `retain_mut` drops a finished job's token. ring's and zstd-sys's build scripts, built by
+/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever (queue 01523):
+/// the MIR inliner inlined `drop_in_place`'s `drop_glue`, a placeholder, so `retain_mut`
+/// dropped nothing it removed. Each step is checked on its own, in the build script and in the
+/// program.
+#[test]
+fn a_build_script_takes_a_token_of_cc_s_in_process_jobserver() {
+    let case = Case::new("a_build_script_takes_a_token_of_cc_s_in_process_jobserver");
+    let said = "parse Ok(true) sub Some(17) zero None update Ok(18) left 17 exchange Ok(17) left 16 \
+                yield (Some(7), 2) acquire (Some(18), 1) none left (None, 100) released 3";
+    assert_eq!(case.ok(&["run"]), format!("script: {said}\nmain: {said}\n"));
+}
+
+/// A crate indexing a `[u8]` by a `Range`, and foldhash 0.2.0 at `opt-level = 3` under a
+/// `Hasher` of its own, as blaze-hash is. The walk listed what core's `#[inline(always)]`
+/// callees build in at the walk's settings; at the unit's, `<[u8] as Index<Range>>::index`
+/// called `<Range<usize> as SliceIndex<[u8]>>::index` and foldhash's `hash_bytes_long` called
+/// `check_language_ub::runtime` instead, which no reference listed, so blaze-hash and
+/// blake3-servil did not build. A callee built in at any depth is now listed too.
+#[test]
+fn a_crate_indexing_bytes_by_a_range_builds() {
+    let case = Case::new("a_crate_indexing_bytes_by_a_range_builds");
+    assert_eq!(case.ok(&["run"]), "[1, 2]\nequal true distinct true\n");
+}
+
 /// A build script that prints a `Vec<String>` with `{:?}`, as libm 0.2.16's `configure.rs`
 /// does: std's `DebugList::finish` and `DebugTuple::finish` each give `Result::and_then` a
 /// closure of one signature, the share key took them as one callee, and the list was finished

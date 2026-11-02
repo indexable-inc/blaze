@@ -75,7 +75,7 @@ use crate::{
     builtin::quote::quote,
     files::FilePosition,
     proc_macro::{
-        CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
         ProcMacroKind, ProcMacros, ProcMacrosBuilder,
     },
 };
@@ -229,11 +229,7 @@ impl Fixture {
     /// Gives `krate` the proc macros `macros` in place of those it had, as loading its dylib
     /// would: a fixture's own `crate:proc-macro:name` has none until it is given some.
     pub fn set_proc_macros(&mut self, krate: Crate, macros: Vec<ProcMacro>) {
-        let proc_macros = ProcMacros::get(&self.db);
-        let mut by_crate = proc_macros.by_crate(&self.db).clone();
-        by_crate.insert(krate, Arc::new(CrateProcMacros::new(Ok(macros))));
-        proc_macros.set_by_crate(&mut self.db).with_durability(Durability::HIGH).to(by_crate);
-        self.db.note_crates_changed();
+        ProcMacros::give(&mut self.db, [(krate, Ok(macros))]);
     }
 }
 

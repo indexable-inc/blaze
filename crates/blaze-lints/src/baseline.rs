@@ -1,7 +1,7 @@
 //! The counts a lint at `warn` may only lower: one file per lint,
 //! `crates/blaze-lints/baselines/<tool>.<lint>.txt`, one `path<TAB>count` line per file of the
 //! workspace that has findings, sorted by path. A check fails when a file's count grows or a file
-//! not in the baseline has a finding; a bless (after `blaze fix`, or a port by hand) only lowers
+//! not in the baseline has a finding; a bless (after `blaze check --fix`, or a port by hand) only lowers
 //! counts and drops files at zero. A lint whose baseline is empty moves to `deny` and its file is
 //! deleted.
 

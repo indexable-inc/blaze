@@ -1,12 +1,12 @@
 ---
 status: plan
-summary: blaze-lints in v2: clippy's lints and blaze's own (`blaze::`), run per body as queries over `&Db` and the flat tree's views; hot_lint.py's rules as typed lints; the `clippy.toml` bans (`disallowed_*`) by resolution, with fixes `blaze fix` makes.
+summary: blaze-lints in v2: clippy's lints and blaze's own (`blaze::`), run per body as queries over `&Db` and the flat tree's views; hot_lint.py's rules as typed lints; the `clippy.toml` bans (`disallowed_*`) by resolution, with fixes `blaze check --fix` makes.
 date: 2026-10-29
 ---
 # Lane `lints`: blaze's clippy and blaze's own lints
 
 `crates/blaze-lints` is blaze's clippy: clippy's lints, names, levels, groups, `clippy.toml` and
-text, run by `blaze clippy` over the analysis `blaze check` already did. v2 moves it onto the
+text, run by `blaze check` over the analysis it does. v2 moves it onto the
 front end's concrete database (`base_db::Db`, [frontend/db.md](frontend/db.md)) and the flat
 tree's borrowed views (`syntax::view`, [frontend/tree.md](frontend/tree.md)), runs every lint
 per body as a query, and adds blaze's own typed lints in the `blaze::` tool namespace, which
@@ -64,6 +64,17 @@ crate of `#[blaze::cache]`. A line keeps the cost with a reason: `// clone: <why
 
 `tools/v2/hot_lint.py` is deleted at integration once these build and its fixtures pass as
 their tests.
+
+**One table.** The compile's lint registry, `crates/blaze-lint-defs/src/lints.rs`'s `BLAZE`,
+has every `blaze::Lint` of `Lint::ALL` (in that order, after the front end's
+`blaze::const_impure`) and `names.rs`'s `BLAZE_GROUPS` has `blaze::hot` as `HOT` has it; a test
+of blaze-lints (`the_registry_has_blazes_lints_and_group_as_here`) holds the two to each other.
+So a level the build sets for one is known to the compile, not an unknown lint (E0602). Those
+lints are `is_externally_loaded`, as rustc marks clippy's: the compile leaves an `#[expect]`
+only of them to blaze-lints, which says under `blaze check` whether it was fulfilled, and a
+build says nothing of it. A name in `[workspace.metadata.blaze.lints]` or a package's
+`[lints.blaze]` that is no lint or group of the registry stops the load with an error naming it
+and the manifest (`crates/blaze-units/src/load/plan/flags.rs`).
 
 `parallelizable` and `serial_dependence` (child `lints-parallel`,
 [lints/parallel.md](lints/parallel.md)) are judged on MIR, in `crates/blaze-lints/src/blaze/parallel*`.
@@ -183,7 +194,7 @@ is right. In blaze's own workspace each is at `warn`, not `deny`, until the tree
   dropped or moved away before the `.await` is not held; each `.await` it is held across is
   noted.
 
-## `blaze fix`
+## `blaze_lints::fix`
 
 `blaze_lints::fix::fix` makes every machine-applicable suggestion of a crate's findings, of the
 lints the command line turns on. Each pass splices the fixes into the front end's trees with
@@ -193,11 +204,12 @@ when no finding has a fix left (one pass for the `disallowed_*` fixes), and fail
 file, line and lint, when two fixes still rewrite the same text after the last of 4 passes,
 findings with a fix are left after it, or a fix's text does not fit the file. The crate's errors
 are checked before and after: fixes that leave an error it did not have are refused, the texts
-restored, and the error named with the lints whose fixes were made. `blaze fix --replace
+restored, and the error named with the lints whose fixes were made. `blaze check --replace
 FROM=TO` is the same move of one path with no lint, through the same rewrite
-(`blaze_intent::retarget`): a command (`crates/blaze-cargo/src/cli/fix.rs`) that has the daemon
-make blaze-intent's `Edit::Replace` in its front end and writes the edits to the checkout.
-`blaze fix` with no `--replace`, making the lints' fixes, is not a command yet.
+(`blaze_intent::retarget`): the client (`crates/blaze-cargo/src/cli/replace.rs`) has the daemon
+make blaze-intent's `Edit::Replace` in its front end and writes the edits to the checkout, and
+checks nothing. The command that makes the lints' fixes is `blaze check --fix`
+([below](#blaze-check-lints)).
 
 ## Baselines
 
@@ -208,8 +220,45 @@ findings) and names, by lint and file, each count over its baseline and each fil
 does not have; `baseline::bless` lowers the baselines to a run's counts, never raising one or
 adding a file, and is only right for a run over the whole workspace. A file in the directory that
 is not of a clippy or blaze lint blaze knows is an error. A lint whose baseline is empty moves to
-`deny` and its file is deleted. Neither is called by a command yet: the check and the bless after
-`blaze fix` come with its lint mode.
+`deny` and its file is deleted.
+
+`blaze check --baselines DIR` (`crates/blaze-cargo/src/cli/baselines.rs`) counts the run's
+`clippy::` and `blaze::` findings by lint and file, a finding that two units of a crate give (its
+lib and its lib test) once, and fails naming each count over the baselines in `DIR` (from the
+checkout's root). `--bless-baselines` lowers them to the run's instead, and `--new-baseline
+LINT[,LINT...]` (given any number of times) starts each `LINT`'s at the run's counts, writing
+none when any is not a lint blaze knows or has a baseline already. Both are only right for a run
+over the whole workspace (`--workspace --all-targets`).
+
+## `blaze check` lints
+
+There is no `blaze clippy` and no `blaze fix` (Andrew, 2026-11-01): `blaze check` runs every
+lint, rustc's, clippy's and blaze's, at the levels the manifests set, as `cargo clippy` with
+clippy's driver would. The load (`crates/blaze-units/src/load/plan.rs`, `PlanInput::lints`) plans
+each crate of the workspace's packages with `--cfg clippy` and the configuration file clippy's
+search finds (`CLIPPY_CONF_DIR` or the package's directory, then up; the client sends those
+above the checkout), all in `UnitPlan`, so the unit's record key has them. The unit's check
+(`crates/blaze-cargo/src/serve/unit/compile.rs`, `linted`) then runs `blaze_lints::check` over
+the crate with the unit's lint flags and that file, and puts what it finds before rustc's
+closing lines, made again to count them. A registry crate is checked, not linted. The `-C
+metadata` of a linted crate does not hash the lints as cargo's wrapper does, so its output files
+keep the names a check gives them; that is names only: the unit's record key hashes its whole
+`UnitPlan` (`work_out_key`), `--cfg clippy`, the configuration file's text and
+`UnitPlan::clippy` included.
+
+`--fix` (`crates/blaze-cargo/src/cli/fix.rs`) checks every target when none is named. The check
+runs on the checkout's head pinned to its root, and every machine-applicable suggestion it gives
+(of any lint or error; with `--lint NAME`, given any number of times, of those lints' alone) is
+made as ops on that root: whole, inside the checkout, and not overlapping one made before it, a
+suggestion two units gave once. The ops are checked again as a what-if view of the root, up to
+four passes, each making the suggestions of the one before. An error with a primary span (code,
+file, message) the first check did not have stops it with nothing written. Else the ops are
+committed to the head, refused if the checkout moved meanwhile, and written to the files as
+`--replace` writes. It says how many suggestions it made in which files and how many it left
+(not machine-applicable, or outside the checkout), and fails when errors remain. A deny lint's
+finding is an error the check fails on, and `--fix` still makes its suggestion. blaze reads no
+version control. `--fix` with `--baselines`, `--lint` without `--fix`, and `--replace` with
+either are refused.
 
 ## Done when
 

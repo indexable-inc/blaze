@@ -608,7 +608,7 @@ fn enum_variant_through_self_in_pattern() {
         expect![[r#"
             75..217 '{     ...     }': !
             85..210 'match ...     }': ()
-            92..99 'loop {}': !
+            91..100 '(loop {})': !
             97..99 '{}': ()
             115..128 'Self::A { x }': E
             125..126 'x': usize

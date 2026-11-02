@@ -1,0 +1,58 @@
+diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
+--- a/src/solve/scratch.rs
++++ b/src/solve/scratch.rs
+@@ -41,14 +41,16 @@
+ 
+         /// Takes back a buffer, emptied and grown to the largest its pool holds: the pool hands
+         /// buffers out last in, first out, so without it a goal may get one smaller than a
+-        /// sibling outgrew and grow it again each run. One that never grew holds nothing worth
+-        /// keeping.
++        /// sibling outgrew and grow it again each run. One that never grew is kept too once
++        /// its pool holds room: a step swaps the list it evaluates for a spare, so a grown
++        /// list goes back from a shallower level than took it, and dropping the spare would
++        /// leave the pool a list short at the depth that grew one, one level more each run.
+         pub(super) fn $give(&mut self, mut buffer: $ty) {
++            buffer.clear();
++            let largest = self.$field.iter().map(|it| it.capacity()).max().unwrap_or(0);
++            // alloc: once per buffer below its pool's largest, while warming.
++            buffer.reserve(largest);
+             if buffer.capacity() != 0 {
+-                buffer.clear();
+-                let largest = self.$field.iter().map(|it| it.capacity()).max().unwrap_or(0);
+-                // alloc: once per buffer below its pool's largest, while warming.
+-                buffer.reserve(largest);
+                 self.$field.push(buffer);
+             }
+         }
+@@ -180,7 +182,31 @@
+         });
+     }
+ 
++    /// The solver's shape: an outer list, an inner one that grows, and a step that evaluates
++    /// the inner list after swapping it for a spare, so the grown list goes back first.
++    fn swapped_run(pool: &mut Pool) {
++        let outer = pool.take();
++        let mut inner = pool.take();
++        inner.extend(0..64);
++        let spare = pool.take();
++        let evaluated = std::mem::replace(&mut inner, spare);
++        pool.give(evaluated);
++        pool.give(inner);
++        pool.give(outer);
++    }
++
+     #[test]
++    fn lists_swapped_between_levels_are_warm_after_one_run() {
++        let mut pool = Pool::default();
++        swapped_run(&mut pool);
++        blaze_alloc_count::assert_at_most(0, "lists swapped between levels", || {
++            swapped_run(&mut pool);
++            swapped_run(&mut pool);
++        });
++        assert_eq!(pool.buffers.len(), 3);
++    }
++
++    #[test]
+     fn held_counts_slots_and_room() {
+         let pool = vec![Vec::<u64>::with_capacity(10), Vec::with_capacity(6)];
+         let room: usize = pool.iter().map(Vec::capacity).sum();

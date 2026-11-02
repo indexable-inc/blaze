@@ -208,6 +208,9 @@ impl AbsPath {
     /// Panics if `path` is not absolute.
     pub fn assert(path: &Utf8Path) -> &AbsPath {
         assert!(is_absolute(path.as_ref()), "{path} is not absolute");
+        // SAFETY: `AbsPath` is `#[repr(transparent)]` over `Utf8Path`, so the two share layout
+        // and pointer metadata (the length of the unsized path), and the reference keeps
+        // `path`'s lifetime; the assert above upholds `AbsPath`'s one invariant, being absolute.
         unsafe { &*(path as *const Utf8Path as *const AbsPath) }
     }
 
@@ -391,6 +394,10 @@ impl AsRef<Path> for RelPath {
 impl RelPath {
     /// Creates a new `RelPath` from `path`, without checking if it is relative.
     pub fn new_unchecked(path: &Utf8Path) -> &RelPath {
+        // SAFETY: `RelPath` is `#[repr(transparent)]` over `Utf8Path`, so the two share layout
+        // and pointer metadata (the length of the unsized path), and the reference keeps
+        // `path`'s lifetime. Being relative is not a memory-safety invariant, so it goes
+        // unchecked here as the name says.
         unsafe { &*(path as *const Utf8Path as *const RelPath) }
     }
 

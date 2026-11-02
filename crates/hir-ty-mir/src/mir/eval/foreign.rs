@@ -168,6 +168,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.lint_mark = super::lint_mark(self.limits_frames, budget.steps);
     }
 
+    /// The steps (basic blocks run) spent of the budget since it was last set.
+    pub fn steps_spent(&self) -> u64 {
+        self.budget.steps - self.steps_left
+    }
+
+    /// The most bytes of stack and heap together the evaluation has held so far, over every
+    /// budget it was given.
+    pub fn memory_peak(&self) -> u64 {
+        self.memory_peak
+    }
+
     /// The `-C overflow-checks` of the crate a run's code is compiled as: what a body that
     /// inherits its checks uses. Unset, such a body checks (a constant's evaluation).
     pub fn set_inherited_overflow_checks(&mut self, checks: bool) {

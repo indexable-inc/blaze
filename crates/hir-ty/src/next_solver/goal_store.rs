@@ -145,7 +145,7 @@ const SOLVER_DOMAIN: &str = "blaze v2 goal 1 solver";
 /// nightly, the vendored solver's patch series (each crate's series file and every patch), and
 /// the front end's code ([`install`]'s `build`). A patch added to a series is added here too;
 /// `the_solver_version_covers_every_patch` checks it.
-const SOLVER_FILES: [(&str, &[u8]); 22] = [
+const SOLVER_FILES: [(&str, &[u8]); 23] = [
     ("harness/toolchain", include_bytes!("../../../../harness/toolchain")),
     (
         "vendor/rustc_next_trait_solver/PATCHES.md",
@@ -197,6 +197,12 @@ const SOLVER_FILES: [(&str, &[u8]); 22] = [
         "vendor/rustc_next_trait_solver/patches/0009-bailed-probes-give-back-their-goals.patch",
         include_bytes!(
             "../../../../vendor/rustc_next_trait_solver/patches/0009-bailed-probes-give-back-their-goals.patch"
+        ),
+    ),
+    (
+        "vendor/rustc_next_trait_solver/patches/0010-never-grown-scratch-buffers-kept.patch",
+        include_bytes!(
+            "../../../../vendor/rustc_next_trait_solver/patches/0010-never-grown-scratch-buffers-kept.patch"
         ),
     ),
     ("vendor/rustc_type_ir/PATCHES.md", include_bytes!("../../../../vendor/rustc_type_ir/PATCHES.md")),

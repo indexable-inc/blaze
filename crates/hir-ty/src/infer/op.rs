@@ -3,6 +3,7 @@
 use hir_def::{FunctionId, GenericParamId, TraitId, hir::ExprId};
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
+use smallvec::SmallVec;
 use syntax::ast::{ArithOp, BinaryOp, UnaryOp};
 use tracing::debug;
 
@@ -18,6 +19,11 @@ use crate::{
         obligation_ctxt::ObligationCtxt,
     },
 };
+
+/// Why an operator's trait does not hold: the errors of its one obligation, at most one, kept
+/// inline because a lookup that fails is not an error until the operands turn out not to be
+/// builtin.
+type OpErrors<'db> = SmallVec<[NextSolverError<'db>; 1]>;
 
 impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Checks a `a <op>= b`
@@ -323,10 +329,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         lhs_ty: Ty<'db>,
         opt_rhs: Option<(ExprId, Ty<'db>)>,
         (op_method, trait_did): (Option<FunctionId>, Option<TraitId>),
-    ) -> Result<MethodCallee<'db>, Vec<NextSolverError<'db>>> {
+    ) -> Result<MethodCallee<'db>, OpErrors<'db>> {
         let (Some(trait_did), Some(op_method)) = (trait_did, op_method) else {
             // Bail if the operator trait is not defined.
-            return Err(vec![]); // alloc: empty
+            return Err(OpErrors::new());
         };
 
         debug!(
@@ -394,14 +400,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 );
                 let mut ocx = ObligationCtxt::new(self.infcx());
                 ocx.register_obligation(obligation);
-                Err(ocx.evaluate_obligations_error_on_ambiguity())
+                let mut errors = OpErrors::new();
+                ocx.evaluate_obligations_error_on_ambiguity_with(&mut |error| errors.push(error));
+                Err(errors)
             }
         }
     }
 
     /// The goals of `errors` as rustc's `report_binop_fulfillment_errors` and `check_user_unop`
     /// read them: each fulfillment error's leaf obligation, resolved.
-    fn unmet_goals(&self, errors: Vec<NextSolverError<'db>>) -> Vec<StoredGoal> {
+    fn unmet_goals(&self, errors: OpErrors<'db>) -> Vec<StoredGoal> {
         let infcx = self.infcx();
         errors
             .into_iter()

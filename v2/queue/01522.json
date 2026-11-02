@@ -1,0 +1,25 @@
+{
+  "id": "01522",
+  "from_lane": "no-fallback-front",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/blaze-units/src/load/plan/flags.rs",
+    "crates/blaze-lint-defs/src/lib.rs",
+    "crates/blaze-diagnostics/src/lints/levels"
+  ],
+  "what": "blaze build turns [workspace.metadata.blaze.lints] into --warn=blaze::<lint> flags for the compile (blaze-units flags.rs:229), but the compile registry (blaze-lint-defs blaze_lints(), 1 lint) does not know blaze-lints lints, so each one gets warning[E0602] unknown lint and is never run (self-run-1101-073755PST.log:40-62). Two fixes: (1) a blaze:: lint the user asked for that blaze does not know is an error naming it and where it was set, not a warning (no-fallback; the blaze tool is ours, so this is no rustc divergence). (2) one table of blaze:: lints: blaze-lints blaze::Lint::ALL and blaze-lint-defs must agree (generate one from the other, or have the build hand blaze-lints levels only to `blaze clippy`, never as compile flags). Please route to the blaze-lint-defs / diagnostics levels owner; tests-misc-lints owns the blaze-lints side.",
+  "state": "open",
+  "created": "2026-11-01T15:39:16Z",
+  "updated": "2026-11-01T15:39:16Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:39:16Z",
+      "by": "no-fallback-front",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

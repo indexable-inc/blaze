@@ -908,7 +908,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         {
                             return default;
                         }
-                        self.ctx.ctx.next_ty_var(span).into()
+                        let GenericParamId::TypeParamId(param_id) = param_id else {
+                            unreachable!("non-type param ID for type param");
+                        };
+                        self.ctx.ctx.next_ty_var_for_param(span, Some(param_id)).into()
                     }
                     GenericParamDataRef::ConstParamData(param) => {
                         if !infer_args
@@ -917,10 +920,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         {
                             return default;
                         }
-                        let GenericParamId::ConstParamId(_) = param_id else {
+                        let GenericParamId::ConstParamId(param_id) = param_id else {
                             unreachable!("non-const param ID for const param");
                         };
-                        self.ctx.ctx.next_const_var(span).into()
+                        self.ctx.ctx.next_const_var_for_param(span, Some(param_id)).into()
                     }
                 }
             }

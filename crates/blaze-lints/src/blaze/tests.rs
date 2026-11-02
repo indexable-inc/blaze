@@ -980,3 +980,18 @@ pub fn run() {
         );
     }
 }
+
+/// The compile's registry has blaze's lints and group as this crate has them, in the same
+/// order, so a level set for one in the build is known there and only this crate gives it.
+#[test]
+fn the_registry_has_blazes_lints_and_group_as_here() {
+    use blaze_diagnostics::lints::registry;
+    let registered: Vec<&str> =
+        registry::blaze_lints().iter().filter(|it| it.is_externally_loaded).map(|it| it.name).collect();
+    let here: Vec<String> = super::Lint::ALL.iter().map(|it| format!("blaze::{}", it.name())).collect();
+    assert_eq!(registered, here);
+    let hot = registry::group("blaze::hot").expect("the registry's `blaze::hot`");
+    let hot: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
+    let here: Vec<String> = super::HOT.iter().map(|it| format!("blaze::{}", it.name())).collect();
+    assert_eq!(hot, here);
+}

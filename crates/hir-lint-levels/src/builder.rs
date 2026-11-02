@@ -581,9 +581,11 @@ impl<'db> Levels<'db> {
                         self.insert_spec(cx, sink, set, node, lint, Spec { level, expect, source });
                     }
                 }
+                // An `#[expect]` only of lints another tool gives is that tool's to check.
                 if let Some(id) = expect
                     && !self.early
                     && self.walking
+                    && (lints.is_empty() || lints.iter().any(|it| !it.is_externally_loaded))
                 {
                     let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
                     // clone: an interned symbol, once per `#[expect]` name

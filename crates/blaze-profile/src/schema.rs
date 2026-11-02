@@ -8,6 +8,8 @@
 //! same clock in every process of the machine, so the spans of the client, the daemon and the
 //! build scripts line up without adjusting. Durations are nanoseconds.
 
+use crate::span;
+
 /// Bumped when a column changes meaning or is removed; adding a nullable column at the end of
 /// a table does not bump it.
 pub const VERSION: u32 = 1;
@@ -74,62 +76,79 @@ const PROCESS_NAME: Column = col(
 const THREAD: Column = col("thread", Type::U32, "the operating system's thread id");
 const THREAD_NAME: Column = col("thread_name", Type::Dict, "the thread's name");
 
+/// The columns of `spans` before those span fields fill.
+const SPAN_HEAD: [Column; 17] = [
+    BUILD_ID,
+    opt("commit", Type::Dict, "the commit of the workspace the build was of"),
+    PROCESS,
+    PROCESS_NAME,
+    THREAD,
+    THREAD_NAME,
+    col("span_id", Type::U64, "unique in its process while the process lives"),
+    opt("parent", Type::U64, "the span it is inside; null at a root"),
+    col("depth", Type::U16, "how many spans its thread was inside when it began"),
+    col("name", Type::Dict, "the span's name"),
+    col(
+        "target",
+        Type::Dict,
+        "its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps)",
+    ),
+    col("start_ns", Type::I64, "when it began"),
+    col("dur_ns", Type::I64, "how long it was open"),
+    opt(
+        "self_cpu_ns",
+        Type::I64,
+        "the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job",
+    ),
+    opt("alloc_bytes", Type::U64, "bytes its thread allocated while it was open"),
+    opt("allocs", Type::U64, "allocations its thread made while it was open"),
+    opt("query_kind", Type::Dict, "the query it ran, for a span of a query"),
+];
+
+/// Beside `alloc_bytes` in meaning, after the generic span columns so adding them kept
+/// `VERSION`.
+const SPAN_FRAMES: [Column; 2] = [
+    opt(
+        "frame_grow_copies",
+        Type::U64,
+        "blocks its thread's task frames moved to grow them while it was open (a block grown while not its frame's last is copied whole); null when not counted or when it closed on another thread",
+    ),
+    opt("frame_copied_bytes", Type::U64, "bytes those moves copied"),
+];
+
+const SPAN_COLUMNS: usize =
+    SPAN_HEAD.len() + span::GENERIC + SPAN_FRAMES.len() + span::TYPED;
+
+/// The span columns in their order: the head, the generic columns span kinds and ad hoc spans
+/// fill, the frame counts, then the typed columns only span kinds fill ([`span`]). A typed
+/// column added to the registry goes at the end, so it keeps `VERSION`.
+const SPAN_ALL: [Column; SPAN_COLUMNS] = {
+    let parts: [&[Column]; 4] =
+        [&SPAN_HEAD, &span::GENERIC_COLUMNS, &SPAN_FRAMES, &span::TYPED_COLUMNS];
+    let mut out = [SPAN_HEAD[0]; SPAN_COLUMNS];
+    let mut at = 0;
+    let mut part = 0;
+    while part < parts.len() {
+        let mut i = 0;
+        while i < parts[part].len() {
+            out[at] = parts[part][i];
+            at += 1;
+            i += 1;
+        }
+        part += 1;
+    }
+    out
+};
+
 /// One row a span: from when it was made to when it closed, on the thread that made it.
 pub const SPANS: Table = Table {
     name: "spans",
     doc: "one row a span, from its start to its close, on the thread that made it",
-    columns: &[
-        BUILD_ID,
-        opt("commit", Type::Dict, "the commit of the workspace the build was of"),
-        PROCESS,
-        PROCESS_NAME,
-        THREAD,
-        THREAD_NAME,
-        col("span_id", Type::U64, "unique in its process while the process lives"),
-        opt("parent", Type::U64, "the span it is inside; null at a root"),
-        col("depth", Type::U16, "how many spans its thread was inside when it began"),
-        col("name", Type::Dict, "the span's name"),
-        col(
-            "target",
-            Type::Dict,
-            "its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps)",
-        ),
-        col("start_ns", Type::I64, "when it began"),
-        col("dur_ns", Type::I64, "how long it was open"),
-        opt(
-            "self_cpu_ns",
-            Type::I64,
-            "its thread's CPU time less that of the spans under it; only while BLAZE_PROFILE is on",
-        ),
-        opt("alloc_bytes", Type::U64, "bytes its thread allocated while it was open"),
-        opt("allocs", Type::U64, "allocations its thread made while it was open"),
-        opt("query_kind", Type::Dict, "the query it ran, for a span of a query"),
-        opt("crate", Type::Dict, "the crate it was of, from its field `crate`"),
-        opt(
-            "function",
-            Type::Utf8,
-            "the function it was of, from its field `function` or `subject`",
-        ),
-        opt("unit", Type::Utf8, "the codegen unit it was of, from its field `unit`"),
-        // Beside `alloc_bytes` in meaning; at the end so adding them keeps `VERSION`.
-        opt(
-            "frame_grow_copies",
-            Type::U64,
-            "blocks its thread's task frames moved to grow them while it was open (a block grown while not its frame's last is copied whole); null when not counted or when it closed on another thread",
-        ),
-        opt("frame_copied_bytes", Type::U64, "bytes those moves copied"),
-        opt(
-            "awaits",
-            Type::Utf8,
-            "what a wait span waits for, from its field `awaits`: a query's key, a lock, a channel; every `wait` span has it",
-        ),
-        opt(
-            "owner",
-            Type::U64,
-            "who runs what it waits for, from its field `owner`: the job (or thread) running the awaited key; null when not known",
-        ),
-    ],
+    columns: &SPAN_ALL,
 };
+
+/// Where `spans`' generic span columns begin: `batches.rs` writes them there.
+pub const SPANS_GENERIC_AT: usize = SPAN_HEAD.len();
 
 /// A value over time: queue depths, memo counts, bytes.
 pub const COUNTERS: Table = Table {

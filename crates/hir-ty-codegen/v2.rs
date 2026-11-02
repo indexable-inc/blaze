@@ -187,7 +187,7 @@ impl HirInstance {
     pub fn function(&self) -> Option<FunctionId> {
         match &self.0 {
             Kind::Code(Instance { def: InstanceDef::Fn(func), .. }, _) => Some(*func),
-            Kind::Code(..) | Kind::Asm(_) | Kind::Start(_) | Kind::Allocator(_) => None,
+            Kind::Code(..) | Kind::Asm(..) | Kind::Start(_) | Kind::Allocator(_) => None,
         }
     }
 }
@@ -199,8 +199,12 @@ pub(crate) enum Kind {
     /// ([`crate::home::Homes`]). `checked` is always `false`: a unit's overflow checks are
     /// its [`blaze_codegen::settings::Spec`]'s.
     Code(Instance, StoredParamEnvAndCrate),
-    /// The function a `global_asm!` or `naked_asm!` defines, by its text.
-    Asm(String),
+    /// The function a `global_asm!` or `naked_asm!` defines, by its text, and whether code of
+    /// the dependency image asks for it: such an asker may be compiled as a workspace crate
+    /// asks (core's `__isb::<SY>` for a build-time crate), and its `asm!` function is then
+    /// the image's too. The walk and the IR builder name it with `false`; the front end
+    /// sets it on the references it describes.
+    Asm(String, bool),
     /// The C `main` that runs the program's `fn main`.
     Start(FunctionId),
     /// A function of the program's allocator shim.
@@ -328,6 +332,29 @@ pub struct BuildTime(pub blaze_hash::HashSet<Crate>);
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {
     // alloc: the error's message
     CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string() }
+}
+
+/// An instance as an error names it: its path with its arguments, and the crate it is
+/// compiled in.
+pub(crate) struct Named<'a>(pub(crate) &'a Db, pub(crate) &'a HirInstance);
+
+impl std::fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Named(db, instance) = *self;
+        write!(f, "`{}`", linked::debug_name(db, &instance.0))?;
+        if let Kind::Code(_, env) = &instance.0
+            && let Some(name) = &env.krate.extra_data(db).display_name
+        {
+            write!(f, " (compiled in `{}`)", name.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// The error of an instance that is not keyed yet, while it is described. Its `Debug` reads

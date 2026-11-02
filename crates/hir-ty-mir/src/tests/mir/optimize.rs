@@ -207,6 +207,47 @@ fn main() {
     );
 }
 
+/// core's `drop_in_place` is an `#[inline(always)]` call of the `drop_glue` lang item, whose body
+/// is a placeholder for the type's drop glue: inlined, it dropped nothing, and std's
+/// `Vec::retain_mut` dropped none of what it removed (cc's build scripts leaked every job token
+/// and hung, queue 01523).
+#[test]
+fn a_drop_in_place_that_inlines_still_drops() {
+    check_output(
+        "drop, manually_drop, deref, copy, slice, index, coerce_unsized",
+        r#"
+mod p {
+    #[inline(always)]
+    pub unsafe fn drop_in_place<T>(to_drop: *mut T) {
+        unsafe { drop_glue(&mut *to_drop) }
+    }
+
+    #[lang = "drop_glue"]
+    unsafe fn drop_glue<T>(_: &mut T) {}
+}
+
+struct Loud(u64);
+
+impl Drop for Loud {
+    fn drop(&mut self) {
+        out(self.0);
+    }
+}
+
+fn drop_at<T>(slot: *mut T) {
+    unsafe { p::drop_in_place(slot) }
+}
+
+fn main() {
+    let loud = core::mem::ManuallyDrop::new(Loud(5));
+    drop_at(&*loud as *const Loud as *mut Loud);
+    out(6);
+}
+"#,
+        "5 6 ",
+    );
+}
+
 #[test]
 fn levels_agree_on_early_returns() {
     check_output(

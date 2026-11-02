@@ -1062,6 +1062,7 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
     container: ItemContainerId,
     attr_macro_item: Option<AstId<ast::Item>>,
 ) {
+    let _p = tracing::info_span!("nameres collect_expansion", depth).entered();
     let db = cx.db;
     if depth > sink.def_map().recursion_limit() {
         cov_mark::hit!(macro_expansion_overflow);

@@ -206,6 +206,9 @@ pub(super) fn lower_body(
                                 collector.collect_pat_top(Some(pat))
                             }
                         }
+                        // An anonymous parameter (2015 `fn f(String) {}`) binds nothing, as
+                        // rustc's `PatKind::Missing` is a wildcard to its THIR.
+                        None if param.ty().is_some() => collector.store.alloc_pat(Pat::Wild),
                         None => collector.missing_pat(),
                     };
                     params.push(Param::new(param_pat));

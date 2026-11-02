@@ -15,6 +15,7 @@
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{bits::BitSet, radix};
 use hir::{HirFileId, InFile, ModuleSourceView, Name};
+use hir_expand::builtin::BuiltinDeriveExpander;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
     StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
@@ -189,6 +190,9 @@ pub(super) struct Defs {
     /// Some definition is in a closure or an anonymous constant ([`Parent::Anon`]), so which of
     /// those are walked matters.
     pub(super) in_anon: bool,
+    /// The impls an expanded `#[derive(Clone)]` or `#[derive(Debug)]` makes, with the trait's
+    /// name: `rustc_trivial_field_reads`, so their items read nothing (`should_ignore_item`).
+    pub(super) trivial_derives: HashMap<DefIdx, &'static str>,
 }
 
 impl Defs {
@@ -207,6 +211,7 @@ impl Defs {
             derives: HashMap::default(),
             scopes: HashSet::default(),
             unported: false,
+            trivial_derives: HashMap::default(),
         };
         let module_ids = crate::checks::modules(cx);
         walk.modules.reserve_exact(module_ids.len());
@@ -246,6 +251,7 @@ impl Defs {
             owners,
             unported: walk.unported,
             in_anon,
+            trivial_derives: walk.trivial_derives,
         };
         defs.impls = defs.resolve_impls(cx);
         defs
@@ -361,6 +367,7 @@ struct Walk<'c, 'a, 'db> {
     derives: HashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>>,
     scopes: HashSet<hir_def::ModuleId>,
     unported: bool,
+    trivial_derives: HashMap<DefIdx, &'static str>,
 }
 
 impl<'db> Walk<'_, '_, 'db> {
@@ -577,8 +584,44 @@ impl<'db> Walk<'_, '_, 'db> {
         if let Some(adt) = adt {
             self.fields_and_variants(item, index);
             self.derived(adt, parent);
+            self.expanded_derives(item, parent);
         }
         Some(index)
+    }
+
+    /// The items the derives of `item` expand to, after it, where they are expanded (a build;
+    /// the front end records the builtin ones of a check instead, [`Walk::derived`]): free items
+    /// of its module. The impls of `Clone`'s and `Debug`'s are [`Defs::trivial_derives`].
+    fn expanded_derives(&mut self, item: InFile<ast::Item<'db>>, parent: Parent) {
+        let cx = self.cx;
+        let db = cx.db;
+        let Some(owner) = ast::AnyHasAttrs::cast(item.value.syntax()) else { return };
+        let cfg = cx.krate.cfg(db);
+        for (meta, _) in hir_expand::attrs::cfg_attrs_view(ast::attrs_including_inner(&owner), cfg) {
+            let is_derive = matches!(meta, ast::Meta::TokenTreeMeta(it)
+                if it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "derive"));
+            if !is_derive {
+                continue;
+            }
+            let Some(derived) = cx.vsema.expand_derive_macro(meta) else { continue };
+            for root in derived.into_iter().flatten() {
+                let file = cx.vsema.hir_file_for(root.value);
+                let Some(call) = file.macro_file() else { continue };
+                let trivial = match call.loc(db).def.kind {
+                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Clone) => Some("Clone"),
+                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Debug) => Some("Debug"),
+                    _ => None,
+                };
+                let first = self.defs.len();
+                self.expansion(InFile::new(file, root.value), Container::Module, parent);
+                let Some(name) = trivial else { continue };
+                for at in first..self.defs.len() {
+                    if self.defs[at].kind == (Kind::Impl { of_trait: true }) {
+                        self.trivial_derives.insert(at as DefIdx, name);
+                    }
+                }
+            }
+        }
     }
 
     fn current(&mut self) -> &mut ModuleItems {

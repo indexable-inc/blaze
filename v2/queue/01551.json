@@ -1,0 +1,23 @@
+{
+  "id": "01551",
+  "from_lane": "coord-1030",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty-mir/src/tests/display_source_code.rs"
+  ],
+  "what": "display_source_code::render_dyn_ty_{independent_of_order,under_enclosing_binder}: the expectations say + 'static, but rustc's default object lifetime of &dyn T in a parameter is the reference's elided lifetime, and we now print none. Update the expectations from the full actual output (the harness stops at the first annotation).",
+  "state": "open",
+  "created": "2026-11-02T01:41:50Z",
+  "updated": "2026-11-02T01:41:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:41:50Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -18,6 +18,41 @@ fn refused(words: &[&str]) -> String {
 }
 
 #[test]
+fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
+    let asked = cargo(&["check", "--workspace", "--baselines", "b"]);
+    assert_eq!(asked.command, Some(Command::Check));
+    assert!(asked.flags.workspace);
+    assert_eq!(asked.flags.baselines.as_deref(), Some("b"));
+    assert_eq!(asked.args, ["--workspace"], "blaze's own flags stay with the client");
+    assert!(refused(&["check", "--no-deps"]).starts_with("error: unexpected argument '--no-deps' found"));
+    assert!(refused(&["check", "--allow-dirty"]).starts_with("error: unexpected argument '--allow-dirty' found"));
+    assert!(refused(&["check", "--", "-D", "warnings"]).starts_with("error: unexpected argument '-D' found"));
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    assert_eq!(unhonored(&["check", "--fix"]), None);
+    assert!(unhonored(&["check", "--fix", "--baselines", "b"]).is_some(), "a fix changes what the baselines count");
+    let fix = cargo(&["check", "--fix", "--lint", "clippy::disallowed_types", "--lint=unused_imports", "-p", "a"]);
+    assert!(fix.flags.fix);
+    assert_eq!(fix.flags.lints, ["clippy::disallowed_types", "unused_imports"]);
+    assert_eq!(fix.args, ["-p", "a"], "`--fix` and its `--lint`s stay with the client");
+    assert!(unhonored(&["check", "--lint", "unused_imports"]).is_some(), "`--lint` narrows `--fix` alone");
+    let replace = cargo(&["check", "--replace", "std::sync::Mutex=parking_lot::Mutex", "--replace=a::B=c::D"]);
+    assert_eq!(replace.flags.replace, ["std::sync::Mutex=parking_lot::Mutex", "a::B=c::D"]);
+    assert!(replace.args.is_empty(), "`--replace` stays with the client");
+    assert!(unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(), "a replace checks nothing");
+    assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
+    assert_eq!(unhonored(&["check", "--baselines", "b", "--bless-baselines", "--new-baseline", "clippy::x"]), None);
+    let many = cargo(&["check", "--baselines", "b", "--new-baseline", "clippy::a,blaze::b", "--new-baseline=clippy::c"]);
+    assert_eq!(many.flags.new_baselines, ["clippy::a", "blaze::b", "clippy::c"]);
+}
+
+/// `check` lints and fixes, so `clippy` and `fix` are no commands of blaze's.
+#[test]
+fn clippy_and_fix_are_no_commands() {
+    assert_eq!(parse(os(&["clippy", "--workspace"])), Ok(Asked::Unknown("clippy".to_owned())));
+    assert_eq!(parse(os(&["fix", "--replace", "a::B=c::D"])), Ok(Asked::Unknown("fix".to_owned())));
+}
+
+#[test]
 fn doc_reads_cargo_docs_flags_and_refuses_what_it_does_not_take() {
     let asked = cargo(&["doc", "--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"]);
     assert!(asked.flags.open && asked.flags.no_deps && asked.flags.private && asked.flags.targeted);

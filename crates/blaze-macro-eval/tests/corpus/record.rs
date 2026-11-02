@@ -1,7 +1,12 @@
 //! Each call of a proc macro as the front end made it, with what blaze-macro-eval's expander
 //! gave (the output the front end goes on with).
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{
+    any::Any,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use base_db::{ContentId, Crate, Db, Env};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
@@ -97,6 +102,8 @@ pub(crate) fn literals(tree: &TopSubtree) -> Vec<String> {
 pub(crate) struct Record {
     pub(crate) call: Call,
     pub(crate) eval: Outcome,
+    /// How long blaze-macro-eval took to give it, the wall clock's.
+    pub(crate) took: Duration,
 }
 
 impl Record {
@@ -140,10 +147,12 @@ impl Recorder {
     }
 
     fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+        let start = Instant::now();
         let expanded = match calling {
             Some(krate) => self.eval.expand_in(db, krate, call),
             None => self.eval.expand(db, call),
         };
+        let took = start.elapsed();
         let eval = Outcome::of(&expanded);
         let recorded = Call {
             krate: self.krate.clone(),
@@ -158,7 +167,7 @@ impl Recorder {
             mixed_site: call.mixed_site,
             current_dir: call.current_dir.to_owned(),
         };
-        self.records.lock().push(Record { call: recorded, eval });
+        self.records.lock().push(Record { call: recorded, eval, took });
         expanded
     }
 }

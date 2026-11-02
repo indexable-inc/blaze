@@ -22,8 +22,9 @@ use crate::{
     sql::{self, Query, SqlError},
 };
 
-/// The spans a unit's time is the sum of: its phases (blaze-cargo's `serve/unit/compile.rs`).
-pub const UNIT_PHASES: [&str; 5] = ["unit names", "unit bodies", "unit codegen", "unit link", "unit store"];
+/// The spans a unit's time is the sum of: its phases, the span kinds blaze-cargo's
+/// `serve/unit/compile.rs` opens.
+pub const UNIT_PHASES: [&str; 5] = crate::span::UNIT_PHASES;
 
 /// Rows of phases and of units the diff shows at most, most changed first.
 pub const LIMIT: usize = 10;

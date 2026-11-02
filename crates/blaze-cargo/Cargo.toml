@@ -61,6 +61,9 @@ blaze-explore.workspace = true
 arrow-array.workspace = true
 blaze-inproc.workspace = true
 blaze-intent.workspace = true
+# `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
+# baselines the client checks a run's counts against.
+blaze-lints.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true

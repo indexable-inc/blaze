@@ -283,10 +283,20 @@ impl BasicAdtInfo {
             let (_, _, body) = arms.into_iter().next().unwrap();
             return quote! {span => { # #lets # #other_lets #body } };
         }
+        // Of one variant whose arm is written, nothing could reach a fallback arm.
+        let variants = match &self.shape {
+            AdtShape::Struct(_) => 1,
+            AdtShape::Enum { variants, .. } => variants.len(),
+            AdtShape::Union => 0,
+        };
+        let covered = variants == 1 && arms.len() == 1;
         let arms = arms.into_iter().map(|(pat1, pat2, body)| {
             let fat_arrow = fat_arrow(span);
             quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
         });
+        if covered {
+            return quote! {span => match (self, other) { # #arms } };
+        }
         let fat_arrow = fat_arrow(span);
         quote! {span => match (self, other) { # #arms _unused #fat_arrow #fallback } }
     }
@@ -1118,10 +1128,12 @@ pub(super) fn ord_expand(
             }
         }
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-        // The discriminants are compared first: a variant without fields is then equal.
-        let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
+        // As rustc's: an enum of several variants compares the discriminants first, and a
+        // variant without fields is then equal.
+        let discriminants =
+            matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
         let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
-        let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
+        let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
             |(pat1, pat2, fields)| {
                 let mut body = quote!(span =>#krate::cmp::Ordering::Equal);
                 for f in fields.into_iter().rev() {
@@ -1134,7 +1146,7 @@ pub(super) fn ord_expand(
         );
         let mut body =
             adt.match_both(span, arms.collect(), quote! {span => #krate::cmp::Ordering::Equal });
-        if matches!(&adt.shape, AdtShape::Enum { .. }) {
+        if discriminants {
             let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
             let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
             body = compare(krate, left, right, body, span);
@@ -1183,10 +1195,12 @@ pub(super) fn partial_ord_expand(
             let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
 
             let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-            // The discriminants are compared first: a variant without fields is then equal.
-            let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
+            // As rustc's: an enum of several variants compares the discriminants first, and a
+            // variant without fields is then equal. A struct compares its fields alone.
+            let discriminants =
+                matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
             let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
-            let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
+            let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
                 |(pat1, pat2, fields)| {
                     let mut body =
                         quote!(span =>#krate::option::Option::Some(#krate::cmp::Ordering::Equal));
@@ -1200,8 +1214,11 @@ pub(super) fn partial_ord_expand(
             );
             let equal =
                 quote! {span => #krate::option::Option::Some(#krate::cmp::Ordering::Equal) };
-            let body =
-                compare(krate, left, right, adt.match_both(span, arms.collect(), equal), span);
+            let matched = adt.match_both(span, arms.collect(), equal);
+            let body = match discriminants {
+                true => compare(krate, left, right, matched, span),
+                false => matched,
+            };
             quote! {span =>
                 fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering> {
                     #body

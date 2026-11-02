@@ -297,6 +297,48 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
     owners
 }
 
+/// Of each item a builtin attribute macro replaces, the attribute that invokes it, as an owner of that
+/// one attribute: expansion reads it (`expand_invoc`, a builtin macro's `validate_input`), while
+/// the walk sees neither the item nor, in what it expands to, the attribute.
+pub(crate) fn invoking_attrs<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>> {
+    let db = cx.db;
+    let Some(root) = cx.krate.root_module(db).as_source_file_id(db) else {
+        // alloc: empty, allocates nothing
+        return Vec::new();
+    };
+    let crate_root = HirFileId::from(root);
+    // alloc: empty until an attribute macro, then a row of each
+    let mut invoking = Vec::new();
+    for tree in &walk.trees {
+        for &node in &tree.replaced {
+            let Some(item) = ast::Item::cast(node) else { continue };
+            let Some(call) = cx.vsema.expand_attr_macro(item).and_then(|it| it.value.file_id.macro_file()) else {
+                continue;
+            };
+            let loc = call.loc(db);
+            // Only a builtin one's input is a meta item (`LegacyAttr`); a proc macro's is tokens.
+            if !matches!(loc.def.kind, hir_expand::MacroDefKind::BuiltInAttr(..)) {
+                continue;
+            }
+            let hir_expand::MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { continue };
+            let invoked = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1;
+            let range = invoked.syntax().text_range();
+            // alloc: the item's attributes, once per attribute macro call
+            let mut attrs = Vec::new();
+            let Some(has_attrs) = ast::AnyHasAttrs::cast(node) else { continue };
+            attributes(walk, tree.file, has_attrs, &mut attrs);
+            attrs.retain(|it| matches!(it.kind, AttrKind::Meta { meta, .. } if meta.syntax().text_range() == range));
+            if attrs.is_empty() {
+                continue;
+            }
+            let node = InFile::new(tree.file, node);
+            let Some(target) = Target::of(cx, node, crate_root) else { continue };
+            invoking.push(Owner { node, target, attrs, buffered_at: None });
+        }
+    }
+    invoking
+}
+
 /// The attributes of `owner`, written in `file`, with `cfg_attr` expanded as the crate's cfg
 /// says and the `cfg`s left out (rustc keeps only a trace of them), pushed onto `attrs`.
 fn attributes<'db>(walk: &Walk<'db>, file: HirFileId, owner: ast::AnyHasAttrs<'db>, attrs: &mut Vec<Attr<'db>>) {

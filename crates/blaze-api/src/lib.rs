@@ -69,8 +69,9 @@ use serde::{Deserialize, Serialize};
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
 /// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
-/// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`].
-pub const SCHEMA: u32 = 22;
+/// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
+/// [`Request::Hot`] and [`Response::Hot`].
+pub const SCHEMA: u32 = 23;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -302,6 +303,82 @@ pub enum Request {
     /// daemon's flight recorder, run by the daemon (the recorder is its); answered with
     /// [`Response::Queried`].
     Sql { sql: String, last_s: u32 },
+    /// `blaze debug hot`: the `top` keys (a span and what it is of) that took most time and
+    /// each kind of wait's quantiles, from the daemon's live sketches (blaze-profile's `hot`),
+    /// no history read; answered with [`Response::Hot`].
+    Hot { top: u32, since: HotSince },
+}
+
+/// Which stretch of the daemon's life a [`Request::Hot`] sums.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HotSince {
+    /// Since the daemon began.
+    Start,
+    /// From the end of the build before the last to the end of the last.
+    LastBuild,
+}
+
+/// [`Request::Hot`]'s answer. Times are of spans nested in others too, so they add up to more
+/// than the wall time.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Hot {
+    /// Most time first.
+    pub keys: Vec<HotKey>,
+    /// List entries read while a thread replaced them: their exact time is left out of
+    /// [`HotKey::lower_ns`].
+    pub torn: u64,
+    pub since: HotSince,
+    /// Spans counted.
+    pub spans: u64,
+    /// Each kind of wait that had any.
+    pub waits: Vec<HotWait>,
+    /// How far over the truth a [`HotKey::upper_ns`] may be, but for a chance of 1.8%.
+    pub error_ns: u64,
+    pub total_ns: u64,
+}
+
+/// A key and its time: never more than `upper_ns` (a count-min estimate) and never less than
+/// `lower_ns`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct HotKey {
+    /// The span's name: a query kind, or a step of the build.
+    pub span: String,
+    pub function: HotFunction,
+    pub lower_ns: u64,
+    pub upper_ns: u64,
+}
+
+/// What a [`HotKey`]'s span is of.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum HotFunction {
+    /// The span names nothing it is of.
+    None,
+    Named(String),
+    /// The daemon let the name go (its flight recorder keeps two generations of names): the
+    /// number it had.
+    Forgotten(u32),
+}
+
+/// One kind of wait: how many there were and their quantiles, each within 1% of the exact.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HotWait {
+    pub kind: HotWaitKind,
+    pub count: u64,
+    pub max_ns: u64,
+    pub p50_ns: u64,
+    pub p90_ns: u64,
+    pub p99_ns: u64,
+}
+
+/// What a wait waits on: blaze-graph's `WaitOn` variants.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HotWaitKind {
+    Key,
+    Lock,
+    Channel,
+    Io,
+    Child,
+    Scope,
 }
 
 /// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table one Arrow IPC
@@ -414,6 +491,8 @@ pub enum Response {
         ipc: Vec<u8>,
         rows: u64,
     },
+    /// [`Request::Hot`]'s answer.
+    Hot(Hot),
 }
 
 /// What a [`Request::Doc`] documented.

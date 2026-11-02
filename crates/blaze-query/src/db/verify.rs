@@ -13,6 +13,7 @@
 use std::{ptr::NonNull, sync::atomic::Ordering};
 
 use super::{
+    counts,
     ingredient::{self, Kind},
     local::{self, Walk},
     row::{
@@ -175,6 +176,7 @@ fn mark(storage: &Storage, header: &Header, word: u32, node: u32) -> bool {
     match header.verified.compare_exchange(word, to, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
             storage.paint(node, color(view, header.changed.load(Ordering::Relaxed)));
+            counts::count(key_parts(storage.key_of(node)).0, counts::VERIFIED);
             true
         }
         Err(now) => now == to,

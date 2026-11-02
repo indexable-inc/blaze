@@ -6,7 +6,7 @@ use super::Server;
 use crate::{
     protocol::Method,
     stream::{IdentKind, Spacing, Stream, Tree},
-    wire::{Reader, Writer},
+    wire::{Reader, Width, Writer},
 };
 
 fn at(start: u32, end: u32) -> Span {
@@ -19,13 +19,13 @@ fn at(start: u32, end: u32) -> Span {
 }
 
 fn server(_db: &Db) -> Server {
-    Server::new([at(0, 0), at(1, 1), at(2, 2)], Edition::CURRENT, false)
+    Server::new([at(0, 0), at(1, 1), at(2, 2)], Edition::CURRENT, false, Width::W64)
 }
 
 /// A request as the client writes it: its tag, then its arguments.
 fn request(method: Method, args: impl FnOnce(&mut Writer<'_>)) -> Vec<u8> {
     let mut out = vec![method as u8];
-    args(&mut Writer { out: &mut out });
+    args(&mut Writer { out: &mut out, width: Width::W64 });
     out
 }
 
@@ -45,7 +45,7 @@ fn punct_tree(w: &mut Writer<'_>, ch: u8, joint: bool, span: u32) {
 
 /// The handle an `Ok` reply holds.
 fn handle_of(reply: &[u8]) -> u32 {
-    let mut r = Reader::new(reply);
+    let mut r = Reader::new(reply, Width::W64);
     assert!(r.some().unwrap(), "an Ok reply");
     r.handle().unwrap()
 }
@@ -56,7 +56,7 @@ fn the_sites_are_the_first_spans_and_the_input_follows() {
     let mut server = server(&db);
     let mut input = Vec::new();
     server.input(&[Stream::default(), Stream::default()], &mut input);
-    let mut r = Reader::new(&input);
+    let mut r = Reader::new(&input, Width::W64);
     assert_eq!([r.handle().unwrap(), r.handle().unwrap(), r.handle().unwrap()], [1, 2, 3]);
     assert_eq!([r.handle().unwrap(), r.handle().unwrap()], [1, 2]);
     assert!(r.is_empty());
@@ -85,7 +85,7 @@ fn trees_given_become_a_stream_with_rustcs_spacing_and_come_back_as_given() {
 
     let into = request(Method::TsIntoTrees, |w| w.handle(handle));
     server.dispatch(&db, &into, &mut reply).unwrap();
-    let mut r = Reader::new(&reply);
+    let mut r = Reader::new(&reply, Width::W64);
     assert!(r.some().unwrap());
     assert_eq!(r.count().unwrap(), 3);
     assert_eq!(r.u8().unwrap(), 2);
@@ -101,7 +101,7 @@ fn trees_given_become_a_stream_with_rustcs_spacing_and_come_back_as_given() {
 
 /// The spans and jointness of the punctuation and identifiers of `reply` to `into_trees`.
 fn read_tokens(server: &Server, reply: &[u8]) -> Vec<(Span, bool)> {
-    let mut r = Reader::new(reply);
+    let mut r = Reader::new(reply, Width::W64);
     assert!(r.some().unwrap());
     let count = r.count().unwrap();
     let mut tokens = Vec::new();
@@ -247,12 +247,12 @@ fn spans_are_interned_and_answered_without_the_database_where_they_can_be() {
         w.usize(5);
     });
     server.dispatch(&db, &sub, &mut reply).unwrap();
-    let mut r = Reader::new(&reply);
+    let mut r = Reader::new(&reply, Width::W64);
     assert!(r.some().unwrap());
     assert!(r.some().unwrap());
     assert_eq!(server.span(r.handle().unwrap()).unwrap(), at(12, 15));
     server.dispatch(&db, &request(Method::SpanSaveSpan, |w| w.handle(handle)), &mut reply).unwrap();
-    let mut r = Reader::new(&reply);
+    let mut r = Reader::new(&reply, Width::W64);
     assert!(r.some().unwrap());
     let id = r.usize().unwrap();
     server.dispatch(&db, &request(Method::SpanRecoverProcMacroSpan, |w| w.usize(id)), &mut reply).unwrap();
@@ -303,13 +303,13 @@ fn the_output_is_the_stream_or_the_panic_message() {
     let mut server = server(&db);
     let handle = server.stream_handle(Stream::default());
     let mut ok = Vec::new();
-    let mut w = Writer { out: &mut ok };
+    let mut w = Writer { out: &mut ok, width: Width::W64 };
     w.ok(true);
     w.some(true);
     w.handle(handle);
     assert!(matches!(server.output(&ok), Ok(Ok(_))));
     let mut panicked = Vec::new();
-    let mut w = Writer { out: &mut panicked };
+    let mut w = Writer { out: &mut panicked, width: Width::W64 };
     w.ok(false);
     w.some(true);
     w.str("no fields");

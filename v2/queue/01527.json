@@ -1,0 +1,25 @@
+{
+  "id": "01527",
+  "from_lane": "one-pool",
+  "owner": "sched",
+  "paths": [
+    "crates/blaze-graph/src/pool.rs",
+    "crates/blaze-graph/src/sched/mod.rs",
+    "crates/blaze-graph/src/sched/graph.rs"
+  ],
+  "what": "Pool::drop waits for its parked jobs with no bound (pool.rs work, stop branch: parked != 0 -> park_timeout(1 ms); continue). A job parked on a wait nothing ends (a stall the process-wide check cannot declare, because another live job is idle elsewhere) holds the drop forever, rule 13; this held a blaze-graph test binary for 42 min. The pool cannot just leave: a parked job woken after leave_pool would reach a freed Shared. Ask: a World operation that fails one member's parked jobs with a typed error (Stalled for a stopping pool, naming each wait, as stall() does, but only for that member's jobs), which the stop drain calls after a deadline with no parked job resumed; the jobs unwind, end, and the pool leaves once none is parked. The two stall tests moved to crates/blaze-graph/tests/stall.rs (a binary of their own, each with an abort deadline), so the timeouts that led here are gone; this is the bound for any other case.",
+  "state": "open",
+  "created": "2026-11-01T17:26:16Z",
+  "updated": "2026-11-01T17:26:16Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T17:26:16Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

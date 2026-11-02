@@ -53,7 +53,7 @@ pub fn lowered(
     check(unit, spec)?;
     match &instance.0 {
         // clone: once an assembly function handed out, its text
-        Kind::Asm(text) => return Ok(Lowering::Asm(text.clone())),
+        Kind::Asm(text, _) => return Ok(Lowering::Asm(text.clone())),
         Kind::Allocator(forward) => return Ok(Lowering::Allocator(forward.symbol)),
         Kind::Code(..) | Kind::Start(_) => {}
     }
@@ -91,7 +91,7 @@ pub fn lowered(
                 convert::names(placed.frame(), key, unit.arch, &func, requests, placed)
             })
             // alloc: an error
-            .map_err(|e| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {e}"))))?;
+            .map_err(|e| failed(unit, format!("{}: {e}", super::Named(db, instance))))?;
             Ok(Lowering::Ir { func, names, data })
         })
     })

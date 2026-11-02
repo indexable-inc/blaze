@@ -23,10 +23,7 @@
 
 use std::{
     fmt,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Weak},
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
@@ -65,8 +62,6 @@ struct Library {
     /// The code as it was at [`load`], which is asked again each time the crate compiles.
     loaded: ContentId,
     code: code::Memo,
-    /// Expansions run so far, for the tier's policy.
-    runs: AtomicU64,
     /// What the store said of the crate's state when it was loaded, and what its expansions
     /// that ran (not found) did since.
     seen: verdicts::Seen,
@@ -231,12 +226,17 @@ fn refused(why: String) -> ProcMacroLoadingError {
 /// The macros of `krate`, a proc-macro crate, each run on blaze's compiler in this process
 /// for a crate built with `toolchain`. An error says why none can run: the crate is no
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks.
+/// The name of `krate` as its errors and spans say it.
+fn crate_name(db: &Db, krate: Crate) -> Box<str> {
+    match &krate.extra_data(db).display_name {
+        Some(name) => name.to_string().into(), // alloc: once per name asked for
+        None => "<unnamed>".into(),
+    }
+}
+
 pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
-    let name: Box<str> = match &krate.extra_data(db).display_name {
-        Some(name) => name.to_string().into(), // alloc: once a proc-macro crate, its name
-        None => "<unnamed>".into(),
-    };
+    let name = crate_name(db, krate);
     if !crate_def_map(db, krate).is_proc_macro() {
         return Err(refused(format!("`{name}` is not a proc-macro crate"))); // alloc: error path
     }
@@ -257,7 +257,6 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
         bridge,
         loaded,
         code,
-        runs: AtomicU64::new(0),
         seen: verdicts::Seen::new(verdict),
         sessions: SharedMap::default(),
     });
@@ -324,19 +323,17 @@ impl Evaluated {
             edition: call.call_site.anchor.file_id.edition(),
             forced_keywords: forced_keywords(db, calling),
         };
-        let code = library.code.get(db, library.krate);
-        let runs = library.runs.fetch_add(1, Ordering::Relaxed);
         let stateless = held.statics.is_empty() && !held.holds;
         let ran = if stateless {
             // Its calls run at once: the state of each is the start, which none of them change.
             drop(held);
-            let ran = self.run_on(db, code, runs, call, &[], &[], &this);
+            let ran = self.run_on(db, calling, call, &[], &[], &this);
             held = session.lock();
             ran?
         } else {
             let replayed: &[Kept] = if held.holds { &held.calls } else { &[] };
             let preset: &[(StaticId, Vec<u8>)] = if held.holds { &[] } else { &held.statics };
-            self.run_on(db, code, runs, call, preset, replayed, &this)?
+            self.run_on(db, calling, call, preset, replayed, &this)?
         };
         library.saw(&ran)?;
         let session = &mut *held;
@@ -363,8 +360,7 @@ impl Evaluated {
     fn run_on(
         &self,
         db: &Db,
-        code: ContentId,
-        runs: u64,
+        calling: Crate,
         call: &ProcMacroCall<'_>,
         preset: &[(StaticId, Vec<u8>)],
         replayed: &[Kept],
@@ -390,8 +386,16 @@ impl Evaluated {
             })
             .collect(); // alloc: once per run, the expansions it runs
         let library = &*self.library;
-        run::run(db, &library.bridge, code, runs, call.env, preset, &expansions)
-            .map_err(|stop| system(format_args!("{} {stop}", self.what())))
+        // alloc: once per call, the names its span carries
+        let path = format!("{}::{}", library.name, self.name.as_str());
+        let calling = crate_name(db, calling);
+        let span = run::expand_span(&path, &calling);
+        // alloc: once per call, what its progress lines say
+        let what = format!("the proc macro `{path}` for `{calling}`");
+        let mut spent = run::Spent::default();
+        let ran = run::run(db, &what, &library.bridge, call.env, preset, &expansions, &mut spent);
+        run::ran_on(span, &spent, &ran);
+        ran.map_err(|stop| system(format_args!("{} {stop}", self.what())))
     }
 
     /// Whether the session of `calling` starts each call from nothing.

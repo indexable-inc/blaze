@@ -1,6 +1,7 @@
 mod api;
 mod budget;
 mod bodies;
+mod const_eval;
 mod db;
 mod infer;
 mod lower;

@@ -315,6 +315,7 @@ unsafe impl Sync for Segments {}
 impl Segments {
     pub(crate) fn new(first: usize, max: usize, align: usize) -> Segments {
         debug_assert!(align.is_power_of_two() && align <= SEGMENT_ALIGN && first <= max);
+        assert!(first > 0, "segments whose first is 0 never grow to fit a copy");
         Segments { lanes: Lanes::new(), all: ShortLock::default(), first, max, align }
     }
 

@@ -1221,7 +1221,9 @@ fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>)
 unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     let run = Ran(header.cast::<Run<R>>());
     let (ctx, critical) = (run.run().ctx, run.live().critical);
+    let span = pool::JobSpan::begin(std::any::type_name::<R>());
     let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
+    drop(span);
     let group = pool::group();
     match result {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), group),

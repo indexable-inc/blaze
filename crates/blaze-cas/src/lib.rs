@@ -1609,6 +1609,26 @@ impl Store {
         out
     }
 
+    /// The keys its own tier's puts (by it and by every writer) made readable and no mapped
+    /// pack holds yet, perhaps some twice: what [`Store::get`] already gives and
+    /// [`Store::new_keys`] lists only once their batch is packed. The remote tier's filter
+    /// deltas take them so a client never rules out a key the server would answer.
+    pub fn unpacked_keys(&self) -> Vec<Key> {
+        let held = Held::writer(&*self.shared);
+        let own = &self.tiers[0];
+        // alloc: once per refresh of the remote tier's filter, the puts not yet packed
+        let mut out = Vec::new();
+        for table in std::iter::once(&own.delta).chain(&own.prev) {
+            out.extend(
+                table
+                    .iter(held)
+                    .filter(|(_, spot)| matches!(spot.place, Place::Segment(_)))
+                    .map(|(_, spot)| spot.key),
+            );
+        }
+        out
+    }
+
     /// Starts keeping the keys each batch puts into packs, for [`Store::new_keys`] to take:
     /// the remote tier's filter deltas. A store no server reads keeps none.
     pub fn watch_keys(&mut self) {

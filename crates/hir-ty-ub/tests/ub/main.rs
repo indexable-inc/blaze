@@ -1388,3 +1388,75 @@ fn sites_are_interned_densely() {
         assert_eq!(sites.get(hir_ty_ub::ids::SiteId::START), None);
     });
 }
+
+// --- C's heap, which std's `System` allocator uses ---
+
+#[test]
+fn calloc_memory_reads_as_zero_and_realloc_keeps_it() {
+    pass(program!(
+        "sized, slice, index, coerce_unsized",
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+fn main() {
+    unsafe {
+        let a = calloc(4, 2) as *mut [u8; 8];
+        let _first = (*a)[0];
+        let b = realloc(a as *mut u8, 16) as *mut [u8; 8];
+        let _kept = (*b)[7];
+        free(b as *mut u8);
+        let none = malloc(0);
+        if none as usize == 0 {
+            let _ = *(0 as *const u8);
+        }
+        free(none);
+    }
+}
+"#
+    ));
+}
+
+#[test]
+fn malloc_memory_is_uninitialized() {
+    ub(
+        program!(
+            "sized",
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+}
+
+fn main() {
+    let p = unsafe { malloc(4) } as *const u32;
+    let _x = unsafe { *p };
+}
+"#
+        ),
+        "uninitialized",
+    );
+}
+
+#[test]
+fn free_of_rusts_allocation_is_ub() {
+    let (found, _) = ub(
+        program!(
+            "sized",
+            r#"
+extern "C" {
+    fn free(ptr: *mut u8);
+}
+
+fn main() {
+    unsafe { free(__rust_alloc(8, 8)) };
+}
+"#
+        ),
+        "which is Rust heap memory, using C heap deallocation operation",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::FreeWrongKind { .. })));
+}

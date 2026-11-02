@@ -203,6 +203,31 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
     );
     let path = of("[blaze.lints]\n\"blaze::hot_alloc\" = \"warn\"\n").unwrap_err();
     assert!(path.what.ends_with("is named without its tool: these are blaze's own lints"), "{}", path.what);
+    assert_eq!(
+        of("[blaze.lints]\nhot = \"deny\"\nconst_impure = \"allow\"\n").unwrap(),
+        ["--allow=blaze::const_impure", "--deny=blaze::hot"]
+    );
+    let unknown = of("[blaze.lints]\nhot_allocs = \"warn\"\n").unwrap_err();
+    assert_eq!(
+        unknown.what,
+        "[workspace.metadata.blaze.lints] in /w/Cargo.toml: `hot_allocs` is no lint or group of blaze's (`blaze::hot_allocs`)"
+    );
+    assert_eq!(unknown.at.as_deref(), Some("/w/Cargo.toml"));
+}
+
+/// A package's `[lints.blaze]` names blaze's lints as the workspace's table does.
+#[test]
+fn a_packages_unknown_blaze_lint_is_an_error_naming_it() {
+    let manifest = |lints: &str| -> TomlManifest {
+        toml::from_str(&format!("[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints.blaze]\n{lints}")).unwrap()
+    };
+    let (lints, _) = flags::lints_of("a", &manifest("wall_clock = \"deny\"\n")).unwrap();
+    assert_eq!(lints, ["--deny=blaze::wall_clock"]);
+    let unknown = flags::lints_of("a", &manifest("wallclock = \"deny\"\n")).unwrap_err();
+    assert_eq!(
+        unknown.what,
+        "the `[lints.blaze]` of `a` set `wallclock`, which is no lint or group of blaze's (`blaze::wallclock`)"
+    );
 }
 
 /// cargo hands every `[lints]` table to rustc as flags, and rustc stops at a tool it does not
@@ -621,8 +646,18 @@ const SERDE: &str = "[package]\nname = \"serde\"\nversion = \"1.0.219\"\nedition
 
 /// Each unit's plan of [`app_units`] for `target`.
 fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
-    let dir = Scratch::new(&format!("app-{}", target.unwrap_or("host")));
+    plan_app_as(target, false)
+}
+
+/// [`plan_app`], under `check`'s lints when `lints`, with a `clippy.toml` at the workspace's
+/// root.
+fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, String) {
+    let named = if lints { "lints-" } else { "" };
+    let dir = Scratch::new(&format!("app-{named}{}", target.unwrap_or("host")));
     let ws = dir.0.join("w");
+    if lints {
+        dir.write("w/clippy.toml", "msrv = \"1.70\"\n");
+    }
     let app_path = dir.write("w/Cargo.toml", APP);
     for file in ["w/build.rs", "w/src/lib.rs", "w/src/main.rs", "w/tests/it.rs"] {
         dir.write(file, "");
@@ -685,7 +720,8 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
         manifests: &manifests,
         roots: &[4, 5, 6],
         config: &config,
-        intent: Intent::Build,
+        intent: if lints { Intent::Check { test: false } } else { Intent::Build },
+        lints,
         build_std: false,
         ws_root: &ws,
         ws_manifest: &app_path,
@@ -704,6 +740,23 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     let planned = plan(&input).unwrap();
     let plans = planned.plans.into_iter().map(|it| it.expect("every unit is planned here")).collect();
     (ws, plans, planned.finished)
+}
+
+#[test]
+fn check_lints_the_workspaces_crates_with_their_configuration() {
+    let (_, plans, _) = plan_app_as(None, true);
+    let linted: Vec<bool> = plans.iter().map(|it| it.clippy.is_some()).collect();
+    assert_eq!(linted, [false, false, true, false, true, true, true], "the member's crates and build script, not its run");
+    let lib = &plans[4];
+    assert!(lib.cfgs.contains(&"clippy".to_owned()));
+    let (path, text) = lib.clippy.as_ref().and_then(|it| it.conf.clone()).expect("the workspace's clippy.toml");
+    assert!(path.ends_with("/w/clippy.toml"), "{path}");
+    assert_eq!(text, "msrv = \"1.70\"\n");
+    assert!(!plans[0].cfgs.contains(&"clippy".to_owned()), "a dependency is checked, not linted");
+    // The build script is compiled to run, as under `cargo build`: one executable, no `.rmeta`.
+    let script = &plans[2];
+    assert!(script.outputs[0].ends_with("/out/build_script_build"), "{:?}", script.outputs);
+    assert!(script.outputs.iter().all(|it| !it.ends_with(".rmeta")), "{:?}", script.outputs);
 }
 
 /// The hex of a plan's `-C extra-filename`.

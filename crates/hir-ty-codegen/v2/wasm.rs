@@ -49,7 +49,7 @@ pub(crate) fn header(db: &Db, instance: &HirInstance, requests: &Requests) -> Re
         {
             exported_symbol(db, *func)
         }
-        Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(_) => None,
+        Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => None,
     };
     Ok(Header { imports, export })
 }

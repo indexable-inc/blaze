@@ -235,6 +235,9 @@ pub struct Lint {
     pub eval_always: bool,
     /// Whether `-D warnings` leaves it a warning.
     pub ignore_deny_warnings: bool,
+    /// Whether a tool other than the compile gives it (rustc's, for clippy's lints): blaze-lints'
+    /// under `blaze check`, which also says which of its `#[expect]`s are unfulfilled.
+    pub is_externally_loaded: bool,
     /// Its index in the tables, set as they are numbered (`index::ALL`).
     id: LintId,
 }
@@ -266,6 +269,7 @@ impl Lint {
             crate_level_only: false,
             eval_always: false,
             ignore_deny_warnings: false,
+            is_externally_loaded: false,
             id: LintId::UNNUMBERED,
         }
     }
@@ -287,6 +291,11 @@ impl Lint {
 
     const fn ignore_deny_warnings(mut self) -> Lint {
         self.ignore_deny_warnings = true;
+        self
+    }
+
+    const fn externally_loaded(mut self) -> Lint {
+        self.is_externally_loaded = true;
         self
     }
 
@@ -491,7 +500,8 @@ pub fn group(name: &str) -> Option<&'static Group> {
 }
 
 /// rustc's lint groups, in the order it adds them: those it makes of the future-incompatible
-/// lints as it registers them, those of `register_builtins`, then the alias `bad_style`.
+/// lints as it registers them, those of `register_builtins`, then the alias `bad_style`; after
+/// them blaze's, `blaze::hot`.
 pub fn groups() -> &'static [Group] {
     static GROUPS: OnceLock<Vec<Group>> = OnceLock::new();
     GROUPS.get_or_init(build_groups)
@@ -572,6 +582,17 @@ fn build_groups() -> Vec<Group> {
             _ => panic!("alias `{alias}` of no group `{of}`"),
         };
         groups.push(Group::new(alias, lints, Some(of)));
+    }
+    for &(name, members) in names::BLAZE_GROUPS {
+        let lints = members
+            .iter()
+            .map(|member| match LINTS_BY_NAME.get(member) {
+                Some(at) if (BUILTIN_END..BLAZE_END).contains(&at) => &ALL[at],
+                _ => panic!("group `{name}` names no lint of blaze's `{member}`"),
+            })
+            // alloc: setup, once per process (`GROUPS`)
+            .collect();
+        groups.push(Group::new(name, lints, None));
     }
     for (at, group) in groups.iter().enumerate() {
         assert_eq!(OTHER_KEYS[at], group.name, "the groups are where the perfect hash has them");

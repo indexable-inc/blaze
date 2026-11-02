@@ -88,6 +88,7 @@ impl Vtable {
             fields: I::FIELD_NAMES,
             row_size: size_of::<RowOf<I>>(),
             ids_of: None,
+            made: None,
             memory: memory::<I>,
             verify: None,
             reset: None,

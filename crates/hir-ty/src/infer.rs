@@ -63,7 +63,7 @@ use hir_def::{
     lang_item::LangItems,
     layout::Integer,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
-    signatures::EnumSignature,
+    signatures::{EnumSignature, FunctionSignature},
     type_ref::{LifetimeRefId, TypeRefId},
     unstable_features::UnstableFeatures,
 };
@@ -2834,8 +2834,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let mut param_tys = sig.inputs().iter().copied();
         // rustc's `check_fn`: a parameter must be `Sized` unless `unsized_fn_params` is on, which
         // `extern "tail"` ignores. The signature's types are in its own store, so the span is
-        // the parameter's pattern (rustc's when no type is written).
-        let params_sized = !self.features.unsized_fn_params || sig.abi() == ExternAbi::RustTail;
+        // the parameter's pattern (rustc's when no type is written). Only a fn with a body:
+        // `check_fn` is typeck's, so a bodyless trait method or foreign fn is asked nothing.
+        let has_body = FunctionSignature::of(self.db, func).has_body();
+        let params_sized =
+            has_body && (!self.features.unsized_fn_params || sig.abi() == ExternAbi::RustTail);
 
         if let Some(self_param) = self_param
             && let Some(ty) = param_tys.next()
@@ -2861,9 +2864,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
 
         self.return_ty = self.process_remote_user_written_ty(sig.output());
-        // rustc requires it in wfcheck at the written type, which is in the signature's store.
-        let code = ObligationCauseCode::SizedReturnType;
-        self.require_type_is_sized(self.return_ty, body_expr.into(), code);
+        // rustc requires it in wfcheck at the written type, which is in the signature's store,
+        // "if the function has a body".
+        if has_body {
+            let code = ObligationCauseCode::SizedReturnType;
+            self.require_type_is_sized(self.return_ty, body_expr.into(), code);
+        }
         self.return_coercion = Some(CoerceMany::new(self.return_ty, self.frame));
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "blaze-macro-eval"
-description = "Proc macros run on blaze's own compiler, in process: the macro's real code and the real `proc_macro` client on the MIR evaluator, answered by blaze's server, isolated by construction"
+description = "Proc macros run in process behind blaze's server of the real `proc_macro` bridge: a macro's wasm32-wasip1 module under Wasmtime, and the MIR evaluator as the reference its output is tested against"
 publish = false
 
 version.workspace = true
@@ -15,28 +15,21 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-cranelift-codegen.workspace = true
 parking_lot.workspace = true
 rustc_lexer.workspace = true
 unicode-normalization.workspace = true
 
 base-db.workspace = true
 blaze-cas.workspace = true
-blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
-blaze-inproc.workspace = true
-blaze-items.workspace = true
-blaze-link.workspace = true
-blaze-mem.workspace = true
-blaze-stencil.workspace = true
+blaze-profile.workspace = true
 blaze-usercode.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
-hir-ty-codegen.workspace = true
 hir-ty-mir.workspace = true
 intern.workspace = true
 blaze-lower.workspace = true
@@ -45,7 +38,9 @@ proc-macro-api.workspace = true
 blaze-query.workspace = true
 span.workspace = true
 stdx.workspace = true
+tracing.workspace = true
 tt.workspace = true
+wasmtime.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -59,6 +54,8 @@ either.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# WebAssembly text for the host's tests' modules.
+wasmtime = { workspace = true, features = ["wat"] }
 
 [lints]
 workspace = true

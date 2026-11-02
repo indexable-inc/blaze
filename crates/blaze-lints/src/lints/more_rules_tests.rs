@@ -1,6 +1,6 @@
 //! What the lints of `no-fallback-front-lints-clippy` run over in their tests: an `std` (and an
 //! `alloc`, `lock_api` and `parking_lot`) with the shapes those lints look at, a run of one lint
-//! alone, and `blaze fix` of one lint applied and checked clean.
+//! alone, and the fix of one lint applied and checked clean (`blaze_lints::fix`).
 
 use base_db::FileId;
 use blaze_hash::HashMap;
@@ -236,7 +236,7 @@ pub(super) fn lint_only(lint_name: &str, main: &str) -> String {
     lint(&fixture(main), &only(lint_name))
 }
 
-/// `src/lib.rs` of `main` as `blaze fix` of `clippy::<lint>` alone leaves it, after checking
+/// `src/lib.rs` of `main` as the fix of `clippy::<lint>` alone leaves it, after checking
 /// that the fix changed it and that linting it again finds nothing.
 pub(super) fn fixed(lint_name: &str, main: &str) -> String {
     let fx = fixture::db(&fixture(main));

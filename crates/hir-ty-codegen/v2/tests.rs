@@ -500,8 +500,9 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
     frontend.with(|db, homes| {
         let walked = refs::walk(db, &root, false, homes).expect("the walk");
         let built_in = refs::built_in(db, &root, false).expect("the walk");
-        let [at] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
+        let [at, nested] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
         let FrontRef::Function(outer) = &walked[at as usize] else { panic!("{walked:?}") };
+        let FrontRef::Function(twice) = &walked[nested as usize] else { panic!("{walked:?}") };
         let named = |it: &HirInstance, name: &str| match &it.0 {
             Kind::Code(instance, _) => match instance.def {
                 InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str() == name,
@@ -510,6 +511,7 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
             _ => false,
         };
         assert!(named(outer, "outer"), "{outer:?}");
+        assert!(named(twice, "twice"), "a callee built in at depth two is listed too: {twice:?}");
         let calls_helper = |it: &FrontRef<HirInstance, _>| {
             matches!(it, FrontRef::Function(callee) if named(callee, "helper"))
         };
@@ -524,6 +526,62 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
         let mut placer = Placer::listed(walked);
         place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
             .expect("the IR asks only for what the walk lists");
+    });
+}
+
+const ASKED_BY_THE_IMAGE: &str = r#"
+//- minicore: sized, asm
+//- /dep.rs crate:dep library
+pub fn fence<T>() { unsafe { core::arch::asm!("nop") } }
+//- /main.rs crate:main deps:dep
+pub fn roots() {
+    dep::fence::<u8>();
+    unsafe { core::arch::asm!("nop") }
+}
+"#;
+
+/// An `asm!` function is its asker's for the dependency image. The one a dependency's generic
+/// asks for, compiled as a member asks (core's `__isb::<SY>` for build-time `blaze-spin`), is
+/// the image's, or the image would refer to the workspace's; the member's own is the
+/// workspace's. Both are one function of one key, which the build gives the image.
+#[test]
+fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
+    use blaze_codegen::{Owner, backend::Frontend as _};
+    let (db, frontend) = frontend(ASKED_BY_THE_IMAGE);
+    let root = frontend.root(function(&db, "roots"));
+    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+    hir_ty::attach_db(db, || {
+        let describe = |instance: &HirInstance| {
+            frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
+        };
+        let asm = |refs: &[FrontRef<HirInstance, super::HirStatic>]| -> Vec<HirInstance> {
+            (refs.iter())
+                .filter_map(|it| match it {
+                    FrontRef::Function(instance @ HirInstance(Kind::Asm(..))) => Some(instance.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let rooted = describe(&root);
+        assert_eq!(rooted.owner, Owner::Workspace);
+        let fence = (rooted.refs.iter()).find_map(|it| match it {
+            FrontRef::Function(instance @ HirInstance(Kind::Code(called, _))) => match called.def {
+                InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "fence" => {
+                    Some(instance.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let fence = fence.unwrap_or_else(|| panic!("no `fence` in {:?}", rooted.refs));
+        let fenced = describe(&fence);
+        assert_eq!(fenced.owner, Owner::Dependency, "{fence:?}");
+        let [asked] = &asm(&fenced.refs)[..] else { panic!("{:?}", fenced.refs) };
+        let [own] = &asm(&rooted.refs)[..] else { panic!("{:?}", rooted.refs) };
+        let (asked, own) = (describe(asked), describe(own));
+        assert_eq!(asked.owner, Owner::Dependency);
+        assert_eq!(own.owner, Owner::Workspace);
+        assert_eq!((asked.code, asked.args), (own.code, own.args));
     });
 }
 

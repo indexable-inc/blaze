@@ -258,14 +258,27 @@ impl Conf {
     /// The configuration of a package whose file is `path`, if it has one, and whose
     /// `rust-version` is `rust_version`.
     pub fn load(path: Option<PathBuf>, rust_version: Option<&str>) -> Result<Conf, String> {
-        let table = match &path {
+        let file = match path {
             Some(path) => {
-                let text = std::fs::read_to_string(path)
+                let text = std::fs::read_to_string(&path)
                     .map_err(|error| format!("error reading `{}`: {error}", path.display()))?;
-                text.parse::<toml::Table>()
-                    .map_err(|error| format!("error parsing `clippy.toml`: {}", error.message()))?
+                Some((path, text))
             }
-            None => toml::Table::new(),
+            None => None,
+        };
+        Conf::of_text(file, rust_version)
+    }
+
+    /// [`Conf::load`] of a file already read: its path and its text.
+    pub fn of_text(file: Option<(PathBuf, String)>, rust_version: Option<&str>) -> Result<Conf, String> {
+        let (path, table) = match file {
+            Some((path, text)) => {
+                let table = text
+                    .parse::<toml::Table>()
+                    .map_err(|error| format!("error parsing `clippy.toml`: {}", error.message()))?;
+                (Some(path), table)
+            }
+            None => (None, toml::Table::new()),
         };
         checked(&table)?;
         let msrv = match table.get("msrv").or_else(|| table.get("min-rust-version")) {

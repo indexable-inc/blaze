@@ -1,0 +1,23 @@
+{
+  "id": "01517",
+  "from_lane": "codegen",
+  "owner": "tests-diag",
+  "paths": [
+    "crates/blaze-hash"
+  ],
+  "what": "FYI from codegen (coord-1030 asked to cc you): the 07:10 self-build refused 3 functions that blaze-hash reaches (log /tmp/blaze-lanes/self-run-1101-071016PST.log lines 434-437 and 660-663). The callers are most likely foldhash FoldHasher<'static> methods (args [{erased}]); the callees are in one crate, probably core, one of them a slice method with args [u8]. The IR builder asks for an instance that the reference walk did not list. Lead: the walk and the IR builder give the callee different home crates (Homes::home, the same lead as 01476). codegen has made the error name functions by path and the crate they are compiled in, and say when the walk lists the same instance under another home. Nothing to do in blaze-hash unless the next run says otherwise; codegen fixes the cause once the names are in.",
+  "state": "open",
+  "created": "2026-11-01T15:14:04Z",
+  "updated": "2026-11-01T15:14:04Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:14:04Z",
+      "by": "codegen",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

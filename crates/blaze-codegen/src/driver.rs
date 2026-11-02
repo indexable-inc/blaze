@@ -394,6 +394,35 @@ fn unkept_inline<I, S>(
     function.inlined.iter().find(|it| !kept.contains(*it)).copied()
 }
 
+/// The refusal of `node`'s compile, which built in the code `it` its key does not hold
+/// ([`unkept_inline`]): the function, the code by the names of the build's instances of it,
+/// and what the key holds.
+fn unkept_message<I, S>(
+    nodes: &Sorted<InstanceKey, FnNode<I, S>>,
+    node: &FnNode<I, S>,
+    it: blaze_items::CodeHash,
+) -> String {
+    let name = |key: &InstanceKey| nodes.get(key).map_or("an instance of no node", |it| &it.described.name);
+    let of_it: Vec<&str> = (nodes.iter())
+        .filter(|(_, it_node)| it_node.unit.instance.code == it)
+        .map(|(_, it_node)| &*it_node.described.name)
+        .take(3)
+        .collect(); // alloc: an error
+    let held: Vec<&str> = node.built_in.iter().map(name).collect(); // alloc: an error
+    let of_it = match of_it.is_empty() {
+        true => "no instance of the build".to_owned(), // alloc: an error
+        false => format!("`{}`", of_it.join("`, `")), // alloc: an error
+    };
+    // alloc: an error
+    format!(
+        "`{}` built in the code {it:?} ({of_it}), which its key does not hold: the key holds \
+         the {} built in [{}]",
+        node.described.name,
+        held.len(),
+        held.join(", "),
+    )
+}
+
 impl<B: Prepare> Job<'_, B> {
     fn stored(&self) -> InstanceKey {
         placed(stored(self.unit.instance.key(), &self.node.built_in), &self.node.refs)
@@ -1446,7 +1475,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
                 // alloc: an error
-                out.errors.push(error(key, node.unit.item, format!("built in {it:?}, which its key does not hold")));
+                out.errors.push(error(key, node.unit.item, unkept_message(nodes, node, it)));
                 continue;
             }
             out.stats.compiled += 1;

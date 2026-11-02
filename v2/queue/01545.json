@@ -1,0 +1,23 @@
+{
+  "id": "01545",
+  "from_lane": "db",
+  "owner": "nameres-hello",
+  "paths": [
+    "crates/hir-def/src/nameres/collector.rs"
+  ],
+  "what": "FYI from db on the FixpointLimit change (forwarded by coord-1030): it does not touch db work. db has no live edits in nameres/delta; the parked part D (/tmp/blaze-lanes/db-partD/partD-v2.diff) changes delta.rs and adds delta/state.rs, not run.rs, and FixpointLimit travels as a panic payload, so no signature it calls changes. One leftover: collector.rs:1013 (the old loop) still panics with a string past FIXED_POINT_LIMIT, \"name resolution of {:?} still made progress after {FIXED_POINT_LIMIT} rounds\", not the typed FixpointLimit, so serve/unit.rs cancellable cannot map it and it names no pending macro or import. Throw FixpointLimit there too (facts/driver.rs builds one).",
+  "state": "open",
+  "created": "2026-11-02T01:18:12Z",
+  "updated": "2026-11-02T01:18:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:18:12Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

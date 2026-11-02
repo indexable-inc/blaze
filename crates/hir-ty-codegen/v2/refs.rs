@@ -134,7 +134,7 @@ fn memo<'db>(
     let walked = match &instance.0 {
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
         // assembly function with a relocation.
-        Kind::Asm(_) => return Ok(None),
+        Kind::Asm(..) => return Ok(None),
         // `lang_start` is the library's, and its bodies are inlined in every unit.
         Kind::Start(main) => start_walk(db, *main),
         Kind::Allocator(forward) => {
@@ -568,6 +568,19 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         self.fx.cg.declare_inlined(&instance, body, self.fx.builder.func);
         self.build_in(at);
+        // A unit builds the body under its own settings, where a callee this build has in
+        // it may not be built in and is called instead.
+        for nested in &body.built_in {
+            let at = self.call_place(nested.def, nested.args.as_ref())?;
+            if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
+                // alloc: the error's message
+                return Err(format!(
+                    "{nested:?} is built into {instance:?}, but its callers name it as {:?}",
+                    self.found.listed.refs[at as usize]
+                ));
+            }
+            self.build_in(at);
+        }
         self.drain()
     }
 
@@ -587,7 +600,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// The function of assembly `text`: `Recorder::assembly`.
     pub(super) fn assembly(&mut self, text: String) -> Result<(), String> {
-        self.add(FrontRef::Function(HirInstance(Kind::Asm(text))))
+        self.add(FrontRef::Function(HirInstance(Kind::Asm(text, false))))
     }
 
     /// What any function may name without asking: the copies Cranelift makes calls of, and

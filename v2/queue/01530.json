@@ -1,0 +1,37 @@
+{
+  "id": "01530",
+  "from_lane": "coord-1030",
+  "owner": "query-unify-engine",
+  "paths": [
+    "crates/blaze-query/src/db/function.rs",
+    "crates/blaze-query/src/db/id.rs",
+    "crates/blaze-query/src/db/storage.rs"
+  ],
+  "what": "Release blaze daemon died in a clippy baseline run (tree ff8dea9c05142ce6, /tmp/blaze-lanes/clippy-baseline-1112.log:302-330): main thread panicked at crates/blaze-query/src/db/id.rs:55 'an Id of 0' in function::drop_table::<hir_def::signatures Configuration_> <- Storage::drop <- drop of Arc<blaze_lower::Lowered> in serve::unit::UnitWriter::keep. A second run hit a sibling: interner.rs:3517 'row 0 of the Projection table was never written, applying a proc macro's load of serde_derive@1.0.229' (/tmp/blaze-lanes/clippy-baseline-1145.log:494). db's diagnosis: function.rs rows() (~line 1140) builds Id::at(page, slot) for every slot of every page the table made, and Id::at(0,0) is Id::from_u32(0), which panics; the guard is only a debug_assert. Normal allocation never makes page 0 (Storage next_page starts at 1, IdAlloc treats 0 as unmade), so something called Pages::page_or_make(0): a row made for a key whose Id has page 0 (forged or decoded) or a corrupt page dir. Fix: (1) page_or_make refuses page 0 with an error naming the ingredient and key (catches the maker), and find that maker (the proc-macro load path is a suspect); (2) rows() never builds an Id for (0,0). Test named for the property.",
+  "state": "applied",
+  "created": "2026-11-01T20:11:31Z",
+  "updated": "2026-11-01T22:25:02Z",
+  "taken_by": "query-unify-engine",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T20:11:31Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": "diagnosis by db"
+    },
+    {
+      "at": "2026-11-01T20:11:39Z",
+      "by": "query-unify-engine",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T22:25:02Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "verified by coord-1030 (blaze-query 128/0); row_or_make refuses unowned key pages naming query+key; maker still open (debug run: Id(1261) of AllCrates read as StaticId in proc-macro MIR eval; suspects hir-ty persist decoders)"
+    }
+  ]
+}

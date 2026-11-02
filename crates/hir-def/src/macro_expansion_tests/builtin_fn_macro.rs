@@ -341,7 +341,7 @@ fn main() {
 fn main() {
      {
         if !(true ) {
-            $crate::panic!("{} {:?}", arg1(a, b, c), arg2);
+            panic!("{} {:?}", arg1(a, b, c), arg2);
         }
     };
 }

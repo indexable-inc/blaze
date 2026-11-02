@@ -778,8 +778,8 @@ impl<'db> Lints<'_, '_, 'db> {
         match &loc.kind {
             MacroCallKind::FnLike { .. } => ast::MacroCall::cast(node)?.path().map(path),
             MacroCallKind::Derive { derive_index, .. } => {
-                let attr = ast::Attr::cast(node)?;
-                derive_paths_view(attr).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
+                let meta = ast::Meta::cast(node)?;
+                derive_paths_view(meta).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
             }
             MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
                 censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1.path().map(path)

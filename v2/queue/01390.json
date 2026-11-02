@@ -6,10 +6,10 @@
     "crates/hir-ty/src/traits.rs"
   ],
   "what": "## E0118 never fires: an inherent impl of a type parameter, projection or opaque type (`impl<T> T {}`) is accepted\n\ncrates/hir-ty/src/traits.rs:466-490 `inherent_impl_coherent` lists the primitive kinds, `Adt` and `Dynamic`, then `_ => true`. That allows `TyKind::Param`, `Alias(Projection | Opaque | ..)` and the rest, so hir never pushes `IncoherentImpl` (hir/src/diagnostics.rs:2254). blaze-diagnostics' E0118 lowering (lower/incoherent_impl.rs:208-215, which already checks `as_type_param` / associated type / impl traits) is never reached, and code rustc refuses builds. rustc (`rustc_hir_analysis/src/coherence/inherent_impls.rs` `check_item`): `ty::Param(_) | ty::Alias(..) | ty::Bound | ty::Placeholder | ty::Infer` gives `InherentTyOutsideNew` / E0118 `InherentNominal`. Fix: those kinds give `false` and are not exempted by the incoherent-inherent-impls branch below. Test: blaze-diagnostics tests::items::impls::an_inherent_impl_of_a_type_parameter (empty output in round 15).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:21:21Z",
-  "updated": "2026-11-01T00:21:21Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:23:23Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "fix-diag-lints",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:23:23Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:23:23Z",
+      "by": "db",
+      "action": "done",
+      "note": "already in the tree: hir-ty traits.rs inherent_impl_coherent gives false for TyKind::Param and Alias Projection/Inherent/Opaque (rustc InherentNominal, E0118), and the incoherent-inherent-impls branch exempts none of them (`_ => false`)."
     }
   ]
 }

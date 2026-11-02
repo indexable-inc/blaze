@@ -274,7 +274,7 @@ pub fn g() { loop { halt(); } }
 
     /// `-> !` is offered where the loop is the tail of a function with no return type, maybe
     /// incorrect (a trait's method or a `fn()` pointer can't change its return type), so
-    /// `blaze fix` leaves it; elsewhere a note says it.
+    /// `blaze check --fix` leaves it; elsewhere a note says it.
     #[test]
     fn a_tail_loop_is_offered_a_never_return_type() {
         let found = lint_only(

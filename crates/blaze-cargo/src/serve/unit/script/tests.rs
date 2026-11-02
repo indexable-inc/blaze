@@ -4,10 +4,10 @@ use std::{
 };
 
 use blaze_build_script::unit as bs;
-use blaze_core::{Completion, Done, Effect, FileName, IoError, Tag};
+use blaze_core::{Completion, Done, Effect, FileName, IoError, Stamp, Tag};
 use blaze_usercode::run::OutFile;
 
-use super::{BYTES, CUT, TIMED, Writing, file_name, out_files, verifies_in};
+use super::{BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing, file_name, out_files, verifies_in};
 
 const RUN: Tag = Tag(5 << 32);
 const BEGAN_NS: u64 = 1_761_782_400_123_456_789;
@@ -142,4 +142,54 @@ fn a_directory_the_run_left_is_no_file_of_it() {
         OutFile { path: "gen/z.rs".to_owned(), executable: false, bytes: Some(b"pub const Z: u8 = 1;".to_vec()) },
     ];
     assert_eq!(out_files(files), [("gen/z.rs".to_owned(), b"pub const Z: u8 = 1;".to_vec())]);
+}
+
+/// A stamp of the live record at `size` bytes.
+fn record(size: u64) -> Done {
+    Done::Stamped(vec![Stamp { ino: 7, size, mtime_ns: size, ctime_ns: size, mode: 0o100644 }])
+}
+
+/// One look of `quiet`: its timer fired, then its stamp told as `stamped`. What it asked next,
+/// and what it found.
+fn look(quiet: &mut Quiet, stamped: Done) -> (Vec<Effect>, Option<Stuck>) {
+    let mut effects = Vec::new();
+    assert_eq!(quiet.step(RUN, done(TICK, Done::Fired), &mut effects), Ok(None));
+    assert!(matches!(&effects[..], [Effect::Stamp { tag, .. }] if *tag == Tag(RUN.0 + LOOK)), "{effects:?}");
+    effects.clear();
+    let found = quiet.step(RUN, done(LOOK, stamped), &mut effects).unwrap();
+    (effects, found)
+}
+
+#[test]
+fn a_run_whose_live_record_stays_as_it_is_is_stuck_and_one_that_reads_is_not() {
+    let mut effects = Vec::new();
+    let mut quiet = Quiet::begin(&name(&format!("{DIR}/blaze-live")), RUN, &mut effects);
+    assert!(matches!(&effects[..], [Effect::Timer { after, tag }] if *after == LOOK_EVERY && *tag == Tag(RUN.0 + TICK)));
+    assert!(Quiet::owns(RUN, Tag(RUN.0 + TICK)) && Quiet::owns(RUN, Tag(RUN.0 + LOOK)));
+    assert!(!Quiet::owns(RUN, RUN) && !Quiet::owns(RUN, Tag(RUN.0 + TIMED)), "the spawn's and cargo's files' are not");
+
+    let looks = (QUIET_MOST.as_secs() / LOOK_EVERY.as_secs()) as u64;
+    for size in 1..=looks * 2 {
+        let (next, found) = look(&mut quiet, record(size));
+        assert_eq!(found, None, "a record that grows is a run making progress");
+        assert!(matches!(&next[..], [Effect::Timer { .. }]), "{next:?}");
+    }
+    let held = looks * 2;
+    for at in 1..looks {
+        assert_eq!(look(&mut quiet, record(held)).1, None, "quiet for {at} looks, short of the bound");
+    }
+    let (next, found) = look(&mut quiet, record(held));
+    assert!(next.is_empty(), "nothing more is asked of a run past its bound");
+    assert_eq!(found, Some(Stuck { quiet: QUIET_MOST, ran: LOOK_EVERY * (held + looks) as u32 }));
+}
+
+#[test]
+fn a_look_that_fails_or_ends_otherwise_is_an_error() {
+    let mut effects = Vec::new();
+    let mut quiet = Quiet::begin(&name("w/blaze-live"), RUN, &mut effects);
+    let failed = Done::Failed(IoError("Permission denied".to_owned()));
+    let error = quiet.step(RUN, done(LOOK, failed), &mut effects).unwrap_err();
+    assert!(error.contains("Permission denied"), "{error}");
+    assert!(quiet.step(RUN, done(LOOK, Done::Stamped(Vec::new())), &mut effects).unwrap_err().contains("no file"));
+    assert!(quiet.step(RUN, done(TICK, Done::Truncated), &mut effects).unwrap_err().contains("Truncated"));
 }

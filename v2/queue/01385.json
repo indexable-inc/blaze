@@ -8,10 +8,10 @@
     "crates/hir-def/src/expr_store/lower.rs"
   ],
   "what": "Three bodies borrowck refuses with blaze's own `blaze cannot borrow-check X: ..` error where rustc reports only the real one. (1) An anonymous parameter (2015 `fn bar_with_default_impl(String, String) {}` in a trait) lowers to a Missing pattern, and MIR lowering gives IncompletePattern. rustc's THIR treats `PatKind::Missing` as a wildcard, so lower it as one (hir-def) or treat it so (hir-ty-mir). Test: tests::lints::syntax::early::builtin::anonymous_parameters_of_trait_methods_are_deprecated_in_2015. (2) `self.bar()` in a fn without a self parameter (E0424, reported by resolution) is borrow checked and gives UnresolvedName { path: Super(0) }. rustc's Res::Err makes an error type that taints typeck, so check_def should skip a body with an unresolved value path (hir-ty is_erroneous). Test: tests::bodies::members::self_in_a_function_without_a_self_parameter. (3) `async fn required();` in a trait, with no body: its coroutine is borrow checked, giving `coroutine: TraitFunctionDefinition(..)`; there is nothing to check. Test: tests::lints::names::items::ungated_async_fn_track_caller_of_methods_and_with_the_feature.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:18:12Z",
-  "updated": "2026-11-01T00:18:12Z",
-  "taken_by": null,
+  "updated": "2026-11-01T22:10:01Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,18 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T22:09:57Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T22:10:01Z",
+      "by": "db",
+      "action": "done",
+      "note": "(1) hir-def expr_store/lower.rs: a parameter with a type and no pattern (2015 anonymous parameter) lowers to Pat::Wild, rustc THIR treatment of PatKind::Missing; test expr_store::tests::body::an_anonymous_parameter_is_a_wildcard. (2) no longer reproduces: the Nov 1 01:09 run (test-globvis-base.log) has no Super(0) borrowck leak and self_in_a_function_without_a_self_parameter is not among its failures. (3) hir-ty-borrowck check_def asks written_with_body before looking at the lowered root, so a bodiless async fn (an async block around nothing) has nothing to check; test missing_body_tests::an_async_fn_without_a_body_has_nothing_to_check."
     }
   ]
 }

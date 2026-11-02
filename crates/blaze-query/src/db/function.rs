@@ -29,6 +29,7 @@ use blaze_mem::Tag;
 
 use super::{
     AsId, Cancelled, Cycle, Database, DatabaseKeyIndex, EventKind, FromIdIn, Id, MemoryUsage,
+    counts,
     id::PAGE_LEN,
     ingredient::{self, Ingredient, Kind, Vtable},
     local::{self, Frame, Kind as FrameKind, Member, NONE, Pending},
@@ -126,6 +127,7 @@ impl Vtable {
             fields: &[],
             row_size: size_of::<RowOf<F>>(),
             ids_of: None,
+            made: None,
             memory: memory::<F>,
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
@@ -233,12 +235,33 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
     }
 }
 
+/// The row of key `id`, its page made when it has none.
+///
+/// # Panics
+///
+/// When no ingredient owns `id`'s page: an ID this storage never gave (page 0, a page not yet
+/// made, past [`Id::MAX_U32`]), forged or decoded unchecked. Its row would sit in a page no
+/// sweep or drop can name.
 fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
     let (table, index) = storage.table_or_make::<FnTable<F>>(F::ingredient());
+    if storage.owner(id).is_none() {
+        never_given(index, id);
+    }
     let (size, align) = row::layout::<RowOf<F>>();
     let page = table.pages.page_or_make(id.page(), &storage.heap, size, align);
     // SAFETY: the page was made for `RowOf<F>` rows; `id.slot() < PAGE_LEN`.
     (unsafe { row_at::<RowOf<F>>(page, id.slot()) }, index)
+}
+
+#[cold]
+#[inline(never)]
+fn never_given(index: u32, id: Id) -> ! {
+    panic!(
+        "`{}` was asked for the key {id:?}, an ID this database never gave (its page {} has no \
+         owner): a key forged, or decoded without checking its page's owner",
+        ingredient::name(index),
+        id.page(),
+    )
 }
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read
@@ -520,6 +543,7 @@ pub(crate) fn mark(
         return false;
     }
     storage.paint(node, color(view, header.changed.load(Ordering::Relaxed)));
+    counts::count(index, counts::VERIFIED);
     if storage.has_hook() {
         storage.event(|| EventKind::DidValidateMemoizedValue {
             database_key: DatabaseKeyIndex::new(index, id),
@@ -729,8 +753,10 @@ fn run<F: Function>(
     });
     let mut running = Running { storage, header, word, at, index, id, armed: true };
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
+    counts::count(index, counts::EXECUTED);
     loop {
         let new = blaze_mem::frame::task(F::TAG, |_| F::execute(db, key));
+        crate::ran_one();
         let done = ran(at);
         if done.head == NONE {
             finish::<F>(storage, row, &done, at, word, new, keep);

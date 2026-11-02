@@ -55,10 +55,14 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     std::process::exit(launch(&spec))
 }
 
-/// The spec in `file`, which has no field [`confine::Spec`] does not know.
+/// The spec in `file`, which has no field [`confine::Spec`] does not know. The file is removed
+/// as it is read, before anything runs: it holds the program's whole environment, secrets
+/// too, which outlive the run nowhere. One that can't be removed is an error.
 pub fn read_spec(file: &Path) -> Result<confine::Spec, String> {
     // alloc: the error, once, and nothing runs.
     let text = std::fs::read(file).map_err(|error| format!("the spec {}: {error}", file.display()))?;
+    // alloc: the error, once, and nothing runs.
+    std::fs::remove_file(file).map_err(|error| format!("removing the spec {} once read: {error}", file.display()))?;
     // alloc: the error, once, and nothing runs.
     serde_json::from_slice(&text).map_err(|error| format!("the spec {}: {error}", file.display()))
 }
@@ -349,6 +353,8 @@ mod tests {
         let mut value = serde_json::to_value(spec(&dir, "/bin/true", &[], true)).unwrap();
         std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(super::read_spec(&file).is_ok());
+        assert!(!file.exists(), "a spec, which holds the program's environment, is removed once read");
+        assert!(super::read_spec(&file).unwrap_err().contains("spec"), "read once");
         value["extra"] = serde_json::Value::Bool(true);
         std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
         let why = super::read_spec(&file).unwrap_err();

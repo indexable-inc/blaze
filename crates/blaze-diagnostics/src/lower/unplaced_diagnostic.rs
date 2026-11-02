@@ -8,12 +8,12 @@ use crate::{
     model::Diag,
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic<'_>) -> Vec<Found> {
+pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic) -> Vec<Found> {
     let node = cx.syntax_view(d.owner);
     let span = cx.span(node.map(|it| it.text_range()));
     let what = match &d.what {
-        // alloc: the error's text, for an error hir found
-        hir::Unplaced::Inference(it) => format!("type checking's {it:?}"),
+        // clone: the error's text, for an error hir found
+        hir::Unplaced::Inference(text) => text.clone(),
         // alloc: the error's text, for an error hir found
         hir::Unplaced::MissingUnsafe { reason, lint } => format!("{reason:?} ({lint:?}) needs `unsafe`"),
         hir::Unplaced::Borrowck { code, message } | hir::Unplaced::ConstCheck { code, message } => {
@@ -22,7 +22,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic<'_>) -> Vec<Fou
         }
     };
     // alloc: the error's text, for an error hir found
-    let message = format!("blaze: {what}, in code with no syntax of its own, which blaze cannot place");
+    let mut diag = Diag::error(None, format!("blaze: {what}"), span);
+    diag.note("blaze could not place this error more precisely: it is in code with no syntax of its own");
     // alloc: the error found
-    vec![Found::new(Diag::error(None, message, span), Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)]
 }

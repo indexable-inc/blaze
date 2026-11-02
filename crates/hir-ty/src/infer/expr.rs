@@ -2589,8 +2589,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// rustc's `ArgMatchingCtxt::check_compatible` off the diagonal: whether an argument of
     /// type `arg_ty` would fit the input `(formal, expected)`, inference left as it was.
     fn check_compatible(&mut self, arg_ty: Ty<'db>, formal: Ty<'db>, expected: Ty<'db>) -> bool {
-        // An error type fits nothing, so the heuristics don't pass errors into every input.
-        if formal.references_error() || expected.references_error() {
+        // An error type fits nothing, so the heuristics don't pass errors into every input. An
+        // error region is no error: a type inference recorded keeps its regions as errors.
+        if formal.references_non_lt_error() || expected.references_non_lt_error() {
             return false;
         }
         let expectation = Expectation::rvalue_hint(self, expected);
@@ -2602,7 +2603,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let cause = ObligationCause::dummy();
         let subtyping_error = infcx
             .probe(|_| infcx.sup_raw(&cause, self.table.param_env, formal, coerced_ty).is_err());
-        !subtyping_error && !coerced_ty.references_error() && !arg_ty.references_error()
+        !subtyping_error && !coerced_ty.references_non_lt_error() && !arg_ty.references_non_lt_error()
     }
 
     pub(super) fn with_breakable_ctx<T>(

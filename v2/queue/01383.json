@@ -6,10 +6,10 @@
     "crates/hir/src/diagnostics.rs"
   ],
   "what": "## E0046: an impl must define an item whose trait default body is unstable\n\n`impl Drop for S {}` reports nothing in blaze. rustc reports E0046 (\"not all trait items implemented, missing: `drop`\"). In the pinned nightly, `Drop::drop` has a default body (it calls `pin_drop`) under `#[rustc_default_body_unstable(feature = \"pin_ergonomics\", issue = \"130494\")]` (library/core/src/ops/drop.rs:241-243). rustc's `check_impl_items_against_trait` counts an item as missing when the impl's crate lacks the default body's feature (`eval_default_body_stability`, then `default_body_is_unstable`). blaze's missing-items check (crates/hir/src/diagnostics.rs:2307-2311) only asks `has_body()`, so the default body hides the missing `drop`. Every `impl Drop` without `drop` in real code goes unreported. Fix: port the rule. An item whose default body is `rustc_default_body_unstable` under a feature the impl crate doesn't enable is required, and the report notes that the default is unstable. blaze-diagnostics already parses the attribute (checks/attrs/parsers/stability.rs:164, checks/features/library.rs:480). Test: blaze-diagnostics tests::items::impls::a_missing_drop_method. Its minicore fixture also needs the attribute (a coordinator request from fix-diag-lints).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:17:44Z",
-  "updated": "2026-11-01T00:17:44Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:24:28Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "fix-diag-lints",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "done",
+      "note": "done by tests-diag (edit 84/85, unbuilt): hir-def attrs/stability.rs default_body_stability + UnstableReason::to_opt_reason, hir diagnostics.rs collect_impl + TraitImplUnstableDefaultBody, blaze-diagnostics lower/trait_impl_unstable_default_body.rs. db agrees, checked present."
     }
   ]
 }

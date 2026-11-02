@@ -20,6 +20,12 @@ several readers.
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
   - `BLAZE_PROFILE=<dir>`: a whole build's Chrome trace.
+  - The hot sketches (crates/blaze-profile/src/hot.rs): each thread's ring also keeps a
+    count-min sketch of the time under each (span, `function`) and its 32 heaviest keys, and
+    a DDSketch of each kind of wait's durations (1% relative error). `blaze debug hot [--top N]
+    [--last-build]` sums the threads' sketches in the daemon and prints the top keys, each
+    with an upper bound (the count-min estimate) and a lower bound (ticks counted exactly once
+    listed), and p50, p90, p99 and max of each wait kind. No DuckDB, no history.
 
 DuckDB is never linked into blaze. `blaze debug sql` runs the pinned DuckDB CLI.
 
@@ -57,17 +63,25 @@ outermost first. `?` marks a nullable column.
 | target | dict | its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps) |
 | start_ns | i64 | when it began |
 | dur_ns | i64 | how long it was open |
-| self_cpu_ns | i64? | its thread's CPU time less that of the spans under it; only while `BLAZE_PROFILE` is on |
+| self_cpu_ns | i64? | the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job |
 | alloc_bytes | u64? | bytes its thread allocated while it was open |
 | allocs | u64? | allocations its thread made while it was open |
 | query_kind | dict? | the query it ran, for a span of a query |
-| crate | dict? | the crate it was of, from its field `crate` |
-| function | utf8? | the function it was of, from its field `function` or `subject` |
-| unit | utf8? | the codegen unit it was of, from its field `unit` |
+| crate | dict? | the crate it was of: a kind's `krate`, or an ad hoc span's field `crate` |
+| function | utf8? | the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject` |
+| unit | utf8? | the unit it was of: a unit phase's package, version and target (`serde v1.0.219 (build script)`), or an ad hoc span's field `unit` (a codegen unit) |
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
 | frame_copied_bytes | u64? | bytes those moves copied |
-| awaits | utf8? | what a wait span waits for, from its field `awaits`: a query's key, a lock, a channel; every `wait` span has it |
-| owner | u64? | who runs what it waits for, from its field `owner`: the job (or thread) running the awaited key; null when not known. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
+| awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
+| owner | u64? | who runs what a `wait` waits for (the job or thread running the awaited key; null when not known), or who holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
+| steps | u64? | the basic blocks a `macro expand` ran on the evaluator; null for a compiled run, a run that did not end, and any other span |
+| peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is |
+| outcome | dict? | how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind) |
+| waits_on | dict? | the kind of thing a `wait` waits on: key, lock, channel, io, child or scope |
+
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`) and `hold` (`what`, `holder`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+
+A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
 A query span on a body names it: `infer_query`, `infer_anon_const_query`, `mir_body_query`,
 `body_query`, `body_relative_query` and `body_with_source_map_query` carry the body's crate in
@@ -335,8 +349,12 @@ On 2026-10-31, rel2's release build of blaze-engine (74 s) had 66.9% uncovered; 
 `b2-home-rel`, with the phase spans below, had 0.1% (0.18 s of 134 s).
 
 The gate `blaze_profile::gate::check` holds a profiled build to that bar for each worker and each
-wait. It fails when a worker spends 1% or more of the wall time outside every span
-(`uncovered_per_worker`). It also fails on every perf sample blocked in a mutex, condition
+wait. It fails when a worker spends 1% or more of the wall time outside every span while it
+runs a job (from the job's `started` or `resumed` switch to its next switch) or before its first
+switch (`uncovered_per_worker`); the time the pool says it was idle or between jobs counts as
+said. Every job a pool runs opens a `job` span, its `function` the type of the job's closure,
+closed as the job parks and opened again where it resumes (`blaze_graph::pool::span_jobs`), so
+a worker's run of a job is never outside a span. It also fails on every perf sample blocked in a mutex, condition
 variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
 the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
 binary measured, and a history with no such build is an error naming it. Its test runs on a

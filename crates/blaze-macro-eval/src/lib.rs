@@ -23,7 +23,6 @@ mod protocol;
 mod run;
 mod server;
 mod stream;
-mod tier;
 mod wire;
 
 pub use expander::{flush, load};

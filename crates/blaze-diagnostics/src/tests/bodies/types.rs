@@ -707,6 +707,32 @@ fn main() {
     assert!(notes.contains(&"required by a bound in `assert_failed`"), "{notes:?}");
 }
 
+/// An error blaze cannot place (a `self` parameter has no pattern for the solver's span to
+/// map to) is still rustc's error in words, naming the type, trait, parameter and item, with a
+/// note that blaze could not place it, never type checking's diagnostic printed raw.
+#[test]
+fn an_unplaced_type_error_names_its_type_trait_and_item() {
+    let fixture = "//- minicore: sized
+trait Head {
+    fn head(self) -> u8 {
+        0
+    }
+}
+";
+    let checked = checked(fixture);
+    assert_eq!(
+        checked.messages(),
+        [
+            "blaze: E0277: the size for values of type `Self` cannot be known at compilation time (`Self: Sized`), for the parameter `self`, in `Head::head`",
+        ]
+    );
+    let notes: Vec<&str> = checked.diags[0].children.iter().map(|it| it.message.as_str()).collect();
+    assert_eq!(
+        notes,
+        ["blaze could not place this error more precisely: it is in code with no syntax of its own"]
+    );
+}
+
 #[test]
 fn a_let_of_a_type_with_an_undecided_parameter() {
     // tests/ui/array-slice-vec/vector-no-ann.rs
@@ -1310,4 +1336,24 @@ fn main() {}
             error(12, &["`unwrap_binder!()`"]),
         ],
     );
+}
+
+/// Our own: a reference coerces to a trait object its referent implements, and so does a
+/// reference to a reference (`&&u64` to `&dyn Debug` through `impl Debug for &T`), as
+/// derive(Debug)'s `DebugTuple::field(.., &_self_0)` of a field bound by reference writes it.
+/// One function each, so an error's line names the form. `dispatch_from_dyn` makes `&self`
+/// dispatchable, so `Debug` is dyn-compatible, as with the real core.
+#[test]
+fn a_reference_to_a_reference_coerces_to_a_trait_object() {
+    let fixture = r#"//- minicore: fmt, builtin_impls, dispatch_from_dyn
+//- /lib.rs crate:other edition:2024
+use core::fmt::{Debug, DebugTuple};
+fn takes(_: &dyn Debug) {}
+pub fn by_value(x: u64) { takes(&x); }
+pub fn by_reference(x: &u64) { takes(&x); }
+pub fn in_a_match(x: &(u64,)) { match x { (it,) => takes(&it) } }
+pub fn to_a_method(x: &u64, t: &mut DebugTuple) { DebugTuple::field(t, &x); }
+"#;
+    let checked = checked(fixture);
+    assert!(!checked.diags.iter().any(|it| it.is_error()), "{}", checked.stderr());
 }

@@ -20,6 +20,7 @@ use crate::{
     flight::{self, CounterRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
     sampler::Sample,
     schema::{self, Table},
+    span,
 };
 
 /// What every row of a batch from one process shares.
@@ -111,19 +112,10 @@ fn build_id(build: u32) -> Option<u64> {
 /// The `spans` rows of `spans`, all from `process`.
 pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = spans.len();
-    let (mut threads, mut names, mut targets, mut kinds, mut crates) =
-        (Dict::new(), Dict::new(), Dict::new(), Dict::new(), Dict::new());
+    let (mut threads, mut names, mut targets, mut kinds) = (Dict::new(), Dict::new(), Dict::new(), Dict::new());
     // alloc: a batch's key columns, once a read, never per span written
-    let (mut thread_keys, mut name_keys, mut target_keys) =
-        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
-    // alloc: a batch's key columns, once a read, never per span written
-    let (mut kind_keys, mut crate_keys, mut functions, mut units, mut awaits) = (
-        Vec::with_capacity(rows),
-        Vec::with_capacity(rows),
-        Vec::with_capacity(rows),
-        Vec::with_capacity(rows),
-        Vec::with_capacity(rows),
-    );
+    let (mut thread_keys, mut name_keys, mut target_keys, mut kind_keys) =
+        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in spans {
         let meta = flight::meta(row.site);
         let name = meta.map_or("?", |it| it.name());
@@ -134,16 +126,10 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
         // A rust-analyzer query's span is named for its query.
         kind_keys.push(name.ends_with("_query").then(|| kinds.key(u64::from(row.site), || name)));
-        crate_keys.push(
-            (row.krate != 0)
-                .then(|| crates.key(u64::from(row.krate), || flight::name(row.krate).unwrap_or_else(|| "?".into()))),
-        );
-        functions.push(flight::name(row.function));
-        units.push(flight::name(row.unit));
-        awaits.push(flight::name(row.awaits));
     }
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema::SPANS.columns.len());
+    columns.extend([
         column(UInt64Array::from_iter(spans.iter().map(|it| build_id(it.build)))),
         constant(process.commit, rows)?,
         column(UInt32Array::from_value(process.pid, rows)),
@@ -157,20 +143,52 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         targets.finish(UInt32Array::from(target_keys))?,
         column(Int64Array::from_iter_values(spans.iter().map(|it| it.start_ns))),
         column(Int64Array::from_iter_values(spans.iter().map(|it| it.dur_ns))),
-        // The ring keeps no CPU time; BLAZE_PROFILE's tables have it.
-        column(Int64Array::new_null(rows)),
+        column(Int64Array::from_iter(spans.iter().map(|it| it.self_cpu_ns.map(|it| it as i64)))),
         column(UInt64Array::from_iter(spans.iter().map(|it| it.alloc.map(|it| it.bytes)))),
         column(UInt64Array::from_iter(spans.iter().map(|it| it.alloc.map(|it| it.count)))),
         kinds.finish(UInt32Array::from(kind_keys))?,
-        crates.finish(UInt32Array::from(crate_keys))?,
-        column(StringArray::from_iter(functions.iter().map(|it| it.as_deref()))),
-        column(StringArray::from_iter(units.iter().map(|it| it.as_deref()))),
+    ]);
+    let (generic, typed) = span::CELLS.split_at(span::GENERIC);
+    for cells in generic {
+        columns.push(span_column(spans, cells)?);
+    }
+    columns.extend([
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.copies)))),
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.bytes)))),
-        column(StringArray::from_iter(awaits.iter().map(|it| it.as_deref()))),
-        column(UInt64Array::from_iter(spans.iter().map(|it| it.owner))),
-    ];
+    ]);
+    for cells in typed {
+        columns.push(span_column(spans, cells)?);
+    }
     RecordBatch::try_new(schema_of(&schema::SPANS), columns)
+}
+
+/// The column of `spans` a span kind's field fills ([`span::CELLS`]), as its schema types it.
+fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, ArrowError> {
+    let words = spans.iter().map(|it| it.said().get(cells.at));
+    Ok(match cells.column.ty {
+        schema::Type::U64 => column(UInt64Array::from_iter(words.map(cells.number))),
+        schema::Type::Utf8 => {
+            // alloc: a batch's column, once a read
+            let texts: Vec<Option<std::sync::Arc<str>>> = words.map(cells.text).collect();
+            column(StringArray::from_iter(texts.iter().map(|it| it.as_deref())))
+        }
+        schema::Type::Dict => {
+            let mut values = Dict::new();
+            let keys: UInt32Array = words
+                .map(|word| {
+                    (word != 0).then(|| values.key(word, || (cells.text)(word).unwrap_or_else(|| "?".into())))
+                })
+                .collect();
+            values.finish(keys)?
+        }
+        other => {
+            // alloc: an error, once
+            return Err(ArrowError::SchemaError(format!(
+                "the spans column `{}` is {other:?}, which no span field fills",
+                cells.column.name
+            )));
+        }
+    })
 }
 
 /// The `counters` rows of `counters`, all from `process`.
@@ -359,6 +377,47 @@ mod tests {
         assert_eq!(named, ["main", "build", "typeck"]);
         let t_ns = batch.column(schema::SAMPLES.column("t_ns").unwrap());
         assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
+    }
+
+    #[test]
+    fn a_runs_cpu_steps_peak_and_outcome_are_its_columns_and_null_where_unsaid() {
+        use crate::span::{Fields as _, MacroExpanded, Outcome, Said, col};
+        let mut typed = Said::EMPTY;
+        MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::Ok }.write(&mut typed);
+        let said = SpanRow {
+            build: 1,
+            thread: 3,
+            thread_name: 0,
+            span_id: 11,
+            parent: 0,
+            depth: 0,
+            site: 0,
+            start_ns: 0,
+            dur_ns: 900,
+            alloc: None,
+            copied: None,
+            krate: 0,
+            function: flight::intern("serde_derive::Serialize"),
+            unit: 0,
+            self_cpu_ns: Some(700),
+            typed: typed.typed,
+        };
+        assert_eq!(said.get::<col::Outcome>(), Some(Outcome::Ok));
+        let unsaid = SpanRow { span_id: 12, self_cpu_ns: None, typed: Said::EMPTY.typed, ..said };
+        let batch = spans(&[said, unsaid], Process { pid: 7, name: "blaze serve", commit: None }).unwrap();
+        let column = |name: &str| batch.column(schema::SPANS.column(name).unwrap());
+        let u64s = |name: &str| {
+            let it = column(name).as_primitive::<arrow_array::types::UInt64Type>();
+            [0, 1].map(|row| it.is_valid(row).then(|| it.value(row)))
+        };
+        let cpu = column("self_cpu_ns").as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!([0, 1].map(|row| cpu.is_valid(row).then(|| cpu.value(row))), [Some(700), None]);
+        assert_eq!(u64s("steps"), [Some(4_200_000), None]);
+        assert_eq!(u64s("peak_bytes"), [Some(48 << 20), None]);
+        let outcome = column("outcome").as_dictionary::<UInt32Type>();
+        let values = outcome.values().as_string::<i32>();
+        assert_eq!(values.value(outcome.keys().value(0) as usize), "ok");
+        assert!(!outcome.keys().is_valid(1));
     }
 
     #[test]
