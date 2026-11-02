@@ -525,11 +525,8 @@ code, with the real std and `library/proc_macro`, every access checked, and the 
 call answered by blaze's own server. Nothing rustc compiles is loaded and no process is
 started: the evaluator is the proc-macro sandbox. The macro reads only below the calling
 crate's `CARGO_MANIFEST_DIR` and `OUT_DIR`, writes nothing, sets no variable and makes no
-system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). Its compiled tier,
-off by default (`Policy::DEFAULT`), keeps the same confinement: the macro's code reaches only
-a 4 GiB region of its own and calls only checked table entries and the same shims
-(`crates/blaze-macro-eval/src/tier.rs`, `tier/confine.rs`). A macro blaze-macro-eval cannot
-run stops the build with an error naming the macro and its crate; nothing runs natively and
+system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). A macro
+blaze-macro-eval cannot run stops the build with an error naming the macro and its crate; nothing runs natively and
 nothing goes to another host (there is none). Each expansion is kept in the store
 (`crates/proc-macro-api/src/kept.rs`) by the macro's library, its name, input and attribute
 tokens, the crate's variables, its directory and the toolchain, and found by what else it
