@@ -18,7 +18,7 @@
 //! drops it writes `<dir>/<program>-<pid>.ixprof`. Off (no `IX_PROF`, no `IX_PROF_HTTP`),
 //! nothing runs and each span callback and allocation costs one relaxed load.
 //!
-//! The format and every interface: docs/profiling.md and docs/profiling-any-program.md.
+//! The format and every interface: docs/ix-prof.md and docs/ix-prof-format.md.
 //! The aggregation is [`core::Recorder`], a sans-IO state machine; everything else here is a
 //! driver (the sampler thread, the layer, the allocator, the ticker, the HTTP server).
 
