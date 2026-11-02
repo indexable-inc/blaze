@@ -117,7 +117,8 @@ def cmake_args(target):
     args = [
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DLLVM_TARGETS_TO_BUILD=X86;AArch64",
+        # WebAssembly: blaze builds proc-macro crates for wasm32-wasip1 and runs them in Wasmtime.
+        "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;WebAssembly",
         "-DLLVM_ENABLE_PROJECTS=",
         "-DLLVM_ENABLE_ASSERTIONS=OFF",
         "-DLLVM_INCLUDE_TESTS=OFF",
