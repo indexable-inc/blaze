@@ -20718,10 +20718,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -20885,6 +20881,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "cpufeatures",
+       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -26723,6 +26723,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cpufeatures"
+    },
+    "cpufeatures@0.3.1 lib cpufeatures build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cpufeatures@0.3.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45514,10 +45534,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -45681,6 +45697,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "cpufeatures",
+       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -51464,6 +51484,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cpufeatures"
+    },
+    "cpufeatures@0.3.1 lib cpufeatures build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cpufeatures@0.3.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -70023,10 +70063,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -70194,6 +70230,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "cpufeatures",
+       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -76022,6 +76062,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cpufeatures"
+    },
+    "cpufeatures@0.3.1 lib cpufeatures build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cpufeatures@0.3.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -94801,10 +94861,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -94972,6 +95028,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "cpufeatures",
+       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -100749,6 +100809,26 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "cpufeatures"
+    },
+    "cpufeatures@0.3.1 lib cpufeatures build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "cpufeatures@0.3.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
