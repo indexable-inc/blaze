@@ -239,6 +239,7 @@ threads inside it run as a loop that LLVM can vectorize. Three things make this 
 5. Subgroup ops, and SIMD-width compilation on the CPU.
 6. Autodiff on MIR (`#[differentiable]`), the one Slang feature with no Rust equivalent on a GPU.
    `std::autodiff` runs Enzyme on LLVM IR, which device code reaches too late to use.
+7. Ray tracing: inline query first, then typed pipelines. See [raytracing.md](raytracing.md).
 
 ## Open questions
 
